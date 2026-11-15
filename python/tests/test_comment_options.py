@@ -37,12 +37,12 @@ def test_comment_password_override_is_per_call_and_limits_precede_decryption(pas
     with pytest.raises(MemoryError):
         archive.read_comment(options=rars.ReadOptions(max_member_output_bytes=0))
     options = rars.ReadOptions(max_total_output_bytes=len(expected))
-    assert archive.read_comment(pwd=b"password", options=options) == expected
+    assert archive.read_comment(password=b"password", options=options) == expected
     if password == "password":
         assert archive.comment == expected
         assert archive.read_comment(options=options) == expected
         with pytest.raises((rars.BadPassword, rars.BadRarFile)):
-            archive.read_comment(pwd="wrong", options=options)
+            archive.read_comment(password="wrong", options=options)
         assert archive.comment == expected
     else:
         error = rars.PasswordRequired if password is None else (rars.BadPassword, rars.BadRarFile)

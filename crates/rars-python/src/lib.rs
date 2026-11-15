@@ -543,18 +543,18 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
-    #[pyo3(signature = (name, pwd = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (name, password = None, *, options = None, volumes = None))]
     fn read(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(name)?;
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let data = if self.needs_later_volumes(index) {
             self.read_from_set(py, volumes, options, &[index])?
@@ -567,16 +567,16 @@ impl RarFile {
         data.ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
-    #[pyo3(signature = (name, pwd = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (name, password = None, *, options = None, volumes = None))]
     fn open(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let data = self.read(py, name, pwd, options, volumes)?;
+        let data = self.read(py, name, password, options, volumes)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -584,12 +584,12 @@ impl RarFile {
 
     /// Read selected members in one session, preserving request order and duplicates.
     /// Output limits apply to the whole call, including required solid predecessors.
-    #[pyo3(signature = (members, pwd = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (members, password = None, *, options = None, volumes = None))]
     fn read_many(
         &self,
         py: Python<'_>,
         members: &Bound<'_, PyAny>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
@@ -598,7 +598,7 @@ impl RarFile {
             .try_iter()?
             .map(|member| self.resolve_index(&member?))
             .collect::<PyResult<Vec<_>>>()?;
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let data = if indices.iter().any(|&index| self.needs_later_volumes(index)) {
             self.read_from_set(py, volumes, options, &indices)?
@@ -612,14 +612,14 @@ impl RarFile {
     }
 
     /// `overwrite`, `in_place`, `flatten` and `volumes` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    #[pyo3(signature = (member, path = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
         path: Option<PathBuf>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         overwrite: Overwrite,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
@@ -631,7 +631,7 @@ impl RarFile {
         let Overwrite(overwrite) = overwrite;
         let target = self.resolve_index(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let mode = OutputMode {
             overwrite,
@@ -680,14 +680,14 @@ impl RarFile {
     /// or `"rename"` to write beside it as `name(N).ext`. `flatten=True` writes
     /// every file straight into `path` under its base name and creates no
     /// directories; symlinks are kept only when they point at a bare name.
-    #[pyo3(signature = (path = None, members = None, pwd = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    #[pyo3(signature = (path = None, members = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
         py: Python<'_>,
         path: Option<PathBuf>,
         members: Option<&Bound<'_, PyAny>>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         overwrite: Overwrite,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
@@ -703,7 +703,7 @@ impl RarFile {
             flatten,
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let Some(members) = members else {
             if volumes.is_none() && !self.archive.is_volume() {
@@ -742,15 +742,15 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`.
-    #[pyo3(signature = (pwd = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (password = None, *, options = None, volumes = None))]
     fn testrar(
         &self,
         py: Python<'_>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         let first = &self.archive;
         if volumes.is_none() && !first.is_volume() {
@@ -771,14 +771,14 @@ impl RarFile {
     }
 
     /// Returns the complete archive comment, or None if absent, under per-call read policies.
-    #[pyo3(signature = (pwd = None, *, options = None))]
+    #[pyo3(signature = (password = None, *, options = None))]
     fn read_comment(
         &self,
         py: Python<'_>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         py.detach(|| {
             self.archive
                 .comment_with_options(self.extraction_options(options, password.as_deref()))
@@ -792,17 +792,17 @@ impl RarFile {
     }
 
     /// Returns the decoded comment attached to a member, or None if absent.
-    #[pyo3(signature = (member, pwd = None, *, options = None))]
+    #[pyo3(signature = (member, password = None, *, options = None))]
     fn getcomment(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Option<Vec<u8>>> {
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(member)?;
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let password = py_password(password)?.or_else(|| self.password.clone());
         let options = self.extraction_options(options, password.as_deref());
         py.detach(|| self.archive.member_comment_at_with_options(index, options))
             .map_err(map_error)
@@ -810,12 +810,12 @@ impl RarFile {
 
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
-    #[pyo3(signature = (member, pwd = None, *, options = None))]
+    #[pyo3(signature = (member, password = None, *, options = None))]
     fn readlink(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
-        pwd: Option<&Bound<'_, PyAny>>,
+        password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
@@ -826,7 +826,7 @@ impl RarFile {
             .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
         if member.is_legacy_unix_symlink() {
-            let password = py_password(pwd)?.or_else(|| self.password.clone());
+            let password = py_password(password)?.or_else(|| self.password.clone());
             let options = self.extraction_options(options, password.as_deref());
             return Ok(py
                 .detach(|| {
@@ -842,7 +842,7 @@ impl RarFile {
             .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
     }
 
-    /// Exact Unix nanoseconds, absent kinds omitted; no `pwd` since headers were decrypted at open.
+    /// Exact Unix nanoseconds, absent kinds omitted; no `password` since headers were decrypted at open.
     #[pyo3(signature = (member, *, options = None))]
     fn gettimes(
         &self,

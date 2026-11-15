@@ -88,14 +88,14 @@ def test_readlink_takes_a_per_call_password():
     archive = rars.RarFile.from_bytes(legacy_link(False))
     with pytest.raises(rars.PasswordRequired):
         archive.readlink("link")
-    assert archive.readlink("link", pwd="right") == b"target"
+    assert archive.readlink("link", password="right") == b"target"
 
 
 def test_header_encrypted_links_and_times_read_with_a_per_call_password():
     archive = rars.RarFile.from_bytes(legacy_link(True), password="right")
     with pytest.raises(rars.BadPassword):
-        archive.readlink("link", pwd="wrong")
-    assert archive.readlink("link", pwd="right") == b"target"
+        archive.readlink("link", password="wrong")
+    assert archive.readlink("link", password="right") == b"target"
     assert archive.readlink("link") == b"target"
     plain = rars.RarFile.from_bytes(legacy_link(False))
     assert archive.gettimes("link", options=rars.ReadOptions()) == plain.gettimes("link")
