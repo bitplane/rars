@@ -2321,6 +2321,60 @@ impl PasswordCheck {
     }
 }
 
+/// Only the signature at offset 0; a file object is read from its position and put back.
+#[pyfunction]
+fn is_rarfile(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<bool> {
+    with_probe_reader(py, source, |reader| {
+        let mut prefix = Vec::with_capacity(8);
+        io::Read::read_to_end(&mut io::Read::take(reader, 8), &mut prefix)?;
+        Ok(rars_rs::detect_archive_family(&prefix).is_some())
+    })
+}
+
+/// Finds an archive start the way `RarFile` does, so the two agree on what opens.
+#[pyfunction]
+fn is_rarfile_sfx(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<bool> {
+    with_probe_reader(py, source, |reader| {
+        let mut scan = Vec::new();
+        let limit = rars_rs::SFX_SCAN_LIMIT + rars_rs::detect::RAR50_SIGNATURE.len();
+        io::Read::read_to_end(&mut io::Read::take(reader, limit as u64), &mut scan)?;
+        Ok(rars_rs::find_archive_start(&scan, rars_rs::SFX_SCAN_LIMIT).is_some())
+    })
+}
+
+/// A seekable file object is returned to where it was; a stream keeps what was read from it.
+fn with_probe_reader(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    probe: impl FnOnce(&mut dyn io::Read) -> io::Result<bool> + Send,
+) -> PyResult<bool> {
+    if let Some(bytes) = py_bytes_like(source)? {
+        refuse_bytes_path(source, &bytes)?;
+        return Ok(probe(&mut &bytes[..])?);
+    }
+    if is_file_object(source)? {
+        refuse_text_mode(source)?;
+        let mut reader = PyFileReader(source.clone().unbind());
+        if !is_seekable(source)? {
+            return Ok(probe(&mut reader)?);
+        }
+        let position = source.call_method0("tell")?;
+        let found = probe(&mut reader);
+        source.call_method1("seek", (position,))?;
+        return Ok(found?);
+    }
+    if source.is_instance_of::<PyString>() || source.hasattr("__fspath__")? {
+        let path = py_path_buf(py, source)?;
+        return py
+            .detach(|| probe(&mut std::fs::File::open(path)?))
+            .map_err(Into::into);
+    }
+    Err(PyTypeError::new_err(format!(
+        "expected archive data (a bytes-like object), a path (str or os.PathLike) or a binary file object, not {}",
+        type_name(source)
+    )))
+}
+
 /// Candidates are taken one at a time, and none after the first proved correct.
 #[pyfunction]
 #[pyo3(signature = (source, candidates, *, options = None))]
@@ -2473,6 +2527,8 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RepairResult>()?;
     m.add_class::<PasswordCheck>()?;
     m.add_function(wrap_pyfunction!(check_password, m)?)?;
+    m.add_function(wrap_pyfunction!(is_rarfile, m)?)?;
+    m.add_function(wrap_pyfunction!(is_rarfile_sfx, m)?)?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
     m.add_function(wrap_pyfunction!(repair_detailed, m)?)?;
     m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;
