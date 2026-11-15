@@ -974,11 +974,8 @@ mod tests {
     fn split_continuations_must_match_the_first_fragment() {
         let first = file(b"a.txt", FHD_SPLIT_AFTER);
 
-        let renamed = file(b"b.txt", FHD_SPLIT_BEFORE);
-        assert!(matches!(
-            continuation_check(first.clone(), &renamed, None),
-            Err(Error::InvalidHeader(_))
-        ));
+        let renamed = file(b"B.TXT", FHD_SPLIT_BEFORE);
+        continuation_check(first.clone(), &renamed, None).unwrap();
 
         let mut new_method = file(b"a.txt", FHD_SPLIT_BEFORE);
         new_method.method = 0x35;

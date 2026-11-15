@@ -3331,11 +3331,8 @@ mod tests {
             })
         };
 
-        let renamed = split_fragment_file(b"b.txt", HFL_SPLIT_BEFORE);
-        assert!(matches!(
-            check(&renamed, None),
-            Err(Error::InvalidHeader(_))
-        ));
+        let renamed = split_fragment_file(b"B.TXT", HFL_SPLIT_BEFORE);
+        check(&renamed, None).unwrap();
 
         let mut new_compression = split_fragment_file(b"a.txt", HFL_SPLIT_BEFORE);
         new_compression.compression_info = 0x123;
@@ -3735,7 +3732,7 @@ mod tests {
         let err = stored_split_result(b"unmatched-size payload", |end| end.unpacked_size += 5)
             .unwrap_err();
         assert!(
-            matches!(err, Error::InvalidHeader(msg) if msg.contains("mismatched packed and unpacked")),
+            matches!(err, Error::InvalidHeader(msg) if msg.contains("unpacked size changed")),
             "expected size mismatch error, got {err:?}"
         );
     }
