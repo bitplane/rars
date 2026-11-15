@@ -26,7 +26,7 @@ use std::sync::{
 /// Partial output and earlier extracted members can remain. The call aborts;
 /// it does not resume solid state, roll back sinks or refund output budgets.
 #[derive(Clone, Debug, Default)]
-pub struct ReadCancellation(Arc<AtomicBool>, Option<Arc<ReadCancellation>>);
+pub struct ReadCancellation(Arc<AtomicBool>, Arc<[ReadCancellation]>);
 
 impl ReadCancellation {
     /// Creates an uncancelled signal.
@@ -37,9 +37,14 @@ impl ReadCancellation {
     /// Cancelling the child never cancels its parent or siblings. This lets a
     /// scoped operation stop its workers without poisoning a caller-owned token.
     pub fn child(&self) -> Self {
+        Self(Arc::new(AtomicBool::new(false)), Arc::new([self.clone()]))
+    }
+    /// A child that also observes `other`, for an operation two callers can each stop.
+    #[doc(hidden)]
+    pub fn joined(&self, other: &Self) -> Self {
         Self(
             Arc::new(AtomicBool::new(false)),
-            Some(Arc::new(self.clone())),
+            Arc::new([self.clone(), other.clone()]),
         )
     }
     /// Signals cancellation to every clone. Calling this repeatedly is harmless.
@@ -48,8 +53,7 @@ impl ReadCancellation {
     }
     /// Returns whether any clone has signalled cancellation.
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
-            || self.1.as_ref().is_some_and(|parent| parent.is_cancelled())
+        self.0.load(Ordering::Relaxed) || self.1.iter().any(ReadCancellation::is_cancelled)
     }
 }
 
@@ -279,6 +283,24 @@ impl Poller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_joined_token_observes_both_without_cancelling_either() {
+        for cancel_first in [true, false] {
+            let (first, second) = (ReadCancellation::new(), ReadCancellation::new());
+            let joined = first.joined(&second);
+            assert!(!joined.is_cancelled());
+            if cancel_first {
+                first.cancel()
+            } else {
+                second.cancel()
+            }
+            assert!(joined.is_cancelled());
+        }
+        let (first, second) = (ReadCancellation::new(), ReadCancellation::new());
+        first.joined(&second).cancel();
+        assert!(!first.is_cancelled() && !second.is_cancelled());
+    }
 
     #[test]
     fn child_cancellation_is_local_but_parent_cancellation_propagates() {

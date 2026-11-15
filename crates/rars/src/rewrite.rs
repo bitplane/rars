@@ -7,9 +7,34 @@ impl Archive {
     /// Decodes comments in member order with one metadata traversal. Like
     /// `member_comment_at`, this does not retain resource limits from parsing.
     pub fn member_comments(&self, password: Option<&[u8]>) -> crate::Result<Vec<Option<Vec<u8>>>> {
+        self.member_comments_with_options(crate::ArchiveReadOptions::with_optional_password(
+            password,
+        ))
+    }
+
+    /// [`Self::member_comments`] under per-comment output limits, decoder limits and cancellation.
+    pub fn member_comments_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> crate::Result<Vec<Option<Vec<u8>>>> {
+        options.check_cancelled()?;
         match self {
-            Archive::Rar13(a) => a.entries.iter().map(|entry| entry.file_comment()).collect(),
-            Archive::Rar15To40(a) => a.files().map(|file| file.file_comment()).collect(),
+            Archive::Rar13(a) => a
+                .entries
+                .iter()
+                .map(|entry| {
+                    let comment = entry.file_comment()?;
+                    if let Some(comment) = &comment {
+                        crate::output_limit::OutputBudget::new(options)
+                            .check(comment.len() as u64, b"CMT")?;
+                    }
+                    Ok(comment)
+                })
+                .collect(),
+            Archive::Rar15To40(a) => a
+                .files()
+                .map(|file| file.file_comment_with_options(options))
+                .collect(),
             Archive::Rar50Plus(a) => {
                 let mut comments: Vec<Option<&crate::rar50::FileHeader>> = Vec::new();
                 for block in &a.blocks {
@@ -30,11 +55,14 @@ impl Archive {
                 comments
                     .into_iter()
                     .map(|comment| {
+                        options.check_cancelled()?;
                         comment
                             .map(|service| {
-                                let mut data = Vec::new();
-                                service.write_to(a, password, &mut data)?;
-                                Ok(data)
+                                service.decoded_comment_with_options(
+                                    a,
+                                    options,
+                                    crate::rar50::CommentChecksum::Verify,
+                                )
                             })
                             .transpose()
                     })
@@ -175,7 +203,17 @@ impl Archive {
         &self,
         password: Option<&[u8]>,
     ) -> crate::Result<Vec<Option<Vec<u8>>>> {
-        use crate::{ArchiveReadOptions, Error, ExtractionDecision, SharedBuffer};
+        self.legacy_symlink_targets_with_options(crate::ArchiveReadOptions::with_optional_password(
+            password,
+        ))
+    }
+
+    /// [`Self::legacy_symlink_targets`] under per-call output limits, decoder limits and cancellation.
+    pub fn legacy_symlink_targets_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> crate::Result<Vec<Option<Vec<u8>>>> {
+        use crate::{Error, ExtractionDecision, SharedBuffer};
         use std::sync::{Arc, Mutex};
 
         let Archive::Rar15To40(legacy) = self else {
@@ -191,27 +229,24 @@ impl Archive {
         let mut targets: Vec<Option<SharedBuffer>> = (0..members.len()).map(|_| None).collect();
         let solid = legacy.main.is_solid();
         let mut index = 0;
-        self.extract_with_control(
-            ArchiveReadOptions::with_optional_password(password),
-            |member| {
-                let current = index;
-                index += 1;
-                if current > last {
-                    return Ok(ExtractionDecision::Stop);
-                }
-                // Finding a legacy link above confines this traversal to
-                // RAR1.5–4, whose member metadata has no redirection flag.
-                if member.is_legacy_unix_symlink() {
-                    let bytes = Arc::new(Mutex::new(Some(Vec::new())));
-                    targets[current] = Some(SharedBuffer(bytes.clone()));
-                    Ok(ExtractionDecision::Extract(Box::new(SharedBuffer(bytes))))
-                } else if solid && !member.meta.is_directory {
-                    Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
-                } else {
-                    Ok(ExtractionDecision::Skip)
-                }
-            },
-        )?;
+        self.extract_with_control(options, |member| {
+            let current = index;
+            index += 1;
+            if current > last {
+                return Ok(ExtractionDecision::Stop);
+            }
+            // Finding a legacy link above confines this traversal to
+            // RAR1.5–4, whose member metadata has no redirection flag.
+            if member.is_legacy_unix_symlink() {
+                let bytes = Arc::new(Mutex::new(Some(Vec::new())));
+                targets[current] = Some(SharedBuffer(bytes.clone()));
+                Ok(ExtractionDecision::Extract(Box::new(SharedBuffer(bytes))))
+            } else if solid && !member.meta.is_directory {
+                Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+            } else {
+                Ok(ExtractionDecision::Skip)
+            }
+        })?;
         targets
             .into_iter()
             .zip(members)

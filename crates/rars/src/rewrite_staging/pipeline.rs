@@ -162,6 +162,7 @@ impl Drop for StopOnDrop {
 
 pub(super) fn run<T>(
     archive: &Archive,
+    later_volumes: &[Archive],
     indices: &[usize],
     options: ArchiveReadOptions<'_>,
     staging: &RewriteStaging,
@@ -170,7 +171,8 @@ pub(super) fn run<T>(
 ) -> Result<T> {
     options.check_cancelled()?;
     let sizes: BTreeMap<_, _> = archive
-        .members()
+        .rewrite_members(later_volumes)?
+        .into_iter()
         .enumerate()
         .map(|(i, member)| (i, member.meta.unpacked_size))
         .collect();
@@ -211,6 +213,7 @@ pub(super) fn run<T>(
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 super::native::stage(
                     archive,
+                    later_volumes,
                     indices,
                     options.with_cancellation(&worker.cancellation),
                     staging,
@@ -435,6 +438,7 @@ mod tests {
 
         let value = run(
             &archive,
+            &[],
             &[0],
             ArchiveReadOptions::default(),
             &staging,
@@ -451,6 +455,7 @@ mod tests {
         assert_eq!(
             run(
                 &archive,
+                &[],
                 &[0],
                 ArchiveReadOptions::default(),
                 &staging,
@@ -479,6 +484,7 @@ mod tests {
 
         let result = run(
             &archive,
+            &[],
             &[0],
             ArchiveReadOptions::default(),
             &staging,
