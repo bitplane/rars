@@ -1,13 +1,16 @@
 #![cfg(feature = "write")]
 
-//! A member too large to filter whole still gets filters, chosen run by run,
-//! and runs that start mid-member convert x86 addresses from their own offset.
+//! A member too large to filter whole still gets filters, chosen run by run or
+//! asked for, and runs that start mid-member convert x86 addresses from their
+//! own offset.
 
 #[path = "support/scratch.rs"]
 mod scratch;
 
 use rars::rar50::{self, ArchiveEntry, ArchiveExtras, FilterPolicy, WriterOptions};
-use rars::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
+use rars::{
+    ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, FilterKind, FilterSpec, WriterResources,
+};
 
 const MIB: u64 = 1024 * 1024;
 const MEMBER: usize = 8 << 20;
@@ -78,6 +81,34 @@ fn runs_of_a_large_member_choose_their_own_filters() {
         assert!(
             filtered.len() * 4 < plain.len() * 3,
             "filters took {} down only to {}",
+            plain.len(),
+            filtered.len()
+        );
+    }
+}
+
+#[test]
+fn an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run() {
+    let root = scratch::case("rar50-large-member-explicit-filter");
+    let data = code(MEMBER);
+    let resources = WriterResources::new(LIMIT).with_temp_dir(&root);
+    let plain = write(&data, FilterPolicy::None, &resources);
+    // The range starts and ends mid-run.
+    for range in [None, Some(MEMBER / 3..MEMBER * 2 / 3)] {
+        let spec = match range.clone() {
+            Some(range) => FilterSpec::range(FilterKind::E8, range),
+            None => FilterSpec::whole(FilterKind::E8),
+        };
+        let filtered = write(&data, FilterPolicy::Explicit(spec), &resources);
+
+        let archive = ArchiveReader::read(&filtered).unwrap();
+        archive.test(None).unwrap();
+        assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
+        let covered = range.as_ref().map_or(MEMBER, |range| range.len());
+        let saved = plain.len() - filtered.len();
+        assert!(
+            saved * 4 > plain.len() * covered / MEMBER,
+            "{range:?} took {} down only to {}",
             plain.len(),
             filtered.len()
         );
