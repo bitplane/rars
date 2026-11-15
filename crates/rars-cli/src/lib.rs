@@ -37,10 +37,7 @@ use rars::output_staging::{failed_entry_name, refused_output};
 use rars::rar13::{
     self, FileEntry, StoredEntry as Rar13StoredEntry, WriterOptions as Rar13WriterOptions,
 };
-use rars::rar15_40::{
-    FileEntry as Rar15FileEntry, StoredEntry as Rar15StoredEntry,
-    WriterOptions as Rar15WriterOptions,
-};
+use rars::rar15_40::{FileEntry as Rar15FileEntry, WriterOptions as Rar15WriterOptions};
 use rars::{
     extract_volumes_with_links, test_volumes_with_options_and_callback, Archive as DetectedArchive,
     ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
@@ -1597,8 +1594,8 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     }
     let write_plan = AddWritePlan::for_target(target)?;
 
-    // A stored RAR 1.5 to 4.x set streams; the rest are still built in memory,
-    // because the split has to see the whole packed payload first.
+    // RAR 1.5 to 4.x sets write each volume as it fills; RAR 1.3 sets are still
+    // built in memory.
     if let Some(volume_size) = volume_size {
         return write_legacy_volumes(
             LegacyVolumeWrite {
@@ -1848,84 +1845,57 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
         "Preparing archive"
     });
 
-    let mut features = FeatureSet::store_only();
-    features.solid = plan.solid;
-    features.header_encryption = plan.header_encryption;
     let password = entry.password.as_deref().map(Vec::as_slice);
-    let parts = match plan.write_plan {
-        AddWritePlan::Rar15To40 => {
-            let mut options = Rar15WriterOptions::new(plan.target, features);
-            if let Some(level) = plan.compression_level {
-                options = options.with_compression_level(level);
-            }
-            if let Some(size) = plan.dictionary_size {
-                options = options.with_dictionary_size(size);
-            }
-            if plan.compress {
-                rars::rar15_40::write_compressed_volumes_with_progress(
-                    Rar15FileEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                        host_os: RAR15_HOST_NATIVE,
-                        password,
-                        file_comment: plan.file_comment,
-                    },
-                    options,
-                    plan.volume_size,
-                    Some(progress),
-                )?
-            } else {
-                rars::rar15_40::write_stored_volumes(
-                    Rar15StoredEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                        host_os: RAR15_HOST_NATIVE,
-                        password,
-                        file_comment: plan.file_comment,
-                    },
-                    options,
-                    plan.volume_size,
-                )?
-            }
-        }
-        AddWritePlan::Rar13 => {
-            let mut options = Rar13WriterOptions::new(plan.target, features);
-            if let Some(level) = plan.compression_level {
-                options = options.with_compression_level(level);
-            }
-            if plan.compress {
-                rar13::write_compressed_volumes_with_progress(
-                    FileEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: entry.file_attr,
-                        password,
-                        file_comment: plan.file_comment,
-                    },
-                    options,
-                    plan.volume_size,
-                    Some(progress),
-                )?
-            } else {
-                rar13::write_stored_volumes(
-                    Rar13StoredEntry {
-                        name: &entry.name,
-                        data: &entry.data,
-                        file_time: entry.dos_mtime,
-                        file_attr: entry.file_attr,
-                        password,
-                        file_comment: plan.file_comment,
-                    },
-                    options,
-                    plan.volume_size,
-                )?
-            }
-        }
+    if matches!(plan.write_plan, AddWritePlan::Rar15To40) {
+        return plan.write_rar15_volumes(progress, |options, sink| {
+            rars::rar15_40::write_compressed_volumes_to(
+                Rar15FileEntry {
+                    name: &entry.name,
+                    data: &entry.data,
+                    file_time: entry.dos_mtime,
+                    file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
+                    host_os: RAR15_HOST_NATIVE,
+                    password,
+                    file_comment: plan.file_comment,
+                },
+                options,
+                plan.volume_size,
+                sink,
+                Some(progress),
+            )
+        });
+    }
+    let mut options = Rar13WriterOptions::new(plan.target, plan.features());
+    if let Some(level) = plan.compression_level {
+        options = options.with_compression_level(level);
+    }
+    let parts = if plan.compress {
+        rar13::write_compressed_volumes_with_progress(
+            FileEntry {
+                name: &entry.name,
+                data: &entry.data,
+                file_time: entry.dos_mtime,
+                file_attr: entry.file_attr,
+                password,
+                file_comment: plan.file_comment,
+            },
+            options,
+            plan.volume_size,
+            Some(progress),
+        )?
+    } else {
+        rar13::write_stored_volumes(
+            Rar13StoredEntry {
+                name: &entry.name,
+                data: &entry.data,
+                file_time: entry.dos_mtime,
+                file_attr: entry.file_attr,
+                password,
+                file_comment: plan.file_comment,
+            },
+            options,
+            plan.volume_size,
+        )?
     };
     write_volume_parts(plan.archive_path, &parts, progress).map_err(|err| {
         format!(
@@ -1954,32 +1924,49 @@ fn write_stored_legacy_volumes(
         Some(password) => entry.with_password(password.to_vec()),
         None => entry,
     };
-    let mut features = FeatureSet::store_only();
-    features.solid = plan.solid;
-    features.header_encryption = plan.header_encryption;
-    let mut options = Rar15WriterOptions::new(plan.target, features);
-    if let Some(level) = plan.compression_level {
-        options = options.with_compression_level(level);
-    }
-    if let Some(size) = plan.dictionary_size {
-        options = options.with_dictionary_size(size);
-    }
     progress.bar("Writing volumes", input.size);
-    let mut sink = CliVolumeSink::new(plan.archive_path, |first, index, _| {
-        volume_part_path(first, index)
-    });
-    let result = rars::rar15_40::write_stored_volumes_to(
-        &entry,
-        options,
-        plan.volume_size,
-        &mut sink,
-        &rars::WriterResources::default(),
-        Some(progress),
-    );
-    let paths = sink.finish(result)?;
-    progress.finish("Volumes written");
-    print_created_volumes(&paths);
-    Ok(())
+    plan.write_rar15_volumes(progress, |options, sink| {
+        rars::rar15_40::write_stored_volumes_to(
+            &entry,
+            options,
+            plan.volume_size,
+            sink,
+            &rars::WriterResources::default(),
+            Some(progress),
+        )
+    })
+}
+
+impl LegacyVolumeWrite<'_> {
+    fn features(&self) -> FeatureSet {
+        let mut features = FeatureSet::store_only();
+        features.solid = self.solid;
+        features.header_encryption = self.header_encryption;
+        features
+    }
+
+    /// Hands RAR 1.5 to 4.x volumes to disk as `write` finishes each one.
+    fn write_rar15_volumes(
+        &self,
+        progress: &CliProgress,
+        write: impl FnOnce(Rar15WriterOptions, &mut CliVolumeSink<'_>) -> rars::Result<()>,
+    ) -> CliResult<()> {
+        let mut options = Rar15WriterOptions::new(self.target, self.features());
+        if let Some(level) = self.compression_level {
+            options = options.with_compression_level(level);
+        }
+        if let Some(size) = self.dictionary_size {
+            options = options.with_dictionary_size(size);
+        }
+        let mut sink = CliVolumeSink::new(self.archive_path, |first, index, _| {
+            volume_part_path(first, index)
+        });
+        let result = write(options, &mut sink);
+        let paths = sink.finish(result)?;
+        progress.finish("Volumes written");
+        print_created_volumes(&paths);
+        Ok(())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2113,11 +2100,7 @@ fn write_plain_rar50_streaming(
 
 /// Warns before a volume set that will not fit comfortably in memory.
 ///
-/// Every writer streams a plain archive now, but a compressed or RAR 1.3 set is
-/// still built whole: the split has to see the entire packed payload before it can
-/// decide where the parts break, so the input, the packed member and every part
-/// are all resident at once. RAR 5 and RAR 7 split as they go, so this never
-/// applies to them. Saying so up front beats an allocation failure an hour in.
+/// The legacy codecs pack a member as a unit, so it is held however the parts are written.
 fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersion) {
     const WARN_THRESHOLD: u64 = 256 * 1024 * 1024;
 
@@ -2132,11 +2115,19 @@ fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersi
         return;
     }
 
-    eprintln!(
-        "warning: --format {target} builds a volume set in memory, so this write needs \
-         several times the {} of input and may run out; --format rar50 splits as it goes",
-        indicatif::HumanBytes(total)
-    );
+    let total = indicatif::HumanBytes(total);
+    if target == ArchiveVersion::Rar14 {
+        eprintln!(
+            "warning: --format {target} builds a volume set in memory, so this write needs \
+             several times the {total} of input and may run out; --format rar50 splits as it goes"
+        );
+    } else {
+        eprintln!(
+            "warning: --format {target} compresses the member in memory, so this write holds it, \
+             its packed form and the encoder's working memory, several times the {total} of \
+             input, and may run out; --format rar50 splits as it goes"
+        );
+    }
 }
 
 /// Writes each volume to a temporary file, then renames the set once the
@@ -2726,13 +2717,17 @@ mod tests {
                 &[path.with_file_name("missing")],
                 super::ArchiveVersion::Rar14,
             );
-            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar14);
+            super::warn_if_buffered_write_is_large(
+                std::slice::from_ref(&path),
+                super::ArchiveVersion::Rar14,
+            );
+            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar40);
             return;
         }
         let root = crate::scratch::case("buffered-volume-warning");
         let path = root.join("sparse.bin");
         let file = std::fs::File::create(&path).unwrap();
-        for (size, expected_warnings) in [(0, 0), (256 * 1024 * 1024, 1)] {
+        for (size, expected_warnings) in [(0, 0), (256 * 1024 * 1024, 2)] {
             // A sparse file exercises the real metadata threshold without
             // allocating or decoding hundreds of megabytes.
             file.set_len(size).unwrap();
@@ -2759,7 +2754,14 @@ mod tests {
             );
             if expected_warnings != 0 {
                 assert!(stderr.contains("--format rar14 builds a volume set in memory"));
-                assert!(stderr.contains("--format rar50 splits as it goes"));
+                assert!(stderr.contains(
+                    "--format rar40 compresses the member in memory, so this write holds it, \
+                     its packed form and the encoder's working memory"
+                ));
+                assert_eq!(
+                    stderr.matches("--format rar50 splits as it goes").count(),
+                    2
+                );
             }
             assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
         }

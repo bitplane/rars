@@ -22,8 +22,8 @@ use crate::FeatureSet;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Write;
 
-mod stored_volumes;
-pub use stored_volumes::write_stored_volumes_to;
+mod volumes;
+pub use volumes::write_stored_volumes_to;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -1585,8 +1585,8 @@ pub(crate) fn write_stored_volumes_with_progress(
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut sink = crate::volume_sink::CollectedVolumes::new();
-    stored_volumes::split_stored(
-        stored_volumes::StoredSplit {
+    volumes::split_stored(
+        volumes::StoredSplit {
             name: entry.name,
             bytes: MemberBytes::Borrowed(entry.data),
             file_time: entry.file_time,
@@ -1621,6 +1621,19 @@ pub fn write_compressed_volumes_with_progress(
     volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
+    let mut sink = crate::volume_sink::CollectedVolumes::new();
+    write_compressed_volumes_to(entry, options, volume_size, &mut sink, progress)?;
+    Ok(sink.take())
+}
+
+/// Writes each volume to `sink` as it fills; only the member and its packed form are held.
+pub fn write_compressed_volumes_to(
+    entry: FileEntry<'_>,
+    options: WriterOptions,
+    volume_size: usize,
+    sink: &mut dyn crate::volume_sink::VolumeSink,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
     let resources = WriterResources::default();
     let control =
         crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
@@ -1638,22 +1651,21 @@ pub fn write_compressed_volumes_with_progress(
         WriteOperation::Compression,
         total_work,
     );
-    let result = write_compressed_volumes_impl(entry, options, volume_size, &work);
-    let result = result?;
+    write_compressed_volumes_impl(entry, options, volume_size, sink, &work)?;
     if !work.finish() {
         return Err(Error::Cancelled);
     }
     report_compression_operation(reporting, false, total_work, 1);
-    work.check()?;
-    Ok(result)
+    work.check()
 }
 
 fn write_compressed_volumes_impl(
     entry: FileEntry<'_>,
     mut options: WriterOptions,
     volume_size: usize,
+    sink: &mut dyn crate::volume_sink::VolumeSink,
     progress: &WorkTracker<'_>,
-) -> Result<Vec<Vec<u8>>> {
+) -> Result<()> {
     validate_plan(
         options,
         PlanShape::new().compressed(true).volumes(true),
@@ -1675,45 +1687,24 @@ fn write_compressed_volumes_impl(
         .map_err(|error| {
             crate::write_stream::member_error(error, entry.name, "compressing volume member")
         })?;
-    if options.features.header_encryption {
-        return write_header_encrypted_split_volumes(SplitVolumeRecord {
-            progress: progress
-                .reporter()
-                .expect("volume compression has a resource reporter"),
+    volumes::split_packed(
+        volumes::PackedSplit {
             name: entry.name,
             unpacked: entry.data,
             packed: &payload.data,
+            method: payload.method,
             file_time: entry.file_time,
             file_attr: entry.file_attr,
             host_os: entry.host_os,
-            target: options.target,
-            method: payload.method,
-            dictionary_flags: dictionary_flags_for_options(options)?,
-            base_flags: writer_file_flags(entry.password, None, false),
-            main_flags: if options.features.solid { MHD_SOLID } else { 0 },
             password: entry.password,
-            volume_size,
-        });
-    }
-
-    write_split_volumes(SplitVolumeRecord {
-        progress: progress
+        },
+        options,
+        volume_size,
+        sink,
+        progress
             .reporter()
             .expect("volume compression has a resource reporter"),
-        name: entry.name,
-        unpacked: entry.data,
-        packed: &payload.data,
-        file_time: entry.file_time,
-        file_attr: entry.file_attr,
-        host_os: entry.host_os,
-        target: options.target,
-        method: payload.method,
-        dictionary_flags: dictionary_flags_for_options(options)?,
-        base_flags: writer_file_flags(entry.password, None, false),
-        main_flags: if options.features.solid { MHD_SOLID } else { 0 },
-        password: entry.password,
-        volume_size,
-    })
+    )
 }
 
 fn report_compression_operation(
@@ -2377,50 +2368,6 @@ fn encode_file_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn encrypt_split_packed_data(
-    data: &mut Vec<u8>,
-    target: ArchiveVersion,
-    password: &[u8],
-) -> Result<Option<[u8; 8]>> {
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = (data, target, password);
-        Err(Error::FeatureDisabled {
-            feature: "encryption",
-        })
-    }
-    #[cfg(feature = "encryption")]
-    {
-        match target {
-            ArchiveVersion::Rar15 => {
-                Rar15Cipher::new(password).crypt_in_place(data);
-                Ok(None)
-            }
-            ArchiveVersion::Rar20 => {
-                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
-                    .expect("byte vector length plus padding fits usize");
-                data.resize(padded_len, 0);
-                Rar20Cipher::new(password)
-                    .encrypt_in_place(data)
-                    .expect("padded legacy ciphertext is block aligned");
-                Ok(None)
-            }
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-                let salt = random_rar30_salt()?;
-                let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
-                    .expect("byte vector length plus padding fits usize");
-                data.resize(padded_len, 0);
-                Rar30Cipher::new(password, Some(salt))
-                    .map_err(super::map_rar30_crypto_error)?
-                    .encrypt_in_place(data)
-                    .expect("padded legacy ciphertext is block aligned");
-                Ok(Some(salt))
-            }
-            _ => Err(Error::UnsupportedVersion(target)),
-        }
-    }
-}
-
 fn header_encryption_password<'a>(
     mut passwords: impl Iterator<Item = Option<&'a [u8]>>,
 ) -> Result<&'a [u8]> {
@@ -2818,16 +2765,6 @@ struct FileRecord<'a> {
     extra: &'a [u8],
 }
 
-fn write_file_header_and_data(
-    out: &mut Vec<u8>,
-    record: FileRecord<'_>,
-    packed: &[u8],
-) -> Result<()> {
-    write_file_header(out, &record)?;
-    out.extend_from_slice(packed);
-    Ok(())
-}
-
 fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
     let large = record.packed_size > MAX_SHORT_SIZE || record.unpacked_size > MAX_SHORT_SIZE;
@@ -2902,23 +2839,6 @@ fn dictionary_flags_for_target(target: ArchiveVersion) -> u16 {
     ((rar29_default_dictionary_size(target).trailing_zeros() - 16) as u16) << 5
 }
 
-struct SplitVolumeRecord<'a> {
-    progress: ProgressReporter<'a>,
-    name: &'a [u8],
-    unpacked: &'a [u8],
-    packed: &'a [u8],
-    file_time: u32,
-    file_attr: u32,
-    host_os: u8,
-    target: ArchiveVersion,
-    method: u8,
-    dictionary_flags: u16,
-    base_flags: u16,
-    main_flags: u16,
-    password: Option<&'a [u8]>,
-    volume_size: usize,
-}
-
 fn report_volume(
     progress: ProgressReporter<'_>,
     index: usize,
@@ -2931,174 +2851,6 @@ fn report_volume(
         bytes: bytes as u64,
     });
     crate::write_progress::check_cancelled(Some(progress))
-}
-
-fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    crate::write_progress::check_cancelled(Some(entry.progress))?;
-    if entry.packed.is_empty() {
-        return Err(Error::InvalidArgument(
-            "RAR 1.5 volume writer needs a non-empty packed payload",
-        )
-        .at_entry(entry.name.to_vec(), "preparing volume member"));
-    }
-
-    let mut packed = entry.packed.to_vec();
-    let split_salt = if let Some(password) = entry.password {
-        encrypt_split_packed_data(&mut packed, entry.target, password).map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "encrypting volume member")
-        })?
-    } else {
-        None
-    };
-    let base_flags = entry.base_flags | if split_salt.is_some() { FHD_SALT } else { 0 };
-
-    let unpacked_crc = crc32(entry.unpacked);
-    let render = |index: usize, split_after: bool, chunk: &[u8]| -> Result<Vec<u8>> {
-        let mut file_flags = base_flags;
-        if index > 0 {
-            file_flags |= FHD_SPLIT_BEFORE;
-        }
-        if split_after {
-            file_flags |= FHD_SPLIT_AFTER;
-        }
-
-        let mut main_flags = MHD_VOLUME | entry.main_flags;
-        if index == 0 {
-            main_flags |= MHD_FIRSTVOLUME;
-        }
-
-        let mut out = Vec::new();
-        out.extend_from_slice(RAR15_SIGNATURE);
-        write_main_header(&mut out, main_flags);
-        // Later volumes put it after the data, so a split member's header comes
-        // first, as RAR writes it and python-rarfile reads it.
-        if index == 0 {
-            write_producer(&mut out, entry.target, None, Some(entry.progress))?;
-        }
-        write_file_header_and_data(
-            &mut out,
-            FileRecord {
-                head_type: FILE_HEAD,
-                name: entry.name,
-                unpacked_size: entry.unpacked.len() as u64,
-                file_crc: if split_after {
-                    crc32(chunk)
-                } else {
-                    unpacked_crc
-                },
-                packed_size: chunk.len() as u64,
-                file_time: entry.file_time,
-                file_attr: entry.file_attr,
-                host_os: entry.host_os,
-                target: entry.target,
-                method: entry.method,
-                dictionary_flags: entry.dictionary_flags,
-                flags: file_flags,
-                salt: split_salt,
-                extra: &[],
-            },
-            chunk,
-        )
-        .map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "writing volume member")
-        })?;
-        if index > 0 {
-            write_producer(&mut out, entry.target, None, Some(entry.progress))?;
-        }
-        if writes_end_block(entry.target) {
-            let data_crc = crc32(&out);
-            out.extend_from_slice(&volume_end_block(index as u64, split_after, data_crc));
-        }
-        Ok(out)
-    };
-    let payload =
-        legacy_volume_payload(entry.volume_size, &packed, |probe| render(0, true, probe))?;
-    render_legacy_volumes(&packed, payload, entry.volume_size, entry.progress, render)
-}
-
-fn write_header_encrypted_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    crate::write_progress::check_cancelled(Some(entry.progress))?;
-    validate_header_encrypted_archive_options(entry.target, entry.password.is_some())?;
-    let password = entry.password.ok_or(Error::NeedPassword)?;
-    if entry.packed.is_empty() {
-        return Err(Error::InvalidArgument(
-            "RAR 1.5 volume writer needs a non-empty packed payload",
-        )
-        .at_entry(entry.name.to_vec(), "preparing volume member"));
-    }
-
-    let mut packed = entry.packed.to_vec();
-    let split_salt =
-        encrypt_split_packed_data(&mut packed, entry.target, password).map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "encrypting volume member")
-        })?;
-    let base_flags = entry.base_flags | FHD_SALT;
-    let unpacked_crc = crc32(entry.unpacked);
-    let render = |index: usize, split_after: bool, chunk: &[u8]| -> Result<Vec<u8>> {
-        let mut file_flags = base_flags;
-        if index > 0 {
-            file_flags |= FHD_SPLIT_BEFORE;
-        }
-        if split_after {
-            file_flags |= FHD_SPLIT_AFTER;
-        }
-
-        let mut main_flags = MHD_VOLUME | MHD_PASSWORD | entry.main_flags;
-        if index == 0 {
-            main_flags |= MHD_FIRSTVOLUME;
-        }
-
-        let mut out = Vec::new();
-        out.extend_from_slice(RAR15_SIGNATURE);
-        write_main_header(&mut out, main_flags);
-        if index == 0 {
-            write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
-        }
-        let mut header = Vec::new();
-        write_file_header(
-            &mut header,
-            &FileRecord {
-                head_type: FILE_HEAD,
-                name: entry.name,
-                unpacked_size: entry.unpacked.len() as u64,
-                file_crc: if split_after {
-                    crc32(chunk)
-                } else {
-                    unpacked_crc
-                },
-                packed_size: chunk.len() as u64,
-                file_time: entry.file_time,
-                file_attr: entry.file_attr,
-                host_os: entry.host_os,
-                target: entry.target,
-                method: entry.method,
-                dictionary_flags: entry.dictionary_flags,
-                flags: file_flags,
-                salt: split_salt,
-                extra: &[],
-            },
-        )
-        .map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "writing volume member")
-        })?;
-        write_encrypted_header(&mut out, &header, password).map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "writing volume member")
-        })?;
-        out.extend_from_slice(chunk);
-        if index > 0 {
-            write_producer(&mut out, entry.target, Some(password), Some(entry.progress))?;
-        }
-        let data_crc = crc32(&out);
-        write_encrypted_end_block(
-            &mut out,
-            &volume_end_block(index as u64, split_after, data_crc),
-            password,
-        )?;
-        Ok(out)
-    };
-    let payload =
-        legacy_volume_payload(entry.volume_size, &packed, |probe| render(0, true, probe))?;
-    render_legacy_volumes(&packed, payload, entry.volume_size, entry.progress, render)
 }
 
 /// How many packed bytes fit in each volume of `volume_size` bytes.
@@ -3217,35 +2969,29 @@ mod tests {
                 let plaintext: Vec<u8> = (0..length)
                     .map(|index| (index as u8).wrapping_mul(37))
                     .collect();
-                for split in [false, true] {
-                    let mut data = plaintext.clone();
-                    let salt = if split {
-                        super::encrypt_split_packed_data(&mut data, target, b"pw")
-                    } else {
-                        super::encrypt_packed_data_for_writer(&mut data, target, Some(b"pw"))
+                let mut data = plaintext.clone();
+                let salt =
+                    super::encrypt_packed_data_for_writer(&mut data, target, Some(b"pw")).unwrap();
+                let padded = length.div_ceil(16) * 16;
+                assert_eq!(data.len(), padded);
+                match target {
+                    crate::ArchiveVersion::Rar20 => {
+                        assert_eq!(salt, None);
+                        super::Rar20Cipher::new(b"pw")
+                            .decrypt_in_place(&mut data)
+                            .unwrap();
                     }
-                    .unwrap();
-                    let padded = length.div_ceil(16) * 16;
-                    assert_eq!(data.len(), padded);
-                    match target {
-                        crate::ArchiveVersion::Rar20 => {
-                            assert_eq!(salt, None);
-                            super::Rar20Cipher::new(b"pw")
-                                .decrypt_in_place(&mut data)
-                                .unwrap();
-                        }
-                        crate::ArchiveVersion::Rar30 => {
-                            assert!(salt.is_some());
-                            super::Rar30Cipher::new(b"pw", salt)
-                                .unwrap()
-                                .decrypt_in_place(&mut data)
-                                .unwrap();
-                        }
-                        _ => unreachable!(),
+                    crate::ArchiveVersion::Rar30 => {
+                        assert!(salt.is_some());
+                        super::Rar30Cipher::new(b"pw", salt)
+                            .unwrap()
+                            .decrypt_in_place(&mut data)
+                            .unwrap();
                     }
-                    assert_eq!(&data[..length], plaintext);
-                    assert!(data[length..].iter().all(|&byte| byte == 0));
+                    _ => unreachable!(),
                 }
+                assert_eq!(&data[..length], plaintext);
+                assert!(data[length..].iter().all(|&byte| byte == 0));
             }
         }
     }
