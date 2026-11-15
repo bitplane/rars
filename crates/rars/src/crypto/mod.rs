@@ -51,6 +51,12 @@ pub fn rar50_key_derivations() -> usize {
     rar50::DERIVATIONS.with(std::cell::Cell::get)
 }
 
+/// RAR 1.5–4 AES keys derived on this thread, so bindings can test that calls reuse them.
+#[cfg(feature = "encryption")]
+pub fn rar30_key_derivations() -> usize {
+    rar30::DERIVATIONS.with(std::cell::Cell::get)
+}
+
 /// Refuses encrypted operations when the implementation is omitted.
 pub(crate) fn require_encryption() -> crate::Result<()> {
     if cfg!(feature = "encryption") {

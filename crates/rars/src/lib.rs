@@ -54,6 +54,7 @@ pub mod filter;
 #[cfg(feature = "write")]
 mod filter_search;
 mod io_util;
+mod key_cache;
 mod member;
 mod member_batches;
 pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
@@ -1593,7 +1594,7 @@ impl ArchiveReader {
     fn read_owned_cached(
         input: Vec<u8>,
         options: ArchiveReadOptions<'_>,
-        key_cache: Arc<rar50::Rar50KeyCache>,
+        key_cache: Arc<crate::key_cache::KeyCache>,
     ) -> Result<Archive> {
         options.check_cancelled()?;
         let signature =
@@ -1603,7 +1604,7 @@ impl ArchiveReader {
                 input, options,
             )?)),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
-                rar15_40::Archive::parse_owned_with_options(input, options)?,
+                rar15_40::Archive::parse_owned_cached(input, options, key_cache)?,
             )),
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(rar50::Archive::parse_owned_cached(
                 input, options, key_cache,
@@ -1655,7 +1656,7 @@ impl ArchiveReader {
     fn read_reader_cached<R: Read + std::io::Seek + Send + 'static>(
         reader: R,
         options: ArchiveReadOptions<'_>,
-        key_cache: Arc<rar50::Rar50KeyCache>,
+        key_cache: Arc<crate::key_cache::KeyCache>,
     ) -> Result<Archive> {
         options.check_cancelled()?;
         let reader = crate::source::ReaderSource::new(reader)?;
@@ -1676,13 +1677,16 @@ impl ArchiveReader {
                 source,
                 options,
             )?)),
-            ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(rar15_40::Archive::parse_seekable(
-                cursor,
-                len as u64,
-                signature.offset,
-                source,
-                options,
-            )?)),
+            ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
+                rar15_40::Archive::parse_seekable_cached(
+                    cursor,
+                    len as u64,
+                    signature.offset,
+                    source,
+                    options,
+                    key_cache,
+                )?,
+            )),
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
                 rar50::Archive::parse_file_backed_cached(
                     &mut cursor,
@@ -1707,7 +1711,7 @@ impl ArchiveReader {
     fn read_path_cached(
         path: impl AsRef<Path>,
         options: ArchiveReadOptions<'_>,
-        key_cache: Arc<rar50::Rar50KeyCache>,
+        key_cache: Arc<crate::key_cache::KeyCache>,
     ) -> Result<Archive> {
         options.check_cancelled()?;
         let path = path.as_ref();
@@ -1721,7 +1725,9 @@ impl ArchiveReader {
                 rar13::Archive::parse_path_with_signature_and_options(path, signature, options)?,
             )),
             ArchiveFamily::Rar15To40 => Ok(Archive::Rar15To40(
-                rar15_40::Archive::parse_path_with_signature(path, signature, options)?,
+                rar15_40::Archive::parse_path_with_signature_cached(
+                    path, signature, options, key_cache,
+                )?,
             )),
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
                 rar50::Archive::parse_path_with_signature_cached(
@@ -6537,20 +6543,17 @@ mod key_cache_extraction_tests {
 
     #[test]
     fn cache_distinguishes_passwords_salts_and_kdf_counts() {
-        let cache = rar50::Rar50KeyCache::default();
+        let cache = crate::key_cache::KeyCache::default();
         let before = derivations();
-        let first = cache.get_or_derive(b"password", [1; 16], 0).unwrap();
-        let other_salt = cache.get_or_derive(b"password", [2; 16], 0).unwrap();
-        let other_count = cache.get_or_derive(b"password", [1; 16], 1).unwrap();
-        let other_password = cache.get_or_derive(b"other", [1; 16], 0).unwrap();
+        let first = cache.rar50(b"password", [1; 16], 0).unwrap();
+        let other_salt = cache.rar50(b"password", [2; 16], 0).unwrap();
+        let other_count = cache.rar50(b"password", [1; 16], 1).unwrap();
+        let other_password = cache.rar50(b"other", [1; 16], 0).unwrap();
         assert_ne!(first, other_salt);
         assert_ne!(first, other_count);
         assert_ne!(first, other_password);
-        assert_eq!(first, cache.get_or_derive(b"password", [1; 16], 0).unwrap());
-        assert_eq!(
-            other_password,
-            cache.get_or_derive(b"other", [1; 16], 0).unwrap()
-        );
+        assert_eq!(first, cache.rar50(b"password", [1; 16], 0).unwrap());
+        assert_eq!(other_password, cache.rar50(b"other", [1; 16], 0).unwrap());
         assert_eq!(derivations() - before, 4);
     }
 }

@@ -39,6 +39,15 @@ def test_a_call_password_wins_over_the_open_password(tmp_path, format, compresse
 
 
 @pytest.mark.parametrize("format", FORMATS)
+def test_a_cached_key_never_stands_in_for_another_password(format):
+    archive = rars.RarFile.from_bytes(encrypted(format))
+    assert archive.read("file", password="right") == PAYLOAD
+    with pytest.raises(rars.BadPassword):
+        archive.read("file", password="wrong")
+    assert archive.read("file", password="right") == PAYLOAD
+
+
+@pytest.mark.parametrize("format", FORMATS)
 def test_a_call_password_opens_an_archive_opened_without_one(tmp_path, format):
     archive = rars.RarFile.from_bytes(encrypted(format))
     for call in calls(archive, tmp_path, "right").values():

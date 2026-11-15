@@ -13,6 +13,7 @@ impl<R, B> Reader<R, B> {
         _version: u8,
         _password: &[u8],
         _salt: Option<[u8; 8]>,
+        _key_cache: &crate::key_cache::KeyCache,
         _allowance: &B,
     ) -> Result<Self> {
         Err(Error::FeatureDisabled {
@@ -45,7 +46,14 @@ mod tests {
             }
         }
         let allowance = crate::codec::workspace::Allowance::limited(0);
-        let result = Reader::with_allowance(Unread, 29, b"password", None, &allowance);
+        let result = Reader::with_allowance(
+            Unread,
+            29,
+            b"password",
+            None,
+            &crate::key_cache::KeyCache::default(),
+            &allowance,
+        );
         assert!(matches!(
             result,
             Err(Error::FeatureDisabled {

@@ -10,6 +10,10 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 const HASH_ROUNDS: u32 = 0x40000;
 
+thread_local! {
+    pub(crate) static DERIVATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, ZeroizeOnDrop)]
 pub struct Rar30Cipher {
     cipher: Aes128,
@@ -18,6 +22,7 @@ pub struct Rar30Cipher {
 
 impl Rar30Cipher {
     pub fn new(password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
+        DERIVATIONS.with(|count| count.set(count.get() + 1));
         let (mut key, iv) = derive_key_iv(password, salt)?;
         let cipher = Aes128::new(&key.into());
         key.zeroize();

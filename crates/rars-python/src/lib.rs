@@ -4083,6 +4083,111 @@ mod tests {
         });
     }
 
+    fn rar300(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../rars/tests/fixtures/rar15_40/rar300")
+            .join(name)
+    }
+
+    #[test]
+    fn listing_a_header_encrypted_rar3_set_derives_its_key_once() {
+        Python::initialize();
+        Python::attach(|py| {
+            let options = one_thread(py);
+            for first in [
+                "header_encrypted_multivol_rar300.rar",
+                "header_encrypted_newnaming_rar300.part01.rar",
+            ] {
+                let before = rars_rs::crypto::rar30_key_derivations();
+                let file = RarFile::from_path(
+                    py,
+                    rar300(first),
+                    Some(b"password".to_vec()),
+                    Some(&options),
+                )
+                .unwrap();
+                assert!(!file.namelist(py).unwrap().is_empty(), "{first}");
+                assert_eq!(
+                    rars_rs::crypto::rar30_key_derivations() - before,
+                    1,
+                    "{first}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn extracting_a_header_encrypted_rar3_set_derives_each_key_once() {
+        Python::initialize();
+        let out = std::env::temp_dir().join(format!("rars-rar3-hp-{}", std::process::id()));
+        Python::attach(|py| {
+            let options = one_thread(py);
+            let before = rars_rs::crypto::rar30_key_derivations();
+            let file = RarFile::from_path(
+                py,
+                rar300("header_encrypted_multivol_rar300.rar"),
+                Some(b"password".to_vec()),
+                Some(&options),
+            )
+            .unwrap();
+            for _ in 0..2 {
+                file.extractall(
+                    py,
+                    Some(out.clone()),
+                    None,
+                    None,
+                    Overwrite(OverwritePolicy::Always),
+                    Some(&options),
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+            }
+            // The headers and the member carry different salts.
+            assert_eq!(rars_rs::crypto::rar30_key_derivations() - before, 2);
+        });
+        fs::remove_dir_all(out).unwrap();
+    }
+
+    #[test]
+    fn a_rarfile_derives_each_rar3_key_once_however_many_calls_follow() {
+        Python::initialize();
+        let out = std::env::temp_dir().join(format!("rars-rar3-key-reuse-{}", std::process::id()));
+        Python::attach(|py| {
+            let options = one_thread(py);
+            let before = rars_rs::crypto::rar30_key_derivations();
+            let file = RarFile::from_path(
+                py,
+                rar300("encrypted_multivol_rar300.rar"),
+                Some(b"password".to_vec()),
+                Some(&options),
+            )
+            .unwrap();
+            let first = PyString::new(py, &file.first.infos[0].filename);
+            for _ in 0..2 {
+                file.testrar(py, None, Some(&options), None).unwrap();
+                file.read(py, &first, None, Some(&options), None).unwrap();
+                file.extract(
+                    py,
+                    &first,
+                    Some(out.clone()),
+                    None,
+                    Overwrite(OverwritePolicy::Always),
+                    Some(&options),
+                    None,
+                    true,
+                    false,
+                    false,
+                )
+                .unwrap();
+            }
+            assert_eq!(rars_rs::crypto::rar30_key_derivations() - before, 1);
+        });
+        fs::remove_dir_all(out).unwrap();
+    }
+
     #[test]
     fn binding_preserves_rar5_member_solid_flags() {
         for version in [

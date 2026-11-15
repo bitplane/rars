@@ -330,6 +330,7 @@ impl<B: Budget> SplitCipher<B> {
         unp_ver: u8,
         password: &[u8],
         salt: Option<[u8; 8]>,
+        key_cache: &KeyCache,
         allowance: &B,
     ) -> Result<Self> {
         if unp_ver == 15 {
@@ -343,7 +344,7 @@ impl<B: Budget> SplitCipher<B> {
         }
         if unp_ver >= 29 {
             return Ok(Self::Rar30(Boxed::try_new(
-                || Rar30Cipher::new(password, salt).map_err(super::map_rar30_crypto_error),
+                || key_cache.rar30(password, salt),
                 allowance,
             )?));
         }
@@ -387,9 +388,10 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
         unp_ver: u8,
         password: &[u8],
         salt: Option<[u8; 8]>,
+        key_cache: &KeyCache,
         allowance: &B,
     ) -> Result<Self> {
-        let cipher = SplitCipher::with_allowance(unp_ver, password, salt, allowance)?;
+        let cipher = SplitCipher::with_allowance(unp_ver, password, salt, key_cache, allowance)?;
         let read_buffer = matches!(cipher, SplitCipher::Rar15(_))
             .then(|| Buffer::filled(64 * 1024, 0, allowance))
             .transpose()?;
@@ -514,7 +516,13 @@ impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
 #[cfg(feature = "encryption")]
 impl SplitCipher<Allowance> {
     fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
-        Self::with_allowance(unp_ver, password, salt, &Allowance::default())
+        Self::with_allowance(
+            unp_ver,
+            password,
+            salt,
+            &KeyCache::default(),
+            &Allowance::default(),
+        )
     }
 }
 #[cfg(all(test, feature = "write"))]
@@ -526,7 +534,14 @@ impl<R: Read> DecryptingReader<R, Allowance> {
         password: &[u8],
         salt: Option<[u8; 8]>,
     ) -> Result<Self> {
-        Self::with_allowance(inner, unp_ver, password, salt, &Allowance::default())
+        Self::with_allowance(
+            inner,
+            unp_ver,
+            password,
+            salt,
+            &KeyCache::default(),
+            &Allowance::default(),
+        )
     }
 }
 #[cfg(all(test, feature = "write"))]
@@ -648,8 +663,14 @@ mod tests {
             }
             let run = |budget: &RefusingBudget| -> Result<()> {
                 let input = ChunkedReader::new(Cursor::new(&encrypted), 7);
-                let mut reader =
-                    DecryptingReader::with_allowance(input, version, b"pw", None, budget)?;
+                let mut reader = DecryptingReader::with_allowance(
+                    input,
+                    version,
+                    b"pw",
+                    None,
+                    &KeyCache::default(),
+                    budget,
+                )?;
                 let mut out = Buffer::new(budget);
                 out.read_to_end(&mut reader)?;
                 assert_eq!(&out[..], &plain);
@@ -1035,6 +1056,7 @@ mod tests {
 
     fn empty_archive() -> Archive {
         Archive {
+            key_cache: Arc::default(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1057,6 +1079,7 @@ mod tests {
 
     fn archive_with_source(blocks: Vec<Block>, source: Vec<u8>) -> Archive {
         Archive {
+            key_cache: Arc::default(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1236,6 +1259,7 @@ mod tests {
         empty.method = 0x33;
         empty.file_crc = 0;
         let archive = Archive {
+            key_cache: Arc::default(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1390,7 +1414,13 @@ mod tests {
                 .source
                 .owned_range_reader(first.packed_range.clone())?;
             let chain = crate::volume_extract::LazyChain::new(walk, reader);
-            let reader = volumes::packed_reader(chain, first, password, &Allowance::default())?;
+            let reader = volumes::packed_reader(
+                chain,
+                first,
+                password,
+                &volume.key_cache,
+                &Allowance::default(),
+            )?;
             Ok(read_in_small_chunks(reader))
         })
         .unwrap()
