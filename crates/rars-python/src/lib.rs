@@ -542,36 +542,41 @@ impl RarFile {
         Ok(self.infos[self.resolve_index(name)?].clone())
     }
 
-    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    /// `volumes` works as in `extractall`, for a member that continues into later volumes.
+    #[pyo3(signature = (name, pwd = None, *, options = None, volumes = None))]
     fn read(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(name)?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| {
-            self.archive.read_member_at_with_options(
-                index,
-                self.extraction_options(options, password.as_deref()),
-            )
-        })
-        .map_err(map_error)?
-        .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
+        let options = self.extraction_options(options, password.as_deref());
+        let data = if self.needs_later_volumes(index) {
+            self.read_from_set(py, volumes, options, &[index])?
+                .pop()
+                .flatten()
+        } else {
+            py.detach(|| self.archive.read_member_at_with_options(index, options))
+                .map_err(map_error)?
+        };
+        data.ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
-    #[pyo3(signature = (name, pwd = None, *, options = None))]
+    #[pyo3(signature = (name, pwd = None, *, options = None, volumes = None))]
     fn open(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let data = self.read(py, name, pwd, options)?;
+        let data = self.read(py, name, pwd, options, volumes)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -579,13 +584,14 @@ impl RarFile {
 
     /// Read selected members in one session, preserving request order and duplicates.
     /// Output limits apply to the whole call, including required solid predecessors.
-    #[pyo3(signature = (members, pwd = None, *, options = None))]
+    #[pyo3(signature = (members, pwd = None, *, options = None, volumes = None))]
     fn read_many(
         &self,
         py: Python<'_>,
         members: &Bound<'_, PyAny>,
         pwd: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
         check_read_options_cancellation(options)?;
         let indices = members
@@ -593,21 +599,20 @@ impl RarFile {
             .map(|member| self.resolve_index(&member?))
             .collect::<PyResult<Vec<_>>>()?;
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        let data = py
-            .detach(|| {
-                self.archive.read_members_at_with_options(
-                    &indices,
-                    self.extraction_options(options, password.as_deref()),
-                )
-            })
-            .map_err(map_error)?;
+        let options = self.extraction_options(options, password.as_deref());
+        let data = if indices.iter().any(|&index| self.needs_later_volumes(index)) {
+            self.read_from_set(py, volumes, options, &indices)?
+        } else {
+            py.detach(|| self.archive.read_members_at_with_options(&indices, options))
+                .map_err(map_error)?
+        };
         data.into_iter()
             .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
             .collect()
     }
 
-    /// `overwrite`, `in_place` and `flatten` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, pwd = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, restore_times = true, in_place = false, flatten = false))]
+    /// `overwrite`, `in_place`, `flatten` and `volumes` work as in `extractall`.
+    #[pyo3(signature = (member, path = None, pwd = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -617,6 +622,7 @@ impl RarFile {
         pwd: Option<&Bound<'_, PyAny>>,
         overwrite: Overwrite,
         options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
         in_place: bool,
         flatten: bool,
@@ -626,22 +632,26 @@ impl RarFile {
         let target = self.resolve_index(member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(pwd)?.or_else(|| self.password.clone());
-        let extracted = py
-            .detach(|| {
-                extract_archive(
-                    &self.archive,
-                    Some(&target),
-                    &out_dir,
-                    self.extraction_options(options, password.as_deref()),
-                    OutputMode {
-                        overwrite,
-                        in_place,
-                        restore_times,
-                        flatten,
-                    },
-                )
-            })
-            .map_err(map_error)?;
+        let options = self.extraction_options(options, password.as_deref());
+        let mode = OutputMode {
+            overwrite,
+            in_place,
+            restore_times,
+            flatten,
+        };
+        let extracted = if self.needs_later_volumes(target) {
+            self.extract_from_set(
+                py,
+                volumes,
+                options,
+                Some(&HashSet::from([target])),
+                &out_dir,
+                mode,
+            )?
+        } else {
+            py.detach(|| extract_archive(&self.archive, Some(&target), &out_dir, options, mode))
+                .map_err(map_error)?
+        };
         extracted
             .warn(py)?
             .into_iter()
@@ -649,8 +659,9 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err("member has no extractable payload"))
     }
 
-    /// On a volume set, extracts the whole set. Without `volumes`, a set opened
-    /// from a path finds its later volumes by name beside it.
+    /// On a volume set, extracts the whole set, or with `members` reads only as far
+    /// as they reach. Without `volumes`, a set opened from a path finds its later
+    /// volumes by name beside it.
     ///
     /// `volumes` yields the volumes after this one, in order: bytes-like objects
     /// are archive data, `str` or `PathLike` are paths. Each is pulled when needed, so a
@@ -692,55 +703,42 @@ impl RarFile {
             flatten,
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
-        if volumes.is_some() && members.is_some() {
-            return Err(PyValueError::new_err(
-                "members cannot be combined with volumes",
-            ));
-        }
-        if volumes.is_some() || (members.is_none() && self.archive.is_volume()) {
-            let password = py_password(pwd)?.or_else(|| self.password.clone());
-            let options = self.extraction_options(options, password.as_deref());
-            let first = &self.archive;
+        let password = py_password(pwd)?.or_else(|| self.password.clone());
+        let options = self.extraction_options(options, password.as_deref());
+        let Some(members) = members else {
+            if volumes.is_none() && !self.archive.is_volume() {
+                return py
+                    .detach(|| {
+                        extract_archive::<HashSet<usize>>(
+                            &self.archive,
+                            None,
+                            &out_dir,
+                            options,
+                            mode,
+                        )
+                    })
+                    .map_err(map_error)?
+                    .warn(py);
+            }
             return self
-                .extract_set(py, volumes, options, |volumes| {
-                    let outputs = std::cell::RefCell::new(ExtractOutputs::new(
-                        &out_dir,
-                        first.family(),
-                        options,
-                        mode,
-                    ));
-                    let result = rars_rs::output_links::extract_arriving_with_links(
-                        first,
-                        volumes,
-                        options,
-                        |meta| outputs.borrow_mut().open(meta),
-                        |meta, link| outputs.borrow_mut().link(meta, link),
-                    );
-                    outputs.into_inner().finish(result)
-                })?
+                .extract_from_set(py, volumes, options, None, &out_dir, mode)?
+                .warn(py);
+        };
+        let selected = members
+            .try_iter()?
+            .map(|member| self.resolve_index(&member?))
+            .collect::<PyResult<HashSet<usize>>>()?;
+        if selected
+            .iter()
+            .any(|&index| self.needs_later_volumes(index))
+        {
+            return self
+                .extract_from_set(py, volumes, options, Some(&selected), &out_dir, mode)?
                 .warn(py);
         }
-        let selected = match members {
-            Some(members) => Some(
-                members
-                    .try_iter()?
-                    .map(|member| self.resolve_index(&member?))
-                    .collect::<PyResult<HashSet<usize>>>()?,
-            ),
-            None => None,
-        };
-        let password = py_password(pwd)?.or_else(|| self.password.clone());
-        py.detach(|| {
-            extract_archive(
-                &self.archive,
-                selected.as_ref(),
-                &out_dir,
-                self.extraction_options(options, password.as_deref()),
-                mode,
-            )
-        })
-        .map_err(map_error)?
-        .warn(py)
+        py.detach(|| extract_archive(&self.archive, Some(&selected), &out_dir, options, mode))
+            .map_err(map_error)?
+            .warn(py)
     }
 
     /// `volumes` works as in `extractall`.
@@ -979,6 +977,92 @@ impl RarFile {
         })
     }
 
+    /// Only the first volume's last member can continue, and reading it needs the set.
+    fn needs_later_volumes(&self, index: usize) -> bool {
+        self.infos[index].is_split_after
+    }
+
+    /// One pass over the set, so solid history and split members decode once.
+    fn extract_from_set(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        selected: Option<&HashSet<usize>>,
+        out_dir: &Path,
+        mode: OutputMode,
+    ) -> PyResult<Extracted> {
+        let first = &self.archive;
+        self.extract_set(py, volumes, options, |volumes| {
+            let outputs = std::cell::RefCell::new(ExtractOutputs::new(
+                out_dir,
+                first.family(),
+                options,
+                mode,
+            ));
+            let open = |meta: &rars_rs::ExtractedEntryMeta| outputs.borrow_mut().open(meta);
+            let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
+                outputs.borrow_mut().link(meta, link)
+            };
+            let result = match selected {
+                Some(selected) => extract_arriving_selected(
+                    first,
+                    volumes,
+                    options,
+                    selected,
+                    |_, meta| open(meta),
+                    link,
+                ),
+                None => rars_rs::output_links::extract_arriving_with_links(
+                    first, volumes, options, open, link,
+                ),
+            };
+            outputs.into_inner().finish(result)
+        })
+    }
+
+    /// One pass over the set, so solid history and split members decode once.
+    fn read_from_set(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        indices: &[usize],
+    ) -> PyResult<Vec<Option<Vec<u8>>>> {
+        let selected: HashSet<usize> = indices.iter().copied().collect();
+        let buffers = Mutex::new(HashMap::new());
+        let first = &self.archive;
+        self.extract_set(py, volumes, options, |volumes| {
+            extract_arriving_selected(
+                first,
+                volumes,
+                options,
+                &selected,
+                |index, meta| {
+                    if meta.is_directory {
+                        return Ok(Box::new(io::sink()));
+                    }
+                    let buffer = Arc::new(Mutex::new(Vec::new()));
+                    buffers
+                        .lock()
+                        .expect("read buffers lock poisoned")
+                        .insert(index, Arc::clone(&buffer));
+                    Ok(Box::new(SharedBuffer(buffer)))
+                },
+                |_, _| Ok(()),
+            )
+        })?;
+        let buffers = buffers.into_inner().expect("read buffers lock poisoned");
+        Ok(indices
+            .iter()
+            .map(|index| {
+                buffers
+                    .get(index)
+                    .map(|buffer| buffer.lock().expect("read buffer lock poisoned").clone())
+            })
+            .collect())
+    }
+
     fn resolve_index(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
         if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
             if !info
@@ -1002,7 +1086,7 @@ impl RarFile {
                     Some(None) => Err(PyValueError::new_err(
                         "ambiguous decoded name; select an entry by its RarInfo or original bytes",
                     )),
-                    None => Err(PyKeyError::new_err(text)),
+                    None => Err(self.not_found(text)),
                 };
             }
         }
@@ -1023,7 +1107,17 @@ impl RarFile {
             .raw
             .get(name.as_slice())
             .copied()
-            .ok_or_else(|| PyKeyError::new_err(String::from_utf8_lossy(&name).into_owned()))
+            .ok_or_else(|| self.not_found(String::from_utf8_lossy(&name).into_owned()))
+    }
+
+    /// Names are listed from the first volume only, so a set's later members are not found.
+    fn not_found(&self, name: String) -> PyErr {
+        if !self.archive.is_volume() {
+            return PyKeyError::new_err(name);
+        }
+        PyKeyError::new_err(format!(
+            "{name} is not in the first volume; members that start in a later volume cannot be selected yet"
+        ))
     }
 
     fn extraction_options<'a>(
@@ -2681,6 +2775,83 @@ fn extract_selected<S: Selection>(
     Ok(())
 }
 
+/// Stops once the last selected member is verified, so a generator isn't asked for volumes nobody needs.
+fn extract_arriving_selected(
+    first: &rars_rs::Archive,
+    volumes: &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+    options: rars_rs::ArchiveReadOptions<'_>,
+    selected: &HashSet<usize>,
+    mut open: impl FnMut(usize, &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>>,
+    mut link: impl FnMut(&rars_rs::ExtractedEntryMeta, ExtractedLink<'_>) -> rars_rs::Result<()>,
+) -> rars_rs::Result<()> {
+    let last = selected.iter().copied().max().unwrap_or_default();
+    let last_name = first
+        .member_refs()
+        .nth(last)
+        .map(|member| member.name_bytes().to_vec());
+    let finished = AtomicBool::new(false);
+    let mut last_volume_seen = false;
+    let volumes = std::iter::from_fn(|| {
+        // Asking past the volume where the last selected member ends means it has been verified.
+        if last_volume_seen {
+            finished.store(true, Ordering::Relaxed);
+            return None;
+        }
+        let volume = volumes.next()?;
+        last_volume_seen = volume.as_ref().is_ok_and(|volume| {
+            volume
+                .members()
+                .next()
+                .is_some_and(|member| !member.meta.is_split_after)
+        });
+        Some(volume)
+    });
+    // The extractor calls `open` or `link` once per member, in archive order.
+    let next = std::cell::Cell::new(0);
+    let advance = || {
+        let index = next.get();
+        next.set(index + 1);
+        if index > last {
+            // The extractor asks for a later member only once the earlier ones are verified.
+            finished.store(true, Ordering::Relaxed);
+            return Err(rars_rs::Error::InvalidArgument("selection is complete"));
+        }
+        Ok(index)
+    };
+    let result = rars_rs::output_links::extract_arriving_with_links(
+        first,
+        volumes,
+        options,
+        |meta| {
+            let index = advance()?;
+            if selected.contains(&index) {
+                open(index, meta)
+            } else {
+                Ok(Box::new(io::sink()))
+            }
+        },
+        |meta, target| {
+            if selected.contains(&advance()?) {
+                link(meta, target)
+            } else {
+                Ok(())
+            }
+        },
+    );
+    match result {
+        _ if finished.load(Ordering::Relaxed) => Ok(()),
+        // A later member's admission checks run before it is opened, once the last selected one is verified.
+        Err(error)
+            if next.get() > last
+                && failed_entry_name(&error)
+                    .is_some_and(|name| Some(name) != last_name.as_deref()) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
+}
+
 fn extracted_meta(member: &rars_rs::ArchiveMember) -> rars_rs::ExtractedEntryMeta {
     let meta = &member.meta;
     let mut extracted = rars_rs::ExtractedEntryMeta::new(
@@ -3230,7 +3401,7 @@ mod tests {
                 });
                 let name = PyBytes::new(py, b"file");
                 let error = file
-                    .read(py, name.as_any(), None, Some(&options))
+                    .read(py, name.as_any(), None, Some(&options), None)
                     .unwrap_err();
                 py.detach(|| worker.join().unwrap());
                 assert!(
@@ -3238,7 +3409,7 @@ mod tests {
                     "{format}: {error}"
                 );
                 assert_eq!(
-                    file.read(py, name.as_any(), None, None).unwrap(),
+                    file.read(py, name.as_any(), None, None, None).unwrap(),
                     b"payload"
                 );
             }
