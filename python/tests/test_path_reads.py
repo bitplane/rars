@@ -20,7 +20,8 @@ PEAK_RSS = textwrap.dedent("""
         return rss if sys.platform == "darwin" else rss * 1024
 
     before = peak()
-    archive = rars.RarFile(sys.argv[1])
+    source = open(sys.argv[1], "rb") if sys.argv[3] == "file" else sys.argv[1]
+    archive = rars.RarFile(source)
     opened = peak()
     archive.extractall(sys.argv[2])
     print(opened - before, peak() - opened)
@@ -29,7 +30,8 @@ PEAK_RSS = textwrap.dedent("""
 
 @pytest.mark.skipif(sys.platform == "win32", reason="resource module is POSIX-only")
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
-def test_path_open_and_extract_do_not_hold_the_archive_in_memory(tmp_path, format):
+@pytest.mark.parametrize("source", ["path", "file"])
+def test_open_and_extract_do_not_hold_the_archive_in_memory(tmp_path, format, source):
     builder = rars.RarBuilder(format=format, store=True)
     for index in range(MEMBERS):
         builder.add_bytes(os.urandom(MEMBER_BYTES), f"member{index}")
@@ -38,7 +40,7 @@ def test_path_open_and_extract_do_not_hold_the_archive_in_memory(tmp_path, forma
     del builder
     output = tmp_path / "out"
     opening, extracting = map(int, subprocess.run(
-        [sys.executable, "-c", PEAK_RSS, str(archive), str(output)],
+        [sys.executable, "-c", PEAK_RSS, str(archive), str(output), source],
         check=True, capture_output=True, text=True,
     ).stdout.split())
     assert sum(path.stat().st_size for path in output.iterdir()) == ARCHIVE_BYTES

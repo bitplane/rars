@@ -719,7 +719,7 @@ impl Archive {
         )
     }
 
-    fn parse_file_backed_cached(
+    pub(crate) fn parse_file_backed_cached(
         file: &mut (impl Read + std::io::Seek),
         archive_len: usize,
         sfx_offset: usize,

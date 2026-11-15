@@ -450,7 +450,7 @@ impl RarInfo {
 }
 
 /// An archive opened from a bytes-like object (`bytes`, `bytearray`, `memoryview`,
-/// `mmap`...) or a path (`str` or `PathLike`).
+/// `mmap`...), a path (`str` or `PathLike`) or a binary file object.
 #[pyclass(module = "rars")]
 struct RarFile {
     identity: Arc<()>,
@@ -540,7 +540,9 @@ impl MemberNames {
 
 #[pymethods]
 impl RarFile {
-    /// A path is read on demand, so the file must stay unchanged while the archive is open.
+    /// A path or seekable file object is read on demand from its start, so it must stay
+    /// open and unchanged while the archive is, and its position is left wherever reading
+    /// ended; a stream that can't seek is read whole from where it is.
     #[new]
     #[pyo3(signature = (source, mode = "r", password = None, *, options = None, first_volume_only = false, volumes = None))]
     fn new(
@@ -558,10 +560,17 @@ impl RarFile {
             ));
         }
         let password = py_password(password)?;
-        let volumes = stored_volumes(volumes)?;
-        let file = match py_bytes_like(source)? {
-            Some(bytes) => Self::from_bytes(py, bytes, password, options)?,
-            None => Self::from_path(py, py_path_buf(py, source)?, password, options)?,
+        let volumes = stored_volumes(
+            volumes,
+            options.and_then(|options| options.cancellation.as_ref()),
+        )?;
+        let cancellation = options.and_then(|options| options.cancellation.as_ref());
+        let file = match archive_input(source, cancellation)? {
+            ArchiveInput::Bytes(bytes) => Self::from_bytes(py, bytes, password, options)?,
+            ArchiveInput::Path(path) => Self::from_path(py, path, password, options)?,
+            ArchiveInput::Reader(reader) => Self::parse(py, password, options, |options| {
+                rars_rs::ArchiveReader::read_reader_with_options(reader, options)
+            })?,
         };
         Ok(file.with_set(first_volume_only, volumes))
     }
@@ -577,7 +586,10 @@ impl RarFile {
         first_volume_only: bool,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        let volumes = stored_volumes(volumes)?;
+        let volumes = stored_volumes(
+            volumes,
+            options.and_then(|options| options.cancellation.as_ref()),
+        )?;
         let file = Self::from_bytes(
             py,
             py_required_bytes(data)?,
@@ -733,7 +745,8 @@ impl RarFile {
     /// volumes by name beside it.
     ///
     /// `volumes` yields the volumes after this one, in order: bytes-like objects
-    /// are archive data, `str` or `PathLike` are paths. Each is pulled when needed, so a
+    /// are archive data, `str` or `PathLike` are paths, and binary file objects are
+    /// read as `RarFile` reads them. Each is pulled when needed, so a
     /// generator may wait for downloads. If the last volume isn't marked as last
     /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
     /// more and must stop, not wait.
@@ -960,7 +973,7 @@ impl RarFile {
     fn volume_paths(&self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
         let Some(first_path) = &self.path else {
             return Err(PyValueError::new_err(
-                "an archive opened from bytes has no volume paths",
+                "an archive opened from bytes or a file object has no volume paths",
             ));
         };
         if !self.archive.is_volume() {
@@ -985,7 +998,7 @@ impl RarFile {
                     .volume_path(first_path, index)
                     .filter(|path| path.is_file());
                 paths.extend(path.clone());
-                Ok(path.map(VolumeSource::Path))
+                Ok(path.map(ArchiveInput::Path))
             },
             |volumes| {
                 let mut readable = 1;
@@ -1090,13 +1103,7 @@ impl RarFile {
                         let Some(volume) = iterator.bind(py).clone().next() else {
                             return Ok(None);
                         };
-                        let volume = volume?;
-                        if let Some(bytes) = py_bytes_like(&volume)? {
-                            return Ok(Some(VolumeSource::Bytes(bytes)));
-                        }
-                        Ok(Some(VolumeSource::Path(std::path::absolute(py_path_buf(
-                            py, &volume,
-                        )?)?)))
+                        Ok(Some(archive_input(&volume?, options.cancellation)?))
                     })
                 },
                 run,
@@ -1119,7 +1126,7 @@ impl RarFile {
                 if asked {
                     map_error_with(
                         error,
-                        "; an archive opened from bytes cannot find its later volumes, so pass them as volumes=",
+                        "; an archive opened from bytes or a file object cannot find its later volumes, so pass them as volumes=",
                     )
                 } else {
                     map_error(error)
@@ -1139,7 +1146,7 @@ impl RarFile {
                     missing = Some(path.clone());
                     return Ok(None);
                 }
-                Ok(path.map(VolumeSource::Path))
+                Ok(path.map(ArchiveInput::Path))
             },
             run,
         )?;
@@ -1387,7 +1394,7 @@ impl RarFile {
             return PyKeyError::new_err(name);
         }
         PyKeyError::new_err(format!(
-            "{name} is not in the first volume; an archive opened from bytes lists its later volumes only when given them as volumes="
+            "{name} is not in the first volume; an archive opened from bytes or a file object lists its later volumes only when given them as volumes="
         ))
     }
 
@@ -1678,7 +1685,7 @@ impl RarBuilder {
     /// and modification/creation/access times are copied in both modes.
     /// For an existing RarFile, its configured password is used. Preservation
     /// reuses it for encrypted output; conversion removes encryption.
-    /// Input files must remain available and unchanged until writing completes.
+    /// Input files, and a file object `source`, must remain open and unchanged until writing completes.
     #[staticmethod]
     /// Payload staging happens afresh during each write. staging_dir defaults
     /// to the output directory (current directory for to_bytes); max_staged_bytes
@@ -1720,9 +1727,9 @@ impl RarBuilder {
                 )));
             }
         }
-        let comments = archive
-            .archive
-            .member_comments(password.as_deref())
+        // Releases the GIL, which a file-object source takes from inside its lock.
+        let comments = py
+            .detach(|| archive.archive.member_comments(password.as_deref()))
             .map_err(map_error)?;
         let inner = if preserve {
             archive
@@ -1749,9 +1756,8 @@ impl RarBuilder {
             }),
         };
         let comment_encryption = archive.archive.member_comment_encryption();
-        let legacy_links = archive
-            .archive
-            .legacy_symlink_targets(password.as_deref())
+        let legacy_links = py
+            .detach(|| archive.archive.legacy_symlink_targets(password.as_deref()))
             .map_err(map_error)?;
         for (((member_index, member), comment), legacy_link) in archive
             .archive
@@ -2259,17 +2265,24 @@ fn py_input_bytes_with_cancellation(
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<Vec<u8>> {
     check_python_cancellation(cancellation)?;
-    if let Some(bytes) = py_bytes_like(source)? {
-        check_python_cancellation(cancellation)?;
-        return Ok(bytes);
-    }
-    let path = py_path_buf(py, source)?;
+    let path = match archive_input(source, cancellation.map(|token| &token.inner))? {
+        ArchiveInput::Bytes(bytes) => {
+            check_python_cancellation(cancellation)?;
+            return Ok(bytes);
+        }
+        ArchiveInput::Reader(PyFileReader(file)) => {
+            let file = file.bind(py);
+            file.call_method1("seek", (0,))?;
+            return py_read_to_end(file, cancellation.map(|token| &token.inner));
+        }
+        ArchiveInput::Path(path) => path,
+    };
     py.detach(|| {
         use std::io::Read;
         check_python_cancellation(cancellation)?;
         let mut file = fs::File::open(path).map_err(map_io_error)?;
         let mut bytes = Vec::new();
-        let mut buffer = [0u8; 64 * 1024];
+        let mut buffer = [0u8; READ_CHUNK];
         loop {
             check_python_cancellation(cancellation)?;
             let count = match file.read(&mut buffer) {
@@ -2522,10 +2535,7 @@ fn py_required_bytes(value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
     py_bytes_like(value)?.ok_or_else(|| {
         PyTypeError::new_err(format!(
             "expected a bytes-like object, not {}",
-            value
-                .get_type()
-                .name()
-                .map_or_else(|_| "?".into(), |name| name.to_string())
+            type_name(value)
         ))
     })
 }
@@ -2534,6 +2544,182 @@ fn py_path_buf(py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<PathBuf> {
     let os = py.import("os")?;
     let path = os.call_method1("fspath", (value,))?;
     path.extract::<PathBuf>()
+}
+
+/// An archive given as data, a path or a file object; a stream that can't seek arrives as data.
+fn archive_input(
+    value: &Bound<'_, PyAny>,
+    cancellation: Option<&rars_rs::ReadCancellation>,
+) -> PyResult<ArchiveInput> {
+    let py = value.py();
+    if let Some(bytes) = py_bytes_like(value)? {
+        refuse_bytes_path(value, &bytes)?;
+        return Ok(ArchiveInput::Bytes(bytes));
+    }
+    if let Some(input) = py_file_input(value, cancellation)? {
+        return Ok(input);
+    }
+    if value.is_instance_of::<PyString>() || value.hasattr("__fspath__")? {
+        return Ok(ArchiveInput::Path(std::path::absolute(py_path_buf(
+            py, value,
+        )?)?));
+    }
+    Err(PyTypeError::new_err(format!(
+        "expected archive data (a bytes-like object), a path (str or os.PathLike) or a binary file object, not {}",
+        type_name(value)
+    )))
+}
+
+/// A binary file object, read on demand when it can seek and whole otherwise; None for anything else.
+fn py_file_input(
+    value: &Bound<'_, PyAny>,
+    cancellation: Option<&rars_rs::ReadCancellation>,
+) -> PyResult<Option<ArchiveInput>> {
+    if !is_file_object(value)? {
+        return Ok(None);
+    }
+    refuse_text_mode(value)?;
+    if is_seekable(value)? {
+        return Ok(Some(ArchiveInput::Reader(PyFileReader(
+            value.clone().unbind(),
+        ))));
+    }
+    Ok(Some(ArchiveInput::Bytes(py_read_to_end(
+        value,
+        cancellation,
+    )?)))
+}
+
+fn refuse_text_mode(file: &Bound<'_, PyAny>) -> PyResult<()> {
+    if file
+        .call_method1("read", (0,))?
+        .is_instance_of::<PyString>()
+    {
+        return Err(PyTypeError::new_err(
+            "the file object is in text mode; open the archive with mode \"rb\"",
+        ));
+    }
+    Ok(())
+}
+
+fn is_seekable(file: &Bound<'_, PyAny>) -> PyResult<bool> {
+    match file.getattr("seekable") {
+        Ok(seekable) => seekable.call0()?.is_truthy(),
+        Err(_) => Ok(false),
+    }
+}
+
+/// `mmap` has `read` too, but it is archive data.
+fn is_file_object(value: &Bound<'_, PyAny>) -> PyResult<bool> {
+    if value.is_instance_of::<PyString>()
+        || value.hasattr("__fspath__")?
+        || !value.hasattr("read")?
+    {
+        return Ok(false);
+    }
+    let py = value.py();
+    match py
+        .import("builtins")?
+        .getattr("memoryview")?
+        .call1((value,))
+    {
+        Ok(_) => Ok(false),
+        Err(error) if error.is_instance_of::<PyTypeError>(py) => Ok(true),
+        Err(error) => Err(error),
+    }
+}
+
+/// Bytes stay archive data, but a short value that names a file was meant as a path.
+fn refuse_bytes_path(value: &Bound<'_, PyAny>, bytes: &[u8]) -> PyResult<()> {
+    const SIGNATURES: [&[u8]; 2] = [b"Rar!", b"RE~^"];
+    // Longer than any path a file system accepts.
+    const LONGEST_PATH: usize = 4096;
+    if bytes.len() > LONGEST_PATH
+        || SIGNATURES
+            .iter()
+            .any(|signature| bytes.starts_with(signature))
+    {
+        return Ok(());
+    }
+    let py = value.py();
+    let names_file = py
+        .import("os.path")?
+        .call_method1("isfile", (PyBytes::new(py, bytes),))
+        .and_then(|found| found.is_truthy())
+        .unwrap_or(false);
+    if !names_file {
+        return Ok(());
+    }
+    Err(PyTypeError::new_err(format!(
+        "bytes are archive data, not a path; {} names a file, so pass it as str or os.PathLike",
+        PyBytes::new(py, bytes).repr()?
+    )))
+}
+
+const READ_CHUNK: usize = 64 * 1024;
+
+fn py_read_to_end(
+    file: &Bound<'_, PyAny>,
+    cancellation: Option<&rars_rs::ReadCancellation>,
+) -> PyResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    loop {
+        if cancellation.is_some_and(rars_rs::ReadCancellation::is_cancelled) {
+            return Err(map_error(rars_rs::Error::Cancelled));
+        }
+        let chunk = file.call_method1("read", (READ_CHUNK,))?;
+        let chunk = py_required_bytes(&chunk)?;
+        if chunk.is_empty() {
+            return Ok(bytes);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+}
+
+/// Decoding threads read through this, so each call takes the GIL.
+struct PyFileReader(Py<PyAny>);
+
+impl io::Read for PyFileReader {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        Python::attach(|py| {
+            let chunk = self.0.bind(py).call_method1("read", (buffer.len(),))?;
+            let chunk = py_required_bytes(&chunk)?;
+            if chunk.len() > buffer.len() {
+                return Err(PyValueError::new_err(format!(
+                    "file object read returned {} bytes when asked for {}",
+                    chunk.len(),
+                    buffer.len()
+                )));
+            }
+            buffer[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        })
+        .map_err(io::Error::other)
+    }
+}
+
+impl io::Seek for PyFileReader {
+    fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+        let (offset, whence) = match from {
+            io::SeekFrom::Start(offset) => (offset as i128, 0),
+            io::SeekFrom::Current(offset) => (offset as i128, 1),
+            io::SeekFrom::End(offset) => (offset as i128, 2),
+        };
+        Python::attach(|py| {
+            self.0
+                .bind(py)
+                .call_method1("seek", (offset, whence))?
+                .extract::<u64>()
+        })
+        .map_err(io::Error::other)
+    }
+}
+
+fn type_name(value: &Bound<'_, PyAny>) -> String {
+    value
+        .get_type()
+        .name()
+        .map_or_else(|_| "?".into(), |name| name.to_string())
 }
 
 fn py_password(value: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Vec<u8>>> {
@@ -3269,7 +3455,7 @@ fn with_volume_sources<T: Send>(
     py: Python<'_>,
     first: &rars_rs::Archive,
     options: rars_rs::ArchiveReadOptions<'_>,
-    mut next: impl FnMut() -> PyResult<Option<VolumeSource>> + Send,
+    mut next: impl FnMut() -> PyResult<Option<ArchiveInput>> + Send,
     run: impl FnOnce(
             &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
         ) -> rars_rs::Result<T>
@@ -3281,8 +3467,9 @@ fn with_volume_sources<T: Send>(
         let mut session = rars_rs::read_session::ReadSession::continuing(first, options);
         let mut pulled = std::iter::from_fn(|| match next() {
             Ok(None) => None,
-            Ok(Some(VolumeSource::Bytes(bytes))) => Some(session.read_owned(bytes)),
-            Ok(Some(VolumeSource::Path(path))) => Some(session.read_path(path)),
+            Ok(Some(ArchiveInput::Bytes(bytes))) => Some(session.read_owned(bytes)),
+            Ok(Some(ArchiveInput::Path(path))) => Some(session.read_path(path)),
+            Ok(Some(ArchiveInput::Reader(reader))) => Some(session.read_reader(reader)),
             Err(error) => {
                 *raised.lock().expect("raised lock poisoned") = Some(error);
                 Some(Err(rars_rs::Error::InvalidArgument(
@@ -3367,28 +3554,38 @@ fn with_attribute<'py>(
     }
 }
 
-enum VolumeSource {
+enum ArchiveInput {
     Bytes(Vec<u8>),
     Path(PathBuf),
+    Reader(PyFileReader),
 }
 
 /// Listing walks the volumes and every later read walks them again, so a one-shot iterator won't do.
-fn stored_volumes(volumes: Option<&Bound<'_, PyAny>>) -> PyResult<Option<Py<PyTuple>>> {
+fn stored_volumes(
+    volumes: Option<&Bound<'_, PyAny>>,
+    cancellation: Option<&rars_rs::ReadCancellation>,
+) -> PyResult<Option<Py<PyTuple>>> {
     let Some(volumes) = volumes else {
         return Ok(None);
     };
     if !volumes.is_instance_of::<PyList>() && !volumes.is_instance_of::<PyTuple>() {
         return Err(PyTypeError::new_err(
-            "volumes must be a list or tuple of paths or bytes-like objects; listing would use up a one-shot iterator",
+            "volumes must be a list or tuple of paths, bytes-like or file objects; listing would use up a one-shot iterator",
         ));
     }
-    Ok(Some(
-        PyTuple::new(
-            volumes.py(),
-            volumes.try_iter()?.collect::<PyResult<Vec<_>>>()?,
-        )?
-        .unbind(),
-    ))
+    let py = volumes.py();
+    let volumes = volumes
+        .try_iter()?
+        .map(|volume| {
+            let volume = volume?;
+            // A stream reads once, and listing and every read walk the volumes again.
+            match py_file_input(&volume, cancellation)? {
+                Some(ArchiveInput::Bytes(bytes)) => Ok(PyBytes::new(py, &bytes).into_any()),
+                _ => Ok(volume),
+            }
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    Ok(Some(PyTuple::new(py, volumes)?.unbind()))
 }
 
 /// A later volume names the set's earlier ones as if it were the first, so listing from it would go astray.
@@ -3681,7 +3878,26 @@ fn map_io_error(error: io::Error) -> PyErr {
 }
 
 /// Only the file being opened can be "not a RAR"; a non-RAR later volume is a broken set.
+/// A file object's own exception, which reached the core only as an `io::Error`.
+fn raised_by_file(error: &rars_rs::Error) -> Option<PyErr> {
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(error) = current {
+        let raised = error
+            .downcast_ref::<io::Error>()
+            .and_then(io::Error::get_ref)
+            .and_then(|inner| inner.downcast_ref::<PyErr>());
+        if let Some(raised) = raised {
+            return Some(Python::attach(|py| raised.clone_ref(py)));
+        }
+        current = error.source();
+    }
+    None
+}
+
 fn map_open_error(error: rars_rs::Error) -> PyErr {
+    if let Some(raised) = raised_by_file(&error) {
+        return raised;
+    }
     if matches!(error.root_cause(), rars_rs::Error::UnsupportedSignature) {
         return NotRarFile::new_err(error.to_string());
     }
@@ -3694,6 +3910,9 @@ fn map_error(error: rars_rs::Error) -> PyErr {
 }
 
 fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
+    if let Some(raised) = raised_by_file(&error) {
+        return raised;
+    }
     if error_is_need_password(&error) {
         return PasswordRequired::new_err(message);
     }
