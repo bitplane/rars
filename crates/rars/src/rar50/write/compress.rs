@@ -499,9 +499,7 @@ fn streaming_wave_capacity(
 /// Compresses independent whole members concurrently, with each workspace
 /// admitted against the shared budget before its input is loaded.
 ///
-/// The resolved plan schedules automatic-filter fallback outside whole-member
-/// batches. Explicit filters retain their whole-member requirement and fail
-/// admission when their workspace exceeds the budget.
+/// The resolved plan schedules filter fallback outside whole-member batches.
 #[allow(clippy::too_many_arguments)]
 fn compress_members_whole(
     sources: &[EntrySource],
@@ -774,9 +772,9 @@ fn compress_whole_member<B: Budget>(
     })
 }
 
-/// Execute the planned automatic-filter fallback without re-entering planning.
-/// Block execution uses only `encode_options` and searches filters per run;
-/// the candidate list belongs to whole-member execution.
+/// Execute the planned filter fallback without re-entering planning. Block
+/// execution uses only `encode_options` and filters each run; the candidate
+/// list belongs to whole-member execution.
 #[allow(clippy::too_many_arguments)]
 fn compress_fallback_members(
     first: usize,
@@ -838,7 +836,7 @@ fn compress_fallback_members(
                         input_size,
                         packed.len(),
                         false,
-                        &FilterPolicy::None,
+                        &plan.filter_policy,
                     ),
                     packed,
                     solid_continuation: false,
@@ -953,7 +951,13 @@ where
             }
 
             if filter_runs {
-                choose_run_filters(&mut jobs, plan, required, resources, advance)?;
+                if let FilterPolicy::Explicit(spec) = &plan.filter_policy {
+                    for job in jobs.iter_mut() {
+                        explicit_run_filter(job, spec)?;
+                    }
+                } else {
+                    choose_run_filters(&mut jobs, plan, required, resources, advance)?;
+                }
                 for job in jobs.iter_mut() {
                     let (member, _, _) = job.blocks[0];
                     let last = job.blocks.last().is_some_and(|&(_, _, last)| last);
@@ -1174,6 +1178,20 @@ fn check_source_end(reader: &mut dyn Read) -> Result<()> {
         return Err(Error::SourceChanged(
             "entry source size changed while compressing",
         ));
+    }
+    Ok(())
+}
+
+/// The part of an explicit filter that falls in a job's run, ranged over it.
+fn explicit_run_filter<B: Budget>(job: &mut BlockJob<B>, spec: &crate::FilterSpec) -> Result<()> {
+    let run = job.offset..job.offset + job.data.len();
+    let range = spec.range.clone().unwrap_or(run.clone());
+    let (start, end) = (range.start.max(run.start), range.end.min(run.end));
+    if start < end {
+        job.filters.push_growing(crate::FilterSpec::range(
+            spec.kind,
+            start - run.start..end - run.start,
+        ))?;
     }
     Ok(())
 }

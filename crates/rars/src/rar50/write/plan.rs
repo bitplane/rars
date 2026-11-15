@@ -17,13 +17,22 @@ fn search_piece(settings: &CompressPlan) -> u64 {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FallbackReason {
-    AutomaticFilterWorkspace { required: u64, limit: u64 },
+    AutomaticFilterWorkspace {
+        required: u64,
+        limit: u64,
+    },
+    /// The requested filter is applied to each run instead of the member.
+    ExplicitFilterWorkspace {
+        required: u64,
+        limit: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Execution {
     WholeMember,
-    /// `run_filters` when each run's filter search fits the budget too.
+    /// `run_filters` when each run's filter search fits the budget too, and
+    /// always for an explicit filter, which each run applies without a search.
     Blocks {
         fallback: FallbackReason,
         run_filters: bool,
@@ -85,36 +94,43 @@ impl ExecutionPlan {
                 } else {
                     whole_member_workspace(size, settings)
                 };
-                Ok(
-                    if required <= limit || settings.filter_policy != FilterPolicy::Auto {
-                        MemberPlan {
-                            execution: Execution::WholeMember,
-                            workspace: required,
-                        }
-                    } else {
-                        let blocks = streaming_workspace(settings, false, size);
-                        // Automatic fallback uses only the base encoder
-                        // candidate, and searches each run for filters as if
-                        // it were a member of its own when that fits.
-                        let search =
-                            whole_member_workspace(size.min(search_piece(settings)), settings);
-                        let run_filters = search <= limit;
-                        MemberPlan {
-                            execution: Execution::Blocks {
-                                fallback: FallbackReason::AutomaticFilterWorkspace {
-                                    required,
-                                    limit,
-                                },
-                                run_filters,
-                            },
-                            workspace: if run_filters {
-                                blocks.max(search)
-                            } else {
-                                blocks
-                            },
-                        }
+                let fallback = match &settings.filter_policy {
+                    _ if required <= limit => None,
+                    FilterPolicy::Auto => {
+                        Some(FallbackReason::AutomaticFilterWorkspace { required, limit })
+                    }
+                    // A range the member cannot hold is left to fail as it
+                    // would whole.
+                    FilterPolicy::Explicit(spec) if spec_fits(spec, size) => {
+                        Some(FallbackReason::ExplicitFilterWorkspace { required, limit })
+                    }
+                    _ => None,
+                };
+                let Some(fallback) = fallback else {
+                    return Ok(MemberPlan {
+                        execution: Execution::WholeMember,
+                        workspace: required,
+                    });
+                };
+                let blocks = streaming_workspace(settings, false, size);
+                // Fallback uses only the base encoder candidate. Automatic
+                // filters search each run as if it were a member of its own
+                // when that fits; an explicit filter is coded the same way,
+                // without the search, so it is charged the same.
+                let search = whole_member_workspace(size.min(search_piece(settings)), settings);
+                let run_filters = search <= limit
+                    || matches!(fallback, FallbackReason::ExplicitFilterWorkspace { .. });
+                Ok(MemberPlan {
+                    execution: Execution::Blocks {
+                        fallback,
+                        run_filters,
                     },
-                )
+                    workspace: if run_filters {
+                        blocks.max(search)
+                    } else {
+                        blocks
+                    },
+                })
             }),
             resources,
         )?))
@@ -127,6 +143,12 @@ impl ExecutionPlan {
             _ => panic!("expected independent member plan"),
         }
     }
+}
+
+fn spec_fits(spec: &crate::FilterSpec, size: u64) -> bool {
+    spec.range
+        .as_ref()
+        .is_none_or(|range| range.start < range.end && range.end as u64 <= size)
 }
 
 /// A job never holds more than its input, so small members are not charged a 1 MiB block.
@@ -243,22 +265,43 @@ mod tests {
     }
 
     #[test]
-    fn explicit_filters_and_candidate_trials_cannot_silently_fall_back() {
+    fn explicit_filters_fall_back_to_filtered_runs() {
         let mut settings = settings();
-        settings.filter_policy =
-            FilterPolicy::Explicit(crate::FilterSpec::whole(crate::FilterKind::Delta {
-                channels: 1,
-            }));
-        for filter in [settings.filter_policy.clone(), FilterPolicy::None] {
-            settings.filter_policy = filter;
-            settings
-                .candidates
-                .push_growing(settings.encode_options)
-                .unwrap();
-            let execution = ExecutionPlan::new(&settings, [16].into_iter(), 1);
-            assert_eq!(execution.members()[0].execution, Execution::WholeMember);
-            assert!(execution.members()[0].workspace > 1);
+        let delta = crate::FilterKind::Delta { channels: 1 };
+        settings.filter_policy = FilterPolicy::Explicit(crate::FilterSpec::whole(delta));
+        let size = 2 * search_piece(&settings);
+        let required = whole_member_workspace(size, &settings);
+        let at_limit = ExecutionPlan::new(&settings, [size].into_iter(), required);
+        assert_eq!(at_limit.members()[0].execution, Execution::WholeMember);
+        // Even when a run's search would not fit, the filter is still applied.
+        for limit in [required - 1, 1] {
+            let below = ExecutionPlan::new(&settings, [size].into_iter(), limit);
+            assert_eq!(
+                below.members()[0].execution,
+                Execution::Blocks {
+                    fallback: FallbackReason::ExplicitFilterWorkspace { required, limit },
+                    run_filters: true,
+                }
+            );
         }
+        // A range past the member's end fails whole, as it always has.
+        settings.filter_policy =
+            FilterPolicy::Explicit(crate::FilterSpec::range(delta, 0..size as usize + 1));
+        let past = ExecutionPlan::new(&settings, [size].into_iter(), 1);
+        assert_eq!(past.members()[0].execution, Execution::WholeMember);
+    }
+
+    #[test]
+    fn candidate_trials_cannot_silently_fall_back() {
+        let mut settings = settings();
+        settings.filter_policy = FilterPolicy::None;
+        settings
+            .candidates
+            .push_growing(settings.encode_options)
+            .unwrap();
+        let execution = ExecutionPlan::new(&settings, [16].into_iter(), 1);
+        assert_eq!(execution.members()[0].execution, Execution::WholeMember);
+        assert!(execution.members()[0].workspace > 1);
     }
 
     #[test]
