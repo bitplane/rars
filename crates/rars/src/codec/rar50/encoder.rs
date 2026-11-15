@@ -2560,7 +2560,33 @@ fn price_optimal_paths_with_state<const RING: bool>(
         if index < committed_through {
             continue;
         }
-        let source_state = index & state_mask;
+        // The distance memory this position is reached with, built once from
+        // the edge that won it rather than stored on every improvement. Every
+        // edge into it came from a position already passed, so the winner is
+        // settled, and its source was priced: a skipped position emits no
+        // edge. Sources lie at most 4096 back, inside the 8192-slot ring.
+        let state = if index == 0 {
+            EncoderMatchState {
+                reps: arrive_reps[0].map(|distance| distance as usize),
+                last_length: arrive_last_length[0] as usize,
+            }
+        } else {
+            let length = arrive_length[index] as usize;
+            let from = (index - length.max(1)) & state_mask;
+            let mut state = EncoderMatchState {
+                reps: arrive_reps[from].map(|distance| distance as usize),
+                last_length: arrive_last_length[from] as usize,
+            };
+            // A literal emits no distance, so it leaves the remembered ones
+            // exactly as it found them.
+            if length != 0 {
+                state.remember(length, arrive_distance[index] as usize);
+            }
+            let slot = index & state_mask;
+            arrive_reps[slot] = state.reps.map(|distance| distance as u32);
+            arrive_last_length[slot] = state.last_length as u32;
+            state
+        };
         // Every priced position extends a literal path to its successor;
         // a committed match skips only to an already priced endpoint. Blocks
         // are at most 1 MiB, so even all 15-bit literals stay below u32::MAX.
@@ -2569,35 +2595,10 @@ fn price_optimal_paths_with_state<const RING: bool>(
             prices.literal(combined[pos]) as u32
         });
         let literal = here.saturating_add(literal_cost);
-        let literal_state = (index + 1) & state_mask;
-        // A target at most 4096 ahead cannot alias this 8192-slot source. Keep
-        // its state across the literal write instead of loading it again.
-        let cached_reps = if RING {
-            arrive_reps[source_state]
-        } else {
-            [0; 4]
-        };
-        let cached_last = if RING {
-            arrive_last_length[source_state]
-        } else {
-            0
-        };
         if literal < price[index + 1] {
             price[index + 1] = literal;
             arrive_length[index + 1] = 0;
             arrive_distance[index + 1] = 0;
-            // A literal emits no distance, so it leaves the remembered ones
-            // exactly as it found them.
-            arrive_reps[literal_state] = if RING {
-                cached_reps
-            } else {
-                arrive_reps[source_state]
-            };
-            arrive_last_length[literal_state] = if RING {
-                cached_last
-            } else {
-                arrive_last_length[source_state]
-            };
         }
 
         let max_distance = pos.min(options.max_match_distance);
@@ -2605,21 +2606,6 @@ fn price_optimal_paths_with_state<const RING: bool>(
         if options.max_match_candidates == 0 || max_distance == 0 || max_length < 4 {
             continue;
         }
-
-        let state_reps = if RING {
-            cached_reps
-        } else {
-            arrive_reps[source_state]
-        };
-        let state_last = if RING {
-            cached_last
-        } else {
-            arrive_last_length[source_state]
-        };
-        let state = EncoderMatchState {
-            reps: state_reps.map(|distance| distance as usize),
-            last_length: state_last as usize,
-        };
 
         let mut reaches_len = 0;
         let mut longest = 0usize;
@@ -2690,15 +2676,10 @@ fn price_optimal_paths_with_state<const RING: bool>(
                 if let Some(cost) = run_price.cost(reach) {
                     let reached = here.saturating_add(cost);
                     let target = index + reach;
-                    let target_state = target & state_mask;
                     if reached < price[target] {
                         price[target] = reached;
                         arrive_length[target] = reach as u32;
                         arrive_distance[target] = distance as u32;
-                        let mut next = state;
-                        next.remember(reach, distance);
-                        arrive_reps[target_state] = next.reps.map(|distance| distance as u32);
-                        arrive_last_length[target_state] = next.last_length as u32;
                     }
                 }
                 length = reach + 1;
