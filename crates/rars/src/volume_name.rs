@@ -2,6 +2,15 @@
 
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How a set names its volume files.
+pub enum VolumeNaming {
+    /// `name.part01.rar`, `name.part02.rar`, ...
+    Part,
+    /// `name.rar`, `name.r00`, `name.r01`, ...
+    Old,
+}
+
 /// Volume `index` as `.r00` on, rolling `.r99` to `.s00` up to `.z99` as rar 4.2's `-vn` does; upper case follows the first extension's.
 pub fn old_style(first: &Path, index: usize) -> Option<PathBuf> {
     let Some(number) = index.checked_sub(1) else {
