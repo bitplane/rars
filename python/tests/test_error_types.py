@@ -30,6 +30,14 @@ def test_input_without_a_rar_signature_is_not_a_rar_file(tmp_path, data):
         rars.RarFile(data)
 
 
+def test_a_later_volume_without_a_rar_signature_is_not_reported_as_not_a_rar_file(tmp_path):
+    paths = write_set(tmp_path, "rar50")
+    with rars.RarFile(paths[0]) as archive:
+        with pytest.raises(rars.Error) as raised:
+            archive.testrar(volumes=[b"PK\x03\x04" + bytes(100)])
+    assert not isinstance(raised.value, rars.NotRarFile)
+
+
 def test_an_sfx_stub_inside_the_scan_limit_still_opens():
     stub = b"MZ" + random.Random(6).randbytes(64 * 1024)
     with rars.RarFile(stub + rar_bytes()) as archive:
@@ -99,3 +107,14 @@ def test_a_corrupt_payload_is_a_checksum_error_naming_the_member(tmp_path, forma
         with pytest.raises(rars.ChecksumError) as raised:
             archive.extractall(tmp_path / "out")
     assert raised.value.member == "large.bin"
+
+
+def test_a_corrupt_encrypted_rar4_member_stays_a_bad_password(tmp_path):
+    builder = rars.RarBuilder(format="rar29", store=True, password="pw")
+    builder.add_bytes(PAYLOAD, "large.bin")
+    path = tmp_path / "encrypted.rar"
+    path.write_bytes(builder.to_bytes())
+    flip_byte(path, 20_000)
+    with rars.RarFile(path, password="pw") as archive:
+        with pytest.raises(rars.BadPassword):
+            archive.testrar()

@@ -1172,7 +1172,7 @@ impl RarFile {
     ) -> PyResult<Self> {
         let archive = py
             .detach(|| read(python_read_options(options, password.as_deref())))
-            .map_err(map_error)?;
+            .map_err(map_open_error)?;
         let encoding = options.and_then(|settings| settings.encoding);
         let identity = Arc::new(());
         let infos = archive
@@ -2917,7 +2917,7 @@ fn with_volume_sources<T: Send>(
     }
 }
 
-/// Where in a set `error` failed, if its chain reaches a cause `is_cause` accepts.
+/// Callers need the failing volume and member as values, and the core keeps them only in wrappers.
 fn set_fault(
     error: &rars_rs::Error,
     is_cause: impl Fn(&rars_rs::Error) -> bool,
@@ -2948,8 +2948,9 @@ fn set_fault(
 
 #[derive(Default)]
 struct SetFault {
-    /// The innermost volume the failure was traced to.
+    /// The innermost volume, where the fault is rather than where reading began.
     volume_number: Option<usize>,
+    /// The outermost member, which is the one the caller asked for.
     member: Option<String>,
 }
 
@@ -3147,6 +3148,14 @@ fn map_io_error(error: io::Error) -> PyErr {
     PyOSError::new_err(error.to_string())
 }
 
+/// Only the file being opened can be "not a RAR"; a non-RAR later volume is a broken set.
+fn map_open_error(error: rars_rs::Error) -> PyErr {
+    if matches!(error.root_cause(), rars_rs::Error::UnsupportedSignature) {
+        return NotRarFile::new_err(error.to_string());
+    }
+    map_error(error)
+}
+
 fn map_error(error: rars_rs::Error) -> PyErr {
     let message = error.to_string();
     typed_error(error, message)
@@ -3159,9 +3168,6 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
     if error_is_bad_password(&error) {
         return BadPassword::new_err(message);
     }
-    if matches!(error.root_cause(), rars_rs::Error::UnsupportedSignature) {
-        return NotRarFile::new_err(message);
-    }
     if let Some(fault) = set_fault(&error, is_missing_volume) {
         return Python::attach(|py| {
             with_attribute(
@@ -3172,7 +3178,10 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
             )
         });
     }
-    if let Some(fault) = set_fault(&error, is_checksum_mismatch) {
+    // Comment and recovery-record checksums name no member, so they stay plain BadRarFile.
+    if let Some(fault) =
+        set_fault(&error, is_checksum_mismatch).filter(|fault| fault.member.is_some())
+    {
         return Python::attach(|py| {
             let error = with_attribute(py, ChecksumError::new_err(message), "member", fault.member);
             with_attribute(py, error, "volume_number", fault.volume_number)
