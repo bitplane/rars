@@ -167,6 +167,7 @@ where
                         first_reader,
                         &mut walk,
                         password,
+                        &volume.key_cache,
                         &mut writer,
                         &allowance,
                     );
@@ -176,6 +177,7 @@ where
                         LazyChain::new(&mut walk, first_reader),
                         first,
                         password,
+                        &volume.key_cache,
                         &allowance,
                     )?;
                     session
@@ -199,6 +201,7 @@ fn write_stored<B: Budget>(
     first_reader: RangeReader<'static>,
     walk: &mut SplitWalk<'_, '_, '_, B>,
     password: Option<&[u8]>,
+    key_cache: &KeyCache,
     writer: &mut dyn Write,
     allowance: &B,
 ) -> Result<()> {
@@ -220,6 +223,7 @@ fn write_stored<B: Budget>(
             LazyChain::new(&mut *walk, first_reader),
             first,
             password,
+            key_cache,
             allowance,
         )?;
         crate::stored_copy::copy(
@@ -250,6 +254,7 @@ pub(super) fn packed_reader<R: Read, B: Budget>(
     chain: R,
     first: &FileHeader,
     password: Option<&[u8]>,
+    key_cache: &KeyCache,
     allowance: &B,
 ) -> Result<PackedReader<R, B>> {
     if !first.is_encrypted() {
@@ -257,7 +262,16 @@ pub(super) fn packed_reader<R: Read, B: Budget>(
     }
     let password = password.expect("encrypted split fragments were admitted with a password");
     Ok(PackedReader::Encrypted(Boxed::try_new(
-        || DecryptingReader::with_allowance(chain, first.unp_ver, password, first.salt, allowance),
+        || {
+            DecryptingReader::with_allowance(
+                chain,
+                first.unp_ver,
+                password,
+                first.salt,
+                key_cache,
+                allowance,
+            )
+        },
         allowance,
     )?))
 }

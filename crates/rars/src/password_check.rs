@@ -1,6 +1,6 @@
 use crate::detect::{find_archive_start, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
-use crate::rar50::Rar50KeyCache;
+use crate::key_cache::KeyCache;
 use crate::version::ArchiveFamily;
 use crate::{rar15_40, rar50, Archive, ArchiveReadOptions, ArchiveReader};
 use std::path::{Path, PathBuf};
@@ -21,7 +21,7 @@ pub struct PasswordProbe {
     source: Source,
     evidence: Evidence,
     archive: Option<Archive>,
-    key_cache: Arc<Rar50KeyCache>,
+    key_cache: Arc<KeyCache>,
 }
 
 enum Source {
@@ -161,9 +161,13 @@ impl PasswordProbe {
                 &self.key_cache,
                 options,
             )?,
-            Evidence::Rar15To40Headers { prefix, offset } => {
-                rar15_40::header_password_matches(prefix, *offset, password, options)?
-            }
+            Evidence::Rar15To40Headers { prefix, offset } => rar15_40::header_password_matches(
+                prefix,
+                *offset,
+                password,
+                &self.key_cache,
+                options,
+            )?,
         };
         Ok(if correct {
             PasswordVerdict::Correct

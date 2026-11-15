@@ -1,11 +1,11 @@
-use crate::{rar50, Archive, ArchiveReadOptions, Result};
+use crate::{key_cache::KeyCache, Archive, ArchiveReadOptions, Result};
 use std::path::Path;
 use std::sync::Arc;
 
-/// Parses a volume set so its shared RAR 5 key is derived once, not once per volume.
+/// Parses a volume set so its shared key is derived once, not once per volume.
 pub struct ReadSession<'a> {
     options: ArchiveReadOptions<'a>,
-    key_cache: Arc<rar50::Rar50KeyCache>,
+    key_cache: Arc<KeyCache>,
 }
 
 impl<'a> ReadSession<'a> {
@@ -17,10 +17,11 @@ impl<'a> ReadSession<'a> {
         }
     }
 
-    /// Continues a set from `first`, reusing the RAR 5 keys it has already derived.
+    /// Continues a set from `first`, reusing the keys it has already derived.
     pub fn continuing(first: &Archive, options: ArchiveReadOptions<'a>) -> Self {
         let key_cache = match first {
             Archive::Rar50Plus(archive) => Arc::clone(&archive.key_cache),
+            Archive::Rar15To40(archive) => Arc::clone(&archive.key_cache),
             _ => Arc::default(),
         };
         Self { options, key_cache }

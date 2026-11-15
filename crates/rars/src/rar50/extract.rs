@@ -69,13 +69,13 @@ impl FileHeader {
 
     #[cfg(all(test, feature = "write", feature = "encryption"))]
     fn encryption_keys(&self, password: Option<&[u8]>) -> Result<Rar50Keys> {
-        self.encryption_keys_cached(password, &super::Rar50KeyCache::default())
+        self.encryption_keys_cached(password, &crate::key_cache::KeyCache::default())
     }
 
     fn encryption_keys_cached(
         &self,
         password: Option<&[u8]>,
-        key_cache: &super::Rar50KeyCache,
+        key_cache: &crate::key_cache::KeyCache,
     ) -> Result<Rar50Keys> {
         #[cfg(not(feature = "encryption"))]
         {
@@ -106,7 +106,7 @@ impl FileHeader {
                     feature: "RAR 5 unknown file encryption version",
                 });
             }
-            let keys = key_cache.get_or_derive(password, encryption.salt, encryption.kdf_count)?;
+            let keys = key_cache.rar50(password, encryption.salt, encryption.kdf_count)?;
             if let Some(check_value) = encryption.check_value {
                 keys.check_password(&check_value)
                     .map_err(super::map_rar50_crypto_error)?;
@@ -131,7 +131,7 @@ impl FileHeader {
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
-        key_cache: &super::Rar50KeyCache,
+        key_cache: &crate::key_cache::KeyCache,
         control: &crate::read_control::ReadControl,
         allowance: &B,
     ) -> Result<(Buffer<u8, B>, Option<Rar50Keys>)> {
@@ -148,7 +148,7 @@ impl FileHeader {
         &self,
         archive: &'a Archive,
         password: Option<&[u8]>,
-        key_cache: &super::Rar50KeyCache,
+        key_cache: &crate::key_cache::KeyCache,
         allowance: &B,
     ) -> Result<(
         PackedReader<crate::source::RangeReader<'a>, B>,
@@ -184,7 +184,7 @@ impl FileHeader {
         self.packed_reader_with_allowance(
             archive,
             password,
-            &super::Rar50KeyCache::default(),
+            &crate::key_cache::KeyCache::default(),
             &Allowance::default(),
         )
     }
@@ -476,7 +476,7 @@ impl FileHeader {
         archive: &Archive,
         decoder: &mut ReaderState<B>,
         password: Option<&[u8]>,
-        key_cache: &super::Rar50KeyCache,
+        key_cache: &crate::key_cache::KeyCache,
         history: HistoryRetention,
     ) -> Result<DecodedData<B>> {
         let (packed, keys) = self.packed_data_with_allowance(
@@ -707,7 +707,7 @@ impl FileHeader {
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
-        key_cache: &super::Rar50KeyCache,
+        key_cache: &crate::key_cache::KeyCache,
         writer: &mut dyn Write,
         allowance: &B,
     ) -> Result<()> {

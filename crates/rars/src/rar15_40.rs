@@ -6,11 +6,14 @@ use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar15::Rar15Cipher;
 #[cfg(feature = "encryption")]
 use crate::crypto::rar20::Rar20Cipher;
+#[cfg(all(feature = "encryption", feature = "write"))]
+use crate::crypto::rar30::Error as Rar30Error;
 #[cfg(feature = "encryption")]
-use crate::crypto::rar30::{Error as Rar30Error, Rar30Cipher};
+use crate::crypto::rar30::Rar30Cipher;
 use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
 use crate::io_util::{read_exact_at, read_u32};
+use crate::key_cache::KeyCache;
 use crate::member_batches::{self, Plan};
 pub(crate) use crate::source::ArchiveSource;
 use crate::version::ArchiveFamily;
@@ -107,6 +110,8 @@ pub struct Archive {
     pub main: MainHeader,
     pub blocks: Vec<Block>,
     source: ArchiveSource,
+    // Shared with later volumes parsed in the same session, so keys outlive one call.
+    pub(crate) key_cache: Arc<KeyCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -380,6 +385,7 @@ impl FileHeader {
                         self.unp_ver,
                         password,
                         self.salt,
+                        &archive.key_cache,
                         allowance,
                     )
                 },
@@ -723,15 +729,23 @@ impl Archive {
     ) -> Result<Self> {
         options.check_cancelled()?;
         let data: Arc<[u8]> = Arc::from(input.to_vec().into_boxed_slice());
-        Self::parse_shared(data, options)
+        Self::parse_shared(data, options, Arc::default())
     }
 
     pub fn parse_owned_with_options(
         input: Vec<u8>,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        Self::parse_owned_cached(input, options, Arc::default())
+    }
+
+    pub(crate) fn parse_owned_cached(
+        input: Vec<u8>,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<KeyCache>,
+    ) -> Result<Self> {
         options.check_cancelled()?;
-        Self::parse_shared(Arc::from(input.into_boxed_slice()), options)
+        Self::parse_shared(Arc::from(input.into_boxed_slice()), options, key_cache)
     }
 
     pub fn parse_with_password(input: &[u8], password: Option<&[u8]>) -> Result<Self> {
@@ -798,6 +812,15 @@ impl Archive {
         signature: ArchiveSignature,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Self> {
+        Self::parse_path_with_signature_cached(path, signature, options, Arc::default())
+    }
+
+    pub(crate) fn parse_path_with_signature_cached(
+        path: impl AsRef<Path>,
+        signature: ArchiveSignature,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<KeyCache>,
+    ) -> Result<Self> {
         options.check_cancelled()?;
         if signature.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
@@ -805,16 +828,21 @@ impl Archive {
         let path = path.as_ref();
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        Self::parse_seekable(
+        Self::parse_seekable_cached(
             file,
             len,
             signature.offset,
             ArchiveSource::file(path),
             options,
+            key_cache,
         )
     }
 
-    fn parse_shared(input: Arc<[u8]>, options: crate::ArchiveReadOptions<'_>) -> Result<Self> {
+    fn parse_shared(
+        input: Arc<[u8]>,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<KeyCache>,
+    ) -> Result<Self> {
         options.check_cancelled()?;
         let sig = find_archive_start(&input, SFX_SCAN_LIMIT).ok_or(Error::UnsupportedSignature)?;
         if sig.family != ArchiveFamily::Rar15To40 {
@@ -842,7 +870,6 @@ impl Archive {
         )? {
             blocks.push(Block::Comment(comment));
         }
-        let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
         let blocks_before_first_header = blocks.len();
 
         while pos < archive.len() {
@@ -857,7 +884,7 @@ impl Archive {
                     pos,
                     password,
                     blocks.len() == blocks_before_first_header,
-                    &mut encrypted_header_ciphers,
+                    &key_cache,
                     &mut budget,
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
@@ -922,6 +949,7 @@ impl Archive {
             main,
             blocks,
             source: ArchiveSource::Memory(input),
+            key_cache,
         })
     }
 
@@ -931,6 +959,17 @@ impl Archive {
         sfx_offset: usize,
         source: ArchiveSource,
         options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Self> {
+        Self::parse_seekable_cached(file, file_len, sfx_offset, source, options, Arc::default())
+    }
+
+    pub(crate) fn parse_seekable_cached(
+        file: impl Read + std::io::Seek,
+        file_len: u64,
+        sfx_offset: usize,
+        source: ArchiveSource,
+        options: crate::ArchiveReadOptions<'_>,
+        key_cache: Arc<KeyCache>,
     ) -> Result<Self> {
         options.check_cancelled()?;
         let password = options.password;
@@ -970,7 +1009,6 @@ impl Archive {
         {
             blocks.push(Block::Comment(comment));
         }
-        let mut encrypted_header_ciphers = EncryptedHeaderCipherCache::default();
         let blocks_before_first_header = blocks.len();
 
         while file_len.saturating_sub((sfx_offset + pos) as u64) >= 7 {
@@ -984,7 +1022,7 @@ impl Archive {
                     pos,
                     password,
                     blocks.len() == blocks_before_first_header,
-                    &mut encrypted_header_ciphers,
+                    &key_cache,
                     &mut budget,
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
@@ -1056,6 +1094,7 @@ impl Archive {
             main,
             blocks,
             source,
+            key_cache,
         })
     }
 
@@ -2368,31 +2407,7 @@ struct EncryptedHeader {
     total_size: usize,
 }
 
-#[derive(Default)]
-struct EncryptedHeaderCipherCache {
-    #[cfg(feature = "encryption")]
-    salt: Option<[u8; 8]>,
-    #[cfg(feature = "encryption")]
-    cipher: Option<Rar30Cipher>,
-}
-
-#[cfg(feature = "encryption")]
-impl EncryptedHeaderCipherCache {
-    fn cipher(&mut self, password: &[u8], salt: [u8; 8]) -> Result<Rar30Cipher> {
-        if self.salt != Some(salt) {
-            self.salt = Some(salt);
-            self.cipher =
-                Some(Rar30Cipher::new(password, Some(salt)).map_err(map_rar30_crypto_error)?);
-        }
-        Ok(self
-            .cipher
-            .as_ref()
-            .expect("RAR 3 encrypted header cipher cache initialized")
-            .clone())
-    }
-}
-
-#[cfg(feature = "encryption")]
+#[cfg(all(feature = "encryption", feature = "write"))]
 fn map_rar30_crypto_error(error: Rar30Error) -> Error {
     Error::from(error)
 }
@@ -2414,17 +2429,11 @@ pub(crate) fn header_password_matches(
     input: &[u8],
     offset: usize,
     password: &[u8],
+    key_cache: &KeyCache,
     options: crate::ArchiveReadOptions<'_>,
 ) -> Result<bool> {
     let mut budget = crate::parse_budget::ParseBudget::new(options);
-    match decrypt_encrypted_header_at(
-        input,
-        offset,
-        password,
-        true,
-        &mut EncryptedHeaderCipherCache::default(),
-        &mut budget,
-    ) {
+    match decrypt_encrypted_header_at(input, offset, password, true, key_cache, &mut budget) {
         Ok(_) => Ok(true),
         Err(Error::WrongPasswordOrCorruptData) => Ok(false),
         Err(error) => Err(error),
@@ -2436,12 +2445,12 @@ fn decrypt_encrypted_header_at(
     offset: usize,
     password: &[u8],
     first: bool,
-    cipher_cache: &mut EncryptedHeaderCipherCache,
+    key_cache: &KeyCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (archive, offset, password, first, cipher_cache, budget);
+        let _ = (archive, offset, password, first, key_cache, budget);
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
@@ -2453,7 +2462,7 @@ fn decrypt_encrypted_header_at(
             .get(offset + 8..offset + 24)
             .ok_or(Error::TooShort)?;
         budget.check_count(offset)?;
-        let mut cipher = cipher_cache.cipher(password, salt)?;
+        let mut cipher = key_cache.rar30(password, Some(salt))?;
         let mut first_block = [0u8; 16];
         first_block.copy_from_slice(first_ciphertext);
         cipher.decrypt_block(&mut first_block);
@@ -2509,7 +2518,7 @@ fn read_encrypted_header_at(
     offset: usize,
     password: &[u8],
     first: bool,
-    cipher_cache: &mut EncryptedHeaderCipherCache,
+    key_cache: &KeyCache,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<EncryptedHeader> {
     #[cfg(not(feature = "encryption"))]
@@ -2521,7 +2530,7 @@ fn read_encrypted_header_at(
             offset,
             password,
             first,
-            cipher_cache,
+            key_cache,
             budget,
         );
         Err(Error::FeatureDisabled {
@@ -2542,7 +2551,7 @@ fn read_encrypted_header_at(
         let prefix = read_exact_at(file, absolute, 24)?;
         let salt = read_header_salt(&prefix, 0)?;
         budget.check_count(offset)?;
-        let mut cipher = cipher_cache.cipher(password, salt)?;
+        let mut cipher = key_cache.rar30(password, Some(salt))?;
         let mut first_block = [0u8; 16];
         first_block.copy_from_slice(&prefix[8..24]);
         cipher.decrypt_block(&mut first_block);
@@ -3158,7 +3167,7 @@ mod tests {
                 0,
                 b"secret",
                 false,
-                &mut super::EncryptedHeaderCipherCache::default(),
+                &KeyCache::default(),
                 &mut ParseBudget::new(options),
             )
             .map(|_| ())
@@ -3610,7 +3619,7 @@ mod tests {
             0,
             b"pw",
             false,
-            &mut EncryptedHeaderCipherCache::default(),
+            &KeyCache::default(),
             &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
         );
         assert!(matches!(
@@ -5147,9 +5156,9 @@ mod tests {
     fn first_encrypted_header_checks_crc(head_type: u8) {
         let mut plain = legacy_auth_block(head_type, 32);
         plain[0..2].copy_from_slice(&0xbeefu16.to_le_bytes());
-        let mut cache = EncryptedHeaderCipherCache::default();
+        let cache = KeyCache::default();
         cache
-            .cipher(b"pw", [0; 8])
+            .rar30(b"pw", Some([0; 8]))
             .unwrap()
             .encrypt_in_place(&mut plain)
             .unwrap();
@@ -5162,7 +5171,7 @@ mod tests {
                 0,
                 b"pw",
                 first,
-                &mut cache,
+                &cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             );
             let seekable = read_encrypted_header_at(
@@ -5172,7 +5181,7 @@ mod tests {
                 0,
                 b"pw",
                 first,
-                &mut cache,
+                &cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             );
             for result in [memory, seekable] {
@@ -5188,12 +5197,12 @@ mod tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
-        let mut cache = EncryptedHeaderCipherCache::default();
+        let cache = KeyCache::default();
         for size in [0u16, 6, 17, 65] {
             let mut plain = [0; 16];
             plain[5..7].copy_from_slice(&size.to_le_bytes());
             cache
-                .cipher(b"pw", [0; 8])
+                .rar30(b"pw", Some([0; 8]))
                 .unwrap()
                 .encrypt_in_place(&mut plain)
                 .unwrap();
@@ -5205,7 +5214,7 @@ mod tests {
                 0,
                 b"pw",
                 false,
-                &mut cache,
+                &cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             )
             .err()
@@ -5217,7 +5226,7 @@ mod tests {
                 0,
                 b"pw",
                 false,
-                &mut cache,
+                &cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             )
             .err()
@@ -5244,7 +5253,7 @@ mod tests {
                     0,
                     b"pw",
                     false,
-                    &mut cache,
+                    &cache,
                     &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
                 ),
                 Err(Error::TooShort)
@@ -5257,7 +5266,7 @@ mod tests {
                     0,
                     b"pw",
                     false,
-                    &mut cache,
+                    &cache,
                     &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
                 ),
                 Err(Error::TooShort)

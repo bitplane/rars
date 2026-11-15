@@ -274,7 +274,7 @@ fn ordinary_encrypted_streaming_preserves_crc_mac_hash_mac_padding_and_truncatio
             let (mut packed, keys) = truncated.packed_reader_with_allowance(
                 &archive,
                 Some(b"password"),
-                &crate::rar50::Rar50KeyCache::default(),
+                &crate::key_cache::KeyCache::default(),
                 &Allowance::default(),
             )?;
             truncated.stream_packed_with_decoder(
@@ -458,7 +458,7 @@ fn optional_crc_keeps_limited_growth_and_refusals_identical_to_legacy_streaming(
             let (mut packed, keys) = file.packed_reader_with_allowance(
                 &archive,
                 None,
-                &crate::rar50::Rar50KeyCache::default(),
+                &crate::key_cache::KeyCache::default(),
                 budget,
             )?;
             file.stream_packed_with_decoder(
@@ -615,7 +615,7 @@ fn large_compressed_members_decode_off_the_caller() {
         .packed_reader_with_allowance(
             &archive,
             None,
-            &crate::rar50::Rar50KeyCache::default(),
+            &crate::key_cache::KeyCache::default(),
             &Allowance::default(),
         )
         .unwrap();
