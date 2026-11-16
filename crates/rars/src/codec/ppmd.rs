@@ -2057,6 +2057,12 @@ impl PpmdEncoder {
         }
     }
 
+    /// The bytes coded so far; a carryless coder never revises them.
+    #[cfg(feature = "write")]
+    pub(crate) fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.range.out)
+    }
+
     /// Ends the block and hands the model back for the next one to continue.
     pub fn finish_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
         self.model
