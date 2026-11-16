@@ -25,7 +25,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 
 mod volumes;
-pub use volumes::write_stored_volumes_to;
+pub use volumes::{write_stored_volumes_to, write_volumes_to};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -2102,17 +2102,10 @@ pub(crate) fn write_stored_volumes_with_progress(
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
     let mut sink = crate::volume_sink::CollectedVolumes::new();
-    volumes::split_stored(
-        volumes::StoredSplit {
-            name: entry.name,
-            bytes: MemberBytes::Borrowed(entry.data),
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            password: entry.password,
-            file_comment: entry.file_comment,
-        },
+    volumes::split_members(
+        &[Member::from_stored(&entry)],
         options,
+        &MemberCoding::Stored,
         volume_size,
         &mut sink,
         &WriterResources::default(),
@@ -2151,76 +2144,14 @@ pub fn write_compressed_volumes_to(
     sink: &mut dyn crate::volume_sink::VolumeSink,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<()> {
-    let resources = WriterResources::default();
-    let control =
-        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
-    let reporting = &control as &dyn WriteProgress;
-    let progress = Some(reporting);
-    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
-    let total_work = if options.target == ArchiveVersion::Rar20 && !options.features.solid {
-        (entry.data.len() as u64).saturating_mul(2)
-    } else {
-        entry.data.len() as u64
-    };
-    report_compression_operation(reporting, true, total_work, 1);
-    let work = WorkTracker::new(
-        Some(ProgressReporter(reporting)),
-        WriteOperation::Compression,
-        total_work,
-    );
-    write_compressed_volumes_impl(entry, options, volume_size, sink, &work)?;
-    if !work.finish() {
-        return Err(Error::Cancelled);
-    }
-    report_compression_operation(reporting, false, total_work, 1);
-    work.check()
-}
-
-fn write_compressed_volumes_impl(
-    entry: FileEntry<'_>,
-    mut options: WriterOptions,
-    volume_size: usize,
-    sink: &mut dyn crate::volume_sink::VolumeSink,
-    progress: &WorkTracker<'_>,
-) -> Result<()> {
-    validate_plan(
+    volumes::split_members(
+        &[Member::from_file(&entry)],
         options,
-        PlanShape::new().compressed(true).volumes(true),
-        false,
-        false,
-    )?;
-    validate_volume_writer_inputs(entry.name, entry.data, entry.file_comment, options)?;
-    // A volume set holds one member, and splitting it changes nothing about
-    // how far back the window has to reach.
-    if options.dictionary_size.is_none() {
-        options.dictionary_size = Some(fitted_dictionary_size(
-            options.target,
-            entry.data.len() as u64,
-        ));
-    }
-
-    let mut solid_encoder = None;
-    let payload = encode_or_store_payload(entry.data, options, &mut solid_encoder, Some(progress))
-        .map_err(|error| {
-            crate::write_stream::member_error(error, entry.name, "compressing volume member")
-        })?;
-    volumes::split_packed(
-        volumes::PackedSplit {
-            name: entry.name,
-            unpacked: entry.data,
-            packed: &payload.data,
-            method: payload.method,
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            password: entry.password,
-        },
-        options,
+        &MemberCoding::Compressed,
         volume_size,
         sink,
-        progress
-            .reporter()
-            .expect("volume compression has a resource reporter"),
+        &WriterResources::default(),
+        progress,
     )
 }
 
@@ -2836,24 +2767,6 @@ fn should_store_fallback(
             MIN_STORE_FALLBACK_SIZE
         })
         .applies(solid, unpacked_len, packed_len)
-}
-
-fn validate_volume_writer_inputs(
-    name: &[u8],
-    data: &[u8],
-    file_comment: Option<&[u8]>,
-    options: WriterOptions,
-) -> Result<()> {
-    validate_volume_member(name, options.target, data.len() as u64).map_err(|error| {
-        crate::write_stream::member_error(error, name, "preparing volume member")
-    })?;
-    if file_comment.is_some() {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "volume_file_comment",
-        });
-    }
-    Ok(())
 }
 
 fn writer_file_flags(

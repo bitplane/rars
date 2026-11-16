@@ -15,17 +15,13 @@ pub fn write_stored_volumes_to(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<()> {
-    split_stored(
-        StoredSplit {
-            name: &entry.name,
-            bytes: MemberBytes::Source(&entry.source),
-            file_time: entry.file_time,
-            file_attr: entry.file_attr,
-            host_os: entry.host_os,
-            password: entry.password.as_deref(),
-            file_comment: entry.file_comment.as_deref(),
-        },
+    let mut member = Member::from_streaming(entry);
+    // This entry point predates directory members and has always written a file.
+    member.is_directory = false;
+    split_members(
+        &[member],
         options,
+        &MemberCoding::Stored,
         volume_size,
         sink,
         resources,
@@ -33,19 +29,32 @@ pub fn write_stored_volumes_to(
     )
 }
 
-pub(super) struct StoredSplit<'a> {
-    pub(super) name: &'a [u8],
-    pub(super) bytes: MemberBytes<'a>,
-    pub(super) file_time: u32,
-    pub(super) file_attr: u32,
-    pub(super) host_os: u8,
-    pub(super) password: Option<&'a [u8]>,
-    pub(super) file_comment: Option<&'a [u8]>,
+/// Packs members into one set in order, so one can end mid-volume and the next start there.
+pub fn write_volumes_to(
+    entries: &[StreamingEntry],
+    options: WriterOptions,
+    coding: MemberCoding,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
+    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
+    split_members(
+        &members,
+        options,
+        &coding,
+        volume_size,
+        sink,
+        resources,
+        progress,
+    )
 }
 
-pub(super) fn split_stored(
-    member: StoredSplit<'_>,
-    options: WriterOptions,
+pub(super) fn split_members(
+    members: &[Member<'_>],
+    mut options: WriterOptions,
+    coding: &MemberCoding,
     volume_size: usize,
     sink: &mut dyn VolumeSink,
     resources: &WriterResources,
@@ -55,162 +64,259 @@ pub(super) fn split_stored(
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = ProgressReporter(&control);
     crate::write_progress::check_cancelled(Some(progress))?;
-    validate_plan(options, PlanShape::new().volumes(true), false, false)?;
-    let name = member.name;
-    let source_len = member.bytes.len()?;
-    validate_member(name, options.target, source_len).map_err(|error| {
-        crate::write_stream::member_error(error, name, "preparing volume member")
-    })?;
-    if member.file_comment.is_some() {
-        return Err(Error::UnsupportedFeature {
-            version: options.target,
-            feature: "volume_file_comment",
-        });
+    validate_plan(options, coding.shape().volumes(true), false, false)?;
+    if let MemberCoding::Filtered(policy) = coding {
+        validate_rar29_filter_policy(policy, options.method)?;
+    }
+    let compresses = coding.compresses();
+    let mut total_bytes = 0u64;
+    let mut largest_member = 0u64;
+    for member in members {
+        let len = member.unpacked_size().map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "reading source")
+        })?;
+        // A compressed member is coded whole in memory, so it keeps to 32-bit sizes.
+        let validate = if compresses {
+            validate_volume_member
+        } else {
+            validate_member
+        };
+        validate(member.name, options.target, len).map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "preparing volume member")
+        })?;
+        if member.file_comment.is_some() {
+            return Err(Error::UnsupportedFeature {
+                version: options.target,
+                feature: "volume_file_comment",
+            });
+        }
+        total_bytes = total_bytes.saturating_add(len);
+        largest_member = largest_member.max(len);
     }
     let header_password = if options.features.header_encryption {
-        validate_header_encrypted_archive_options(options.target, member.password.is_some())?;
-        Some(member.password.ok_or(Error::NeedPassword)?)
+        validate_header_encrypted_archive_options(
+            options.target,
+            members.iter().any(|member| member.password.is_some()),
+        )?;
+        Some(header_encryption_password(
+            members.iter().map(|member| member.password),
+        )?)
     } else {
         None
     };
-    if source_len == 0 {
-        return Err(Error::InvalidArgument(
-            "RAR 1.5 volume writer needs a non-empty packed payload",
-        )
-        .at_entry(name.to_vec(), "preparing volume member"));
+    if total_bytes == 0 {
+        let error =
+            Error::InvalidArgument("RAR 1.5 volume writer needs a non-empty packed payload");
+        return Err(match members {
+            [only] => error.at_entry(only.name.to_vec(), "preparing volume member"),
+            _ => Error::InvalidArgument("legacy volume set has no member data to split"),
+        });
     }
-    let cipher = CipherPlan::new(options.target, member.password).map_err(|error| {
-        crate::write_stream::member_error(error, name, "encrypting volume member")
-    })?;
-    let packed_len = cipher.packed_len(source_len)?;
     if volume_size == 0 {
         return Err(Error::InvalidArgument("volume size must be non-zero"));
     }
+    let solid = options.features.solid && compresses;
+    if compresses && options.dictionary_size.is_none() {
+        // A solid run is one stream, so its window reaches back across members.
+        let reach = if solid { total_bytes } else { largest_member };
+        options.dictionary_size = Some(fitted_dictionary_size(options.target, reach));
+    }
 
-    let work = WorkTracker::new(Some(progress), WriteOperation::Emission, source_len);
+    let operation = if compresses {
+        WriteOperation::Compression
+    } else {
+        WriteOperation::Emission
+    };
+    // RAR 2.0 walks a non-solid member twice, once to pick a method and once to encode it.
+    let total_work = if compresses && options.target == ArchiveVersion::Rar20 && !solid {
+        total_bytes.saturating_mul(2)
+    } else {
+        total_bytes
+    };
     progress.report(WriteProgressEvent::OperationStarted {
-        operation: WriteOperation::Emission,
-        total_bytes: Some(source_len),
-        total_entries: Some(1),
+        operation,
+        total_bytes: Some(total_work),
+        total_entries: Some(members.len()),
         pass: 1,
     });
-    // Derive the key before the volume headers do, so a bad password names the member.
-    let payload = PackedStream::open(&member.bytes, source_len, &cipher, progress, Some(&work))
-        .map_err(|error| {
+    let work = WorkTracker::new(Some(progress), operation, total_work);
+    let mut solid_encoder = if solid {
+        Some(SolidEncoder::for_target(options)?)
+    } else {
+        None
+    };
+    let mut solid_run_has_member = false;
+    // Opened once the first member's key is derived, so a bad password names the member.
+    let mut packer = None;
+    let mut sink = Some(sink);
+    let reserves = if writes_end_block(options.target) {
+        vec![0; members.len()]
+    } else {
+        boundary_reserves(members, options.target)?
+    };
+    for (member, &reserve) in members.iter().zip(&reserves) {
+        let name = member.name;
+        let encoded = if compresses && !member.is_directory {
+            Some(
+                encode_member(
+                    member,
+                    options,
+                    coding,
+                    &mut solid_encoder,
+                    resources,
+                    &work,
+                )
+                .map_err(|error| {
+                    crate::write_stream::member_error(error, name, "compressing volume member")
+                })?,
+            )
+        } else {
+            None
+        };
+        let (packed, unpacked_size, method, final_crc) = match encoded {
+            Some(EncodedMember {
+                payload: MemberPayload::Packed(packed),
+                method,
+                unpacked_size,
+                file_crc,
+            }) => (Some(packed), unpacked_size, method, Some(file_crc)),
+            Some(_) => {
+                return Err(Error::WriterFailure(
+                    "compressed volume member came back uncoded",
+                ))
+            }
+            None => {
+                let len = member.unpacked_size()?;
+                if member.is_directory && len != 0 {
+                    return Err(crate::write_stream::member_error(
+                        Error::InvalidArgument("directory source must be empty"),
+                        name,
+                        "preparing volume member",
+                    ));
+                }
+                (None, len, 0x30, None)
+            }
+        };
+        let packed_bytes = packed.as_deref().map(MemberBytes::Borrowed);
+        let bytes = packed_bytes.as_ref().unwrap_or(&member.bytes);
+        // As the plain writer chains them: a stored member restarts the run,
+        // and an empty one leaves it as it was.
+        let solid_continuation =
+            solid && (method != 0x30 || member.is_directory) && solid_run_has_member;
+        if !member.is_directory {
+            if method == 0x30 {
+                solid_run_has_member = false;
+            } else if unpacked_size != 0 {
+                solid_run_has_member = true;
+            }
+        }
+        let cipher = CipherPlan::new(options.target, member.password).map_err(|error| {
             crate::write_stream::member_error(error, name, "encrypting volume member")
         })?;
-    let mut packer = VolumePacker::new(
-        sink,
-        volume_size as u64,
-        options.target,
-        0,
-        header_password,
-        progress,
-    )?;
-    let member = VolumeMember {
-        name,
-        target: options.target,
-        unpacked_size: source_len,
-        file_time: member.file_time,
-        file_attr: member.file_attr,
-        host_os: member.host_os,
-        method: 0x30,
-        dictionary_flags: dictionary_flags_for_options(options)?,
-        file_flags: writer_file_flags(member.password, None, false)
-            | if cipher.salt.is_some() { FHD_SALT } else { 0 },
-        salt: cipher.salt,
-        packed_len,
-        final_crc: None,
-        payload,
-    };
-    packer.expect_only(&member)?;
-    packer.write_member(member)?;
-    packer.finish()?;
+        let packed_source_len = bytes.len()?;
+        let packed_len = cipher.packed_len(packed_source_len)?;
+        let stored_work = (!compresses).then_some(&work);
+        let payload = PackedStream::open(bytes, packed_source_len, &cipher, progress, stored_work)
+            .map_err(|error| {
+                crate::write_stream::member_error(error, name, "encrypting volume member")
+            })?;
+        let volume_member = VolumeMember {
+            name,
+            target: options.target,
+            unpacked_size,
+            file_time: member.file_time,
+            file_attr: member.file_attr,
+            host_os: member.host_os,
+            method,
+            dictionary_flags: if member.is_directory && options.target != ArchiveVersion::Rar15 {
+                FHD_DIRECTORY_MASK
+            } else {
+                dictionary_flags_for_options(options)?
+            },
+            file_flags: writer_file_flags(member.password, None, solid_continuation)
+                | if cipher.salt.is_some() { FHD_SALT } else { 0 },
+            salt: cipher.salt,
+            packed_len,
+            final_crc,
+            payload,
+        };
+        if packer.is_none() {
+            let mut opened = VolumePacker::new(
+                sink.take().expect("the packer opens once"),
+                volume_size as u64,
+                options.target,
+                if solid { MHD_SOLID } else { 0 },
+                header_password,
+                progress,
+            )?;
+            if members.len() == 1 {
+                opened.expect_only(&volume_member)?;
+            }
+            packer = Some(opened);
+        }
+        packer
+            .as_mut()
+            .expect("opened above")
+            .write_member(volume_member, reserve)?;
+    }
+    packer.expect("a set with data has a member").finish()?;
     if !work.finish() {
         return Err(Error::Cancelled);
     }
     progress.report(WriteProgressEvent::OperationFinished {
-        operation: WriteOperation::Emission,
-        total_bytes: Some(source_len),
-        total_entries: Some(1),
+        operation,
+        total_bytes: Some(total_work),
+        total_entries: Some(members.len()),
         pass: 1,
     });
     crate::write_progress::check_cancelled(Some(progress))
 }
 
-pub(super) struct PackedSplit<'a> {
-    pub(super) name: &'a [u8],
-    pub(super) unpacked: &'a [u8],
-    pub(super) packed: &'a [u8],
-    pub(super) method: u8,
-    pub(super) file_time: u32,
-    pub(super) file_attr: u32,
-    pub(super) host_os: u8,
-    pub(super) password: Option<&'a [u8]>,
+/// RAR 1.5 and 2.0 volumes have no end block, so a reader moves to the next
+/// volume only when the last member in one continues there. Each entry is the
+/// room to leave after that member's last byte so the next member with data
+/// starts in the same volume; empty members between them have no data to
+/// split, so their headers are counted too.
+fn boundary_reserves(members: &[Member<'_>], target: ArchiveVersion) -> Result<Vec<u64>> {
+    let mut reserves = vec![0u64; members.len()];
+    for index in (0..members.len().saturating_sub(1)).rev() {
+        let next = &members[index + 1];
+        let header = header_len_bound(next, target)?;
+        reserves[index] = if next.unpacked_size()? == 0 {
+            header.saturating_add(reserves[index + 1])
+        } else {
+            header.saturating_add(1)
+        };
+    }
+    Ok(reserves)
 }
 
-/// Splits a member that has already been packed, encrypting it as it is copied.
-pub(super) fn split_packed(
-    member: PackedSplit<'_>,
-    options: WriterOptions,
-    volume_size: usize,
-    sink: &mut dyn VolumeSink,
-    progress: ProgressReporter<'_>,
-) -> Result<()> {
-    crate::write_progress::check_cancelled(Some(progress))?;
-    let name = member.name;
-    let header_password = if options.features.header_encryption {
-        validate_header_encrypted_archive_options(options.target, member.password.is_some())?;
-        Some(member.password.ok_or(Error::NeedPassword)?)
-    } else {
-        None
-    };
-    if member.packed.is_empty() {
-        return Err(Error::InvalidArgument(
-            "RAR 1.5 volume writer needs a non-empty packed payload",
-        )
-        .at_entry(name.to_vec(), "preparing volume member"));
-    }
-    let cipher = CipherPlan::new(options.target, member.password).map_err(|error| {
-        crate::write_stream::member_error(error, name, "encrypting volume member")
-    })?;
-    let packed_len = cipher.packed_len(member.packed.len() as u64)?;
-    if volume_size == 0 {
-        return Err(Error::InvalidArgument("volume size must be non-zero"));
-    }
-    let packed = MemberBytes::Borrowed(member.packed);
-    let payload = PackedStream::open(&packed, member.packed.len() as u64, &cipher, progress, None)
-        .map_err(|error| {
-            crate::write_stream::member_error(error, name, "encrypting volume member")
-        })?;
-    let main_flags = if options.features.solid { MHD_SOLID } else { 0 };
-    let mut packer = VolumePacker::new(
-        sink,
-        volume_size as u64,
-        options.target,
-        main_flags,
-        header_password,
-        progress,
+/// At least the length of a member's RAR 1.5 or 2.0 file header, which has no
+/// salt: only the name and whether the sizes need high words change it.
+fn header_len_bound(member: &Member<'_>, target: ArchiveVersion) -> Result<u64> {
+    let unpacked_size = member.unpacked_size()?;
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        &FileRecord {
+            head_type: FILE_HEAD,
+            name: member.name,
+            unpacked_size,
+            file_crc: 0,
+            // Coding or cipher padding can make the packed size the larger.
+            packed_size: unpacked_size.saturating_add(64),
+            file_time: 0,
+            file_attr: 0,
+            host_os: 0,
+            target,
+            method: 0x30,
+            dictionary_flags: 0,
+            flags: 0,
+            salt: None,
+            extra: &[],
+        },
     )?;
-    let member = VolumeMember {
-        name,
-        target: options.target,
-        unpacked_size: member.unpacked.len() as u64,
-        file_time: member.file_time,
-        file_attr: member.file_attr,
-        host_os: member.host_os,
-        method: member.method,
-        dictionary_flags: dictionary_flags_for_options(options)?,
-        file_flags: writer_file_flags(member.password, None, false)
-            | if cipher.salt.is_some() { FHD_SALT } else { 0 },
-        salt: cipher.salt,
-        packed_len,
-        final_crc: Some(crc32(member.unpacked)),
-        payload,
-    };
-    packer.expect_only(&member)?;
-    packer.write_member(member)?;
-    packer.finish()
+    Ok(header.len() as u64)
 }
 
 /// Header fields and two readers over one member's packed bytes.
@@ -297,6 +403,8 @@ struct OpenVolume {
     out: Box<dyn crate::volume_sink::VolumeOutput>,
     used: u64,
     fragments: u64,
+    /// The last fragment in it finishes its member.
+    ends_member: bool,
     /// CRC32 of the volume's bytes so far, as they end up once headers are patched.
     crc: u32,
 }
@@ -348,16 +456,19 @@ impl<'a> VolumePacker<'a> {
             .len() as u64)
     }
 
-    fn write_member(&mut self, mut member: VolumeMember<'_>) -> Result<()> {
+    /// `reserve` is the room to leave after the member's last byte, or it goes on into the next volume.
+    fn write_member(&mut self, mut member: VolumeMember<'_>, reserve: u64) -> Result<()> {
         let name = member.name;
-        self.write_fragments(&mut member).map_err(|error| {
+        self.write_fragments(&mut member, reserve).map_err(|error| {
             crate::write_stream::member_error(error, name, "writing volume member")
         })
     }
 
-    fn write_fragments(&mut self, member: &mut VolumeMember<'_>) -> Result<()> {
+    fn write_fragments(&mut self, member: &mut VolumeMember<'_>, reserve: u64) -> Result<()> {
         let header_len = self.header_len(member)?;
         let mut start = 0;
+        // A fragment can be empty, so `start` alone doesn't say whether one came before.
+        let mut continued = false;
         loop {
             crate::write_progress::check_cancelled(Some(self.progress))?;
             if self.open.is_none() {
@@ -370,16 +481,33 @@ impl<'a> VolumePacker<'a> {
                 .saturating_sub(self.tail_len)
                 .saturating_sub(header_len);
             let remaining = member.packed_len - start;
-            if room == 0 && remaining > 0 {
+            // A member with no data still needs room for its header.
+            let header_fits = volume.used + self.tail_len + header_len <= self.volume_size;
+            if !header_fits || (room == 0 && remaining > 0) {
                 if volume.fragments == 0 {
                     return Err(Error::InvalidArgument(
                         "volume size is too small to hold the volume headers",
                     ));
                 }
+                // Readers would stop at this volume: see `boundary_reserves`.
+                if volume.ends_member && !writes_end_block(self.target) {
+                    return Err(Error::InvalidArgument(
+                        "volume size is too small to hold the end of one member and the start of the next",
+                    ));
+                }
                 self.close_volume(true)?;
                 continue;
             }
-            let len = remaining.min(room);
+            let mut len = remaining.min(room);
+            if len == remaining && remaining > 0 && room - remaining < reserve {
+                if remaining == 1 && volume.fragments == 0 {
+                    // A fresh volume would do the same again.
+                    return Err(Error::InvalidArgument(
+                        "volume size is too small to hold the end of one member and the start of the next",
+                    ));
+                }
+                len = remaining - 1;
+            }
             let split_after = start + len < member.packed_len;
             // The header carries the CRC of what follows it, so it goes out as
             // a placeholder and is patched once the payload has been copied.
@@ -392,7 +520,7 @@ impl<'a> VolumePacker<'a> {
                 (false, None) => member.payload.unpacked_crc(),
             };
             let header =
-                member.header(start > 0, split_after, len, file_crc, self.header_password)?;
+                member.header(continued, split_after, len, file_crc, self.header_password)?;
             if header.len() as u64 != header_len {
                 return Err(Error::WriterFailure(
                     "legacy file header changed length when patched",
@@ -410,7 +538,9 @@ impl<'a> VolumePacker<'a> {
             volume.crc = crc32_combine(volume.crc, fragment_crc, len);
             volume.used += header_len + len;
             volume.fragments += 1;
+            volume.ends_member = !split_after;
             start += len;
+            continued = true;
             if !split_after {
                 return Ok(());
             }
@@ -457,6 +587,7 @@ impl<'a> VolumePacker<'a> {
             out,
             used: head.len() as u64,
             fragments: 0,
+            ends_member: false,
             crc: crc32(&head),
         });
         Ok(())

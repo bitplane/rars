@@ -2181,7 +2181,7 @@ fn rejects_multivolume_with_multiple_inputs() {
         .output()
         .unwrap();
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("multivolume writer supports one input file"));
+    assert!(stderr(&output).contains("RAR 1.3 volume sets hold one regular input file"));
 }
 
 #[test]
@@ -2560,13 +2560,40 @@ fn modern_volumes_preserve_empty_directories_alongside_split_files() {
 }
 
 #[test]
-fn legacy_volumes_reject_directory_inputs_before_writing_any_members() {
+fn rar13_volumes_reject_directory_inputs_before_writing_any_members() {
     let dir = scratch("legacy-volume-directory");
     let input = dir.join("tree");
     fs::create_dir(&input).unwrap();
     fs::write(input.join("one"), b"first").unwrap();
     fs::write(input.join("two"), b"second").unwrap();
-    for format in ["rar14", "rar15", "rar20", "rar29", "rar30", "rar40"] {
+    let archive = dir.join("rar14.rar");
+    let add = rars()
+        .args(["a", "--store", "--volume-size", "1k", "--format", "rar14"])
+        .arg(&archive)
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        !add.status.success(),
+        "rar14 must reject a tree rather than discard its members"
+    );
+    assert!(
+        stderr(&add).contains("one regular input file"),
+        "{}",
+        stderr(&add)
+    );
+    assert!(!archive.exists());
+}
+
+#[test]
+fn legacy_volumes_keep_every_member_of_a_directory_input() {
+    let dir = scratch("legacy-volume-tree");
+    let input = dir.join("tree");
+    fs::create_dir_all(input.join("empty")).unwrap();
+    let payload = deterministic_noise(4096);
+    fs::write(input.join("one"), &payload).unwrap();
+    fs::write(input.join("two"), b"second").unwrap();
+    for format in ["rar15", "rar20", "rar29", "rar30", "rar40"] {
         let archive = dir.join(format!("{format}.rar"));
         let add = rars()
             .args(["a", "--store", "--volume-size", "1k", "--format", format])
@@ -2574,16 +2601,17 @@ fn legacy_volumes_reject_directory_inputs_before_writing_any_members() {
             .arg(&input)
             .output()
             .unwrap();
-        assert!(
-            !add.status.success(),
-            "{format} must reject a tree rather than discard its members"
+        assert!(add.status.success(), "{format}: {}", stderr(&add));
+        let out = dir.join(format!("{format}-out"));
+        let extract = rars().arg("x").arg(&archive).arg(&out).output().unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert!(out.join("tree/empty").is_dir(), "{format}");
+        assert_eq!(fs::read(out.join("tree/one")).unwrap(), payload, "{format}");
+        assert_eq!(
+            fs::read(out.join("tree/two")).unwrap(),
+            b"second",
+            "{format}"
         );
-        assert!(
-            stderr(&add).contains("one regular input file"),
-            "{format}: {}",
-            stderr(&add)
-        );
-        assert!(!archive.exists());
     }
 }
 
@@ -7559,5 +7587,101 @@ fn volume_names_follow_the_case_of_the_first_volume() {
         };
         let test = rars().arg("test").arg(first_path).output().unwrap();
         assert!(test.status.success(), "{format}: {}", stderr(&test));
+    }
+}
+
+#[test]
+fn legacy_volume_sets_hold_several_inputs_including_rar_sets() {
+    let root = scratch("legacy-volume-set-members");
+    let inner = root.join("inner");
+    fs::create_dir(&inner).unwrap();
+    let inner_source = root.join("inner.bin");
+    fs::write(&inner_source, deterministic_noise(5_000)).unwrap();
+    let create_inner = rars()
+        .args(["add", "--format", "rar40", "--store", "--volume-size", "2k"])
+        .arg(inner.join("release.rar"))
+        .arg(&inner_source)
+        .output()
+        .unwrap();
+    assert!(create_inner.status.success(), "{}", stderr(&create_inner));
+    fs::create_dir(inner.join("empty")).unwrap();
+    let movie = root.join("a.mkv");
+    let notes = root.join("c.nfo");
+    fs::write(&movie, deterministic_noise(9_000)).unwrap();
+    fs::write(&notes, b"several members in one legacy set\n".repeat(40)).unwrap();
+    let mut inputs: Vec<_> = fs::read_dir(&inner)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "empty")
+        .collect();
+    inputs.sort();
+    assert!(inputs.len() > 1, "inner set should span volumes");
+
+    let cases: [(&str, &[&str]); 6] = [
+        ("rar40", &["--store"]),
+        ("rar40", &[]),
+        ("rar29", &[]),
+        ("rar20", &["--store"]),
+        ("rar40", &["--solid"]),
+        ("rar40", &["--password", "secret", "--encrypt-headers"]),
+    ];
+    for (index, (format, flags)) in cases.into_iter().enumerate() {
+        let case = root.join(format!("{index}-{format}"));
+        fs::create_dir(&case).unwrap();
+        let archive = case.join("out.rar");
+        let password = flags.contains(&"--password");
+        let mut create = rars();
+        create.args(["add", "--format", format, "--volume-size", "3k"]);
+        create.args(flags);
+        let create = create
+            .arg(&archive)
+            .arg(&movie)
+            .arg(&inner)
+            .arg(&notes)
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "{format}: {}", stderr(&create));
+        let out = case.join("x");
+        let mut extract = rars();
+        extract.arg("extract");
+        if password {
+            extract.args(["--password", "secret"]);
+        }
+        let extract = extract.arg(&archive).arg(&out).output().unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert_eq!(
+            fs::read(out.join("a.mkv")).unwrap(),
+            fs::read(&movie).unwrap()
+        );
+        assert_eq!(
+            fs::read(out.join("c.nfo")).unwrap(),
+            fs::read(&notes).unwrap()
+        );
+        assert!(out.join("inner/empty").is_dir());
+        for name in &inputs {
+            assert_eq!(
+                fs::read(out.join("inner").join(name)).unwrap(),
+                fs::read(inner.join(name)).unwrap(),
+                "{format}: {name:?}"
+            );
+        }
+        let mut test = rars();
+        test.arg("test");
+        if password {
+            test.args(["--password", "secret"]);
+        }
+        let test = test.arg(&archive).output().unwrap();
+        assert!(test.status.success(), "{format}: {}", stderr(&test));
+        match Command::new("unrar")
+            .args(["t", "-idq", if password { "-psecret" } else { "-p-" }])
+            .arg(&archive)
+            .output()
+        {
+            Ok(result) => assert!(result.status.success(), "{format}: {}", stderr(&result)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                eprintln!("unrar unavailable; reference check skipped")
+            }
+            Err(error) => panic!("unrar: {error}"),
+        }
     }
 }

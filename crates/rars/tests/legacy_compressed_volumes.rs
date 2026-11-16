@@ -101,12 +101,14 @@ fn compressed_volumes_match_the_collecting_writer_byte_for_byte() {
         (ArchiveVersion::Rar29, plain, None, &data, rar29_family),
         (ArchiveVersion::Rar30, plain, None, &data, rar29_family),
         (ArchiveVersion::Rar40, plain, None, &data, rar29_family),
+        // Coded through the solid encoder since sets took several members, as
+        // a plain solid archive codes it.
         (
             ArchiveVersion::Rar40,
             features(true, false),
             None,
             &data,
-            &[(4000, 1229085140), (4000, 4189036031), (1610, 684340468)],
+            &[(4000, 3767647119), (4000, 1883229518), (706, 3369210247)],
         ),
         (
             ArchiveVersion::Rar15,
