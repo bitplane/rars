@@ -6,6 +6,8 @@ use super::super::{
 };
 use super::standard_filters::rgb_predict;
 use super::*;
+use std::io::Read;
+use std::ops::ControlFlow;
 
 const MAX_VM_FILTER_BLOCK_SIZE: usize = 128 * 1024;
 // The standard AUDIO bytecode uses separate input/output regions inside RARVM
@@ -946,32 +948,147 @@ fn encode_member_blocks(
     options.block_size = None;
     let mut out = Vec::new();
     for_each_block(
-        input,
-        history,
+        &mut InMemory::new(input, history, options),
         options,
         block_size,
         progress,
         |_, end, tokens| {
             out.extend_from_slice(&code_block(tokens, &[], end < input.len(), levels)?);
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         },
-    )?;
+    )?
+    .continue_value()
+    .expect("an in-memory member codes every block");
     Ok(out)
 }
 
+/// The bytes of [`unpack29_encode_literals_with_options`] without holding the member; `out` breaks to abandon it.
+pub(crate) fn unpack29_encode_literals_streamed(
+    input: &mut dyn Read,
+    len: usize,
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+) -> Result<ControlFlow<()>> {
+    let mut options = options.constrained();
+    let Some(block_size) = options.block_size.filter(|&size| size != 0 && len > size) else {
+        // A single block parses against a smaller finder, so it is read whole to match.
+        let mut data = Vec::with_capacity(len);
+        input.take(len as u64).read_to_end(&mut data)?;
+        if data.len() != len {
+            return Err(Error::NeedMoreInput);
+        }
+        return out(&unpack29_encode_literals_with_options_and_progress(
+            &data, options, progress,
+        )?);
+    };
+    options.block_size = None;
+    let mut levels = [0; TABLE_COUNT];
+    for_each_block(
+        &mut ReadSegments {
+            input,
+            len,
+            window: Vec::new(),
+        },
+        options,
+        block_size,
+        Some(progress),
+        |_, end, tokens| out(&code_block(tokens, &[], end < len, &mut levels)?),
+    )
+}
+
+/// Where a block parse reads its member from, one segment at a time.
+trait Segments {
+    fn len(&self) -> usize;
+
+    /// `start - behind..end`, after history when `behind` falls short of the reach.
+    fn segment(
+        &mut self,
+        start: usize,
+        behind: usize,
+        end: usize,
+        reach: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>>;
+}
+
+struct InMemory<'a> {
+    input: &'a [u8],
+    history: &'a [u8],
+}
+
+impl<'a> InMemory<'a> {
+    fn new(input: &'a [u8], history: &'a [u8], options: EncodeOptions) -> Self {
+        let reach = options.max_match_distance.min(MAX_HISTORY);
+        Self {
+            input,
+            history: &history[history.len().saturating_sub(reach)..],
+        }
+    }
+}
+
+impl Segments for InMemory<'_> {
+    fn len(&self) -> usize {
+        self.input.len()
+    }
+
+    fn segment(
+        &mut self,
+        start: usize,
+        behind: usize,
+        end: usize,
+        reach: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>> {
+        let (input, history) = (self.input, self.history);
+        Ok(if behind == reach || history.is_empty() {
+            std::borrow::Cow::Borrowed(&input[start - behind..end])
+        } else {
+            let carried = &history[history.len().saturating_sub(reach - behind)..];
+            let mut joined = Vec::with_capacity(carried.len() + end - start + behind);
+            joined.extend_from_slice(carried);
+            joined.extend_from_slice(&input[start - behind..end]);
+            std::borrow::Cow::Owned(joined)
+        })
+    }
+}
+
+/// Keeps the last reach of what it has read, which is all a segment looks back at.
+struct ReadSegments<'a> {
+    input: &'a mut dyn Read,
+    len: usize,
+    window: Vec<u8>,
+}
+
+impl Segments for ReadSegments<'_> {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn segment(
+        &mut self,
+        start: usize,
+        behind: usize,
+        end: usize,
+        _reach: usize,
+    ) -> Result<std::borrow::Cow<'_, [u8]>> {
+        self.window.drain(..self.window.len() - behind);
+        self.window.resize(behind + end - start, 0);
+        self.input.read_exact(&mut self.window[behind..])?;
+        Ok(std::borrow::Cow::Borrowed(&self.window))
+    }
+}
+
 fn for_each_block(
-    input: &[u8],
-    history: &[u8],
+    input: &mut dyn Segments,
     options: EncodeOptions,
     block_size: usize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    mut code: impl FnMut(usize, usize, &[EncodeToken]) -> Result<()>,
-) -> Result<()> {
+    mut code: impl FnMut(usize, usize, &[EncodeToken]) -> Result<ControlFlow<()>>,
+) -> Result<ControlFlow<()>> {
     let block_size = block_size.max(1);
     let reach = options.max_match_distance.min(MAX_HISTORY);
-    let history = &history[history.len().saturating_sub(reach)..];
-    let mut ends: Vec<usize> = (block_size..input.len()).step_by(block_size).collect();
-    ends.push(input.len());
+    let len = input.len();
+    let mut ends: Vec<usize> = (block_size..len).step_by(block_size).collect();
+    ends.push(len);
     let per_batch = (LzParser::batch_bytes(block_size) / block_size).max(1);
     // Segments bound what a parser holds, for one re-hashed reach each.
     let per_segment = per_batch
@@ -983,15 +1100,7 @@ fn for_each_block(
     for segment in ends.chunks(per_segment) {
         let segment_end = *segment.last().expect("chunks are never empty");
         let behind = reach.min(block_start);
-        let combined: std::borrow::Cow<'_, [u8]> = if behind == reach || history.is_empty() {
-            std::borrow::Cow::Borrowed(&input[block_start - behind..segment_end])
-        } else {
-            let carried = &history[history.len().saturating_sub(reach - behind)..];
-            let mut joined = Vec::with_capacity(carried.len() + segment_end - block_start + behind);
-            joined.extend_from_slice(carried);
-            joined.extend_from_slice(&input[block_start - behind..segment_end]);
-            std::borrow::Cow::Owned(joined)
-        };
+        let combined = input.segment(block_start, behind, segment_end, reach)?;
         let base = combined.len() - (segment_end - block_start);
         let mut parser = LzParser::new(&combined, base, options, block_size);
         let origin = block_start;
@@ -1004,7 +1113,9 @@ fn for_each_block(
             }
             let local: Vec<usize> = batch.iter().map(|&end| base + end - origin).collect();
             for (tokens, &end) in parser.parse_blocks(&local).iter().zip(batch) {
-                code(block_start, end, tokens)?;
+                if code(block_start, end, tokens)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
                 block_start = end;
                 if progress.as_deref_mut().is_some_and(|report| !report(end)) {
                     return Err(Error::Cancelled);
@@ -1012,7 +1123,7 @@ fn for_each_block(
             }
         }
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 /// `more_blocks_follow` is what the block's terminator says.
@@ -1328,8 +1439,7 @@ fn encode_filtered_member_blocks(
     let mut programs: Vec<&'static [u8]> = Vec::new();
     let mut out = Vec::new();
     for_each_block(
-        data,
-        history,
+        &mut InMemory::new(data, history, inner),
         inner,
         block_size,
         progress,
@@ -1342,9 +1452,11 @@ fn encode_filtered_member_blocks(
                 .collect();
             let records = encoded_filter_records_at(&in_block, base, window, &mut programs)?;
             out.extend_from_slice(&code_block(tokens, &records, end < data.len(), levels)?);
-            Ok(())
+            Ok(ControlFlow::Continue(()))
         },
-    )?;
+    )?
+    .continue_value()
+    .expect("an in-memory member codes every block");
     Ok(out)
 }
 

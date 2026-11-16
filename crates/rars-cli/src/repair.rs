@@ -5,6 +5,7 @@ use crate::{resolve_password_args, CliError, CliResult};
 use rars::crc32::crc32;
 use rars::Error;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const RAR50_SIGNATURE: &[u8] = b"Rar!\x1a\x07\x01\x00";

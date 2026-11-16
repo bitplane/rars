@@ -4693,3 +4693,55 @@ fn ppmd_members_code_to_the_bytes_before_the_search_ran_ahead() {
         ]
     );
 }
+
+#[test]
+fn a_member_read_in_segments_codes_to_the_in_memory_bytes() {
+    let input = mixed_member(600 * 1024);
+    let options = EncodeOptions::new(64)
+        .with_lazy_matching(true)
+        .with_max_match_distance(16 * 1024)
+        .with_block_size(4096);
+    let mut streamed = Vec::new();
+    let mut blocks = 0;
+    let flow = super::unpack29_encode_literals_streamed(
+        &mut &input[..],
+        input.len(),
+        options,
+        &mut |_| true,
+        &mut |block| {
+            blocks += 1;
+            streamed.extend_from_slice(block);
+            Ok(std::ops::ControlFlow::Continue(()))
+        },
+    )
+    .unwrap();
+
+    assert_eq!(flow, std::ops::ControlFlow::Continue(()));
+    assert_eq!(blocks, input.len().div_ceil(4096));
+    assert_eq!(packed_fingerprint(&streamed), (146_951, 4_071_059_742));
+}
+
+#[test]
+fn a_streamed_member_stops_at_the_block_its_sink_refuses() {
+    let input = mixed_member(64 * 1024);
+    let options = EncodeOptions::new(8).with_block_size(4096);
+    let mut blocks = 0;
+    let flow = super::unpack29_encode_literals_streamed(
+        &mut &input[..],
+        input.len(),
+        options,
+        &mut |_| true,
+        &mut |_| {
+            blocks += 1;
+            Ok(if blocks == 3 {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            })
+        },
+    )
+    .unwrap();
+
+    assert_eq!(flow, std::ops::ControlFlow::Break(()));
+    assert_eq!(blocks, 3);
+}

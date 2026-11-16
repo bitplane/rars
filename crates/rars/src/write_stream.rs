@@ -185,13 +185,12 @@ impl<'a> MemberBytes<'a> {
     }
 
     /// A reader over the member, for callers that walk it more than once.
-    pub(crate) fn open(&self) -> Result<Box<dyn Read + 'a>> {
+    pub(crate) fn open(&self) -> Result<Box<dyn crate::streaming::EntryReader + 'a>> {
         match self {
-            Self::Borrowed(data) => Ok(Box::new(*data)),
-            Self::Source(source) | Self::NamedSource(source, _) => source
-                .open()
-                .map(|reader| Box::new(reader) as Box<dyn Read + 'a>)
-                .map_err(|error| self.source_error(error)),
+            Self::Borrowed(data) => Ok(Box::new(std::io::Cursor::new(*data))),
+            Self::Source(source) | Self::NamedSource(source, _) => {
+                source.open().map_err(|error| self.source_error(error))
+            }
         }
     }
 
