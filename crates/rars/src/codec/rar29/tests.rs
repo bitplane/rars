@@ -851,8 +851,13 @@ fn huffman_decoding_returns_the_index_from_its_constructor_alphabet() {
 }
 
 fn table_description(level_lengths: &[u8; 20], tokens: &[LevelToken]) -> Vec<u8> {
-    let codes = canonical_codes(level_lengths);
     let mut bits = BitWriter::default();
+    write_table_description(&mut bits, level_lengths, tokens);
+    bits.finish()
+}
+
+fn write_table_description(bits: &mut BitWriter, level_lengths: &[u8; 20], tokens: &[LevelToken]) {
+    let codes = canonical_codes(level_lengths);
     bits.write_bit(false);
     bits.write_bit(false);
     for &length in level_lengths {
@@ -863,7 +868,6 @@ fn table_description(level_lengths: &[u8; 20], tokens: &[LevelToken]) -> Vec<u8>
         bits.write_bits(u32::from(code.code), code.len);
         bits.write_bits(u32::from(token.extra_value), token.extra_bits);
     }
-    bits.finish()
 }
 
 fn encoded_table_description(levels: &[u8; TABLE_COUNT]) -> Vec<u8> {
@@ -1160,6 +1164,80 @@ fn rejects_an_lz_literal_after_the_declared_member_size() {
         unpack29_decode(&packed, input.len() - 1),
         Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"))
     ));
+}
+
+// 'A' has the all-zero code, so zero padding would read as more 'A's.
+fn literal_levels() -> [u8; TABLE_COUNT] {
+    let mut levels = [0; TABLE_COUNT];
+    levels[usize::from(b'A')] = 1;
+    levels[usize::from(b'B')] = 2;
+    levels[256] = 2;
+    levels
+}
+
+fn write_literals_without_end_marker(bits: &mut BitWriter, literals: &[u8]) {
+    let codes = canonical_codes(&literal_levels()[..MAIN_COUNT]);
+    for &literal in literals {
+        let code = codes[usize::from(literal)].unwrap();
+        bits.write_bits(u32::from(code.code), code.len);
+    }
+}
+
+fn literal_member_without_end_marker(literals: &[u8]) -> Vec<u8> {
+    let tokens = encode_table_level_tokens(&literal_levels());
+    let mut bits = BitWriter::default();
+    write_table_description(&mut bits, &level_code_lengths(&tokens), &tokens);
+    write_literals_without_end_marker(&mut bits, literals);
+    bits.finish()
+}
+
+#[test]
+fn an_lz_member_may_end_on_the_zero_padding_of_its_last_byte() {
+    // Each extra 'A' moves the last code's end one bit, through every padding width.
+    for count in 0..8 {
+        let mut input = b"B".to_vec();
+        input.extend(std::iter::repeat_n(b'A', count));
+        let packed = literal_member_without_end_marker(&input);
+
+        assert_eq!(unpack29_decode(&packed, input.len()).unwrap(), input);
+        let mut streamed = Vec::new();
+        Unpack29::new()
+            .decode_member_from_reader(&mut &packed[..], input.len(), &mut streamed)
+            .unwrap();
+        assert_eq!(streamed, input);
+    }
+}
+
+#[test]
+fn a_whole_zero_byte_after_the_last_lz_code_is_trailing_data() {
+    let input = b"BAA";
+    let mut packed = literal_member_without_end_marker(input);
+    packed.push(0);
+
+    assert!(matches!(
+        unpack29_decode(&packed, input.len()),
+        Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"))
+    ));
+}
+
+#[test]
+fn a_solid_follower_of_an_lz_member_ended_on_padding_keeps_its_tables() {
+    let first = literal_member_without_end_marker(b"BA");
+    let mut second = BitWriter::default();
+    write_literals_without_end_marker(&mut second, b"AB");
+    let mut decoder = Unpack29::new();
+
+    assert_eq!(
+        decoder.decode_member_owned(&first, 2).unwrap().into_vec(),
+        b"BA"
+    );
+    assert_eq!(
+        decoder
+            .decode_member_owned(&second.finish(), 2)
+            .unwrap()
+            .into_vec(),
+        b"AB"
+    );
 }
 
 #[test]
