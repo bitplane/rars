@@ -1,0 +1,2 @@
+# The compiled extension inside the package; rars.pyi types what it re-exports.
+rars.rars

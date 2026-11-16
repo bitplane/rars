@@ -36,10 +36,10 @@ def create_venv(path: Path, keep: bool) -> Path:
 def install_dev_tools(python: Path) -> None:
     uv = shutil.which("uv")
     if uv:
-        run([uv, "pip", "install", "--python", str(python), "maturin>=1.8,<2", "pytest"])
+        run([uv, "pip", "install", "--python", str(python), "maturin>=1.8,<2", "pytest", "mypy"])
     else:
         run([str(python), "-m", "pip", "install", "--upgrade", "pip"])
-        run([str(python), "-m", "pip", "install", "maturin>=1.8,<2", "pytest"])
+        run([str(python), "-m", "pip", "install", "maturin>=1.8,<2", "pytest", "mypy"])
 
 
 def smoke_script() -> str:
@@ -112,6 +112,18 @@ def main() -> int:
             "crates/rars-python/Cargo.toml",
             "--features",
             "extension-module",
+        ],
+        env=env,
+    )
+    # Fails when rars.pyi and the compiled module disagree on a name or signature.
+    run(
+        [
+            str(python),
+            "-m",
+            "mypy.stubtest",
+            "rars",
+            "--allowlist",
+            str(ROOT / "scripts/stubtest-allowlist.txt"),
         ],
         env=env,
     )
