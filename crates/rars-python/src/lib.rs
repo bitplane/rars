@@ -415,6 +415,8 @@ struct ReadState {
     seen_bytes: u64,
     seen_entries: usize,
     total_known: bool,
+    /// The set's headers gave the total before reading, so volumes add nothing to it.
+    listed: bool,
     started: usize,
     entry_name: Option<Vec<u8>>,
     volume: Option<usize>,
@@ -458,8 +460,19 @@ impl ReadProgress {
             state.see(&member.meta, chosen(index));
         }
         state.volume = first.is_volume().then_some(1);
-        state.total_known = alone || volume_end(first) == VolumeEnd::Last;
+        state.total_known = state.listed || alone || volume_end(first) == VolumeEnd::Last;
         self.report(state, false);
+    }
+
+    fn list(&self, infos: &[RarInfo], chosen: &dyn Fn(usize) -> bool) {
+        let mut state = self.lock();
+        for info in infos {
+            if chosen(info.member_index) && !info.is_directory && !info.is_redirection {
+                state.seen_bytes += info.file_size;
+                state.seen_entries += 1;
+            }
+        }
+        state.listed = true;
     }
 
     /// A later volume's members count toward the total only once the set's last volume is known.
@@ -473,7 +486,7 @@ impl ReadProgress {
             state.see(&member.meta, chosen(index));
         }
         state.volume = state.volume.map(|volume| volume + 1);
-        state.total_known = volume_end(volume) == VolumeEnd::Last;
+        state.total_known = state.listed || volume_end(volume) == VolumeEnd::Last;
         self.report(state, false);
     }
 
@@ -578,7 +591,12 @@ impl ReadProgress {
 impl ReadState {
     /// A split member counts at its last part, the only one sure to record its whole size.
     fn see(&mut self, meta: &rars_rs::ArchiveMemberMeta, chosen: bool) {
-        if chosen && !meta.is_split_after && !meta.is_directory && !meta.is_redirection {
+        if !self.listed
+            && chosen
+            && !meta.is_split_after
+            && !meta.is_directory
+            && !meta.is_redirection
+        {
             self.seen_bytes += meta.unpacked_size;
             self.seen_entries += 1;
         }
@@ -679,6 +697,7 @@ struct RarInfo {
     #[pyo3(get)]
     detail: HashMap<String, String>,
     is_directory: bool,
+    is_redirection: bool,
     /// Counted from 0.
     #[pyo3(get)]
     volume: usize,
@@ -1117,7 +1136,11 @@ impl RarFile {
         let first = &self.archive;
         let alone = volumes.is_none() && !first.is_volume();
         if let Some(progress) = &progress {
-            progress.begin(first, &|_| true, alone);
+            if alone {
+                progress.begin(first, &|_| true, true);
+            } else {
+                self.begin_set(py, volumes, options, progress, &|_| true);
+            }
         }
         let result = if alone {
             py.detach(|| match &progress {
@@ -1455,6 +1478,41 @@ impl RarFile {
         })
     }
 
+    /// Reads the set's headers first when every volume is already to hand, so progress has a total from its first event.
+    fn begin_set(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        progress: &ReadProgress,
+        chosen: &dyn Fn(usize) -> bool,
+    ) {
+        // A volume not there yet leaves the total to arrive with the last volume.
+        match volumes {
+            None if self.lists_later_volumes() && !self.first_volume_only => {
+                if let Ok(listing) = self.listing(py) {
+                    progress.list(&listing.infos, chosen);
+                }
+            }
+            Some(volumes) if starts_set(&self.archive) && rereadable(volumes) => {
+                let listing = self.extract_set(py, Some(volumes), options, |later| {
+                    list_later_volumes(
+                        &self.archive,
+                        &self.first,
+                        later,
+                        self.encoding,
+                        &self.identity,
+                    )
+                });
+                if let Ok(listing) = listing {
+                    progress.list(&listing.infos, chosen);
+                }
+            }
+            _ => {}
+        }
+        progress.begin(&self.archive, chosen, false);
+    }
+
     /// A member that continues past, or starts after, the first volume needs the set to read.
     fn needs_later_volumes(&self, index: usize) -> bool {
         self.first
@@ -1545,7 +1603,7 @@ impl RarFile {
         let first = &self.archive;
         let chosen = |index: usize| selected.is_none_or(|selected| selected.contains(&index));
         if let Some(progress) = progress {
-            progress.begin(first, &chosen, false);
+            self.begin_set(py, volumes, options, progress, &chosen);
         }
         self.extract_set(py, volumes, options, |volumes| {
             let mut volumes = tracked(progress.map(Arc::as_ref), volumes, &chosen);
@@ -1592,7 +1650,7 @@ impl RarFile {
         let first = &self.archive;
         let chosen = |index: usize| selected.contains(&index);
         if let Some(progress) = progress {
-            progress.begin(first, &chosen, false);
+            self.begin_set(py, volumes, options, progress, &chosen);
         }
         self.extract_set(py, volumes, options, |volumes| {
             let mut volumes = tracked(progress.map(Arc::as_ref), volumes, &chosen);
@@ -3849,6 +3907,14 @@ fn extract_arriving_selected(
     }
 }
 
+/// Listing walks `volumes` once more before the read, which an iterator or stream can't survive.
+fn rereadable(volumes: &Bound<'_, PyAny>) -> bool {
+    (volumes.is_instance_of::<PyList>() || volumes.is_instance_of::<PyTuple>())
+        && volumes.try_iter().is_ok_and(|mut items| {
+            items.all(|item| item.is_ok_and(|item| is_file_object(&item).is_ok_and(|file| !file)))
+        })
+}
+
 fn watched<'a>(
     progress: &'a Option<Arc<ReadProgress>>,
     options: rars_rs::ArchiveReadOptions<'a>,
@@ -4299,6 +4365,7 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         file_attr: member.meta.file_attr,
         detail,
         is_directory: member.meta.is_directory,
+        is_redirection: member.meta.is_redirection,
         volume: 0,
     }
 }

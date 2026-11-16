@@ -146,3 +146,41 @@ def test_read_many_on_a_set_counts_a_member_after_a_split_one(tmp_path):
     assert {event.phase for event in events} == {"reading"}
     assert events[-1].completed == events[-1].total == len(PAYLOAD) + 5
     assert events[-1].total_entries == 2
+
+
+def test_a_set_found_by_name_knows_its_total_from_the_first_event(tmp_path):
+    paths = write_set(tmp_path / "made")
+    events = []
+
+    with rars.RarFile(paths[0]) as archive:
+        archive.extractall(tmp_path / "out", options=rars.ReadOptions(progress=events.append))
+
+    assert all(event.total == len(PAYLOAD) + 5 for event in events)
+    assert events[0].percentage is not None
+    assert events[0].total_entries == 2
+
+
+def test_a_set_given_as_a_list_knows_its_total_from_the_first_event(tmp_path):
+    paths = write_set(tmp_path / "made")
+    events = []
+
+    with rars.RarFile.from_bytes(paths[0].read_bytes()) as archive:
+        archive.testrar(
+            options=rars.ReadOptions(progress=events.append),
+            volumes=[path.read_bytes() for path in paths[1:]],
+        )
+
+    assert all(event.total == len(PAYLOAD) + 5 for event in events)
+
+
+def test_a_set_with_a_volume_still_missing_falls_back_to_an_unknown_total(tmp_path):
+    paths = write_set(tmp_path / "made")
+    paths[-1].unlink()
+    events = []
+
+    with rars.RarFile(paths[0]) as archive:
+        with pytest.raises(rars.MissingVolume):
+            archive.testrar(options=rars.ReadOptions(progress=events.append))
+
+    assert events
+    assert all(event.total == 0 and event.percentage is None for event in events)
