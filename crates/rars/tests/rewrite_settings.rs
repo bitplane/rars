@@ -636,7 +636,8 @@ fn preservation_preflight_checks_derived_service_and_locator_consistency() {
 
 #[test]
 fn preservation_preflight_checks_every_derived_service_field() {
-    use rars::{rar50, Archive, FileTimes, FileTimestamp};
+    use rars::rar50::{self, RecordTime, TimeRecord};
+    use rars::Archive;
 
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -673,12 +674,12 @@ fn preservation_preflight_checks_every_derived_service_field() {
     check(q, |service| service.encrypted = true);
     check(q, |service| service.mtime = Some(1));
     check(q, |service| {
-        service.file_times = Some(FileTimes {
-            modified: Some(FileTimestamp::Unix {
+        service.file_times = Some(TimeRecord {
+            modified: Some(RecordTime::Unix {
                 seconds: 1,
                 nanoseconds: 0,
             }),
-            ..FileTimes::default()
+            ..TimeRecord::default()
         });
     });
     check(q, |service| service.file_flags |= 8);
@@ -704,7 +705,8 @@ fn preservation_preflight_checks_every_derived_service_field() {
 
 #[test]
 fn preservation_preflight_checks_comment_service_metadata_and_duplicates() {
-    use rars::{rar50, Archive, FileTimes, FileTimestamp};
+    use rars::rar50::{self, RecordTime, TimeRecord};
+    use rars::Archive;
 
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -739,12 +741,12 @@ fn preservation_preflight_checks_comment_service_metadata_and_duplicates() {
     check(|service| service.name = b"OTHER".to_vec());
     check(|service| service.mtime = Some(1));
     check(|service| {
-        service.file_times = Some(FileTimes {
-            modified: Some(FileTimestamp::Unix {
+        service.file_times = Some(TimeRecord {
+            modified: Some(RecordTime::Unix {
                 seconds: 1,
                 nanoseconds: 0,
             }),
-            ..FileTimes::default()
+            ..TimeRecord::default()
         });
     });
     check(|service| service.file_flags |= 8);
@@ -778,7 +780,7 @@ fn legacy_rewrite_helpers_leave_regular_files_without_link_or_modern_metadata() 
     assert_eq!(archive.member_comment_encryption(), [false]);
     assert_eq!(archive.legacy_symlink_targets(None).unwrap(), [None]);
     let member = archive.members().next().unwrap();
-    assert!(member.file_times().unwrap().is_none());
+    assert_eq!(member.times().unwrap().created, None);
     assert!(member.unix_symlink().is_none());
 }
 

@@ -14,7 +14,7 @@ fn unix_symlinks_round_trip_without_resolving_targets() {
                     b"link".to_vec(),
                     b"../missing".to_vec(),
                     false,
-                    Some(123),
+                    Some(rars::Timestamp::from_unix_seconds(123)),
                     Some(0o750),
                 )
                 .unwrap();
@@ -69,7 +69,7 @@ fn archive_redirection_retains_unix_symlink_attributes() {
         b"link".to_vec(),
         b"missing".to_vec(),
         false,
-        Some(123),
+        Some(rars::Timestamp::from_unix_seconds(123)),
         Some(0o750),
     )
     .unwrap();

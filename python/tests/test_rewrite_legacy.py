@@ -9,6 +9,8 @@ import pytest
 import rars
 
 ROOT = Path(__file__).resolve().parents[2]
+MTIME = 1_710_000_000
+# Stored form, for hand-built extended-time records.
 DOS_TIME = ((2024 - 1980) << 25) | (3 << 21) | (10 << 16) | (2 << 11) | (30 << 5) | 7
 
 
@@ -55,8 +57,8 @@ def file_metadata(data):
 
 def source_bytes(format="rar40", **options):
     builder = rars.RarBuilder(format=format, **options)
-    builder.add_bytes(b"payload" * 50, b"raw-\xff", mtime=DOS_TIME, mode=0o100640)
-    builder.add_bytes(b"second", "second", mtime=0)
+    builder.add_bytes(b"payload" * 50, b"raw-\xff", mtime=MTIME, mode=0o100640)
+    builder.add_bytes(b"second", "second")
     return builder.to_bytes()
 
 
@@ -117,8 +119,8 @@ def test_unsupported_legacy_metadata_is_rejected_before_destination_write(tmp_pa
 @pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
 def test_unrar_extracts_native_legacy_rewrite(tmp_path):
     source = rars.RarBuilder(format="rar40", solid=True)
-    source.add_bytes(b"first" * 100, "first", mtime=DOS_TIME)
-    source.add_bytes(b"second" * 100, "second", mtime=DOS_TIME)
+    source.add_bytes(b"first" * 100, "first", mtime=MTIME)
+    source.add_bytes(b"second" * 100, "second", mtime=MTIME)
     builder = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
     builder.rename("first", "renamed")
     archive = tmp_path / "rewritten.rar"

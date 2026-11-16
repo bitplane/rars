@@ -105,6 +105,15 @@ pub fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
         .unwrap_or(0)
 }
 
+/// `time` as the DOS timestamp RAR 1.3–4.x store: local wall-clock fields
+/// in 2-second steps, so an odd second and any fraction round down. `None`
+/// outside 1980–2107.
+#[cfg(feature = "write")]
+pub(crate) fn dos_time_from_unix(time: crate::Timestamp) -> Option<u32> {
+    let seconds = u64::try_from(time.unix_seconds()).ok()?;
+    system_time_to_dos_time(UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
 /// Converts a present stored timestamp without treating Unix epoch as missing.
 /// Legacy DOS zero remains invalid under the existing local-zone conversion.
 pub fn extracted_system_time(

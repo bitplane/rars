@@ -1,3 +1,5 @@
+from datetime import datetime
+
 import pytest
 import rars
 
@@ -17,8 +19,9 @@ def test_rar5_date_time_is_utc(seconds, expected):
 
 
 def test_legacy_date_time_keeps_stored_wall_clock_fields():
-    raw = ((2026 - 1980) << 25) | (7 << 21) | (15 << 16) | (15 << 11) | (23 << 5) | 21
+    # RAR 1.3-4.x store local wall-clock fields; date_time shows them as stored.
+    seconds = int(datetime(2026, 7, 15, 15, 23, 42).timestamp())
     builder = rars.RarBuilder(format="rar29", store=True)
-    builder.add_bytes(b"time", "file", mtime=raw)
+    builder.add_bytes(b"time", "file", mtime=seconds)
     archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("file").date_time == (2026, 7, 15, 15, 23, 42)

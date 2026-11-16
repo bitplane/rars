@@ -402,12 +402,7 @@ fn member_times_are_restored_on_flattened_and_renamed_files() {
         let root = scratch::case("flat-times");
         let archive = root.join("times.rar");
         let mut builder = Builder::new(version);
-        // Legacy formats take DOS-packed times.
-        let times = if version == ArchiveVersion::Rar50 {
-            [1_600_000_000, 1_700_000_000]
-        } else {
-            [0x5A21_6000, 0x5E21_6000]
-        };
+        let times = [1_600_000_000, 1_700_000_000].map(rars::Timestamp::from_unix_seconds);
         for (name, time) in [("a/readme.txt", times[0]), ("b/readme.txt", times[1])] {
             builder
                 .add_bytes(name.as_bytes().to_vec(), b"x".to_vec(), Some(time), None)

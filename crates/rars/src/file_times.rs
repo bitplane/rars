@@ -1,14 +1,143 @@
-//! Lossless RAR5 timestamps and validation/conversion of legacy extended times.
+//! Format-neutral times, RAR5's own time record, and legacy extended times.
 
 use crate::{Error, Result};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+/// A moment in Unix time: whole seconds since 1970-01-01 00:00 UTC, plus
+/// nanoseconds. Every format-neutral time in this crate takes this form;
+/// each format's writer converts it to what that format stores.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timestamp {
+    unix_seconds: i64,
+    nanoseconds: u32,
+}
+
+impl Timestamp {
+    /// `None` when `nanoseconds` is a whole second or more.
+    pub fn new(unix_seconds: i64, nanoseconds: u32) -> Option<Self> {
+        (nanoseconds < 1_000_000_000).then_some(Self {
+            unix_seconds,
+            nanoseconds,
+        })
+    }
+
+    pub fn from_unix_seconds(unix_seconds: i64) -> Self {
+        Self {
+            unix_seconds,
+            nanoseconds: 0,
+        }
+    }
+
+    /// `None` outside the range of `i64` seconds.
+    pub fn from_unix_nanoseconds(nanoseconds: i128) -> Option<Self> {
+        Some(Self {
+            unix_seconds: i64::try_from(nanoseconds.div_euclid(NANOS_PER_SECOND)).ok()?,
+            nanoseconds: nanoseconds.rem_euclid(NANOS_PER_SECOND) as u32,
+        })
+    }
+
+    pub fn unix_seconds(self) -> i64 {
+        self.unix_seconds
+    }
+
+    /// Below one second, counted forward from [`Self::unix_seconds`].
+    pub fn nanoseconds(self) -> u32 {
+        self.nanoseconds
+    }
+
+    pub fn unix_nanoseconds(self) -> i128 {
+        i128::from(self.unix_seconds) * NANOS_PER_SECOND + i128::from(self.nanoseconds)
+    }
+
+    /// The whole seconds as RAR5's 32-bit field holds them, if they fit.
+    #[cfg(feature = "write")]
+    pub(crate) fn unix_seconds_u32(self) -> Option<u32> {
+        u32::try_from(self.unix_seconds).ok()
+    }
+}
+
+impl TryFrom<SystemTime> for Timestamp {
+    type Error = Error;
+
+    fn try_from(time: SystemTime) -> Result<Self> {
+        let nanoseconds = match time.duration_since(UNIX_EPOCH) {
+            Ok(after) => i128::try_from(after.as_nanos()).ok(),
+            Err(before) => i128::try_from(before.duration().as_nanos())
+                .ok()
+                .map(|nanoseconds| -nanoseconds),
+        };
+        nanoseconds
+            .and_then(Self::from_unix_nanoseconds)
+            .ok_or(Error::InvalidArgument(
+                "time is outside the Timestamp range",
+            ))
+    }
+}
+
+impl TryFrom<Timestamp> for SystemTime {
+    type Error = Error;
+
+    fn try_from(time: Timestamp) -> Result<Self> {
+        let whole = Duration::from_secs(time.unix_seconds.unsigned_abs());
+        let moment = if time.unix_seconds >= 0 {
+            UNIX_EPOCH.checked_add(whole)
+        } else {
+            UNIX_EPOCH.checked_sub(whole)
+        };
+        moment
+            .and_then(|moment| {
+                moment.checked_add(Duration::from_nanos(u64::from(time.nanoseconds)))
+            })
+            .ok_or(Error::InvalidArgument(
+                "time is outside this platform's range",
+            ))
+    }
+}
+
+/// A member's times, in any format. `None` is a time the member doesn't record.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FileTimes {
+    pub modified: Option<Timestamp>,
+    pub created: Option<Timestamp>,
+    pub accessed: Option<Timestamp>,
+}
+
+impl RecordTime {
+    pub(crate) fn timestamp(self) -> Option<Timestamp> {
+        Timestamp::from_unix_nanoseconds(self.unix_nanoseconds())
+    }
+}
+
+impl TimeRecord {
+    pub(crate) fn times(self) -> FileTimes {
+        FileTimes {
+            modified: self.modified.and_then(RecordTime::timestamp),
+            created: self.created.and_then(RecordTime::timestamp),
+            accessed: self.accessed.and_then(RecordTime::timestamp),
+        }
+    }
+
+    /// RAR5's encoding of `times`: Unix seconds with nanoseconds when they fit,
+    /// FILETIME otherwise.
+    #[cfg(feature = "write")]
+    pub(crate) fn from_times(times: FileTimes) -> Result<Self> {
+        Self::from_unix_nanoseconds(
+            times.modified.map(Timestamp::unix_nanoseconds),
+            times.created.map(Timestamp::unix_nanoseconds),
+            times.accessed.map(Timestamp::unix_nanoseconds),
+        )
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileTimestamp {
+pub enum RecordTime {
     Unix { seconds: u32, nanoseconds: u32 },
     WindowsFiletime(u64),
 }
 
-impl FileTimestamp {
+impl RecordTime {
     pub fn unix_nanoseconds(self) -> i128 {
         match self {
             Self::Unix {
@@ -21,10 +150,10 @@ impl FileTimestamp {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct FileTimes {
-    pub modified: Option<FileTimestamp>,
-    pub created: Option<FileTimestamp>,
-    pub accessed: Option<FileTimestamp>,
+pub struct TimeRecord {
+    pub modified: Option<RecordTime>,
+    pub created: Option<RecordTime>,
+    pub accessed: Option<RecordTime>,
 }
 
 #[cfg(any(test, feature = "write"))]
@@ -40,7 +169,7 @@ impl std::ops::Deref for EncodedTimes {
     }
 }
 
-impl FileTimes {
+impl TimeRecord {
     /// Build a record from exact Unix nanoseconds, using FILETIME when needed.
     /// FILETIME requires 100-nanosecond precision for every present timestamp.
     pub fn from_unix_nanoseconds(
@@ -57,7 +186,7 @@ impl FileTimes {
         for (slot, value) in result.iter_mut().zip(values) {
             if let Some(value) = value {
                 *slot = Some(if unix {
-                    FileTimestamp::Unix {
+                    RecordTime::Unix {
                         seconds: (value / 1_000_000_000) as u32,
                         nanoseconds: (value % 1_000_000_000) as u32,
                     }
@@ -71,7 +200,7 @@ impl FileTimes {
                         .checked_add(116_444_736_000_000_000)
                         .and_then(|ticks| u64::try_from(ticks).ok())
                         .ok_or(Error::InvalidArgument("timestamp exceeds FILETIME range"))?;
-                    FileTimestamp::WindowsFiletime(ticks)
+                    RecordTime::WindowsFiletime(ticks)
                 });
             }
         }
@@ -90,7 +219,7 @@ impl FileTimes {
             .flatten()
             .next()
             .ok_or(Error::InvalidArgument("file time record is empty"))?;
-        let unix = matches!(first, FileTimestamp::Unix { .. });
+        let unix = matches!(first, RecordTime::Unix { .. });
         let mut flags = u8::from(unix);
         let mut seconds = [0; 24];
         let mut seconds_len = 0;
@@ -100,7 +229,7 @@ impl FileTimes {
             if let Some(time) = time {
                 flags |= 2 << index;
                 match time {
-                    FileTimestamp::Unix {
+                    RecordTime::Unix {
                         seconds: value,
                         nanoseconds,
                     } if unix && nanoseconds < 1_000_000_000 => {
@@ -111,7 +240,7 @@ impl FileTimes {
                             .copy_from_slice(&nanoseconds.to_le_bytes());
                         fractions_len += 4;
                     }
-                    FileTimestamp::WindowsFiletime(ticks) if !unix => {
+                    RecordTime::WindowsFiletime(ticks) if !unix => {
                         seconds[seconds_len..seconds_len + 8].copy_from_slice(&ticks.to_le_bytes());
                         seconds_len += 8;
                     }
@@ -162,12 +291,12 @@ impl FileTimes {
                 if nanoseconds >= 1_000_000_000 {
                     return None;
                 }
-                FileTimestamp::Unix {
+                RecordTime::Unix {
                     seconds,
                     nanoseconds,
                 }
             } else {
-                FileTimestamp::WindowsFiletime(u64::from_le_bytes(
+                RecordTime::WindowsFiletime(u64::from_le_bytes(
                     data[at * width..at * width + 8].try_into().ok()?,
                 ))
             });
@@ -180,7 +309,6 @@ impl FileTimes {
         })
     }
 
-    #[cfg(any(test, feature = "write"))]
     pub(crate) fn legacy(raw: &[u8], mtime: Option<u32>) -> Result<Option<Self>> {
         if raw.is_empty() {
             return Ok(None);
@@ -231,7 +359,7 @@ impl FileTimes {
                 .duration_since(std::time::UNIX_EPOCH)
                 // extracted_system_time adds nonnegative durations to UNIX_EPOCH.
                 .expect("extracted timestamps cannot precede the Unix epoch");
-            *slot = Some(FileTimestamp::Unix {
+            *slot = Some(RecordTime::Unix {
                 seconds: u32::try_from(duration.as_secs()).map_err(|_| invalid())?,
                 nanoseconds: duration.subsec_nanos(),
             });
@@ -292,62 +420,58 @@ mod tests {
             for mask in 1..8 {
                 let stamp = |index: u64| {
                     if unix {
-                        FileTimestamp::Unix {
+                        RecordTime::Unix {
                             seconds: if index == 0 { 0 } else { u32::MAX },
                             nanoseconds: (index as u32 + 1) * 123,
                         }
                     } else {
-                        FileTimestamp::WindowsFiletime(if index == 0 {
-                            0
-                        } else {
-                            u64::MAX - index
-                        })
+                        RecordTime::WindowsFiletime(if index == 0 { 0 } else { u64::MAX - index })
                     }
                 };
-                let times = FileTimes {
+                let times = TimeRecord {
                     modified: (mask & 1 != 0).then(|| stamp(0)),
                     created: (mask & 2 != 0).then(|| stamp(1)),
                     accessed: (mask & 4 != 0).then(|| stamp(2)),
                 };
                 let bytes = times.encode().unwrap();
                 assert_eq!(
-                    FileTimes::parse(u64::from(bytes[0]), &bytes[1..]),
+                    TimeRecord::parse(u64::from(bytes[0]), &bytes[1..]),
                     Some(times)
                 );
             }
         }
         assert_eq!(
-            FileTimestamp::WindowsFiletime(0).unix_nanoseconds(),
+            RecordTime::WindowsFiletime(0).unix_nanoseconds(),
             -11_644_473_600_000_000_000
         );
     }
 
     #[test]
     fn malformed_or_mixed_time_records_are_rejected() {
-        assert!(FileTimes::parse(1, &[]).is_none());
-        assert!(FileTimes::parse(0x23, &[0; 4]).is_none());
-        assert!(FileTimes::parse(0x13, &[0; 4]).is_none());
+        assert!(TimeRecord::parse(1, &[]).is_none());
+        assert!(TimeRecord::parse(0x23, &[0; 4]).is_none());
+        assert!(TimeRecord::parse(0x13, &[0; 4]).is_none());
         // Fractional seconds are available only with Unix encoding.
-        assert!(FileTimes::parse(0x12, &[0; 8]).is_none());
+        assert!(TimeRecord::parse(0x12, &[0; 8]).is_none());
         let mut data = vec![0; 4];
         data.extend(1_000_000_000u32.to_le_bytes());
-        assert!(FileTimes::parse(0x13, &data).is_none());
-        let mixed = FileTimes {
-            modified: Some(FileTimestamp::WindowsFiletime(0)),
-            created: Some(FileTimestamp::Unix {
+        assert!(TimeRecord::parse(0x13, &data).is_none());
+        let mixed = TimeRecord {
+            modified: Some(RecordTime::WindowsFiletime(0)),
+            created: Some(RecordTime::Unix {
                 seconds: 0,
                 nanoseconds: 0,
             }),
             accessed: None,
         };
         assert!(mixed.encode().is_err());
-        assert!(FileTimes::default().encode().is_err());
-        assert!(FileTimes {
-            modified: Some(FileTimestamp::Unix {
+        assert!(TimeRecord::default().encode().is_err());
+        assert!(TimeRecord {
+            modified: Some(RecordTime::Unix {
                 seconds: 0,
                 nanoseconds: 1_000_000_000,
             }),
-            ..FileTimes::default()
+            ..TimeRecord::default()
         }
         .encode()
         .is_err());
@@ -355,8 +479,10 @@ mod tests {
         std::mem::swap(&mut reverse_mixed.modified, &mut reverse_mixed.created);
         assert!(reverse_mixed.encode().is_err());
         assert_eq!(
-            FileTimes::parse(3, &123u32.to_le_bytes()).unwrap().modified,
-            Some(FileTimestamp::Unix {
+            TimeRecord::parse(3, &123u32.to_le_bytes())
+                .unwrap()
+                .modified,
+            Some(RecordTime::Unix {
                 seconds: 123,
                 nanoseconds: 0
             })
@@ -367,32 +493,32 @@ mod tests {
     fn exact_nanoseconds_choose_one_lossless_encoding_at_range_boundaries() {
         let unix_end = i128::from(u32::MAX) * 1_000_000_000 + 999_999_999;
         for value in [0, 1, unix_end] {
-            let times = FileTimes::from_unix_nanoseconds(Some(value), None, None).unwrap();
-            assert!(matches!(times.modified, Some(FileTimestamp::Unix { .. })));
+            let times = TimeRecord::from_unix_nanoseconds(Some(value), None, None).unwrap();
+            assert!(matches!(times.modified, Some(RecordTime::Unix { .. })));
             assert_eq!(times.modified.unwrap().unix_nanoseconds(), value);
             let encoded = times.encode().unwrap();
             assert_eq!(
-                FileTimes::parse(u64::from(encoded[0]), &encoded[1..]),
+                TimeRecord::parse(u64::from(encoded[0]), &encoded[1..]),
                 Some(times)
             );
         }
         let filetime_min = -11_644_473_600_000_000_000i128;
         let filetime_max = (i128::from(u64::MAX) - 116_444_736_000_000_000) * 100;
         for value in [filetime_min, -100, unix_end + 1, filetime_max] {
-            let times = FileTimes::from_unix_nanoseconds(Some(value), Some(0), None).unwrap();
+            let times = TimeRecord::from_unix_nanoseconds(Some(value), Some(0), None).unwrap();
             assert!(matches!(
                 times.modified,
-                Some(FileTimestamp::WindowsFiletime(_))
+                Some(RecordTime::WindowsFiletime(_))
             ));
             assert!(matches!(
                 times.created,
-                Some(FileTimestamp::WindowsFiletime(_))
+                Some(RecordTime::WindowsFiletime(_))
             ));
             assert_eq!(times.modified.unwrap().unix_nanoseconds(), value);
             assert_eq!(times.created.unwrap().unix_nanoseconds(), 0);
             let encoded = times.encode().unwrap();
             assert_eq!(
-                FileTimes::parse(u64::from(encoded[0]), &encoded[1..]),
+                TimeRecord::parse(u64::from(encoded[0]), &encoded[1..]),
                 Some(times)
             );
         }
@@ -405,13 +531,13 @@ mod tests {
             i128::MAX,
         ] {
             assert!(
-                FileTimes::from_unix_nanoseconds(Some(value), None, None).is_err(),
+                TimeRecord::from_unix_nanoseconds(Some(value), None, None).is_err(),
                 "{value}"
             );
         }
         assert_eq!(
-            FileTimes::from_unix_nanoseconds(None, None, None).unwrap(),
-            FileTimes::default()
+            TimeRecord::from_unix_nanoseconds(None, None, None).unwrap(),
+            TimeRecord::default()
         );
     }
 
@@ -424,7 +550,7 @@ mod tests {
             (0x0800u16.to_le_bytes().to_vec(), None),
             (0x9000u16.to_le_bytes().to_vec(), Some(0x5022_1882)),
         ] {
-            assert!(FileTimes::legacy(&raw, modified).is_err());
+            assert!(TimeRecord::legacy(&raw, modified).is_err());
         }
         let future_dos = (127 << 25) | (1 << 21) | (1 << 16); // 2107-01-01
         let instant = crate::timestamp::extracted_system_time(
@@ -440,8 +566,8 @@ mod tests {
                 .as_secs()
                 > u64::from(u32::MAX)
         );
-        assert!(FileTimes::legacy(&0x8000u16.to_le_bytes(), Some(future_dos)).is_err());
-        assert_eq!(FileTimes::legacy(&[], None).unwrap(), None);
+        assert!(TimeRecord::legacy(&0x8000u16.to_le_bytes(), Some(future_dos)).is_err());
+        assert_eq!(TimeRecord::legacy(&[], None).unwrap(), None);
         assert!(validate_legacy_extended_times(&[0]).is_err());
         assert!(validate_legacy_extended_times(&0x0800u16.to_le_bytes()).is_err());
         assert!(validate_legacy_extended_times(&0x9000u16.to_le_bytes()).is_err());
@@ -454,7 +580,7 @@ mod tests {
         raw.extend(0x5022_1882u32.to_le_bytes());
         validate_legacy_extended_times(&raw).unwrap();
         assert_eq!(
-            FileTimes::legacy(&raw, None),
+            TimeRecord::legacy(&raw, None),
             Err(Error::InvalidArgument(
                 "legacy archival time has no supported RAR5 representation"
             ))
@@ -472,10 +598,10 @@ mod tests {
             let mut raw = 0xb000u16.to_le_bytes().to_vec();
             raw.extend_from_slice(&ticks.to_le_bytes()[..3]);
             assert_eq!(validate_legacy_extended_times(&raw).is_ok(), valid);
-            let converted = FileTimes::legacy(&raw, Some(dos));
+            let converted = TimeRecord::legacy(&raw, Some(dos));
             assert_eq!(converted.is_ok(), valid);
             if valid {
-                let FileTimestamp::Unix { nanoseconds, .. } =
+                let RecordTime::Unix { nanoseconds, .. } =
                     converted.unwrap().unwrap().modified.unwrap()
                 else {
                     panic!("legacy conversion must use Unix seconds");
@@ -483,8 +609,8 @@ mod tests {
                 assert_eq!(nanoseconds, ticks * 100);
             }
         }
-        assert_eq!(FileTimes::legacy(&[0, 0], None).unwrap(), None);
-        assert!(FileTimes::legacy(&[0, 0, 1], None).is_err());
+        assert_eq!(TimeRecord::legacy(&[0, 0], None).unwrap(), None);
+        assert!(TimeRecord::legacy(&[0, 0, 1], None).is_err());
         assert!(validate_legacy_extended_times(&[0, 0, 1]).is_err());
     }
 
@@ -497,7 +623,7 @@ mod tests {
         raw.extend([4, 5, 6]);
         raw.extend(dos.to_le_bytes());
         raw.push(7);
-        let times = FileTimes::legacy(&raw, Some(dos)).unwrap().unwrap();
+        let times = TimeRecord::legacy(&raw, Some(dos)).unwrap().unwrap();
         let base = crate::timestamp::extracted_system_time(
             crate::ArchiveFamily::Rar15To40,
             Some(dos),
@@ -521,6 +647,6 @@ mod tests {
             base + 0x070000 * 100
         );
         raw.pop();
-        assert!(FileTimes::legacy(&raw, Some(dos)).is_err());
+        assert!(TimeRecord::legacy(&raw, Some(dos)).is_err());
     }
 }

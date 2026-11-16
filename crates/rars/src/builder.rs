@@ -89,7 +89,7 @@ struct BuilderEntry {
     is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
-    file_times: Option<crate::FileTimes>,
+    file_times: Option<crate::file_times::TimeRecord>,
     legacy_extended_times: Option<Vec<u8>>,
     legacy_unicode_name: Option<Vec<u8>>,
     file_comment: Option<Vec<u8>>,
@@ -97,6 +97,68 @@ struct BuilderEntry {
     redirection: Option<rar50::FileRedirection>,
     redirection_size: Option<u64>,
     attributes: EntryAttributes,
+}
+
+/// A member's times in the forms the writers take: RAR 1.3–4.x use only
+/// `mtime`, a DOS time; RAR5/7 use Unix seconds, nanoseconds and the record.
+#[derive(Debug, Default)]
+struct StoredTimes {
+    mtime: Option<u32>,
+    mtime_nanoseconds: Option<u32>,
+    record: Option<crate::file_times::TimeRecord>,
+}
+
+impl StoredTimes {
+    fn apply(self, entry: &mut BuilderEntry) {
+        entry.mtime = self.mtime;
+        entry.mtime_nanoseconds = self.mtime_nanoseconds;
+        entry.file_times = self.record;
+    }
+}
+
+/// A RAR5/7 member's times in Unix time, from its seconds and its record.
+fn rar50_entry_times(entry: &BuilderEntry) -> crate::FileTimes {
+    let mut times = entry
+        .file_times
+        .map(crate::file_times::TimeRecord::times)
+        .unwrap_or_default();
+    if times.modified.is_none() {
+        times.modified = entry.mtime.and_then(|seconds| {
+            crate::Timestamp::new(i64::from(seconds), entry.mtime_nanoseconds.unwrap_or(0))
+        });
+    }
+    times
+}
+
+/// Attach a copied RAR5 record as the writer expects: a record's own
+/// modification time replaces the seconds field, and fractional seconds
+/// move into the record when it carries only other times.
+fn attach_time_record(
+    entry: &mut BuilderEntry,
+    record: Option<crate::file_times::TimeRecord>,
+) -> Result<()> {
+    if let Some(record) = record {
+        record.encode()?;
+    }
+    if record.is_some_and(|record| record.modified.is_some()) {
+        entry.mtime = None;
+    }
+    let record = if let (Some(mut record), Some(seconds), Some(nanoseconds)) =
+        (record, entry.mtime, entry.mtime_nanoseconds)
+    {
+        record.modified = Some(crate::file_times::RecordTime::Unix {
+            seconds,
+            nanoseconds,
+        });
+        record.encode()?;
+        entry.mtime = None;
+        Some(record)
+    } else {
+        record
+    };
+    entry.mtime_nanoseconds = None;
+    entry.file_times = record;
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -316,6 +378,8 @@ impl Builder {
     /// for those nonportable mapped names. [`Self::add_path`] handles this
     /// conversion automatically for filesystem inputs.
     ///
+    /// `mtime` is stored as [`set_times`](Self::set_times) describes.
+    ///
     /// `mode` is a Unix mode, with optional file-type bits. Without a mode,
     /// the member uses DOS archive attributes and the extractor's default permissions.
     /// RAR 1.3-1.5 output uses DOS metadata even when a Unix mode is supplied.
@@ -323,18 +387,19 @@ impl Builder {
         &mut self,
         name: Vec<u8>,
         data: Vec<u8>,
-        mtime: Option<u32>,
+        mtime: Option<crate::Timestamp>,
         mode: Option<u32>,
     ) -> Result<()> {
+        let times = self.stored_mtime(mtime)?;
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
             data,
             source: None,
             is_directory: false,
-            mtime,
-            mtime_nanoseconds: None,
-            file_times: None,
+            mtime: times.mtime,
+            mtime_nanoseconds: times.mtime_nanoseconds,
+            file_times: times.record,
             legacy_extended_times: None,
             legacy_unicode_name: None,
             file_comment: None,
@@ -350,23 +415,24 @@ impl Builder {
 
     /// Queue a member whose bytes are fetched from `source` when the writer
     /// reaches it.
-    /// `mode` has the same meaning as in [`add_bytes`](Self::add_bytes).
+    /// `mtime` and `mode` have the same meaning as in [`add_bytes`](Self::add_bytes).
     pub fn add_source(
         &mut self,
         name: Vec<u8>,
         source: EntrySource,
-        mtime: Option<u32>,
+        mtime: Option<crate::Timestamp>,
         mode: Option<u32>,
     ) -> Result<()> {
+        let times = self.stored_mtime(mtime)?;
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
             data: Vec::new(),
             source: Some(source),
             is_directory: false,
-            mtime,
-            mtime_nanoseconds: None,
-            file_times: None,
+            mtime: times.mtime,
+            mtime_nanoseconds: times.mtime_nanoseconds,
+            file_times: times.record,
             legacy_extended_times: None,
             legacy_unicode_name: None,
             file_comment: None,
@@ -407,11 +473,12 @@ impl Builder {
 
     /// Queue an explicit RAR1.3–4.x or RAR5/7 directory, including an empty one.
     /// `mode` supplies Unix permission bits; otherwise DOS directory flags are used.
-    /// Legacy timestamps use raw DOS values; legacy volume output is unsupported.
+    /// `mtime` is as in [`add_bytes`](Self::add_bytes); legacy volume output
+    /// is unsupported.
     pub fn add_directory(
         &mut self,
         name: Vec<u8>,
-        mtime: Option<u32>,
+        mtime: Option<crate::Timestamp>,
         mode: Option<u32>,
     ) -> Result<()> {
         if matches!(
@@ -428,15 +495,16 @@ impl Builder {
                 "explicit directories require RAR5/7 or single-archive RAR1.3–4.x output",
             ));
         }
+        let times = self.stored_mtime(mtime)?;
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
             data: Vec::new(),
             source: None,
             is_directory: true,
-            mtime,
-            mtime_nanoseconds: None,
-            file_times: None,
+            mtime: times.mtime,
+            mtime_nanoseconds: times.mtime_nanoseconds,
+            file_times: times.record,
             legacy_extended_times: None,
             legacy_unicode_name: None,
             file_comment: None,
@@ -458,7 +526,7 @@ impl Builder {
         name: Vec<u8>,
         target: Vec<u8>,
         target_is_directory: bool,
-        mtime: Option<u32>,
+        mtime: Option<crate::Timestamp>,
         mode: Option<u32>,
     ) -> Result<()> {
         if matches!(
@@ -493,15 +561,16 @@ impl Builder {
         {
             return Err(Error::InvalidArgument("symbolic links require single-archive RAR5/7 output and a nonempty UTF-8 wire target without NUL"));
         }
+        let times = self.stored_mtime(mtime)?;
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
             data: Vec::new(),
             source: None,
             is_directory: false,
-            mtime,
-            mtime_nanoseconds: None,
-            file_times: None,
+            mtime: times.mtime,
+            mtime_nanoseconds: times.mtime_nanoseconds,
+            file_times: times.record,
             legacy_extended_times: None,
             legacy_unicode_name: None,
             file_comment: None,
@@ -679,16 +748,19 @@ impl Builder {
         Ok(())
     }
 
-    /// Retain a native RAR2.9–4.x extended-time record, including archival time.
-    /// DOS values and fractional precision are copied without timezone conversion.
-    /// Unsupported output or invalid records leave the entry unchanged.
-    pub fn set_legacy_extended_times(&mut self, name: &[u8], raw: Option<Vec<u8>>) -> Result<()> {
+    #[cfg(test)]
+    pub(crate) fn set_legacy_extended_times(
+        &mut self,
+        name: &[u8],
+        raw: Option<Vec<u8>>,
+    ) -> Result<()> {
         let id = self.entry_id(name)?;
         self.set_legacy_extended_times_by_id(id, raw)
     }
 
-    /// Identity-based variant of [`set_legacy_extended_times`](Self::set_legacy_extended_times).
-    pub fn set_legacy_extended_times_by_id(
+    /// Retain a native RAR2.9–4.x extended-time record, including archival time.
+    /// Invalid records or other output leave the entry unchanged.
+    pub(crate) fn set_legacy_extended_times_by_id(
         &mut self,
         id: usize,
         raw: Option<Vec<u8>>,
@@ -712,75 +784,121 @@ impl Builder {
         Ok(())
     }
 
-    /// Set complete RAR5/7 timestamps without narrowing FILETIME or discarding fractions.
-    pub fn set_file_times(&mut self, name: &[u8], times: Option<crate::FileTimes>) -> Result<()> {
+    /// Set a queued member's times. A time given replaces the member's; one
+    /// left `None` keeps what the member has. RAR5/7 keep all three to the
+    /// nanosecond. RAR 1.3–4.x keep only `modified`, as a local-zone DOS time
+    /// in 2-second steps from 1980 to 2107, and refuse `created` and `accessed`.
+    /// Errors leave the entry unchanged.
+    pub fn set_times(&mut self, name: &[u8], times: crate::FileTimes) -> Result<()> {
         let id = self.entry_id(name)?;
-        self.set_file_times_by_id(id, times)
+        self.set_times_by_id(id, times)
     }
 
-    /// Identity-based variant of [`set_file_times`](Self::set_file_times).
-    pub fn set_file_times_by_id(
-        &mut self,
-        id: usize,
-        times: Option<crate::FileTimes>,
-    ) -> Result<()> {
+    /// Identity-based variant of [`set_times`](Self::set_times).
+    pub fn set_times_by_id(&mut self, id: usize, times: crate::FileTimes) -> Result<()> {
         let index = self.index_by_id(id)?;
-
-        if self.format.family() != ArchiveFamily::Rar50Plus {
-            return Err(Error::InvalidArgument(
-                "complete file times require RAR5/7 output",
-            ));
-        }
-        if let Some(times) = times {
-            times.encode()?;
-        }
-        let entry = &mut self.entries[index];
-        if times.is_some_and(|times| times.modified.is_some()) {
-            entry.mtime = None;
-        }
-        // Preserve an existing fractional mtime when adding only ctime/atime.
-        let times = if let (Some(mut times), Some(seconds), Some(nanoseconds)) =
-            (times, entry.mtime, entry.mtime_nanoseconds)
-        {
-            times.modified = Some(crate::FileTimestamp::Unix {
-                seconds,
-                nanoseconds,
-            });
-            times.encode()?;
-            entry.mtime = None;
-            Some(times)
+        if self.format.family() == ArchiveFamily::Rar50Plus {
+            let current = rar50_entry_times(&self.entries[index]);
+            let stored = self.store_times(crate::FileTimes {
+                modified: times.modified.or(current.modified),
+                created: times.created.or(current.created),
+                accessed: times.accessed.or(current.accessed),
+            })?;
+            stored.apply(&mut self.entries[index]);
         } else {
-            times
-        };
-        entry.mtime_nanoseconds = None;
-        entry.file_times = times;
+            let stored = self.store_times(times)?;
+            if stored.mtime.is_some() {
+                let entry = &mut self.entries[index];
+                entry.mtime = stored.mtime;
+                entry.legacy_extended_times = None;
+            }
+        }
         Ok(())
     }
 
-    /// Add nanosecond precision to a queued RAR5/7 modification time.
-    /// The member must already have whole seconds; legacy output is unsupported.
-    pub fn set_mtime_nanoseconds(&mut self, name: &[u8], nanoseconds: u32) -> Result<()> {
-        let id = self.entry_id(name)?;
-        self.set_mtime_nanoseconds_by_id(id, nanoseconds)
-    }
-
-    /// Identity-based variant of [`set_mtime_nanoseconds`](Self::set_mtime_nanoseconds).
-    pub fn set_mtime_nanoseconds_by_id(&mut self, id: usize, nanoseconds: u32) -> Result<()> {
+    /// Give a queued member `source`'s times exactly as stored, for copying a
+    /// member into an archive of the same family unchanged.
+    pub fn copy_times_by_id(&mut self, id: usize, source: &crate::ArchiveMember) -> Result<()> {
         let index = self.index_by_id(id)?;
-
-        if self.format.family() != crate::ArchiveFamily::Rar50Plus || nanoseconds >= 1_000_000_000 {
+        if source.meta.family != self.format.family() {
             return Err(Error::InvalidArgument(
-                "nanosecond modification times require RAR5/7 and a fraction below one second",
+                "stored times copy only within one archive family",
             ));
         }
-        let entry = &mut self.entries[index];
-        if entry.mtime.is_none() {
-            return Err(Error::InvalidArgument(
-                "fractional modification time requires whole seconds",
-            ));
+        match &source.detail {
+            crate::ArchiveMemberDetail::Rar50Plus { file_times, .. } => {
+                let entry = &mut self.entries[index];
+                entry.mtime = source.meta.file_time;
+                entry.mtime_nanoseconds = source
+                    .meta
+                    .mtime_refinement
+                    .map(|detail| detail.nanoseconds)
+                    .filter(|&nanoseconds| nanoseconds != 0);
+                if file_times.is_some() {
+                    attach_time_record(entry, *file_times)?;
+                }
+            }
+            crate::ArchiveMemberDetail::Rar15To40 { extended_times, .. }
+                if !extended_times.is_empty() =>
+            {
+                self.set_legacy_extended_times_by_id(id, Some(extended_times.clone()))?;
+                self.entries[index].mtime = source.meta.file_time;
+            }
+            _ => self.entries[index].mtime = source.meta.file_time,
         }
-        entry.mtime_nanoseconds = Some(nanoseconds);
         Ok(())
+    }
+
+    /// What `times` become in this builder's format.
+    fn store_times(&self, times: crate::FileTimes) -> Result<StoredTimes> {
+        if self.format.family() == ArchiveFamily::Rar50Plus {
+            if times.created.is_none() && times.accessed.is_none() {
+                match times.modified {
+                    None => return Ok(StoredTimes::default()),
+                    Some(time) => {
+                        if let Some(seconds) = time.unix_seconds_u32() {
+                            return Ok(StoredTimes {
+                                mtime: Some(seconds),
+                                mtime_nanoseconds: Some(time.nanoseconds())
+                                    .filter(|&nanoseconds| nanoseconds != 0),
+                                record: None,
+                            });
+                        }
+                    }
+                }
+            }
+            let record = crate::file_times::TimeRecord::from_times(times)?;
+            record.encode()?;
+            return Ok(StoredTimes {
+                record: Some(record),
+                ..StoredTimes::default()
+            });
+        }
+        if times.created.is_some() || times.accessed.is_some() {
+            return Err(Error::InvalidArgument(
+                "RAR 1.3–4.x keep only a modification time",
+            ));
+        }
+        let mtime = times
+            .modified
+            .map(|time| {
+                crate::timestamp::dos_time_from_unix(time).ok_or(Error::InvalidArgument(
+                    "RAR 1.3–4.x store modification times from 1980 to 2107 only",
+                ))
+            })
+            .transpose()?;
+        Ok(StoredTimes {
+            mtime,
+            ..StoredTimes::default()
+        })
+    }
+
+    /// A new member's stored times, from the Unix `mtime` its caller gave.
+    fn stored_mtime(&self, mtime: Option<crate::Timestamp>) -> Result<StoredTimes> {
+        self.store_times(crate::FileTimes {
+            modified: mtime,
+            ..crate::FileTimes::default()
+        })
     }
 
     /// Sets or removes a queued member's comment. Comments follow the entry
@@ -863,6 +981,7 @@ impl Builder {
     /// level below it: a link is a name for someone else's file, and copying
     /// what it points at is not what the caller asked for.
     /// Other special files are refused instead of being silently omitted.
+    /// Each file keeps its modification time where the format can hold it.
     pub fn add_path(&mut self, path: &Path, archive_name: &[u8]) -> Result<()> {
         let link_meta = fs::symlink_metadata(path)?;
         if link_meta.file_type().is_symlink() {
@@ -893,7 +1012,12 @@ impl Builder {
             } else {
                 archive_name.to_vec()
             };
-            self.add_source(name, EntrySource::from_path(path), None, unix_mode(&meta))?;
+            // As the CLI does: whole seconds, and no time where the format
+            // can't store the file's.
+            let mtime = crate::timestamp::source_unix_mtime(&meta)
+                .map(|seconds| crate::Timestamp::from_unix_seconds(i64::from(seconds)))
+                .filter(|&time| self.stored_mtime(Some(time)).is_ok());
+            self.add_source(name, EntrySource::from_path(path), mtime, unix_mode(&meta))?;
         } else {
             return Err(
                 Error::InvalidArgument("input path is not a regular file or directory")
@@ -1798,6 +1922,66 @@ fn unix_mode(_metadata: &fs::Metadata) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn legacy_extended_times_are_validated_before_the_archive_is_written() {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+        builder
+            .add_bytes(
+                b"file".to_vec(),
+                b"payload".to_vec(),
+                Some(crate::Timestamp::from_unix_seconds(1_700_000_000)),
+                None,
+            )
+            .unwrap();
+        let before = builder.to_bytes().unwrap();
+        // No odd-second or fraction control bits may be present without the
+        // corresponding timestamp-present bit, in any of the four legacy slots.
+        for index in 0..4 {
+            for mode in 1..8u16 {
+                let flags = mode << (12 - index * 4);
+                assert_eq!(
+                    builder.set_legacy_extended_times(b"file", Some(flags.to_le_bytes().to_vec())),
+                    Err(Error::InvalidArgument(
+                        "legacy extended timestamps are incomplete or invalid"
+                    ))
+                );
+                assert_eq!(builder.to_bytes().unwrap(), before);
+            }
+        }
+        assert!(builder
+            .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90]))
+            .is_err());
+        assert_eq!(builder.to_bytes().unwrap(), before);
+        builder
+            .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
+            .unwrap();
+        let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive
+            .members()
+            .next()
+            .unwrap()
+            .time_record()
+            .unwrap()
+            .is_some());
+
+        let mut old = Builder::new(ArchiveVersion::Rar20).store(true);
+        old.add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        assert!(old
+            .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
+            .is_err());
+
+        let mut volume = Builder::new(ArchiveVersion::Rar29)
+            .store(true)
+            .volume_size(Some(512));
+        volume
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        assert!(volume
+            .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
+            .is_err());
+    }
+
+    #[test]
     fn pending_archive_retries_name_collisions_and_reports_exhaustion() {
         let root = crate::scratch::case("pending-archive-collision");
         let destination = root.join("archive.rar");
@@ -2088,7 +2272,12 @@ mod tests {
         use crate::{ArchiveReader, ArchiveVersion, Builder, EntrySource, ErrorKind};
         let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
         builder
-            .add_bytes(b"file".to_vec(), b"old".to_vec(), Some(123), Some(0o640))
+            .add_bytes(
+                b"file".to_vec(),
+                b"old".to_vec(),
+                Some(crate::Timestamp::from_unix_seconds(123)),
+                Some(0o640),
+            )
             .unwrap();
         builder
             .set_file_comment(b"file", Some(b"comment".to_vec()))
@@ -2139,10 +2328,10 @@ mod tests {
     fn legacy_directory_metadata_and_link_payloads_survive_solid_output() {
         let mut builder = Builder::new(ArchiveVersion::Rar29).solid(true);
         builder
-            .add_bytes(b"file".to_vec(), b"payload".repeat(100), Some(0), None)
+            .add_bytes(b"file".to_vec(), b"payload".repeat(100), None, None)
             .unwrap();
         builder
-            .add_directory(b"directory".to_vec(), Some(0), Some(0o2750))
+            .add_directory(b"directory".to_vec(), None, Some(0o2750))
             .unwrap();
         builder
             .set_file_comment(b"directory", Some(b"comment".to_vec()))
@@ -2151,10 +2340,10 @@ mod tests {
             .set_legacy_extended_times(b"directory", Some(vec![0, 0xb0, 1, 2, 3]))
             .unwrap();
         builder
-            .add_unix_symlink(b"link".to_vec(), b"file".to_vec(), false, Some(0), None)
+            .add_unix_symlink(b"link".to_vec(), b"file".to_vec(), false, None, None)
             .unwrap();
         builder
-            .add_bytes(b"last".to_vec(), b"payload".repeat(100), Some(0), None)
+            .add_bytes(b"last".to_vec(), b"payload".repeat(100), None, None)
             .unwrap();
         let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
         assert!(archive.rewrite_preservation_issues().is_empty());
@@ -2193,16 +2382,16 @@ mod tests {
         ] {
             let mut builder = Builder::new(target).solid(true);
             builder
-                .add_directory(b"first".to_vec(), Some(0), None)
+                .add_directory(b"first".to_vec(), None, None)
                 .unwrap();
             builder
-                .add_bytes(b"first/a".to_vec(), text.clone(), Some(0), None)
+                .add_bytes(b"first/a".to_vec(), text.clone(), None, None)
                 .unwrap();
             builder
-                .add_directory(b"second".to_vec(), Some(0), None)
+                .add_directory(b"second".to_vec(), None, None)
                 .unwrap();
             builder
-                .add_bytes(b"second/b".to_vec(), text.clone(), Some(0), None)
+                .add_bytes(b"second/b".to_vec(), text.clone(), None, None)
                 .unwrap();
             let archive = crate::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             let flags: Vec<_> = archive
@@ -2233,7 +2422,7 @@ mod tests {
             .password(Some(b"secret".to_vec()))
             .comment(Some(b"archive".to_vec()));
         builder
-            .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(0), None)
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
             .unwrap();
         builder
             .set_file_comment(b"file", Some(b"comment".to_vec()))
@@ -2273,11 +2462,11 @@ mod tests {
             .password(Some(b"secret".to_vec()))
             .header_encryption(true);
         builder
-            .add_bytes(b"plain".to_vec(), b"public".to_vec(), Some(0), None)
+            .add_bytes(b"plain".to_vec(), b"public".to_vec(), None, None)
             .unwrap();
         builder.set_entry_encryption(b"plain", None, None).unwrap();
         builder
-            .add_bytes(b"encrypted".to_vec(), b"private".to_vec(), Some(0), None)
+            .add_bytes(b"encrypted".to_vec(), b"private".to_vec(), None, None)
             .unwrap();
         // Salt and native extended times must coexist in encrypted file headers.
         builder
@@ -2351,7 +2540,7 @@ mod tests {
         for store in [true, false] {
             let mut builder = Builder::new(ArchiveVersion::Rar40).store(store);
             builder
-                .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(0), None)
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
                 .unwrap();
             builder
                 .set_legacy_extended_times(b"file", Some(raw.clone()))
