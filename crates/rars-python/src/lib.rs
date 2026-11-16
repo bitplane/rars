@@ -2675,6 +2675,7 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Py<PyBytes>> {
+        self.refuse_volume_mismatch(false)?;
         if self.resources.max_memory_bytes().is_none() {
             let bytes = self.detached(
                 py,
@@ -2706,6 +2707,7 @@ impl RarBuilder {
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
+        self.refuse_volume_mismatch(false)?;
         let directory = output_directory(&path);
         self.detached(
             py,
@@ -2731,6 +2733,7 @@ impl RarBuilder {
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<PathBuf>> {
         let first_path = py_path_buf(py, first_path)?;
+        self.refuse_volume_mismatch(true)?;
         let parts = self.detached(
             py,
             progress,
@@ -2780,6 +2783,19 @@ impl RarBuilder {
 }
 
 impl RarBuilder {
+    /// The core's refusal names its own methods; this names Python's.
+    fn refuse_volume_mismatch(&self, volumes: bool) -> PyResult<()> {
+        match (volumes, self.inner.splits_into_volumes()) {
+            (false, true) => Err(PyValueError::new_err(
+                "volume_size is set, so write the set with write_volumes()",
+            )),
+            (true, false) => Err(PyValueError::new_err(
+                "write_volumes() needs RarBuilder(volume_size=...)",
+            )),
+            _ => Ok(()),
+        }
+    }
+
     fn edit_member_id(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
         if member.is_instance_of::<pyo3::types::PyInt>() {
             let id: usize = member
@@ -3661,7 +3677,7 @@ impl<'a> ExtractOutputs<'a> {
             return Ok(Box::new(io::sink()));
         }
         if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists").into());
+            return Err(already_exists(&destination).into());
         }
         if self.in_place {
             fs::create_dir_all(
@@ -3808,7 +3824,7 @@ impl<'a> ExtractOutputs<'a> {
             return Ok(());
         }
         if self.overwrite == OverwritePolicy::Never && fs::symlink_metadata(&destination).is_ok() {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "File exists").into());
+            return Err(already_exists(&destination).into());
         }
         let staging = match &mut self.staging {
             Some(staging) => staging,
@@ -4687,6 +4703,34 @@ fn map_open_error(error: rars_rs::Error) -> PyErr {
     map_error(error)
 }
 
+/// What `overwrite=False` raises, naming the file and the ways past it.
+fn already_exists(destination: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!(
+            "{} already exists; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
+            destination.display()
+        ),
+    )
+}
+
+/// The errno Python picks an `OSError` subclass by, such as `FileExistsError`.
+fn io_errno(error: &rars_rs::Error) -> Option<i32> {
+    let rars_rs::Error::Io(io_error) = error.root_cause() else {
+        return None;
+    };
+    io_error
+        .source()
+        .downcast_ref::<io::Error>()
+        .and_then(io::Error::raw_os_error)
+        .or(match io_error.kind {
+            io::ErrorKind::AlreadyExists => Some(libc::EEXIST),
+            io::ErrorKind::NotFound => Some(libc::ENOENT),
+            io::ErrorKind::PermissionDenied => Some(libc::EACCES),
+            _ => None,
+        })
+}
+
 fn map_error(error: rars_rs::Error) -> PyErr {
     let message = error.to_string();
     typed_error(error, message)
@@ -4727,7 +4771,10 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
             UnsupportedRarFeature::new_err(message)
         }
         ErrorKind::UnsafePath => UnsafeArchivePath::new_err(message),
-        ErrorKind::Io | ErrorKind::SourceChanged => PyOSError::new_err(message),
+        ErrorKind::Io | ErrorKind::SourceChanged => match io_errno(&error) {
+            Some(errno) => PyOSError::new_err((errno, message)),
+            None => PyOSError::new_err(message),
+        },
         ErrorKind::InvalidArgument | ErrorKind::DuplicateEntry => PyValueError::new_err(message),
         ErrorKind::EntryNotFound => PyKeyError::new_err(message),
         ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
