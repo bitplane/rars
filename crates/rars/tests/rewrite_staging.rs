@@ -784,3 +784,156 @@ fn incremental_rewrites_match_eager_staging_bytes() {
         }
     }
 }
+
+fn stage_from_set(
+    first: &rars::Archive,
+    later: &[rars::Archive],
+    indices: &[usize],
+) -> Vec<Vec<u8>> {
+    let root = scratch::case("rewrite-volume-set");
+    first
+        .with_rewrite_sources_from_volumes(
+            later,
+            indices,
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 1 << 24,
+            },
+            None,
+            |sources| {
+                sources
+                    .iter()
+                    .map(|source| {
+                        let mut data = Vec::new();
+                        source.open()?.read_to_end(&mut data)?;
+                        Ok(data)
+                    })
+                    .collect::<rars::Result<Vec<_>>>()
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn volume_set_staging_follows_split_members_into_later_volumes() {
+    let mut state = 0x9e37_79b9u32;
+    let large: Vec<u8> = (0..20_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    for solid in [false, true] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .solid(solid)
+            .volume_size(Some(8192));
+        builder
+            .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+            .unwrap();
+        builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+        builder
+            .add_bytes(b"large".to_vec(), large.clone(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"last".to_vec(), b"last payload".to_vec(), None, None)
+            .unwrap();
+        let mut volumes = builder
+            .build_volumes(None)
+            .unwrap()
+            .into_iter()
+            .map(|bytes| ArchiveReader::read_owned(bytes).unwrap());
+        let first = volumes.next().unwrap();
+        let later: Vec<_> = volumes.collect();
+        assert!(later.len() >= 2);
+
+        let members = first.volume_set_members(&later).unwrap();
+        let names: Vec<_> = members.iter().map(|m| m.member.meta.name.clone()).collect();
+        assert_eq!(names, [&b"first"[..], b"dir", b"large", b"last"]);
+        assert_eq!(members[2].member.meta.unpacked_size, large.len() as u64);
+        assert_eq!(members[3].volume, later.len());
+
+        let staged = stage_from_set(&first, &later, &[3, 0, 2]);
+        assert_eq!(
+            staged,
+            [
+                b"last payload".to_vec(),
+                b"first payload".to_vec(),
+                large.clone()
+            ],
+            "solid={solid}"
+        );
+
+        let missing = first.volume_set_members(&later[..later.len() - 1]);
+        assert_eq!(*missing.unwrap_err().root_cause(), Error::MissingVolume);
+    }
+}
+
+#[test]
+fn volume_set_staging_matches_extraction_of_winrar_legacy_sets() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar15_40/rar300");
+    for names in [
+        &[
+            "multivol_newnaming_rar300.part01.rar",
+            "multivol_newnaming_rar300.part02.rar",
+        ][..],
+        &[
+            "compressed_multivol_prng_rar300.rar",
+            "compressed_multivol_prng_rar300.r00",
+            "compressed_multivol_prng_rar300.r01",
+            "compressed_multivol_prng_rar300.r02",
+            "compressed_multivol_prng_rar300.r03",
+        ],
+    ] {
+        let mut volumes = names
+            .iter()
+            .map(|name| ArchiveReader::read_path(fixtures.join(name)).unwrap());
+        let first = volumes.next().unwrap();
+        let later: Vec<_> = volumes.collect();
+        let members = first.volume_set_members(&later).unwrap();
+        assert!(
+            members.iter().any(|m| m.member.meta.is_split_after),
+            "{names:?}"
+        );
+
+        let expected = std::cell::RefCell::new(Vec::<Arc<std::sync::Mutex<Vec<u8>>>>::new());
+        first
+            .extract_with_volumes(
+                later.iter().cloned().map(Ok),
+                ArchiveReadOptions::default(),
+                |_| {
+                    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    expected.borrow_mut().push(buffer.clone());
+                    Ok(Box::new(Shared(buffer)))
+                },
+            )
+            .unwrap();
+        let expected: Vec<_> = expected
+            .into_inner()
+            .iter()
+            .map(|b| b.lock().unwrap().clone())
+            .collect();
+        let indices: Vec<_> = (0..members.len()).collect();
+        assert_eq!(
+            stage_from_set(&first, &later, &indices),
+            expected,
+            "{names:?}"
+        );
+    }
+}
+
+struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Shared {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

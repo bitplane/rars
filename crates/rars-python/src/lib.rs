@@ -329,6 +329,15 @@ impl ReadOptions {
         }
         Ok(Some(call))
     }
+
+    /// The policies alone, without a call's progress or cancellation.
+    fn policies(&self) -> Self {
+        Self {
+            cancellation: None,
+            progress: None,
+            ..self.clone()
+        }
+    }
 }
 
 fn python_read_options<'a>(
@@ -1430,16 +1439,9 @@ impl RarFile {
                 Ok(path.map(ArchiveInput::Path))
             },
             |volumes| {
-                let mut readable = 1;
-                let mut end = volume_end(&self.archive);
-                while end != VolumeEnd::Last {
-                    let Some(Ok(volume)) = volumes.next() else {
-                        break;
-                    };
-                    readable += 1;
-                    end = volume_end(&volume);
-                }
-                Ok(readable)
+                Ok(1 + volumes_to_last(&self.archive, volumes)
+                    .take_while(Result::is_ok)
+                    .count())
             },
         )?
         .map_err(map_error)?;
@@ -1649,6 +1651,59 @@ impl RarFile {
             list_later_volumes(archive, first, volumes, encoding, identity)
         })?;
         Ok(self.whole.get_or_init(|| whole))
+    }
+
+    /// A set's later volumes are read here, as their headers describe the set's members.
+    fn rewrite_source(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        password: Option<&[u8]>,
+    ) -> PyResult<(Vec<rars_rs::Archive>, Vec<SourceMember>)> {
+        let options = self.extraction_options(self.options.as_ref(), password);
+        let later = if !self.archive.is_volume() {
+            Vec::new()
+        } else if self.first_volume_only {
+            return Err(PyValueError::new_err(
+                "a RarFile opened with first_volume_only=True cannot rewrite its volume set; open it without first_volume_only",
+            ));
+        } else {
+            self.extract_set(py, volumes, options, |volumes| {
+                volumes_to_last(&self.archive, volumes).collect()
+            })?
+        };
+        // Releases the GIL, which a file-object source takes from inside its lock.
+        let members = py
+            .detach(|| {
+                let mut read = std::iter::once(&self.archive)
+                    .chain(&later)
+                    .map(|volume| {
+                        Ok((
+                            volume.member_comments_with_options(options)?,
+                            volume.legacy_symlink_targets_with_options(options)?,
+                            volume.member_comment_encryption(),
+                        ))
+                    })
+                    .collect::<rars_rs::Result<Vec<_>>>()?;
+                Ok::<_, rars_rs::Error>(
+                    self.archive
+                        .volume_set_members(&later)?
+                        .into_iter()
+                        .map(|set_member| {
+                            let (comments, links, encrypted) = &mut read[set_member.volume];
+                            let index = set_member.index_in_volume;
+                            SourceMember {
+                                member: set_member.member,
+                                comment: comments[index].take(),
+                                legacy_link: links[index].take(),
+                                comment_encrypted: encrypted[index],
+                            }
+                        })
+                        .collect(),
+                )
+            })
+            .map_err(map_error)?;
+        Ok((later, members))
     }
 
     /// Only a set's first volume knows where the set starts, and bytes alone can't find the rest.
@@ -2020,11 +2075,21 @@ impl PythonVolumes {
     }
 }
 
+/// A source member with the metadata read from its volume besides the payload.
+struct SourceMember {
+    member: rars_rs::ArchiveMember,
+    comment: Option<Vec<u8>>,
+    legacy_link: Option<Vec<u8>>,
+    comment_encrypted: bool,
+}
+
 /// Original identity follows edits; verified payload sources belong to one write.
 #[derive(Debug, Clone)]
 struct RewriteInput {
     archive: rars_rs::Archive,
+    later_volumes: Vec<rars_rs::Archive>,
     password: Option<Vec<u8>>,
+    options: Option<ReadOptions>,
     members: HashMap<usize, RewriteMember>,
     directory: Option<PathBuf>,
     max_staged_bytes: Option<u64>,
@@ -2057,12 +2122,12 @@ impl RewriteInput {
             })?,
         };
         let indices: Vec<_> = members.iter().map(|(_, member)| member.index).collect();
-        let mut options =
-            rars_rs::ArchiveReadOptions::with_optional_password(self.password.as_deref());
+        let mut options = python_read_options(self.options.as_ref(), self.password.as_deref());
         if let Some(progress) = &progress {
             options = options.with_cancellation(&progress.read_cancellation);
         }
-        self.archive.with_rewrite_sources(
+        self.archive.with_rewrite_sources_from_volumes(
+            &self.later_volumes,
             &indices,
             options,
             &rars_rs::RewriteStaging {
@@ -2201,11 +2266,23 @@ impl RarBuilder {
     /// Payload staging happens afresh during each write. staging_dir defaults
     /// to the output directory (current directory for to_bytes); max_staged_bytes
     /// defaults to the retained payloads' combined declared uncompressed size.
-    #[pyo3(signature = (source, password = None, *, preserve = true, staging_dir = None, max_staged_bytes = None))]
+    ///
+    /// `options` reads the source as `RarFile` does, replacing a `RarFile` source's own,
+    /// both here and while staging. `cancellation` covers what this call reads;
+    /// a write's own `cancellation` covers staging.
+    /// A volume set rewrites into one archive with `preserve=False`, its later
+    /// volumes taken from `volumes` as in `extractall`, else found by name. They are
+    /// all read before this returns. Writing decodes every member up to the last one
+    /// kept, removed ones included, so those must still be readable.
+    #[pyo3(signature = (source, password = None, *, options = None, volumes = None, cancellation = None, preserve = true, staging_dir = None, max_staged_bytes = None))]
+    #[allow(clippy::too_many_arguments)]
     fn from_archive(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         preserve: bool,
         staging_dir: Option<&Bound<'_, PyAny>>,
         max_staged_bytes: Option<u64>,
@@ -2213,11 +2290,18 @@ impl RarBuilder {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
             Ok(archive) => RarFile {
                 identity: archive.identity.clone(),
-                encoding: None,
+                encoding: options.map_or(archive.encoding, |options| options.encoding),
                 archive: archive.archive.clone(),
                 path: archive.path.clone(),
                 password: archive.password.clone(),
-                options: archive.options.clone(),
+                options: ReadOptions::for_call(
+                    options
+                        .or(archive.options.as_ref())
+                        .map(ReadOptions::policies)
+                        .as_ref(),
+                    None,
+                    cancellation,
+                )?,
                 volumes: archive
                     .volumes
                     .as_ref()
@@ -2226,22 +2310,33 @@ impl RarBuilder {
                 first: SetListing::new(archive.first.infos.clone()),
                 whole: OnceLock::new(),
             },
-            Err(_) => RarFile::new(py, source, "r", password, None, None, false, None)?,
+            Err(_) => RarFile::new(
+                py,
+                source,
+                "r",
+                password,
+                options,
+                cancellation,
+                false,
+                None,
+            )?,
         };
         let password = archive.password.clone();
         if preserve {
             let issues = archive.archive.rewrite_preservation_issues();
             if !issues.is_empty() {
+                let way_through = if archive.archive.is_volume() {
+                    "use preserve=False to rewrite the volume set as one RAR5 archive"
+                } else {
+                    "use preserve=False for explicit RAR5 conversion"
+                };
                 return Err(UnsupportedRarFeature::new_err(format!(
-                    "cannot preserve archive: {}; use preserve=False for explicit RAR5 conversion (archive settings may be lost)",
+                    "cannot preserve archive: {}; {way_through} (archive settings may be lost)",
                     issues.join("; ")
                 )));
             }
         }
-        // Releases the GIL, which a file-object source takes from inside its lock.
-        let comments = py
-            .detach(|| archive.archive.member_comments(password.as_deref()))
-            .map_err(map_error)?;
+        let (later_volumes, members) = archive.rewrite_source(py, volumes, password.as_deref())?;
         let inner = if preserve {
             archive
                 .archive
@@ -2254,28 +2349,29 @@ impl RarBuilder {
         let legacy_preservation = preserve && format.family() != rars_rs::ArchiveFamily::Rar50Plus;
         let mut builder = Self {
             inner: inner
-                .comment(archive.comment(py)?)
+                .comment(archive.read_comment(py, None, archive.options.as_ref(), None)?)
                 .allow_duplicate_names(true),
             format,
             resources: rars_rs::WriterResources::default(),
             rewrite: Some(RewriteInput {
                 archive: archive.archive.clone(),
+                later_volumes: later_volumes.clone(),
                 password: password.clone(),
+                options: archive.options.as_ref().map(ReadOptions::policies),
                 members: HashMap::new(),
                 directory: staging_dir.map(|path| py_path_buf(py, path)).transpose()?,
                 max_staged_bytes,
             }),
         };
-        let comment_encryption = archive.archive.member_comment_encryption();
-        let legacy_links = py
-            .detach(|| archive.archive.legacy_symlink_targets(password.as_deref()))
-            .map_err(map_error)?;
-        for (((member_index, member), comment), legacy_link) in archive
-            .archive
-            .members()
-            .enumerate()
-            .zip(comments)
-            .zip(legacy_links)
+        for (
+            member_index,
+            SourceMember {
+                member,
+                comment,
+                legacy_link,
+                comment_encrypted,
+            },
+        ) in members.into_iter().enumerate()
         {
             let legacy_unicode_name = if legacy_preservation {
                 match &member.detail {
@@ -2294,6 +2390,11 @@ impl RarBuilder {
             } else {
                 (None, Some(member.times().map_err(map_error)?))
             };
+            let converted_name = (!legacy_preservation
+                && member.meta.family != rars_rs::ArchiveFamily::Rar50Plus)
+                .then(|| member.decoded_name(archive.encoding).map(Cow::into_owned))
+                .transpose()
+                .map_err(map_error)?;
             let link = member.supported_redirection().cloned();
             let retained_link = link.as_ref().map(|_| member.clone());
             let info = member.meta;
@@ -2301,15 +2402,14 @@ impl RarBuilder {
             // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
             // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
             let attr_source = info.attr_source();
-            let output_name = if !legacy_preservation
-                && info.family != rars_rs::ArchiveFamily::Rar50Plus
-                && attr_source == rars_rs::AttrSource::Unix
-            {
-                rars_rs::builder::validate_entry_name(info.name.clone())
-                    .map_err(map_builder_error)?;
-                rars_rs::filename::encode_rar50(&info.name).into_owned()
-            } else {
-                info.name.clone()
+            let output_name = match converted_name {
+                Some(name) if attr_source == rars_rs::AttrSource::Unix => {
+                    rars_rs::builder::validate_entry_name(name.clone())
+                        .map_err(map_builder_error)?;
+                    rars_rs::filename::encode_rar50(&name).into_owned()
+                }
+                Some(name) => name,
+                None => info.name.clone(),
             };
             let unix_type = info.file_attr & 0o170000;
             let unsupported_type = attr_source == rars_rs::AttrSource::Unix
@@ -2407,7 +2507,7 @@ impl RarBuilder {
                         } else {
                             None
                         },
-                        if comment_encryption[member_index] {
+                        if comment_encrypted {
                             password.clone()
                         } else {
                             None
@@ -4274,6 +4374,31 @@ enum VolumeEnd {
     Unknown,
 }
 
+/// Volumes marked with no end run until the caller's run out, so only a marked set can report one missing.
+fn volumes_to_last<'a>(
+    first: &rars_rs::Archive,
+    volumes: &'a mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+) -> impl Iterator<Item = rars_rs::Result<rars_rs::Archive>> + 'a {
+    let mut end = volume_end(first);
+    let mut number = 1;
+    std::iter::from_fn(move || {
+        if end == VolumeEnd::Last {
+            return None;
+        }
+        number += 1;
+        let volume = match volumes.next() {
+            Some(volume) => volume,
+            None if end == VolumeEnd::More => Err(rars_rs::Error::MissingVolume),
+            None => return None,
+        };
+        end = volume.as_ref().map_or(VolumeEnd::Last, volume_end);
+        Some(volume.map_err(|error| rars_rs::Error::InVolume {
+            number,
+            source: Box::new(error),
+        }))
+    })
+}
+
 fn volume_end(archive: &rars_rs::Archive) -> VolumeEnd {
     if !archive.is_volume() {
         return VolumeEnd::Last;
@@ -4318,17 +4443,11 @@ fn list_later_volumes(
     let mut infos = listing.infos.clone();
     let mut places = listing.places.clone();
     let mut pending = infos.last().is_some_and(|info| info.is_split_after);
-    let mut end = volume_end(first);
-    let mut index = 0;
-    while end != VolumeEnd::Last {
-        index += 1;
-        let Some(volume) = volumes.next() else {
-            if pending || end == VolumeEnd::More {
-                return Err(in_volume(index, rars_rs::Error::MissingVolume));
-            }
-            break;
-        };
-        let volume = volume.map_err(|error| in_volume(index, error))?;
+    let mut pulled = 0;
+    for volume in volumes_to_last(first, volumes) {
+        pulled += 1;
+        let index = pulled;
+        let volume = volume?;
         for (index_in_volume, member) in volume.members().enumerate() {
             let split_after = member.meta.is_split_after;
             if member.meta.is_split_before {
@@ -4370,7 +4489,9 @@ fn list_later_volumes(
             }
             pending = split_after;
         }
-        end = volume_end(&volume);
+    }
+    if pending {
+        return Err(in_volume(pulled + 1, rars_rs::Error::MissingVolume));
     }
     Ok(SetListing {
         infos,
@@ -5357,6 +5478,9 @@ mod tests {
                     let builder = RarBuilder::from_archive(
                         py,
                         source.bind(py).as_any(),
+                        None,
+                        None,
+                        None,
                         None,
                         true,
                         Some(directory.as_any()),

@@ -1,6 +1,6 @@
 //! Verified payload staging for archive rewrites.
 
-use crate::{Archive, ArchiveReadOptions, EntrySource, Result};
+use crate::{Archive, ArchiveMember, ArchiveReadOptions, EntrySource, Error, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -19,10 +19,110 @@ pub struct RewriteStaging {
     pub max_staged_bytes: u64,
 }
 
+/// Only a set's last part records a split member's whole size, so it is carried onto the first.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct VolumeSetMember {
+    pub volume: usize,
+    pub index_in_volume: usize,
+    pub member: ArchiveMember,
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod pipeline;
 
 impl Archive {
+    /// Set rewrites number members by this list, each counted once however many volumes it spans.
+    #[doc(hidden)]
+    pub fn volume_set_members(&self, later_volumes: &[Archive]) -> Result<Vec<VolumeSetMember>> {
+        let broken = |volume: usize| Error::InVolume {
+            number: volume + 1,
+            source: Box::new(Error::InvalidHeader(
+                "volume does not continue the member split from the volume before it",
+            )),
+        };
+        let mut members: Vec<VolumeSetMember> = Vec::new();
+        let mut pending = false;
+        for (volume, archive) in std::iter::once(self).chain(later_volumes).enumerate() {
+            for (index_in_volume, member) in archive.members().enumerate() {
+                let split_after = member.meta.is_split_after;
+                if member.meta.is_split_before {
+                    let first = members
+                        .last_mut()
+                        .filter(|first| {
+                            pending
+                                && index_in_volume == 0
+                                && first.member.meta.name == member.meta.name
+                        })
+                        .ok_or_else(|| broken(volume))?;
+                    if !split_after {
+                        first.member.meta.unpacked_size = member.meta.unpacked_size;
+                    }
+                } else if pending {
+                    return Err(broken(volume));
+                } else {
+                    members.push(VolumeSetMember {
+                        volume,
+                        index_in_volume,
+                        member,
+                    });
+                }
+                pending = split_after;
+            }
+        }
+        if pending {
+            return Err(Error::InVolume {
+                number: later_volumes.len() + 2,
+                source: Box::new(Error::MissingVolume),
+            });
+        }
+        Ok(members)
+    }
+
+    /// Indices follow [`Self::volume_set_members`], so a split member stages whole.
+    #[doc(hidden)]
+    pub fn with_rewrite_sources_from_volumes<T>(
+        &self,
+        later_volumes: &[Archive],
+        indices: &[usize],
+        options: ArchiveReadOptions<'_>,
+        staging: &RewriteStaging,
+        progress: Option<Arc<dyn crate::WriteProgress>>,
+        consume: impl FnOnce(Vec<EntrySource>) -> Result<T>,
+    ) -> Result<T> {
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            pipeline::run(
+                self,
+                later_volumes,
+                indices,
+                options,
+                staging,
+                progress,
+                consume,
+            )
+        }
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = (later_volumes, indices, options, staging, progress, consume);
+            Err(crate::Error::InvalidArgument(
+                "rewrite staging requires disk storage",
+            ))
+        }
+    }
+
+    /// Members as a rewrite numbers them: this archive's own, or the set's when it continues.
+    fn rewrite_members(&self, later_volumes: &[Archive]) -> Result<Vec<ArchiveMember>> {
+        if later_volumes.is_empty() {
+            return Ok(self.members().collect());
+        }
+        Ok(self
+            .volume_set_members(later_volumes)?
+            .into_iter()
+            .map(|member| member.member)
+            .collect())
+    }
+
     /// Supply verified payloads on demand during one writer call. Decoding uses
     /// one archive-order traversal, including required solid predecessors.
     /// Sources belong to one write in this call only: assign each source to one
@@ -41,7 +141,7 @@ impl Archive {
     ) -> Result<T> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
-            pipeline::run(self, indices, options, staging, progress, consume)
+            pipeline::run(self, &[], indices, options, staging, progress, consume)
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
@@ -94,7 +194,7 @@ impl Archive {
     ) -> Result<Vec<EntrySource>> {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         {
-            native::stage(self, indices, options, staging, progress, None)
+            native::stage(self, &[], indices, options, staging, progress, None)
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
@@ -237,6 +337,7 @@ mod native {
 
     pub(super) fn stage(
         archive: &Archive,
+        later_volumes: &[Archive],
         indices: &[usize],
         options: ArchiveReadOptions<'_>,
         staging: &RewriteStaging,
@@ -268,7 +369,8 @@ mod native {
         };
         let mut total = 0u64;
         let mut entries = 0;
-        for (index, member) in archive.members().enumerate() {
+        let members = archive.rewrite_members(later_volumes)?;
+        for (index, member) in members.iter().enumerate() {
             options.check_cancelled()?;
             if index <= last
                 && (selected.contains_key(&index) || solid)
@@ -281,11 +383,12 @@ mod native {
             if !selected.contains_key(&index) {
                 continue;
             }
-            let meta = member.meta;
+            let meta = &member.meta;
+            // A set's members are listed whole, so only a lone volume's split member is a fragment.
             if meta.is_directory
                 || meta.is_redirection
                 || meta.is_split_before
-                || meta.is_split_after
+                || (meta.is_split_after && later_volumes.is_empty())
             {
                 return Err(Error::InvalidArgument(
                     "rewrite staging requires unsplit payload members",
@@ -333,7 +436,7 @@ mod native {
         let mut pending = None;
         let mut decoded = 0;
         let mut staged_pending = None;
-        archive.extract_with_control(options, |member| {
+        let mut visit = || {
             publish_pending(&mut staged_pending, &mut selected, delivery)?;
             if let Some(progress) = &progress {
                 if let Some(entry) = pending.take() {
@@ -345,6 +448,9 @@ mod native {
             if current > last {
                 return Ok(ExtractionDecision::Stop);
             }
+            let member = members.get(current).ok_or(Error::InvalidHeader(
+                "extraction passed more members than the archive lists",
+            ))?;
             let wanted = selected.contains_key(&current);
             let dependency = solid && !member.meta.is_directory && !member.meta.is_redirection;
             if !wanted && !dependency {
@@ -392,7 +498,12 @@ mod native {
                     sink
                 },
             ))
-        })?;
+        };
+        if later_volumes.is_empty() {
+            archive.extract_with_control(options, |_| visit())?;
+        } else {
+            set_extract(archive, later_volumes, options, visit)?;
+        }
         if let Some(progress) = &progress {
             if let Some(entry) = pending.take() {
                 progress.finish_entry(&entry)?;
@@ -421,6 +532,38 @@ mod native {
                 Ok(spool.into_source())
             })
             .collect()
+    }
+
+    /// Set extraction can't skip or stop: unselected members decode into a sink, and a stop is an error discarded here.
+    fn set_extract(
+        archive: &Archive,
+        later_volumes: &[Archive],
+        options: ArchiveReadOptions<'_>,
+        visit: impl FnMut() -> Result<ExtractionDecision>,
+    ) -> Result<()> {
+        let visit = RefCell::new(visit);
+        let stopped = Cell::new(false);
+        let next = || -> Result<Box<dyn Write>> {
+            match (visit.borrow_mut())()? {
+                ExtractionDecision::Extract(sink) => Ok(sink),
+                ExtractionDecision::Skip => Ok(Box::new(std::io::sink())),
+                ExtractionDecision::Stop => {
+                    stopped.set(true);
+                    Err(Error::InvalidArgument("rewrite staging is complete"))
+                }
+            }
+        };
+        let result = crate::output_links::extract_arriving_with_links(
+            archive,
+            later_volumes.iter().cloned().map(Ok),
+            options,
+            |_| next(),
+            |_, _| next().map(drop),
+        );
+        match result {
+            Err(_) if stopped.get() => Ok(()),
+            result => result,
+        }
     }
 
     fn publish_pending(
