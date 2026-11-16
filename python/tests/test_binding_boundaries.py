@@ -32,7 +32,7 @@ def test_reader_context_iteration_and_info_aliases():
         infos = list(archive)
         assert [info.filename for info in infos] == archive.namelist()
         for info in infos:
-            assert info.CRC == info.crc
+            assert not hasattr(info, "crc")
             assert "RarInfo(" in repr(info)
             assert isinstance(info.is_dir(), bool)
             with archive.open(info) as stream:

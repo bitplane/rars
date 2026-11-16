@@ -3,7 +3,8 @@ use pyo3::exceptions::{
     PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple};
+use pyo3::sync::PyOnceLock;
+use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
 use rars_rs::output_links::{create_link_output, link_source_path};
@@ -14,6 +15,7 @@ use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
 use rars_rs::ExtractedLink;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -35,10 +37,69 @@ create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
 create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
 
+/// `str` subclasses, so each member still compares, hashes and formats as its
+/// value did when these were plain strings. Python 3.10 has no `StrEnum`.
+const ENUMS: &CStr = c"
+import enum
+
+
+class ArchiveVersion(str, enum.Enum):
+    RAR13 = 'rar13'
+    RAR14 = 'rar14'
+    RAR15 = 'rar15'
+    RAR20 = 'rar20'
+    RAR29 = 'rar29'
+    RAR30 = 'rar30'
+    RAR40 = 'rar40'
+    RAR50 = 'rar50'
+    RAR70 = 'rar70'
+
+
+class ArchiveFamily(str, enum.Enum):
+    RAR13 = 'rar13'
+    RAR15_40 = 'rar15_40'
+    RAR50_PLUS = 'rar50_plus'
+    UNKNOWN = 'unknown'
+
+
+class VolumeNaming(str, enum.Enum):
+    PART = 'part'
+    OLD = 'old'
+
+
+class ProgressPhase(str, enum.Enum):
+    READING = 'reading'
+    EXTRACTING = 'extracting'
+    TESTING = 'testing'
+    STAGING = 'staging'
+    COMPRESSION = 'compression'
+    RECOVERY = 'recovery'
+    WRITING = 'writing'
+
+
+ENUMS = (ArchiveVersion, ArchiveFamily, VolumeNaming, ProgressPhase)
+for cls in ENUMS:
+    cls.__str__ = str.__str__
+    cls.__format__ = str.__format__
+    cls.__module__ = 'rars'
+";
+
+static ARCHIVE_FAMILY: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static VOLUME_NAMING: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static PROGRESS_PHASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+
+fn enum_member<'py>(
+    py: Python<'py>,
+    class: &PyOnceLock<Py<PyType>>,
+    name: &str,
+    value: &str,
+) -> PyResult<Bound<'py, PyAny>> {
+    class.import(py, "rars", name)?.call1((value,))
+}
+
 #[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone)]
 struct ProgressEvent {
-    #[pyo3(get)]
     phase: String,
     #[pyo3(get)]
     completed: u64,
@@ -100,6 +161,11 @@ struct RepairResult {
 
 #[pymethods]
 impl ProgressEvent {
+    #[getter]
+    fn phase<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        enum_member(py, &PROGRESS_PHASE, "ProgressPhase", &self.phase)
+    }
+
     #[getter]
     fn percentage(&self) -> Option<f64> {
         if !self.total_known || (self.phase == "writing" && self.total == 0 && !self.finished) {
@@ -707,7 +773,7 @@ struct RarInfo {
     /// Whole-second calendar tuple: UTC for RAR5, stored wall-clock fields for
     /// legacy DOS timestamps. None means no usable timestamp was recorded.
     date_time: Option<(u16, u8, u8, u8, u8, u8)>,
-    #[pyo3(get)]
+    /// Python reads it as `CRC`, the name `zipfile` and `rarfile` use.
     crc: Option<u32>,
     #[pyo3(get)]
     host_os: Option<u64>,
@@ -719,8 +785,7 @@ struct RarInfo {
     is_split_before: bool,
     #[pyo3(get)]
     is_split_after: bool,
-    #[pyo3(get)]
-    rar_version: String,
+    family: rars_rs::ArchiveFamily,
     #[pyo3(get)]
     file_attr: u64,
     #[pyo3(get)]
@@ -742,6 +807,11 @@ impl RarInfo {
     #[getter(CRC)]
     fn crc_upper(&self) -> Option<u32> {
         self.crc
+    }
+
+    #[getter]
+    fn family<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        family_member(py, self.family)
     }
 
     fn is_dir(&self) -> bool {
@@ -1370,8 +1440,8 @@ impl RarFile {
     }
 
     #[getter]
-    fn family(&self) -> String {
-        family_name(self.archive.family()).to_string()
+    fn family<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        family_member(py, self.archive.family())
     }
 
     #[getter]
@@ -1390,11 +1460,12 @@ impl RarFile {
     }
 
     #[getter]
-    fn volume_naming(&self) -> &'static str {
-        match self.archive.volume_naming() {
+    fn volume_naming<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let value = match self.archive.volume_naming() {
             rars_rs::volume_name::VolumeNaming::Part => "part",
             rars_rs::volume_name::VolumeNaming::Old => "old",
-        }
+        };
+        enum_member(py, &VOLUME_NAMING, "VolumeNaming", value)
     }
 
     fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
@@ -2991,10 +3062,19 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("NotRarFile", py.get_type::<NotRarFile>())?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
     m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
-    for version in [
-        "rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70",
+    let enums = PyModule::from_code(py, ENUMS, c"rars/_enums.py", c"rars._enums")?;
+    for name in [
+        "ArchiveVersion",
+        "ArchiveFamily",
+        "VolumeNaming",
+        "ProgressPhase",
     ] {
-        m.add(version.to_ascii_uppercase(), version)?;
+        m.add(name, enums.getattr(name)?)?;
+    }
+    // Kept as the module-level spellings of ArchiveVersion's members.
+    for member in enums.getattr("ArchiveVersion")?.try_iter()? {
+        let member = member?;
+        m.add(member.getattr("name")?.extract::<String>()?, member)?;
     }
     Ok(())
 }
@@ -4399,7 +4479,7 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         is_solid: solid,
         is_split_before: member.meta.is_split_before,
         is_split_after: member.meta.is_split_after,
-        rar_version: family_name(member.meta.family).to_string(),
+        family: member.meta.family,
         file_attr: member.meta.file_attr,
         detail,
         is_directory: member.meta.is_directory,
@@ -4417,13 +4497,14 @@ fn hash_label(hash: Option<rars_rs::ArchiveMemberHash>) -> String {
     }
 }
 
-fn family_name(family: rars_rs::ArchiveFamily) -> &'static str {
-    match family {
+fn family_member(py: Python<'_>, family: rars_rs::ArchiveFamily) -> PyResult<Bound<'_, PyAny>> {
+    let value = match family {
         rars_rs::ArchiveFamily::Rar13 => "rar13",
         rars_rs::ArchiveFamily::Rar15To40 => "rar15_40",
         rars_rs::ArchiveFamily::Rar50Plus => "rar50_plus",
         _ => "unknown",
-    }
+    };
+    enum_member(py, &ARCHIVE_FAMILY, "ArchiveFamily", value)
 }
 
 fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {

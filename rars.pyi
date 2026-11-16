@@ -1,5 +1,6 @@
 import os
 from collections.abc import Callable, Iterable, Iterator
+from enum import Enum
 from pathlib import Path
 from types import TracebackType
 from typing import IO, Final, Literal, Protocol, final
@@ -13,6 +14,10 @@ __all__ = [
     "ProgressEvent",
     "CancellationToken",
     "ReadOptions",
+    "ArchiveVersion",
+    "ArchiveFamily",
+    "VolumeNaming",
+    "ProgressPhase",
     "WriterResources",
     "RepairReport",
     "RepairResult",
@@ -55,15 +60,49 @@ _NewName: TypeAlias = str | bytes
 _Overwrite: TypeAlias = bool | Literal["rename"]
 _Progress: TypeAlias = Callable[[ProgressEvent], object]
 
-RAR13: Final = "rar13"
-RAR14: Final = "rar14"
-RAR15: Final = "rar15"
-RAR20: Final = "rar20"
-RAR29: Final = "rar29"
-RAR30: Final = "rar30"
-RAR40: Final = "rar40"
-RAR50: Final = "rar50"
-RAR70: Final = "rar70"
+class ArchiveVersion(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    RAR13 = "rar13"
+    RAR14 = "rar14"
+    RAR15 = "rar15"
+    RAR20 = "rar20"
+    RAR29 = "rar29"
+    RAR30 = "rar30"
+    RAR40 = "rar40"
+    RAR50 = "rar50"
+    RAR70 = "rar70"
+
+class ArchiveFamily(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    RAR13 = "rar13"
+    RAR15_40 = "rar15_40"
+    RAR50_PLUS = "rar50_plus"
+    UNKNOWN = "unknown"
+
+class VolumeNaming(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    PART = "part"
+    OLD = "old"
+
+class ProgressPhase(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    READING = "reading"
+    EXTRACTING = "extracting"
+    TESTING = "testing"
+    STAGING = "staging"
+    COMPRESSION = "compression"
+    RECOVERY = "recovery"
+    WRITING = "writing"
+
+RAR13: Final = ArchiveVersion.RAR13
+RAR14: Final = ArchiveVersion.RAR14
+RAR15: Final = ArchiveVersion.RAR15
+RAR20: Final = ArchiveVersion.RAR20
+RAR29: Final = ArchiveVersion.RAR29
+RAR30: Final = ArchiveVersion.RAR30
+RAR40: Final = ArchiveVersion.RAR40
+RAR50: Final = ArchiveVersion.RAR50
+RAR70: Final = ArchiveVersion.RAR70
 
 class Error(Exception): ...
 class BadRarFile(Error): ...
@@ -86,7 +125,7 @@ class UnsafeLinkWarning(UserWarning): ...
 @final
 class ProgressEvent:
     @property
-    def phase(self) -> str: ...
+    def phase(self) -> ProgressPhase: ...
     @property
     def completed(self) -> int: ...
     @property
@@ -178,8 +217,6 @@ class RarInfo:
     @property
     def date_time(self) -> tuple[int, int, int, int, int, int] | None: ...
     @property
-    def crc(self) -> int | None: ...
-    @property
     def CRC(self) -> int | None: ...
     @property
     def host_os(self) -> int | None: ...
@@ -192,7 +229,7 @@ class RarInfo:
     @property
     def is_split_after(self) -> bool: ...
     @property
-    def rar_version(self) -> str: ...
+    def family(self) -> ArchiveFamily: ...
     @property
     def file_attr(self) -> int: ...
     @property
@@ -317,7 +354,7 @@ class RarFile:
     @property
     def sfx_offset(self) -> int: ...
     @property
-    def family(self) -> Literal["rar13", "rar15_40", "rar50_plus", "unknown"]: ...
+    def family(self) -> ArchiveFamily: ...
     @property
     def is_volume(self) -> bool: ...
     @property
@@ -325,7 +362,7 @@ class RarFile:
     @property
     def is_first_volume(self) -> bool | None: ...
     @property
-    def volume_naming(self) -> Literal["part", "old"]: ...
+    def volume_naming(self) -> VolumeNaming: ...
     def __enter__(self) -> Self: ...
     def __exit__(
         self,
@@ -339,7 +376,7 @@ class RarFile:
 class RarBuilder:
     def __new__(
         cls,
-        format: str = "rar50",
+        format: ArchiveVersion | str = "rar50",
         *,
         level: int = 3,
         store: bool = False,
