@@ -1381,21 +1381,7 @@ impl RarFile {
             .members()
             .nth(index)
             .ok_or_else(|| PyKeyError::new_err("member not found"))?;
-        let mut times = member.file_times().map_err(map_error)?.unwrap_or_default();
-        if times.modified.is_none() {
-            times.modified = member
-                .meta
-                .modification_time()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|time| {
-                    u32::try_from(time.as_secs())
-                        .ok()
-                        .map(|seconds| rars_rs::FileTimestamp::Unix {
-                            seconds,
-                            nanoseconds: time.subsec_nanos(),
-                        })
-                });
-        }
+        let times = member.times().map_err(map_error)?;
         Ok([
             ("modified", times.modified),
             ("created", times.created),
@@ -2301,22 +2287,12 @@ impl RarBuilder {
             } else {
                 None
             };
-            let legacy_extended_times = if legacy_preservation {
-                match &member.detail {
-                    rars_rs::ArchiveMemberDetail::Rar15To40 { extended_times, .. }
-                        if !extended_times.is_empty() =>
-                    {
-                        Some(extended_times.clone())
-                    }
-                    _ => None,
-                }
+            // Within one family the stored times copy exactly; across families
+            // they go through Unix time.
+            let (copied_times, converted_times) = if member.meta.family == format.family() {
+                (Some(member.clone()), None)
             } else {
-                None
-            };
-            let file_times = if legacy_preservation {
-                None
-            } else {
-                member.file_times().map_err(map_error)?
+                (None, Some(member.times().map_err(map_error)?))
             };
             let link = member.supported_redirection().cloned();
             let retained_link = link.as_ref().map(|_| member.clone());
@@ -2359,22 +2335,6 @@ impl RarBuilder {
                 } else {
                     (info.file_attr & 0o7777) as u32
                 });
-            // Reuse CLI extraction's local-zone policy for legacy DOS times,
-            // including the extended odd second, before writing RAR5 Unix time.
-            let modified = (!legacy_preservation)
-                .then(|| info.modification_time())
-                .flatten()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
-            let mtime = if legacy_preservation {
-                info.file_time
-            } else {
-                modified
-                    .map(|duration| u32::try_from(duration.as_secs()))
-                    .transpose()
-                    .map_err(|_| {
-                        PyValueError::new_err("modification time exceeds the RAR5 timestamp range")
-                    })?
-            };
             if let Some(member) = retained_link {
                 builder
                     .inner
@@ -2391,14 +2351,14 @@ impl RarBuilder {
                             rars_rs::filename::encode_rar50(&target).into_owned()
                         },
                         false,
-                        mtime,
+                        None,
                         mode,
                     )
                     .map_err(map_builder_error)?;
             } else if info.is_directory {
                 builder
                     .inner
-                    .add_directory(output_name.clone(), mtime, mode)
+                    .add_directory(output_name.clone(), None, mode)
                     .map_err(map_builder_error)?;
             } else {
                 // The per-write builder replaces this placeholder after a single
@@ -2410,7 +2370,7 @@ impl RarBuilder {
                 });
                 builder
                     .inner
-                    .add_source(output_name.clone(), source, mtime, mode)
+                    .add_source(output_name.clone(), source, None, mode)
                     .map_err(map_builder_error)?;
                 builder.rewrite.as_mut().unwrap().members.insert(
                     builder.inner.member_ids().last().unwrap(),
@@ -2425,10 +2385,16 @@ impl RarBuilder {
                 .inner
                 .set_file_comment_by_id(id, comment)
                 .map_err(map_builder_error)?;
-            if let Some(time) = modified.filter(|time| time.subsec_nanos() != 0) {
+            if let Some(source) = &copied_times {
                 builder
                     .inner
-                    .set_mtime_nanoseconds_by_id(id, time.subsec_nanos())
+                    .copy_times_by_id(id, source)
+                    .map_err(map_builder_error)?;
+            }
+            if let Some(times) = converted_times {
+                builder
+                    .inner
+                    .set_times_by_id(id, times)
                     .map_err(map_builder_error)?;
             }
             if preserve {
@@ -2453,18 +2419,6 @@ impl RarBuilder {
                 builder
                     .inner
                     .set_legacy_unicode_name_by_id(id, raw)
-                    .map_err(map_builder_error)?;
-            }
-            if legacy_extended_times.is_some() {
-                builder
-                    .inner
-                    .set_legacy_extended_times_by_id(id, legacy_extended_times)
-                    .map_err(map_builder_error)?;
-            }
-            if file_times.is_some() {
-                builder
-                    .inner
-                    .set_file_times_by_id(id, file_times)
                     .map_err(map_builder_error)?;
             }
             if attr_source == rars_rs::AttrSource::Dos {
@@ -2498,27 +2452,32 @@ impl RarBuilder {
     fn add_directory(
         &mut self,
         arcname: &Bound<'_, PyAny>,
-        mtime: Option<u32>,
+        mtime: Option<i64>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
-            .add_directory(new_member_name(arcname)?, mtime, mode)
+            .add_directory(
+                new_member_name(arcname)?,
+                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mode,
+            )
             .map_err(map_builder_error)
     }
 
+    /// `mtime` is Unix seconds, in every format.
     #[pyo3(signature = (data, arcname, mtime = None, mode = None))]
     fn add_bytes(
         &mut self,
         data: &Bound<'_, PyAny>,
         arcname: &Bound<'_, PyAny>,
-        mtime: Option<u32>,
+        mtime: Option<i64>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
             .add_bytes(
                 new_member_name(arcname)?,
                 py_required_bytes(data)?,
-                mtime,
+                mtime.map(rars_rs::Timestamp::from_unix_seconds),
                 mode,
             )
             .map_err(map_builder_error)
@@ -2553,7 +2512,7 @@ impl RarBuilder {
         arcname: &Bound<'_, PyAny>,
         target: &Bound<'_, PyAny>,
         target_is_directory: bool,
-        mtime: Option<u32>,
+        mtime: Option<i64>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
@@ -2561,13 +2520,14 @@ impl RarBuilder {
                 new_member_name(arcname)?,
                 new_member_name(target)?,
                 target_is_directory,
-                mtime,
+                mtime.map(rars_rs::Timestamp::from_unix_seconds),
                 mode,
             )
             .map_err(map_builder_error)
     }
 
-    /// Sets complete timestamps from exact Unix nanoseconds.
+    /// Sets times from exact Unix nanoseconds; one left `None` keeps what the
+    /// member has. RAR 1.3–4.x keep only `modified_ns`, in 2-second steps.
     #[pyo3(signature = (member, *, modified_ns=None, created_ns=None, accessed_ns=None))]
     fn set_times(
         &mut self,
@@ -2576,14 +2536,22 @@ impl RarBuilder {
         created_ns: Option<i128>,
         accessed_ns: Option<i128>,
     ) -> PyResult<()> {
-        let times = rars_rs::FileTimes::from_unix_nanoseconds(modified_ns, created_ns, accessed_ns)
-            .map_err(map_builder_error)?;
+        let time = |nanoseconds: Option<i128>| {
+            nanoseconds
+                .map(|nanoseconds| {
+                    rars_rs::Timestamp::from_unix_nanoseconds(nanoseconds)
+                        .ok_or_else(|| PyValueError::new_err("time is out of range"))
+                })
+                .transpose()
+        };
+        let times = rars_rs::FileTimes {
+            modified: time(modified_ns)?,
+            created: time(created_ns)?,
+            accessed: time(accessed_ns)?,
+        };
         let id = self.edit_member_id(member)?;
         self.inner
-            .set_file_times_by_id(
-                id,
-                (times != rars_rs::FileTimes::default()).then_some(times),
-            )
+            .set_times_by_id(id, times)
             .map_err(map_builder_error)
     }
 

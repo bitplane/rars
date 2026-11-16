@@ -6954,7 +6954,10 @@ fn extract_distinguishes_missing_mtime_from_epoch_for_files_and_directories() {
     let archive = dir.join("times.rar");
     let out = dir.join("out");
     let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
-    for (name, time) in [("missing", None), ("epoch", Some(0))] {
+    for (name, time) in [
+        ("missing", None),
+        ("epoch", Some(rars::Timestamp::from_unix_seconds(0))),
+    ] {
         builder
             .add_directory(name.as_bytes().to_vec(), time, None)
             .unwrap();

@@ -220,7 +220,7 @@ pub struct RarInfo {
     crc: Option<u32>,
     host_os: Option<f64>,
     file_attr: f64,
-    file_time: Option<u32>,
+    mtime: Option<f64>,
     encrypted: bool,
     stored: bool,
     solid: bool,
@@ -275,10 +275,10 @@ impl RarInfo {
         self.file_attr
     }
 
-    /// Modification time as a raw DOS timestamp.
-    #[wasm_bindgen(getter, js_name = fileTime)]
-    pub fn file_time(&self) -> Option<u32> {
-        self.file_time
+    /// Modification time in Unix seconds, with any fraction the archive keeps.
+    #[wasm_bindgen(getter)]
+    pub fn mtime(&self) -> Option<f64> {
+        self.mtime
     }
 
     /// Whether the member's data is encrypted.
@@ -579,7 +579,12 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
         _ => None,
     };
+    let mtime = member
+        .meta
+        .modification_time()
+        .map(|time| time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9);
     RarInfo {
+        mtime,
         display_name: String::from_utf8_lossy(&member.meta.name).into_owned(),
         name: member.meta.name,
         size: member.meta.unpacked_size as f64,
@@ -587,7 +592,6 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         crc,
         host_os: member.meta.host_os.map(|os| os as f64),
         file_attr: member.meta.file_attr as f64,
-        file_time: member.meta.file_time,
         encrypted: member.meta.is_encrypted,
         stored: member.meta.is_stored,
         solid,
@@ -624,7 +628,7 @@ export interface RarBuilderOptions {
 }
 
 export interface RarEntryOptions {
-  /** Modification time as a raw DOS timestamp. */
+  /** Modification time in Unix seconds; a fraction is kept where the format can. */
   mtime?: number;
   /** File mode, as `st_mode` from `stat`. */
   mode?: number;
@@ -704,7 +708,7 @@ impl RarBuilder {
             .add_bytes(
                 name.as_bytes().to_vec(),
                 data,
-                opt_number(&options, "mtime")?.map(|n| n as u32),
+                opt_timestamp(&options, "mtime")?,
                 opt_number(&options, "mode")?.map(|n| n as u32),
             )
             .map_err(js_error)
@@ -726,7 +730,7 @@ impl RarBuilder {
             .add_bytes(
                 name,
                 data,
-                opt_number(&options, "mtime")?.map(|n| n as u32),
+                opt_timestamp(&options, "mtime")?,
                 opt_number(&options, "mode")?.map(|n| n as u32),
             )
             .map_err(js_error)
@@ -945,6 +949,23 @@ fn opt_number(options: &JsValue, key: &str) -> Result<Option<f64>, JsValue> {
         .as_f64()
         .map(Some)
         .ok_or_else(|| binding_error("INVALID_OPTION", &format!("{key} must be a number")))
+}
+
+/// Unix seconds, possibly fractional, as a timestamp; refuses what isn't one.
+fn opt_timestamp(options: &JsValue, key: &str) -> Result<Option<rars_rs::Timestamp>, JsValue> {
+    let Some(seconds) = opt_number(options, key)? else {
+        return Ok(None);
+    };
+    let nanoseconds = (seconds * 1e9).round();
+    if !nanoseconds.is_finite() || nanoseconds.abs() >= 1e36 {
+        return Err(binding_error(
+            "INVALID_OPTION",
+            &format!("{key} must be Unix seconds"),
+        ));
+    }
+    rars_rs::Timestamp::from_unix_nanoseconds(nanoseconds as i128)
+        .map(Some)
+        .ok_or_else(|| binding_error("INVALID_OPTION", &format!("{key} is out of range")))
 }
 
 fn opt_string(options: &JsValue, key: &str) -> Result<Option<String>, JsValue> {

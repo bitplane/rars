@@ -82,7 +82,7 @@ pub struct ArchiveEntry {
     pub mtime: Option<u32>,
     /// Optional nanosecond fraction; requires mtime and a value below one second.
     pub mtime_nanoseconds: Option<u32>,
-    pub file_times: Option<crate::FileTimes>,
+    pub file_times: Option<crate::file_times::TimeRecord>,
     pub attributes: u64,
     pub host_os: u64,
     /// Encrypts this member's payload. With header encryption every member
@@ -155,7 +155,7 @@ impl ArchiveEntry {
         self
     }
 
-    pub fn with_file_times(mut self, times: Option<crate::FileTimes>) -> Self {
+    pub fn with_file_times(mut self, times: Option<crate::file_times::TimeRecord>) -> Self {
         self.file_times = times;
         self
     }
@@ -1189,8 +1189,9 @@ mod tests {
         timestamped.mtime_nanoseconds = Some(1_000_000_000);
         assert!(super::validate_entry(&timestamped).is_err());
         timestamped.mtime_nanoseconds = None;
-        timestamped.file_times =
-            Some(crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap());
+        timestamped.file_times = Some(
+            crate::file_times::TimeRecord::from_unix_nanoseconds(Some(0), None, None).unwrap(),
+        );
         assert_eq!(
             super::validate_entry(&timestamped).unwrap_err(),
             crate::Error::InvalidArgument("conflicting file modification timestamps")

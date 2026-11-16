@@ -6,9 +6,9 @@ def source_archive(format="rar50", solid=False):
     builder = rars.RarBuilder(
         format=format, solid=solid, store=not solid or format in ("rar50", "rar70")
     )
-    builder.add_directory("empty", mtime=123)
-    builder.add_bytes(b"first payload", "first", mtime=456)
-    builder.add_bytes(b"second payload", "second", mtime=789)
+    builder.add_directory("empty", mtime=1_700_000_000)
+    builder.add_bytes(b"first payload", "first", mtime=1_700_000_002)
+    builder.add_bytes(b"second payload", "second", mtime=1_700_000_004)
     return builder.to_bytes()
 
 

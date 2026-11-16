@@ -1,6 +1,6 @@
 #![cfg(feature = "write")]
 
-use rars::{ArchiveReader, ArchiveVersion, Builder};
+use rars::{ArchiveReader, ArchiveVersion, Builder, FileTimes, Timestamp};
 use std::time::{Duration, UNIX_EPOCH};
 
 #[path = "support/scratch.rs"]
@@ -50,7 +50,7 @@ fn stored_timestamp_view_retains_family_presence_and_refinements() {
     for format in ArchiveVersion::ALL {
         let mut builder = Builder::new(format).store(true);
         builder
-            .add_bytes(b"time".to_vec(), vec![], Some(0), None)
+            .add_bytes(b"time".to_vec(), vec![], None, None)
             .unwrap();
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
         let mut meta = archive.members().next().unwrap().meta;
@@ -73,6 +73,112 @@ fn stored_timestamp_view_retains_family_presence_and_refinements() {
     }
 }
 
+fn at(seconds: i64, nanoseconds: u32) -> Option<Timestamp> {
+    Some(Timestamp::new(seconds, nanoseconds).unwrap())
+}
+
+/// A FILETIME tick count as the Unix time it names.
+fn filetime(ticks: u64) -> Option<Timestamp> {
+    Timestamp::from_unix_nanoseconds((i128::from(ticks) - 116_444_736_000_000_000) * 100)
+}
+
+fn only_member(bytes: Vec<u8>) -> rars::ArchiveMember {
+    ArchiveReader::read_owned(bytes)
+        .unwrap()
+        .members()
+        .next()
+        .unwrap()
+}
+
+#[test]
+fn one_unix_mtime_reads_back_the_same_in_every_format() {
+    for format in ArchiveVersion::ALL {
+        let mut builder = Builder::new(format).store(true);
+        builder
+            .add_bytes(
+                b"file".to_vec(),
+                b"payload".to_vec(),
+                at(1_700_000_000, 0),
+                None,
+            )
+            .unwrap();
+        let member = only_member(builder.to_bytes().unwrap());
+        assert_eq!(
+            member.meta.modification_time(),
+            at(1_700_000_000, 0),
+            "{format}"
+        );
+        assert_eq!(
+            member.times().unwrap().modified,
+            at(1_700_000_000, 0),
+            "{format}"
+        );
+    }
+}
+
+#[test]
+fn times_an_old_format_cannot_store_are_refused_and_change_nothing() {
+    for format in [
+        ArchiveVersion::Rar14,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+    ] {
+        let mut builder = Builder::new(format).store(true);
+        builder
+            .add_bytes(
+                b"file".to_vec(),
+                b"payload".to_vec(),
+                at(1_700_000_000, 0),
+                None,
+            )
+            .unwrap();
+        let before = builder.to_bytes().unwrap();
+        for early in [0, 315_000_000] {
+            assert!(builder
+                .add_bytes(b"other".to_vec(), vec![], at(early, 0), None)
+                .is_err());
+        }
+        let created = FileTimes {
+            created: at(1_700_000_000, 0),
+            ..FileTimes::default()
+        };
+        assert!(builder.set_times(b"file", created).is_err());
+        assert!(builder.set_times(b"missing", FileTimes::default()).is_err());
+        assert_eq!(builder.to_bytes().unwrap(), before, "{format}");
+    }
+}
+
+#[test]
+fn an_old_format_rounds_a_modification_time_down_to_two_seconds() {
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), vec![], at(1_700_000_001, 500), None)
+        .unwrap();
+    let member = only_member(builder.to_bytes().unwrap());
+    assert_eq!(member.meta.modification_time(), at(1_700_000_000, 0));
+}
+
+#[test]
+fn add_path_keeps_each_files_modification_time() {
+    let root = scratch::case("add-path-mtime");
+    let path = root.join("source.txt");
+    std::fs::write(&path, b"payload").unwrap();
+    let file = std::fs::File::options().write(true).open(&path).unwrap();
+    file.set_modified(UNIX_EPOCH + Duration::from_secs(1_700_000_000))
+        .unwrap();
+    drop(file);
+    for format in ArchiveVersion::ALL {
+        let mut builder = Builder::new(format).store(true);
+        builder.add_path(&path, b"source.txt").unwrap();
+        let member = only_member(builder.to_bytes().unwrap());
+        assert_eq!(
+            member.meta.modification_time(),
+            at(1_700_000_000, 0),
+            "{format}"
+        );
+    }
+}
+
 #[test]
 fn fractional_mtime_survives_all_rar5_output_paths() {
     let root = scratch::case("fractional-mtime");
@@ -88,11 +194,10 @@ fn fractional_mtime_survives_all_rar5_output_paths() {
             .add_bytes(
                 b"file".to_vec(),
                 b"timestamp payload".repeat(100),
-                Some(1_700_000_002),
+                at(1_700_000_002, 704_088_300),
                 None,
             )
             .unwrap();
-        builder.set_mtime_nanoseconds(b"file", 704_088_300).unwrap();
         let path = root.join(format!("{format}.rar"));
         builder.write_to_path(&path, None).unwrap();
         let mut outputs = vec![builder.to_bytes().unwrap(), std::fs::read(path).unwrap()];
@@ -107,10 +212,7 @@ fn fractional_mtime_survives_all_rar5_output_paths() {
             )
             .unwrap();
             let meta = archive.members().next().unwrap().meta;
-            assert_eq!(
-                meta.modification_time(),
-                Some(UNIX_EPOCH + Duration::new(1_700_000_002, 704_088_300))
-            );
+            assert_eq!(meta.modification_time(), at(1_700_000_002, 704_088_300));
             archive
                 .extract_to(password.as_deref(), |meta| {
                     assert_eq!(meta.mtime_refinement.unwrap().nanoseconds, 704_088_300);
@@ -127,9 +229,8 @@ fn split_volume_extraction_retains_fractional_mtime() {
         .store(true)
         .volume_size(Some(512));
     builder
-        .add_bytes(b"file".to_vec(), vec![42; 2048], Some(123), None)
+        .add_bytes(b"file".to_vec(), vec![42; 2048], at(123, 987_654_321), None)
         .unwrap();
-    builder.set_mtime_nanoseconds(b"file", 987_654_321).unwrap();
     let volumes: Vec<_> = builder
         .build_volumes(None)
         .unwrap()
@@ -173,39 +274,21 @@ fn an_epoch_fraction_is_not_treated_as_missing_time() {
 }
 
 #[test]
-fn invalid_fractional_mtime_leaves_queued_metadata_unchanged() {
-    for (format, seconds) in [
-        (ArchiveVersion::Rar29, Some(123)),
-        (ArchiveVersion::Rar50, None),
-        (ArchiveVersion::Rar50, Some(123)),
-    ] {
-        let mut builder = Builder::new(format).store(true);
-        builder
-            .add_bytes(b"file".to_vec(), vec![], seconds, None)
-            .unwrap();
-        let before = builder.to_bytes().unwrap();
-        assert!(builder
-            .set_mtime_nanoseconds(b"file", 1_000_000_000)
-            .is_err());
-        assert!(builder.set_mtime_nanoseconds(b"missing", 100).is_err());
-        if seconds.is_none() || format == ArchiveVersion::Rar29 {
-            assert!(builder.set_mtime_nanoseconds(b"file", 100).is_err());
-        }
-        assert_eq!(builder.to_bytes().unwrap(), before);
-    }
-}
-
-#[test]
 fn extraction_retains_missing_and_epoch_times_in_single_and_split_archives() {
     for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         for time in [None, Some(0)] {
             let mut builder = Builder::new(format).store(true);
             builder
-                .add_bytes(b"file".to_vec(), vec![42; 2048], time, None)
+                .add_bytes(
+                    b"file".to_vec(),
+                    vec![42; 2048],
+                    time.map(Timestamp::from_unix_seconds),
+                    None,
+                )
                 .unwrap();
             let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             let check = |meta: &rars::ExtractedEntryMeta| {
-                assert_eq!(meta.file_time, time);
+                assert_eq!(meta.file_time, time.map(|seconds| seconds as u32));
                 assert_eq!(meta.mtime_refinement, None);
                 assert_eq!(
                     rars::timestamp::extracted_system_time(
@@ -244,37 +327,40 @@ fn extraction_retains_missing_and_epoch_times_in_single_and_split_archives() {
 
 #[test]
 fn complete_file_times_survive_streaming_and_volume_paths() {
-    use rars::{FileTimes, FileTimestamp};
-    for times in [
-        FileTimes {
-            modified: Some(FileTimestamp::WindowsFiletime(0)),
-            created: Some(FileTimestamp::WindowsFiletime(u64::MAX)),
-            accessed: Some(FileTimestamp::WindowsFiletime(116_444_736_000_000_001)),
-        },
-        FileTimes {
-            modified: None,
-            created: Some(FileTimestamp::Unix {
-                seconds: 0,
-                nanoseconds: 123,
+    for (times, expected) in [
+        (
+            FileTimes {
+                modified: filetime(0),
+                created: filetime(u64::MAX),
+                accessed: filetime(116_444_736_000_000_001),
+            },
+            None,
+        ),
+        (
+            FileTimes {
+                modified: None,
+                created: at(0, 123),
+                accessed: at(i64::from(u32::MAX), 999_999_999),
+            },
+            Some(FileTimes {
+                modified: at(123, 0),
+                created: at(0, 123),
+                accessed: at(i64::from(u32::MAX), 999_999_999),
             }),
-            accessed: Some(FileTimestamp::Unix {
-                seconds: u32::MAX,
-                nanoseconds: 999_999_999,
-            }),
-        },
+        ),
     ] {
         let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
         builder
-            .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), at(123, 0), None)
             .unwrap();
-        builder.set_file_times(b"file", Some(times)).unwrap();
+        builder.set_times(b"file", times).unwrap();
         let mut outputs = vec![builder.to_bytes().unwrap()];
         outputs.extend(builder.volume_size(Some(4096)).build_volumes(None).unwrap());
         for bytes in outputs {
             let archive = ArchiveReader::read_owned(bytes).unwrap();
             assert_eq!(
-                archive.members().next().unwrap().file_times().unwrap(),
-                Some(times)
+                archive.members().next().unwrap().times().unwrap(),
+                expected.unwrap_or(times)
             );
             assert_eq!(
                 archive.read_member(b"file", None).unwrap().unwrap(),
@@ -286,156 +372,66 @@ fn complete_file_times_survive_streaming_and_volume_paths() {
 
 #[test]
 fn adding_creation_time_preserves_an_existing_fractional_modification_time() {
-    use rars::{FileTimes, FileTimestamp};
     let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
-    builder
-        .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
-        .unwrap();
-    builder.set_mtime_nanoseconds(b"file", 456_789_123).unwrap();
-    let before = builder.to_bytes().unwrap();
-    let mixed = FileTimes {
-        modified: None,
-        created: Some(FileTimestamp::WindowsFiletime(116_444_736_000_000_001)),
-        accessed: None,
-    };
-    assert!(builder.set_file_times(b"file", Some(mixed)).is_err());
-    assert_eq!(builder.to_bytes().unwrap(), before);
-    let times = FileTimes {
-        modified: None,
-        created: Some(FileTimestamp::Unix {
-            seconds: 456,
-            nanoseconds: 0,
-        }),
-        accessed: None,
-    };
-    builder.set_file_times(b"file", Some(times)).unwrap();
-    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    assert_eq!(
-        archive.members().next().unwrap().file_times().unwrap(),
-        Some(FileTimes {
-            modified: Some(FileTimestamp::Unix {
-                seconds: 123,
-                nanoseconds: 456_789_123,
-            }),
-            ..times
-        })
-    );
-}
-
-#[test]
-fn invalid_complete_times_leave_builder_output_unchanged() {
-    use rars::{FileTimes, FileTimestamp};
-    for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
-        let mut builder = Builder::new(format).store(true);
-        builder
-            .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
-            .unwrap();
-        let before = builder.to_bytes().unwrap();
-        let invalid = FileTimes {
-            modified: Some(FileTimestamp::Unix {
-                seconds: 123,
-                nanoseconds: 1_000_000_000,
-            }),
-            created: None,
-            accessed: None,
-        };
-        assert!(builder.set_file_times(b"file", Some(invalid)).is_err());
-        assert_eq!(builder.to_bytes().unwrap(), before);
-        if format == ArchiveVersion::Rar29 {
-            assert!(builder
-                .set_file_times(b"file", Some(FileTimes::default()))
-                .is_err());
-            assert_eq!(builder.to_bytes().unwrap(), before);
-        }
-    }
-}
-
-#[test]
-fn clearing_complete_times_removes_the_rar5_time_record() {
-    use rars::{FileTimes, FileTimestamp};
-
-    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
-    builder
-        .add_bytes(b"file".to_vec(), b"payload".to_vec(), Some(123), None)
-        .unwrap();
-    builder
-        .set_file_times(
-            b"file",
-            Some(FileTimes {
-                modified: Some(FileTimestamp::Unix {
-                    seconds: 456,
-                    nanoseconds: 789,
-                }),
-                created: None,
-                accessed: None,
-            }),
-        )
-        .unwrap();
-    builder.set_file_times(b"file", None).unwrap();
-
-    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    assert_eq!(
-        archive.members().next().unwrap().file_times().unwrap(),
-        None
-    );
-}
-
-#[test]
-fn legacy_extended_times_are_validated_before_the_archive_is_written() {
-    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
     builder
         .add_bytes(
             b"file".to_vec(),
             b"payload".to_vec(),
-            Some(0x5a21_0000),
+            at(123, 456_789_123),
             None,
         )
         .unwrap();
     let before = builder.to_bytes().unwrap();
-    // No odd-second or fraction control bits may be present without the
-    // corresponding timestamp-present bit, in any of the four legacy slots.
-    for index in 0..4 {
-        for mode in 1..8u16 {
-            let flags = mode << (12 - index * 4);
-            assert_eq!(
-                builder.set_legacy_extended_times(b"file", Some(flags.to_le_bytes().to_vec())),
-                Err(rars::Error::InvalidArgument(
-                    "legacy extended timestamps are incomplete or invalid"
-                ))
-            );
-            assert_eq!(builder.to_bytes().unwrap(), before);
-        }
-    }
-    assert!(builder
-        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90]))
-        .is_err());
+    // A creation time before 1970 needs FILETIME, which can't hold the
+    // modification time's last two digits of nanoseconds.
+    let unstorable = FileTimes {
+        created: at(-1, 0),
+        ..FileTimes::default()
+    };
+    assert!(builder.set_times(b"file", unstorable).is_err());
     assert_eq!(builder.to_bytes().unwrap(), before);
-    builder
-        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
-        .unwrap();
-    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-    assert!(archive
-        .members()
-        .next()
-        .unwrap()
-        .file_times()
-        .unwrap()
-        .is_some());
+    let created = FileTimes {
+        created: at(456, 0),
+        ..FileTimes::default()
+    };
+    builder.set_times(b"file", created).unwrap();
+    assert_eq!(
+        only_member(builder.to_bytes().unwrap()).times().unwrap(),
+        FileTimes {
+            modified: at(123, 456_789_123),
+            created: at(456, 0),
+            accessed: None,
+        }
+    );
+}
 
-    let mut old = Builder::new(ArchiveVersion::Rar20).store(true);
-    old.add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
-        .unwrap();
-    assert!(old
-        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
-        .is_err());
-
-    let mut volume = Builder::new(ArchiveVersion::Rar29)
-        .store(true)
-        .volume_size(Some(512));
-    volume
+#[test]
+fn copied_times_keep_their_stored_form_and_stay_in_one_family() {
+    let mut source = Builder::new(ArchiveVersion::Rar50).store(true);
+    source
         .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
         .unwrap();
-    assert!(volume
-        .set_legacy_extended_times(b"file", Some(vec![0x00, 0x90, 0x01]))
-        .is_err());
+    let times = FileTimes {
+        modified: filetime(0),
+        created: filetime(1),
+        accessed: None,
+    };
+    source.set_times(b"file", times).unwrap();
+    let member = only_member(source.to_bytes().unwrap());
+
+    let mut copy = Builder::new(ArchiveVersion::Rar50).store(true);
+    copy.add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let id = copy.member_ids().next().unwrap();
+    copy.copy_times_by_id(id, &member).unwrap();
+    let copied = only_member(copy.to_bytes().unwrap());
+    assert_eq!(copied.times().unwrap(), times);
+    assert_eq!(copied.meta.file_time, member.meta.file_time);
+
+    let mut legacy = Builder::new(ArchiveVersion::Rar29).store(true);
+    legacy
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let id = legacy.member_ids().next().unwrap();
+    assert!(legacy.copy_times_by_id(id, &member).is_err());
 }

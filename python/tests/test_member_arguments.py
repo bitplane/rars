@@ -4,7 +4,7 @@ import rars
 
 def linked_archive():
     builder = rars.RarBuilder(format="rar50", store=True)
-    builder.add_bytes(b"payload", "file", mtime=10)
+    builder.add_bytes(b"payload", "file", mtime=1_700_000_000)
     builder.set_file_comment("file", b"note")
     builder.add_unix_symlink("link", "file")
     return rars.RarFile(builder.to_bytes())
@@ -20,7 +20,7 @@ def member_calls(archive, tmp_path):
         "extractall": ("file", lambda m: archive.extractall(tmp_path, members=[m], overwrite=True)[0].read_bytes(), b"payload"),
         "getcomment": ("file", lambda m: archive.getcomment(m), b"note"),
         "readlink": ("link", lambda m: archive.readlink(m), b"file"),
-        "gettimes": ("file", lambda m: archive.gettimes(m)["modified"], 10_000_000_000),
+        "gettimes": ("file", lambda m: archive.gettimes(m)["modified"], 1_700_000_000 * 10**9),
     }
 
 
@@ -73,7 +73,7 @@ def test_member_comments_honour_output_limits(format):
 
 def legacy_link(encrypt_headers):
     builder = rars.RarBuilder(format="rar40", password="right", encrypt_headers=encrypt_headers)
-    builder.add_bytes(b"target", "link", mtime=10, mode=0o120777)
+    builder.add_bytes(b"target", "link", mtime=1_700_000_000, mode=0o120777)
     return builder.to_bytes()
 
 

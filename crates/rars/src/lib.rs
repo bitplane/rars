@@ -103,7 +103,7 @@ mod stored_copy;
 mod streaming;
 mod temp_file;
 pub mod timestamp;
-pub use file_times::{FileTimes, FileTimestamp};
+pub use file_times::{FileTimes, Timestamp};
 mod tzif;
 pub mod version;
 mod volume_extract;
@@ -481,6 +481,30 @@ pub struct ArchiveMember {
 }
 
 impl ArchiveMember {
+    /// The member's times in Unix time, from whichever records its format
+    /// keeps. Legacy DOS fields use the established local-zone policy.
+    pub fn times(&self) -> crate::Result<crate::FileTimes> {
+        let mut times = self
+            .time_record()?
+            .map(crate::file_times::TimeRecord::times)
+            .unwrap_or_default();
+        if times.modified.is_none() {
+            times.modified = self.meta.modification_time();
+        }
+        Ok(times)
+    }
+
+    /// The times as RAR5 records them: legacy extended times are converted.
+    pub(crate) fn time_record(&self) -> crate::Result<Option<crate::file_times::TimeRecord>> {
+        match &self.detail {
+            crate::ArchiveMemberDetail::Rar50Plus { file_times, .. } => Ok(*file_times),
+            crate::ArchiveMemberDetail::Rar15To40 { extended_times, .. } => {
+                crate::file_times::TimeRecord::legacy(extended_times, self.meta.file_time)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Whether this member declares a dependency on preceding decoded history.
     /// RAR 1.3 has no member-level solid flag; consult its archive main header.
     pub fn is_solid(&self) -> bool {
@@ -560,16 +584,16 @@ impl ArchiveMemberMeta {
             .map(|raw| StoredTimestamp::from_family(self.family, raw))
     }
 
-    /// Modification time as an instant. Legacy DOS values use the same local
+    /// Modification time in Unix time. Legacy DOS values use the same local
     /// zone and refinement policy as CLI extraction; RAR5 values are absolute.
-    pub fn modification_time(&self) -> Option<std::time::SystemTime> {
+    pub fn modification_time(&self) -> Option<Timestamp> {
         let raw = self.file_time?;
         if self.family == ArchiveFamily::Rar50Plus {
             let nanos = self.mtime_refinement.map_or(0, |detail| detail.nanoseconds);
-            return std::time::UNIX_EPOCH
-                .checked_add(std::time::Duration::new(u64::from(raw), nanos));
+            return Timestamp::new(i64::from(raw), nanos);
         }
         timestamp::extracted_system_time(self.family, Some(raw), self.mtime_refinement)
+            .and_then(|time| Timestamp::try_from(time).ok())
     }
 
     /// How to interpret this member's attributes, using the archive family's
@@ -643,7 +667,7 @@ pub enum ArchiveMemberDetail {
         /// Stored CRC-32 when present.
         crc32: Option<u32>,
         /// Complete supported RAR5 high-precision file times.
-        file_times: Option<FileTimes>,
+        file_times: Option<file_times::TimeRecord>,
         /// Redirection metadata, including the raw target name.
         redirection: Option<rar50::FileRedirection>,
         /// Strong file hash when present.

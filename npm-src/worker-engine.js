@@ -34,32 +34,6 @@ async function sourceBytes(source, platform) {
   throw new TypeError("unsupported binary source");
 }
 
-function dosDate(value) {
-  if (value === undefined) return undefined;
-  const date = value >>> 16;
-  const time = value & 0xffff;
-  const day = date & 0x1f;
-  const month = (date >>> 5) & 0x0f;
-  const year = ((date >>> 9) & 0x7f) + 1980;
-  const second = (time & 0x1f) * 2;
-  const minute = (time >>> 5) & 0x3f;
-  const hour = (time >>> 11) & 0x1f;
-  return Date.UTC(year, month - 1, day, hour, minute, second);
-}
-
-function toDosDate(milliseconds) {
-  if (milliseconds === undefined) return undefined;
-  const date = new Date(milliseconds);
-  const year = Math.min(2107, Math.max(1980, date.getUTCFullYear()));
-  const time = (date.getUTCHours() << 11) |
-    (date.getUTCMinutes() << 5) |
-    Math.floor(date.getUTCSeconds() / 2);
-  const day = ((year - 1980) << 9) |
-    ((date.getUTCMonth() + 1) << 5) |
-    date.getUTCDate();
-  return ((day << 16) | time) >>> 0;
-}
-
 function metadata(archive, password, options) {
   const entries = archive.entries().map((info, index) => {
     if (!Number.isSafeInteger(info.size) || !Number.isSafeInteger(info.packedSize)) {
@@ -71,7 +45,7 @@ function metadata(archive, password, options) {
       nameBytes: info.nameBytes,
       size: info.size,
       compressedSize: info.packedSize,
-      modifiedAt: dosDate(info.fileTime),
+      modifiedAt: info.mtime === undefined ? undefined : info.mtime * 1000,
       crc32: info.crc,
       isDirectory: info.isDirectory,
       isEncrypted: info.isEncrypted,
@@ -122,7 +96,7 @@ async function build(wasm, payload, platform, volumes) {
           ? new TextEncoder().encode(entry.data)
           : await sourceBytes(entry.data, platform);
       const entryOptions = {
-        mtime: toDosDate(entry.options.modifiedAt),
+        mtime: entry.options.modifiedAt === undefined ? undefined : entry.options.modifiedAt / 1000,
         mode: entry.options.mode,
       };
       if (typeof entry.name === "string") builder.addBytes(entry.name, data, entryOptions);

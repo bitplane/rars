@@ -1233,7 +1233,7 @@ struct VolumeMember<'a> {
     is_directory: bool,
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
-    file_times: Option<crate::FileTimes>,
+    file_times: Option<crate::file_times::TimeRecord>,
     attributes: u64,
     host_os: u64,
     unpacked_size: u64,

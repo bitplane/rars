@@ -1,5 +1,6 @@
 """Small public API regressions for binding-only behavior."""
 import os
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -257,14 +258,15 @@ def test_readlink_refuses_regular_members():
         archive.readlink(archive.namelist()[0])
 
 
-def test_conversion_refuses_legacy_time_outside_rar5_range():
-    dos_time = (127 << 25) | (12 << 21) | (31 << 16) | (23 << 11) | (59 << 5) | 29
+def test_a_legacy_time_past_2106_converts_to_rar5():
+    # Past RAR5's 32-bit seconds, so conversion has to use FILETIME.
+    seconds = int(datetime(2107, 12, 31, 23, 59, 58).timestamp())
     builder = rars.RarBuilder(format="rar29", store=True)
-    builder.add_bytes(b"payload", "future.txt", mtime=dos_time)
+    builder.add_bytes(b"payload", "future.txt", mtime=seconds)
     archive = rars.RarFile(builder.to_bytes())
-    assert archive.getinfo("future.txt").date_time[:3] == (2107, 12, 31)
-    with pytest.raises(ValueError, match="RAR5 timestamp range"):
-        rars.RarBuilder.from_archive(archive, preserve=False)
+    assert archive.getinfo("future.txt").date_time == (2107, 12, 31, 23, 59, 58)
+    converted = rars.RarFile(rars.RarBuilder.from_archive(archive, preserve=False).to_bytes())
+    assert converted.gettimes("future.txt") == archive.gettimes("future.txt")
     retained = rars.RarFile(rars.RarBuilder.from_archive(archive).to_bytes())
     assert retained.getinfo("future.txt").date_time == archive.getinfo("future.txt").date_time
 

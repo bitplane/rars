@@ -74,6 +74,19 @@ await check("metadata and immutable entry objects are friendly JavaScript", asyn
   assert.deepEqual(archive.getAll("hello.txt"), [entry]);
 });
 
+await check("modification times read back as written in every family", async () => {
+  // An even second: RAR 1.5-4.x store DOS times in 2-second steps.
+  const modifiedAt = new Date("2025-02-03T04:05:06Z");
+  for (const format of ["rar50", "rar29"]) {
+    const writer = new RarWriter({ format });
+    writer.add("hello.txt", HELLO, { modifiedAt });
+    const archive = await RarArchive.open(await writer.bytes());
+    assert.equal(archive.entries[0].modifiedAt.valueOf(), modifiedAt.valueOf(), format);
+    archive.close();
+    writer.close();
+  }
+});
+
 await check("passwords, comments and structured errors work", async () => {
   const writer = new RarWriter({
     format: "rar50",
