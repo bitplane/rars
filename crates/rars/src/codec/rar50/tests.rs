@@ -4097,44 +4097,72 @@ fn decoders_report_truncated_match_extra_bits() {
 }
 
 #[test]
-fn decoders_reject_rar7_distance_slot_above_bit_limit() {
-    let mut lengths = TableLengths {
-        main: vec![0; MAIN_TABLE_SIZE],
-        distance: vec![0; DISTANCE_TABLE_SIZE_70],
-        align: vec![0; ALIGN_TABLE_SIZE],
-        length: vec![0; LENGTH_TABLE_SIZE],
-    };
-    lengths.main[262] = 1; // New match with length slot 0.
-    lengths.distance[66] = 1; // (66 - 2) / 2 = 32 extra bits.
-    let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 1).unwrap();
-    let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
-    input.extend(encode_compressed_block(&[0], 2, false, true).unwrap());
-    let expected = Error::InvalidData("RAR 5 distance slot is too large");
+fn decoders_read_rar7_distance_slots_past_31_bits_as_zeros() {
+    for align_mode in [false, true] {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_70],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[262] = 1; // New match with length slot 0.
+        lengths.distance[66] = 1; // 32 extra bits.
+        lengths.distance[79] = 1; // 38 extra bits, the last slot.
+        if align_mode {
+            lengths.align[0] = 1;
+            lengths.align[15] = 1;
+        }
+        let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 1).unwrap();
+        let mut writer = BitWriter::new();
+        writer.write_bits(0, 1); // 'A'
+        for (slot_code, extra_bits) in [(0, 32), (1, 38)] {
+            writer.write_bits(1, 1); // Match, length 2 plus a bonus of 3.
+            writer.write_bits(slot_code, 1);
+            if align_mode {
+                writer.write_bits((1 << (extra_bits - 4)) - 1, extra_bits - 4);
+                writer.write_bits(1, 1); // Align symbol 15.
+            } else {
+                writer.write_bits((1 << extra_bits) - 1, extra_bits);
+            }
+        }
+        let payload_bits = writer.bit_pos;
+        let payload = writer.finish();
+        let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+        input.extend(encode_compressed_block(&payload, payload_bits, false, true).unwrap());
+        let expected = b"A\0\0\0\0\0\0\0\0\0\0".to_vec();
 
-    let mut buffered = Unpack50Decoder::new();
-    assert_eq!(
-        buffered.decode_member_with_dictionary(
+        let buffered = Unpack50Decoder::new().decode_member_with_dictionary(
             &input,
             1,
-            2,
+            expected.len(),
             DEFAULT_DICTIONARY_SIZE,
             false,
             DecodeMode::Lz,
-        ),
-        Err(expected.clone())
-    );
-    assert!(buffered.state.tables.is_none());
-    let mut streaming = Unpack50Decoder::new();
-    let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
-        &mut input.as_slice(),
-        1,
-        2,
-        DEFAULT_DICTIONARY_SIZE,
-        false,
-        |_chunk| Ok::<(), std::convert::Infallible>(()),
-    );
-    assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
-    assert!(streaming.state.tables.is_none());
+        );
+        assert_eq!(buffered, Ok(expected.clone()), "align {align_mode}");
+
+        let mut streamed = Vec::new();
+        Unpack50Decoder::new()
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                1,
+                expected.len(),
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => streamed.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            streamed.extend(std::iter::repeat_n(byte, len));
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(streamed, expected, "align {align_mode}");
+    }
 }
 
 #[test]
@@ -4397,17 +4425,16 @@ fn match_pricing_and_encoding_reject_invalid_internal_candidates() {
             estimated_match_cost(&fresh, 4, 1usize << 40, DISTANCE_TABLE_SIZE_50).unwrap_err(),
             too_distant
         );
-        let invalid_slot = Error::InvalidData("RAR 5 distance slot is too large");
         assert_eq!(
             fresh
-                .encode_match(5, (1usize << 33) + 1, DISTANCE_TABLE_SIZE_70)
+                .encode_match(5, (1usize << 40) + 1, DISTANCE_TABLE_SIZE_70)
                 .unwrap_err(),
-            invalid_slot
+            too_distant
         );
         assert_eq!(
-            estimated_match_cost(&fresh, 5, (1usize << 33) + 1, DISTANCE_TABLE_SIZE_70)
+            estimated_match_cost(&fresh, 5, (1usize << 40) + 1, DISTANCE_TABLE_SIZE_70)
                 .unwrap_err(),
-            invalid_slot
+            too_distant
         );
     }
 }
@@ -4476,8 +4503,8 @@ fn optimal_match_collection_grows_beyond_one_run_per_position() {
 #[test]
 fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
     for (slot, extra, distance) in [
-        (63, (1u32 << 30) - 1, 1u64 << 32),
-        (65, (1u32 << 31) - 1, 1u64 << 33),
+        (63, (1u64 << 30) - 1, 1u64 << 32),
+        (65, (1u64 << 31) - 1, 1u64 << 33),
     ] {
         assert_eq!(
             slot_to_distance(slot, extra).unwrap(),
@@ -4487,15 +4514,25 @@ fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
 }
 
 #[test]
-fn rejects_out_of_range_distance_slots_and_extras() {
-    #[cfg(target_pointer_width = "64")]
-    assert!(slot_to_distance(65, (1 << 31) - 1).is_ok());
+fn distance_slots_reach_the_end_of_the_rar7_alphabet_and_no_further() {
+    for (slot, extra, distance) in [
+        (66, 0, 0x2_0000_0001u64),
+        (67, 0xffff_ffff, 0x4_0000_0000),
+        (79, 0x3f_ffff_ffff, 0x100_0000_0000),
+    ] {
+        let expected = usize::try_from(distance).unwrap_or(usize::MAX);
+        assert_eq!(slot_to_distance(slot, extra), Ok(expected));
+    }
     assert_eq!(
         slot_to_distance(4, 2),
         Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"))
     );
     assert_eq!(
-        slot_to_distance(66, 0),
+        slot_to_distance(79, 1 << 38),
+        Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"))
+    );
+    assert_eq!(
+        slot_to_distance(DISTANCE_TABLE_SIZE_70, 0),
         Err(Error::InvalidData("RAR 5 distance slot is too large"))
     );
 }

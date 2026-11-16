@@ -165,11 +165,11 @@ impl BlockOps {
                     let distance_slot = tables.distance.decode(&mut bits)?;
                     let distance_bit_count = distance_slot_bit_count(distance_slot)?;
                     let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
-                        let high = bits.read_bits((distance_bit_count - 4) as u8)?;
-                        let low = tables.align.decode(&mut bits)? as u32;
+                        let high = bits.read_wide_bits(distance_bit_count - 4)?;
+                        let low = tables.align.decode(&mut bits)? as u64;
                         (high << 4) | low
                     } else {
-                        bits.read_bits(distance_bit_count as u8)?
+                        bits.read_wide_bits(distance_bit_count)?
                     };
                     let distance =
                         distance_from_slot_parts(distance_slot, distance_bit_count, distance_extra);

@@ -198,3 +198,36 @@ fn literal_burst_leaves_codes_past_the_input_end_to_the_generic_decoder() {
     assert_eq!(table.decode(&mut bits), Err(Error::NeedMoreInput));
     assert_eq!(bits.position(), 1);
 }
+
+#[test]
+fn wide_reads_keep_every_bit_and_refuse_without_consuming() {
+    let input: [u8; 6] = std::array::from_fn(|index| (index as u8).wrapping_mul(37) ^ 0xa5);
+    for size in 0..=input.len() {
+        for start in 0..=size * 8 {
+            for count in 0..=38 {
+                let available = size * 8 - start;
+                let expected = (count <= available).then(|| {
+                    (start..start + count).fold(0u64, |value, pos| {
+                        (value << 1) | u64::from((input[pos / 8] >> (7 - pos % 8)) & 1)
+                    })
+                });
+                let mut actual = BitReader::at(&input[..size], start);
+                let context = format!("size={size}, start={start}, count={count}");
+                match expected {
+                    Some(value) => {
+                        assert_eq!(actual.read_wide_bits(count), Ok(value), "{context}");
+                        assert_eq!(actual.position(), start + count, "{context}");
+                    }
+                    None => {
+                        assert_eq!(
+                            actual.read_wide_bits(count),
+                            Err(Error::NeedMoreInput),
+                            "{context}"
+                        );
+                        assert_eq!(actual.position(), start, "{context}");
+                    }
+                }
+            }
+        }
+    }
+}
