@@ -158,13 +158,32 @@ fn workers_decode_a_multi_block_member_as_the_serial_decoder_does() {
 fn workers_stop_at_the_declared_size_as_the_serial_decoder_does() {
     let data = prose(12_000, 11);
     let stream = lz_stream(&data, &[], 700);
-    for output_size in [0, 1, 699, 700, 701, 6_000, 11_999] {
+    // At 699 the block's last match straddles the declared size.
+    for output_size in [699, 700, 7_000] {
         let serial = assert_workers_match_serial(&stream, output_size);
         assert_eq!(serial.error, None);
         assert_eq!(serial.bytes(), data[..output_size]);
     }
+    // Inside a block, the symbols after the declared size are refused.
+    for output_size in [0, 1, 701, 6_000, 11_000] {
+        let serial = assert_workers_match_serial(&stream, output_size);
+        assert_eq!(
+            serial.error.as_deref(),
+            Some("Decode(InvalidData(\"RAR 5 stream continues past the declared size\"))"),
+            "output_size={output_size}"
+        );
+    }
     let serial = assert_workers_match_serial(&stream, data.len() + 1);
     assert_eq!(serial.error.as_deref(), Some("Decode(NeedMoreInput)"));
+}
+
+#[test]
+fn workers_judge_symbols_past_every_declared_size_as_the_serial_decoder_does() {
+    let data = prose(2_100, 29);
+    let stream = lz_stream(&data, &[], 700);
+    for output_size in 0..=data.len() {
+        assert_workers_match_serial(&stream, output_size);
+    }
 }
 
 #[test]
