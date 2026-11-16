@@ -7,7 +7,7 @@ import rars
 def test_writer_memory_preserves_output(format, store, solid, recovery):
     options = dict(format=format, store=store, solid=solid, recovery_percent=recovery)
     plain = rars.RarBuilder(**options)
-    limited = rars.RarBuilder(**options, max_memory_bytes=256 << 20)
+    limited = rars.RarBuilder(**options, resources=rars.WriterResources(max_memory=256 << 20))
     for builder in (plain, limited):
         builder.add_bytes(b"payload" * 1024, "member")
     expected = plain.to_bytes()
@@ -18,7 +18,7 @@ def test_writer_memory_preserves_output(format, store, solid, recovery):
 
 
 def test_writer_memory_failure_preserves_destination(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, max_memory_bytes=1024)
+    builder = rars.RarBuilder(format="rar50", store=True, resources=rars.WriterResources(max_memory=1024))
     builder.add_bytes(b"payload" * 1024, "member")
     destination = tmp_path / "archive.rar"
     destination.write_bytes(b"original")
@@ -33,7 +33,7 @@ def test_writer_memory_failure_preserves_destination(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 def test_legacy_writer_refuses_memory_policy(format):
-    builder = rars.RarBuilder(format=format, store=True, max_memory_bytes=0)
+    builder = rars.RarBuilder(format=format, store=True, resources=rars.WriterResources(max_memory=0))
     builder.add_bytes(b"payload", "member")
     with pytest.raises(rars.UnsupportedRarFeature):
         builder.to_bytes()
@@ -43,7 +43,7 @@ def test_legacy_writer_refuses_memory_policy(format):
 def test_encrypted_recovery_and_volume_output_obey_memory_policy(tmp_path, encrypt_headers):
     options = dict(format="rar50", store=True, password="secret",
                    encrypt_headers=encrypt_headers, recovery_percent=10,
-                   max_memory_bytes=32 << 20)
+                   resources=rars.WriterResources(max_memory=32 << 20))
     builder = rars.RarBuilder(**options)
     builder.add_bytes(b"payload" * 1024, "member")
     archive = rars.RarFile.from_bytes(builder.to_bytes(), password="secret")

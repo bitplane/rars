@@ -49,8 +49,26 @@ def test_reader_modes_and_noncallable_progress_are_rejected():
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="progress must be callable"):
         builder.to_bytes(progress=123)
-    with pytest.raises(NotImplementedError, match="filter selection"):
-        rars.RarBuilder(filters=[])
+
+
+def test_builder_settings_after_format_are_keyword_only():
+    with pytest.raises(TypeError):
+        rars.RarBuilder("rar50", 5)
+    with pytest.raises(TypeError, match="compression"):
+        rars.RarBuilder(compression=5)
+    with pytest.raises(TypeError, match="filters"):
+        rars.RarBuilder(filters=None)
+    builder = rars.RarBuilder(rars.RAR29, level=0)
+    builder.add_bytes(b"payload" * 64, "file.txt")
+    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    assert archive.infolist()[0].compress_size == archive.infolist()[0].file_size
+
+
+def test_writer_resources_keep_their_settings():
+    assert rars.WriterResources().max_memory is None
+    assert rars.WriterResources(max_memory=1 << 20).max_memory == 1 << 20
+    with pytest.raises(TypeError):
+        rars.WriterResources(1 << 20)
 
 
 def test_plain_builder_removal_and_decoded_missing_name():
