@@ -979,6 +979,106 @@ fn lz_member_reads_trailing_table_for_next_solid_member() {
     assert_eq!(decoder.decode_member(&[], 4).unwrap(), vec![0; 4]);
 }
 
+#[test]
+fn a_complete_rar20_member_passes_when_the_header_after_it_is_cut() {
+    for (name, write_block) in TRAILING_HEADER_BLOCKS {
+        for packed in members_with_a_cut_trailing_header(write_block) {
+            let mut decoder = Unpack20::new();
+            assert_eq!(
+                decoder.decode_member(&packed, 4).unwrap(),
+                vec![0; 4],
+                "{name} buffered, cut at {}",
+                packed.len()
+            );
+
+            let mut decoder = Unpack20::new();
+            let mut output = Vec::new();
+            decoder
+                .decode_member_from_reader(&mut packed.as_slice(), 4, &mut output)
+                .unwrap();
+            assert_eq!(
+                output,
+                vec![0; 4],
+                "{name} streamed, cut at {}",
+                packed.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_solid_follower_after_a_cut_trailing_header_keeps_the_old_tables() {
+    for (name, write_block) in TRAILING_HEADER_BLOCKS {
+        for packed in members_with_a_cut_trailing_header(write_block) {
+            // Under the old tables a zero bit is one zero symbol; a fresh
+            // header could not be read from one byte.
+            let mut decoder = Unpack20::new();
+            decoder.decode_member(&packed, 4).unwrap();
+            assert_eq!(
+                decoder.decode_member(&[0], 4).unwrap(),
+                vec![0; 4],
+                "{name} buffered, cut at {}",
+                packed.len()
+            );
+
+            let mut decoder = Unpack20::new();
+            decoder
+                .decode_member_from_reader(&mut packed.as_slice(), 4, &mut Vec::new())
+                .unwrap();
+            let mut output = Vec::new();
+            decoder
+                .decode_member_from_reader(&mut &[0u8][..], 4, &mut output)
+                .unwrap();
+            assert_eq!(
+                output,
+                vec![0; 4],
+                "{name} streamed, cut at {}",
+                packed.len()
+            );
+        }
+    }
+}
+
+#[test]
+fn a_cut_trailing_header_still_sets_the_block_kind_and_channels_it_read() {
+    let mut bits = BitWriter::default();
+    write_fresh_lz_zero_block(&mut bits, 4, true);
+    bits.write_bits(0b10, 2); // audio block, do not keep previous tables.
+    bits.write_bits(1, 2); // two channels.
+    for symbol in 0..LEVEL_COUNT {
+        bits.write_bits(if symbol < 16 { 4 } else { 0 }, 4);
+    }
+    let packed = bits.finish();
+
+    let mut decoder = Unpack20::new();
+    assert_eq!(decoder.decode_member(&packed, 4).unwrap(), vec![0; 4]);
+    assert!(decoder.audio_block);
+    assert_eq!(decoder.channels, 2);
+}
+
+type WriteBlock = fn(&mut BitWriter, usize, bool);
+
+const TRAILING_HEADER_BLOCKS: [(&str, WriteBlock); 2] = [
+    ("lz", write_fresh_lz_zero_block),
+    ("audio", write_fresh_audio_block),
+];
+
+fn members_with_a_cut_trailing_header(write_block: WriteBlock) -> Vec<Vec<u8>> {
+    let mut bits = BitWriter::default();
+    write_block(&mut bits, 4, true);
+    let member_end = bits.finish().len();
+
+    let mut bits = BitWriter::default();
+    write_block(&mut bits, 4, true);
+    write_block(&mut bits, 0, false);
+    let header = bits.finish();
+    // The decoder skips a trailing header with fewer than 5 bytes left.
+    assert!(member_end + 4 < header.len());
+    (member_end + 4..header.len())
+        .map(|cut| header[..cut].to_vec())
+        .collect()
+}
+
 fn write_fresh_lz_zero_block(bits: &mut BitWriter, count: usize, end: bool) {
     let mut table = [0u8; super::TABLE_COUNT];
     table[0] = 1;

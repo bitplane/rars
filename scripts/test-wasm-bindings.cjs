@@ -46,8 +46,10 @@ check('version and stored round trips expose all metadata getters', () => {
   assert.match(engine.version(), /^\d+\.\d+\.\d+$/);
   for (const format of engine.formats()) {
     const builder = new engine.RarBuilder({format, store: true});
-    builder.addBytes('first.txt', bytes('first'), {mtime: 0, mode: 0o640});
-    builder.addBytesRaw(bytes('second.txt'), bytes('second'), {mtime: 1, mode: 0o640});
+    // Unix seconds in every format; even, as RAR 1.5-4.x keep 2-second steps.
+    const mtimes = [1700000000, 1700000002];
+    builder.addBytes('first.txt', bytes('first'), {mtime: mtimes[0], mode: 0o640});
+    builder.addBytesRaw(bytes('second.txt'), bytes('second'), {mtime: mtimes[1], mode: 0o640});
     assert.equal(builder.length, 2);
     assert.deepEqual(builder.names(), ['first.txt', 'second.txt']);
     builder.rename('second.txt', 'renamed.txt');
@@ -72,7 +74,7 @@ check('version and stored round trips expose all metadata getters', () => {
       assert.ok(info.crc === undefined || Number.isInteger(info.crc));
       assert.ok(info.hostOs === undefined || Number.isInteger(info.hostOs));
       assert.ok(Number.isInteger(info.fileAttr));
-      assert.ok(info.fileTime === undefined || Number.isInteger(info.fileTime));
+      assert.equal(info.mtime, mtimes[index], format);
       assert.deepEqual(archive.read(info.name), archive.readAt(index));
       info.free();
     }

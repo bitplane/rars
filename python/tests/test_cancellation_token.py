@@ -36,7 +36,7 @@ def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
     payload = b"thread cancellation\n" * 10000
     builder.add_bytes(payload, "file")
     if phase == "staging":
-        builder = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(builder.to_bytes()),
+        builder = rars.RarBuilder.from_archive(rars.RarFile(builder.to_bytes()),
                                               staging_dir=tmp_path)
     token = rars.CancellationToken()
     reached = threading.Event()
@@ -73,7 +73,7 @@ def test_callback_failure_does_not_cancel_the_callers_token(tmp_path, rewrite):
     builder = rars.RarBuilder(store=True)
     builder.add_bytes(b"payload", "file")
     if rewrite:
-        builder = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(builder.to_bytes()),
+        builder = rars.RarBuilder.from_archive(rars.RarFile(builder.to_bytes()),
                                               staging_dir=tmp_path)
     token = rars.CancellationToken()
     failure = RuntimeError("callback failed")
@@ -86,6 +86,6 @@ def test_callback_failure_does_not_cancel_the_callers_token(tmp_path, rewrite):
     assert caught.value is failure
     assert not token.is_cancelled()
     assert list(tmp_path.iterdir()) == []
-    output = rars.RarFile.from_bytes(builder.to_bytes(cancellation=token))
+    output = rars.RarFile(builder.to_bytes(cancellation=token))
     assert output.read("file") == b"payload"
     assert not token.is_cancelled()

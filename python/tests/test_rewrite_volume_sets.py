@@ -35,7 +35,7 @@ def assert_rewrites_whole(tmp_path, first, **kwargs):
     with rars.RarFile(first) as archive:
         expected = extracted(archive, tmp_path / "expected")
     rewrite = rars.RarBuilder.from_archive(first, preserve=False, **kwargs)
-    rewritten = rars.RarFile.from_bytes(rewrite.to_bytes())
+    rewritten = rars.RarFile(rewrite.to_bytes())
     assert not rewritten.is_volume
     assert extracted(rewritten, tmp_path / "rewritten") == expected
 
@@ -61,7 +61,7 @@ def test_volumes_supplies_the_later_volumes(tmp_path):
     rewrite = rars.RarBuilder.from_archive(
         data, preserve=False, volumes=(path.read_bytes() for path in paths[1:])
     )
-    rewritten = rars.RarFile.from_bytes(rewrite.to_bytes())
+    rewritten = rars.RarFile(rewrite.to_bytes())
     assert rewritten.read("large.bin") == PAYLOAD
     assert rewritten.namelist() == ["head.txt", "dir", "large.bin", "tail.txt"]
 
@@ -75,7 +75,7 @@ def test_a_set_from_bytes_without_volumes_points_at_volumes(tmp_path):
 def test_a_rarfile_set_rewrites_with_the_volumes_it_was_opened_with(tmp_path):
     paths = write_set(tmp_path, "rar50")
     archive = rars.RarFile(paths[0].read_bytes(), volumes=paths[1:])
-    rewritten = rars.RarFile.from_bytes(
+    rewritten = rars.RarFile(
         rars.RarBuilder.from_archive(archive, preserve=False).to_bytes()
     )
     assert rewritten.read("large.bin") == PAYLOAD

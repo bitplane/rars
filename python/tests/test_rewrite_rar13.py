@@ -15,7 +15,7 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
     editor = rars.RarBuilder.from_archive(source)
     editor.rename(source.namelist()[0], "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password="password")
+    output = rars.RarFile(data, password="password")
     assert output.family == source.family == "rar13"
     assert output.rewrite_preservation_issues() == []
     assert output.comment == source.comment
@@ -36,13 +36,13 @@ def test_rar13_directories_between_solid_members_and_after_removal(tmp_path, sol
     builder.add_bytes(b"data " * 500, b"raw-\xff", mtime=DOS_TIME)
     builder.add_directory("empty", mtime=DOS_TIME)
     builder.add_bytes(b"data " * 500 + b"end", "last", mtime=DOS_TIME)
-    source = rars.RarFile.from_bytes(builder.to_bytes(), password="password")
+    source = rars.RarFile(builder.to_bytes(), password="password")
     editor = rars.RarBuilder.from_archive(source)
     data = editor.to_bytes()
     check_unrar(tmp_path, data)
     editor.remove(b"raw-\xff")
     data = editor.to_bytes()
-    assert rars.RarFile.from_bytes(data, password="password").read("last") == b"data " * 500 + b"end"
+    assert rars.RarFile(data, password="password").read("last") == b"data " * 500 + b"end"
     check_unrar(tmp_path, data)
 
 
@@ -62,7 +62,7 @@ def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
         size = struct.unpack_from("<H", data, offset + 10)[0]
         data[offset + size:offset + size] = b"unknown"
         struct.pack_into("<H", data, offset + 10, size + 7)
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     path = tmp_path / "existing.rar"
     path.write_bytes(b"keep")
     with pytest.raises(rars.UnsupportedRarFeature):
@@ -76,14 +76,14 @@ def test_rar13_mixed_encryption_keeps_plain_members_plain(tmp_path):
     encrypted = rars.RarBuilder(format="rar13", password="password")
     encrypted.add_bytes(b"private", "secret")
     data = encrypted.to_bytes()
-    source = rars.RarFile.from_bytes(plain.to_bytes() + data[struct.unpack_from("<H", data, 4)[0]:], password="password")
+    source = rars.RarFile(plain.to_bytes() + data[struct.unpack_from("<H", data, 4)[0]:], password="password")
     editor = rars.RarBuilder.from_archive(source)
     rewritten = editor.to_bytes()
-    output = rars.RarFile.from_bytes(rewritten, password="password")
+    output = rars.RarFile(rewritten, password="password")
     assert not output.getinfo("plain").is_encrypted
     assert output.getinfo("secret").is_encrypted
     assert output.read("plain") == b"public"
     assert output.read("secret") == b"private"
     check_unrar(tmp_path, rewritten)
     editor.remove("secret")
-    assert rars.RarFile.from_bytes(editor.to_bytes()).read("plain") == b"public"
+    assert rars.RarFile(editor.to_bytes()).read("plain") == b"public"

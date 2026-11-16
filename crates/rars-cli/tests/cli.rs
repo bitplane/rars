@@ -1620,7 +1620,10 @@ fn create_and_extract_preserve_mtime_and_permissions() {
     let archive = rars::ArchiveReader::read_path(&archive).unwrap();
     let members: Vec<_> = archive.members().collect();
     assert_eq!(members.len(), 1);
-    assert_eq!(members[0].meta.file_time, Some(1_700_000_002));
+    assert_eq!(
+        members[0].meta.modification_time(),
+        Some(rars::Timestamp::from_unix_seconds(1_700_000_002))
+    );
     assert_eq!(members[0].meta.file_attr & 0o777, 0o640);
 
     let extract = rars()
@@ -6954,7 +6957,10 @@ fn extract_distinguishes_missing_mtime_from_epoch_for_files_and_directories() {
     let archive = dir.join("times.rar");
     let out = dir.join("out");
     let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
-    for (name, time) in [("missing", None), ("epoch", Some(0))] {
+    for (name, time) in [
+        ("missing", None),
+        ("epoch", Some(rars::Timestamp::from_unix_seconds(0))),
+    ] {
         builder
             .add_directory(name.as_bytes().to_vec(), time, None)
             .unwrap();

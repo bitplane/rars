@@ -82,7 +82,7 @@ pub struct ArchiveEntry {
     pub mtime: Option<u32>,
     /// Optional nanosecond fraction; requires mtime and a value below one second.
     pub mtime_nanoseconds: Option<u32>,
-    pub file_times: Option<crate::FileTimes>,
+    pub file_times: Option<crate::file_times::TimeRecord>,
     pub attributes: u64,
     pub host_os: u64,
     /// Encrypts this member's payload. With header encryption every member
@@ -155,7 +155,7 @@ impl ArchiveEntry {
         self
     }
 
-    pub fn with_file_times(mut self, times: Option<crate::FileTimes>) -> Self {
+    pub fn with_file_times(mut self, times: Option<crate::file_times::TimeRecord>) -> Self {
         self.file_times = times;
         self
     }
@@ -1189,8 +1189,9 @@ mod tests {
         timestamped.mtime_nanoseconds = Some(1_000_000_000);
         assert!(super::validate_entry(&timestamped).is_err());
         timestamped.mtime_nanoseconds = None;
-        timestamped.file_times =
-            Some(crate::FileTimes::from_unix_nanoseconds(Some(0), None, None).unwrap());
+        timestamped.file_times = Some(
+            crate::file_times::TimeRecord::from_unix_nanoseconds(Some(0), None, None).unwrap(),
+        );
         assert_eq!(
             super::validate_entry(&timestamped).unwrap_err(),
             crate::Error::InvalidArgument("conflicting file modification timestamps")
@@ -2427,6 +2428,95 @@ mod tests {
         let extracted = collect_extract(&parsed).unwrap();
         assert_eq!(extracted[0].name, name);
         assert_eq!(extracted[0].data, data);
+    }
+
+    #[test]
+    fn rar7_member_reads_matches_from_the_widest_distance_slots_as_zeros() {
+        use crate::codec::rar50::{
+            encode_compressed_block, encode_table_lengths_with_bit_count, TableLengths,
+            ALIGN_TABLE_SIZE, DISTANCE_TABLE_SIZE_70, LENGTH_TABLE_SIZE, MAIN_TABLE_SIZE,
+        };
+
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_70],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[262] = 1;
+        lengths.distance[66] = 1;
+        lengths.distance[79] = 1;
+        let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 1).unwrap();
+        // 'A', then a match on slot 66 and one on slot 79, every extra bit set.
+        let mut bits = vec![false];
+        for (slot_code, extra_bits) in [(false, 32), (true, 38)] {
+            bits.extend([true, slot_code]);
+            bits.extend(std::iter::repeat_n(true, extra_bits));
+        }
+        let payload: Vec<u8> = bits
+            .chunks(8)
+            .map(|byte| {
+                byte.iter()
+                    .enumerate()
+                    .fold(0, |value, (i, &bit)| value | (u8::from(bit) << (7 - i)))
+            })
+            .collect();
+        let mut packed = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+        packed.extend(encode_compressed_block(&payload, bits.len(), false, true).unwrap());
+        let data = b"A\0\0\0\0\0\0\0\0\0\0";
+        let name = b"far.bin";
+
+        let mut archive = Vec::new();
+        archive.extend_from_slice(RAR50_SIGNATURE);
+        write_main_header(
+            &mut archive,
+            0,
+            None,
+            &[],
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
+        let mut extra = Vec::new();
+        write_hash_record_with_value(&mut extra, blake2sp::hash(data)).unwrap();
+        let compression_info = 1 | 1 << 7; // RAR 7 stream, method m1, 128 KiB dictionary.
+        let specific = file_specific(
+            name,
+            data.len() as u64,
+            crc32(data),
+            0x20,
+            None,
+            compression_info,
+            0,
+            false,
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
+        write_block(
+            &mut archive,
+            HEAD_FILE,
+            HFL_EXTRA | HFL_DATA,
+            Some(packed.len() as u64),
+            &specific,
+            &extra,
+            &packed,
+            &crate::WriterResources::default(),
+        )
+        .unwrap();
+        write_end_header(&mut archive, 0, &crate::WriterResources::default()).unwrap();
+
+        let parsed = Archive::parse(&archive).unwrap();
+        for buffered_limit in [0, u64::MAX] {
+            let output = Rc::new(RefCell::new(Vec::new()));
+            parsed
+                .extract_to(
+                    crate::ArchiveReadOptions::default()
+                        .with_rar50_buffered_decode_limit(buffered_limit),
+                    |_| Ok(Box::new(CollectWriter(Rc::clone(&output)))),
+                )
+                .unwrap();
+            assert_eq!(*output.borrow(), data, "buffered limit {buffered_limit}");
+        }
     }
 
     #[test]

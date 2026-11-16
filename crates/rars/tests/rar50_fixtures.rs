@@ -1656,6 +1656,55 @@ fn writes_rar50_quick_open_service_record() {
     assert_eq!(extracted[1].data, entry_data(&entries[1]));
 }
 
+fn archives_with_a_locator() -> [Vec<u8>; 2] {
+    let entries = [
+        entry(b"first.txt", b"first member\n"),
+        entry(b"second.txt", b"second member\n"),
+    ];
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    let quick_open = write_stored_archive_with_comment(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
+        None,
+    )
+    .unwrap();
+    let recovery = write_stored_archive_with_recovery(
+        &entries,
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        5,
+    )
+    .unwrap();
+    [quick_open, recovery]
+}
+
+#[test]
+fn a_rar5_archive_whose_locator_points_past_the_end_is_refused() {
+    for bytes in archives_with_a_locator() {
+        let archive = Archive::parse(&bytes).unwrap();
+        let second = archive
+            .files()
+            .find(|file| file.name == b"second.txt")
+            .unwrap();
+        let cut = &bytes[..archive.sfx_offset + second.block.offset];
+
+        let refused = Archive::parse(cut).unwrap_err();
+        assert!(
+            refused.to_string().contains("past the end"),
+            "a cut archive has to say why it is refused: {refused}"
+        );
+    }
+}
+
+#[test]
+fn a_rar5_archive_whose_locator_points_inside_the_file_is_read() {
+    for bytes in archives_with_a_locator() {
+        let archive = Archive::parse(&bytes).unwrap();
+        assert!(archive.main.locator().is_some());
+        assert_eq!(collect_extract(&archive).unwrap().len(), 2);
+    }
+}
+
 #[test]
 fn writes_rar50_acl_and_stream_file_service_records() {
     let entries = [entry(b"serviced.txt", b"payload with attached services\n")
@@ -4793,7 +4842,12 @@ fn rar50_reads_the_modification_time_from_the_htime_record() {
         };
         let common = rars::Archive::Rar50Plus(archive.clone());
         for (member, file) in common.members().zip(archive.files()) {
-            assert_eq!(member.meta.file_time, file.mtime.or(file.htime_mtime));
+            assert_eq!(
+                member.meta.stored_modification_time(),
+                file.mtime
+                    .or(file.htime_mtime)
+                    .map(rars::StoredTimestamp::UnixSeconds)
+            );
         }
         for file in archive.files() {
             if file.mtime.is_some() {

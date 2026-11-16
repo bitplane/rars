@@ -15,17 +15,17 @@ from test_rewrite_legacy import ROOT, headers, service_headers
 def test_native_archive_comments_survive_rewrites(format, comment, password):
     builder = rars.RarBuilder(format=format, comment=comment, password=password)
     builder.add_bytes(b"payload", "file")
-    source = rars.RarFile.from_bytes(builder.to_bytes(), password=password)
+    source = rars.RarFile(builder.to_bytes(), password=password)
     assert source.rewrite_preservation_issues() == []
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password=password)
+    output = rars.RarFile(data, password=password)
     assert output.family == "rar15_40"
     assert output.comment == comment
     assert output.read("renamed") == b"payload"
     assert output.rewrite_preservation_issues() == []
-    assert rars.RarFile.from_bytes(rars.RarBuilder.from_archive(output).to_bytes(), password=password).comment == comment
+    assert rars.RarFile(rars.RarBuilder.from_archive(output).to_bytes(), password=password).comment == comment
 
 
 @pytest.mark.parametrize("password", [None, "secret"])
@@ -37,20 +37,20 @@ def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password, f
     builder.set_file_comment("file", b"comment\xff")
     builder.set_file_comment("empty", b"")
     builder.set_file_comment("remove", b"discard")
-    source = rars.RarFile.from_bytes(builder.to_bytes(), password=password)
+    source = rars.RarFile(builder.to_bytes(), password=password)
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     editor.remove("remove")
-    output = rars.RarFile.from_bytes(editor.to_bytes(), password=password)
+    output = rars.RarFile(editor.to_bytes(), password=password)
     assert output.comment == b"archive"
     assert output.getcomment("renamed") == b"comment\xff"
     assert output.getcomment("empty") == b""
     assert output.getcomment("absent") is None
     assert output.read("renamed") == b"file"
     editor.set_file_comment("renamed", b"changed")
-    assert rars.RarFile.from_bytes(editor.to_bytes(), password=password).getcomment("renamed") == b"changed"
+    assert rars.RarFile(editor.to_bytes(), password=password).getcomment("renamed") == b"changed"
     editor.set_file_comment("renamed", None)
-    assert rars.RarFile.from_bytes(editor.to_bytes(), password=password).getcomment("renamed") is None
+    assert rars.RarFile(editor.to_bytes(), password=password).getcomment("renamed") is None
 
 
 def old_comment_archive():
@@ -65,9 +65,9 @@ def test_nested_archive_comment_is_retained():
     assert offset == 20
     struct.pack_into("<H", data, 12, 13 + size)
     struct.pack_into("<H", data, 7, zlib.crc32(data[9:20]) & 0xffff)
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     assert source.comment == b"comment"
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    output = rars.RarFile(rars.RarBuilder.from_archive(source).to_bytes())
     assert output.comment == b"comment"
     assert output.read("file") == b"payload"
 
@@ -87,7 +87,7 @@ def test_bad_archive_comments_leave_destination_untouched(tmp_path, damage):
         struct.pack_into("<H", data, 7, zlib.crc32(data[9:20]) & 0xffff)
     else:
         data[offset + 13] ^= 1
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises((rars.UnsupportedRarFeature, rars.BadRarFile)):
@@ -103,7 +103,7 @@ def test_corrupt_file_comment_fails_before_destination_write(tmp_path):
     offset, _, _, _ = next(h for h in headers(data) if h[1] == 0x74)
     name_size = struct.unpack_from("<H", data, offset + 26)[0]
     data[offset + 32 + name_size + 13] ^= 1
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.BadRarFile):
@@ -148,6 +148,6 @@ def test_unsupported_cmt_service_layout_is_rejected(damage):
     else:
         struct.pack_into("<H", data, offset + 3, flags | 0x1000)
         struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     with pytest.raises(rars.UnsupportedRarFeature):
         rars.RarBuilder.from_archive(source)

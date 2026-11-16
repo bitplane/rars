@@ -1,10 +1,10 @@
 //! Pool threads decode batches of blocks to operations; the calling thread
 //! reads ahead and replays them, so output and errors match the serial decoder.
-use super::block_ops::{BlockOps, Repeats, Stop};
+use super::block_ops::{skip_symbols, BlockOps, Reached, Repeats, Stop};
 use super::{
-    read_compressed_block_with_allowance, read_table_lengths_with_allowance, Budget, DecodedChunk,
-    Error, OwnedCompressedBlock, PendingFilter, ReaderState, ReaderTables, Result,
-    StreamDecodeError, StreamingOutput,
+    read_compressed_block_with_allowance, read_table_lengths_with_allowance,
+    refuse_stream_past_declared, Budget, DecodedChunk, Error, OwnedCompressedBlock, PendingFilter,
+    ReaderState, ReaderTables, Result, StreamDecodeError, StreamingOutput,
 };
 use std::collections::VecDeque;
 use std::io::Read;
@@ -261,6 +261,26 @@ fn batch_bytes<B: Budget>(batch: &Batch<B>) -> usize {
     batch.blocks.iter().map(held_bytes).sum()
 }
 
+/// The serial decoder's check, from where it would have stopped in the newest block.
+fn refuse_past_declared_in_batch<B: Budget>(
+    batch: &Batch<B>,
+    tables: &[Tables<B>],
+    reached: &Reached,
+) -> Result<()> {
+    let Some(index) = reached.blocks.checked_sub(1) else {
+        return Ok(());
+    };
+    let block = &batch.blocks[index];
+    let start = if block.header.has_tables {
+        let allowance = block.payload.allowance();
+        read_table_lengths_with_allowance(&block.payload, batch.algorithm_version, &allowance)?.1
+    } else {
+        0
+    };
+    let bits = skip_symbols(&tables[index], &block.payload, start, reached.symbols)?;
+    refuse_stream_past_declared(&tables[index], bits, block.header.payload_bits)
+}
+
 impl<B: Budget> ReaderState<B> {
     pub(super) fn decode_blocks_ahead<E>(
         &mut self,
@@ -318,18 +338,26 @@ impl<B: Budget> ReaderState<B> {
                     mut stop,
                     mut tables,
                 } = batch.take(&spare);
-                let mut begun = 0;
+                let mut reached = Reached::default();
                 let mut in_symbols = false;
                 let replayed = loop {
-                    let applied =
-                        ops.apply(&mut repeats, output, &mut poller, sink, filters, &mut begun);
+                    let applied = ops.apply(
+                        &mut repeats,
+                        output,
+                        &mut poller,
+                        sink,
+                        filters,
+                        &mut reached,
+                    );
                     // As in the serial decoder, a failure among symbols leaves no tables.
                     if applied.is_err() {
                         in_symbols = true;
                         break applied;
                     }
                     if output.written() >= output_size {
-                        break applied;
+                        let refused = refuse_past_declared_in_batch(&batch, &tables, &reached);
+                        in_symbols = refused.is_err();
+                        break refused.map_err(Into::into);
                     }
                     // Whatever the worker left is decoded here, a list at a time.
                     ops.clear();
@@ -352,7 +380,7 @@ impl<B: Budget> ReaderState<B> {
                         Stop::BlockEnd => batch.decode_from(index + 1, &mut ops, &mut tables),
                     };
                 };
-                if let Some(reached) = begun.checked_sub(1) {
+                if let Some(reached) = reached.blocks.checked_sub(1) {
                     reached_tables = Some(Arc::clone(&tables[reached]));
                 }
                 if in_symbols {

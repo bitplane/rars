@@ -26,7 +26,7 @@ def test_batch_link_metadata_leaves_unrelated_corrupt_payload_for_writing(tmp_pa
     checksum = struct.unpack_from("<I", data, offset + 16)[0]
     struct.pack_into("<I", data, offset + 16, checksum ^ 1)
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    archive = rars.RarFile.from_bytes(bytes(data))
+    archive = rars.RarFile(bytes(data))
     editor = rars.RarBuilder.from_archive(archive, preserve=preserve, staging_dir=tmp_path)
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
@@ -53,11 +53,11 @@ def test_legacy_directories_survive_edits_without_breaking_solid_data(options, m
     source.add_bytes(b"first payload " * 200, "first", mtime=DOS_TIME)
     source.add_directory("empty", mtime=DOS_TIME, mode=mode)
     source.add_bytes(b"first payload " * 200 + b"second", "second", mtime=DOS_TIME)
-    archive = rars.RarFile.from_bytes(source.to_bytes(), password=options.get("password"))
+    archive = rars.RarFile(source.to_bytes(), password=options.get("password"))
     assert archive.getinfo("empty").is_dir()
     editor = rars.RarBuilder.from_archive(archive)
     editor.rename("empty", "renamed")
-    output = rars.RarFile.from_bytes(editor.to_bytes(), password=options.get("password"))
+    output = rars.RarFile(editor.to_bytes(), password=options.get("password"))
     assert output.namelist() == ["first", "renamed", "second"]
     assert output.getinfo("renamed").is_dir()
     assert output.getinfo("renamed").file_attr == archive.getinfo("empty").file_attr
@@ -66,7 +66,7 @@ def test_legacy_directories_survive_edits_without_breaking_solid_data(options, m
     assert output.read("second") == b"first payload " * 200 + b"second"
     assert output.rewrite_preservation_issues() == []
     editor.remove("first")
-    output = rars.RarFile.from_bytes(editor.to_bytes(), password=options.get("password"))
+    output = rars.RarFile(editor.to_bytes(), password=options.get("password"))
     assert output.read("second") == b"first payload " * 200 + b"second"
 
 
@@ -77,11 +77,11 @@ def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
     source.add_bytes(b"first" * 200, "first")
     source.add_unix_symlink(b"link-\xff", target, mtime=DOS_TIME, mode=0o755)
     source.add_bytes(b"last" * 200, "last")
-    archive = rars.RarFile.from_bytes(source.to_bytes(), password=options.get("password"))
+    archive = rars.RarFile(source.to_bytes(), password=options.get("password"))
     assert archive.readlink(b"link-\xff") == target
     editor = rars.RarBuilder.from_archive(archive)
     editor.rename(b"link-\xff", b"renamed-\xfe")
-    output = rars.RarFile.from_bytes(editor.to_bytes(), password=options.get("password"))
+    output = rars.RarFile(editor.to_bytes(), password=options.get("password"))
     assert output.family == "rar15_40"
     assert output.readlink(b"renamed-\xfe") == target
     assert output.getinfo(b"renamed-\xfe").file_attr == archive.getinfo(b"link-\xff").file_attr
@@ -103,7 +103,7 @@ def test_unrar_extracts_rewritten_legacy_directories_and_links(tmp_path, solid, 
         source.add_unix_symlink("link", b"file", mtime=DOS_TIME)
         source.add_unix_symlink("dangling", b"missing", mtime=DOS_TIME)
     source.add_bytes(b"payload" * 300 + b"end", "last")
-    editor = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+    editor = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
     editor.rename("empty", "renamed")
     path = tmp_path / "archive.rar"
     editor.write(path)
@@ -125,7 +125,7 @@ def test_invalid_native_link_target_leaves_destination_untouched(tmp_path, targe
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(ValueError, match="link target"):
-        rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes())).write(destination)
+        rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes())).write(destination)
     assert destination.read_bytes() == b"keep"
 
 
@@ -138,8 +138,8 @@ def test_reference_legacy_directory_headers_retain_metadata():
     for offset, kind, flags, size in headers(data):
         if kind in [0x73, 0x7b] or (kind == 0x74 and flags & 0xe0 == 0xe0):
             blocks.append(data[offset:offset + size])
-    source = rars.RarFile.from_bytes(b"".join(blocks))
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source).to_bytes())
+    source = rars.RarFile(b"".join(blocks))
+    output = rars.RarFile(rars.RarBuilder.from_archive(source).to_bytes())
     assert len(output.infolist()) == 3
     for before, after in zip(source.infolist(), output.infolist(), strict=True):
         assert after.is_dir()
@@ -159,7 +159,7 @@ def test_legacy_directory_payload_is_rejected_before_output(tmp_path):
     struct.pack_into("<H", data, offset + 3, flags | 0xe0)
     struct.pack_into("<I", data, offset + 28, 0x10)
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.UnsupportedRarFeature):

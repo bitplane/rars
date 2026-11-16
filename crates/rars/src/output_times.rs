@@ -1,8 +1,7 @@
 //! Stored modified times for extracted outputs, set once extraction ends because writing into a directory moves its time.
 //! Shared by the CLI and the Python binding; not part of the stable API.
 
-use crate::timestamp::extracted_system_time;
-use crate::{ArchiveFamily, ExtractedEntryMeta};
+use crate::ExtractedEntryMeta;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -26,15 +25,15 @@ impl OutputTimes {
     }
 
     /// Records an output as it opens, which completes the one before it.
-    pub fn opened(&mut self, path: PathBuf, family: ArchiveFamily, meta: &ExtractedEntryMeta) {
+    pub fn opened(&mut self, path: PathBuf, meta: &ExtractedEntryMeta) {
         self.finish();
-        self.current =
-            extracted_system_time(family, meta.file_time, meta.mtime_refinement).map(|modified| {
-                OutputTime {
-                    path,
-                    modified,
-                    is_directory: meta.is_directory,
-                }
+        self.current = meta
+            .modified
+            .and_then(|time| SystemTime::try_from(time).ok())
+            .map(|modified| OutputTime {
+                path,
+                modified,
+                is_directory: meta.is_directory,
             });
     }
 
@@ -85,7 +84,8 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     fn meta(seconds: u32, is_directory: bool) -> ExtractedEntryMeta {
-        ExtractedEntryMeta::new(b"x".to_vec(), Some(seconds), 0, is_directory)
+        let modified = crate::Timestamp::from_unix_seconds(i64::from(seconds));
+        ExtractedEntryMeta::new(b"x".to_vec(), Some(modified), 0, is_directory)
     }
 
     fn modified(path: &Path) -> SystemTime {
@@ -99,13 +99,9 @@ mod tests {
         let file = directory.join("file");
         std::fs::create_dir(&directory).unwrap();
         let mut times = OutputTimes::new();
-        times.opened(
-            directory.clone(),
-            ArchiveFamily::Rar50Plus,
-            &meta(1_000, true),
-        );
+        times.opened(directory.clone(), &meta(1_000, true));
         std::fs::write(&file, b"x").unwrap();
-        times.opened(file.clone(), ArchiveFamily::Rar50Plus, &meta(2_000, false));
+        times.opened(file.clone(), &meta(2_000, false));
         times.finish();
 
         times.restore().unwrap();
@@ -126,12 +122,8 @@ mod tests {
         std::fs::write(&failed, b"x").unwrap();
         let written = modified(&failed);
         let mut times = OutputTimes::new();
-        times.opened(done.clone(), ArchiveFamily::Rar50Plus, &meta(1_000, false));
-        times.opened(
-            failed.clone(),
-            ArchiveFamily::Rar50Plus,
-            &meta(2_000, false),
-        );
+        times.opened(done.clone(), &meta(1_000, false));
+        times.opened(failed.clone(), &meta(2_000, false));
 
         times.restore().unwrap();
 

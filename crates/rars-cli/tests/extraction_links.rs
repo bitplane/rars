@@ -28,7 +28,7 @@ fn write_archive(
         .add_bytes(
             b"real.txt".to_vec(),
             b"hello\n".to_vec(),
-            Some(1_700_000_000),
+            Some(rars::Timestamp::from_unix_seconds(1_700_000_000)),
             Some(0o640),
         )
         .unwrap();
@@ -37,7 +37,7 @@ fn write_archive(
             b"link-to-real.txt".to_vec(),
             target.to_vec(),
             false,
-            Some(1_600_000_000),
+            Some(rars::Timestamp::from_unix_seconds(1_600_000_000)),
             Some(0o777),
         )
         .unwrap();

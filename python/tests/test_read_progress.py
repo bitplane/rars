@@ -8,18 +8,16 @@ PAYLOAD = random.Random(5).randbytes(300_000)
 
 
 def single_archive():
-    builder = rars.RarBuilder(format="rar50", compression=3)
+    builder = rars.RarBuilder(format="rar50", level=3)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     builder.add_directory("empty")
-    return rars.RarFile.from_bytes(builder.to_bytes())
+    return rars.RarFile(builder.to_bytes())
 
 
 def test_extractall_reports_bytes_written_against_a_known_total(tmp_path):
     events = []
-    options = rars.ReadOptions(progress=events.append)
-
-    single_archive().extractall(tmp_path, options=options)
+    single_archive().extractall(tmp_path, progress=events.append)
 
     assert events
     assert {event.phase for event in events} == {"extracting"}
@@ -50,7 +48,7 @@ def test_a_set_from_a_generator_claims_no_total_before_its_last_volume(tmp_path)
         events.append((event.volume, event.total, event.percentage, event.completed))
 
     with rars.RarFile(paths[0]) as archive:
-        archive.testrar(options=rars.ReadOptions(progress=record), volumes=later_volumes())
+        archive.testrar(progress=record, volumes=later_volumes())
 
     before_last = [event for event in events if event[0] < len(paths)]
     assert before_last
@@ -72,7 +70,7 @@ def test_a_raising_callback_stops_extraction_and_reaches_the_caller(tmp_path):
     paths = write_set(tmp_path / "made")
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(Stop, match="enough"):
-            archive.extractall(tmp_path / "out", options=rars.ReadOptions(progress=stop))
+            archive.extractall(tmp_path / "out", progress=stop)
 
     assert not (tmp_path / "out" / "large.bin").exists()
 
@@ -83,21 +81,21 @@ def test_a_callback_raising_on_the_finished_event_still_reaches_the_caller():
             raise Stop("at the end")
 
     with pytest.raises(Stop, match="at the end"):
-        single_archive().read_many(["large.bin"], options=rars.ReadOptions(progress=stop))
+        single_archive().read_many(["large.bin"], progress=stop)
 
 
 @pytest.mark.parametrize(
     "call, phase, total",
     [
-        (lambda archive, options: archive.read_many(["small.txt", "large.bin"], options=options), "reading", len(PAYLOAD) + 5),
-        (lambda archive, options: archive.read("small.txt", options=options), "reading", 5),
-        (lambda archive, options: archive.testrar(options=options), "testing", len(PAYLOAD) + 5),
+        (lambda archive, progress: archive.read_many(["small.txt", "large.bin"], progress=progress), "reading", len(PAYLOAD) + 5),
+        (lambda archive, progress: archive.read("small.txt", progress=progress), "reading", 5),
+        (lambda archive, progress: archive.testrar(progress=progress), "testing", len(PAYLOAD) + 5),
     ],
 )
 def test_reads_and_tests_report_their_phase_against_the_members_they_decode(call, phase, total):
     events = []
 
-    call(single_archive(), rars.ReadOptions(progress=events.append))
+    call(single_archive(), events.append)
 
     assert {event.phase for event in events} == {phase}
     assert all(event.total == total for event in events)
@@ -106,9 +104,7 @@ def test_reads_and_tests_report_their_phase_against_the_members_they_decode(call
 
 def test_read_many_with_progress_returns_the_same_bytes_in_request_order():
     archive = single_archive()
-    options = rars.ReadOptions(progress=lambda event: None)
-
-    data = archive.read_many(["small.txt", "large.bin", "small.txt"], options=options)
+    data = archive.read_many(["small.txt", "large.bin", "small.txt"], progress=lambda event: None)
 
     assert data == [b"small", PAYLOAD, b"small"]
 
@@ -121,7 +117,7 @@ def test_a_selection_on_a_set_counts_only_the_selected_member(tmp_path):
         archive.extractall(
             tmp_path / "out",
             members=["large.bin"],
-            options=rars.ReadOptions(progress=events.append),
+            progress=events.append,
         )
 
     assert events[-1].completed == events[-1].total == len(PAYLOAD)
@@ -130,7 +126,14 @@ def test_a_selection_on_a_set_counts_only_the_selected_member(tmp_path):
 
 def test_progress_must_be_callable():
     with pytest.raises(ValueError, match="progress must be callable"):
-        rars.ReadOptions(progress=3)
+        single_archive().read("small.txt", progress=3)
+
+
+def test_read_options_no_longer_carry_progress_or_cancellation():
+    with pytest.raises(TypeError):
+        rars.ReadOptions(progress=print)
+    with pytest.raises(TypeError):
+        rars.ReadOptions(cancellation=rars.CancellationToken())
 
 
 def test_read_many_on_a_set_counts_a_member_after_a_split_one(tmp_path):
@@ -139,7 +142,7 @@ def test_read_many_on_a_set_counts_a_member_after_a_split_one(tmp_path):
 
     with rars.RarFile(paths[0]) as archive:
         data = archive.read_many(
-            ["small.txt", "large.bin"], options=rars.ReadOptions(progress=events.append)
+            ["small.txt", "large.bin"], progress=events.append
         )
 
     assert data == [b"small", PAYLOAD]
@@ -153,7 +156,7 @@ def test_a_set_found_by_name_knows_its_total_from_the_first_event(tmp_path):
     events = []
 
     with rars.RarFile(paths[0]) as archive:
-        archive.extractall(tmp_path / "out", options=rars.ReadOptions(progress=events.append))
+        archive.extractall(tmp_path / "out", progress=events.append)
 
     assert all(event.total == len(PAYLOAD) + 5 for event in events)
     assert events[0].percentage is not None
@@ -164,9 +167,9 @@ def test_a_set_given_as_a_list_knows_its_total_from_the_first_event(tmp_path):
     paths = write_set(tmp_path / "made")
     events = []
 
-    with rars.RarFile.from_bytes(paths[0].read_bytes()) as archive:
+    with rars.RarFile(paths[0].read_bytes()) as archive:
         archive.testrar(
-            options=rars.ReadOptions(progress=events.append),
+            progress=events.append,
             volumes=[path.read_bytes() for path in paths[1:]],
         )
 
@@ -180,7 +183,7 @@ def test_a_set_with_a_volume_still_missing_falls_back_to_an_unknown_total(tmp_pa
 
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(rars.MissingVolume):
-            archive.testrar(options=rars.ReadOptions(progress=events.append))
+            archive.testrar(progress=events.append)
 
     assert events
     assert all(event.total == 0 and event.percentage is None for event in events)

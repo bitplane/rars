@@ -56,7 +56,7 @@ def test_path_open_parses_cancellably(tmp_path):
     token = rars.CancellationToken()
     token.cancel()
     with pytest.raises(InterruptedError):
-        rars.RarFile(archive, options=rars.ReadOptions(cancellation=token))
+        rars.RarFile(archive, cancellation=token)
     assert rars.RarFile(archive).read("member") == b"payload"
 
 
@@ -77,5 +77,5 @@ def test_relative_path_survives_working_directory_change(tmp_path, monkeypatch, 
     assert archive.read("member") == b"payload"
     archive.extractall("out")
     assert (elsewhere / "out" / "member").read_bytes() == b"payload"
-    rewritten = rars.RarFile.from_bytes(rewrite.to_bytes())
+    rewritten = rars.RarFile(rewrite.to_bytes())
     assert rewritten.read("member") == b"payload"

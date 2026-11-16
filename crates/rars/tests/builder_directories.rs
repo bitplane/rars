@@ -12,13 +12,18 @@ fn explicit_directories_survive_all_rar5_writer_paths() {
         for solid in [false, true] {
             let mut builder = Builder::new(format).solid(solid);
             builder
-                .add_directory(b"empty".to_vec(), Some(123), None)
+                .add_directory(
+                    b"empty".to_vec(),
+                    Some(rars::Timestamp::from_unix_seconds(123)),
+                    None,
+                )
                 .unwrap();
             builder
-                .add_directory(b"nested".to_vec(), Some(456), Some(0o750))
-                .unwrap();
-            builder
-                .set_mtime_nanoseconds(b"nested", 704_088_300)
+                .add_directory(
+                    b"nested".to_vec(),
+                    rars::Timestamp::new(456, 704_088_300),
+                    Some(0o750),
+                )
                 .unwrap();
             builder
                 .add_bytes(b"nested/file".to_vec(), b"payload".repeat(20), None, None)
@@ -33,12 +38,15 @@ fn explicit_directories_survive_all_rar5_writer_paths() {
                 assert_eq!(members.len(), 3);
                 assert!(members[0].meta.is_directory);
                 assert_eq!(members[0].meta.file_attr, 0x10);
-                assert_eq!(members[0].meta.file_time, Some(123));
+                assert_eq!(
+                    members[0].meta.modification_time(),
+                    Some(rars::Timestamp::from_unix_seconds(123))
+                );
                 assert!(members[1].meta.is_directory);
                 assert_eq!(members[1].meta.file_attr, 0o040750);
                 assert_eq!(
-                    members[1].meta.mtime_refinement.unwrap().nanoseconds,
-                    704_088_300
+                    members[1].meta.modification_time(),
+                    rars::Timestamp::new(456, 704_088_300)
                 );
                 assert!(!members[2].meta.is_directory);
                 assert_eq!(
@@ -73,11 +81,18 @@ fn directory_validation_does_not_change_entry_kind_or_queued_names() {
 fn rar15_directory_uses_legacy_directory_attributes() {
     let mut builder = Builder::new(ArchiveVersion::Rar15).store(true);
     builder
-        .add_directory(b"empty".to_vec(), Some(123), None)
+        .add_directory(
+            b"empty".to_vec(),
+            Some(rars::Timestamp::from_unix_seconds(1_700_000_000)),
+            None,
+        )
         .unwrap();
     let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
     let member = archive.members().next().unwrap();
     assert!(member.meta.is_directory);
     assert_eq!(member.meta.file_attr, 0x10);
-    assert_eq!(member.meta.file_time, Some(123));
+    assert_eq!(
+        member.meta.modification_time(),
+        Some(rars::Timestamp::from_unix_seconds(1_700_000_000))
+    );
 }

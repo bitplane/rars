@@ -1,5 +1,4 @@
 use crate::password::Password;
-use crate::time::{source_dos_mtime, source_unix_mtime};
 use crate::{CliResult, DOS_ARCHIVE_ATTR};
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -8,12 +7,11 @@ use std::path::{Component, Path, PathBuf};
 use zeroize::Zeroizing;
 
 /// An input read fully into memory, for the RAR 1.3 writer.
-/// That format records DOS timestamps, so the Unix one is not carried here.
 pub(crate) struct OwnedInput {
     pub(crate) name: Vec<u8>,
     pub(crate) data: Vec<u8>,
     pub(crate) file_attr: u8,
-    pub(crate) dos_mtime: u32,
+    pub(crate) mtime: Option<rars::Timestamp>,
     pub(crate) password: Option<Password>,
 }
 
@@ -24,8 +22,38 @@ pub(crate) struct LazyInput {
     pub(crate) size: u64,
     pub(crate) file_attr: u8,
     pub(crate) unix_mode: Option<u32>,
-    pub(crate) unix_mtime: Option<u32>,
-    pub(crate) dos_mtime: u32,
+    /// Whole seconds: the writers below store no finer.
+    pub(crate) mtime: Option<rars::Timestamp>,
+}
+
+/// An input's time as each family's writer stores it.
+pub(crate) trait StoredTime {
+    fn mtime(&self) -> Option<rars::Timestamp>;
+
+    /// RAR 1.3–4.x: a DOS time, or 0 where the file's time doesn't fit.
+    fn dos_time(&self) -> u32 {
+        self.mtime()
+            .and_then(rars::timestamp::dos_time)
+            .unwrap_or(0)
+    }
+
+    /// RAR5/7: Unix seconds, where they fit the 32-bit field.
+    fn unix_seconds(&self) -> Option<u32> {
+        self.mtime()
+            .and_then(|time| u32::try_from(time.unix_seconds()).ok())
+    }
+}
+
+impl StoredTime for OwnedInput {
+    fn mtime(&self) -> Option<rars::Timestamp> {
+        self.mtime
+    }
+}
+
+impl StoredTime for LazyInput {
+    fn mtime(&self) -> Option<rars::Timestamp> {
+        self.mtime
+    }
 }
 
 impl LazyInput {
@@ -75,7 +103,7 @@ where
             name: entry.name,
             data,
             file_attr: entry.file_attr,
-            dos_mtime: entry.dos_mtime,
+            mtime: entry.mtime,
             password: password.map(|p| Zeroizing::new(p.to_vec())),
         });
     }
@@ -104,8 +132,11 @@ fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<LazyInput>) -> 
                 DOS_ARCHIVE_ATTR
             },
             unix_mode: source_unix_mode(&meta),
-            unix_mtime: source_unix_mtime(&meta),
-            dos_mtime: source_dos_mtime(&meta),
+            mtime: meta
+                .modified()
+                .ok()
+                .and_then(|time| rars::Timestamp::try_from(time).ok())
+                .map(|time| rars::Timestamp::from_unix_seconds(time.unix_seconds())),
         });
     } else {
         return Err(format!(
@@ -357,7 +388,7 @@ mod tests {
                     DOS_ARCHIVE_ATTR
                 }
             );
-            assert_eq!(owned.dos_mtime, lazy.dos_mtime);
+            assert_eq!(owned.mtime, lazy.mtime);
             assert_eq!(owned.password.as_deref().unwrap().as_slice(), b"secret");
         }
         let events = events.into_inner();

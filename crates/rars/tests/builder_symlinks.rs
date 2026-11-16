@@ -14,7 +14,7 @@ fn unix_symlinks_round_trip_without_resolving_targets() {
                     b"link".to_vec(),
                     b"../missing".to_vec(),
                     false,
-                    Some(123),
+                    Some(rars::Timestamp::from_unix_seconds(123)),
                     Some(0o750),
                 )
                 .unwrap();
@@ -42,7 +42,10 @@ fn unix_symlinks_round_trip_without_resolving_targets() {
                 b"../missing"
             );
             assert_eq!(members[0].meta.file_attr, 0o120750);
-            assert_eq!(members[0].meta.file_time, Some(123));
+            assert_eq!(
+                members[0].meta.modification_time(),
+                Some(rars::Timestamp::from_unix_seconds(123))
+            );
             assert_eq!(members[1].unix_symlink().unwrap().flags, 1);
             assert!(!members[1].meta.is_directory);
             assert_eq!(archive.read_member_at(0, None).unwrap(), None);
@@ -69,7 +72,7 @@ fn archive_redirection_retains_unix_symlink_attributes() {
         b"link".to_vec(),
         b"missing".to_vec(),
         false,
-        Some(123),
+        Some(rars::Timestamp::from_unix_seconds(123)),
         Some(0o750),
     )
     .unwrap();
@@ -82,7 +85,10 @@ fn archive_redirection_retains_unix_symlink_attributes() {
     assert_eq!(link.unix_symlink().unwrap().target_name, b"missing");
     assert_eq!(link.meta.host_os, Some(1));
     assert_eq!(link.meta.file_attr, 0o120750);
-    assert_eq!(link.meta.file_time, Some(123));
+    assert_eq!(
+        link.meta.modification_time(),
+        Some(rars::Timestamp::from_unix_seconds(123))
+    );
 }
 
 #[test]

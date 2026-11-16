@@ -16,7 +16,7 @@ def archive(files, format="rar50", **kwargs):
     builder.add_directory("a")
     for name, contents in files:
         builder.add_bytes(contents.encode(), name)
-    return rars.RarFile.from_bytes(builder.to_bytes())
+    return rars.RarFile(builder.to_bytes())
 
 
 def listing(out):
@@ -111,7 +111,7 @@ def test_an_invalid_overwrite_value_raises(tmp_path, value, error):
 def test_flatten_cannot_escape_the_output_directory(tmp_path, name, overwrite):
     out = tmp_path / "out"
     out.mkdir()
-    rar = rars.RarFile.from_bytes(hostile_archive(name))
+    rar = rars.RarFile(hostile_archive(name))
     with pytest.raises(rars.UnsafeArchivePath):
         rar.extractall(out, flatten=True, overwrite=overwrite)
     assert tree(tmp_path) == {Path("out")}
@@ -154,7 +154,7 @@ def test_flat_redirections_built_by_rars_resolve_too(tmp_path, kind):
     builder.add_bytes(b"target", "c/target.txt")
     builder.add_unix_symlink("b/link.txt", "c/target.txt")
     data = redirect(builder.to_bytes(), kind)
-    rars.RarFile.from_bytes(data).extractall(tmp_path, flatten=True)
+    rars.RarFile(data).extractall(tmp_path, flatten=True)
     assert (tmp_path / "link.txt").read_bytes() == b"target"
     assert os.path.samefile(tmp_path / "link.txt", tmp_path / "target.txt") == (kind == HARD_LINK)
 
@@ -167,7 +167,7 @@ def test_flat_legacy_symlinks_keep_only_bare_targets(tmp_path, format):
     builder.add_unix_symlink("a/near.txt", "local.txt")
     builder.add_unix_symlink("a/up.txt", "../x/local.txt")
     with pytest.warns(rars.UnsafeLinkWarning, match="a/up.txt"):
-        rars.RarFile.from_bytes(builder.to_bytes()).extractall(tmp_path, flatten=True)
+        rars.RarFile(builder.to_bytes()).extractall(tmp_path, flatten=True)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["local.txt", "near.txt"]
     assert os.readlink(tmp_path / "near.txt") == "local.txt"
 
@@ -194,7 +194,7 @@ def test_member_times_are_restored_on_flattened_and_renamed_files(tmp_path, form
     builder = rars.RarBuilder(format=format)
     builder.add_bytes(b"x", "a/readme.txt", mtime=times[0])
     builder.add_bytes(b"x", "b/readme.txt", mtime=times[1])
-    rar = rars.RarFile.from_bytes(builder.to_bytes())
+    rar = rars.RarFile(builder.to_bytes())
     rar.extractall(tmp_path / "flat", flatten=True, overwrite="rename")
     rar.extractall(tmp_path / "nested")
     mtime = lambda path: os.stat(tmp_path / path).st_mtime_ns
@@ -209,5 +209,5 @@ def test_rename_without_flatten_refuses_a_repeated_stored_path_as_the_cli_does(t
     builder.add_bytes(b"second", "pppppppppppp")
     data = _rewrite_name(builder.to_bytes(), b"pppppppppppp", b"a/readme.txt")
     with pytest.raises(rars.Error, match="same output path"):
-        rars.RarFile.from_bytes(data).extractall(tmp_path, overwrite="rename")
+        rars.RarFile(data).extractall(tmp_path, overwrite="rename")
     assert listing(tmp_path / "a") == [("readme.txt", "first")]

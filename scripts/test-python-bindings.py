@@ -59,7 +59,7 @@ assert isinstance(first, bytes)
 builder = rars.RarBuilder(format="rar50", store=True)
 builder.add_bytes(b"alpha", "alpha.txt")
 builder.add_bytes(b"beta", "nested/beta.txt")
-rebuilt = rars.RarFile.from_bytes(builder.to_bytes())
+rebuilt = rars.RarFile(builder.to_bytes())
 assert rebuilt.namelist() == ["alpha.txt", "nested/beta.txt"]
 assert rebuilt.read("alpha.txt") == b"alpha"
 assert rebuilt.read(b"nested/beta.txt") == b"beta"

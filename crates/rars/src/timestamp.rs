@@ -3,7 +3,6 @@
 
 use crate::tzif::TimeZone;
 use crate::{ArchiveFamily, TimeRefinement};
-use std::fs;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// A stored timestamp with its interpretation attached, before refinements.
@@ -74,15 +73,6 @@ pub fn format_filetime_utc(filetime: u64) -> String {
         .unwrap_or_else(|| format!("{filetime:#018x}"))
 }
 
-pub fn source_unix_mtime(metadata: &fs::Metadata) -> Option<u32> {
-    metadata
-        .modified()
-        .ok()?
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| u32::try_from(duration.as_secs()).ok())
-}
-
 /// UTC calendar fields for a RAR5 whole-second timestamp, including Unix epoch.
 pub fn unix_datetime(seconds: u32) -> (u16, u8, u8, u8, u8, u8) {
     let (year, month, day) = civil_from_days(i64::from(seconds / 86_400));
@@ -97,17 +87,34 @@ pub fn unix_datetime(seconds: u32) -> (u16, u8, u8, u8, u8, u8) {
     )
 }
 
-pub fn source_dos_mtime(metadata: &fs::Metadata) -> u32 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(system_time_to_dos_time)
-        .unwrap_or(0)
+/// `time` as the DOS timestamp RAR 1.3–4.x store: local wall-clock fields
+/// in 2-second steps, so an odd second and any fraction round down. `None`
+/// outside 1980–2107. For callers of the per-format writers, which take
+/// each format's stored form.
+pub fn dos_time(time: crate::Timestamp) -> Option<u32> {
+    let seconds = u64::try_from(time.unix_seconds()).ok()?;
+    system_time_to_dos_time(UNIX_EPOCH + Duration::from_secs(seconds))
+}
+
+/// A stored modification time in Unix time, for every family: DOS values go
+/// through the local zone, and `None` stands for an absent or invalid one.
+pub(crate) fn stored_to_unix(
+    family: ArchiveFamily,
+    file_time: Option<u32>,
+    refinement: Option<TimeRefinement>,
+) -> Option<crate::Timestamp> {
+    let raw = file_time?;
+    if family == ArchiveFamily::Rar50Plus {
+        let nanoseconds = refinement.map_or(0, |detail| detail.nanoseconds);
+        return crate::Timestamp::new(i64::from(raw), nanoseconds);
+    }
+    extracted_system_time(family, Some(raw), refinement)
+        .and_then(|time| crate::Timestamp::try_from(time).ok())
 }
 
 /// Converts a present stored timestamp without treating Unix epoch as missing.
 /// Legacy DOS zero remains invalid under the existing local-zone conversion.
-pub fn extracted_system_time(
+pub(crate) fn extracted_system_time(
     family: ArchiveFamily,
     file_time: Option<u32>,
     refinement: Option<TimeRefinement>,

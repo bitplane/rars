@@ -2239,8 +2239,8 @@ fn detects_rar50_align_mode_when_align_lengths_are_not_uniform_four() {
 
 #[test]
 fn decodes_synthetic_literal_only_block() {
-    let payload = literal_only_payload(b"ABBA");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"ABBA");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_literal_only(&input, 0, 4).unwrap();
 
@@ -3860,8 +3860,8 @@ fn decode_member_from_reader_accepts_incremental_input() {
         }
     }
 
-    let payload = literal_only_payload(b"ABBA");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"ABBA");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     let mut reader = OneByteReader {
         data: &input,
         pos: 0,
@@ -3877,8 +3877,8 @@ fn decode_member_from_reader_accepts_incremental_input() {
 
 #[test]
 fn decoders_stop_at_declared_size_before_a_nonfinal_block() {
-    let payload = literal_only_payload(b"AB");
-    let block = encode_compressed_block(&payload, payload.len() * 8, true, false).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let block = encode_compressed_block(&payload, payload_bits, true, false).unwrap();
     let mut input = block.clone();
     input.extend_from_slice(b"not another block");
 
@@ -3909,8 +3909,8 @@ fn decoders_stop_at_declared_size_before_a_nonfinal_block() {
 
 #[test]
 fn decodes_synthetic_new_match_block() {
-    let payload = new_match_payload();
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = new_match_payload();
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_lz(&input, 0, 4).unwrap();
 
@@ -3919,8 +3919,8 @@ fn decodes_synthetic_new_match_block() {
 
 #[test]
 fn decodes_synthetic_last_length_match_block() {
-    let payload = repeat_payload(257);
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = repeat_payload(257);
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_lz(&input, 0, 6).unwrap();
 
@@ -3929,8 +3929,8 @@ fn decodes_synthetic_last_length_match_block() {
 
 #[test]
 fn decodes_synthetic_repeat_distance_match_block() {
-    let payload = repeat_payload(258);
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = repeat_payload(258);
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_lz(&input, 0, 6).unwrap();
 
@@ -4097,50 +4097,78 @@ fn decoders_report_truncated_match_extra_bits() {
 }
 
 #[test]
-fn decoders_reject_rar7_distance_slot_above_bit_limit() {
-    let mut lengths = TableLengths {
-        main: vec![0; MAIN_TABLE_SIZE],
-        distance: vec![0; DISTANCE_TABLE_SIZE_70],
-        align: vec![0; ALIGN_TABLE_SIZE],
-        length: vec![0; LENGTH_TABLE_SIZE],
-    };
-    lengths.main[262] = 1; // New match with length slot 0.
-    lengths.distance[66] = 1; // (66 - 2) / 2 = 32 extra bits.
-    let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 1).unwrap();
-    let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
-    input.extend(encode_compressed_block(&[0], 2, false, true).unwrap());
-    let expected = Error::InvalidData("RAR 5 distance slot is too large");
+fn decoders_read_rar7_distance_slots_past_31_bits_as_zeros() {
+    for align_mode in [false, true] {
+        let mut lengths = TableLengths {
+            main: vec![0; MAIN_TABLE_SIZE],
+            distance: vec![0; DISTANCE_TABLE_SIZE_70],
+            align: vec![0; ALIGN_TABLE_SIZE],
+            length: vec![0; LENGTH_TABLE_SIZE],
+        };
+        lengths.main[b'A' as usize] = 1;
+        lengths.main[262] = 1; // New match with length slot 0.
+        lengths.distance[66] = 1; // 32 extra bits.
+        lengths.distance[79] = 1; // 38 extra bits, the last slot.
+        if align_mode {
+            lengths.align[0] = 1;
+            lengths.align[15] = 1;
+        }
+        let (tables, table_bits) = encode_table_lengths_with_bit_count(&lengths, 1).unwrap();
+        let mut writer = BitWriter::new();
+        writer.write_bits(0, 1); // 'A'
+        for (slot_code, extra_bits) in [(0, 32), (1, 38)] {
+            writer.write_bits(1, 1); // Match, length 2 plus a bonus of 3.
+            writer.write_bits(slot_code, 1);
+            if align_mode {
+                writer.write_bits((1 << (extra_bits - 4)) - 1, extra_bits - 4);
+                writer.write_bits(1, 1); // Align symbol 15.
+            } else {
+                writer.write_bits((1 << extra_bits) - 1, extra_bits);
+            }
+        }
+        let payload_bits = writer.bit_pos;
+        let payload = writer.finish();
+        let mut input = encode_compressed_block(&tables, table_bits, true, false).unwrap();
+        input.extend(encode_compressed_block(&payload, payload_bits, false, true).unwrap());
+        let expected = b"A\0\0\0\0\0\0\0\0\0\0".to_vec();
 
-    let mut buffered = Unpack50Decoder::new();
-    assert_eq!(
-        buffered.decode_member_with_dictionary(
+        let buffered = Unpack50Decoder::new().decode_member_with_dictionary(
             &input,
             1,
-            2,
+            expected.len(),
             DEFAULT_DICTIONARY_SIZE,
             false,
             DecodeMode::Lz,
-        ),
-        Err(expected.clone())
-    );
-    assert!(buffered.state.tables.is_none());
-    let mut streaming = Unpack50Decoder::new();
-    let result = streaming.decode_member_from_reader_with_dictionary_to_sink(
-        &mut input.as_slice(),
-        1,
-        2,
-        DEFAULT_DICTIONARY_SIZE,
-        false,
-        |_chunk| Ok::<(), std::convert::Infallible>(()),
-    );
-    assert!(matches!(result, Err(StreamDecodeError::Decode(error)) if error == expected));
-    assert!(streaming.state.tables.is_none());
+        );
+        assert_eq!(buffered, Ok(expected.clone()), "align {align_mode}");
+
+        let mut streamed = Vec::new();
+        Unpack50Decoder::new()
+            .decode_member_from_reader_with_dictionary_to_sink(
+                &mut input.as_slice(),
+                1,
+                expected.len(),
+                DEFAULT_DICTIONARY_SIZE,
+                false,
+                |chunk| {
+                    match chunk {
+                        DecodedChunk::Bytes(bytes) => streamed.extend_from_slice(bytes),
+                        DecodedChunk::Repeated { byte, len } => {
+                            streamed.extend(std::iter::repeat_n(byte, len));
+                        }
+                    }
+                    Ok::<(), std::convert::Infallible>(())
+                },
+            )
+            .unwrap();
+        assert_eq!(streamed, expected, "align {align_mode}");
+    }
 }
 
 #[test]
 fn solid_decoders_report_truncated_repeat_length() {
-    let bootstrap = new_match_payload();
-    let bootstrap = encode_compressed_block(&bootstrap, bootstrap.len() * 8, true, true).unwrap();
+    let (bootstrap, bits) = new_match_payload();
+    let bootstrap = encode_compressed_block(&bootstrap, bits, true, true).unwrap();
 
     for (length_slot, packed) in [
         (0, 0b0000_0001), // Seven literals and a repeat, without its length code.
@@ -4397,17 +4425,16 @@ fn match_pricing_and_encoding_reject_invalid_internal_candidates() {
             estimated_match_cost(&fresh, 4, 1usize << 40, DISTANCE_TABLE_SIZE_50).unwrap_err(),
             too_distant
         );
-        let invalid_slot = Error::InvalidData("RAR 5 distance slot is too large");
         assert_eq!(
             fresh
-                .encode_match(5, (1usize << 33) + 1, DISTANCE_TABLE_SIZE_70)
+                .encode_match(5, (1usize << 40) + 1, DISTANCE_TABLE_SIZE_70)
                 .unwrap_err(),
-            invalid_slot
+            too_distant
         );
         assert_eq!(
-            estimated_match_cost(&fresh, 5, (1usize << 33) + 1, DISTANCE_TABLE_SIZE_70)
+            estimated_match_cost(&fresh, 5, (1usize << 40) + 1, DISTANCE_TABLE_SIZE_70)
                 .unwrap_err(),
-            invalid_slot
+            too_distant
         );
     }
 }
@@ -4476,8 +4503,8 @@ fn optimal_match_collection_grows_beyond_one_run_per_position() {
 #[test]
 fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
     for (slot, extra, distance) in [
-        (63, (1u32 << 30) - 1, 1u64 << 32),
-        (65, (1u32 << 31) - 1, 1u64 << 33),
+        (63, (1u64 << 30) - 1, 1u64 << 32),
+        (65, (1u64 << 31) - 1, 1u64 << 33),
     ] {
         assert_eq!(
             slot_to_distance(slot, extra).unwrap(),
@@ -4487,15 +4514,25 @@ fn distance_slots_beyond_native_address_width_use_out_of_window_sentinel() {
 }
 
 #[test]
-fn rejects_out_of_range_distance_slots_and_extras() {
-    #[cfg(target_pointer_width = "64")]
-    assert!(slot_to_distance(65, (1 << 31) - 1).is_ok());
+fn distance_slots_reach_the_end_of_the_rar7_alphabet_and_no_further() {
+    for (slot, extra, distance) in [
+        (66, 0, 0x2_0000_0001u64),
+        (67, 0xffff_ffff, 0x4_0000_0000),
+        (79, 0x3f_ffff_ffff, 0x100_0000_0000),
+    ] {
+        let expected = usize::try_from(distance).unwrap_or(usize::MAX);
+        assert_eq!(slot_to_distance(slot, extra), Ok(expected));
+    }
     assert_eq!(
         slot_to_distance(4, 2),
         Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"))
     );
     assert_eq!(
-        slot_to_distance(66, 0),
+        slot_to_distance(79, 1 << 38),
+        Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"))
+    );
+    assert_eq!(
+        slot_to_distance(DISTANCE_TABLE_SIZE_70, 0),
         Err(Error::InvalidData("RAR 5 distance slot is too large"))
     );
 }
@@ -4653,13 +4690,14 @@ fn filtered_reader_history_retains_only_the_raw_dictionary_tail() {
 
 #[test]
 fn failed_buffered_filter_preserves_previous_solid_history() {
-    let data = b"\xe8\0\0\0\0abcdefghijklmnop".to_vec();
+    let data = [&b"\xe8\0\0\0\0"[..], &b"abcd".repeat(8)].concat();
     let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
     let mut decoder = Unpack50Decoder::new();
     decoder.state = ReaderState::with_history(Buffer::from_vec(b"old raw history".to_vec()));
     let history = decoder.state.history.to_vec();
     // The record spans the full member, but the advertised output stops
-    // one byte earlier: the failure happens during filter application.
+    // one byte earlier, inside the final match: the failure happens during
+    // filter application.
     assert_eq!(
         decoder.decode_member_with_dictionary(&packed, 0, data.len() - 1, 64, true, DecodeMode::Lz),
         Err(Error::InvalidData("RAR 5 filter range exceeds output"))
@@ -4670,12 +4708,10 @@ fn failed_buffered_filter_preserves_previous_solid_history() {
 #[test]
 fn solid_history_is_capped_to_dictionary_size() {
     let mut decoder = Unpack50Decoder::new();
-    let first_payload = literal_only_payload(b"ABBA");
-    let first =
-        encode_compressed_block(&first_payload, first_payload.len() * 8, true, true).unwrap();
-    let second_payload = literal_only_payload(b"BAAB");
-    let second =
-        encode_compressed_block(&second_payload, second_payload.len() * 8, true, true).unwrap();
+    let (first_payload, first_bits) = literal_only_payload(b"ABBA");
+    let first = encode_compressed_block(&first_payload, first_bits, true, true).unwrap();
+    let (second_payload, second_bits) = literal_only_payload(b"BAAB");
+    let second = encode_compressed_block(&second_payload, second_bits, true, true).unwrap();
 
     assert_eq!(
         decoder
@@ -4743,12 +4779,10 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
 #[test]
 fn streaming_decoder_history_is_capped_without_reordering() {
     let mut decoder = Unpack50Decoder::new();
-    let first_payload = literal_only_payload(b"ABBA");
-    let first =
-        encode_compressed_block(&first_payload, first_payload.len() * 8, true, true).unwrap();
-    let second_payload = literal_only_payload(b"BAAB");
-    let second =
-        encode_compressed_block(&second_payload, second_payload.len() * 8, true, true).unwrap();
+    let (first_payload, first_bits) = literal_only_payload(b"ABBA");
+    let first = encode_compressed_block(&first_payload, first_bits, true, true).unwrap();
+    let (second_payload, second_bits) = literal_only_payload(b"BAAB");
+    let second = encode_compressed_block(&second_payload, second_bits, true, true).unwrap();
     let mut decoded = Vec::new();
 
     decoder
@@ -4797,8 +4831,8 @@ fn streaming_decoder_history_is_capped_without_reordering() {
 
 #[test]
 fn solid_streaming_decoder_trims_inherited_history_before_member() {
-    let payload = literal_only_payload(b"AB");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     let mut decoder = Unpack50Decoder::new();
     decoder.state = ReaderState::with_history(Buffer::from_vec(b"123456".to_vec()));
     let mut decoded = Vec::new();
@@ -4828,12 +4862,12 @@ fn solid_streaming_decoder_trims_inherited_history_before_member() {
 
 #[test]
 fn streaming_decoder_handles_each_match_control() {
-    for (payload, expected) in [
+    for ((payload, payload_bits), expected) in [
         (new_match_payload(), b"ABAB".as_slice()),
         (repeat_payload(257), b"ABABAB".as_slice()),
         (repeat_payload(258), b"ABABAB".as_slice()),
     ] {
-        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
         let mut decoded = Vec::new();
         Unpack50Decoder::new()
             .decode_member_from_reader_with_dictionary_to_sink(
@@ -5093,10 +5127,10 @@ fn final_match_past_declared_size_truncates_and_keeps_overrun_for_solid_member()
     // The follow-on member copies two bytes from distance 2, so it reads the
     // overrun byte only if the window kept it.
     let follow_on = {
-        let payload = match_only_payload();
-        encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap()
+        let (payload, payload_bits) = match_only_payload();
+        encode_compressed_block(&payload, payload_bits, true, true).unwrap()
     };
-    for (payload, declared_size, expected, next) in [
+    for ((payload, payload_bits), declared_size, expected, next) in [
         // AB, then a two-byte match: ABA|B.
         (new_match_payload(), 3, &b"ABA"[..], b"AB"),
         // ABAB, then the previous match: ABABA|B.
@@ -5104,7 +5138,7 @@ fn final_match_past_declared_size_truncates_and_keeps_overrun_for_solid_member()
         // ABAB, then a repeat distance: ABABA|B.
         (repeat_payload(258), 5, b"ABABA", b"AB"),
     ] {
-        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
         let mut buffered = Unpack50Decoder::new();
         let decode = |decoder: &mut Unpack50Decoder, input: &[u8], size, solid| {
             decoder.decode_member_with_dictionary(
@@ -5280,8 +5314,8 @@ fn streaming_decoder_rejects_missing_tables_and_invalid_dictionary() {
 
 #[test]
 fn streaming_decoder_propagates_sink_failure() {
-    let payload = literal_only_payload(b"AB");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     let error = Unpack50Decoder::new()
         .decode_member_from_reader_with_dictionary_to_sink(
             &mut input.as_slice(),
@@ -5537,8 +5571,8 @@ fn streaming_decoder_propagates_filter_record_failure() {
 
 #[test]
 fn streaming_decoder_reports_truncated_block_and_incomplete_output() {
-    let payload = literal_only_payload(b"AB");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     for truncated in [&input[..1], &input[..input.len() - 1]] {
         let mut reader = truncated;
         let error = Unpack50Decoder::new()
@@ -5905,7 +5939,7 @@ fn streaming_window_zero_fills_match_beyond_declared_dictionary() {
     assert_eq!(decoded, b"\0");
 }
 
-fn literal_only_payload(data: &[u8]) -> Vec<u8> {
+fn literal_only_payload(data: &[u8]) -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -5926,10 +5960,11 @@ fn literal_only_payload(data: &[u8]) -> Vec<u8> {
             _ => panic!("test helper only encodes A/B"),
         }
     }
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
-fn new_match_payload() -> Vec<u8> {
+fn new_match_payload() -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -5950,10 +5985,11 @@ fn new_match_payload() -> Vec<u8> {
     writer.write_bits(0b01, 2); // 'B'
     writer.write_bits(0b10, 2); // match length 2
     writer.write_bits(0, 1); // distance slot 1
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
-fn match_only_payload() -> Vec<u8> {
+fn match_only_payload() -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -5970,10 +6006,11 @@ fn match_only_payload() -> Vec<u8> {
     };
     writer.write_bits(1, 1); // match length 2
     writer.write_bits(0, 1); // distance slot 1
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
-fn repeat_payload(repeat_symbol: usize) -> Vec<u8> {
+fn repeat_payload(repeat_symbol: usize) -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -6000,7 +6037,8 @@ fn repeat_payload(repeat_symbol: usize) -> Vec<u8> {
     if repeat_symbol == 258 {
         writer.write_bits(0, 1); // length slot 0
     }
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
 fn control_only_block(symbol: usize) -> Vec<u8> {

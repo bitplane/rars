@@ -4,6 +4,8 @@ use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 use crate::detect::{find_archive_start, ArchiveSignature, RAR50_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
+/// RAR5's own time record: which encoding each time used, kept for exact copies.
+pub use crate::file_times::{RecordTime, TimeRecord};
 #[cfg(feature = "encryption")]
 use crate::io_util::align16 as checked_align16;
 use crate::io_util::read_exact_at;
@@ -220,7 +222,7 @@ pub struct FileHeader {
     /// Fractional detail belonging to the extended modification time.
     pub htime_mtime_refinement: Option<crate::TimeRefinement>,
     /// Complete supported time record, retaining FILETIME ticks without narrowing.
-    pub file_times: Option<crate::FileTimes>,
+    pub file_times: Option<crate::file_times::TimeRecord>,
     pub data_crc32: Option<u32>,
     pub compression_info: u64,
     pub host_os: u64,
@@ -1557,7 +1559,7 @@ fn parse_file_extra_area(
             FHEXTRA_HTIME => {
                 let flags = read_vint_at(input, data.start, data.end).ok();
                 let times = flags.and_then(|(flags, len)| {
-                    crate::FileTimes::parse(flags, &input[data.start + len..data.end])
+                    crate::file_times::TimeRecord::parse(flags, &input[data.start + len..data.end])
                 });
                 let parsed = parse_htime_mtime(input, data);
                 file.rewrite_metadata_complete &= times.is_some()
@@ -2022,6 +2024,22 @@ where
     let mut main = parse_main_header_bytes(first).map_err(|error| at_offset(error, main_pos))?;
     main.encrypted_headers = header_keys.is_some();
     main.rewrite_metadata_complete &= header_metadata_complete;
+    // A file cut exactly at a block boundary otherwise parses as a smaller, sound archive.
+    if let Some(locator) = main.locator() {
+        let past_end = |offset: Option<u64>| {
+            offset.is_some_and(|offset| {
+                (main_pos as u64).saturating_add(offset) >= archive_len as u64
+            })
+        };
+        if past_end(locator.quick_open_offset) || past_end(locator.recovery_record_offset) {
+            return Err(at_offset(
+                Error::InvalidHeader(
+                    "RAR 5 main header locator points past the end of the archive",
+                ),
+                main_pos,
+            ));
+        }
+    }
     pos = first.next_offset;
 
     let mut blocks = Vec::new();
@@ -2963,7 +2981,7 @@ mod tests {
             assert!(file.rewrite_metadata_complete);
             assert_eq!(
                 file.file_times.unwrap().modified,
-                Some(crate::FileTimestamp::WindowsFiletime(ticks))
+                Some(crate::file_times::RecordTime::WindowsFiletime(ticks))
             );
         }
     }

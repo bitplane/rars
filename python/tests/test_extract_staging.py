@@ -12,7 +12,7 @@ def archive_of(**members):
     builder = rars.RarBuilder(store=True)
     for name, payload in members.items():
         builder.add_bytes(payload, name)
-    return rars.RarFile.from_bytes(builder.to_bytes())
+    return rars.RarFile(builder.to_bytes())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX hard links")
@@ -85,7 +85,7 @@ def test_without_overwrite_an_existing_symlink_is_refused(tmp_path):
 def corrupt_last(builder):
     data = bytearray(builder.to_bytes())
     data[data.rindex(b"bad payload")] ^= 0xFF
-    return rars.RarFile.from_bytes(bytes(data))
+    return rars.RarFile(bytes(data))
 
 
 def staging_left(out):
@@ -156,7 +156,7 @@ def test_no_staging_remains_after_success_cancellation_or_a_raising_volumes_iter
 
         with pytest.raises(InterruptedError):
             archive.extractall(tmp_path / "cancelled", volumes=cancelling(),
-                               options=rars.ReadOptions(cancellation=token))
+                               cancellation=token)
 
         def raising():
             yield paths[1]

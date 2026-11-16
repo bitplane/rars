@@ -923,13 +923,13 @@ impl<B: Budget> ReaderState<B> {
                         let distance_slot = tables.distance.decode(&mut bits)?;
                         let distance_bit_count = distance_slot_bit_count(distance_slot)?;
                         let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
-                            let high = bits.read_bits((distance_bit_count - 4) as u8)?;
-                            let low = tables.align.decode(&mut bits)? as u32;
+                            let high = bits.read_wide_bits(distance_bit_count - 4)?;
+                            let low = tables.align.decode(&mut bits)? as u64;
                             (high << 4) | low
                         } else {
-                            bits.read_bits(distance_bit_count as u8)?
+                            bits.read_wide_bits(distance_bit_count)?
                         };
-                        // distance_slot_bit_count rejected slots above 65 and
+                        // distance_slot_bit_count rejected slots above 79 and
                         // the extra value was read at exactly that width.
                         let distance = distance_from_slot_parts(
                             distance_slot,
@@ -956,6 +956,9 @@ impl<B: Budget> ReaderState<B> {
                 }
             }
 
+            if output.len() >= output_size {
+                refuse_stream_past_declared(&tables, bits, payload_bits)?;
+            }
             self.tables = Some(tables);
             if block.header.is_last || output.len() >= output_size {
                 break;
@@ -1195,13 +1198,13 @@ impl<B: Budget> ReaderState<B> {
                         let distance_slot = tables.distance.decode(&mut bits)?;
                         let distance_bit_count = distance_slot_bit_count(distance_slot)?;
                         let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
-                            let high = bits.read_bits((distance_bit_count - 4) as u8)?;
-                            let low = tables.align.decode(&mut bits)? as u32;
+                            let high = bits.read_wide_bits(distance_bit_count - 4)?;
+                            let low = tables.align.decode(&mut bits)? as u64;
                             (high << 4) | low
                         } else {
-                            bits.read_bits(distance_bit_count as u8)?
+                            bits.read_wide_bits(distance_bit_count)?
                         };
-                        // distance_slot_bit_count rejected slots above 65 and
+                        // distance_slot_bit_count rejected slots above 79 and
                         // the extra value was read at exactly that width.
                         let distance = distance_from_slot_parts(
                             distance_slot,
@@ -1217,6 +1220,9 @@ impl<B: Budget> ReaderState<B> {
                 }
             }
 
+            if output.written() >= output_size {
+                refuse_stream_past_declared(&tables, bits, payload_bits)?;
+            }
             self.tables = Some(tables);
             if block.header.is_last || output.written() >= output_size {
                 return Ok(());
@@ -2177,28 +2183,74 @@ pub(crate) enum FilterType {
     Arm,
 }
 
-fn read_filter(bits: &mut BitReader<'_>, current_pos: usize) -> Result<PendingFilter> {
+const PAST_DECLARED: Error = Error::InvalidData("RAR 5 stream continues past the declared size");
+
+/// Past the declared size a block may hold only whole filter records and the zero bits writers pad with.
+fn refuse_stream_past_declared<B: Budget>(
+    tables: &ReaderTables<B>,
+    mut bits: BitReader<'_>,
+    payload_bits: usize,
+) -> Result<()> {
+    loop {
+        let mut record = bits;
+        let whole = matches!(tables.main.decode(&mut record), Ok(256))
+            && read_filter_record(&mut record).is_ok()
+            && record.position() <= payload_bits;
+        if !whole {
+            break;
+        }
+        bits = record;
+    }
+    while bits.position() < payload_bits {
+        let count = (payload_bits - bits.position()).min(32);
+        if bits.read_bits(count as u8)? != 0 {
+            return Err(PAST_DECLARED);
+        }
+    }
+    Ok(())
+}
+
+/// Parsed apart from its type so a trailing record of any type can be skipped.
+struct FilterRecord {
+    offset: usize,
+    length: usize,
+    kind: u32,
+    channels: usize,
+}
+
+fn read_filter_record(bits: &mut BitReader<'_>) -> Result<FilterRecord> {
     let offset = read_filter_data(bits)? as usize;
     let length = read_filter_data(bits)? as usize;
-    let filter_type = match bits.read_bits(3)? {
+    let kind = bits.read_bits(3)?;
+    let channels = if kind == 0 {
+        bits.read_bits(5)? as usize + 1
+    } else {
+        0
+    };
+    Ok(FilterRecord {
+        offset,
+        length,
+        kind,
+        channels,
+    })
+}
+
+fn read_filter(bits: &mut BitReader<'_>, current_pos: usize) -> Result<PendingFilter> {
+    let record = read_filter_record(bits)?;
+    let filter_type = match record.kind {
         0 => FilterType::Delta,
         1 => FilterType::E8,
         2 => FilterType::E8E9,
         3 => FilterType::Arm,
         _ => return Err(Error::InvalidData("RAR 5 filter type is unsupported")),
     };
-    let channels = if filter_type == FilterType::Delta {
-        bits.read_bits(5)? as usize + 1
-    } else {
-        0
-    };
     Ok(PendingFilter {
         start: current_pos
-            .checked_add(offset)
+            .checked_add(record.offset)
             .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?,
-        length,
+        length: record.length,
         filter_type,
-        channels,
+        channels: record.channels,
     })
 }
 
@@ -2418,35 +2470,31 @@ fn length_from_slot_parts(slot: usize, extra_bits: u32) -> usize {
 pub fn distance_slot_bit_count(slot: usize) -> Result<usize> {
     if slot < 4 {
         Ok(0)
+    } else if slot >= DISTANCE_TABLE_SIZE_70 {
+        Err(Error::InvalidData("RAR 5 distance slot is too large"))
     } else {
-        let bit_count = (slot - 2) >> 1;
-        if bit_count > 31 {
-            Err(Error::InvalidData("RAR 5 distance slot is too large"))
-        } else {
-            Ok(bit_count)
-        }
+        Ok((slot - 2) >> 1)
     }
 }
 
-pub fn slot_to_distance(slot: usize, extra_bits: u32) -> Result<usize> {
+pub fn slot_to_distance(slot: usize, extra_bits: u64) -> Result<usize> {
     if slot < 4 {
         return Ok(slot + 1);
     }
     let bit_count = distance_slot_bit_count(slot)?;
-    let max_extra = (1u32 << bit_count) - 1;
-    if extra_bits > max_extra {
+    if extra_bits >> bit_count != 0 {
         return Err(Error::InvalidData("RAR 5 distance extra bits exceed slot"));
     }
     Ok(distance_from_slot_parts(slot, bit_count, extra_bits))
 }
 
-fn distance_from_slot_parts(slot: usize, bit_count: usize, extra_bits: u32) -> usize {
+fn distance_from_slot_parts(slot: usize, bit_count: usize, extra_bits: u64) -> usize {
     if slot < 4 {
         return slot + 1;
     }
-    debug_assert!(bit_count <= 31);
-    debug_assert!(extra_bits < 1u32 << bit_count);
-    let distance = (((2u64 | (slot & 1) as u64) << bit_count) | u64::from(extra_bits)) + 1;
+    debug_assert!(bit_count <= 38);
+    debug_assert!(extra_bits >> bit_count == 0);
+    let distance = (((2u64 | (slot & 1) as u64) << bit_count) | extra_bits) + 1;
     // RAR 5 slots can name more than a 32-bit host can address. Preserve the
     // decoder's out-of-window zero-fill behavior instead of wrapping to a
     // plausible distance (or panicking on arithmetic overflow).
@@ -2623,13 +2671,30 @@ impl<'a> BitReader<'a> {
         Ok(value)
     }
 
+    /// RAR 7 distance extras run past 32 bits.
+    #[inline(always)]
+    fn read_wide_bits(&mut self, count: usize) -> Result<u64> {
+        if count <= 32 {
+            return self.read_bits(count as u8).map(u64::from);
+        }
+        if self.remaining_bits() < count {
+            return Err(Error::NeedMoreInput);
+        }
+        let high = self.read_bits((count - 32) as u8)?;
+        let low = self.read_bits(32)?;
+        Ok(u64::from(high) << 32 | u64::from(low))
+    }
+
+    fn remaining_bits(&self) -> usize {
+        (self.input.len().saturating_sub(self.byte_pos))
+            .saturating_mul(8)
+            .saturating_add(self.cache_bits as usize)
+    }
+
     #[inline(never)]
     fn read_bits_slow(&mut self, count: u32) -> Result<u32> {
-        let remaining = (self.input.len().saturating_sub(self.byte_pos))
-            .saturating_mul(8)
-            .saturating_add(self.cache_bits as usize);
         // Refusal consumes nothing, even for wide reads.
-        if remaining < count as usize {
+        if self.remaining_bits() < count as usize {
             return Err(Error::NeedMoreInput);
         }
         if count > 32 {
@@ -2701,6 +2766,10 @@ mod checkpoint_tests;
 #[cfg(all(test, feature = "write"))]
 #[path = "rar50/history_retention_tests.rs"]
 mod history_retention_tests;
+
+#[cfg(all(test, feature = "write"))]
+#[path = "rar50/past_declared_tests.rs"]
+mod past_declared_tests;
 
 #[cfg(test)]
 mod bit_lookup_tests;

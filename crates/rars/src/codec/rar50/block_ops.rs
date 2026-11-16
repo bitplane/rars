@@ -2,8 +2,8 @@
 //! as operations; replaying them in order resolves what earlier blocks decide.
 use super::{
     distance_from_slot_parts, distance_slot_bit_count, length_bonus, length_from_slot_parts,
-    length_slot_extra_bits, read_filter, BitReader, Budget, DecodedChunk, Error, PendingFilter,
-    ReaderTables, Result, StreamDecodeError, StreamingOutput, LITERAL_BURST,
+    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, DecodedChunk,
+    Error, PendingFilter, ReaderTables, Result, StreamDecodeError, StreamingOutput, LITERAL_BURST,
 };
 use crate::read_control::Poller;
 
@@ -66,6 +66,13 @@ pub(super) enum Stop {
     Full(usize),
     /// Reported only if replay consumes every operation before it.
     Failed(Error),
+}
+
+/// Lets the declared-size check find the serial decoder's stopping point.
+#[derive(Default)]
+pub(super) struct Reached {
+    pub(super) blocks: usize,
+    pub(super) symbols: usize,
 }
 
 /// The match state that carries from one block to the next.
@@ -159,29 +166,15 @@ impl BlockOps {
                     }
                 }
                 _ => {
-                    let length_slot = symbol - 262;
-                    let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                    let length = length_from_slot_parts(length_slot, length_extra);
-                    let distance_slot = tables.distance.decode(&mut bits)?;
-                    let distance_bit_count = distance_slot_bit_count(distance_slot)?;
-                    let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
-                        let high = bits.read_bits((distance_bit_count - 4) as u8)?;
-                        let low = tables.align.decode(&mut bits)? as u32;
-                        (high << 4) | low
-                    } else {
-                        bits.read_bits(distance_bit_count as u8)?
-                    };
-                    let distance =
-                        distance_from_slot_parts(distance_slot, distance_bit_count, distance_extra);
-                    self.ops
-                        .push(Op::new(MATCH, length + length_bonus(distance), distance));
+                    let (length, distance) = new_match(tables, &mut bits, symbol)?;
+                    self.ops.push(Op::new(MATCH, length, distance));
                 }
             }
         }
         Ok(None)
     }
 
-    /// Replays the list up to where the serial decoder would stop, counting blocks reached.
+    /// Replays the list up to where the serial decoder would stop, counting what it reaches.
     pub(super) fn apply<B: Budget, E>(
         &self,
         repeats: &mut Repeats<'_>,
@@ -189,7 +182,7 @@ impl BlockOps {
         poller: &mut Poller,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
         filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
-        blocks_begun: &mut usize,
+        reached: &mut Reached,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         let output_size = output.output_limit;
         let Repeats {
@@ -208,12 +201,14 @@ impl BlockOps {
                     let (run, rest) = literals.split_at(op.value());
                     literals = rest;
                     let visible = run.len().min(output_size - output.written());
+                    reached.symbols += visible;
                     for piece in run[..visible].chunks(LITERAL_POLL) {
                         poller.check_codec(output.written())?;
                         output.push_literals(piece, sink)?;
                     }
                 }
                 MATCH => {
+                    reached.symbols += 1;
                     let (distance, length) = (op.value(), op.length());
                     reps.rotate_right(1);
                     reps[0] = distance;
@@ -221,6 +216,7 @@ impl BlockOps {
                     output.copy_match(distance, length, sink)?;
                 }
                 REPEAT => {
+                    reached.symbols += 1;
                     let (index, length) = (op.value(), op.length());
                     let distance = initialized(reps[index])?;
                     reps[..=index].rotate_right(1);
@@ -229,11 +225,13 @@ impl BlockOps {
                     output.copy_match(distance, length, sink)?;
                 }
                 REPEAT_LAST => {
+                    reached.symbols += 1;
                     if **last_length != 0 {
                         output.copy_match(reps[0], **last_length, sink)?;
                     }
                 }
                 FILTER => {
+                    reached.symbols += 1;
                     let mut filter = *block_filters.next().expect("one filter per filter op");
                     filter.start = output
                         .written()
@@ -244,12 +242,59 @@ impl BlockOps {
                 REPEAT_CHECK => {
                     initialized(reps[op.value()])?;
                 }
-                BLOCK => *blocks_begun += 1,
+                BLOCK => {
+                    reached.blocks += 1;
+                    reached.symbols = 0;
+                }
                 tag => unreachable!("operation tag {tag}"),
             }
         }
         Ok(())
     }
+}
+
+/// Finds where the serial decoder stopped, which replayed operations do not record.
+pub(super) fn skip_symbols<'a, B: Budget>(
+    tables: &ReaderTables<B>,
+    payload: &'a [u8],
+    bit_pos: usize,
+    count: usize,
+) -> Result<BitReader<'a>> {
+    let mut bits = BitReader::at(payload, bit_pos);
+    for _ in 0..count {
+        match tables.main.decode(&mut bits)? {
+            0..=255 | 257 => {}
+            256 => {
+                read_filter_record(&mut bits)?;
+            }
+            258..=261 => drop(repeat_length(tables, &mut bits)?),
+            symbol => drop(new_match(tables, &mut bits, symbol)?),
+        }
+    }
+    Ok(bits)
+}
+
+/// Shared by decoding and skipping so both read a match's bits alike.
+#[inline(always)]
+fn new_match<B: Budget>(
+    tables: &ReaderTables<B>,
+    bits: &mut BitReader<'_>,
+    symbol: usize,
+) -> Result<(usize, usize)> {
+    let length_slot = symbol - 262;
+    let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
+    let length = length_from_slot_parts(length_slot, length_extra);
+    let distance_slot = tables.distance.decode(bits)?;
+    let distance_bit_count = distance_slot_bit_count(distance_slot)?;
+    let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
+        let high = bits.read_wide_bits(distance_bit_count - 4)?;
+        let low = tables.align.decode(bits)? as u64;
+        (high << 4) | low
+    } else {
+        bits.read_wide_bits(distance_bit_count)?
+    };
+    let distance = distance_from_slot_parts(distance_slot, distance_bit_count, distance_extra);
+    Ok((length + length_bonus(distance), distance))
 }
 
 fn repeat_length<B: Budget>(tables: &ReaderTables<B>, bits: &mut BitReader<'_>) -> Result<usize> {
