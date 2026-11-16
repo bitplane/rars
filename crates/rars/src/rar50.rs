@@ -2022,6 +2022,22 @@ where
     let mut main = parse_main_header_bytes(first).map_err(|error| at_offset(error, main_pos))?;
     main.encrypted_headers = header_keys.is_some();
     main.rewrite_metadata_complete &= header_metadata_complete;
+    // A file cut exactly at a block boundary otherwise parses as a smaller, sound archive.
+    if let Some(locator) = main.locator() {
+        let past_end = |offset: Option<u64>| {
+            offset.is_some_and(|offset| {
+                (main_pos as u64).saturating_add(offset) >= archive_len as u64
+            })
+        };
+        if past_end(locator.quick_open_offset) || past_end(locator.recovery_record_offset) {
+            return Err(at_offset(
+                Error::InvalidHeader(
+                    "RAR 5 main header locator points past the end of the archive",
+                ),
+                main_pos,
+            ));
+        }
+    }
     pos = first.next_offset;
 
     let mut blocks = Vec::new();
