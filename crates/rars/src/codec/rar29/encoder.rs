@@ -286,6 +286,9 @@ fn filter_window(
             if progress.as_mut().is_some_and(|report| !report(0)) {
                 return Err(Error::Cancelled);
             }
+            if !x86_offsets_invert(filter.kind, &range) {
+                continue;
+            }
             let filtered = filter_in_place(data, offset, filter)?;
             group_records.push(OwnedVmFilterRecord {
                 block_start: filtered.block_start,
@@ -367,6 +370,20 @@ fn split_large_filter(
         start = end;
     }
     Ok(filters)
+}
+
+/// Whether a decoder can undo the x86 filter on every operand in `range`.
+///
+/// It finds an operand from its position in the member, as a `u32`. Where that
+/// position is past 2^31 (mod 2^32), no encoding decodes back to some operands,
+/// small forward calls among them, so those stretches stay unfiltered. The
+/// decoder looks for opcodes up to five bytes from the range's end.
+fn x86_offsets_invert(kind: crate::FilterKind, range: &std::ops::Range<usize>) -> bool {
+    if !matches!(kind, crate::FilterKind::E8 | crate::FilterKind::E8E9) || range.len() <= 4 {
+        return true;
+    }
+    let (first, last) = (range.start as u64, (range.end - 5) as u64);
+    first >> 32 == last >> 32 && last & 0xffff_ffff < 1 << 31
 }
 
 fn checked_filter_range(

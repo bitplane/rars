@@ -4838,3 +4838,40 @@ fn a_member_filtered_a_segment_at_a_time_codes_to_the_in_memory_bytes() {
     assert_eq!(streamed, in_memory);
     assert_eq!(unpack29_decode(&streamed, input.len()).unwrap(), input);
 }
+
+#[test]
+fn x86_filters_leave_operands_a_decoder_cannot_restore_unfiltered() {
+    use crate::{FilterKind, FilterSpec};
+    // Calls one byte forward. Once a member is 2^31 + 2^24 bytes in, no
+    // encoding of one decodes back.
+    let mut original = vec![0x90u8; 64];
+    for at in (0..56).step_by(8) {
+        original[at..at + 5].copy_from_slice(&[0xe8, 1, 0, 0, 0]);
+    }
+    let half = 1usize << 31;
+    let mut lost = original.clone();
+    crate::codec::filters::e8e9_encode(&mut lost, (half + (1 << 24)) as u32, false);
+    crate::codec::filters::e8e9_decode(&mut lost, (half + (1 << 24)) as u32, false);
+    assert_ne!(lost, original, "filtered there, the calls come back");
+    let mut cases = vec![
+        (half - 64, true),
+        // Its last opcodes are past 2^31.
+        (half - 32, false),
+        (half + (1 << 24), false),
+    ];
+    // Positions are taken mod 2^32, so the next 2 GiB filter again.
+    if let Ok(four) = usize::try_from(1u64 << 32) {
+        cases.push((four, true));
+    }
+    for (offset, filtered) in cases {
+        let mut data = original.clone();
+        let spec = FilterSpec::range(FilterKind::E8, offset..offset + original.len());
+        let records = super::filter_window(&mut data, offset, &[spec], None).unwrap();
+        assert_eq!(!records.is_empty(), filtered, "{offset:#x}");
+        if filtered {
+            assert_ne!(data, original, "{offset:#x}");
+            crate::codec::filters::e8e9_decode(&mut data, offset as u32, false);
+        }
+        assert_eq!(data, original, "{offset:#x}");
+    }
+}
