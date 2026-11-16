@@ -230,3 +230,47 @@ fn compressed_sets_can_be_solid_encrypted_or_both() {
         }
     }
 }
+
+#[test]
+fn old_volumes_end_mid_member_so_readers_move_on() {
+    // RAR 1.5 and 2.0 volumes have no end block: RAR and UnRAR open the next
+    // volume only when the last member in this one continues there, and
+    // otherwise stop, reporting success, with members still unread.
+    let a = bytes(700, 6);
+    let b = bytes(900, 7);
+    let entries = [
+        file("a.bin", a.clone()),
+        file("one", vec![b'z']),
+        directory("dir"),
+        file("b.bin", b.clone()),
+    ];
+    let expected = expected(&[
+        ("a.bin", Some(a)),
+        ("one", Some(vec![b'z'])),
+        ("dir", None),
+        ("b.bin", Some(b)),
+    ]);
+    for target in [ArchiveVersion::Rar15, ArchiveVersion::Rar20] {
+        let options = WriterOptions::new(target, FeatureSet::store_only());
+        for volume_size in 300..=900 {
+            let volumes = write(&entries, options, MemberCoding::Stored, volume_size).unwrap();
+            let (last, rest) = volumes.split_last().unwrap();
+            for volume in rest {
+                assert!(volume.len() <= volume_size);
+                let archive = Archive::parse(volume).unwrap();
+                let tail = archive.files().last().unwrap();
+                assert!(
+                    tail.is_split_after(),
+                    "{target:?} at {volume_size}: a volume ends after {}",
+                    tail.name_lossy()
+                );
+            }
+            assert!(last.len() <= volume_size);
+            assert_eq!(
+                extract(&volumes, None),
+                expected,
+                "{target:?} {volume_size}"
+            );
+        }
+    }
+}

@@ -149,7 +149,12 @@ pub(super) fn split_members(
     // Opened once the first member's key is derived, so a bad password names the member.
     let mut packer = None;
     let mut sink = Some(sink);
-    for member in members {
+    let reserves = if writes_end_block(options.target) {
+        vec![0; members.len()]
+    } else {
+        boundary_reserves(members, options.target)?
+    };
+    for (member, &reserve) in members.iter().zip(&reserves) {
         let name = member.name;
         let encoded = if compresses && !member.is_directory {
             Some(
@@ -252,7 +257,7 @@ pub(super) fn split_members(
         packer
             .as_mut()
             .expect("opened above")
-            .write_member(volume_member)?;
+            .write_member(volume_member, reserve)?;
     }
     packer.expect("a set with data has a member").finish()?;
     if !work.finish() {
@@ -265,6 +270,53 @@ pub(super) fn split_members(
         pass: 1,
     });
     crate::write_progress::check_cancelled(Some(progress))
+}
+
+/// RAR 1.5 and 2.0 volumes have no end block, so a reader moves to the next
+/// volume only when the last member in one continues there. Each entry is the
+/// room to leave after that member's last byte so the next member with data
+/// starts in the same volume; empty members between them have no data to
+/// split, so their headers are counted too.
+fn boundary_reserves(members: &[Member<'_>], target: ArchiveVersion) -> Result<Vec<u64>> {
+    let mut reserves = vec![0u64; members.len()];
+    for index in (0..members.len().saturating_sub(1)).rev() {
+        let next = &members[index + 1];
+        let header = header_len_bound(next, target)?;
+        reserves[index] = if next.unpacked_size()? == 0 {
+            header.saturating_add(reserves[index + 1])
+        } else {
+            header.saturating_add(1)
+        };
+    }
+    Ok(reserves)
+}
+
+/// At least the length of a member's RAR 1.5 or 2.0 file header, which has no
+/// salt: only the name and whether the sizes need high words change it.
+fn header_len_bound(member: &Member<'_>, target: ArchiveVersion) -> Result<u64> {
+    let unpacked_size = member.unpacked_size()?;
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        &FileRecord {
+            head_type: FILE_HEAD,
+            name: member.name,
+            unpacked_size,
+            file_crc: 0,
+            // Coding or cipher padding can make the packed size the larger.
+            packed_size: unpacked_size.saturating_add(64),
+            file_time: 0,
+            file_attr: 0,
+            host_os: 0,
+            target,
+            method: 0x30,
+            dictionary_flags: 0,
+            flags: 0,
+            salt: None,
+            extra: &[],
+        },
+    )?;
+    Ok(header.len() as u64)
 }
 
 /// Header fields and two readers over one member's packed bytes.
@@ -351,6 +403,8 @@ struct OpenVolume {
     out: Box<dyn crate::volume_sink::VolumeOutput>,
     used: u64,
     fragments: u64,
+    /// The last fragment in it finishes its member.
+    ends_member: bool,
     /// CRC32 of the volume's bytes so far, as they end up once headers are patched.
     crc: u32,
 }
@@ -402,16 +456,19 @@ impl<'a> VolumePacker<'a> {
             .len() as u64)
     }
 
-    fn write_member(&mut self, mut member: VolumeMember<'_>) -> Result<()> {
+    /// `reserve` is the room to leave after the member's last byte, or it goes on into the next volume.
+    fn write_member(&mut self, mut member: VolumeMember<'_>, reserve: u64) -> Result<()> {
         let name = member.name;
-        self.write_fragments(&mut member).map_err(|error| {
+        self.write_fragments(&mut member, reserve).map_err(|error| {
             crate::write_stream::member_error(error, name, "writing volume member")
         })
     }
 
-    fn write_fragments(&mut self, member: &mut VolumeMember<'_>) -> Result<()> {
+    fn write_fragments(&mut self, member: &mut VolumeMember<'_>, reserve: u64) -> Result<()> {
         let header_len = self.header_len(member)?;
         let mut start = 0;
+        // A fragment can be empty, so `start` alone doesn't say whether one came before.
+        let mut continued = false;
         loop {
             crate::write_progress::check_cancelled(Some(self.progress))?;
             if self.open.is_none() {
@@ -432,10 +489,25 @@ impl<'a> VolumePacker<'a> {
                         "volume size is too small to hold the volume headers",
                     ));
                 }
+                // Readers would stop at this volume: see `boundary_reserves`.
+                if volume.ends_member && !writes_end_block(self.target) {
+                    return Err(Error::InvalidArgument(
+                        "volume size is too small to hold the end of one member and the start of the next",
+                    ));
+                }
                 self.close_volume(true)?;
                 continue;
             }
-            let len = remaining.min(room);
+            let mut len = remaining.min(room);
+            if len == remaining && remaining > 0 && room - remaining < reserve {
+                if remaining == 1 && volume.fragments == 0 {
+                    // A fresh volume would do the same again.
+                    return Err(Error::InvalidArgument(
+                        "volume size is too small to hold the end of one member and the start of the next",
+                    ));
+                }
+                len = remaining - 1;
+            }
             let split_after = start + len < member.packed_len;
             // The header carries the CRC of what follows it, so it goes out as
             // a placeholder and is patched once the payload has been copied.
@@ -448,7 +520,7 @@ impl<'a> VolumePacker<'a> {
                 (false, None) => member.payload.unpacked_crc(),
             };
             let header =
-                member.header(start > 0, split_after, len, file_crc, self.header_password)?;
+                member.header(continued, split_after, len, file_crc, self.header_password)?;
             if header.len() as u64 != header_len {
                 return Err(Error::WriterFailure(
                     "legacy file header changed length when patched",
@@ -466,7 +538,9 @@ impl<'a> VolumePacker<'a> {
             volume.crc = crc32_combine(volume.crc, fragment_crc, len);
             volume.used += header_len + len;
             volume.fragments += 1;
+            volume.ends_member = !split_after;
             start += len;
+            continued = true;
             if !split_after {
                 return Ok(());
             }
@@ -513,6 +587,7 @@ impl<'a> VolumePacker<'a> {
             out,
             used: head.len() as u64,
             fragments: 0,
+            ends_member: false,
             crc: crc32(&head),
         });
         Ok(())
