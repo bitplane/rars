@@ -72,6 +72,38 @@ def test_the_constructor_is_the_one_way_to_open_data():
         assert rars.RarFile(source).namelist() == rars.RarFile(STORED).namelist()
 
 
+def test_passwords_and_policies_after_the_main_arguments_are_keyword_only(tmp_path):
+    builder = rars.RarBuilder(store=True, password="secret")
+    builder.add_bytes(b"payload", "file.txt", mtime=1_700_000_000, mode=0o644)
+    with pytest.raises(TypeError):
+        builder.add_bytes(b"payload", "other.txt", 1_700_000_000)
+    with pytest.raises(TypeError):
+        builder.add_directory("dir", 1_700_000_000)
+    data = builder.to_bytes()
+    archive = rars.RarFile(data, password="secret")
+    for call in (
+        lambda: rars.RarFile(data, "r", "secret"),
+        lambda: archive.read("file.txt", "secret"),
+        lambda: archive.open("file.txt", "r"),
+        lambda: archive.read_many(["file.txt"], "secret"),
+        lambda: archive.extract("file.txt", tmp_path, "secret"),
+        lambda: archive.extractall(tmp_path, None, "secret"),
+        lambda: archive.testrar("secret"),
+        lambda: archive.read_comment("secret"),
+        lambda: archive.getcomment("file.txt", "secret"),
+        lambda: rars.repair(data, "secret"),
+        lambda: rars.RarBuilder.from_archive(data, "secret"),
+    ):
+        with pytest.raises(TypeError):
+            call()
+    assert archive.read("file.txt", password="secret") == b"payload"
+    assert not hasattr(archive.getinfo("file.txt"), "detail")
+    edit = rars.RarBuilder()
+    edit.add_bytes(b"x", "gone")
+    edit.remove(member="gone")
+    assert edit.member_ids() == []
+
+
 def test_writer_resources_keep_their_settings():
     assert rars.WriterResources().max_memory is None
     assert rars.WriterResources(max_memory=1 << 20).max_memory == 1 << 20
@@ -96,22 +128,23 @@ def test_volume_conversion_errors(operation, tmp_path):
     builder = rars.RarBuilder(store=True, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
-    args = (tmp_path / "out", None, None, True) if operation == "extractall" else ()
+    args = (tmp_path / "out",) if operation == "extractall" else ()
+    kwargs = {"overwrite": True} if operation == "extractall" else {}
     with rars.RarFile(paths[0]) as archive:
         method = getattr(archive, operation)
         with pytest.raises(rars.Error, match="volume is missing"):
-            method(*args, volumes=[])
+            method(*args, volumes=[], **kwargs)
         with pytest.raises(TypeError):
-            method(*args, volumes=[object()])
+            method(*args, volumes=[object()], **kwargs)
         with pytest.raises(TypeError):
-            method(*args, volumes=object())
+            method(*args, volumes=object(), **kwargs)
 
         def broken_paths():
             yield paths[1]
             raise RuntimeError("path iterator failed")
 
         with pytest.raises(RuntimeError, match="path iterator failed"):
-            method(*args, volumes=broken_paths())
+            method(*args, volumes=broken_paths(), **kwargs)
 
 
 @pytest.mark.parametrize("stem", ["archive.part01.rar", "archive.part.rar", "archive.partxy.RAR", "archive", "archive.RAR"])
