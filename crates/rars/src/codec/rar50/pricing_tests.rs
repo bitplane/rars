@@ -83,7 +83,7 @@ fn prepared_run_prices_refuse_unencodable_fresh_distances() {
     let state = EncoderMatchState::default();
     for (distance, size) in [
         (1usize << 40, DISTANCE_TABLE_SIZE_50),
-        ((1usize << 33) + 1, DISTANCE_TABLE_SIZE_70),
+        ((1usize << 40) + 1, DISTANCE_TABLE_SIZE_70),
     ] {
         assert!(prepared.run(&state, distance, size, None).is_err());
         assert!(estimated_match_cost(&state, 5, distance, size).is_err());
