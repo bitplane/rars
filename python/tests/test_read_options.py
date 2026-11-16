@@ -64,20 +64,17 @@ def test_total_budget_counts_solid_dependencies_and_resets_per_call(tmp_path, fo
 def test_cancelled_reader_operations_do_no_output_work(tmp_path, method, empty_selection):
     archive = make_archive()
     token = rars.CancellationToken()
-    options = rars.ReadOptions(cancellation=token)
-    assert options.cancellation is not None
     token.cancel()
-    assert options.cancellation.is_cancelled()
     name = "missing" if empty_selection else "first"
     with pytest.raises(InterruptedError):
         if method in ("read", "open"):
-            getattr(archive, method)(name, options=options)
+            getattr(archive, method)(name, cancellation=token)
         elif method == "extract":
-            archive.extract(name, tmp_path, options=options)
+            archive.extract(name, tmp_path, cancellation=token)
         elif method == "extractall":
-            archive.extractall(tmp_path, members=[] if empty_selection else None, options=options)
+            archive.extractall(tmp_path, members=[] if empty_selection else None, cancellation=token)
         else:
-            archive.testrar(options=options)
+            archive.testrar(cancellation=token)
     assert list(tmp_path.iterdir()) == []
     assert archive.read("first") == b"first"
 
@@ -87,15 +84,15 @@ def test_options_are_immutable_reusable_and_preserve_password_handling():
     builder.add_bytes(b"encrypted payload", "file")
     archive = rars.RarFile.from_bytes(builder.to_bytes())
     token = rars.CancellationToken()
-    options = rars.ReadOptions(cancellation=token, max_total_output_bytes=17)
+    options = rars.ReadOptions(max_total_output_bytes=17)
     assert options.max_total_output_bytes == 17
     assert options.max_member_output_bytes is None
     with pytest.raises(AttributeError):
         options.max_total_output_bytes = 100
     with pytest.raises(rars.PasswordRequired):
-        archive.read("file", options=options)
-    assert archive.read("file", password="secret", options=options) == b"encrypted payload"
-    archive.testrar(password="secret", options=options)
+        archive.read("file", options=options, cancellation=token)
+    assert archive.read("file", password="secret", options=options, cancellation=token) == b"encrypted payload"
+    archive.testrar(password="secret", options=options, cancellation=token)
     assert not token.is_cancelled()
     for value in [-1, 2**64]:
         with pytest.raises(OverflowError):
@@ -160,15 +157,17 @@ def test_parsing_limits_are_per_call_and_do_not_become_payload_defaults(tmp_path
     data = builder.to_bytes()
     path = tmp_path / "archive.rar"
     path.write_bytes(data)
-    def open_archive(options):
-        return rars.RarFile(path, options=options) if from_path else rars.RarFile.from_bytes(data, options=options)
+    def open_archive(options, cancellation=None):
+        if from_path:
+            return rars.RarFile(path, options=options, cancellation=cancellation)
+        return rars.RarFile.from_bytes(data, options=options, cancellation=cancellation)
     for options in [rars.ReadOptions(max_header_count=0), rars.ReadOptions(max_header_bytes=0)]:
         with pytest.raises(MemoryError):
             open_archive(options)
     token = rars.CancellationToken()
     token.cancel()
     with pytest.raises(InterruptedError):
-        open_archive(rars.ReadOptions(cancellation=token))
+        open_archive(None, cancellation=token)
     options = rars.ReadOptions(max_header_count=100, max_header_bytes=10000, max_member_output_bytes=0)
     assert options.max_header_count == 100
     assert open_archive(options).read("file") == b"payload"
@@ -203,8 +202,7 @@ def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, forma
     assert target.read_bytes() == payload
     token = rars.CancellationToken()
     token.cancel()
-    cancelled = rars.ReadOptions(cancellation=token)
     with pytest.raises(InterruptedError):
-        rars.RarFile(paths[0]).testrar(options=cancelled, volumes=[tmp_path / "missing.rar"])
+        rars.RarFile(paths[0]).testrar(cancellation=token, volumes=[tmp_path / "missing.rar"])
     with pytest.raises(InterruptedError):
-        rars.RarFile(paths[0]).extractall(output, options=cancelled, volumes=[tmp_path / "missing.rar"])
+        rars.RarFile(paths[0]).extractall(output, cancellation=token, volumes=[tmp_path / "missing.rar"])

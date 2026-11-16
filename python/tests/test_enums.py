@@ -38,7 +38,7 @@ def test_reads_report_enum_members():
         assert archive.volume_naming is rars.VolumeNaming.PART
         assert {info.family for info in archive.infolist()} == {rars.ArchiveFamily.RAR50_PLUS}
         events = []
-        archive.read(archive.namelist()[0], options=rars.ReadOptions(progress=events.append))
+        archive.read(archive.namelist()[0], progress=events.append)
     assert {event.phase for event in events} == {rars.ProgressPhase.READING}
     assert all(type(event.phase) is rars.ProgressPhase for event in events)
 

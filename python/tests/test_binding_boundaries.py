@@ -462,13 +462,10 @@ def test_volume_write_failure_names_an_oserror(tmp_path, format):
     assert not (tmp_path / "missing").exists()
 
 
-@pytest.mark.parametrize("operation", [rars.repair, rars.repair_detailed, rars.repair_to_path])
-def test_module_password_conversion_errors_are_typeerrors(tmp_path, operation):
-    args = (STORED,)
-    if operation is rars.repair_to_path:
-        args += (tmp_path / "output",)
+@pytest.mark.parametrize("to_file", [False, True])
+def test_module_password_conversion_errors_are_typeerrors(tmp_path, to_file):
     with pytest.raises(TypeError):
-        operation(*args, password=object())
+        rars.repair(STORED, password=object(), output=tmp_path / "output" if to_file else None)
     assert list(tmp_path.iterdir()) == []
 
 

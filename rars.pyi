@@ -26,8 +26,6 @@ __all__ = [
     "is_rarfile",
     "is_rarfile_sfx",
     "repair",
-    "repair_detailed",
-    "repair_to_path",
     "Error",
     "BadRarFile",
     "BadPassword",
@@ -154,7 +152,6 @@ class ReadOptions:
     def __new__(
         cls,
         *,
-        cancellation: CancellationToken | None = None,
         max_member_output_bytes: int | None = None,
         max_total_output_bytes: int | None = None,
         max_reader_workspace_bytes: int | None = None,
@@ -165,10 +162,7 @@ class ReadOptions:
         legacy_name_encoding: str | None = None,
         allow_rar3_vm_programs: bool = False,
         threads: int | None = None,
-        progress: _Progress | None = None,
     ) -> Self: ...
-    @property
-    def cancellation(self) -> CancellationToken | None: ...
     @property
     def max_member_output_bytes(self) -> int | None: ...
     @property
@@ -189,8 +183,6 @@ class ReadOptions:
     def allow_rar3_vm_programs(self) -> bool: ...
     @property
     def threads(self) -> int | None: ...
-    @property
-    def progress(self) -> _Progress | None: ...
 
 @final
 class WriterResources:
@@ -247,6 +239,7 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        cancellation: CancellationToken | None = None,
         first_volume_only: bool = False,
         volumes: list[_Source] | tuple[_Source, ...] | None = None,
     ) -> Self: ...
@@ -256,6 +249,7 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        cancellation: CancellationToken | None = None,
         first_volume_only: bool = False,
         volumes: list[_Source] | tuple[_Source, ...] | None = None,
     ) -> RarFile: ...
@@ -268,6 +262,8 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        progress: _Progress | None = None,
+        cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
     ) -> bytes: ...
     def open(
@@ -276,6 +272,8 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        progress: _Progress | None = None,
+        cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
     ) -> IO[bytes]: ...
     def read_many(
@@ -284,6 +282,8 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        progress: _Progress | None = None,
+        cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
     ) -> list[bytes]: ...
     def extract(
@@ -294,6 +294,8 @@ class RarFile:
         overwrite: _Overwrite = ...,
         *,
         options: ReadOptions | None = None,
+        progress: _Progress | None = None,
+        cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
         restore_times: bool = True,
         in_place: bool = False,
@@ -307,6 +309,8 @@ class RarFile:
         overwrite: _Overwrite = ...,
         *,
         options: ReadOptions | None = None,
+        progress: _Progress | None = None,
+        cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
         restore_times: bool = True,
         in_place: bool = False,
@@ -317,6 +321,8 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        progress: _Progress | None = None,
+        cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
     ) -> None: ...
     @property
@@ -326,6 +332,7 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> bytes | None: ...
     @property
     def needs_password(self) -> bool: ...
@@ -335,6 +342,7 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> bytes | None: ...
     def readlink(
         self,
@@ -342,12 +350,14 @@ class RarFile:
         password: _Password | None = None,
         *,
         options: ReadOptions | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> bytes: ...
     def gettimes(
         self,
         member: _Member,
         *,
         options: ReadOptions | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> dict[Literal["modified", "created", "accessed"], int]: ...
     def rewrite_preservation_issues(self) -> list[str]: ...
     def volume_paths(self) -> list[Path]: ...
@@ -475,7 +485,7 @@ class RepairReport:
 @final
 class RepairResult:
     @property
-    def data(self) -> bytes: ...
+    def data(self) -> bytes | None: ...
     @property
     def report(self) -> RepairReport: ...
 
@@ -497,23 +507,13 @@ def check_password(
     candidates: Iterable[_Password],
     *,
     options: ReadOptions | None = None,
+    cancellation: CancellationToken | None = None,
 ) -> PasswordCheck: ...
 def repair(
     source: _Source,
     password: _Password | None = None,
     *,
-    cancellation: CancellationToken | None = None,
-) -> bytes: ...
-def repair_detailed(
-    source: _Source,
-    password: _Password | None = None,
-    *,
+    output: _StrPath | None = None,
+    options: ReadOptions | None = None,
     cancellation: CancellationToken | None = None,
 ) -> RepairResult: ...
-def repair_to_path(
-    input: _Source,
-    output: _StrPath,
-    password: _Password | None = None,
-    *,
-    cancellation: CancellationToken | None = None,
-) -> None: ...
