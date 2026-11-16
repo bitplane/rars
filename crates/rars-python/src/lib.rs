@@ -3762,7 +3762,7 @@ impl<'a> ExtractOutputs<'a> {
         restore_times: bool,
     ) {
         if let (Some(times), true) = (&mut self.times, restore_times) {
-            times.opened(path.clone(), self.family, meta);
+            times.opened(path.clone(), meta);
             times.finish();
         }
         self.created.insert(stored, path.clone());
@@ -4101,12 +4101,11 @@ fn extracted_meta(member: &rars_rs::ArchiveMember) -> rars_rs::ExtractedEntryMet
     let meta = &member.meta;
     let mut extracted = rars_rs::ExtractedEntryMeta::new(
         meta.name.clone(),
-        meta.file_time,
+        meta.modification_time(),
         meta.file_attr,
         meta.is_directory,
     )
-    .with_attr_source(meta.attr_source())
-    .with_mtime_refinement(meta.mtime_refinement);
+    .with_attr_source(meta.attr_source());
     extracted.name_is_unicode = member.name_is_unicode();
     extracted
 }

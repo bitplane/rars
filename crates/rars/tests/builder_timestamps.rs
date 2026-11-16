@@ -7,69 +7,69 @@ use std::time::{Duration, UNIX_EPOCH};
 mod scratch;
 
 #[test]
-fn source_metadata_preserves_unix_epoch_and_refuses_unrepresentable_seconds() {
-    let root = scratch::case("source-timestamp-boundaries");
-    let file = std::fs::File::create(root.join("source")).unwrap();
-    for (instant, expected_unix, expected_dos_year) in [
-        (UNIX_EPOCH - Duration::from_secs(1), None, None),
-        (UNIX_EPOCH, Some(0), None),
+fn timestamps_convert_to_and_from_system_time_on_both_sides_of_the_epoch() {
+    for (instant, expected) in [
+        (UNIX_EPOCH - Duration::new(1, 0), Timestamp::new(-1, 0)),
         (
-            UNIX_EPOCH + Duration::from_secs(1_594_771_200),
-            Some(1_594_771_200),
-            Some(2020),
+            UNIX_EPOCH - Duration::new(0, 1),
+            Timestamp::new(-1, 999_999_999),
         ),
+        (UNIX_EPOCH, Timestamp::new(0, 0)),
         (
-            UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)),
-            Some(u32::MAX),
-            Some(2106),
-        ),
-        (
-            UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX) + 1),
-            None,
-            Some(2106),
+            UNIX_EPOCH + Duration::new(1_594_771_200, 5),
+            Timestamp::new(1_594_771_200, 5),
         ),
     ] {
-        file.set_modified(instant).unwrap();
-        let metadata = file.metadata().unwrap();
-        assert_eq!(metadata.modified().unwrap(), instant);
-        assert_eq!(rars::timestamp::source_unix_mtime(&metadata), expected_unix);
-        let packed = rars::timestamp::source_dos_mtime(&metadata);
-        assert_eq!(
-            (packed != 0).then_some(1980 + (packed >> 25)),
-            expected_dos_year
-        );
+        let time = Timestamp::try_from(instant).unwrap();
+        assert_eq!(Some(time), expected);
+        assert_eq!(std::time::SystemTime::try_from(time).unwrap(), instant);
     }
+    assert_eq!(Timestamp::new(0, 1_000_000_000), None);
     let current = rars::timestamp::current_filetime();
     assert!(current >= 116_444_736_000_000_000);
     assert!(!rars::timestamp::format_filetime_utc(current).starts_with("0x"));
 }
 
 #[test]
-fn stored_timestamp_view_retains_family_presence_and_refinements() {
-    use rars::{ArchiveFamily, StoredTimestamp, TimeRefinement};
+fn dos_times_cover_1980_to_2107_only() {
+    let local = |year| {
+        let mut seconds = (i64::from(year) - 1970) * 365 * 86_400;
+        // Well inside the year whatever the local zone.
+        seconds += 180 * 86_400;
+        Timestamp::from_unix_seconds(seconds)
+    };
+    assert_eq!(rars::timestamp::dos_time(local(1979)), None);
+    assert!(rars::timestamp::dos_time(local(1981)).is_some());
+    assert!(rars::timestamp::dos_time(local(2107)).is_some());
+    assert_eq!(rars::timestamp::dos_time(local(2109)), None);
+}
+
+#[test]
+fn the_stored_view_names_each_familys_own_form() {
+    use rars::{ArchiveFamily, StoredTimestamp};
+    let time = Timestamp::from_unix_seconds(1_700_000_000);
     for format in ArchiveVersion::ALL {
         let mut builder = Builder::new(format).store(true);
         builder
-            .add_bytes(b"time".to_vec(), vec![], None, None)
+            .add_bytes(b"time".to_vec(), vec![], Some(time), None)
+            .unwrap();
+        builder
+            .add_bytes(b"none".to_vec(), vec![], None, None)
             .unwrap();
         let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
-        let mut meta = archive.members().next().unwrap().meta;
-        for raw in [0, 0x5022_1882] {
-            meta.file_time = Some(raw);
-            meta.mtime_refinement = Some(TimeRefinement {
-                add_second: true,
-                nanoseconds: 123,
-            });
-            let before = meta.clone();
-            let expected = match archive.family() {
-                ArchiveFamily::Rar50Plus => StoredTimestamp::UnixSeconds(raw),
-                _ => StoredTimestamp::DosLocal(raw),
-            };
-            assert_eq!(meta.stored_modification_time(), Some(expected), "{format}");
-            assert_eq!(meta, before);
+        let members: Vec<_> = archive.members().collect();
+        let expected = match archive.family() {
+            ArchiveFamily::Rar50Plus => StoredTimestamp::UnixSeconds(1_700_000_000),
+            _ => StoredTimestamp::DosLocal(rars::timestamp::dos_time(time).unwrap()),
+        };
+        assert_eq!(
+            members[0].meta.stored_modification_time(),
+            Some(expected),
+            "{format}"
+        );
+        if archive.family() == ArchiveFamily::Rar50Plus {
+            assert_eq!(members[1].meta.stored_modification_time(), None);
         }
-        meta.file_time = None;
-        assert_eq!(meta.stored_modification_time(), None);
     }
 }
 
@@ -215,7 +215,7 @@ fn fractional_mtime_survives_all_rar5_output_paths() {
             assert_eq!(meta.modification_time(), at(1_700_000_002, 704_088_300));
             archive
                 .extract_to(password.as_deref(), |meta| {
-                    assert_eq!(meta.mtime_refinement.unwrap().nanoseconds, 704_088_300);
+                    assert_eq!(meta.modified, at(1_700_000_002, 704_088_300));
                     Ok(Box::new(std::io::sink()))
                 })
                 .unwrap();
@@ -241,8 +241,7 @@ fn split_volume_extraction_retains_fractional_mtime() {
     let mut opened = 0;
     rars::extract_volumes_to(&volumes, None, |meta| {
         opened += 1;
-        assert_eq!(meta.file_time, Some(123));
-        assert_eq!(meta.mtime_refinement.unwrap().nanoseconds, 987_654_321);
+        assert_eq!(meta.modified, at(123, 987_654_321));
         Ok(Box::new(std::io::sink()))
     })
     .unwrap();
@@ -251,26 +250,14 @@ fn split_volume_extraction_retains_fractional_mtime() {
 
 #[test]
 fn an_epoch_fraction_is_not_treated_as_missing_time() {
-    let detail = rars::TimeRefinement {
-        add_second: false,
-        nanoseconds: 123,
-    };
-    assert_eq!(
-        rars::timestamp::extracted_system_time(
-            rars::ArchiveFamily::Rar50Plus,
-            Some(0),
-            Some(detail)
-        ),
-        Some(UNIX_EPOCH + Duration::from_nanos(123))
-    );
-    assert_eq!(
-        rars::timestamp::extracted_system_time(rars::ArchiveFamily::Rar50Plus, Some(0), None),
-        Some(UNIX_EPOCH)
-    );
-    assert_eq!(
-        rars::timestamp::extracted_system_time(rars::ArchiveFamily::Rar50Plus, None, Some(detail)),
-        None
-    );
+    for time in [at(0, 123), at(0, 0)] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"file".to_vec(), vec![], time, None)
+            .unwrap();
+        let member = only_member(builder.to_bytes().unwrap());
+        assert_eq!(member.meta.modification_time(), time);
+    }
 }
 
 #[test]
@@ -288,16 +275,7 @@ fn extraction_retains_missing_and_epoch_times_in_single_and_split_archives() {
                 .unwrap();
             let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             let check = |meta: &rars::ExtractedEntryMeta| {
-                assert_eq!(meta.file_time, time.map(|seconds| seconds as u32));
-                assert_eq!(meta.mtime_refinement, None);
-                assert_eq!(
-                    rars::timestamp::extracted_system_time(
-                        rars::ArchiveFamily::Rar50Plus,
-                        meta.file_time,
-                        meta.mtime_refinement,
-                    ),
-                    time.map(|_| UNIX_EPOCH),
-                );
+                assert_eq!(meta.modified, time.map(Timestamp::from_unix_seconds));
             };
             archive
                 .extract_to(None, |meta| {
@@ -426,7 +404,10 @@ fn copied_times_keep_their_stored_form_and_stay_in_one_family() {
     copy.copy_times_by_id(id, &member).unwrap();
     let copied = only_member(copy.to_bytes().unwrap());
     assert_eq!(copied.times().unwrap(), times);
-    assert_eq!(copied.meta.file_time, member.meta.file_time);
+    assert_eq!(
+        copied.meta.stored_modification_time(),
+        member.meta.stored_modification_time()
+    );
 
     let mut legacy = Builder::new(ArchiveVersion::Rar29).store(true);
     legacy

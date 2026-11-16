@@ -4842,7 +4842,12 @@ fn rar50_reads_the_modification_time_from_the_htime_record() {
         };
         let common = rars::Archive::Rar50Plus(archive.clone());
         for (member, file) in common.members().zip(archive.files()) {
-            assert_eq!(member.meta.file_time, file.mtime.or(file.htime_mtime));
+            assert_eq!(
+                member.meta.stored_modification_time(),
+                file.mtime
+                    .or(file.htime_mtime)
+                    .map(rars::StoredTimestamp::UnixSeconds)
+            );
         }
         for file in archive.files() {
             if file.mtime.is_some() {

@@ -87,10 +87,7 @@ struct BuilderEntry {
     data: Vec<u8>,
     source: Option<EntrySource>,
     is_directory: bool,
-    mtime: Option<u32>,
-    mtime_nanoseconds: Option<u32>,
-    file_times: Option<crate::file_times::TimeRecord>,
-    legacy_extended_times: Option<Vec<u8>>,
+    times: StoredTimes,
     legacy_unicode_name: Option<Vec<u8>>,
     file_comment: Option<Vec<u8>>,
     encryption: Option<EntryEncryption>,
@@ -99,32 +96,30 @@ struct BuilderEntry {
     attributes: EntryAttributes,
 }
 
-/// A member's times in the forms the writers take: RAR 1.3–4.x use only
-/// `mtime`, a DOS time; RAR5/7 use Unix seconds, nanoseconds and the record.
-#[derive(Debug, Default)]
+/// A member's times in the forms the writers take, encoded once when they're
+/// given: RAR 1.3–4.x use `mtime` as a DOS time plus a copied extended-time
+/// record; RAR5/7 use Unix seconds, nanoseconds and their own record.
+#[derive(Debug, Clone, Default)]
 struct StoredTimes {
     mtime: Option<u32>,
     mtime_nanoseconds: Option<u32>,
     record: Option<crate::file_times::TimeRecord>,
-}
-
-impl StoredTimes {
-    fn apply(self, entry: &mut BuilderEntry) {
-        entry.mtime = self.mtime;
-        entry.mtime_nanoseconds = self.mtime_nanoseconds;
-        entry.file_times = self.record;
-    }
+    legacy_extended: Option<Vec<u8>>,
 }
 
 /// A RAR5/7 member's times in Unix time, from its seconds and its record.
 fn rar50_entry_times(entry: &BuilderEntry) -> crate::FileTimes {
     let mut times = entry
-        .file_times
+        .times
+        .record
         .map(crate::file_times::TimeRecord::times)
         .unwrap_or_default();
     if times.modified.is_none() {
-        times.modified = entry.mtime.and_then(|seconds| {
-            crate::Timestamp::new(i64::from(seconds), entry.mtime_nanoseconds.unwrap_or(0))
+        times.modified = entry.times.mtime.and_then(|seconds| {
+            crate::Timestamp::new(
+                i64::from(seconds),
+                entry.times.mtime_nanoseconds.unwrap_or(0),
+            )
         });
     }
     times
@@ -141,23 +136,23 @@ fn attach_time_record(
         record.encode()?;
     }
     if record.is_some_and(|record| record.modified.is_some()) {
-        entry.mtime = None;
+        entry.times.mtime = None;
     }
     let record = if let (Some(mut record), Some(seconds), Some(nanoseconds)) =
-        (record, entry.mtime, entry.mtime_nanoseconds)
+        (record, entry.times.mtime, entry.times.mtime_nanoseconds)
     {
         record.modified = Some(crate::file_times::RecordTime::Unix {
             seconds,
             nanoseconds,
         });
         record.encode()?;
-        entry.mtime = None;
+        entry.times.mtime = None;
         Some(record)
     } else {
         record
     };
-    entry.mtime_nanoseconds = None;
-    entry.file_times = record;
+    entry.times.mtime_nanoseconds = None;
+    entry.times.record = record;
     Ok(())
 }
 
@@ -397,10 +392,7 @@ impl Builder {
             data,
             source: None,
             is_directory: false,
-            mtime: times.mtime,
-            mtime_nanoseconds: times.mtime_nanoseconds,
-            file_times: times.record,
-            legacy_extended_times: None,
+            times,
             legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
@@ -430,10 +422,7 @@ impl Builder {
             data: Vec::new(),
             source: Some(source),
             is_directory: false,
-            mtime: times.mtime,
-            mtime_nanoseconds: times.mtime_nanoseconds,
-            file_times: times.record,
-            legacy_extended_times: None,
+            times,
             legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
@@ -502,10 +491,7 @@ impl Builder {
             data: Vec::new(),
             source: None,
             is_directory: true,
-            mtime: times.mtime,
-            mtime_nanoseconds: times.mtime_nanoseconds,
-            file_times: times.record,
-            legacy_extended_times: None,
+            times,
             legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
@@ -568,10 +554,7 @@ impl Builder {
             data: Vec::new(),
             source: None,
             is_directory: false,
-            mtime: times.mtime,
-            mtime_nanoseconds: times.mtime_nanoseconds,
-            file_times: times.record,
-            legacy_extended_times: None,
+            times,
             legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
@@ -599,10 +582,11 @@ impl Builder {
             data: Vec::new(),
             source: None,
             is_directory: meta.is_directory,
-            mtime: meta.file_time,
-            mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
-            file_times: None,
-            legacy_extended_times: None,
+            times: StoredTimes {
+                mtime: meta.file_time,
+                mtime_nanoseconds: meta.mtime_refinement.map(|time| time.nanoseconds),
+                ..StoredTimes::default()
+            },
             legacy_unicode_name: None,
             file_comment: None,
             encryption: None,
@@ -780,7 +764,7 @@ impl Builder {
             crate::file_times::validate_legacy_extended_times(raw)?;
         }
         let entry = &mut self.entries[index];
-        entry.legacy_extended_times = raw;
+        entry.times.legacy_extended = raw;
         Ok(())
     }
 
@@ -804,13 +788,13 @@ impl Builder {
                 created: times.created.or(current.created),
                 accessed: times.accessed.or(current.accessed),
             })?;
-            stored.apply(&mut self.entries[index]);
+            self.entries[index].times = stored;
         } else {
             let stored = self.store_times(times)?;
             if stored.mtime.is_some() {
                 let entry = &mut self.entries[index];
-                entry.mtime = stored.mtime;
-                entry.legacy_extended_times = None;
+                entry.times.mtime = stored.mtime;
+                entry.times.legacy_extended = None;
             }
         }
         Ok(())
@@ -828,8 +812,8 @@ impl Builder {
         match &source.detail {
             crate::ArchiveMemberDetail::Rar50Plus { file_times, .. } => {
                 let entry = &mut self.entries[index];
-                entry.mtime = source.meta.file_time;
-                entry.mtime_nanoseconds = source
+                entry.times.mtime = source.meta.file_time;
+                entry.times.mtime_nanoseconds = source
                     .meta
                     .mtime_refinement
                     .map(|detail| detail.nanoseconds)
@@ -842,9 +826,9 @@ impl Builder {
                 if !extended_times.is_empty() =>
             {
                 self.set_legacy_extended_times_by_id(id, Some(extended_times.clone()))?;
-                self.entries[index].mtime = source.meta.file_time;
+                self.entries[index].times.mtime = source.meta.file_time;
             }
-            _ => self.entries[index].mtime = source.meta.file_time,
+            _ => self.entries[index].times.mtime = source.meta.file_time,
         }
         Ok(())
     }
@@ -861,7 +845,7 @@ impl Builder {
                                 mtime: Some(seconds),
                                 mtime_nanoseconds: Some(time.nanoseconds())
                                     .filter(|&nanoseconds| nanoseconds != 0),
-                                record: None,
+                                ..StoredTimes::default()
                             });
                         }
                     }
@@ -882,7 +866,7 @@ impl Builder {
         let mtime = times
             .modified
             .map(|time| {
-                crate::timestamp::dos_time_from_unix(time).ok_or(Error::InvalidArgument(
+                crate::timestamp::dos_time(time).ok_or(Error::InvalidArgument(
                     "RAR 1.3–4.x store modification times from 1980 to 2107 only",
                 ))
             })
@@ -1014,8 +998,11 @@ impl Builder {
             };
             // As the CLI does: whole seconds, and no time where the format
             // can't store the file's.
-            let mtime = crate::timestamp::source_unix_mtime(&meta)
-                .map(|seconds| crate::Timestamp::from_unix_seconds(i64::from(seconds)))
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|time| crate::Timestamp::try_from(time).ok())
+                .map(|time| crate::Timestamp::from_unix_seconds(time.unix_seconds()))
                 .filter(|&time| self.stored_mtime(Some(time)).is_ok());
             self.add_source(name, EntrySource::from_path(path), mtime, unix_mode(&meta))?;
         } else {
@@ -1390,7 +1377,7 @@ impl Builder {
             ));
         }
         if self.entries.iter().any(|entry| {
-            entry.legacy_extended_times.is_some() || entry.legacy_unicode_name.is_some()
+            entry.times.legacy_extended.is_some() || entry.legacy_unicode_name.is_some()
         }) {
             return Err(Error::InvalidArgument(
                 "legacy extended timestamps and Unicode names are unsupported in volume output",
@@ -1635,9 +1622,9 @@ impl Builder {
                 .with_directory(entry.is_directory)
                 .with_redirection(entry.redirection.clone())
                 .with_redirection_size(entry.redirection_size)
-                .with_mtime(entry.mtime)
-                .with_mtime_nanoseconds(entry.mtime_nanoseconds)
-                .with_file_times(entry.file_times)
+                .with_mtime(entry.times.mtime)
+                .with_mtime_nanoseconds(entry.times.mtime_nanoseconds)
+                .with_file_times(entry.times.record)
                 .with_attributes(entry.rar50_attr())
                 .with_host_os(entry.rar50_host_os());
             let data_password = entry
@@ -1730,7 +1717,7 @@ impl Builder {
                 file: rar15_40::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
+                    file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: entry
@@ -1744,7 +1731,7 @@ impl Builder {
                 metadata: rar15_40::RetainedMemberMetadata {
                     unicode_name: entry.legacy_unicode_name.as_deref(),
                     unpack_version: self.legacy_unpack_version,
-                    extended_times: entry.legacy_extended_times.as_deref(),
+                    extended_times: entry.times.legacy_extended.as_deref(),
                     is_directory: entry.is_directory,
                     is_symlink: matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000),
                 },
@@ -1790,7 +1777,7 @@ impl Builder {
                 file: rar13::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
+                    file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: entry
                         .encryption
@@ -1837,7 +1824,7 @@ impl Builder {
                 rar15_40::StoredEntry {
                     name: &entry.name,
                     data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
+                    file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
@@ -1852,7 +1839,7 @@ impl Builder {
                 rar15_40::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
+                    file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
                     password: self.password.as_deref(),
@@ -1877,7 +1864,7 @@ impl Builder {
                 rar13::StoredEntry {
                     name: &entry.name,
                     data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
+                    file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
                     file_comment: entry.file_comment.as_deref(),
@@ -1891,7 +1878,7 @@ impl Builder {
                 rar13::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
-                    file_time: entry.mtime.unwrap_or(0),
+                    file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar13_attr(),
                     password: self.password.as_deref(),
                     file_comment: entry.file_comment.as_deref(),

@@ -38,12 +38,15 @@ fn explicit_directories_survive_all_rar5_writer_paths() {
                 assert_eq!(members.len(), 3);
                 assert!(members[0].meta.is_directory);
                 assert_eq!(members[0].meta.file_attr, 0x10);
-                assert_eq!(members[0].meta.file_time, Some(123));
+                assert_eq!(
+                    members[0].meta.modification_time(),
+                    Some(rars::Timestamp::from_unix_seconds(123))
+                );
                 assert!(members[1].meta.is_directory);
                 assert_eq!(members[1].meta.file_attr, 0o040750);
                 assert_eq!(
-                    members[1].meta.mtime_refinement.unwrap().nanoseconds,
-                    704_088_300
+                    members[1].meta.modification_time(),
+                    rars::Timestamp::new(456, 704_088_300)
                 );
                 assert!(!members[2].meta.is_directory);
                 assert_eq!(
