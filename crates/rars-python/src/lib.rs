@@ -805,8 +805,6 @@ struct RarInfo {
     family: rars_rs::ArchiveFamily,
     #[pyo3(get)]
     file_attr: u64,
-    #[pyo3(get)]
-    detail: HashMap<String, String>,
     is_directory: bool,
     is_redirection: bool,
     /// Counted from 0.
@@ -938,7 +936,7 @@ impl RarFile {
     /// open and unchanged while the archive is, and its position is left wherever reading
     /// ended; a stream that can't seek is read whole from where it is.
     #[new]
-    #[pyo3(signature = (source, mode = "r", password = None, *, options = None, cancellation = None, first_volume_only = false, volumes = None))]
+    #[pyo3(signature = (source, mode = "r", *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn new(
         py: Python<'_>,
@@ -998,7 +996,7 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
-    #[pyo3(signature = (name, password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read(
         &self,
@@ -1021,7 +1019,7 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
-    #[pyo3(signature = (name, password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn open(
         &self,
@@ -1043,7 +1041,7 @@ impl RarFile {
 
     /// Read selected members in one session, preserving request order and duplicates.
     /// Output limits apply to the whole call, including required solid predecessors.
-    #[pyo3(signature = (members, password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (members, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read_many(
         &self,
@@ -1069,7 +1067,7 @@ impl RarFile {
     }
 
     /// `overwrite`, `in_place`, `flatten` and `volumes` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -1160,7 +1158,7 @@ impl RarFile {
     /// or `"rename"` to write beside it as `name(N).ext`. `flatten=True` writes
     /// every file straight into `path` under its base name and creates no
     /// directories; symlinks are kept only when they point at a bare name.
-    #[pyo3(signature = (path = None, members = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1238,7 +1236,7 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`.
-    #[pyo3(signature = (password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (*, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     fn testrar(
         &self,
         py: Python<'_>,
@@ -1293,7 +1291,7 @@ impl RarFile {
     }
 
     /// Returns the complete archive comment, or None if absent, under per-call read policies.
-    #[pyo3(signature = (password = None, *, options = None, cancellation = None))]
+    #[pyo3(signature = (*, password = None, options = None, cancellation = None))]
     fn read_comment(
         &self,
         py: Python<'_>,
@@ -1317,7 +1315,7 @@ impl RarFile {
     }
 
     /// Returns the decoded comment attached to a member, or None if absent.
-    #[pyo3(signature = (member, password = None, *, options = None, cancellation = None))]
+    #[pyo3(signature = (member, *, password = None, options = None, cancellation = None))]
     fn getcomment(
         &self,
         py: Python<'_>,
@@ -1339,7 +1337,7 @@ impl RarFile {
 
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
-    #[pyo3(signature = (member, password = None, *, options = None, cancellation = None))]
+    #[pyo3(signature = (member, *, password = None, options = None, cancellation = None))]
     fn readlink(
         &self,
         py: Python<'_>,
@@ -2274,7 +2272,7 @@ impl RarBuilder {
     /// volumes taken from `volumes` as in `extractall`, else found by name. They are
     /// all read before this returns. Writing decodes every member up to the last one
     /// kept, removed ones included, so those must still be readable.
-    #[pyo3(signature = (source, password = None, *, options = None, volumes = None, cancellation = None, preserve = true, staging_dir = None, max_staged_bytes = None))]
+    #[pyo3(signature = (source, *, password = None, options = None, volumes = None, cancellation = None, preserve = true, staging_dir = None, max_staged_bytes = None))]
     #[allow(clippy::too_many_arguments)]
     fn from_archive(
         py: Python<'_>,
@@ -2548,7 +2546,7 @@ impl RarBuilder {
     }
 
     /// Add an explicit, possibly empty directory to RAR5/7 output.
-    #[pyo3(signature = (arcname, mtime = None, mode = None))]
+    #[pyo3(signature = (arcname, *, mtime = None, mode = None))]
     fn add_directory(
         &mut self,
         arcname: &Bound<'_, PyAny>,
@@ -2565,7 +2563,7 @@ impl RarBuilder {
     }
 
     /// `mtime` is Unix seconds, in every format.
-    #[pyo3(signature = (data, arcname, mtime = None, mode = None))]
+    #[pyo3(signature = (data, arcname, *, mtime = None, mode = None))]
     fn add_bytes(
         &mut self,
         data: &Bound<'_, PyAny>,
@@ -2588,8 +2586,8 @@ impl RarBuilder {
         self.inner.member_ids().collect()
     }
 
-    fn remove(&mut self, name: &Bound<'_, PyAny>) -> PyResult<()> {
-        let id = self.edit_member_id(name)?;
+    fn remove(&mut self, member: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = self.edit_member_id(member)?;
         self.inner.remove_by_id(id).map_err(map_builder_error)?;
         if let Some(rewrite) = &mut self.rewrite {
             rewrite.members.remove(&id);
@@ -3071,7 +3069,7 @@ fn check_password(
 /// With `output=`, the repaired archive replaces that file only once the repair
 /// succeeds and `data` is None; otherwise `data` holds it.
 #[pyfunction]
-#[pyo3(signature = (source, password = None, *, output = None, options = None, cancellation = None))]
+#[pyo3(signature = (source, *, password = None, output = None, options = None, cancellation = None))]
 fn repair(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
@@ -4478,13 +4476,10 @@ fn list_later_volumes(
                 }
                 info.compress_size += member.meta.packed_size;
                 if !split_after {
-                    // Only the last part records the whole member's CRC and hash.
-                    let mut last = info_from_member_named(member, String::new());
+                    // Only the last part records the whole member's size and CRC.
+                    let last = info_from_member_named(member, String::new());
                     info.file_size = last.file_size;
                     info.crc = last.crc;
-                    if let Some(hash) = last.detail.remove("hash") {
-                        info.detail.insert("hash".to_string(), hash);
-                    }
                     place.last_volume = Some(index);
                 }
             } else {
@@ -4523,50 +4518,12 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
 }
 
 fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> RarInfo {
-    let mut detail = HashMap::new();
-    let mut crc = None;
     let solid = member.is_solid();
-    match member.detail {
-        rars_rs::ArchiveMemberDetail::Rar13 {
-            method,
-            unpack_version,
-            file_checksum,
-            has_file_comment,
-            ..
-        } => {
-            detail.insert("method".to_string(), method.to_string());
-            detail.insert("unpack_version".to_string(), unpack_version.to_string());
-            detail.insert("file_checksum".to_string(), file_checksum.to_string());
-            detail.insert("has_file_comment".to_string(), has_file_comment.to_string());
-        }
-        rars_rs::ArchiveMemberDetail::Rar15To40 {
-            method,
-            unpack_version,
-            crc32,
-            salt,
-            has_file_comment,
-            ..
-        } => {
-            crc = Some(crc32);
-            detail.insert("method".to_string(), method.to_string());
-            detail.insert("unpack_version".to_string(), unpack_version.to_string());
-            detail.insert("has_salt".to_string(), salt.is_some().to_string());
-            detail.insert("has_file_comment".to_string(), has_file_comment.to_string());
-        }
-        rars_rs::ArchiveMemberDetail::Rar50Plus {
-            compression_info,
-            crc32,
-            hash,
-            ..
-        } => {
-            crc = crc32;
-            detail.insert("compression_info".to_string(), compression_info.to_string());
-            detail.insert("hash".to_string(), hash_label(hash));
-        }
-        _ => {
-            detail.insert("kind".to_string(), "unknown".to_string());
-        }
-    }
+    let crc = match member.detail {
+        rars_rs::ArchiveMemberDetail::Rar15To40 { crc32, .. } => Some(crc32),
+        rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
+        _ => None,
+    };
     let date_time = member
         .meta
         .stored_modification_time()
@@ -4587,19 +4544,9 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         is_split_after: member.meta.is_split_after,
         family: member.meta.family,
         file_attr: member.meta.file_attr,
-        detail,
         is_directory: member.meta.is_directory,
         is_redirection: member.meta.is_redirection,
         volume: 0,
-    }
-}
-
-fn hash_label(hash: Option<rars_rs::ArchiveMemberHash>) -> String {
-    match hash {
-        Some(rars_rs::ArchiveMemberHash::Blake2sp(_)) => "blake2sp".to_string(),
-        Some(rars_rs::ArchiveMemberHash::Other { hash_type, .. }) => format!("other:{hash_type}"),
-        Some(_) => "unknown".to_string(),
-        None => "none".to_string(),
     }
 }
 
@@ -5077,13 +5024,6 @@ mod tests {
             assert!(!token.is_cancelled());
             token.cancel();
             assert!(token.is_cancelled());
-            assert_eq!(
-                hash_label(Some(rars_rs::ArchiveMemberHash::Other {
-                    hash_type: 42,
-                    data: vec![1, 2],
-                })),
-                "other:42"
-            );
             for error in [
                 rars_rs::Error::EntryNotFound,
                 rars_rs::Error::DuplicateEntry,

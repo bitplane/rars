@@ -225,8 +225,6 @@ class RarInfo:
     @property
     def file_attr(self) -> int: ...
     @property
-    def detail(self) -> dict[str, str]: ...
-    @property
     def volume(self) -> int: ...
     def is_dir(self) -> bool: ...
 
@@ -236,8 +234,8 @@ class RarFile:
         cls,
         source: _Source,
         mode: Literal["r"] = "r",
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         cancellation: CancellationToken | None = None,
         first_volume_only: bool = False,
@@ -249,8 +247,8 @@ class RarFile:
     def read(
         self,
         name: _Member,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
@@ -259,8 +257,8 @@ class RarFile:
     def open(
         self,
         name: _Member,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
@@ -269,8 +267,8 @@ class RarFile:
     def read_many(
         self,
         members: Iterable[_Member],
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
@@ -280,9 +278,9 @@ class RarFile:
         self,
         member: _Member,
         path: _StrPath | None = None,
+        *,
         password: _Password | None = None,
         overwrite: _Overwrite = ...,
-        *,
         options: ReadOptions | None = None,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
@@ -295,9 +293,9 @@ class RarFile:
         self,
         path: _StrPath | None = None,
         members: Iterable[_Member] | None = None,
+        *,
         password: _Password | None = None,
         overwrite: _Overwrite = ...,
-        *,
         options: ReadOptions | None = None,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
@@ -308,8 +306,8 @@ class RarFile:
     ) -> list[Path]: ...
     def testrar(
         self,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
@@ -319,8 +317,8 @@ class RarFile:
     def comment(self) -> bytes | None: ...
     def read_comment(
         self,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         cancellation: CancellationToken | None = None,
     ) -> bytes | None: ...
@@ -329,16 +327,16 @@ class RarFile:
     def getcomment(
         self,
         member: _Member,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         cancellation: CancellationToken | None = None,
     ) -> bytes | None: ...
     def readlink(
         self,
         member: _Member,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         cancellation: CancellationToken | None = None,
     ) -> bytes: ...
@@ -391,8 +389,8 @@ class RarBuilder:
     @staticmethod
     def from_archive(
         source: RarFile | _Source,
-        password: _Password | None = None,
         *,
+        password: _Password | None = None,
         options: ReadOptions | None = None,
         volumes: Iterable[_Source] | None = None,
         cancellation: CancellationToken | None = None,
@@ -404,6 +402,7 @@ class RarBuilder:
     def add_directory(
         self,
         arcname: _NewName,
+        *,
         mtime: int | None = None,
         mode: int | None = None,
     ) -> None: ...
@@ -411,11 +410,12 @@ class RarBuilder:
         self,
         data: Buffer,
         arcname: _NewName,
+        *,
         mtime: int | None = None,
         mode: int | None = None,
     ) -> None: ...
     def member_ids(self) -> list[int]: ...
-    def remove(self, name: int | _Member) -> None: ...
+    def remove(self, member: int | _Member) -> None: ...
     def rename(self, old: int | _Member, new: _NewName) -> None: ...
     def add_unix_symlink(
         self,
@@ -504,8 +504,8 @@ def check_password(
 ) -> PasswordCheck: ...
 def repair(
     source: _Source,
-    password: _Password | None = None,
     *,
+    password: _Password | None = None,
     output: _StrPath | None = None,
     options: ReadOptions | None = None,
     cancellation: CancellationToken | None = None,
