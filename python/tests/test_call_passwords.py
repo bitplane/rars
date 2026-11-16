@@ -32,7 +32,7 @@ def calls(archive, tmp_path, password):
     "call", ["read", "read_many", "open", "extract", "extractall", "testrar"]
 )
 def test_a_call_password_wins_over_the_open_password(tmp_path, format, compressed, call):
-    archive = rars.RarFile.from_bytes(encrypted(format, compressed), password="right")
+    archive = rars.RarFile(encrypted(format, compressed), password="right")
     with pytest.raises(rars.BadPassword):
         calls(archive, tmp_path, "wrong")[call]()
     assert archive.read("file") == PAYLOAD
@@ -40,7 +40,7 @@ def test_a_call_password_wins_over_the_open_password(tmp_path, format, compresse
 
 @pytest.mark.parametrize("format", FORMATS)
 def test_a_cached_key_never_stands_in_for_another_password(format):
-    archive = rars.RarFile.from_bytes(encrypted(format))
+    archive = rars.RarFile(encrypted(format))
     assert archive.read("file", password="right") == PAYLOAD
     with pytest.raises(rars.BadPassword):
         archive.read("file", password="wrong")
@@ -49,7 +49,7 @@ def test_a_cached_key_never_stands_in_for_another_password(format):
 
 @pytest.mark.parametrize("format", FORMATS)
 def test_a_call_password_opens_an_archive_opened_without_one(tmp_path, format):
-    archive = rars.RarFile.from_bytes(encrypted(format))
+    archive = rars.RarFile(encrypted(format))
     for call in calls(archive, tmp_path, "right").values():
         call()
     assert archive.read("file", password="right") == PAYLOAD
@@ -86,6 +86,6 @@ def test_a_wrong_password_on_rar4_header_encryption_raises_at_open(name):
     lambda archive, tmp_path: archive.readlink("file", pwd="right"),
 ], ids=["read", "read_many", "open", "extract", "extractall", "testrar", "read_comment", "getcomment", "readlink"])
 def test_the_per_call_password_keyword_is_password(tmp_path, call):
-    archive = rars.RarFile.from_bytes(encrypted("rar50"))
+    archive = rars.RarFile(encrypted("rar50"))
     with pytest.raises(TypeError, match="pwd"):
         call(archive, tmp_path)

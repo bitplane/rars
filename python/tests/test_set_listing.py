@@ -206,7 +206,7 @@ def test_a_set_opened_from_bytes_lists_only_its_first_volume(tmp_path):
 def test_a_set_given_its_volumes_lists_and_reads_them(tmp_path, as_bytes):
     paths = write_set(tmp_path)
     later = [path.read_bytes() if as_bytes else path for path in paths[1:]]
-    with rars.RarFile.from_bytes(paths[0].read_bytes(), volumes=later) as archive:
+    with rars.RarFile(paths[0].read_bytes(), volumes=later) as archive:
         assert archive.namelist() == list(MEMBERS)
         assert archive.read("after.bin") == MEMBERS["after.bin"]
         assert archive.read("large.bin") == MEMBERS["large.bin"]

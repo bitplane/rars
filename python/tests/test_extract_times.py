@@ -11,7 +11,7 @@ def test_extractall_restores_rar5_times_with_sub_second_precision(tmp_path):
     builder = rars.RarBuilder()
     builder.add_bytes(b"payload", "file.txt")
     builder.set_times("file.txt", modified_ns=MTIME_NS)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path)
 
@@ -23,7 +23,7 @@ def test_extractall_restores_file_and_directory_times(tmp_path, format):
     builder = rars.RarBuilder(format=format)
     builder.add_directory("dir", mtime=1_600_000_000)
     builder.add_bytes(b"payload", "dir/file.txt", mtime=1_650_000_000)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path)
 
@@ -34,7 +34,7 @@ def test_extractall_restores_file_and_directory_times(tmp_path, format):
 def test_restore_times_false_keeps_written_times(tmp_path):
     builder = rars.RarBuilder()
     builder.add_bytes(b"payload", "file.txt", mtime=1_600_000_000)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path / "all", restore_times=False)
     archive.extract("file.txt", tmp_path / "one", restore_times=False)
@@ -47,7 +47,7 @@ def test_extract_and_selected_members_restore_times(tmp_path):
     builder = rars.RarBuilder()
     builder.add_bytes(b"one", "one.txt", mtime=1_600_000_000)
     builder.add_bytes(b"two", "two.txt", mtime=1_600_000_002)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
 
     archive.extract("one.txt", tmp_path / "single")
     archive.extractall(tmp_path / "selected", members=["one.txt", "two.txt"])
@@ -82,7 +82,7 @@ def test_failed_extraction_restores_completed_outputs_only(tmp_path, members):
     builder.add_bytes(b"bad payload", "bad.txt", mtime=1_600_000_000)
     data = bytearray(builder.to_bytes())
     data[data.rindex(b"bad payload")] ^= 0xFF
-    archive = rars.RarFile.from_bytes(bytes(data))
+    archive = rars.RarFile(bytes(data))
 
     with pytest.raises(rars.Error):
         archive.extractall(tmp_path, members=members)

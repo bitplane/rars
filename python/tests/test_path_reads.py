@@ -77,5 +77,5 @@ def test_relative_path_survives_working_directory_change(tmp_path, monkeypatch, 
     assert archive.read("member") == b"payload"
     archive.extractall("out")
     assert (elsewhere / "out" / "member").read_bytes() == b"payload"
-    rewritten = rars.RarFile.from_bytes(rewrite.to_bytes())
+    rewritten = rars.RarFile(rewrite.to_bytes())
     assert rewritten.read("member") == b"payload"

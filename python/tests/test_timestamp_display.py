@@ -12,7 +12,7 @@ import rars
 def test_rar5_date_time_is_utc(seconds, expected):
     builder = rars.RarBuilder(store=True)
     builder.add_bytes(b"time", "file", mtime=seconds)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("file").date_time == expected
 
 
@@ -20,5 +20,5 @@ def test_legacy_date_time_keeps_stored_wall_clock_fields():
     raw = ((2026 - 1980) << 25) | (7 << 21) | (15 << 16) | (15 << 11) | (23 << 5) | 21
     builder = rars.RarBuilder(format="rar29", store=True)
     builder.add_bytes(b"time", "file", mtime=raw)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("file").date_time == (2026, 7, 15, 15, 23, 42)

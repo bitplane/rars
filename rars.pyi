@@ -243,16 +243,6 @@ class RarFile:
         first_volume_only: bool = False,
         volumes: list[_Source] | tuple[_Source, ...] | None = None,
     ) -> Self: ...
-    @staticmethod
-    def from_bytes(
-        data: Buffer,
-        password: _Password | None = None,
-        *,
-        options: ReadOptions | None = None,
-        cancellation: CancellationToken | None = None,
-        first_volume_only: bool = False,
-        volumes: list[_Source] | tuple[_Source, ...] | None = None,
-    ) -> RarFile: ...
     def namelist(self) -> list[str]: ...
     def infolist(self) -> list[RarInfo]: ...
     def getinfo(self, name: _Member) -> RarInfo: ...

@@ -22,7 +22,7 @@ def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
     source.add_bytes(b"second", "two.txt", mtime=20)
     source.set_file_comment("one.txt", b"first comment")
     source.set_file_comment("two.txt", b"second comment")
-    archive = rars.RarFile.from_bytes(_rewrite_name(source.to_bytes(), b"two.txt", b"one.txt"))
+    archive = rars.RarFile(_rewrite_name(source.to_bytes(), b"two.txt", b"one.txt"))
     builder = rars.RarBuilder.from_archive(archive, preserve=preserve, staging_dir=tmp_path)
     assert builder.member_ids() == [0, 1]
     for edit in [lambda: builder.remove("one.txt"), lambda: builder.rename("one.txt", "new"),
@@ -31,12 +31,12 @@ def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
         with pytest.raises(ValueError, match="ambiguous member name"):
             edit()
     # Both copies remain writable before resolving the ambiguity.
-    assert rars.RarFile.from_bytes(builder.to_bytes()).namelist() == ["one.txt", "one.txt"]
+    assert rars.RarFile(builder.to_bytes()).namelist() == ["one.txt", "one.txt"]
     builder.rename(1, "second")
     builder.set_file_comment(1, b"changed")
     builder.set_times(1, modified_ns=123_000_000_000)
     for _ in range(2):
-        output = rars.RarFile.from_bytes(builder.to_bytes())
+        output = rars.RarFile(builder.to_bytes())
         assert output.read("one.txt") == b"first"
         assert output.read("second") == b"second"
         assert output.getcomment("one.txt") == b"first comment"
@@ -51,7 +51,7 @@ def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
         builder.remove(0)
     with pytest.raises(ValueError):
         builder.rename(2, "one.txt")
-    assert rars.RarFile.from_bytes(builder.to_bytes()).read("one.txt") == b"second"
+    assert rars.RarFile(builder.to_bytes()).read("one.txt") == b"second"
     assert list(tmp_path.iterdir()) == []
 
 
@@ -61,12 +61,12 @@ def test_rewrite_source_indices_survive_directory_and_file_edits():
     source.add_bytes(b"first payload", "first")
     source.add_directory("other")
     source.add_bytes(b"last payload", "last")
-    rewritten = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+    rewritten = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
     rewritten.remove("empty")
     rewritten.remove("first")
     rewritten.rename("last", "first")
     rewritten.add_bytes(b"new payload", "last")
-    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    output = rars.RarFile(rewritten.to_bytes())
     assert output.namelist() == ["other", "first", "last"]
     assert output.read("first") == b"last payload"
     assert output.read("last") == b"new payload"
@@ -79,9 +79,9 @@ def test_rewrite_retains_empty_directories_and_metadata(format, mode):
     source.add_directory("empty", mtime=1_700_000_002, mode=mode)
     source.add_directory("nested", mode=mode)
     source.add_bytes(b"payload", "nested/file")
-    rewritten = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+    rewritten = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
     rewritten.rename("empty", "renamed")
-    result = rars.RarFile.from_bytes(rewritten.to_bytes())
+    result = rars.RarFile(rewritten.to_bytes())
     assert result.namelist() == ["renamed", "nested", "nested/file"]
     for name in ("renamed", "nested"):
         info = result.getinfo(name)
@@ -97,7 +97,7 @@ def test_rewritten_directories_extract_with_unrar(tmp_path):
     source.add_directory("nested", mode=0o750)
     source.add_bytes(b"payload", "nested/file")
     rewritten = tmp_path / "rewritten.rar"
-    rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes())).write(rewritten)
+    rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes())).write(rewritten)
     output = tmp_path / "out"
     output.mkdir()
     subprocess.run(["unrar", "x", "-idq", "-o+", str(rewritten), str(output) + "/"],
@@ -117,7 +117,7 @@ def test_rewrite_retains_hard_links_and_updates_internal_targets(tmp_path, fixtu
     source = ROOT / "crates/rars/tests/fixtures/rar50/wild" / fixture
     rewritten = rars.RarBuilder.from_archive(source, preserve=False)
     rewritten.rename(target, "renamed")
-    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    output = rars.RarFile(rewritten.to_bytes())
     assert output.readlink(link) == b"renamed"
     assert output.read("renamed") == rars.RarFile(source).read(target)
     destination = tmp_path / "existing.rar"
@@ -130,7 +130,7 @@ def test_rewrite_retains_hard_links_and_updates_internal_targets(tmp_path, fixtu
 
 def test_rewrite_converts_reference_unix_symlink_archive():
     source = rars.RarFile(ROOT / "crates/rars/tests/fixtures/rar50/wild/symlink.rar")
-    rewritten = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
+    rewritten = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
     assert rewritten.readlink("symlink.txt") == source.readlink("symlink.txt") == b"file.txt"
     assert rewritten.readlink("dirlink") == source.readlink("dirlink") == b"dir"
     assert rewritten.read("file.txt") == source.read("file.txt")
@@ -140,7 +140,7 @@ def test_rewrite_converts_reference_unix_symlink_archive():
 def test_rewrite_rejects_unix_special_file_modes(kind):
     source = rars.RarBuilder(format="rar29", store=True)
     source.add_bytes(b"special payload", "special", mode=kind | 0o644)
-    archive = rars.RarFile.from_bytes(source.to_bytes())
+    archive = rars.RarFile(source.to_bytes())
     assert archive.read("special") == b"special payload"
     with pytest.raises(rars.UnsupportedRarFeature, match="special"):
         rars.RarBuilder.from_archive(archive, preserve=False)
@@ -196,14 +196,14 @@ def archive_with_dos_flags(flags):
 
 @pytest.mark.parametrize("flags", [0, 1, 2, 4, 0x20, 0x27])
 def test_rewrite_retains_dos_flags(flags):
-    source = rars.RarFile.from_bytes(archive_with_dos_flags(flags))
+    source = rars.RarFile(archive_with_dos_flags(flags))
     # Validate the crafted input, so a broken fixture cannot pass as a rewrite fix.
     assert source.getinfo("file.txt").file_attr == flags
     assert source.getinfo("file.txt").host_os == 0
     assert source.read("file.txt") == b"DOS payload"
     rewritten = rars.RarBuilder.from_archive(source)
     rewritten.rename("file.txt", "renamed.txt")
-    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    output = rars.RarFile(rewritten.to_bytes())
     assert output.getinfo("renamed.txt").file_attr == flags
     assert output.getinfo("renamed.txt").host_os == 0
     assert output.read("renamed.txt") == b"DOS payload"
@@ -236,7 +236,7 @@ def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
     builder.set_file_comment("link", b"link comment")
     builder.add_unix_symlink("directory-link", "missing-dir", target_is_directory=True)
     builder.add_bytes(b"payload", "file")
-    source = rars.RarFile.from_bytes(builder.to_bytes())
+    source = rars.RarFile(builder.to_bytes())
     assert source.rewrite_preservation_issues() == []
     rewritten = rars.RarBuilder.from_archive(source, preserve=True)
     rewritten.rename("link", "renamed")
@@ -250,7 +250,7 @@ def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
     assert output.rewrite_preservation_issues() == []
     assert not (tmp_path / "missing-dir").exists()
     rewritten.remove("renamed")
-    assert "renamed" not in rars.RarFile.from_bytes(rewritten.to_bytes()).namelist()
+    assert "renamed" not in rars.RarFile(rewritten.to_bytes()).namelist()
 
 
 @pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
@@ -271,9 +271,9 @@ def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
     source = rars.RarBuilder(format=format, store=True)
     source.add_bytes(b"missing-\xff", b"link-\xff", mode=0o120750)
     source.add_bytes(b"payload", b"file-\xff", mode=0o100640)
-    archive = rars.RarFile.from_bytes(source.to_bytes())
+    archive = rars.RarFile(source.to_bytes())
     assert archive.readlink(b"link-\xff") == b"missing-\xff"
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(archive, preserve=False).to_bytes())
+    output = rars.RarFile(rars.RarBuilder.from_archive(archive, preserve=False).to_bytes())
     link_name = "\ufffelink-\ue0ff".encode()
     file_name = "\ufffefile-\ue0ff".encode()
     assert output.readlink(link_name) == "\ufffemissing-\ue0ff".encode()
@@ -286,4 +286,4 @@ def test_invalid_legacy_link_targets_are_rejected(target):
     source = rars.RarBuilder(format="rar29", store=True)
     source.add_bytes(target, "link", mode=0o120777)
     with pytest.raises(ValueError, match="link target"):
-        rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()), preserve=False)
+        rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()), preserve=False)

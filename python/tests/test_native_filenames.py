@@ -40,7 +40,7 @@ def test_native_filename_round_trip(tmp_path, format, raw_names, request):
         (root / os.fsdecode(name)).write_bytes(name)
     builder = rars.RarBuilder(format=format, store=True)
     builder.add(root)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     # Lookups continue to use exact archive identity, including RAR5 mapping.
     for info in archive.infolist():
         assert archive.read(info) in names
@@ -54,7 +54,7 @@ def test_native_filename_round_trip(tmp_path, format, raw_names, request):
 def legacy_byte_archive():
     builder = rars.RarBuilder(format="rar29", store=True)
     builder.add_bytes(b"payload", b"legacy-\xff")
-    return rars.RarFile.from_bytes(builder.to_bytes())
+    return rars.RarFile(builder.to_bytes())
 
 
 def test_legacy_byte_member_can_be_added_and_selected(legacy_byte_archive):

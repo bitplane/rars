@@ -15,7 +15,7 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     builder.set_file_comment("one.txt", b"first comment")
     builder.set_file_comment("two.txt", b"second comment")
     data = _rewrite_name(builder.to_bytes(), b"two.txt", b"one.txt")
-    archive = rars.RarFile.from_bytes(data)
+    archive = rars.RarFile(data)
     first, second = archive.infolist()[1:]
     assert [first.member_index, second.member_index] == [1, 2]
     assert archive.getinfo("one.txt").member_index == 2
@@ -49,7 +49,7 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
         assert archive.extractall(destination, members=[info], overwrite=True)[0].read_bytes() == payload
     assert archive.getcomment("one.txt") == b"second comment"
     assert archive.gettimes("one.txt")["modified"] == 20_000_000_000
-    other = rars.RarFile.from_bytes(data)
+    other = rars.RarFile(data)
     for operation in [other.read, other.getinfo, other.getcomment, other.gettimes, other.readlink]:
         with pytest.raises(ValueError, match="different archive"):
             operation(first)

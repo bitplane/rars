@@ -11,7 +11,7 @@ def test_decoded_names_select_extract_and_preserve(tmp_path, format):
     data = builder.to_bytes()
     options = rars.ReadOptions(legacy_name_encoding="cp850")
     assert options.legacy_name_encoding == "cp850"
-    archive = rars.RarFile.from_bytes(data, options=options)
+    archive = rars.RarFile(data, options=options)
     assert archive.namelist() == ["café.txt"]
     info = archive.getinfo("café.txt")
     assert isinstance(info.orig_filename_bytes, bytes)
@@ -26,7 +26,7 @@ def test_decoded_names_select_extract_and_preserve(tmp_path, format):
     archive.extractall(tmp_path / "limits", options=rars.ReadOptions(max_total_output_bytes=7))
     assert (tmp_path / "limits" / "café.txt").read_bytes() == b"payload"
     rewrite = rars.RarBuilder.from_archive(archive)
-    rewritten = rars.RarFile.from_bytes(rewrite.to_bytes())
+    rewritten = rars.RarFile(rewrite.to_bytes())
     assert rewritten.infolist()[0].orig_filename_bytes == b"caf\x82.txt"
 
 
@@ -39,7 +39,7 @@ def test_decoded_names_select_extract_and_preserve(tmp_path, format):
 def test_shared_encoding_mappings(encoding, raw, expected):
     builder = rars.RarBuilder(format="rar29", store=True)
     builder.add_bytes(b"x", raw)
-    archive = rars.RarFile.from_bytes(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding=encoding))
+    archive = rars.RarFile(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding=encoding))
     assert archive.namelist() == [expected]
 
 
@@ -50,8 +50,8 @@ def test_invalid_options_and_undefined_bytes_fail(tmp_path):
     builder.add_bytes(b"x", b"bad-\x81")
     options = rars.ReadOptions(legacy_name_encoding="windows-1252")
     with pytest.raises(ValueError, match="undefined byte"):
-        rars.RarFile.from_bytes(builder.to_bytes(), options=options)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+        rars.RarFile(builder.to_bytes(), options=options)
+    archive = rars.RarFile(builder.to_bytes())
     with pytest.raises(ValueError, match="undefined byte"):
         archive.extractall(tmp_path, options=options)
     assert list(tmp_path.iterdir()) == []
@@ -61,7 +61,7 @@ def test_invalid_options_and_undefined_bytes_fail(tmp_path):
 def test_modern_unicode_is_not_reinterpreted(tmp_path, format):
     builder = rars.RarBuilder(format=format, store=True)
     builder.add_bytes(b"x", "café.txt")
-    archive = rars.RarFile.from_bytes(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="cp850"))
+    archive = rars.RarFile(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="cp850"))
     assert archive.namelist() == ["café.txt"]
     archive.extractall(tmp_path)
     assert (tmp_path / "café.txt").read_bytes() == b"x"
@@ -74,7 +74,7 @@ def test_legacy_unicode_and_decoded_collisions(tmp_path):
     builder.add_bytes(b"legacy", b"caf\x82.txt")
     data = replace_first_name(builder.to_bytes(), unicode_wire("café.txt"))
     options = rars.ReadOptions(legacy_name_encoding="cp850")
-    archive = rars.RarFile.from_bytes(data, options=options)
+    archive = rars.RarFile(data, options=options)
     assert archive.namelist() == ["café.txt", "café.txt"]
     for operation in [archive.read, archive.getinfo]:
         with pytest.raises(ValueError, match="ambiguous"):

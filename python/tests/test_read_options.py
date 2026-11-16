@@ -12,7 +12,7 @@ def make_archive(format="rar50", solid=False):
     builder.add_bytes(b"first", "first")
     builder.add_bytes(b"second!", "second")
     builder.add_bytes(b"end", "last")
-    return rars.RarFile.from_bytes(builder.to_bytes())
+    return rars.RarFile(builder.to_bytes())
 
 
 @pytest.mark.parametrize("format", FORMATS)
@@ -82,7 +82,7 @@ def test_cancelled_reader_operations_do_no_output_work(tmp_path, method, empty_s
 def test_options_are_immutable_reusable_and_preserve_password_handling():
     builder = rars.RarBuilder(password="secret")
     builder.add_bytes(b"encrypted payload", "file")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     token = rars.CancellationToken()
     options = rars.ReadOptions(max_total_output_bytes=17)
     assert options.max_total_output_bytes == 17
@@ -105,7 +105,7 @@ def test_thread_cap_extracts_and_tests_the_same_bytes(tmp_path, threads):
     payloads = {f"m{index}": bytes([index]) * 300_000 + b"tail" for index in range(6)}
     for name, payload in payloads.items():
         builder.add_bytes(payload, name)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     options = rars.ReadOptions(threads=threads, rar50_buffered_decode_limit=0)
     assert options.threads == threads
     archive.extractall(tmp_path, options=options)
@@ -121,7 +121,7 @@ def test_rar5_dictionary_policy_and_streaming_decode_option(format):
     builder = rars.RarBuilder(format=format)
     payload = b"repeated text\n" * 1000
     builder.add_bytes(payload, "file")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     refused = rars.ReadOptions(rar50_dictionary_size_limit=0)
     with pytest.raises(MemoryError):
         archive.read("file", options=refused)
@@ -138,7 +138,7 @@ def test_selected_extraction_keeps_empty_files_and_completed_prefixes(tmp_path, 
     builder.add_bytes(b"", "empty")
     builder.add_bytes(b"first", "first")
     builder.add_bytes(b"second", "second")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     zero = rars.ReadOptions(max_total_output_bytes=0)
     assert archive.extract("empty", tmp_path, options=zero) == tmp_path / "empty"
     assert (tmp_path / "empty").read_bytes() == b""
@@ -160,7 +160,7 @@ def test_parsing_limits_are_per_call_and_do_not_become_payload_defaults(tmp_path
     def open_archive(options, cancellation=None):
         if from_path:
             return rars.RarFile(path, options=options, cancellation=cancellation)
-        return rars.RarFile.from_bytes(data, options=options, cancellation=cancellation)
+        return rars.RarFile(data, options=options, cancellation=cancellation)
     for options in [rars.ReadOptions(max_header_count=0), rars.ReadOptions(max_header_bytes=0)]:
         with pytest.raises(MemoryError):
             open_archive(options)

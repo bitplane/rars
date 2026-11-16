@@ -12,7 +12,7 @@ def single_archive():
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     builder.add_directory("empty")
-    return rars.RarFile.from_bytes(builder.to_bytes())
+    return rars.RarFile(builder.to_bytes())
 
 
 def test_extractall_reports_bytes_written_against_a_known_total(tmp_path):
@@ -167,7 +167,7 @@ def test_a_set_given_as_a_list_knows_its_total_from_the_first_event(tmp_path):
     paths = write_set(tmp_path / "made")
     events = []
 
-    with rars.RarFile.from_bytes(paths[0].read_bytes()) as archive:
+    with rars.RarFile(paths[0].read_bytes()) as archive:
         archive.testrar(
             progress=events.append,
             volumes=[path.read_bytes() for path in paths[1:]],

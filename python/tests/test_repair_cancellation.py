@@ -34,7 +34,7 @@ def test_repair_token_is_reusable_and_path_publication_cleans_up(tmp_path, forma
     token = rars.CancellationToken()
     repaired = rars.repair(source, cancellation=token).data
     assert repaired == rars.repair(original, cancellation=token).data == rars.repair(original).data
-    rars.RarFile.from_bytes(repaired).testrar()
+    rars.RarFile(repaired).testrar()
     written = rars.repair(source, output=output, cancellation=token)
     assert written.data is None
     assert output.read_bytes() == repaired
@@ -60,7 +60,7 @@ def test_repair_token_keeps_damaged_header_fallback_working(tmp_path, to_file):
     result = rars.repair(damaged, output=output if to_file else None, cancellation=token)
     assert result.report.data_repaired
     repaired = output.read_bytes() if to_file else result.data
-    assert rars.RarFile.from_bytes(repaired).read("file") == payload
+    assert rars.RarFile(repaired).read("file") == payload
     assert not token.is_cancelled()
 
 
