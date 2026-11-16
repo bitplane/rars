@@ -137,6 +137,35 @@ impl CancellationToken {
     }
 }
 
+/// Limits for `RarBuilder` writes. Raising a limit never changes the archive written.
+#[pyclass(frozen, module = "rars")]
+#[derive(Debug, Clone, Default)]
+struct WriterResources {
+    /// Hard ceiling on the RAR 5 writer's managed allocations; exceeding it
+    /// raises `MemoryError`. Legacy formats refuse it.
+    #[pyo3(get)]
+    max_memory: Option<u64>,
+}
+
+#[pymethods]
+impl WriterResources {
+    #[new]
+    #[pyo3(signature = (*, max_memory = None))]
+    fn new(max_memory: Option<u64>) -> Self {
+        Self { max_memory }
+    }
+}
+
+impl WriterResources {
+    fn core(&self) -> rars_rs::WriterResources {
+        let resources = rars_rs::WriterResources::default();
+        match self.max_memory {
+            Some(limit) => resources.with_max_memory_bytes(limit),
+            None => resources,
+        }
+    }
+}
+
 /// Per-call parsing, decoding and extraction policies.
 #[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone, Default)]
@@ -2024,10 +2053,13 @@ fn map_builder_error(error: rars_rs::Error) -> PyErr {
 
 #[pymethods]
 impl RarBuilder {
+    /// Everything after `format` is keyword-only, so later releases can add
+    /// and regroup settings without breaking callers.
     #[new]
     #[pyo3(signature = (
         format = "rar50",
-        compression = 3,
+        *,
+        level = 3,
         store = false,
         solid = false,
         password = None,
@@ -2035,13 +2067,12 @@ impl RarBuilder {
         comment = None,
         recovery_percent = None,
         volume_size = None,
-        filters = None,
-        max_memory_bytes = None
+        resources = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         format: &str,
-        compression: u8,
+        level: u8,
         store: bool,
         solid: bool,
         password: Option<&Bound<'_, PyAny>>,
@@ -2049,18 +2080,12 @@ impl RarBuilder {
         comment: Option<&Bound<'_, PyAny>>,
         recovery_percent: Option<u64>,
         volume_size: Option<usize>,
-        filters: Option<&Bound<'_, PyAny>>,
-        max_memory_bytes: Option<u64>,
+        resources: Option<&WriterResources>,
     ) -> PyResult<Self> {
-        if filters.is_some() {
-            return Err(PyNotImplementedError::new_err(
-                "filter selection is not exposed yet; use the default writer filter policy",
-            ));
-        }
         let format = parse_version(format)?;
         Ok(Self {
             inner: rars_rs::Builder::new(format)
-                .compression_level(Some(compression))
+                .compression_level(Some(level))
                 .store(store)
                 .solid(solid)
                 .password(py_password(password)?)
@@ -2070,8 +2095,8 @@ impl RarBuilder {
                 .volume_size(volume_size),
             format,
             rewrite: None,
-            resources: max_memory_bytes.map_or_else(rars_rs::WriterResources::default, |limit| {
-                rars_rs::WriterResources::default().with_max_memory_bytes(limit)
+            resources: resources.map_or_else(rars_rs::WriterResources::default, |resources| {
+                resources.core()
             }),
         })
     }
@@ -2937,6 +2962,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ProgressEvent>()?;
     m.add_class::<CancellationToken>()?;
     m.add_class::<ReadOptions>()?;
+    m.add_class::<WriterResources>()?;
     m.add_class::<RepairReport>()?;
     m.add_class::<RepairResult>()?;
     m.add_class::<PasswordCheck>()?;

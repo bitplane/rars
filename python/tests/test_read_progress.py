@@ -8,7 +8,7 @@ PAYLOAD = random.Random(5).randbytes(300_000)
 
 
 def single_archive():
-    builder = rars.RarBuilder(format="rar50", compression=3)
+    builder = rars.RarBuilder(format="rar50", level=3)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     builder.add_directory("empty")

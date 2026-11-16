@@ -153,7 +153,7 @@ def test_from_archive_retains_fixture_htime_with_reference_extractor(tmp_path):
 
 
 def test_builder_reports_compression_progress():
-    builder = rars.RarBuilder(format="rar70", compression=3, solid=True)
+    builder = rars.RarBuilder(format="rar70", level=3, solid=True)
     builder.add_bytes(b"progress payload " * 8192, "payload.txt")
     events = []
 
@@ -169,7 +169,7 @@ def test_builder_reports_compression_progress():
 
 
 def test_builder_progress_exception_cancels_and_is_reraised():
-    builder = rars.RarBuilder(format="rar50", compression=3)
+    builder = rars.RarBuilder(format="rar50", level=3)
     builder.add_bytes(b"cancel me " * 8192, "payload.txt")
 
     class StopCompression(Exception):

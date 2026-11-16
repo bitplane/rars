@@ -1,9 +1,8 @@
-import io
 import os
 from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
 from types import TracebackType
-from typing import Final, Literal, Protocol, final
+from typing import IO, Final, Literal, Protocol, final
 
 from typing_extensions import Buffer, Self, TypeAlias
 
@@ -14,6 +13,7 @@ __all__ = [
     "ProgressEvent",
     "CancellationToken",
     "ReadOptions",
+    "WriterResources",
     "RepairReport",
     "RepairResult",
     "PasswordCheck",
@@ -154,6 +154,16 @@ class ReadOptions:
     def progress(self) -> _Progress | None: ...
 
 @final
+class WriterResources:
+    def __new__(
+        cls,
+        *,
+        max_memory: int | None = None,
+    ) -> Self: ...
+    @property
+    def max_memory(self) -> int | None: ...
+
+@final
 class RarInfo:
     @property
     def member_index(self) -> int: ...
@@ -230,7 +240,7 @@ class RarFile:
         *,
         options: ReadOptions | None = None,
         volumes: Iterable[_Source] | None = None,
-    ) -> io.BytesIO: ...
+    ) -> IO[bytes]: ...
     def read_many(
         self,
         members: Iterable[_Member],
@@ -330,7 +340,8 @@ class RarBuilder:
     def __new__(
         cls,
         format: str = "rar50",
-        compression: int = 3,
+        *,
+        level: int = 3,
         store: bool = False,
         solid: bool = False,
         password: _Password | None = None,
@@ -338,8 +349,7 @@ class RarBuilder:
         comment: str | bytes | None = None,
         recovery_percent: int | None = None,
         volume_size: int | None = None,
-        filters: None = None,
-        max_memory_bytes: int | None = None,
+        resources: WriterResources | None = None,
     ) -> Self: ...
     @staticmethod
     def from_archive(
