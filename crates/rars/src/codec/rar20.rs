@@ -637,19 +637,29 @@ impl<B: Budget> Reader20State<B> {
                 return Ok(());
             }
             if self.audio_tables[self.cur_channel].decode(&mut self.bits)? == 256 {
-                self.read_tables()?;
-                self.in_block = true;
+                self.read_trailing_tables()?;
             }
         } else {
             if self.main.state.is_empty() {
                 return Ok(());
             }
             if self.main.decode(&mut self.bits)? == 269 {
-                self.read_tables()?;
-                self.in_block = true;
+                self.read_trailing_tables()?;
             }
         }
         Ok(())
+    }
+
+    // The trailing header only feeds the next member, so a cut one must not fail this one.
+    fn read_trailing_tables(&mut self) -> Result<()> {
+        match self.read_tables() {
+            Ok(()) => {
+                self.in_block = true;
+                Ok(())
+            }
+            Err(Error::NeedMoreInput) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     fn push_old_offset(&mut self, offset: usize) {
