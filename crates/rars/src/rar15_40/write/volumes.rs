@@ -199,17 +199,16 @@ pub(super) fn split_members(
         };
         let packed_bytes = packed.as_deref().map(MemberBytes::Borrowed);
         let bytes = packed_bytes.as_ref().unwrap_or(&member.bytes);
-        // As the plain writer chains them: a stored member restarts the run,
-        // and an empty one leaves it as it was.
+        // Chained as the plain writer chains them: see `solid_chain_runs_on`.
         let solid_continuation =
             solid && (method != 0x30 || member.is_directory) && solid_run_has_member;
-        if !member.is_directory {
-            if method == 0x30 {
-                solid_run_has_member = false;
-            } else if unpacked_size != 0 {
-                solid_run_has_member = true;
-            }
-        }
+        solid_run_has_member = solid_chain_runs_on(
+            solid_run_has_member,
+            member.is_directory,
+            method,
+            unpacked_size,
+            packed.as_ref().is_some_and(|data| !data.is_empty()),
+        );
         let cipher = CipherPlan::new(options.target, member.password).map_err(|error| {
             crate::write_stream::member_error(error, name, "encrypting volume member")
         })?;

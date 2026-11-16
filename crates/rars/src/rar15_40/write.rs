@@ -739,19 +739,13 @@ fn write_members_to(
             // on; UnRAR passes over directory headers either way.
             let solid_continuation =
                 (encoded.method != 0x30 || member.is_directory) && solid_run_has_member;
-            // Storing a member rebuilds the encoder, so the chain ends there.
-            // An empty compressed member leaves the chain exactly as it was:
-            // it feeds the encoder nothing, and readers pass over an empty
-            // payload without advancing their decoder. Counting one as a
-            // member left the next one flagged as continuing a chain that had
-            // been broken by a stored member two places back.
-            if member.is_directory {
-                // Directory headers do not participate in the solid stream.
-            } else if encoded.method == 0x30 {
-                solid_run_has_member = false;
-            } else if encoded.unpacked_size != 0 {
-                solid_run_has_member = true;
-            }
+            solid_run_has_member = solid_chain_runs_on(
+                solid_run_has_member,
+                member.is_directory,
+                encoded.method,
+                encoded.unpacked_size,
+                matches!(&encoded.payload, MemberPayload::Packed(data) if !data.is_empty()),
+            );
             write_member(
                 output,
                 member,
@@ -2439,6 +2433,32 @@ fn dictionary_flags_for_size(size: usize) -> Result<u16> {
 }
 
 // Callers have passed `validate_plan`, including compression-level validation.
+/// Whether a solid chain is running once this member is written, so the next
+/// compressed one is flagged as continuing it.
+///
+/// Storing a member rebuilds the encoder, so the chain ends there. An empty
+/// member that the encoder wrote nothing for leaves the chain as it was:
+/// readers pass over an empty payload without advancing their decoder.
+/// RAR 2.9 does code an empty member, though, and its bytes move the encoder
+/// on, so like RAR's own writer the member after it continues the chain.
+/// Flagging that member as a fresh start sent it as a continuation of tables
+/// no reader had, whenever the empty member was the first in the chain.
+pub(super) fn solid_chain_runs_on(
+    running: bool,
+    is_directory: bool,
+    method: u8,
+    unpacked_size: u64,
+    wrote_bytes: bool,
+) -> bool {
+    if is_directory {
+        running
+    } else if method == 0x30 {
+        false
+    } else {
+        running || unpacked_size != 0 || wrote_bytes
+    }
+}
+
 fn compression_method_for_level(options: WriterOptions) -> u8 {
     let Some(level) = options.compression_level else {
         return 0x33;

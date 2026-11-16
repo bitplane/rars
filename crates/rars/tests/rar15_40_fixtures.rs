@@ -8458,6 +8458,60 @@ fn an_empty_member_does_not_restart_a_broken_solid_chain() {
     }
 }
 
+/// RAR 2.9 codes an empty member, so the chain runs on from it. Flagging the
+/// member after one at the head of the chain as a fresh start left it a
+/// continuation of tables no reader had seen.
+#[test]
+fn a_solid_chain_can_start_with_an_empty_member() {
+    let text: Vec<u8> = (0..3000)
+        .flat_map(|n| format!("{n}\n").into_bytes())
+        .collect();
+    let one: Vec<(&[u8], Vec<u8>)> = vec![(b"empty.dat", Vec::new()), (b"text.txt", text.clone())];
+    let two: Vec<(&[u8], Vec<u8>)> = vec![
+        (b"empty.dat", Vec::new()),
+        (b"also-empty.dat", Vec::new()),
+        (b"text.txt", text),
+    ];
+
+    let targets = [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ];
+    for (members, target) in [&one, &two]
+        .into_iter()
+        .flat_map(|members| targets.map(|target| (members, target)))
+    {
+        let entries = file_entries(members);
+        let mut methods = vec![Rar29Method::Lz];
+        if target != ArchiveVersion::Rar20 {
+            // Auto, the CLI's default, picks PPMd for text.
+            methods.extend([Rar29Method::Ppmd, Rar29Method::Auto]);
+        }
+        for method in methods {
+            let options = solid_options(target).with_method(method);
+            let bytes = write_compressed_archive(&entries, options).unwrap();
+            let archive = Archive::parse(&bytes).unwrap();
+            let extracted = collect_extract(&archive)
+                .unwrap_or_else(|error| panic!("{target} {method:?}: {error:?}"));
+            assert_eq!(extracted.len(), members.len());
+            for (got, (_, want)) in extracted.iter().zip(members) {
+                assert_eq!(&got.data, want, "{target} {method:?}");
+            }
+
+            if let Some(output) = local_reference_test("solid-empty-head", &bytes) {
+                assert!(
+                    output.status.success(),
+                    "{target} {method:?}: the reference tool rejected it\nstdout:\n{}\nstderr:\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn extracts_legacy_matches_that_reach_past_the_start_of_the_window() {
     let mut expected = vec![0u8; 8];
