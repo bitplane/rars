@@ -828,7 +828,9 @@ impl<B: Budget> Reader29State<B> {
     }
 
     fn finish_lz_member(&mut self) -> Result<bool> {
-        if !self.in_lz_block {
+        // Zero padding in the last byte is not a symbol: with the output
+        // complete, the member may end there without an end of block.
+        if !self.in_lz_block || self.bits.only_zero_padding_left() {
             return Ok(true);
         }
         let symbol = self.main.decode(&mut self.bits)?;
@@ -1472,6 +1474,11 @@ impl<B: Budget> BitReader<B> {
         }
         self.input.discard_prefix(bytes);
         self.bit_pos -= bytes * 8;
+    }
+
+    fn only_zero_padding_left(&self) -> bool {
+        let left = (self.input.len() * 8).saturating_sub(self.bit_pos);
+        self.refill_at == DRAINED && left < 8 && self.peek_bits(left as u8) == Ok(0)
     }
 
     fn align_byte(&mut self) {
