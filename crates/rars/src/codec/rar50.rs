@@ -956,6 +956,9 @@ impl<B: Budget> ReaderState<B> {
                 }
             }
 
+            if output.len() >= output_size {
+                refuse_stream_past_declared(&tables, bits, payload_bits)?;
+            }
             self.tables = Some(tables);
             if block.header.is_last || output.len() >= output_size {
                 break;
@@ -1217,6 +1220,9 @@ impl<B: Budget> ReaderState<B> {
                 }
             }
 
+            if output.written() >= output_size {
+                refuse_stream_past_declared(&tables, bits, payload_bits)?;
+            }
             self.tables = Some(tables);
             if block.header.is_last || output.written() >= output_size {
                 return Ok(());
@@ -2177,28 +2183,74 @@ pub(crate) enum FilterType {
     Arm,
 }
 
-fn read_filter(bits: &mut BitReader<'_>, current_pos: usize) -> Result<PendingFilter> {
+const PAST_DECLARED: Error = Error::InvalidData("RAR 5 stream continues past the declared size");
+
+/// Past the declared size a block may hold only whole filter records and the zero bits writers pad with.
+fn refuse_stream_past_declared<B: Budget>(
+    tables: &ReaderTables<B>,
+    mut bits: BitReader<'_>,
+    payload_bits: usize,
+) -> Result<()> {
+    loop {
+        let mut record = bits;
+        let whole = matches!(tables.main.decode(&mut record), Ok(256))
+            && read_filter_record(&mut record).is_ok()
+            && record.position() <= payload_bits;
+        if !whole {
+            break;
+        }
+        bits = record;
+    }
+    while bits.position() < payload_bits {
+        let count = (payload_bits - bits.position()).min(32);
+        if bits.read_bits(count as u8)? != 0 {
+            return Err(PAST_DECLARED);
+        }
+    }
+    Ok(())
+}
+
+/// Parsed apart from its type so a trailing record of any type can be skipped.
+struct FilterRecord {
+    offset: usize,
+    length: usize,
+    kind: u32,
+    channels: usize,
+}
+
+fn read_filter_record(bits: &mut BitReader<'_>) -> Result<FilterRecord> {
     let offset = read_filter_data(bits)? as usize;
     let length = read_filter_data(bits)? as usize;
-    let filter_type = match bits.read_bits(3)? {
+    let kind = bits.read_bits(3)?;
+    let channels = if kind == 0 {
+        bits.read_bits(5)? as usize + 1
+    } else {
+        0
+    };
+    Ok(FilterRecord {
+        offset,
+        length,
+        kind,
+        channels,
+    })
+}
+
+fn read_filter(bits: &mut BitReader<'_>, current_pos: usize) -> Result<PendingFilter> {
+    let record = read_filter_record(bits)?;
+    let filter_type = match record.kind {
         0 => FilterType::Delta,
         1 => FilterType::E8,
         2 => FilterType::E8E9,
         3 => FilterType::Arm,
         _ => return Err(Error::InvalidData("RAR 5 filter type is unsupported")),
     };
-    let channels = if filter_type == FilterType::Delta {
-        bits.read_bits(5)? as usize + 1
-    } else {
-        0
-    };
     Ok(PendingFilter {
         start: current_pos
-            .checked_add(offset)
+            .checked_add(record.offset)
             .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?,
-        length,
+        length: record.length,
         filter_type,
-        channels,
+        channels: record.channels,
     })
 }
 
@@ -2714,6 +2766,10 @@ mod checkpoint_tests;
 #[cfg(all(test, feature = "write"))]
 #[path = "rar50/history_retention_tests.rs"]
 mod history_retention_tests;
+
+#[cfg(all(test, feature = "write"))]
+#[path = "rar50/past_declared_tests.rs"]
+mod past_declared_tests;
 
 #[cfg(test)]
 mod bit_lookup_tests;

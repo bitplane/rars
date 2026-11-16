@@ -2239,8 +2239,8 @@ fn detects_rar50_align_mode_when_align_lengths_are_not_uniform_four() {
 
 #[test]
 fn decodes_synthetic_literal_only_block() {
-    let payload = literal_only_payload(b"ABBA");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"ABBA");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_literal_only(&input, 0, 4).unwrap();
 
@@ -3860,8 +3860,8 @@ fn decode_member_from_reader_accepts_incremental_input() {
         }
     }
 
-    let payload = literal_only_payload(b"ABBA");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"ABBA");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     let mut reader = OneByteReader {
         data: &input,
         pos: 0,
@@ -3877,8 +3877,8 @@ fn decode_member_from_reader_accepts_incremental_input() {
 
 #[test]
 fn decoders_stop_at_declared_size_before_a_nonfinal_block() {
-    let payload = literal_only_payload(b"AB");
-    let block = encode_compressed_block(&payload, payload.len() * 8, true, false).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let block = encode_compressed_block(&payload, payload_bits, true, false).unwrap();
     let mut input = block.clone();
     input.extend_from_slice(b"not another block");
 
@@ -3909,8 +3909,8 @@ fn decoders_stop_at_declared_size_before_a_nonfinal_block() {
 
 #[test]
 fn decodes_synthetic_new_match_block() {
-    let payload = new_match_payload();
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = new_match_payload();
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_lz(&input, 0, 4).unwrap();
 
@@ -3919,8 +3919,8 @@ fn decodes_synthetic_new_match_block() {
 
 #[test]
 fn decodes_synthetic_last_length_match_block() {
-    let payload = repeat_payload(257);
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = repeat_payload(257);
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_lz(&input, 0, 6).unwrap();
 
@@ -3929,8 +3929,8 @@ fn decodes_synthetic_last_length_match_block() {
 
 #[test]
 fn decodes_synthetic_repeat_distance_match_block() {
-    let payload = repeat_payload(258);
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = repeat_payload(258);
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
 
     let output = decode_lz(&input, 0, 6).unwrap();
 
@@ -4167,8 +4167,8 @@ fn decoders_read_rar7_distance_slots_past_31_bits_as_zeros() {
 
 #[test]
 fn solid_decoders_report_truncated_repeat_length() {
-    let bootstrap = new_match_payload();
-    let bootstrap = encode_compressed_block(&bootstrap, bootstrap.len() * 8, true, true).unwrap();
+    let (bootstrap, bits) = new_match_payload();
+    let bootstrap = encode_compressed_block(&bootstrap, bits, true, true).unwrap();
 
     for (length_slot, packed) in [
         (0, 0b0000_0001), // Seven literals and a repeat, without its length code.
@@ -4690,13 +4690,14 @@ fn filtered_reader_history_retains_only_the_raw_dictionary_tail() {
 
 #[test]
 fn failed_buffered_filter_preserves_previous_solid_history() {
-    let data = b"\xe8\0\0\0\0abcdefghijklmnop".to_vec();
+    let data = [&b"\xe8\0\0\0\0"[..], &b"abcd".repeat(8)].concat();
     let packed = encode_lz_member_with_filter(&data, crate::FilterKind::E8).unwrap();
     let mut decoder = Unpack50Decoder::new();
     decoder.state = ReaderState::with_history(Buffer::from_vec(b"old raw history".to_vec()));
     let history = decoder.state.history.to_vec();
     // The record spans the full member, but the advertised output stops
-    // one byte earlier: the failure happens during filter application.
+    // one byte earlier, inside the final match: the failure happens during
+    // filter application.
     assert_eq!(
         decoder.decode_member_with_dictionary(&packed, 0, data.len() - 1, 64, true, DecodeMode::Lz),
         Err(Error::InvalidData("RAR 5 filter range exceeds output"))
@@ -4707,12 +4708,10 @@ fn failed_buffered_filter_preserves_previous_solid_history() {
 #[test]
 fn solid_history_is_capped_to_dictionary_size() {
     let mut decoder = Unpack50Decoder::new();
-    let first_payload = literal_only_payload(b"ABBA");
-    let first =
-        encode_compressed_block(&first_payload, first_payload.len() * 8, true, true).unwrap();
-    let second_payload = literal_only_payload(b"BAAB");
-    let second =
-        encode_compressed_block(&second_payload, second_payload.len() * 8, true, true).unwrap();
+    let (first_payload, first_bits) = literal_only_payload(b"ABBA");
+    let first = encode_compressed_block(&first_payload, first_bits, true, true).unwrap();
+    let (second_payload, second_bits) = literal_only_payload(b"BAAB");
+    let second = encode_compressed_block(&second_payload, second_bits, true, true).unwrap();
 
     assert_eq!(
         decoder
@@ -4780,12 +4779,10 @@ fn streaming_reader_history_capacity_follows_the_active_dictionary() {
 #[test]
 fn streaming_decoder_history_is_capped_without_reordering() {
     let mut decoder = Unpack50Decoder::new();
-    let first_payload = literal_only_payload(b"ABBA");
-    let first =
-        encode_compressed_block(&first_payload, first_payload.len() * 8, true, true).unwrap();
-    let second_payload = literal_only_payload(b"BAAB");
-    let second =
-        encode_compressed_block(&second_payload, second_payload.len() * 8, true, true).unwrap();
+    let (first_payload, first_bits) = literal_only_payload(b"ABBA");
+    let first = encode_compressed_block(&first_payload, first_bits, true, true).unwrap();
+    let (second_payload, second_bits) = literal_only_payload(b"BAAB");
+    let second = encode_compressed_block(&second_payload, second_bits, true, true).unwrap();
     let mut decoded = Vec::new();
 
     decoder
@@ -4834,8 +4831,8 @@ fn streaming_decoder_history_is_capped_without_reordering() {
 
 #[test]
 fn solid_streaming_decoder_trims_inherited_history_before_member() {
-    let payload = literal_only_payload(b"AB");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     let mut decoder = Unpack50Decoder::new();
     decoder.state = ReaderState::with_history(Buffer::from_vec(b"123456".to_vec()));
     let mut decoded = Vec::new();
@@ -4865,12 +4862,12 @@ fn solid_streaming_decoder_trims_inherited_history_before_member() {
 
 #[test]
 fn streaming_decoder_handles_each_match_control() {
-    for (payload, expected) in [
+    for ((payload, payload_bits), expected) in [
         (new_match_payload(), b"ABAB".as_slice()),
         (repeat_payload(257), b"ABABAB".as_slice()),
         (repeat_payload(258), b"ABABAB".as_slice()),
     ] {
-        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
         let mut decoded = Vec::new();
         Unpack50Decoder::new()
             .decode_member_from_reader_with_dictionary_to_sink(
@@ -5130,10 +5127,10 @@ fn final_match_past_declared_size_truncates_and_keeps_overrun_for_solid_member()
     // The follow-on member copies two bytes from distance 2, so it reads the
     // overrun byte only if the window kept it.
     let follow_on = {
-        let payload = match_only_payload();
-        encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap()
+        let (payload, payload_bits) = match_only_payload();
+        encode_compressed_block(&payload, payload_bits, true, true).unwrap()
     };
-    for (payload, declared_size, expected, next) in [
+    for ((payload, payload_bits), declared_size, expected, next) in [
         // AB, then a two-byte match: ABA|B.
         (new_match_payload(), 3, &b"ABA"[..], b"AB"),
         // ABAB, then the previous match: ABABA|B.
@@ -5141,7 +5138,7 @@ fn final_match_past_declared_size_truncates_and_keeps_overrun_for_solid_member()
         // ABAB, then a repeat distance: ABABA|B.
         (repeat_payload(258), 5, b"ABABA", b"AB"),
     ] {
-        let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+        let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
         let mut buffered = Unpack50Decoder::new();
         let decode = |decoder: &mut Unpack50Decoder, input: &[u8], size, solid| {
             decoder.decode_member_with_dictionary(
@@ -5317,8 +5314,8 @@ fn streaming_decoder_rejects_missing_tables_and_invalid_dictionary() {
 
 #[test]
 fn streaming_decoder_propagates_sink_failure() {
-    let payload = literal_only_payload(b"AB");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     let error = Unpack50Decoder::new()
         .decode_member_from_reader_with_dictionary_to_sink(
             &mut input.as_slice(),
@@ -5574,8 +5571,8 @@ fn streaming_decoder_propagates_filter_record_failure() {
 
 #[test]
 fn streaming_decoder_reports_truncated_block_and_incomplete_output() {
-    let payload = literal_only_payload(b"AB");
-    let input = encode_compressed_block(&payload, payload.len() * 8, true, true).unwrap();
+    let (payload, payload_bits) = literal_only_payload(b"AB");
+    let input = encode_compressed_block(&payload, payload_bits, true, true).unwrap();
     for truncated in [&input[..1], &input[..input.len() - 1]] {
         let mut reader = truncated;
         let error = Unpack50Decoder::new()
@@ -5942,7 +5939,7 @@ fn streaming_window_zero_fills_match_beyond_declared_dictionary() {
     assert_eq!(decoded, b"\0");
 }
 
-fn literal_only_payload(data: &[u8]) -> Vec<u8> {
+fn literal_only_payload(data: &[u8]) -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -5963,10 +5960,11 @@ fn literal_only_payload(data: &[u8]) -> Vec<u8> {
             _ => panic!("test helper only encodes A/B"),
         }
     }
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
-fn new_match_payload() -> Vec<u8> {
+fn new_match_payload() -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -5987,10 +5985,11 @@ fn new_match_payload() -> Vec<u8> {
     writer.write_bits(0b01, 2); // 'B'
     writer.write_bits(0b10, 2); // match length 2
     writer.write_bits(0, 1); // distance slot 1
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
-fn match_only_payload() -> Vec<u8> {
+fn match_only_payload() -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -6007,10 +6006,11 @@ fn match_only_payload() -> Vec<u8> {
     };
     writer.write_bits(1, 1); // match length 2
     writer.write_bits(0, 1); // distance slot 1
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
-fn repeat_payload(repeat_symbol: usize) -> Vec<u8> {
+fn repeat_payload(repeat_symbol: usize) -> (Vec<u8>, usize) {
     let mut lengths = TableLengths {
         main: vec![0; MAIN_TABLE_SIZE],
         distance: vec![0; DISTANCE_TABLE_SIZE_50],
@@ -6037,7 +6037,8 @@ fn repeat_payload(repeat_symbol: usize) -> Vec<u8> {
     if repeat_symbol == 258 {
         writer.write_bits(0, 1); // length slot 0
     }
-    writer.finish()
+    let bits = writer.bit_pos;
+    (writer.finish(), bits)
 }
 
 fn control_only_block(symbol: usize) -> Vec<u8> {
