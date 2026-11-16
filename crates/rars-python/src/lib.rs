@@ -2342,8 +2342,20 @@ fn is_rarfile_sfx(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<bool> {
     })
 }
 
-/// A seekable file object is returned to where it was; a stream keeps what was read from it.
+/// Any OSError, including a failed tell or seek, is not RAR: a file can vanish mid-job.
 fn with_probe_reader(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    probe: impl FnOnce(&mut dyn io::Read) -> io::Result<bool> + Send,
+) -> PyResult<bool> {
+    match probe_source(py, source, probe) {
+        Err(error) if error.is_instance_of::<PyOSError>(py) => Ok(false),
+        result => result,
+    }
+}
+
+/// Dispatches as `zipfile.is_zipfile` does, so a file object that can't tell or seek is not RAR.
+fn probe_source(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     probe: impl FnOnce(&mut dyn io::Read) -> io::Result<bool> + Send,
@@ -2354,17 +2366,17 @@ fn with_probe_reader(
     }
     if is_file_object(source)? {
         refuse_text_mode(source)?;
-        let mut reader = PyFileReader(source.clone().unbind());
-        if !is_seekable(source)? {
-            return Ok(probe(&mut reader)?);
-        }
         let position = source.call_method0("tell")?;
-        let found = probe(&mut reader);
+        let found = probe(&mut PyFileReader(source.clone().unbind()));
         source.call_method1("seek", (position,))?;
         return Ok(found?);
     }
     if source.is_instance_of::<PyString>() || source.hasattr("__fspath__")? {
         let path = py_path_buf(py, source)?;
+        // Python's open() refuses this before any I/O; File::open would report an OSError.
+        if path.as_os_str().as_encoded_bytes().contains(&0) {
+            return Err(PyValueError::new_err("embedded null byte"));
+        }
         return py
             .detach(|| probe(&mut std::fs::File::open(path)?))
             .map_err(Into::into);

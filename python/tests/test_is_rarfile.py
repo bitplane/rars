@@ -1,4 +1,6 @@
 import io
+import os
+import pathlib
 
 import pytest
 import rars
@@ -70,16 +72,70 @@ def test_seekable_file_object_is_put_back():
     assert file.tell() == 2
 
 
-def test_unseekable_stream_keeps_what_was_read():
-    stream = Unseekable(STUB + archive_bytes())
-    assert rars.is_rarfile_sfx(stream)
-    assert stream.inner.tell() > 0
-
-
-def test_missing_file_raises(tmp_path):
+def test_unseekable_stream_is_not_rar_as_with_zipfile():
     for check in (rars.is_rarfile, rars.is_rarfile_sfx):
-        with pytest.raises(FileNotFoundError):
-            check(tmp_path / "missing.rar")
+        stream = Unseekable(archive_bytes())
+        assert not check(stream)
+        assert stream.inner.tell() == 0
+
+
+def test_nul_in_path_raises_as_with_zipfile():
+    for check in (rars.is_rarfile, rars.is_rarfile_sfx):
+        for path in ("a\0b.rar", pathlib.PurePosixPath("a\0b.rar")):
+            with pytest.raises(ValueError):
+                check(path)
+
+
+def test_unreadable_path_is_not_rar(tmp_path):
+    for check in (rars.is_rarfile, rars.is_rarfile_sfx):
+        assert not check(tmp_path / "missing.rar")
+        assert not check(str(tmp_path / "missing.rar"))
+        assert not check(tmp_path)
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs file permissions")
+def test_unreadable_permissions_are_not_rar(tmp_path):
+    path = tmp_path / "locked.rar"
+    path.write_bytes(archive_bytes())
+    path.chmod(0)
+    for check in (rars.is_rarfile, rars.is_rarfile_sfx):
+        assert not check(path)
+
+
+class FailingRead(io.RawIOBase):
+    def __init__(self, error):
+        self.error = error
+
+    def readable(self):
+        return True
+
+    def tell(self):
+        return 0
+
+    def seek(self, offset, whence=0):
+        return 0
+
+    def readinto(self, buffer):
+        raise self.error
+
+
+class FailingSeek(io.BytesIO):
+    def seek(self, offset, whence=0):
+        raise OSError("device gone")
+
+
+def test_file_object_os_error_is_not_rar():
+    for check in (rars.is_rarfile, rars.is_rarfile_sfx):
+        assert not check(FailingRead(OSError("device gone")))
+        assert not check(FailingSeek(archive_bytes()))
+
+
+def test_other_errors_still_raise():
+    for check in (rars.is_rarfile, rars.is_rarfile_sfx):
+        with pytest.raises(ValueError):
+            check(FailingRead(ValueError("closed")))
+        with pytest.raises(TypeError):
+            check(42)
 
 
 def test_text_mode_file_is_refused(tmp_path):
