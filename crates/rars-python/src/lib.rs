@@ -52,7 +52,12 @@ struct ProgressEvent {
     entry_index: Option<usize>,
     #[pyo3(get)]
     total_entries: Option<usize>,
+    /// The volume being read, counting the first as 1; None outside a volume set.
+    #[pyo3(get)]
+    volume: Option<usize>,
     finished: bool,
+    /// A set whose last volume hasn't been read yet has no total; `total` is 0 until it does.
+    total_known: bool,
 }
 
 #[pyclass(frozen, module = "rars")]
@@ -97,7 +102,7 @@ struct RepairResult {
 impl ProgressEvent {
     #[getter]
     fn percentage(&self) -> Option<f64> {
-        if self.phase == "writing" && self.total == 0 && !self.finished {
+        if !self.total_known || (self.phase == "writing" && self.total == 0 && !self.finished) {
             return None;
         }
         if self.total == 0 {
@@ -159,13 +164,15 @@ struct ReadOptions {
     /// Caps members decoded side by side and a large RAR 5 member's block decoders; 0 or 1 keeps the call on the calling thread.
     #[pyo3(get)]
     threads: Option<usize>,
+    /// Beside `cancellation` because a callback that raises cancels the read the same way.
+    progress: Option<Arc<Py<PyAny>>>,
 }
 
 #[pymethods]
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
+    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None, progress=None))]
     fn new(
         cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
@@ -178,7 +185,11 @@ impl ReadOptions {
         legacy_name_encoding: Option<String>,
         allow_rar3_vm_programs: bool,
         threads: Option<usize>,
+        progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        if progress.is_some_and(|progress| !progress.is_callable()) {
+            return Err(PyValueError::new_err("progress must be callable"));
+        }
         let encoding = legacy_name_encoding
             .as_deref()
             .map(str::parse)
@@ -197,7 +208,16 @@ impl ReadOptions {
             max_header_bytes,
             allow_rar3_vm_programs,
             threads,
+            progress: progress.map(|progress| Arc::new(progress.clone().unbind())),
         })
+    }
+
+    /// Called with a `ProgressEvent` by `read`, `read_many`, `extract`, `extractall` and `testrar`, a few times a second at most; an exception it raises stops the call and is re-raised.
+    #[getter]
+    fn progress(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.progress
+            .as_ref()
+            .map(|progress| progress.clone_ref(py))
     }
 
     #[getter]
@@ -287,7 +307,9 @@ impl rars_rs::WriteProgress for PythonProgress {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
+                volume: None,
                 finished: false,
+                total_known: true,
             });
             match event {
                 rars_rs::WriteProgressEvent::OperationStarted {
@@ -372,6 +394,243 @@ impl rars_rs::WriteProgress for PythonProgress {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed) || self.read_cancellation.is_cancelled()
+    }
+}
+
+/// Callbacks need the GIL, so a read reports at most this often, plus once when it finishes.
+const READ_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// One read call's progress, counted at the writers the binding opens rather than in the decoder.
+struct ReadProgress {
+    callback: Arc<Py<PyAny>>,
+    phase: &'static str,
+    cancellation: rars_rs::ReadCancellation,
+    error: Mutex<Option<PyErr>>,
+    state: Mutex<ReadState>,
+}
+
+#[derive(Default)]
+struct ReadState {
+    completed: u64,
+    seen_bytes: u64,
+    seen_entries: usize,
+    total_known: bool,
+    started: usize,
+    entry_name: Option<Vec<u8>>,
+    volume: Option<usize>,
+    next_index: usize,
+    reported: Option<std::time::Instant>,
+}
+
+impl ReadProgress {
+    fn new(settings: Option<&ReadOptions>, phase: &'static str) -> Option<Arc<Self>> {
+        let settings = settings?;
+        Some(Arc::new(Self {
+            callback: Arc::clone(settings.progress.as_ref()?),
+            phase,
+            cancellation: settings
+                .cancellation
+                .as_ref()
+                .map_or_else(rars_rs::ReadCancellation::new, |token| token.child()),
+            error: Mutex::new(None),
+            state: Mutex::new(ReadState::default()),
+        }))
+    }
+
+    fn watch<'a>(
+        &'a self,
+        options: rars_rs::ArchiveReadOptions<'a>,
+    ) -> rars_rs::ArchiveReadOptions<'a> {
+        options.with_cancellation(&self.cancellation)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, ReadState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `alone` when the call reads no later volume, so the first one holds the whole total.
+    fn begin(&self, first: &rars_rs::Archive, chosen: &dyn Fn(usize) -> bool, alone: bool) {
+        let mut state = self.lock();
+        for (index, member) in first.members().enumerate() {
+            state.next_index = index + 1;
+            state.see(&member.meta, chosen(index));
+        }
+        state.volume = first.is_volume().then_some(1);
+        state.total_known = alone || volume_end(first) == VolumeEnd::Last;
+        self.report(state, false);
+    }
+
+    /// A later volume's members count toward the total only once the set's last volume is known.
+    fn arrived(&self, volume: &rars_rs::Archive, chosen: &dyn Fn(usize) -> bool) {
+        let mut state = self.lock();
+        for member in volume.members() {
+            if !member.meta.is_split_before {
+                state.next_index += 1;
+            }
+            let index = state.next_index - 1;
+            state.see(&member.meta, chosen(index));
+        }
+        state.volume = state.volume.map(|volume| volume + 1);
+        state.total_known = volume_end(volume) == VolumeEnd::Last;
+        self.report(state, false);
+    }
+
+    fn entry(&self, name: &[u8]) {
+        let mut state = self.lock();
+        state.entry_name = Some(name.to_vec());
+        state.started += 1;
+        self.report(state, false);
+    }
+
+    fn advance(&self, bytes: u64) {
+        let mut state = self.lock();
+        state.completed += bytes;
+        self.report(state, false);
+    }
+
+    fn counted(self: &Arc<Self>, name: &[u8], writer: Box<dyn Write>) -> Box<dyn Write> {
+        self.entry(name);
+        Box::new(CountedWriter {
+            writer,
+            progress: Arc::clone(self),
+            pending: 0,
+        })
+    }
+
+    /// A raising callback's exception wins over the cancellation it caused; success reports once more, finished.
+    fn finish<T>(&self, result: PyResult<T>) -> PyResult<T> {
+        if let Some(error) = self.take_error() {
+            return Err(error);
+        }
+        let value = result?;
+        let mut state = self.lock();
+        if state.total_known {
+            state.completed = state.seen_bytes;
+        } else {
+            state.seen_bytes = state.completed;
+            state.total_known = true;
+        }
+        self.report(state, true);
+        match self.take_error() {
+            Some(error) => Err(error),
+            None => Ok(value),
+        }
+    }
+
+    fn take_error(&self) -> Option<PyErr> {
+        self.error
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+    }
+
+    fn report(&self, mut state: std::sync::MutexGuard<'_, ReadState>, finished: bool) {
+        if self.cancellation.is_cancelled() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if !finished
+            && state
+                .reported
+                .is_some_and(|reported| now.duration_since(reported) < READ_PROGRESS_INTERVAL)
+        {
+            return;
+        }
+        state.reported = Some(now);
+        let total = if state.total_known {
+            state.seen_bytes
+        } else {
+            0
+        };
+        let event = ProgressEvent {
+            phase: self.phase.to_string(),
+            completed: if state.total_known {
+                state.completed.min(total)
+            } else {
+                state.completed
+            },
+            total,
+            pass_number: 1,
+            entry_name: state.entry_name.clone(),
+            entry_index: state.started.checked_sub(1),
+            total_entries: state.total_known.then_some(state.seen_entries),
+            volume: state.volume,
+            finished,
+            total_known: state.total_known,
+        };
+        drop(state);
+        let result = Python::attach(|py| {
+            let event = Py::new(py, event)?;
+            self.callback.call1(py, (event,)).map(|_| ())
+        });
+        if let Err(error) = result {
+            self.cancellation.cancel();
+            *self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error);
+        }
+    }
+}
+
+impl ReadState {
+    /// A split member counts at its last part, the only one sure to record its whole size.
+    fn see(&mut self, meta: &rars_rs::ArchiveMemberMeta, chosen: bool) {
+        if chosen && !meta.is_split_after && !meta.is_directory && !meta.is_redirection {
+            self.seen_bytes += meta.unpacked_size;
+            self.seen_entries += 1;
+        }
+    }
+}
+
+type Volumes<'a> = dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send + 'a;
+
+fn tracked<'a>(
+    progress: Option<&'a ReadProgress>,
+    volumes: &'a mut Volumes<'a>,
+    chosen: &'a (dyn Fn(usize) -> bool + Sync),
+) -> Box<Volumes<'a>> {
+    match progress {
+        Some(progress) => Box::new(volumes.inspect(move |volume| {
+            if let Ok(volume) = volume {
+                progress.arrived(volume, chosen);
+            }
+        })),
+        None => Box::new(volumes),
+    }
+}
+
+/// Hands counts over a mebibyte at a time, so a decoder's writes don't each take the progress lock.
+const COUNTED_BATCH: u64 = 1 << 20;
+
+struct CountedWriter {
+    writer: Box<dyn Write>,
+    progress: Arc<ReadProgress>,
+    pending: u64,
+}
+
+impl Write for CountedWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let written = self.writer.write(bytes)?;
+        self.pending += written as u64;
+        if self.pending >= COUNTED_BATCH {
+            self.progress.advance(std::mem::take(&mut self.pending));
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl Drop for CountedWriter {
+    fn drop(&mut self) {
+        if self.pending > 0 {
+            self.progress.advance(self.pending);
+        }
     }
 }
 
@@ -635,17 +894,11 @@ impl RarFile {
     ) -> PyResult<Vec<u8>> {
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, name)?;
-        let password = py_password(password)?.or_else(|| self.password.clone());
-        let options = self.extraction_options(options, password.as_deref());
-        let data = if self.needs_later_volumes(index) {
-            self.read_from_set(py, volumes, options, &[index])?
-                .pop()
-                .flatten()
-        } else {
-            py.detach(|| self.archive.read_member_at_with_options(index, options))
-                .map_err(map_error)?
-        };
-        data.ok_or_else(|| PyKeyError::new_err("member has no file payload"))
+        let data = self.read_indices(py, &[index], password, options, volumes)?;
+        data.into_iter()
+            .next()
+            .flatten()
+            .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
     #[pyo3(signature = (name, password = None, *, options = None, volumes = None))]
@@ -679,15 +932,8 @@ impl RarFile {
             .try_iter()?
             .map(|member| self.resolve_index(py, &member?))
             .collect::<PyResult<Vec<_>>>()?;
-        let password = py_password(password)?.or_else(|| self.password.clone());
-        let options = self.extraction_options(options, password.as_deref());
-        let data = if indices.iter().any(|&index| self.needs_later_volumes(index)) {
-            self.read_from_set(py, volumes, options, &indices)?
-        } else {
-            py.detach(|| self.archive.read_members_at_with_options(&indices, options))
-                .map_err(map_error)?
-        };
-        data.into_iter()
+        self.read_indices(py, &indices, password, options, volumes)?
+            .into_iter()
             .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
             .collect()
     }
@@ -713,13 +959,18 @@ impl RarFile {
         let target = self.resolve_index(py, member)?;
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(password)?.or_else(|| self.password.clone());
-        let options = self.extraction_options(options, password.as_deref());
+        let progress = ReadProgress::new(options, "extracting");
+        let options = watched(
+            &progress,
+            self.extraction_options(options, password.as_deref()),
+        );
         let mode = OutputMode {
             overwrite,
             in_place,
             restore_times,
             flatten,
         };
+        let chosen = |index: usize| index == target;
         let extracted = if self.needs_later_volumes(target) {
             self.extract_from_set(
                 py,
@@ -728,12 +979,25 @@ impl RarFile {
                 Some(&HashSet::from([target])),
                 &out_dir,
                 mode,
-            )?
+                progress.as_ref(),
+            )
         } else {
-            py.detach(|| extract_archive(&self.archive, Some(&target), &out_dir, options, mode))
-                .map_err(map_error)?
+            if let Some(progress) = &progress {
+                progress.begin(&self.archive, &chosen, true);
+            }
+            py.detach(|| {
+                extract_archive(
+                    &self.archive,
+                    Some(&target),
+                    &out_dir,
+                    options,
+                    mode,
+                    progress.clone(),
+                )
+            })
+            .map_err(map_error)
         };
-        extracted
+        finished(&progress, extracted)?
             .warn(py)?
             .into_iter()
             .next()
@@ -786,41 +1050,53 @@ impl RarFile {
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(password)?.or_else(|| self.password.clone());
-        let options = self.extraction_options(options, password.as_deref());
-        let Some(members) = members else {
-            if volumes.is_none() && !self.archive.is_volume() {
-                return py
-                    .detach(|| {
-                        extract_archive::<HashSet<usize>>(
-                            &self.archive,
-                            None,
-                            &out_dir,
-                            options,
-                            mode,
-                        )
-                    })
-                    .map_err(map_error)?
-                    .warn(py);
-            }
-            return self
-                .extract_from_set(py, volumes, options, None, &out_dir, mode)?
-                .warn(py);
-        };
         let selected = members
-            .try_iter()?
-            .map(|member| self.resolve_index(py, &member?))
-            .collect::<PyResult<HashSet<usize>>>()?;
-        if selected
-            .iter()
-            .any(|&index| self.needs_later_volumes(index))
-        {
-            return self
-                .extract_from_set(py, volumes, options, Some(&selected), &out_dir, mode)?
-                .warn(py);
-        }
-        py.detach(|| extract_archive(&self.archive, Some(&selected), &out_dir, options, mode))
-            .map_err(map_error)?
-            .warn(py)
+            .map(|members| {
+                members
+                    .try_iter()?
+                    .map(|member| self.resolve_index(py, &member?))
+                    .collect::<PyResult<HashSet<usize>>>()
+            })
+            .transpose()?;
+        let progress = ReadProgress::new(options, "extracting");
+        let options = watched(
+            &progress,
+            self.extraction_options(options, password.as_deref()),
+        );
+        let in_set = match &selected {
+            None => volumes.is_some() || self.archive.is_volume(),
+            Some(selected) => selected
+                .iter()
+                .any(|&index| self.needs_later_volumes(index)),
+        };
+        let extracted = if in_set {
+            self.extract_from_set(
+                py,
+                volumes,
+                options,
+                selected.as_ref(),
+                &out_dir,
+                mode,
+                progress.as_ref(),
+            )
+        } else {
+            if let Some(progress) = &progress {
+                let chosen = |index: usize| selected.as_ref().is_none_or(|s| s.contains(&index));
+                progress.begin(&self.archive, &chosen, true);
+            }
+            py.detach(|| {
+                extract_archive(
+                    &self.archive,
+                    selected.as_ref(),
+                    &out_dir,
+                    options,
+                    mode,
+                    progress.clone(),
+                )
+            })
+            .map_err(map_error)
+        };
+        finished(&progress, extracted)?.warn(py)
     }
 
     /// `volumes` works as in `extractall`.
@@ -833,18 +1109,36 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let password = py_password(password)?.or_else(|| self.password.clone());
-        let options = self.extraction_options(options, password.as_deref());
+        let progress = ReadProgress::new(options, "testing");
+        let options = watched(
+            &progress,
+            self.extraction_options(options, password.as_deref()),
+        );
         let first = &self.archive;
-        if volumes.is_none() && !first.is_volume() {
-            return py
-                .detach(|| first.test_with_options(options))
-                .map_err(map_error);
+        let alone = volumes.is_none() && !first.is_volume();
+        if let Some(progress) = &progress {
+            progress.begin(first, &|_| true, alone);
         }
-        self.extract_set(py, volumes, options, |volumes| {
-            first.extract_with_volumes(volumes, options, |_| {
-                Ok(Box::new(io::sink()) as Box<dyn Write>)
+        let result = if alone {
+            py.detach(|| match &progress {
+                None => first.test_with_options(options),
+                Some(progress) => test_counted(first, options, progress),
             })
-        })
+            .map_err(map_error)
+        } else {
+            self.extract_set(py, volumes, options, |volumes| {
+                let all = |_: usize| true;
+                let volumes = tracked(progress.as_deref(), volumes, &all);
+                first.extract_with_volumes(volumes, options, |meta| {
+                    let sink = Box::new(io::sink()) as Box<dyn Write>;
+                    Ok(match &progress {
+                        Some(progress) if !meta.is_directory => progress.counted(&meta.name, sink),
+                        _ => sink,
+                    })
+                })
+            })
+        };
+        finished(&progress, result)
     }
 
     #[getter]
@@ -1237,6 +1531,7 @@ impl RarFile {
     }
 
     /// One pass over the set, so solid history and split members decode once.
+    #[allow(clippy::too_many_arguments)]
     fn extract_from_set(
         &self,
         py: Python<'_>,
@@ -1245,14 +1540,21 @@ impl RarFile {
         selected: Option<&HashSet<usize>>,
         out_dir: &Path,
         mode: OutputMode,
+        progress: Option<&Arc<ReadProgress>>,
     ) -> PyResult<Extracted> {
         let first = &self.archive;
+        let chosen = |index: usize| selected.is_none_or(|selected| selected.contains(&index));
+        if let Some(progress) = progress {
+            progress.begin(first, &chosen, false);
+        }
         self.extract_set(py, volumes, options, |volumes| {
+            let mut volumes = tracked(progress.map(Arc::as_ref), volumes, &chosen);
             let outputs = std::cell::RefCell::new(ExtractOutputs::new(
                 out_dir,
                 first.family(),
                 options,
                 mode,
+                progress.cloned(),
             ));
             let open = |meta: &rars_rs::ExtractedEntryMeta| outputs.borrow_mut().open(meta);
             let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
@@ -1261,7 +1563,7 @@ impl RarFile {
             let result = match selected {
                 Some(selected) => extract_arriving_selected(
                     first,
-                    volumes,
+                    &mut *volumes,
                     options,
                     selected,
                     self.selection_end(selected),
@@ -1283,14 +1585,20 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
         options: rars_rs::ArchiveReadOptions<'_>,
         indices: &[usize],
+        progress: Option<&Arc<ReadProgress>>,
     ) -> PyResult<Vec<Option<Vec<u8>>>> {
         let selected: HashSet<usize> = indices.iter().copied().collect();
         let buffers = Mutex::new(HashMap::new());
         let first = &self.archive;
+        let chosen = |index: usize| selected.contains(&index);
+        if let Some(progress) = progress {
+            progress.begin(first, &chosen, false);
+        }
         self.extract_set(py, volumes, options, |volumes| {
+            let mut volumes = tracked(progress.map(Arc::as_ref), volumes, &chosen);
             extract_arriving_selected(
                 first,
-                volumes,
+                &mut *volumes,
                 options,
                 &selected,
                 self.selection_end(&selected),
@@ -1303,7 +1611,11 @@ impl RarFile {
                         .lock()
                         .expect("read buffers lock poisoned")
                         .insert(index, Arc::clone(&buffer));
-                    Ok(Box::new(SharedBuffer(buffer)))
+                    let buffer = Box::new(SharedBuffer(buffer));
+                    Ok(match progress {
+                        Some(progress) => progress.counted(&meta.name, buffer),
+                        None => buffer,
+                    })
                 },
                 |_, _| Ok(()),
             )
@@ -1317,6 +1629,38 @@ impl RarFile {
                     .map(|buffer| buffer.lock().expect("read buffer lock poisoned").clone())
             })
             .collect())
+    }
+
+    fn read_indices(
+        &self,
+        py: Python<'_>,
+        indices: &[usize],
+        password: Option<&Bound<'_, PyAny>>,
+        options: Option<&ReadOptions>,
+        volumes: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Option<Vec<u8>>>> {
+        let password = py_password(password)?.or_else(|| self.password.clone());
+        let progress = ReadProgress::new(options, "reading");
+        let options = watched(
+            &progress,
+            self.extraction_options(options, password.as_deref()),
+        );
+        let data = if indices.iter().any(|&index| self.needs_later_volumes(index)) {
+            self.read_from_set(py, volumes, options, indices, progress.as_ref())
+        } else {
+            let selected: HashSet<usize> = indices.iter().copied().collect();
+            if let Some(progress) = &progress {
+                progress.begin(&self.archive, &|index| selected.contains(&index), true);
+            }
+            py.detach(|| match &progress {
+                None => self.archive.read_members_at_with_options(indices, options),
+                Some(progress) => {
+                    read_counted(&self.archive, &selected, indices, options, progress)
+                }
+            })
+            .map_err(map_error)
+        };
+        finished(&progress, data)
     }
 
     fn resolve_index(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -2916,6 +3260,7 @@ struct ExtractOutputs<'a> {
     /// Where each output went, by its stored path, for hard links and copies.
     created: HashMap<PathBuf, PathBuf>,
     skipped_links: Vec<SkippedLink>,
+    progress: Option<Arc<ReadProgress>>,
 }
 
 struct PendingOutput {
@@ -2977,6 +3322,7 @@ impl<'a> ExtractOutputs<'a> {
         family: rars_rs::ArchiveFamily,
         options: rars_rs::ArchiveReadOptions<'_>,
         mode: OutputMode,
+        progress: Option<Arc<ReadProgress>>,
     ) -> Self {
         Self {
             out_dir,
@@ -2997,6 +3343,7 @@ impl<'a> ExtractOutputs<'a> {
             published: Vec::new(),
             created: HashMap::new(),
             skipped_links: Vec::new(),
+            progress,
         }
     }
 
@@ -3046,8 +3393,16 @@ impl<'a> ExtractOutputs<'a> {
         Ok(())
     }
 
-    /// The library has verified the previous member by the time it asks for another output.
     fn open(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
+        let writer = self.open_file(meta)?;
+        Ok(match &self.progress {
+            Some(progress) if !meta.is_directory => progress.counted(&meta.name, writer),
+            _ => writer,
+        })
+    }
+
+    /// The library has verified the previous member by the time it asks for another output.
+    fn open_file(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
         self.publish_pending()?;
         if self.flatten && meta.is_directory {
             return Ok(Box::new(io::sink()));
@@ -3311,6 +3666,7 @@ fn extract_archive<S: Selection>(
     out_dir: &Path,
     options: rars_rs::ArchiveReadOptions<'_>,
     mode: OutputMode,
+    progress: Option<Arc<ReadProgress>>,
 ) -> rars_rs::Result<Extracted> {
     if options
         .cancellation
@@ -3323,6 +3679,7 @@ fn extract_archive<S: Selection>(
         archive.family(),
         options,
         mode,
+        progress,
     ));
     let result = extract_selected(archive, selected, options, &outputs);
     outputs.into_inner().finish(result)
@@ -3490,6 +3847,100 @@ fn extract_arriving_selected(
         }
         result => result,
     }
+}
+
+fn watched<'a>(
+    progress: &'a Option<Arc<ReadProgress>>,
+    options: rars_rs::ArchiveReadOptions<'a>,
+) -> rars_rs::ArchiveReadOptions<'a> {
+    match progress {
+        Some(progress) => progress.watch(options),
+        None => options,
+    }
+}
+
+fn finished<T>(progress: &Option<Arc<ReadProgress>>, result: PyResult<T>) -> PyResult<T> {
+    match progress {
+        Some(progress) => progress.finish(result),
+        None => result,
+    }
+}
+
+/// `read_members_at_with_options` keeps its buffers to itself, so a counted read chooses members the same way here.
+fn read_counted(
+    archive: &rars_rs::Archive,
+    selected: &HashSet<usize>,
+    indices: &[usize],
+    options: rars_rs::ArchiveReadOptions<'_>,
+    progress: &Arc<ReadProgress>,
+) -> rars_rs::Result<Vec<Option<Vec<u8>>>> {
+    let mut buffers = HashMap::new();
+    let last = archive
+        .member_refs()
+        .enumerate()
+        .filter(|(index, member)| {
+            selected.contains(index) && !member.is_directory() && !member.is_redirection()
+        })
+        .map(|(index, _)| index)
+        .last();
+    if let Some(last) = last {
+        let solid = archive.is_solid();
+        let mut current = 0;
+        archive.extract_with_control(options, |member| {
+            let index = current;
+            current += 1;
+            let meta = &member.meta;
+            if index > last {
+                return Ok(rars_rs::ExtractionDecision::Stop);
+            }
+            if meta.is_directory || meta.is_redirection {
+                return Ok(rars_rs::ExtractionDecision::Skip);
+            }
+            if selected.contains(&index) {
+                let buffer = Arc::new(Mutex::new(Vec::new()));
+                buffers.insert(index, Arc::clone(&buffer));
+                return Ok(rars_rs::ExtractionDecision::Extract(
+                    progress.counted(&meta.name, Box::new(SharedBuffer(buffer))),
+                ));
+            }
+            Ok(if solid {
+                rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
+            } else {
+                rars_rs::ExtractionDecision::Skip
+            })
+        })?;
+    }
+    Ok(indices
+        .iter()
+        .map(|index| {
+            buffers
+                .get(index)
+                .map(|buffer| buffer.lock().expect("read buffer lock poisoned").clone())
+        })
+        .collect())
+}
+
+/// Testing a lone archive hands over no decoded bytes, so its progress moves a member at a time.
+fn test_counted(
+    archive: &rars_rs::Archive,
+    options: rars_rs::ArchiveReadOptions<'_>,
+    progress: &ReadProgress,
+) -> rars_rs::Result<()> {
+    // The callback names regular entries and directories in archive order, skipping redirections.
+    let mut sizes = archive
+        .members()
+        .filter(|member| !member.meta.is_redirection)
+        .map(|member| (!member.meta.is_directory).then_some(member.meta.unpacked_size));
+    let mut previous = 0;
+    archive.test_with_options_and_callback(options, |meta| {
+        progress.advance(previous);
+        previous = 0;
+        if let Some(Some(size)) = sizes.next() {
+            progress.entry(&meta.name);
+            previous = size;
+        }
+        Ok(())
+    })
 }
 
 fn extracted_meta(member: &rars_rs::ArchiveMember) -> rars_rs::ExtractedEntryMeta {
@@ -4277,7 +4728,9 @@ mod tests {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
+                volume: None,
                 finished: false,
+                total_known: true,
             };
             assert_eq!(event.percentage(), None);
             event.finished = true;
@@ -4512,6 +4965,7 @@ mod tests {
                     None,
                     false,
                     None,
+                    None,
                 )
                 .unwrap();
                 let cancel_object = Py::new(py, token).unwrap();
@@ -4571,6 +5025,7 @@ mod tests {
                     restore_times: true,
                     flatten: false,
                 },
+                None,
             )
             .unwrap()
             .paths;
@@ -4587,6 +5042,7 @@ mod tests {
                     restore_times: true,
                     flatten: false,
                 },
+                None,
             )
             .map(|extracted| extracted.paths)
             .unwrap_err();
@@ -4603,6 +5059,7 @@ mod tests {
                     restore_times: true,
                     flatten: false,
                 },
+                None,
             )
             .unwrap()
             .paths;
