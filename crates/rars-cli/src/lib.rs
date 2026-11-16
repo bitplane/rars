@@ -37,7 +37,7 @@ use rars::output_staging::{failed_entry_name, refused_output};
 use rars::rar13::{
     self, FileEntry, StoredEntry as Rar13StoredEntry, WriterOptions as Rar13WriterOptions,
 };
-use rars::rar15_40::{FileEntry as Rar15FileEntry, WriterOptions as Rar15WriterOptions};
+use rars::rar15_40::WriterOptions as Rar15WriterOptions;
 use rars::{
     extract_volumes_with_links, test_volumes_with_options_and_callback, Archive as DetectedArchive,
     ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
@@ -1545,17 +1545,12 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             "--encrypt-headers needs a --password to encrypt them with",
         ));
     }
-    // Every writer below RAR 5 splits a single packed payload, so a set can
-    // only hold one member. This was a hand-written list of six versions with
-    // rar13 already missing from it, harmless only because `--format rar13`
-    // has no spelling yet: adding one would have let a set through to
-    // `owned.first()`, which archives the first input and drops the rest
-    // without a word.
-    if target.family() != rars::ArchiveFamily::Rar50Plus
+    // The RAR 1.3 writer splits a single packed payload, so its sets hold one member.
+    if matches!(AddWritePlan::for_target(target), Ok(AddWritePlan::Rar13))
         && volume_size.is_some()
         && input_paths.len() != 1
     {
-        return Err("multivolume writer supports one input file".into());
+        return Err(RAR13_VOLUME_INPUTS.into());
     }
     if matches!(target, ArchiveVersion::Rar50 | ArchiveVersion::Rar70) {
         // Quick-open indexes plaintext headers, so the two cannot combine.
@@ -1660,21 +1655,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             AddWritePlan::Rar15To40 => {
                 let entries: Vec<_> = inputs
                     .iter()
-                    .map(|input| {
-                        let entry =
-                            rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
-                                .with_file_time(input.dos_mtime)
-                                .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
-                                .with_host_os(RAR15_HOST_NATIVE);
-                        let entry = match file_comment.as_deref() {
-                            Some(comment) => entry.with_file_comment(comment.to_vec()),
-                            None => entry,
-                        };
-                        match password {
-                            Some(password) => entry.with_password(password.to_vec()),
-                            None => entry,
-                        }
-                    })
+                    .map(|input| rar15_streaming_entry(input, file_comment.as_deref(), password))
                     .collect();
                 let mut options = Rar15WriterOptions::new(target, features);
                 if let Some(level) = compression_level {
@@ -1800,6 +1781,8 @@ fn legacy_filter_policy(
     Some(rars::FilterPolicy::Explicit(FilterSpec::whole(kind)))
 }
 
+const RAR13_VOLUME_INPUTS: &str = "RAR 1.3 volume sets hold one regular input file";
+
 /// What a legacy volume set needs.
 struct LegacyVolumeWrite<'a> {
     write_plan: AddWritePlan,
@@ -1817,18 +1800,18 @@ struct LegacyVolumeWrite<'a> {
 }
 
 fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
+    progress.spinner("Scanning inputs");
     let inputs = collect_inputs(plan.input_paths)?;
+    if matches!(plan.write_plan, AddWritePlan::Rar15To40) {
+        return write_rar15_legacy_volumes(&plan, &inputs, progress);
+    }
     let [input] = inputs.as_slice() else {
-        return Err("multivolume writer supports one regular input file".into());
+        return Err(RAR13_VOLUME_INPUTS.into());
     };
     if input.is_directory {
-        return Err("multivolume writer supports one regular input file".into());
-    }
-    if matches!(plan.write_plan, AddWritePlan::Rar15To40) && !plan.compress {
-        return write_stored_legacy_volumes(&plan, input, progress);
+        return Err(RAR13_VOLUME_INPUTS.into());
     }
     warn_if_buffered_write_is_large(plan.input_paths, plan.target);
-    progress.spinner("Scanning inputs");
     let owned = read_inputs_with_progress(
         plan.input_paths,
         plan.password,
@@ -1841,10 +1824,10 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
     // Collection runs again while reading; check it too so an input tree that
     // changed since preflight cannot silently lose every member after the first.
     let [entry] = owned.as_slice() else {
-        return Err("multivolume writer supports one regular input file".into());
+        return Err(RAR13_VOLUME_INPUTS.into());
     };
     if entry.file_attr & 0x10 != 0 {
-        return Err("multivolume writer supports one regular input file".into());
+        return Err(RAR13_VOLUME_INPUTS.into());
     }
     progress.finish(format!(
         "Read 1 file ({})",
@@ -1857,25 +1840,6 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
     });
 
     let password = entry.password.as_deref().map(Vec::as_slice);
-    if matches!(plan.write_plan, AddWritePlan::Rar15To40) {
-        return plan.write_rar15_volumes(progress, |options, sink| {
-            rars::rar15_40::write_compressed_volumes_to(
-                Rar15FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.dos_mtime,
-                    file_attr: rar15_file_attr(entry.unix_mode, entry.file_attr),
-                    host_os: RAR15_HOST_NATIVE,
-                    password,
-                    file_comment: plan.file_comment,
-                },
-                options,
-                plan.volume_size,
-                sink,
-                Some(progress),
-            )
-        });
-    }
     let mut options = Rar13WriterOptions::new(plan.target, plan.features());
     if let Some(level) = plan.compression_level {
         options = options.with_compression_level(level);
@@ -1917,35 +1881,68 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
     Ok(())
 }
 
-/// Stored RAR 1.5 to 4.x sets copy straight from the source, so nothing is held.
-fn write_stored_legacy_volumes(
+/// Stored members copy straight from their sources; a compressed one is held only while it is coded.
+fn write_rar15_legacy_volumes(
     plan: &LegacyVolumeWrite<'_>,
-    input: &input::LazyInput,
+    inputs: &[input::LazyInput],
     progress: &CliProgress,
 ) -> CliResult<()> {
-    let entry = rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
-        .with_file_time(input.dos_mtime)
-        .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
-        .with_host_os(RAR15_HOST_NATIVE);
-    let entry = match plan.file_comment {
-        Some(comment) => entry.with_file_comment(comment.to_vec()),
-        None => entry,
+    if plan.compress {
+        warn_if_buffered_write_is_large(plan.input_paths, plan.target);
+    }
+    let total: u64 = inputs.iter().map(|input| input.size).sum();
+    progress.finish(format!(
+        "Found {} entries ({})",
+        inputs.len(),
+        indicatif::HumanBytes(total)
+    ));
+    let entries: Vec<_> = inputs
+        .iter()
+        .map(|input| rar15_streaming_entry(input, plan.file_comment, plan.password))
+        .collect();
+    let coding = if plan.compress {
+        rars::rar15_40::MemberCoding::Compressed
+    } else {
+        rars::rar15_40::MemberCoding::Stored
     };
-    let entry = match plan.password {
-        Some(password) => entry.with_password(password.to_vec()),
-        None => entry,
-    };
-    progress.bar("Writing volumes", input.size);
+    progress.bar(
+        if plan.compress {
+            "Compressing volumes"
+        } else {
+            "Writing volumes"
+        },
+        total,
+    );
     plan.write_rar15_volumes(progress, |options, sink| {
-        rars::rar15_40::write_stored_volumes_to(
-            &entry,
+        rars::rar15_40::write_volumes_to(
+            &entries,
             options,
+            coding,
             plan.volume_size,
             sink,
             &rars::WriterResources::default(),
             Some(progress),
         )
     })
+}
+
+fn rar15_streaming_entry(
+    input: &input::LazyInput,
+    file_comment: Option<&[u8]>,
+    password: Option<&[u8]>,
+) -> rars::rar15_40::StreamingEntry {
+    let entry = rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
+        .with_file_time(input.dos_mtime)
+        .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
+        .with_host_os(RAR15_HOST_NATIVE);
+    let entry = match file_comment {
+        Some(comment) => entry.with_file_comment(comment.to_vec()),
+        None => entry,
+    };
+    match password {
+        Some(password) => entry.with_password(password.to_vec()),
+        None => entry,
+    }
 }
 
 impl LegacyVolumeWrite<'_> {
@@ -2121,22 +2118,27 @@ fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersi
     let Ok(inputs) = collect_inputs(input_paths) else {
         return;
     };
-    let total: u64 = inputs.iter().map(|entry| entry.size).sum();
-    if total < WARN_THRESHOLD {
+    // RAR 1.3 holds the whole set; later formats hold one member at a time.
+    let held = if target == ArchiveVersion::Rar14 {
+        inputs.iter().map(|entry| entry.size).sum()
+    } else {
+        inputs.iter().map(|entry| entry.size).max().unwrap_or(0)
+    };
+    if held < WARN_THRESHOLD {
         return;
     }
 
-    let total = indicatif::HumanBytes(total);
+    let held = indicatif::HumanBytes(held);
     if target == ArchiveVersion::Rar14 {
         eprintln!(
             "warning: --format {target} builds a volume set in memory, so this write needs \
-             several times the {total} of input and may run out; --format rar50 splits as it goes"
+             several times the {held} of input and may run out; --format rar50 splits as it goes"
         );
     } else {
         eprintln!(
-            "warning: --format {target} compresses the member in memory, so this write holds it, \
-             its packed form and the encoder's working memory, several times the {total} of \
-             input, and may run out; --format rar50 splits as it goes"
+            "warning: --format {target} compresses each member in memory, so this write holds \
+             the largest, its packed form and the encoder's working memory, several times its \
+             {held}, and may run out; --format rar50 splits as it goes"
         );
     }
 }
@@ -2782,8 +2784,8 @@ mod tests {
             if expected_warnings != 0 {
                 assert!(stderr.contains("--format rar14 builds a volume set in memory"));
                 assert!(stderr.contains(
-                    "--format rar40 compresses the member in memory, so this write holds it, \
-                     its packed form and the encoder's working memory"
+                    "--format rar40 compresses each member in memory, so this write holds \
+                     the largest, its packed form and the encoder's working memory"
                 ));
                 assert_eq!(
                     stderr.matches("--format rar50 splits as it goes").count(),
