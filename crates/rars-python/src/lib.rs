@@ -153,8 +153,9 @@ impl From<rars_rs::RecoveryRepairReport> for RepairReport {
 
 #[pyclass(frozen, module = "rars")]
 struct RepairResult {
+    /// None when `repair(output=)` wrote it to a file.
     #[pyo3(get)]
-    data: Vec<u8>,
+    data: Option<Vec<u8>>,
     #[pyo3(get)]
     report: RepairReport,
 }
@@ -259,7 +260,8 @@ struct ReadOptions {
     /// Caps members decoded side by side and a large RAR 5 member's block decoders; 0 or 1 keeps the call on the calling thread.
     #[pyo3(get)]
     threads: Option<usize>,
-    /// Beside `cancellation` because a callback that raises cancels the read the same way.
+    /// Set per call from `progress=`, beside `cancellation` because a callback
+    /// that raises cancels the read the same way.
     progress: Option<Arc<Py<PyAny>>>,
 }
 
@@ -267,9 +269,8 @@ struct ReadOptions {
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, cancellation=None, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None, progress=None))]
+    #[pyo3(signature = (*, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
     fn new(
-        cancellation: Option<&CancellationToken>,
         max_member_output_bytes: Option<u64>,
         max_total_output_bytes: Option<u64>,
         max_reader_workspace_bytes: Option<u64>,
@@ -280,11 +281,7 @@ impl ReadOptions {
         legacy_name_encoding: Option<String>,
         allow_rar3_vm_programs: bool,
         threads: Option<usize>,
-        progress: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
-        if progress.is_some_and(|progress| !progress.is_callable()) {
-            return Err(PyValueError::new_err("progress must be callable"));
-        }
         let encoding = legacy_name_encoding
             .as_deref()
             .map(str::parse)
@@ -293,7 +290,7 @@ impl ReadOptions {
         Ok(Self {
             legacy_name_encoding,
             encoding,
-            cancellation: cancellation.map(|token| token.inner.clone()),
+            cancellation: None,
             max_member_output_bytes,
             max_total_output_bytes,
             max_reader_workspace_bytes,
@@ -303,23 +300,34 @@ impl ReadOptions {
             max_header_bytes,
             allow_rar3_vm_programs,
             threads,
-            progress: progress.map(|progress| Arc::new(progress.clone().unbind())),
+            progress: None,
         })
     }
+}
 
-    /// Called with a `ProgressEvent` by `read`, `read_many`, `extract`, `extractall` and `testrar`, a few times a second at most; an exception it raises stops the call and is re-raised.
-    #[getter]
-    fn progress(&self, py: Python<'_>) -> Option<Py<PyAny>> {
-        self.progress
-            .as_ref()
-            .map(|progress| progress.clone_ref(py))
-    }
-
-    #[getter]
-    fn cancellation(&self) -> Option<CancellationToken> {
-        self.cancellation.as_ref().map(|inner| CancellationToken {
-            inner: inner.clone(),
-        })
+impl ReadOptions {
+    /// One call's options: the caller's policies plus that call's `progress=`,
+    /// called with a `ProgressEvent` a few times a second at most, and its
+    /// `cancellation=`. An exception the callback raises stops the call and is re-raised.
+    fn for_call(
+        options: Option<&Self>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Option<Self>> {
+        if progress.is_none() && cancellation.is_none() {
+            return Ok(options.cloned());
+        }
+        if progress.is_some_and(|progress| !progress.is_callable()) {
+            return Err(PyValueError::new_err("progress must be callable"));
+        }
+        let mut call = options.cloned().unwrap_or_default();
+        if let Some(token) = cancellation {
+            call.cancellation = Some(token.inner.clone());
+        }
+        if let Some(progress) = progress {
+            call.progress = Some(Arc::new(progress.clone().unbind()));
+        }
+        Ok(Some(call))
     }
 }
 
@@ -921,16 +929,20 @@ impl RarFile {
     /// open and unchanged while the archive is, and its position is left wherever reading
     /// ended; a stream that can't seek is read whole from where it is.
     #[new]
-    #[pyo3(signature = (source, mode = "r", password = None, *, options = None, first_volume_only = false, volumes = None))]
+    #[pyo3(signature = (source, mode = "r", password = None, *, options = None, cancellation = None, first_volume_only = false, volumes = None))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn new(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
         mode: &str,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        cancellation: Option<&CancellationToken>,
         first_volume_only: bool,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let options = call_options.as_ref();
         if mode != "r" {
             return Err(PyNotImplementedError::new_err(
                 "RarFile currently opens archives for reading; use RarBuilder to create or rewrite archives",
@@ -954,15 +966,18 @@ impl RarFile {
 
     #[staticmethod]
     #[pyo3(name = "from_bytes")]
-    #[pyo3(signature = (data, password = None, *, options = None, first_volume_only = false, volumes = None))]
+    #[pyo3(signature = (data, password = None, *, options = None, cancellation = None, first_volume_only = false, volumes = None))]
     fn from_bytes_py(
         py: Python<'_>,
         data: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        cancellation: Option<&CancellationToken>,
         first_volume_only: bool,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
+        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let options = call_options.as_ref();
         let volumes = stored_volumes(
             volumes,
             options.and_then(|options| options.cancellation.as_ref()),
@@ -1001,15 +1016,20 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
-    #[pyo3(signature = (name, password = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (name, password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
+        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, name)?;
         let data = self.read_indices(py, &[index], password, options, volumes)?;
@@ -1019,16 +1039,21 @@ impl RarFile {
             .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
     }
 
-    #[pyo3(signature = (name, password = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (name, password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn open(
         &self,
         py: Python<'_>,
         name: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let data = self.read(py, name, password, options, volumes)?;
+        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let options = call_options.as_ref();
+        let data = self.read(py, name, password, options, None, None, volumes)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -1036,15 +1061,20 @@ impl RarFile {
 
     /// Read selected members in one session, preserving request order and duplicates.
     /// Output limits apply to the whole call, including required solid predecessors.
-    #[pyo3(signature = (members, password = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (members, password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read_many(
         &self,
         py: Python<'_>,
         members: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
+        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let indices = members
             .try_iter()?
@@ -1057,7 +1087,7 @@ impl RarFile {
     }
 
     /// `overwrite`, `in_place`, `flatten` and `volumes` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    #[pyo3(signature = (member, path = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -1067,11 +1097,15 @@ impl RarFile {
         password: Option<&Bound<'_, PyAny>>,
         overwrite: Overwrite,
         options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
         in_place: bool,
         flatten: bool,
     ) -> PyResult<PathBuf> {
+        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let Overwrite(overwrite) = overwrite;
         let target = self.resolve_index(py, member)?;
@@ -1144,7 +1178,7 @@ impl RarFile {
     /// or `"rename"` to write beside it as `name(N).ext`. `flatten=True` writes
     /// every file straight into `path` under its base name and creates no
     /// directories; symlinks are kept only when they point at a bare name.
-    #[pyo3(signature = (path = None, members = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    #[pyo3(signature = (path = None, members = None, password = None, overwrite = Overwrite(OverwritePolicy::Never), *, options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1154,11 +1188,15 @@ impl RarFile {
         password: Option<&Bound<'_, PyAny>>,
         overwrite: Overwrite,
         options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
         in_place: bool,
         flatten: bool,
     ) -> PyResult<Vec<PathBuf>> {
+        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let mode = OutputMode {
             overwrite: overwrite.0,
@@ -1218,14 +1256,18 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`.
-    #[pyo3(signature = (password = None, *, options = None, volumes = None))]
+    #[pyo3(signature = (password = None, *, options = None, progress = None, cancellation = None, volumes = None))]
     fn testrar(
         &self,
         py: Python<'_>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "testing");
         let options = watched(
@@ -1265,17 +1307,20 @@ impl RarFile {
 
     #[getter]
     fn comment(&self, py: Python<'_>) -> PyResult<Option<Vec<u8>>> {
-        self.read_comment(py, None, None)
+        self.read_comment(py, None, None, None)
     }
 
     /// Returns the complete archive comment, or None if absent, under per-call read policies.
-    #[pyo3(signature = (password = None, *, options = None))]
+    #[pyo3(signature = (password = None, *, options = None, cancellation = None))]
     fn read_comment(
         &self,
         py: Python<'_>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
+        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         py.detach(|| {
             self.archive
@@ -1290,14 +1335,17 @@ impl RarFile {
     }
 
     /// Returns the decoded comment attached to a member, or None if absent.
-    #[pyo3(signature = (member, password = None, *, options = None))]
+    #[pyo3(signature = (member, password = None, *, options = None, cancellation = None))]
     fn getcomment(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
+        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
         let password = py_password(password)?.or_else(|| self.password.clone());
@@ -1309,14 +1357,17 @@ impl RarFile {
 
     /// Returns raw target bytes for a supported RAR5 or legacy Unix link.
     /// This reads archive metadata and never follows the link.
-    #[pyo3(signature = (member, password = None, *, options = None))]
+    #[pyo3(signature = (member, password = None, *, options = None, cancellation = None))]
     fn readlink(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
+        cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<u8>> {
+        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
         let password = py_password(password)?.or_else(|| self.password.clone());
@@ -1339,13 +1390,16 @@ impl RarFile {
     }
 
     /// Exact Unix nanoseconds, absent kinds omitted; no `password` since headers were decrypted at open.
-    #[pyo3(signature = (member, *, options = None))]
+    #[pyo3(signature = (member, *, options = None, cancellation = None))]
     fn gettimes(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
         options: Option<&ReadOptions>,
+        cancellation: Option<&CancellationToken>,
     ) -> PyResult<HashMap<String, i128>> {
+        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
         let options = self.extraction_options(options, self.password.as_deref());
@@ -2213,7 +2267,7 @@ impl RarBuilder {
                 first: SetListing::new(archive.first.infos.clone()),
                 whole: OnceLock::new(),
             },
-            Err(_) => RarFile::new(py, source, "r", password, None, false, None)?,
+            Err(_) => RarFile::new(py, source, "r", password, None, None, false, None)?,
         };
         let password = archive.password.clone();
         if preserve {
@@ -2887,13 +2941,16 @@ fn probe_source(
 
 /// Candidates are taken one at a time, and none after the first proved correct.
 #[pyfunction]
-#[pyo3(signature = (source, candidates, *, options = None))]
+#[pyo3(signature = (source, candidates, *, options = None, cancellation = None))]
 fn check_password(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     candidates: &Bound<'_, PyAny>,
     options: Option<&ReadOptions>,
+    cancellation: Option<&CancellationToken>,
 ) -> PyResult<PasswordCheck> {
+    let call_options = ReadOptions::for_call(options, None, cancellation)?;
+    let options = call_options.as_ref();
     check_read_options_cancellation(options)?;
     let read_options = python_read_options(options, None);
     let (probe, path) = match py_bytes_like(source)? {
@@ -2954,75 +3011,49 @@ fn check_password(
     })
 }
 
+/// With `output=`, the repaired archive replaces that file only once the repair
+/// succeeds and `data` is None; otherwise `data` holds it.
 #[pyfunction]
-#[pyo3(signature = (source, password = None, *, cancellation = None))]
+#[pyo3(signature = (source, password = None, *, output = None, options = None, cancellation = None))]
 fn repair(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
+    output: Option<&Bound<'_, PyAny>>,
+    options: Option<&ReadOptions>,
     cancellation: Option<&CancellationToken>,
-) -> PyResult<Vec<u8>> {
+) -> PyResult<RepairResult> {
     check_python_cancellation(cancellation)?;
+    let call_options = ReadOptions::for_call(options, None, cancellation)?;
+    let options = call_options.as_ref();
+    let output = output.map(|output| py_path_buf(py, output)).transpose()?;
     let password = py_password(password)?;
     let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
-    py.detach(|| repair_core(&bytes, password.as_deref(), cancellation).map(|result| result.data))
-        .map_err(map_error)
+    py.detach(|| {
+        let result = repair_core(&bytes, python_read_options(options, password.as_deref()))?;
+        let report = result.report.into();
+        let data = match output {
+            Some(output) => {
+                result.write_to_path(&output, cancellation.map(|token| &token.inner))?;
+                None
+            }
+            None => Some(result.data),
+        };
+        Ok(RepairResult { data, report })
+    })
+    .map_err(map_error)
 }
 
 /// A parsing cancellation must not start the damaged-header fallback.
 fn repair_core(
     bytes: &[u8],
-    password: Option<&[u8]>,
-    cancellation: Option<&CancellationToken>,
+    options: rars_rs::ArchiveReadOptions<'_>,
 ) -> rars_rs::Result<rars_rs::RecoveryRepairResult> {
-    let mut options = rars_rs::ArchiveReadOptions::with_optional_password(password);
-    options.cancellation = cancellation.map(|token| &token.inner);
     match rars_rs::ArchiveReader::read_with_options(bytes, options) {
         Ok(archive) => archive.repair_recovery_with_options(options),
         Err(error) if error.kind() == rars_rs::ErrorKind::Cancelled => Err(error),
         Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(bytes, options),
     }
-}
-
-#[pyfunction]
-#[pyo3(signature = (source, password = None, *, cancellation = None))]
-fn repair_detailed(
-    py: Python<'_>,
-    source: &Bound<'_, PyAny>,
-    password: Option<&Bound<'_, PyAny>>,
-    cancellation: Option<&CancellationToken>,
-) -> PyResult<RepairResult> {
-    check_python_cancellation(cancellation)?;
-    let password = py_password(password)?;
-    let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
-    py.detach(|| {
-        let result = repair_core(&bytes, password.as_deref(), cancellation)?;
-        Ok(RepairResult {
-            data: result.data,
-            report: result.report.into(),
-        })
-    })
-    .map_err(map_error)
-}
-
-#[pyfunction]
-#[pyo3(signature = (input, output, password = None, *, cancellation = None))]
-fn repair_to_path(
-    py: Python<'_>,
-    input: &Bound<'_, PyAny>,
-    output: &Bound<'_, PyAny>,
-    password: Option<&Bound<'_, PyAny>>,
-    cancellation: Option<&CancellationToken>,
-) -> PyResult<()> {
-    check_python_cancellation(cancellation)?;
-    let output = py_path_buf(py, output)?;
-    let password = py_password(password)?;
-    let bytes = py_input_bytes_with_cancellation(py, input, cancellation)?;
-    py.detach(|| {
-        let result = repair_core(&bytes, password.as_deref(), cancellation)?;
-        result.write_to_path(&output, cancellation.map(|token| &token.inner))
-    })
-    .map_err(map_error)
 }
 
 #[pymodule]
@@ -3041,8 +3072,6 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_rarfile, m)?)?;
     m.add_function(wrap_pyfunction!(is_rarfile_sfx, m)?)?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
-    m.add_function(wrap_pyfunction!(repair_detailed, m)?)?;
-    m.add_function(wrap_pyfunction!(repair_to_path, m)?)?;
     m.add("Error", py.get_type::<Error>())?;
     m.add("BadRarFile", py.get_type::<BadRarFile>())?;
     m.add("BadPassword", py.get_type::<BadPassword>())?;
@@ -4689,10 +4718,12 @@ mod tests {
                 Some(&options),
             )
             .unwrap();
-            file.testrar(py, None, Some(&options), None).unwrap();
+            file.testrar(py, None, Some(&options), None, None, None)
+                .unwrap();
             let first = PyString::new(py, &file.first.infos[0].filename);
             for _ in 0..2 {
-                file.read(py, &first, None, Some(&options), None).unwrap();
+                file.read(py, &first, None, Some(&options), None, None, None)
+                    .unwrap();
                 file.extract(
                     py,
                     &first,
@@ -4700,6 +4731,8 @@ mod tests {
                     None,
                     Overwrite(OverwritePolicy::Always),
                     Some(&options),
+                    None,
+                    None,
                     None,
                     true,
                     false,
@@ -4713,6 +4746,8 @@ mod tests {
                     None,
                     Overwrite(OverwritePolicy::Always),
                     Some(&options),
+                    None,
+                    None,
                     None,
                     true,
                     false,
@@ -4770,7 +4805,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            file.testrar(py, None, Some(&options), Some(&later))
+            file.testrar(py, None, Some(&options), None, None, Some(&later))
                 .unwrap();
             assert_eq!(rars_rs::crypto::rar50_key_derivations() - before, 1);
         });
@@ -4832,6 +4867,8 @@ mod tests {
                     Overwrite(OverwritePolicy::Always),
                     Some(&options),
                     None,
+                    None,
+                    None,
                     true,
                     false,
                     false,
@@ -4860,8 +4897,10 @@ mod tests {
             .unwrap();
             let first = PyString::new(py, &file.first.infos[0].filename);
             for _ in 0..2 {
-                file.testrar(py, None, Some(&options), None).unwrap();
-                file.read(py, &first, None, Some(&options), None).unwrap();
+                file.testrar(py, None, Some(&options), None, None, None)
+                    .unwrap();
+                file.read(py, &first, None, Some(&options), None, None, None)
+                    .unwrap();
                 file.extract(
                     py,
                     &first,
@@ -4869,6 +4908,8 @@ mod tests {
                     None,
                     Overwrite(OverwritePolicy::Always),
                     Some(&options),
+                    None,
+                    None,
                     None,
                     true,
                     false,
@@ -5037,7 +5078,8 @@ mod tests {
     fn repair_parse_cancellation_does_not_enter_damaged_header_fallback() {
         let token = CancellationToken::new();
         token.cancel();
-        let error = repair_core(b"not an archive", None, Some(&token)).unwrap_err();
+        let options = rars_rs::ArchiveReadOptions::default().with_cancellation(&token.inner);
+        let error = repair_core(b"not an archive", options).unwrap_err();
         assert_eq!(error.kind(), rars_rs::ErrorKind::Cancelled);
     }
 
@@ -5139,21 +5181,10 @@ mod tests {
                     password: None,
                 };
                 let token = CancellationToken::new();
-                let options = ReadOptions::new(
-                    Some(&token),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    false,
-                    None,
-                    None,
-                )
-                .unwrap();
+                let options =
+                    ReadOptions::new(None, None, None, None, None, None, None, None, false, None)
+                        .unwrap();
+                let cancellation = token.clone();
                 let cancel_object = Py::new(py, token).unwrap();
                 armed.store(true, Ordering::Relaxed);
                 let worker = std::thread::spawn(move || {
@@ -5165,7 +5196,15 @@ mod tests {
                 });
                 let name = PyBytes::new(py, b"file");
                 let error = file
-                    .read(py, name.as_any(), None, Some(&options), None)
+                    .read(
+                        py,
+                        name.as_any(),
+                        None,
+                        Some(&options),
+                        None,
+                        Some(&cancellation),
+                        None,
+                    )
                     .unwrap_err();
                 py.detach(|| worker.join().unwrap());
                 assert!(
@@ -5173,7 +5212,8 @@ mod tests {
                     "{format}: {error}"
                 );
                 assert_eq!(
-                    file.read(py, name.as_any(), None, None, None).unwrap(),
+                    file.read(py, name.as_any(), None, None, None, None, None)
+                        .unwrap(),
                     b"payload"
                 );
             }

@@ -56,7 +56,7 @@ def test_path_open_parses_cancellably(tmp_path):
     token = rars.CancellationToken()
     token.cancel()
     with pytest.raises(InterruptedError):
-        rars.RarFile(archive, options=rars.ReadOptions(cancellation=token))
+        rars.RarFile(archive, cancellation=token)
     assert rars.RarFile(archive).read("member") == b"payload"
 
 

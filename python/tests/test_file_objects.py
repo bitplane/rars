@@ -115,14 +115,14 @@ def damaged_archive():
 
 def test_repair_takes_file_objects(tmp_path):
     data = damaged_archive()
-    expected = rars.repair(data)
+    expected = rars.repair(data).data
     path = tmp_path / "damaged.rar"
     path.write_bytes(data)
     with path.open("rb") as file:
         file.read(10)
-        assert rars.repair(file) == expected
-        assert rars.repair_detailed(io.BytesIO(data)).data == expected
-        rars.repair_to_path(Stream(data), tmp_path / "repaired.rar")
+        assert rars.repair(file).data == expected
+        assert rars.repair(io.BytesIO(data)).data == expected
+        assert rars.repair(Stream(data), output=tmp_path / "repaired.rar").data is None
     assert (tmp_path / "repaired.rar").read_bytes() == expected
     assert rars.RarFile(expected).read("file") == b"recoverable payload " * 1000
 
