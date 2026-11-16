@@ -345,6 +345,11 @@ impl Builder {
     /// Split the output into volumes of at most this many bytes.
     /// [`build_volumes`](Self::build_volumes) requires it; the single-archive
     /// entry points refuse to run while it is set.
+    /// Whether a volume size is set, so the output is a volume set.
+    pub fn splits_into_volumes(&self) -> bool {
+        self.volume_size.is_some()
+    }
+
     pub fn volume_size(mut self, size: Option<usize>) -> Self {
         self.volume_size = size;
         self
