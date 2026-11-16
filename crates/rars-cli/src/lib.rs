@@ -21,7 +21,7 @@ mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
-use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress};
+use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress, StoredTime};
 use output::{
     create_link_output, open_output_writer, print_ok_entry, rar50_output_relative_path,
     restore_output_metadata, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
@@ -899,7 +899,6 @@ impl<'a> ExtractOutputState<'a> {
             // In place, `Rename` chose the name when it opened.
             path: if self.in_place { path } else { destination },
             meta: meta.clone(),
-            family: self.family,
             restore_metadata: true,
         });
         Ok(writer)
@@ -957,7 +956,6 @@ impl<'a> ExtractOutputState<'a> {
             stored,
             path: if self.in_place { path } else { destination },
             meta: meta.clone(),
-            family: self.family,
             restore_metadata,
         });
         Ok(())
@@ -1092,10 +1090,7 @@ impl<'a> ExtractOutputState<'a> {
         destination: &Path,
         meta: &rars::ExtractedEntryMeta,
     ) -> rars::Result<()> {
-        if meta.is_directory
-            && time::extracted_system_time(self.family, meta.file_time, meta.mtime_refinement)
-                .is_none()
-        {
+        if meta.is_directory && meta.modified.is_none() {
             match fs::metadata(destination) {
                 Ok(metadata) if metadata.is_dir() => self
                     .directory_times
@@ -1700,7 +1695,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                     .map(|input| {
                         let entry =
                             rars::rar13::StreamingEntry::new(input.name.clone(), input.source())
-                                .with_file_time(input.dos_mtime)
+                                .with_file_time(input.dos_time())
                                 .with_file_attr(input.file_attr);
                         let entry = match file_comment.as_deref() {
                             Some(comment) => entry.with_file_comment(comment.to_vec()),
@@ -1849,7 +1844,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
             FileEntry {
                 name: &entry.name,
                 data: &entry.data,
-                file_time: entry.dos_mtime,
+                file_time: entry.dos_time(),
                 file_attr: entry.file_attr,
                 password,
                 file_comment: plan.file_comment,
@@ -1863,7 +1858,7 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
             Rar13StoredEntry {
                 name: &entry.name,
                 data: &entry.data,
-                file_time: entry.dos_mtime,
+                file_time: entry.dos_time(),
                 file_attr: entry.file_attr,
                 password,
                 file_comment: plan.file_comment,
@@ -1932,7 +1927,7 @@ fn rar15_streaming_entry(
     password: Option<&[u8]>,
 ) -> rars::rar15_40::StreamingEntry {
     let entry = rars::rar15_40::StreamingEntry::new(input.name.clone(), input.source())
-        .with_file_time(input.dos_mtime)
+        .with_file_time(input.dos_time())
         .with_file_attr(rar15_file_attr(input.unix_mode, input.file_attr))
         .with_host_os(RAR15_HOST_NATIVE);
     let entry = match file_comment {
@@ -2011,6 +2006,7 @@ fn write_plain_rar50_streaming(
         .into_iter()
         .map(|entry| {
             let source = entry.source();
+            let mtime = entry.unix_seconds();
             let name = if cfg!(unix) {
                 rars::filename::encode_rar50(&entry.name).into_owned()
             } else {
@@ -2018,7 +2014,7 @@ fn write_plain_rar50_streaming(
             };
             let entry = rars::rar50::ArchiveEntry::new(name, source)
                 .with_directory(entry.is_directory)
-                .with_mtime(entry.unix_mtime)
+                .with_mtime(mtime)
                 .with_attributes(u64::from(
                     entry
                         .unix_mode

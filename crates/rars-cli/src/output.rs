@@ -1,5 +1,5 @@
 use crate::CliResult;
-use rars::{Archive as DetectedArchive, ArchiveFamily, AttrSource, Error, ExtractedEntryMeta};
+use rars::{Archive as DetectedArchive, AttrSource, Error, ExtractedEntryMeta};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,7 +11,6 @@ pub(crate) struct ExtractedOutput {
     pub(crate) stored: PathBuf,
     pub(crate) path: PathBuf,
     pub(crate) meta: ExtractedEntryMeta,
-    pub(crate) family: ArchiveFamily,
     pub(crate) restore_metadata: bool,
 }
 
@@ -77,7 +76,7 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         .collect();
     let mut times = rars::output_times::OutputTimes::new();
     for output in &restored {
-        times.opened(output.path.clone(), output.family, &output.meta);
+        times.opened(output.path.clone(), &output.meta);
     }
     times.finish();
     times.restore()?;
@@ -570,7 +569,10 @@ mod tests {
         use super::*;
         let dir = scratch("metadata-errors");
         for directory in [false, true] {
-            for timestamp in [None, Some(1_704_067_200)] {
+            for timestamp in [
+                None,
+                Some(rars::Timestamp::from_unix_seconds(1_704_067_200)),
+            ] {
                 let output = ExtractedOutput {
                     name: b"missing".to_vec(),
                     stored: PathBuf::new(),
@@ -582,7 +584,6 @@ mod tests {
                         directory,
                     )
                     .with_attr_source(AttrSource::Unix),
-                    family: ArchiveFamily::Rar50Plus,
                     restore_metadata: false,
                 };
                 restore_output_metadata(std::slice::from_ref(&output)).unwrap();
@@ -1043,16 +1044,24 @@ mod tests {
                 name: b"payload.exe".to_vec(),
                 stored: std::path::PathBuf::new(),
                 path: file,
-                meta: ExtractedEntryMeta::new(b"payload.exe".to_vec(), 1_704_067_200, 0x20, false),
-                family: ArchiveFamily::Rar50Plus,
+                meta: ExtractedEntryMeta::new(
+                    b"payload.exe".to_vec(),
+                    Some(rars::Timestamp::from_unix_seconds(1_704_067_200)),
+                    0x20,
+                    false,
+                ),
                 restore_metadata: true,
             },
             ExtractedOutput {
                 name: b"nested".to_vec(),
                 stored: std::path::PathBuf::new(),
                 path: dir,
-                meta: ExtractedEntryMeta::new(b"nested".to_vec(), 1_704_067_200, 0x10, true),
-                family: ArchiveFamily::Rar50Plus,
+                meta: ExtractedEntryMeta::new(
+                    b"nested".to_vec(),
+                    Some(rars::Timestamp::from_unix_seconds(1_704_067_200)),
+                    0x10,
+                    true,
+                ),
                 restore_metadata: true,
             },
         ];
@@ -1091,12 +1100,13 @@ mod tests {
                     path: paths[index].clone(),
                     meta: ExtractedEntryMeta::new(
                         name,
-                        1_704_067_200 + index as u32,
+                        Some(rars::Timestamp::from_unix_seconds(
+                            1_704_067_200 + index as i64,
+                        )),
                         0o040000,
                         true,
                     )
                     .with_attr_source(rars::AttrSource::Unix),
-                    family: ArchiveFamily::Rar50Plus,
                     restore_metadata: true,
                 }
             })

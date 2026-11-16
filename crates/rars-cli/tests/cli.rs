@@ -1620,7 +1620,10 @@ fn create_and_extract_preserve_mtime_and_permissions() {
     let archive = rars::ArchiveReader::read_path(&archive).unwrap();
     let members: Vec<_> = archive.members().collect();
     assert_eq!(members.len(), 1);
-    assert_eq!(members[0].meta.file_time, Some(1_700_000_002));
+    assert_eq!(
+        members[0].meta.modification_time(),
+        Some(rars::Timestamp::from_unix_seconds(1_700_000_002))
+    );
     assert_eq!(members[0].meta.file_attr & 0o777, 0o640);
 
     let extract = rars()
