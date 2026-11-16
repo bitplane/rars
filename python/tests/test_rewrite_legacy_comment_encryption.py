@@ -20,12 +20,12 @@ def test_comments_survive_encrypted_headers_and_cmt_combinations(tmp_path, encry
         builder.set_file_comment("file", b"first comment")
         builder.set_file_comment("directory", b"")
     original = builder.to_bytes()
-    source = rars.RarFile.from_bytes(original, password="password")
+    source = rars.RarFile(original, password="password")
     assert source.comment == b"archive comment"
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password="password")
+    output = rars.RarFile(data, password="password")
     assert output.rewrite_preservation_issues() == []
     assert output.comment == source.comment
     assert output.read("renamed") == b"data " * 100
@@ -35,7 +35,7 @@ def test_comments_survive_encrypted_headers_and_cmt_combinations(tmp_path, encry
         assert output.getcomment("directory") == b""
     if encrypted_headers:
         with pytest.raises(rars.PasswordRequired):
-            rars.RarFile.from_bytes(data)
+            rars.RarFile(data)
     if not file_comments:
         check_unrar(tmp_path, data)
     elif shutil.which("unrar"):
@@ -67,16 +67,16 @@ def encrypted_comment_source():
 
 
 def test_encrypted_archive_comment_retains_password_with_plain_members(tmp_path):
-    source = rars.RarFile.from_bytes(encrypted_comment_source(), password="password")
+    source = rars.RarFile(encrypted_comment_source(), password="password")
     assert source.comment == b"secret archive comment"
     data = rars.RarBuilder.from_archive(source).to_bytes()
-    output = rars.RarFile.from_bytes(data, password="password")
+    output = rars.RarFile(data, password="password")
     assert output.comment == source.comment
     assert not output.getinfo("plain").is_encrypted
     assert output.read("plain") == b"public"
     assert next(flags for _, _, flags, _ in service_headers(data, b"CMT")) & 0x404 == 0x404
     with pytest.raises(rars.PasswordRequired):
-        rars.RarFile.from_bytes(data).comment
+        rars.RarFile(data).comment
     check_unrar(tmp_path, data)
     if shutil.which("unrar"):
         result = subprocess.run(["unrar", "l", "-ppassword", str(tmp_path / "rewritten.rar")], capture_output=True, check=True)
@@ -88,7 +88,7 @@ def test_encrypted_comment_failure_leaves_destination_intact(tmp_path, password)
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises((rars.PasswordRequired, rars.BadPassword, rars.BadRarFile)):
-        source = rars.RarFile.from_bytes(encrypted_comment_source(), password=password)
+        source = rars.RarFile(encrypted_comment_source(), password=password)
         rars.RarBuilder.from_archive(source).write(destination)
     assert destination.read_bytes() == b"keep"
 

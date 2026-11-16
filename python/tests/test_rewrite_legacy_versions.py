@@ -25,10 +25,10 @@ def test_mixed_unpackers_keep_archive_requirement_even_after_removing_newer_memb
     first = versioned_file(versions[0], "first", password)
     second = versioned_file(versions[1], "second")
     start = next(offset for offset, kind, _, _ in headers(second) if kind == 0x74)
-    source = rars.RarFile.from_bytes(without_end_block(first) + second[start:], password=password)
+    source = rars.RarFile(without_end_block(first) + second[start:], password=password)
     editor = rars.RarBuilder.from_archive(source)
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password=password)
+    output = rars.RarFile(data, password=password)
     assert output.read("first") == b"first" * 100
     assert output.read("second") == b"second" * 100
     assert output.getinfo("first").is_encrypted == (password is not None)
@@ -51,12 +51,12 @@ def test_rar15_dos_directory_without_later_directory_marker(tmp_path):
     struct.pack_into("<H", data, offset + 3, flags & ~0xe0)
     data[offset + 25] = 0x33  # Vintage directory method marker; there is no payload.
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     assert source.getinfo("directory").is_dir()
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("directory", "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data)
+    output = rars.RarFile(data)
     assert output.getinfo("renamed").is_dir()
     assert output.gettimes("renamed") == source.gettimes("directory")
     assert output.read("last") == b"last" * 100

@@ -30,7 +30,7 @@ def test_chunked_legacy_encryption_round_trip(format):
     builder = rars.RarBuilder(format=format, store=True, password="secret")
     payload = bytes(range(256)) * 601
     builder.add_bytes(payload, "file")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     assert archive.read("file", password="secret") == payload
 
 
@@ -49,4 +49,4 @@ def test_legacy_streaming_progress_has_unknown_total_until_completion(format):
     assert writing[-1].completed == writing[-1].total == len(data)
     assert writing[-1].percentage == 100
     assert [event.completed for event in writing] == sorted(event.completed for event in writing)
-    assert rars.RarFile.from_bytes(data).read("file") == payload
+    assert rars.RarFile(data).read("file") == payload

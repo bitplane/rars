@@ -38,7 +38,7 @@ def raw_names(data):
 @pytest.mark.parametrize("name", ["日本語.txt", "cafe\u0301-😀.txt"])
 def test_unicode_wire_bytes_survive_and_rename_keeps_unicode(tmp_path, format, name):
     raw = unicode_wire(name)
-    source = rars.RarFile.from_bytes(replace_first_name(source_bytes(format, solid=True), raw))
+    source = rars.RarFile(replace_first_name(source_bytes(format, solid=True), raw))
     editor = rars.RarBuilder.from_archive(source)
     assert raw_names(editor.to_bytes())[0] == (0x200, raw)
     editor.rename(name, name)
@@ -49,7 +49,7 @@ def test_unicode_wire_bytes_survive_and_rename_keeps_unicode(tmp_path, format, n
     renamed = "renamed-日本語.txt"
     editor.rename(name, renamed)
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data)
+    output = rars.RarFile(data)
     assert output.read(renamed) == b"payload" * 50
     assert output.read("second") == b"second"
     assert raw_names(data)[0][0] == 0x200
@@ -67,7 +67,7 @@ def test_reference_encrypted_unicode_archives_retain_exact_names(tmp_path, fixtu
     source = rars.RarFile(path, password="test")
     data = rars.RarBuilder.from_archive(source).to_bytes()
     assert raw_names(data) == raw_names(path.read_bytes())
-    output = rars.RarFile.from_bytes(data, password="test")
+    output = rars.RarFile(data, password="test")
     assert output.namelist() == source.namelist()
     for name in source.namelist():
         if not source.getinfo(name).is_dir():
@@ -77,7 +77,7 @@ def test_reference_encrypted_unicode_archives_retain_exact_names(tmp_path, fixtu
 
 @pytest.mark.parametrize("raw", [b"fallback\0\0\x80\0\xd8", b"fallback\0\0\xc0\x7f", b"invalid-\xff"])
 def test_malformed_unicode_names_are_refused(tmp_path, raw):
-    source = rars.RarFile.from_bytes(replace_first_name(source_bytes(store=True), raw))
+    source = rars.RarFile(replace_first_name(source_bytes(store=True), raw))
     path = tmp_path / "existing.rar"
     path.write_bytes(b"keep")
     with pytest.raises(rars.UnsupportedRarFeature):
@@ -86,8 +86,8 @@ def test_malformed_unicode_names_are_refused(tmp_path, raw):
 
 
 def test_unicode_rename_retains_non_bmp_characters():
-    source = rars.RarFile.from_bytes(replace_first_name(source_bytes(store=True), unicode_wire("name.txt")))
+    source = rars.RarFile(replace_first_name(source_bytes(store=True), unicode_wire("name.txt")))
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("name.txt", "emoji-😀.txt")
-    output = rars.RarFile.from_bytes(editor.to_bytes())
+    output = rars.RarFile(editor.to_bytes())
     assert output.read("emoji-😀.txt") == b"payload" * 50

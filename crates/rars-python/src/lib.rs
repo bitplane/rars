@@ -964,33 +964,6 @@ impl RarFile {
         Ok(file.with_set(first_volume_only, volumes))
     }
 
-    #[staticmethod]
-    #[pyo3(name = "from_bytes")]
-    #[pyo3(signature = (data, password = None, *, options = None, cancellation = None, first_volume_only = false, volumes = None))]
-    fn from_bytes_py(
-        py: Python<'_>,
-        data: &Bound<'_, PyAny>,
-        password: Option<&Bound<'_, PyAny>>,
-        options: Option<&ReadOptions>,
-        cancellation: Option<&CancellationToken>,
-        first_volume_only: bool,
-        volumes: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
-        let options = call_options.as_ref();
-        let volumes = stored_volumes(
-            volumes,
-            options.and_then(|options| options.cancellation.as_ref()),
-        )?;
-        let file = Self::from_bytes(
-            py,
-            py_required_bytes(data)?,
-            py_password(password)?,
-            options,
-        )?;
-        Ok(file.with_set(first_volume_only, volumes))
-    }
-
     fn namelist(&self, py: Python<'_>) -> PyResult<Vec<String>> {
         Ok(self
             .listing(py)?

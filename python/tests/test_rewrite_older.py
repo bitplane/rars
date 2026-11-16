@@ -25,7 +25,7 @@ def test_vintage_rar15_preservation(tmp_path, fixture):
     editor = rars.RarBuilder.from_archive(source)
     editor.rename(source.namelist()[0], "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password="password")
+    output = rars.RarFile(data, password="password")
     assert output.rewrite_preservation_issues() == []
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert source.read(before) == output.read(after)
@@ -50,11 +50,11 @@ def test_older_formats_keep_version_and_solid_directory_state(tmp_path, version,
             if kind == 0x74:
                 original[offset + 24] = 26
                 struct.pack_into("<H", original, offset, zlib.crc32(original[offset + 2:offset + size]) & 0xffff)
-    source = rars.RarFile.from_bytes(bytes(original), password=password)
+    source = rars.RarFile(bytes(original), password=password)
     editor = rars.RarBuilder.from_archive(source)
     editor.rename(b"raw-\xff", "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password=password)
+    output = rars.RarFile(data, password=password)
     assert output.read("renamed") == b"first " * 300
     assert output.read("last") == b"first " * 300 + b"end"
     assert output.getinfo("empty").is_dir()
@@ -63,5 +63,5 @@ def test_older_formats_keep_version_and_solid_directory_state(tmp_path, version,
     check_unrar(tmp_path, data)
     editor.remove("renamed")
     data = editor.to_bytes()
-    assert rars.RarFile.from_bytes(data, password=password).read("last") == b"first " * 300 + b"end"
+    assert rars.RarFile(data, password=password).read("last") == b"first " * 300 + b"end"
     check_unrar(tmp_path, data)

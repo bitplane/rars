@@ -101,7 +101,7 @@ def tree(root: Path) -> set[Path]:
 
 
 def test_the_rewriter_produces_an_archive_that_still_reads():
-    archive = rars.RarFile.from_bytes(hostile_archive(b"harmless.txt"))
+    archive = rars.RarFile(hostile_archive(b"harmless.txt"))
 
     assert archive.namelist() == ["harmless.txt"]
     assert archive.read("harmless.txt") == b"owned\n"
@@ -122,7 +122,7 @@ def test_the_rewriter_produces_an_archive_that_still_reads():
 def test_extractall_refuses_a_hostile_member_name(tmp_path, name, label):
     out = tmp_path / "out"
     out.mkdir()
-    archive = rars.RarFile.from_bytes(hostile_archive(name))
+    archive = rars.RarFile(hostile_archive(name))
 
     with pytest.raises(rars.Error) as raised:
         archive.extractall(out)
@@ -148,7 +148,7 @@ def test_extractall_refuses_to_follow_a_symlinked_directory(tmp_path):
     out.mkdir()
     (out / "sub").symlink_to(outside, target_is_directory=True)
 
-    archive = rars.RarFile.from_bytes(hostile_archive(b"sub/file.txt"))
+    archive = rars.RarFile(hostile_archive(b"sub/file.txt"))
 
     with pytest.raises(rars.UnsafeArchivePath):
         archive.extractall(out)
@@ -165,7 +165,7 @@ def test_extractall_refuses_to_write_through_a_symlinked_file(tmp_path):
     out.mkdir()
     (out / "member.txt").symlink_to(guarded)
 
-    archive = rars.RarFile.from_bytes(hostile_archive(b"member.txt"))
+    archive = rars.RarFile(hostile_archive(b"member.txt"))
 
     with pytest.raises(rars.UnsafeArchivePath):
         archive.extractall(out, overwrite=True)

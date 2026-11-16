@@ -60,8 +60,15 @@ def test_builder_settings_after_format_are_keyword_only():
         rars.RarBuilder(filters=None)
     builder = rars.RarBuilder(rars.RAR29, level=0)
     builder.add_bytes(b"payload" * 64, "file.txt")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     assert archive.infolist()[0].compress_size == archive.infolist()[0].file_size
+
+
+def test_the_constructor_is_the_one_way_to_open_data():
+    assert not hasattr(rars.RarFile, "from_bytes")
+    data = STORED.read_bytes()
+    for source in (data, bytearray(data), memoryview(data)):
+        assert rars.RarFile(source).namelist() == rars.RarFile(STORED).namelist()
 
 
 def test_writer_resources_keep_their_settings():
@@ -74,7 +81,7 @@ def test_writer_resources_keep_their_settings():
 def test_plain_builder_removal_and_decoded_missing_name():
     builder = rars.RarBuilder(format="rar29", store=True)
     builder.add_bytes(b"payload", b"caf\x82.txt")
-    archive = rars.RarFile.from_bytes(
+    archive = rars.RarFile(
         builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="cp850")
     )
     with pytest.raises(KeyError, match="absent"):
@@ -125,7 +132,7 @@ def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
 def test_directory_only_extraction_preserves_empty_directories(tmp_path, selected):
     builder = rars.RarBuilder(store=True)
     builder.add_directory("empty")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     paths = archive.extractall(tmp_path, members=["empty"] if selected else None)
     assert [Path(p) for p in paths] == [tmp_path / "empty"]
     assert (tmp_path / "empty").is_dir()
@@ -219,7 +226,7 @@ def test_selected_file_skips_directory_and_empty_selection(tmp_path):
     builder = rars.RarBuilder(store=True)
     builder.add_directory("unused")
     builder.add_bytes(b"payload", "selected.txt")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     assert archive.extractall(tmp_path / "none", members=[]) == []
     archive.extractall(tmp_path / "some", members=["selected.txt"])
     assert not (tmp_path / "some/unused").exists()
@@ -254,11 +261,11 @@ def test_conversion_refuses_legacy_time_outside_rar5_range():
     dos_time = (127 << 25) | (12 << 21) | (31 << 16) | (23 << 11) | (59 << 5) | 29
     builder = rars.RarBuilder(format="rar29", store=True)
     builder.add_bytes(b"payload", "future.txt", mtime=dos_time)
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("future.txt").date_time[:3] == (2107, 12, 31)
     with pytest.raises(ValueError, match="RAR5 timestamp range"):
         rars.RarBuilder.from_archive(archive, preserve=False)
-    retained = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(archive).to_bytes())
+    retained = rars.RarFile(rars.RarBuilder.from_archive(archive).to_bytes())
     assert retained.getinfo("future.txt").date_time == archive.getinfo("future.txt").date_time
 
 
@@ -275,7 +282,7 @@ def test_conversion_refuses_legacy_special_types(host, attributes):
     data[offset + 15] = host
     struct.pack_into("<I", data, offset + 28, attributes)
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    archive = rars.RarFile.from_bytes(bytes(data))
+    archive = rars.RarFile(bytes(data))
     assert archive.getinfo("special.txt").file_attr == attributes
     archive.testrar()
     with pytest.raises(rars.UnsupportedRarFeature, match="special entry"):
@@ -285,7 +292,7 @@ def test_conversion_refuses_legacy_special_types(host, attributes):
 def test_modern_dos_backslash_name_uses_portable_destination(tmp_path):
     from test_extract_guards import hostile_archive
 
-    archive = rars.RarFile.from_bytes(hostile_archive(b"one\\two.txt"))
+    archive = rars.RarFile(hostile_archive(b"one\\two.txt"))
     archive.testrar()
     archive.extractall(tmp_path)
     assert (tmp_path / "one_two.txt").read_bytes() == b"owned\n"
@@ -295,7 +302,7 @@ def test_selected_extraction_creates_only_selected_redirections(tmp_path):
     builder = rars.RarBuilder(store=True)
     builder.add_unix_symlink("link", "target")
     builder.add_bytes(b"payload", "selected")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     archive.extractall(tmp_path / "file", members=["selected"])
     assert not os.path.lexists(tmp_path / "file" / "link")
     assert (tmp_path / "file" / "selected").read_bytes() == b"payload"
@@ -310,7 +317,7 @@ def test_explicit_none_password_and_comment_arguments_remain_optional():
     builder.add_bytes(b"payload", "file.txt")
     builder.set_file_comment("file.txt", b"comment")
     builder.set_file_comment("file.txt", None)
-    archive = rars.RarFile.from_bytes(builder.to_bytes(), password=None)
+    archive = rars.RarFile(builder.to_bytes(), password=None)
     assert archive.comment is None
     assert archive.getcomment("file.txt", password=None) is None
     assert archive.read("file.txt", password=None) == b"payload"
@@ -343,7 +350,7 @@ def test_conversion_refuses_unknown_redirection_kind():
                 break
             cursor = record_start + size
     assert changed
-    archive = rars.RarFile.from_bytes(bytes(data))
+    archive = rars.RarFile(bytes(data))
     assert archive.namelist() == ["link"]
     with pytest.raises(rars.UnsupportedRarFeature, match="not a supported redirection"):
         archive.readlink("link")
@@ -362,7 +369,7 @@ def test_conversion_refuses_payload_on_legacy_directory():
     offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)
     struct.pack_into("<H", data, offset + 3, flags | 0xe0)
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    archive = rars.RarFile.from_bytes(bytes(data))
+    archive = rars.RarFile(bytes(data))
     info = archive.getinfo("directory")
     assert info.is_dir()
     assert info.file_size == 7
@@ -374,7 +381,7 @@ def test_selected_solid_file_skips_unselected_directory(tmp_path):
     builder = rars.RarBuilder(format="rar29", solid=True)
     builder.add_directory("unused")
     builder.add_bytes(b"payload", "selected")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     archive.extractall(tmp_path, members=["selected"])
     assert not (tmp_path / "unused").exists()
     assert (tmp_path / "selected").read_bytes() == b"payload"
@@ -385,7 +392,7 @@ def test_path_add_explicit_archive_name_and_default_extract_destination(tmp_path
     source.write_bytes(b"payload")
     builder = rars.RarBuilder(store=True)
     builder.add(source, arcname="renamed")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     monkeypatch.chdir(tmp_path)
     assert Path(archive.extract("renamed")) == Path("renamed")
     assert Path("renamed").read_bytes() == b"payload"
@@ -397,7 +404,7 @@ def test_recovery_progress_reports_its_phase_and_percentage():
     builder = rars.RarBuilder(store=True, recovery_percent=1)
     builder.add_bytes(b"payload", "file.txt")
     events = []
-    rars.RarFile.from_bytes(builder.to_bytes(progress=events.append)).testrar()
+    rars.RarFile(builder.to_bytes(progress=events.append)).testrar()
     assert "recovery" in {event.phase for event in events}
     assert all(event.percentage is None or 0 <= event.percentage <= 100 for event in events)
 
@@ -435,7 +442,7 @@ def test_builder_argument_conversion_errors_are_typeerrors(method, args):
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(TypeError):
         getattr(builder, method)(*args)
-    assert rars.RarFile.from_bytes(builder.to_bytes()).namelist() == ["file.txt"]
+    assert rars.RarFile(builder.to_bytes()).namelist() == ["file.txt"]
 
 
 def test_pathlike_errors_survive_binding_conversion(tmp_path):

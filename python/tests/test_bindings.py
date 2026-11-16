@@ -25,7 +25,7 @@ def test_rarfile_lists_and_reads_fixture():
 def test_extractall_rejects_existing_without_overwrite(tmp_path):
     builder = rars.RarBuilder(store=True)
     builder.add_bytes(b"payload", "hello.txt")
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path)
     with pytest.raises(OSError):
@@ -39,13 +39,13 @@ def test_builder_creates_archive_and_rewrite_model():
     builder.add_bytes(b"one", "one.txt")
     builder.add_bytes(b"two", "two.txt")
 
-    archive = rars.RarFile.from_bytes(builder.to_bytes())
+    archive = rars.RarFile(builder.to_bytes())
     rewritten = rars.RarBuilder.from_archive(archive)
     rewritten.remove("one.txt")
     rewritten.rename("two.txt", "renamed.txt")
     rewritten.add_bytes(b"three", "three.txt")
 
-    output = rars.RarFile.from_bytes(rewritten.to_bytes())
+    output = rars.RarFile(rewritten.to_bytes())
     assert output.namelist() == ["renamed.txt", "three.txt"]
     assert output.read("renamed.txt") == b"two"
 
@@ -60,11 +60,11 @@ def test_from_archive_explicit_conversion_contract(encrypted):
     members = [("second.txt", b"second payload"), ("first.txt", b"first payload")]
     for name, data in members:
         builder.add_bytes(data, name)
-    source = rars.RarFile.from_bytes(builder.to_bytes(), password=password)
+    source = rars.RarFile(builder.to_bytes(), password=password)
     assert source.family == "rar15_40"
     assert source.needs_password == encrypted
 
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
+    output = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
 
     assert output.family == "rar50_plus"
     assert not output.needs_password
@@ -80,8 +80,8 @@ def test_from_archive_explicit_conversion_contract(encrypted):
 def test_from_archive_interprets_permissions_using_source_host(format, mode):
     builder = rars.RarBuilder(format=format, store=True)
     builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
-    source = rars.RarFile.from_bytes(builder.to_bytes())
-    output = rars.RarFile.from_bytes(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
+    source = rars.RarFile(builder.to_bytes())
+    output = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
     info = output.getinfo("file.txt")
 
     # RAR 1.4/1.5 writers deliberately emit DOS metadata even for Unix input.
@@ -103,7 +103,7 @@ def test_from_archive_permissions_match_reference_extraction(tmp_path, format, m
     expected_mode = control.stat().st_mode & 0o777 if mode is None else mode
     builder = rars.RarBuilder(format=format, store=True)
     builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
-    source = rars.RarFile.from_bytes(builder.to_bytes())
+    source = rars.RarFile(builder.to_bytes())
     archive_path = tmp_path / "rewritten.rar"
     rars.RarBuilder.from_archive(source, preserve=False).write(archive_path)
     output = tmp_path / "output"
@@ -124,7 +124,7 @@ def test_from_archive_permissions_match_reference_extraction(tmp_path, format, m
 def test_from_archive_retains_rar5_modification_time(format, mtime):
     source = rars.RarBuilder(format=format, store=True)
     source.add_bytes(b"timestamp payload", "file.txt", mtime=mtime, mode=0o640)
-    rewritten = rars.RarBuilder.from_archive(rars.RarFile.from_bytes(source.to_bytes()))
+    rewritten = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
     rewritten.rename("file.txt", "renamed.txt")
 
     expected = rars.RarBuilder()

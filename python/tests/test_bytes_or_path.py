@@ -25,7 +25,7 @@ BYTES_LIKE = {
 def test_bytes_like_objects_are_archive_data(kind):
     data = BYTES_LIKE[kind](archive_bytes())
     assert rars.RarFile(data).read("file") == b"payload"
-    assert rars.RarFile.from_bytes(data).read("file") == b"payload"
+    assert rars.RarFile(data).read("file") == b"payload"
 
 
 def test_mmap_is_archive_data(tmp_path):
@@ -47,7 +47,7 @@ def test_other_values_are_neither(value):
     with pytest.raises(TypeError):
         rars.RarFile(value)
     with pytest.raises(TypeError, match="bytes-like"):
-        rars.RarFile.from_bytes(value)
+        rars.RarFile(value)
     with pytest.raises(TypeError, match="bytes-like"):
         rars.RarBuilder().add_bytes(value, "file")
 

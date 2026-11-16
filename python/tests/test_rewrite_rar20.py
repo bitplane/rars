@@ -23,7 +23,7 @@ def test_vintage_rar20_preserves_metadata_comments_and_payloads(tmp_path, fixtur
     name = source.namelist()[0]
     editor.rename(name, "renamed")
     data = editor.to_bytes()
-    output = rars.RarFile.from_bytes(data, password="password")
+    output = rars.RarFile(data, password="password")
     assert output.rewrite_preservation_issues() == []
     assert output.comment == source.comment
     assert bool(next(headers(data))[2] & 8) == bool(next(headers(path.read_bytes()))[2] & 8)
@@ -68,7 +68,7 @@ def test_unsupported_rar20_combinations_leave_destination_untouched(tmp_path, da
             size += 8
             struct.pack_into("<H", data, offset + 5, size)
         struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    source = rars.RarFile.from_bytes(bytes(data))
+    source = rars.RarFile(bytes(data))
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.UnsupportedRarFeature):
