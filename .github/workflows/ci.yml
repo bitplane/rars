@@ -344,9 +344,9 @@ jobs:
         run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
 
   # Every optional-feature combination of the library, without workspace
-  # feature unification. Four jobs of four sets each: a set shares most of its
-  # dependency builds with the others in its job, and four jobs leave runners
-  # free for the rest of CI.
+  # feature unification. Running the unit tests is most of each set's time, so
+  # every write set gets a job of its own; the read and recovery sets are
+  # quicker and share two jobs, reusing their dependency builds.
   unit-features:
     name: Library unit features (${{ matrix.group }})
     runs-on: ubuntu-latest
@@ -360,10 +360,23 @@ jobs:
           - group: recovery
             features: recovery recovery,parallel recovery,encryption recovery,encryption,parallel
           - group: write
-            features: write write,parallel write,encryption write,encryption,parallel
-            memory: write write,parallel
-          - group: write and recovery
-            features: write,recovery write,recovery,parallel write,recovery,encryption write,recovery,encryption,parallel
+            features: write
+            memory: write
+          - group: write,parallel
+            features: write,parallel
+            memory: write,parallel
+          - group: write,encryption
+            features: write,encryption
+          - group: write,encryption,parallel
+            features: write,encryption,parallel
+          - group: write,recovery
+            features: write,recovery
+          - group: write,recovery,parallel
+            features: write,recovery,parallel
+          - group: write,recovery,encryption
+            features: write,recovery,encryption
+          - group: write,recovery,encryption,parallel
+            features: write,recovery,encryption,parallel
     env:
       CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0
