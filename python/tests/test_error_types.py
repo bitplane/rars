@@ -152,3 +152,25 @@ def test_password_errors_are_not_damage():
             rars.RarFile(data, password=password)
         assert isinstance(raised.value, rars.Error)
         assert not isinstance(raised.value, rars.BadRarFile)
+
+
+# rars writes legacy sets of one member only, so only RAR 5 has a member wholly in a later volume.
+@pytest.mark.parametrize("format", ["rar50", "rar70"])
+def test_a_corrupt_member_wholly_in_a_later_volume_names_that_volume(tmp_path, format):
+    payloads = [random.Random(index).randbytes(1500) for index in range(6)]
+    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    for index, payload in enumerate(payloads):
+        builder.add_bytes(payload, f"m{index}")
+    paths = builder.write_volumes(tmp_path / "set.part1.rar")
+    with rars.RarFile(paths[0]) as archive:
+        info = next(info for info in archive.infolist()
+                    if info.volume_number > 1 and not info.is_split_before and not info.is_split_after)
+    volume = paths[info.volume_number - 1]
+    data = bytearray(volume.read_bytes())
+    data[data.find(payloads[int(info.filename[1:])][100:140])] ^= 0xFF
+    volume.write_bytes(bytes(data))
+    with rars.RarFile(paths[0]) as archive:
+        with pytest.raises(rars.ChecksumError) as raised:
+            archive.testrar()
+    assert raised.value.member == info.filename
+    assert raised.value.volume_number == info.volume_number

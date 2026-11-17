@@ -926,6 +926,7 @@ impl Archive {
                 });
                 let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
                 rar13::extract_from_feed(&mut feed, options, |meta| open(&rar13_meta(meta)))
+                    .map_err(|error| error.in_member_volume(feed.current_index()))
             }
             Self::Rar15To40(first) => {
                 let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
@@ -952,6 +953,7 @@ impl Archive {
                         .as_mut()
                         .map(|link| link as &mut extraction_links::LegacyLink<'_>),
                 )
+                .map_err(|error| error.in_member_volume(feed.current_index()))
             }
             Self::Rar50Plus(first) => {
                 let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
@@ -985,6 +987,7 @@ impl Archive {
                     },
                     emit,
                 )
+                .map_err(|error| error.in_member_volume(feed.current_index()))
             }
         }
     }

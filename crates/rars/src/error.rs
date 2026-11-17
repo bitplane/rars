@@ -417,6 +417,28 @@ impl Error {
         error
     }
 
+    /// Names the volume a member failed in, counting the first as 0, unless
+    /// the error names a volume already or no member.
+    pub(crate) fn in_member_volume(self, index: usize) -> Self {
+        let mut error = &self;
+        loop {
+            match error {
+                Self::InVolume { .. } => return self,
+                Self::AtArchiveOffset { source, .. } | Self::AtEntry { source, .. } => {
+                    error = source
+                }
+                _ => break,
+            }
+        }
+        if self.entry_context().is_none() {
+            return self;
+        }
+        Self::InVolume {
+            number: index + 1,
+            source: Box::new(self),
+        }
+    }
+
     /// The outermost member context, if this error identifies a member.
     pub fn entry_context(&self) -> Option<(&[u8], &'static str)> {
         let mut error = self;

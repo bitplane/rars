@@ -118,7 +118,7 @@ struct ProgressEvent {
     total_entries: Option<usize>,
     /// The volume being read, counting the first as 1; None outside a volume set.
     #[pyo3(get)]
-    volume: Option<usize>,
+    volume_number: Option<usize>,
     finished: bool,
     /// A set whose last volume hasn't been read yet has no total; `total` is 0 until it does.
     total_known: bool,
@@ -422,7 +422,7 @@ impl rars_rs::WriteProgress for PythonProgress {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
-                volume: None,
+                volume_number: None,
                 finished: false,
                 total_known: true,
             });
@@ -684,7 +684,7 @@ impl ReadProgress {
             entry_name: state.entry_name.clone(),
             entry_index: state.started.checked_sub(1),
             total_entries: state.total_known.then_some(state.seen_entries),
-            volume: state.volume,
+            volume_number: state.volume,
             finished,
             total_known: state.total_known,
         };
@@ -810,8 +810,7 @@ struct RarInfo {
     file_attr: u64,
     is_directory: bool,
     is_redirection: bool,
-    /// Counted from 0.
-    #[pyo3(get)]
+    /// The volume the member starts in, counting the first as 0; Python counts from 1.
     volume: usize,
 }
 
@@ -834,6 +833,12 @@ impl RarInfo {
 
     fn is_dir(&self) -> bool {
         self.is_directory
+    }
+
+    /// The volume the member starts in, counting the first as 1 like `RarFile.volume_number`.
+    #[getter]
+    fn volume_number(&self) -> usize {
+        self.volume + 1
     }
 
     fn __repr__(&self) -> String {
@@ -5059,7 +5064,7 @@ mod tests {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
-                volume: None,
+                volume_number: None,
                 finished: false,
                 total_known: true,
             };

@@ -99,8 +99,8 @@ def test_every_member_has_its_whole_sizes_and_crc(tmp_path):
     for name, data in MEMBERS.items():
         assert infos[name].file_size == infos[name].compress_size == len(data)
         assert infos[name].CRC == zlib.crc32(data)
-    assert infos["head.txt"].volume == 0
-    assert infos["after.bin"].volume > 0
+    assert infos["head.txt"].volume_number == 1
+    assert infos["after.bin"].volume_number > 1
 
 
 def test_members_starting_in_later_volumes_can_be_selected(tmp_path):
@@ -134,7 +134,7 @@ def test_a_later_member_reads_only_as_far_as_it_ends(tmp_path):
             for info in rars.RarFile(path, first_volume_only=True).infolist()
         )
     )
-    assert after.volume < ends < len(paths) - 1
+    assert after.volume_number - 1 < ends < len(paths) - 1
 
     def volumes():
         yield from paths[1 : ends + 1]
