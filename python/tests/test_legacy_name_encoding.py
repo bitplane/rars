@@ -99,7 +99,7 @@ def test_volume_extraction_uses_name_policy(tmp_path, format):
     builder = rars.RarBuilder(version=format, level=0, volume_size=1024)
     payload = b"volume" * 2000
     builder.add_bytes(payload, b"caf\x82.txt")
-    paths = builder.write_volumes(tmp_path / "parts.rar")
+    paths = builder.write(tmp_path / "parts.rar")
     out = tmp_path / "out"
     rars.RarFile(paths[0]).extractall(out, options=rars.ReadOptions(legacy_name_encoding="cp850"),
                                       volumes=paths[1:])

@@ -24,7 +24,7 @@ def test_legacy_volume_name_refusal_preserves_existing_parts(tmp_path):
     first.write_bytes(b"original first")
     second.write_bytes(b"original second")
     with pytest.raises(ValueError, match=r"run out after \.z99"):
-        builder.write_volumes(first)
+        builder.write(first)
     assert first.read_bytes() == b"original first"
     assert second.read_bytes() == b"original second"
     assert set(tmp_path.iterdir()) == {first, second}
@@ -131,7 +131,7 @@ def test_plain_builder_removal_and_decoded_missing_name():
 def test_volume_conversion_errors(operation, tmp_path):
     builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
     args = (tmp_path / "out",) if operation == "extractall" else ()
     kwargs = {"overwrite": True} if operation == "extractall" else {}
     with rars.RarFile(paths[0]) as archive:
@@ -155,7 +155,7 @@ def test_volume_conversion_errors(operation, tmp_path):
 def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
     builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
-    paths = builder.write_volumes(tmp_path / stem)
+    paths = builder.write(tmp_path / stem)
     base = stem.removesuffix(".rar").removesuffix(".RAR")
     suffix = stem[len(base):] or ".rar"
     if base.endswith(".part01"):
@@ -180,7 +180,7 @@ def test_volume_extraction_directories_overwrite_and_open_failures(tmp_path):
     builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_directory("empty")
     builder.add_bytes(b"payload" * 200, "nested/file.txt")
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
     output = tmp_path / "output"
     with rars.RarFile(paths[0]) as archive:
         archive.extractall(output, volumes=paths[1:])
@@ -219,7 +219,7 @@ def test_invalid_argument_types_and_missing_output_names(tmp_path):
     builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="needs a file name"):
-        builder.write_volumes(Path("/"))
+        builder.write(Path("/"))
 
 
 @pytest.mark.parametrize("source", ["missing", "directory"])
@@ -283,7 +283,7 @@ def test_cancelled_volume_publication_preserves_old_destination(tmp_path):
     first = tmp_path / "archive.rar"
     first.write_bytes(b"original")
     with pytest.raises(rars.Cancelled):
-        builder.write_volumes(first, progress=finish, cancellation=cancellation)
+        builder.write(first, progress=finish, cancellation=cancellation)
     assert cancellation.is_cancelled()
     assert first.read_bytes() == b"original"
     assert list(tmp_path.iterdir()) == [first]
@@ -507,7 +507,7 @@ def test_pathlike_errors_survive_binding_conversion(tmp_path):
     for operation in [lambda: rars.RarFile(BrokenPath()),
                       lambda: builder.add(BrokenPath()),
                       lambda: builder.write(BrokenPath()),
-                      lambda: builder.write_volumes(BrokenPath())]:
+                      lambda: builder.write(BrokenPath())]:
         with pytest.raises(RuntimeError, match="path conversion failed"):
             operation()
     assert list(tmp_path.iterdir()) == []
@@ -518,7 +518,7 @@ def test_volume_write_failure_names_an_oserror(tmp_path, format):
     builder = rars.RarBuilder(version=format, level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     with pytest.raises(OSError):
-        builder.write_volumes(tmp_path / "missing/archive.rar")
+        builder.write(tmp_path / "missing/archive.rar")
     assert not (tmp_path / "missing").exists()
 
 
@@ -549,7 +549,7 @@ def test_legacy_volume_names_follow_the_first_extension_case(tmp_path, first, se
     # unrar looks for archive.R00 after archive.RAR on a case-sensitive filesystem.
     builder = rars.RarBuilder(version="rar29", level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
-    paths = builder.write_volumes(tmp_path / first)
+    paths = builder.write(tmp_path / first)
     assert [Path(path).name for path in paths[:2]] == [first, second]
     with rars.RarFile(paths[0]) as archive:
         archive.testrar(volumes=paths[1:])

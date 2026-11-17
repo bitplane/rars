@@ -178,7 +178,7 @@ def test_volume_sets_flatten_the_same_way(tmp_path, given):
     builder.add_bytes(b"\1" * 3000, "a/one.bin")
     builder.add_bytes(b"\2" * 3000, "b/c/two.bin")
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     assert len(paths) > 1
     with rars.RarFile(paths[0]) as rar:
         volumes = iter(paths[1:]) if given else None

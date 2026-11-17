@@ -27,7 +27,7 @@ def write_set(tmp_path, **options):
     for name, data in MEMBERS.items():
         builder.add_bytes(data, name)
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     assert len(paths) > 3
     return paths
 
@@ -36,7 +36,7 @@ def write_legacy_set(tmp_path, format, first, **options):
     builder = rars.RarBuilder(version=format, level=0, volume_size=4096, **options)
     builder.add_bytes(MEMBERS["large.bin"], "large.bin")
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / first)
+    paths = builder.write(tmp_path / "made" / first)
     assert len(paths) > 3
     return paths
 
@@ -258,7 +258,7 @@ def test_listing_a_large_set_reads_headers_only(tmp_path):
     for index in range(4):
         builder.add_bytes(random.Random(index).randbytes(3 << 20), f"{index}.bin")
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "big.part01.rar")
+    paths = builder.write(tmp_path / "made" / "big.part01.rar")
     with rars.RarFile(paths[0]) as archive:
         start = read_bytes_so_far()
         assert len(archive.namelist()) == 4

@@ -53,7 +53,7 @@ def write_set(tmp_path, format):
     builder.add_bytes(PAYLOAD, "large.bin")
     first = "set.part01.rar" if format == "rar50" else "set.rar"
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / first)
+    paths = builder.write(tmp_path / "made" / first)
     assert len(paths) > 3
     return paths
 
@@ -161,7 +161,7 @@ def test_a_corrupt_member_wholly_in_a_later_volume_names_that_volume(tmp_path, f
     builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     for index, payload in enumerate(payloads):
         builder.add_bytes(payload, f"m{index}")
-    paths = builder.write_volumes(tmp_path / "set.part1.rar")
+    paths = builder.write(tmp_path / "set.part1.rar")
     with rars.RarFile(paths[0]) as archive:
         info = next(info for info in archive.infolist()
                     if info.volume_number > 1 and not info.is_split_before and not info.is_split_after)

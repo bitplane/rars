@@ -187,7 +187,7 @@ def test_builder_progress_exception_cancels_and_is_reraised():
 def test_builder_writes_and_extracts_volumes(tmp_path):
     builder = rars.RarBuilder(version="rar50", level=0, volume_size=512)
     builder.add_bytes(b"0123456789" * 200, "large.txt")
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
 
     assert len(paths) > 1
     out_dir = tmp_path / "out"
@@ -203,7 +203,7 @@ def test_builder_writes_volumes_from_added_paths(tmp_path):
 
     builder = rars.RarBuilder(version="rar50", level=0, volume_size=512)
     builder.add(source)
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
 
     assert len(paths) > 1
     out_dir = tmp_path / "out"
@@ -291,11 +291,11 @@ def test_writers_refuse_an_existing_file_unless_told_to_overwrite(tmp_path):
     volumes = rars.RarBuilder(level=0, volume_size=4096)
     volumes.add_bytes(os.urandom(20_000), "big")
     first = tmp_path / "set.part1.rar"
-    paths = volumes.write_volumes(first)
+    paths = volumes.write(first)
     paths[-1].write_bytes(b"precious")
     for part in paths[:-1]:
         part.unlink()
     with pytest.raises(FileExistsError, match=paths[-1].name):
-        volumes.write_volumes(first)
+        volumes.write(first)
     assert [path.name for path in tmp_path.iterdir() if path.name.startswith("set.")] == [paths[-1].name]
-    assert volumes.write_volumes(first, overwrite=True) == paths
+    assert volumes.write(first, overwrite=True) == paths

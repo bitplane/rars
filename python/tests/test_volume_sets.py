@@ -17,7 +17,7 @@ def write_set(tmp_path, compressed, format="rar50"):
     if format == "rar50":
         builder.add_bytes(b"small", "small.txt")
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     assert len(paths) > 3
     return paths
 
@@ -106,7 +106,7 @@ def write_named_set(tmp_path, format):
     builder.add_bytes(PAYLOAD, "large.bin")
     first = "set.part01.rar" if format == "rar50" else "set.rar"
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / first)
+    paths = builder.write(tmp_path / "made" / first)
     assert len(paths) > 3
     return paths
 
@@ -211,7 +211,7 @@ def write_mixed_set(tmp_path, format="rar50", compressed=False, solid=False):
         builder.add_bytes(random.Random(23).randbytes(12_000), "after.bin")
     first = "set.part01.rar" if format == "rar50" else "set.rar"
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / first)
+    paths = builder.write(tmp_path / "made" / first)
     assert len(paths) > 3
     return paths
 

@@ -465,14 +465,6 @@ class RarBuilder:
         overwrite: bool = False,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
-    ) -> None: ...
-    def write_volumes(
-        self,
-        first_path: _StrPath,
-        *,
-        overwrite: bool = False,
-        progress: _Progress | None = None,
-        cancellation: CancellationToken | None = None,
     ) -> list[Path]: ...
 
 @final

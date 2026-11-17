@@ -2868,7 +2868,11 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Py<PyBytes>> {
-        self.refuse_volume_mismatch(false)?;
+        if self.inner.splits_into_volumes() {
+            return Err(PyValueError::new_err(
+                "volume_size is set, so write the set to files with write()",
+            ));
+        }
         if self.resources.max_memory_bytes().is_none() {
             let bytes = self.detached(
                 py,
@@ -2891,7 +2895,10 @@ impl RarBuilder {
             .map_err(map_error)
     }
 
-    /// An existing file at `path` is refused unless `overwrite=True`, which replaces it once the archive is written.
+    /// Writes the archive to `path` and returns the files written: `path` alone, or with
+    /// `volume_size` set, every part of the set, named from `path`.
+    /// An existing file is refused unless `overwrite=True`; a set checks every part before
+    /// writing any.
     #[pyo3(signature = (path, *, overwrite = false, progress = None, cancellation = None))]
     fn write(
         &self,
@@ -2900,9 +2907,11 @@ impl RarBuilder {
         overwrite: bool,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<PathBuf>> {
         let path = py_path_buf(py, path)?;
-        self.refuse_volume_mismatch(false)?;
+        if self.inner.splits_into_volumes() {
+            return self.write_volumes(py, path, overwrite, progress, cancellation);
+        }
         refuse_existing(&path, overwrite)?;
         let directory = output_directory(&path);
         self.detached(
@@ -2917,21 +2926,20 @@ impl RarBuilder {
                     progress,
                 )
             },
-        )
+        )?;
+        Ok(vec![path])
     }
+}
 
-    /// Refuses before writing any part if one exists, unless `overwrite=True`.
-    #[pyo3(signature = (first_path, *, overwrite = false, progress = None, cancellation = None))]
+impl RarBuilder {
     fn write_volumes(
         &self,
         py: Python<'_>,
-        first_path: &Bound<'_, PyAny>,
+        first_path: PathBuf,
         overwrite: bool,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<PathBuf>> {
-        let first_path = py_path_buf(py, first_path)?;
-        self.refuse_volume_mismatch(true)?;
         let parts = self.detached(
             py,
             progress,
@@ -2992,21 +3000,6 @@ impl RarBuilder {
             }
             Ok(paths)
         })
-    }
-}
-
-impl RarBuilder {
-    /// The core's refusal names its own methods; this names Python's.
-    fn refuse_volume_mismatch(&self, volumes: bool) -> PyResult<()> {
-        match (volumes, self.inner.splits_into_volumes()) {
-            (false, true) => Err(PyValueError::new_err(
-                "volume_size is set, so write the set with write_volumes()",
-            )),
-            (true, false) => Err(PyValueError::new_err(
-                "write_volumes() needs RarBuilder(volume_size=...)",
-            )),
-            _ => Ok(()),
-        }
     }
 
     fn edit_member_id(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {

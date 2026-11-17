@@ -9,10 +9,10 @@ FORMATS = ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50
 
 
 @pytest.mark.parametrize("format", FORMATS)
-@pytest.mark.parametrize("method", ["to_bytes", "write", "write_volumes"])
+@pytest.mark.parametrize("method", ["to_bytes", "write", "write set"])
 def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, format, method):
     builder = rars.RarBuilder(version=format, level=0,
-                              volume_size=1000 if method == "write_volumes" else None)
+                              volume_size=1000 if method == "write set" else None)
     builder.add_bytes(b"payload" * 1000, "file")
     token = rars.CancellationToken()
     assert not token.is_cancelled()
@@ -25,7 +25,7 @@ def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, f
         if method == "to_bytes":
             builder.to_bytes(cancellation=token)
         else:
-            getattr(builder, method)(destination, overwrite=True, cancellation=token)
+            builder.write(destination, overwrite=True, cancellation=token)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
 

@@ -62,7 +62,7 @@ def test_volume_sets_restore_times(tmp_path, format):
     builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     assert len(paths) > 2
 
     with rars.RarFile(paths[0]) as archive:
@@ -96,7 +96,7 @@ def test_cancelled_volume_set_restores_completed_outputs_and_drops_the_rest(tmp_
     builder.add_bytes(b"small", "small.txt", mtime=1_600_000_000)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     token = rars.CancellationToken()
 
     def volumes():

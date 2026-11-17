@@ -192,7 +192,7 @@ def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, forma
     payload = b"split payload " * 1000
     builder = rars.RarBuilder(version=format, level=0, volume_size=1024)
     builder.add_bytes(payload, "file")
-    paths = builder.write_volumes(tmp_path / "archive.rar")
+    paths = builder.write(tmp_path / "archive.rar")
     assert len(paths) > 1
     output = tmp_path / "output"
     output.mkdir()

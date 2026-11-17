@@ -18,18 +18,19 @@ def test_a_refused_overwrite_names_the_file_and_the_way_past_it(tmp_path):
     assert (tmp_path / "file.txt").read_bytes() == b"payload"
 
 
-def test_volume_settings_and_write_methods_must_agree(tmp_path):
+def test_write_returns_every_file_it_wrote(tmp_path):
     split = rars.RarBuilder(level=0, volume_size=4096)
-    split.add_bytes(b"payload", "file.txt")
-    with pytest.raises(ValueError, match=r"write_volumes\(\)"):
-        split.write(tmp_path / "one.rar")
-    with pytest.raises(ValueError, match=r"write_volumes\(\)"):
+    split.add_bytes(bytes(range(256)) * 64, "file.bin")
+    with pytest.raises(ValueError, match=r"write\(\)"):
         split.to_bytes()
+    paths = split.write(tmp_path / "set.rar")
+    assert len(paths) > 1
+    assert paths[0] == tmp_path / "set.part01.rar"
+    assert sorted(tmp_path.iterdir()) == paths
     whole = rars.RarBuilder(level=0)
     whole.add_bytes(b"payload", "file.txt")
-    with pytest.raises(ValueError, match="volume_size"):
-        whole.write_volumes(tmp_path / "set.part1.rar")
-    assert list(tmp_path.iterdir()) == []
+    assert whole.write(tmp_path / "one.rar") == [tmp_path / "one.rar"]
+    assert not hasattr(whole, "write_volumes")
 
 
 def test_a_missing_file_is_file_not_found():

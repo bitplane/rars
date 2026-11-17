@@ -112,7 +112,7 @@ def test_a_later_volume_checks_the_same_as_the_first(tmp_path, encrypt_headers):
         version="rar50", level=0, volume_size=4096, password="right", encrypt_headers=encrypt_headers
     )
     builder.add_bytes(random.Random(6).randbytes(20_000), "large.bin")
-    paths = builder.write_volumes(tmp_path / "set.part1.rar")
+    paths = builder.write(tmp_path / "set.part1.rar")
     for path in [paths[0], paths[1]]:
         check = rars.check_password(path, ["wrong", "right"])
         assert check.correct == "right"

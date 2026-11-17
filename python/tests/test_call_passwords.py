@@ -58,7 +58,7 @@ def test_a_call_password_opens_an_archive_opened_without_one(tmp_path, format):
 def test_a_call_password_wins_in_later_volumes(tmp_path):
     builder = rars.RarBuilder(version="rar50", level=0, volume_size=4096, password="right")
     builder.add_bytes(bytes(range(256)) * 64, "large.bin")
-    paths = builder.write_volumes(tmp_path / "set.part01.rar")
+    paths = builder.write(tmp_path / "set.part01.rar")
     archive = rars.RarFile(paths[0], password="right")
     with pytest.raises(rars.BadPassword):
         archive.read("large.bin", password="wrong")

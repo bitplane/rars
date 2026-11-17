@@ -118,7 +118,7 @@ def write_set(tmp_path):
     builder.add_bytes(b"small payload", "small.txt")
     builder.add_bytes(bytes(range(256)) * 80, "large.bin")
     (tmp_path / "made").mkdir()
-    return builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    return builder.write(tmp_path / "made" / "set.part01.rar")
 
 
 @pytest.mark.parametrize("old", [None, b"old contents"])

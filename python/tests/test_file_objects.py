@@ -44,7 +44,7 @@ class Stream(io.RawIOBase):
 def volume_set(tmp_path, format="rar50"):
     builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(bytes(range(256)) * 80, "large.bin")
-    return [Path(path) for path in builder.write_volumes(tmp_path / "set.part01.rar")]
+    return [Path(path) for path in builder.write(tmp_path / "set.part01.rar")]
 
 
 @pytest.mark.parametrize("format", ["rar29", "rar50"])

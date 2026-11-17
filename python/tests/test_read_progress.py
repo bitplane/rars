@@ -32,7 +32,7 @@ def write_set(tmp_path):
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     tmp_path.mkdir(exist_ok=True)
-    return builder.write_volumes(tmp_path / "set.part01.rar")
+    return builder.write(tmp_path / "set.part01.rar")
 
 
 def test_a_set_from_a_generator_claims_no_total_before_its_last_volume(tmp_path):

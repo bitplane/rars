@@ -121,7 +121,7 @@ def test_preflight_accepts_supported_fractional_mtime():
 def test_preflight_detects_volume_settings(tmp_path):
     builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload" * 400, "file")
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
     assert len(paths) > 1
     source = rars.RarFile(paths[0])
     assert any("volume" in issue for issue in source.rewrite_preservation_issues())
