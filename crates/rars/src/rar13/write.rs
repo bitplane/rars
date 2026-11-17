@@ -2642,10 +2642,7 @@ mod tests {
 
         // Use only the first volume, which leaves pending=Some after the loop.
         let err = collect_extract_volumes(std::slice::from_ref(&volumes[0]), None).unwrap_err();
-        assert_eq!(
-            err,
-            Error::InvalidHeader("RAR 1.3 split entry is incomplete")
-        );
+        assert_eq!(err.root_cause(), &Error::MissingVolume);
     }
 
     #[test]

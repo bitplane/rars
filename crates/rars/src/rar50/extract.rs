@@ -3274,12 +3274,11 @@ mod tests {
             vec![Block::File(split_fragment_file(b"a.txt", HFL_SPLIT_AFTER))],
             Vec::new(),
         )];
-        assert!(matches!(
-            extract_volumes_to(&incomplete, crate::ArchiveReadOptions::default(), |_| Ok(
-                Box::new(std::io::sink()) as Box<dyn Write>
-            ),),
-            Err(Error::InvalidHeader(_))
-        ));
+        let error = extract_volumes_to(&incomplete, crate::ArchiveReadOptions::default(), |_| {
+            Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+        })
+        .unwrap_err();
+        assert_eq!(error.root_cause(), &Error::MissingVolume);
     }
 
     #[test]
