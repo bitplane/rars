@@ -789,9 +789,14 @@ impl RarFile {
     }
 
     /// Decodes the entries at `indices` (every entry when undefined) in one pass and hands
-    /// each file and directory to `deliver(entry, bytes)` once the core has verified it.
-    /// `entry` is `{ index, path, isDirectory, mtime }`, where `path` is the safe relative
-    /// output path, `/`-separated, built by the core's rules; links are skipped.
+    /// each to `deliver(entry, bytes)` once the core has verified it. `entry` is
+    /// `{ path, stored, isDirectory, mtime }` for a file or directory, where `path` is the
+    /// safe relative output path, `/`-separated, and `stored` the same before flattening.
+    /// A link comes as `{ path, stored, link: { kind, target, directory } }` with no bytes,
+    /// `kind` one of `symlink`, `junction`, `hardlink` or `copy`, or with `skipped: true`
+    /// and its raw target when following it could leave the output directory.
+    /// `readLink(path)` answers for that check: the target of the symbolic link already at
+    /// `path` under the output directory, or undefined.
     #[wasm_bindgen(js_name = extractEach)]
     #[allow(clippy::too_many_arguments)] // JavaScript arguments.
     pub fn extract_each(
@@ -802,83 +807,125 @@ impl RarFile {
         flatten: bool,
         posix: bool,
         deliver: js_sys::Function,
+        read_link: js_sys::Function,
         progress: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
+        use rars_rs::ExtractedLink;
         use std::cell::RefCell;
         use std::collections::HashSet;
         use std::rc::Rc;
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         let options = read_options(password.as_deref(), &settings)?;
-        let members: Vec<rars_rs::ArchiveMember> = if self.archives.len() == 1 {
-            self.archives[0].members().collect()
-        } else {
-            rars_rs::volume_members(&self.archives).map_err(js_error)?
-        };
-        let selected: Option<HashSet<usize>> =
-            indices.map(|indices| indices.into_iter().map(|index| index as usize).collect());
-        let chosen = |index: usize| selected.as_ref().is_none_or(|set| set.contains(&index));
-        // The core calls back for regular entries and directories in archive order, skipping links.
-        let order: Vec<usize> = members
+        // Selection by stored name: the core calls back once per member, for a file,
+        // directory or link alike, and gives each its stored name.
+        let selected: Option<HashSet<Vec<u8>>> = indices.map(|indices| {
+            indices
+                .into_iter()
+                .filter_map(|index| self.infos.get(index as usize).map(|info| info.name.clone()))
+                .collect()
+        });
+        let chosen = |name: &[u8]| selected.as_ref().is_none_or(|set| set.contains(name));
+        let total = self
+            .infos
             .iter()
-            .enumerate()
-            .filter(|(_, member)| !member.meta.is_redirection)
-            .map(|(index, _)| index)
-            .collect();
-        let total = members
-            .iter()
-            .enumerate()
-            .filter(|(index, member)| {
-                chosen(*index) && !member.meta.is_redirection && !member.meta.is_directory
-            })
-            .map(|(_, member)| member.meta.unpacked_size)
+            .filter(|info| chosen(&info.name) && !info.link && !info.directory)
+            .map(|info| info.size as u64)
             .sum();
         let family = self.archives[0].family();
         let encoding = options.legacy_name_encoding;
+        let tree = JsTree(read_link);
         let raised: RefCell<Option<JsValue>> = RefCell::new(None);
         type Pending = (JsValue, Rc<RefCell<Vec<u8>>>);
         let pending: RefCell<Option<Pending>> = RefCell::new(None);
+        let hand_over = |entry: &JsValue, bytes: &JsValue| -> rars_rs::Result<()> {
+            if let Err(error) = deliver.call2(&JsValue::NULL, entry, bytes) {
+                *raised.borrow_mut() = Some(error);
+                return Err(rars_rs::Error::InvalidArgument("extraction output failed"));
+            }
+            Ok(())
+        };
         // Hands over the entry before; the core has verified it by the time it opens the next.
         let flush = || -> rars_rs::Result<()> {
             if let Some((entry, buffer)) = pending.borrow_mut().take() {
                 let bytes = js_sys::Uint8Array::from(buffer.borrow().as_slice());
-                if let Err(error) = deliver.call2(&JsValue::NULL, &entry, &bytes) {
-                    *raised.borrow_mut() = Some(error);
-                    return Err(rars_rs::Error::InvalidArgument("extraction output failed"));
-                }
+                hand_over(&entry, &bytes)?;
             }
             Ok(())
         };
-        let mut next = 0;
+        let describe =
+            |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<(js_sys::Object, String)> {
+                let (stored, path) = output_paths(meta, family, encoding, flatten, posix)?;
+                let entry = js_sys::Object::new();
+                set_error_field(&entry, "path", &path.as_str().into());
+                set_error_field(&entry, "stored", &stored.into());
+                set_error_field(&entry, "isDirectory", &meta.is_directory.into());
+                if let Some(time) = meta.modified {
+                    let seconds = time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9;
+                    set_error_field(&entry, "mtime", &seconds.into());
+                }
+                Ok((entry, path))
+            };
         let result = progress::watching(progress, || {
             let count = progress::ReadCount::new("extracting", total);
-            let mut open =
+            let open =
                 |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<Box<dyn std::io::Write>> {
                     flush()?;
-                    let index = order.get(next).copied().unwrap_or(usize::MAX);
-                    next += 1;
-                    if !chosen(index) {
+                    if !chosen(&meta.name) {
                         return Ok(Box::new(std::io::sink()));
                     }
-                    let path = output_path(meta, family, encoding, flatten, posix)?;
-                    let entry = js_sys::Object::new();
-                    set_error_field(&entry, "index", &(index as f64).into());
-                    set_error_field(&entry, "path", &path.into());
-                    set_error_field(&entry, "isDirectory", &meta.is_directory.into());
-                    if let Some(time) = meta.modified {
-                        let seconds =
-                            time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9;
-                        set_error_field(&entry, "mtime", &seconds.into());
-                    }
+                    let (entry, _) = describe(meta)?;
                     let buffer = Rc::new(RefCell::new(Vec::new()));
                     *pending.borrow_mut() = Some((entry.into(), Rc::clone(&buffer)));
                     Ok(count.counted(Box::new(SharedBytes(buffer))))
                 };
-            let extracted = if self.archives.len() == 1 {
-                self.archives[0].extract_to_with_options(options, &mut open)
-            } else {
-                rars_rs::extract_volumes_to_with_options(&self.archives, options, &mut open)
+            let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
+                flush()?;
+                if !chosen(&meta.name) {
+                    return Ok(());
+                }
+                let (entry, path) = describe(meta)?;
+                let target = rars_rs::output_links::link_target_in(
+                    &tree,
+                    std::path::Path::new(""),
+                    std::path::Path::new(&path),
+                    meta,
+                    link,
+                    family,
+                    flatten,
+                )?;
+                // A kind this build doesn't know is skipped like an unsafe one.
+                let kind = match link {
+                    ExtractedLink::Symlink { directory, .. } => Some(("symlink", directory)),
+                    ExtractedLink::Junction { .. } => Some(("junction", true)),
+                    ExtractedLink::HardLink { .. } => Some(("hardlink", false)),
+                    ExtractedLink::FileCopy { .. } => Some(("copy", false)),
+                    _ => None,
+                };
+                match target.zip(kind) {
+                    Some((target, (kind, directory))) => {
+                        let detail = js_sys::Object::new();
+                        set_error_field(&detail, "kind", &kind.into());
+                        set_error_field(&detail, "target", &slash_path(&target).into());
+                        set_error_field(&detail, "directory", &directory.into());
+                        set_error_field(&entry, "link", &detail);
+                    }
+                    None => {
+                        set_error_field(&entry, "skipped", &true.into());
+                        let raw = String::from_utf8_lossy(link.target()).into_owned();
+                        set_error_field(&entry, "target", &raw.into());
+                    }
+                }
+                hand_over(&entry, &JsValue::UNDEFINED)
             };
-            let result = extracted.and_then(|()| flush());
+            let later = self.archives[1..].iter().cloned().map(Ok);
+            let result = rars_rs::output_links::extract_arriving_with_links(
+                &self.archives[0],
+                later,
+                options,
+                open,
+                link,
+            )
+            .and_then(|()| flush());
             if result.is_ok() {
                 count.finish();
             }
@@ -996,16 +1043,37 @@ impl std::io::Write for SharedBytes {
     }
 }
 
-/// The member's relative output path, `/`-separated, by the rules Python's extraction uses:
-/// the name is validated, RAR 5 names are made native, older ones decoded, and the path
-/// must stay inside the output directory.
-fn output_path(
+/// The output directory as the Node worker sees it, for the link containment check.
+struct JsTree(js_sys::Function);
+
+impl rars_rs::output_links::OutputTree for JsTree {
+    fn read_link(&self, path: &std::path::Path) -> std::io::Result<Option<std::path::PathBuf>> {
+        let answer = self
+            .0
+            .call1(&JsValue::NULL, &slash_path(path).into())
+            .map_err(|_| std::io::Error::other("reading a link in the output directory failed"))?;
+        Ok(answer.as_string().map(std::path::PathBuf::from))
+    }
+}
+
+/// A relative path as `/`-separated text, the form the worker joins onto its directory.
+fn slash_path(path: &std::path::Path) -> String {
+    path.components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The member's stored and output paths, `/`-separated, by the rules Python's extraction
+/// uses: the name is validated, RAR 5 names are made native, older ones decoded, and the
+/// path must stay inside the output directory. They differ only when flattening.
+fn output_paths(
     meta: &rars_rs::ExtractedEntryMeta,
     family: rars_rs::ArchiveFamily,
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     flatten: bool,
     posix: bool,
-) -> rars_rs::Result<String> {
+) -> rars_rs::Result<(String, String)> {
     rars_rs::validate_entry_name(meta.name.clone())?;
     let rar50 = family == rars_rs::ArchiveFamily::Rar50Plus;
     let name = if !rar50 {
@@ -1016,19 +1084,15 @@ fn output_path(
         rars_rs::output_links::rar50_native_name(&meta.name, false)
     };
     let stored = rars_rs::filename::relative_path(&name, !rar50)?;
+    if stored.components().next().is_none() {
+        return Err(rars_rs::Error::UnsafePath("empty output path"));
+    }
     let relative = if flatten {
         rars_rs::output_staging::flat_relative(&stored)
     } else {
-        stored
+        stored.clone()
     };
-    let parts = relative
-        .components()
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>();
-    if parts.is_empty() {
-        return Err(rars_rs::Error::UnsafePath("empty output path"));
-    }
-    Ok(parts.join("/"))
+    Ok((slash_path(&stored), slash_path(&relative)))
 }
 
 /// Selected members decoded in one pass, counted as they decode. Unselected solid

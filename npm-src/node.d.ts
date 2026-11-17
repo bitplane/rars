@@ -38,7 +38,8 @@ export class RarArchive {
    * Extracts entries under `directory` in one pass and returns the files written. Each is
    * written only once verified. `overwrite` is false (refuse an existing file), true, or
    * "rename" (write beside it as name(N).ext); `flatten` drops stored directories;
-   * `restoreTimes` (default true) sets modification times. Links are skipped.
+   * `restoreTimes` (default true) sets modification times. Links are written too; one that
+   * could lead outside `directory` is skipped with an `UnsafeLinkWarning` process warning.
    */
   extractAll(directory: NodePath, options?: ReadOptions & {
     members?: Iterable<import("./base.js").RarEntry | RarName>;

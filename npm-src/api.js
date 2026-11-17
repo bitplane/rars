@@ -252,7 +252,7 @@ export function createApi(runtime) {
           indices.push(entry.index);
         }
       }
-      return this._request("extract", {
+      const { written, skipped } = await this._request("extract", {
         directory: runtime.prepareOutputPath(directory),
         indices,
         overwrite,
@@ -261,6 +261,13 @@ export function createApi(runtime) {
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
+      // A link that could lead out of the directory is skipped, as Python warns with UnsafeLinkWarning.
+      for (const link of skipped) {
+        globalThis.process?.emitWarning?.(
+          `skipped link ${link.name} -> ${link.target}: it could lead outside the output directory`,
+          "UnsafeLinkWarning");
+      }
+      return written;
     }
 
     async readComment(options) {
