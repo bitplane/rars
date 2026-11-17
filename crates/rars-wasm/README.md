@@ -30,7 +30,9 @@ the exact header bytes.
 `get(name)` selects the last matching entry; `getAll(name)` returns every match
 in archive order, and `has(name)` says whether there is one. Each returned entry
 reads its own payload by index. In a volume set, `entry.volumeIndex` is the
-volume the entry starts in, counting the first as 0.
+volume the entry starts in, counting the first as 0. The archive says where it
+sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
+`volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
 
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.

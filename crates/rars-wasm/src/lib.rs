@@ -601,6 +601,35 @@ impl RarFile {
         self.infos.iter().any(|info| info.encrypted)
     }
 
+    /// Whether the (first) archive opened is one volume of a set.
+    #[wasm_bindgen(getter, js_name = isVolume)]
+    pub fn is_volume(&self) -> bool {
+        self.archives[0].is_volume()
+    }
+
+    /// The (first) archive's place in its set, counting the first as 0; undefined when
+    /// its headers don't record it.
+    #[wasm_bindgen(getter, js_name = volumeIndex)]
+    pub fn volume_index(&self) -> Option<f64> {
+        self.archives[0].volume_index().map(|index| index as f64)
+    }
+
+    /// Whether the (first) archive starts its set; undefined when its headers can't tell.
+    #[wasm_bindgen(getter, js_name = isFirstVolume)]
+    pub fn is_first_volume(&self) -> Option<bool> {
+        self.archives[0].is_first_volume()
+    }
+
+    /// How the set names its volume files: "part" or "old".
+    #[wasm_bindgen(getter, js_name = volumeNaming)]
+    pub fn volume_naming(&self) -> String {
+        match self.archives[0].volume_naming() {
+            rars_rs::volume_name::VolumeNaming::Part => "part",
+            rars_rs::volume_name::VolumeNaming::Old => "old",
+        }
+        .to_string()
+    }
+
     /// Where the RAR data starts, which is past the stub in a self-extracting
     /// archive and zero otherwise.
     #[wasm_bindgen(getter, js_name = sfxOffset)]

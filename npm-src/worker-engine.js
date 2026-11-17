@@ -74,6 +74,10 @@ function metadata(archive, password, options) {
     family: archive.family,
     sfxOffset: archive.sfxOffset,
     needsPassword: archive.needsPassword,
+    isVolume: archive.isVolume,
+    volumeIndex: archive.volumeIndex,
+    isFirstVolume: archive.isFirstVolume,
+    volumeNaming: archive.volumeNaming,
     comment: archive.readComment(password, options),
   };
 }

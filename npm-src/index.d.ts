@@ -124,6 +124,14 @@ export class RarArchive {
   readonly family: ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;
+  /** Whether the (first) archive opened is one volume of a set. */
+  readonly isVolume: boolean;
+  /** Its place in the set, counting the first as 0; undefined when its headers don't record it. */
+  readonly volumeIndex?: number;
+  /** Whether it starts its set; undefined when its headers can't tell. */
+  readonly isFirstVolume?: boolean;
+  /** How the set names its volume files. */
+  readonly volumeNaming: "part" | "old";
   readonly comment?: Uint8Array;
   get(name: RarName): RarEntry | undefined;
   getAll(name: RarName): readonly RarEntry[];

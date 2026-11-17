@@ -134,6 +134,17 @@ await check("volume sets are logical archives", async () => {
   const archive = await RarArchive.open(volumes);
   assert.deepEqual(archive.entries.map((entry) => entry.name), ["big.bin"]);
   assert.equal(archive.entries[0].volumeIndex, 0);
+  assert.equal(archive.isVolume, true);
+  assert.equal(archive.volumeIndex, 0);
+  assert.equal(archive.isFirstVolume, true);
+  assert.equal(archive.volumeNaming, "part");
+  const second = await RarArchive.open(volumes[1]);
+  assert.equal(second.volumeIndex, 1);
+  assert.equal(second.isFirstVolume, false);
+  second.close();
+  const plain = await RarArchive.open(await new RarWriter().add("a", "a").bytes());
+  assert.deepEqual([plain.isVolume, plain.volumeIndex, plain.isFirstVolume], [false, 0, true]);
+  plain.close();
   assert.ok(archive.has("big.bin"));
   assert.ok(!archive.has("missing"));
   assert.deepEqual(await archive.entries[0].bytes(), payload);

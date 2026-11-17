@@ -112,6 +112,10 @@ export function createApi(runtime) {
       this.sfxOffset = metadata.sfxOffset;
       this.comment = metadata.comment;
       this.needsPassword = metadata.needsPassword;
+      this.isVolume = metadata.isVolume;
+      this.volumeIndex = metadata.volumeIndex;
+      this.isFirstVolume = metadata.isFirstVolume;
+      this.volumeNaming = metadata.volumeNaming;
       this.entries = Object.freeze(metadata.entries.map(
         (entry) => Object.freeze(new RarEntry(this, entry)),
       ));
