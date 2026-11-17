@@ -245,23 +245,42 @@ export function createApi(runtime) {
     if (!ARCHIVE_VERSIONS.includes(version)) {
       throw new TypeError(`unknown RAR version ${JSON.stringify(version)}; expected one of ${ARCHIVE_VERSIONS.join(", ")}`);
     }
+    // A wrong type is a TypeError; a value the version can't write is refused here,
+    // before anything is added, as an INVALID_OPTION RarError.
+    const invalid = (message) => new RarError("INVALID_OPTION", message);
+    const modern = version === "rar50" || version === "rar70";
     const level = options.level ?? 3;
-    if (!Number.isInteger(level) || level < 0 || level > 5) {
-      throw new TypeError("level must be an integer from 0 to 5");
-    }
+    if (!Number.isInteger(level)) throw new TypeError("level must be an integer");
+    if (level < 0 || level > 5) throw invalid("level must be from 0 to 5");
     for (const key of ["solid", "encryptHeaders"]) {
       if (options[key] !== undefined && typeof options[key] !== "boolean") {
         throw new TypeError(`${key} must be a boolean`);
       }
     }
-    if (options.recoveryPercent !== undefined &&
-        (!Number.isInteger(options.recoveryPercent) ||
-         options.recoveryPercent < 1 || options.recoveryPercent > 100)) {
-      throw new TypeError("recoveryPercent must be an integer from 1 to 100");
+    if (options.recoveryPercent !== undefined) {
+      if (!Number.isInteger(options.recoveryPercent)) {
+        throw new TypeError("recoveryPercent must be an integer");
+      }
+      if (!modern) throw invalid(`${version} cannot write a recovery record`);
+      if (options.recoveryPercent < 1 || options.recoveryPercent > 100) {
+        throw invalid("recoveryPercent must be from 1 to 100");
+      }
     }
-    if (options.volumeSize !== undefined &&
-        (!Number.isSafeInteger(options.volumeSize) || options.volumeSize <= 0)) {
-      throw new TypeError("volumeSize must be a positive safe integer");
+    if (options.encryptHeaders) {
+      if (options.password == null) throw invalid("encryptHeaders needs a password");
+      if (!["rar30", "rar40", "rar50", "rar70"].includes(version)) {
+        throw invalid(`${version} cannot write header encryption`);
+      }
+    }
+    if (options.volumeSize !== undefined) {
+      if (!Number.isSafeInteger(options.volumeSize)) {
+        throw new TypeError("volumeSize must be a safe integer");
+      }
+      if (options.volumeSize <= 0) throw invalid("volumeSize must be more than 0");
+      if (options.comment != null) throw invalid(`${version} cannot write an archive comment in a volume set`);
+    }
+    if (options.maxMemoryBytes != null && !modern) {
+      throw invalid(`${version} cannot write to a memory limit; only rar50 and rar70 can`);
     }
     return { ...options, version, level };
   }

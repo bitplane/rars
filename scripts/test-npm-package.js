@@ -40,6 +40,16 @@ await check("CommonJS and ESM expose the same async API", async () => {
   assert.deepEqual(commonjs.archiveVersions, archiveVersions);
   assert.throws(() => new RarWriter({ format: "rar29" }), /now called version/);
   assert.throws(() => new RarWriter({ version: "RAR50" }), /unknown RAR version/);
+  for (const settings of [
+    { level: -1 }, { level: 6 }, { recoveryPercent: 0 }, { recoveryPercent: 101 },
+    { version: "rar29", recoveryPercent: 5 }, { encryptHeaders: true },
+    { version: "rar20", password: "pw", encryptHeaders: true }, { volumeSize: 0 },
+    { comment: "note", volumeSize: 4096 },
+  ]) {
+    assert.throws(() => new RarWriter(settings),
+      (error) => error instanceof RarError && error.code === "INVALID_OPTION", JSON.stringify(settings));
+  }
+  assert.throws(() => new RarWriter({ level: "3" }), TypeError);
 });
 
 await check("every format round-trips without blocking API calls", async () => {
@@ -305,8 +315,8 @@ await check("aggregate writer memory policy crosses the worker boundary", async 
     assert.ok(volumes.length > 1);
   }
   for (const format of ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"]) {
-    await assert.rejects(new RarWriter({ version: format, level: 0, maxMemoryBytes: 0 })
-      .add("member", HELLO).bytes(), (error) => error.code === "UNSUPPORTED_FEATURE");
+    assert.throws(() => new RarWriter({ version: format, level: 0, maxMemoryBytes: 0 }),
+      (error) => error instanceof RarError && error.code === "INVALID_OPTION");
   }
 });
 

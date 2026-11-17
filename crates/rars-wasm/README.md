@@ -147,8 +147,9 @@ staged temporary files. No separate cancellation-token object is needed in JS.
 through `2n ** 64n - 1n`. It caps managed RAR5/7 execution allocation capacity,
 including retained WASM spools, archive/volume output and the final JavaScript
 payload copy. The default is unlimited; zero admits no managed allocation.
-A refusal has code `RESOURCE_LIMIT`; legacy formats reject the requested policy
-with `UNSUPPORTED_FEATURE`. Caller inputs, returned caller-owned bytes, JavaScript
+A refusal has code `RESOURCE_LIMIT`; the constructor refuses it for older
+versions with `INVALID_OPTION`, as it does any setting the version can't write.
+Caller inputs, returned caller-owned bytes, JavaScript
 runtime objects, allocator overhead, stacks and OS memory are excluded. This is
 not a process-memory ceiling and does not bound reading or rewrite staging.
 
