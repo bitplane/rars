@@ -269,12 +269,12 @@ fn compressed_legacy_volume_can_cancel_at_final_progress() {
     impl WriteProgress for StopAfterLastVolume {
         fn report(&self, event: WriteProgressEvent<'_>) {
             if let WriteProgressEvent::VolumeFinished {
-                volume_number,
+                volume_index,
                 total_volumes: Some(total_volumes),
                 ..
             } = event
             {
-                if volume_number == total_volumes {
+                if volume_index + 1 == total_volumes {
                     self.final_volume.store(true, Ordering::Relaxed);
                 }
             }

@@ -92,7 +92,7 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
         {
             self.ended = true;
             return Err(crate::Error::InVolume {
-                number: self.index,
+                index: self.index - 1,
                 source: Box::new(crate::Error::InvalidHeader("volume is out of order")),
             });
         }
@@ -114,10 +114,10 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
 
     /// A volume the set still needs; running out fails the same way wherever it happens.
     pub(crate) fn next_part(&mut self) -> crate::Result<Option<A>> {
-        let number = self.index + 1;
+        let index = self.index;
         match self.next()? {
             None if self.stop_at_last => Err(crate::Error::InVolume {
-                number,
+                index,
                 source: Box::new(crate::Error::MissingVolume),
             }),
             volume => Ok(volume),

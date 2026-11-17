@@ -3296,7 +3296,7 @@ fn report_volume(
     bytes: usize,
 ) -> Result<()> {
     progress.report(WriteProgressEvent::VolumeFinished {
-        volume_number: index + 1,
+        volume_index: index,
         total_volumes: Some(total),
         bytes: bytes as u64,
     });

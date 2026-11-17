@@ -105,9 +105,9 @@ fn js_error(error: rars_rs::Error) -> JsValue {
                 set_error_field(&context, "offset", &offset.to_string().into());
                 cause = source;
             }
-            rars_rs::Error::InVolume { number, source } => {
+            rars_rs::Error::InVolume { index, source } => {
                 set_error_field(&context, "kind", &"volume".into());
-                set_error_field(&context, "number", &(*number as f64).into());
+                set_error_field(&context, "index", &(*index as f64).into());
                 cause = source;
             }
             _ => break,
@@ -1157,7 +1157,7 @@ mod host_tests {
             .into_iter()
             .map(|error| {
                 let wrapped = Error::InVolume {
-                    number: 3,
+                    index: 2,
                     source: Box::new(
                         error
                             .at_entry(vec![0xff, 0, 1], "reading")

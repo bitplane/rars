@@ -23,7 +23,8 @@ pub struct RewriteStaging {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct VolumeSetMember {
-    pub volume: usize,
+    /// Counting the set's first volume as 0.
+    pub volume_index: usize,
     pub index_in_volume: usize,
     pub member: ArchiveMember,
 }
@@ -36,7 +37,7 @@ impl Archive {
     #[doc(hidden)]
     pub fn volume_set_members(&self, later_volumes: &[Archive]) -> Result<Vec<VolumeSetMember>> {
         let broken = |volume: usize| Error::InVolume {
-            number: volume + 1,
+            index: volume,
             source: Box::new(Error::InvalidHeader(
                 "volume does not continue the member split from the volume before it",
             )),
@@ -62,7 +63,7 @@ impl Archive {
                     return Err(broken(volume));
                 } else {
                     members.push(VolumeSetMember {
-                        volume,
+                        volume_index: volume,
                         index_in_volume,
                         member,
                     });
@@ -72,7 +73,7 @@ impl Archive {
         }
         if pending {
             return Err(Error::InVolume {
-                number: later_volumes.len() + 2,
+                index: later_volumes.len() + 1,
                 source: Box::new(Error::MissingVolume),
             });
         }

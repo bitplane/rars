@@ -3782,11 +3782,8 @@ mod tests {
         };
         let volume_count = AtomicUsize::new(0);
         let reporter = |event: WriteProgressEvent<'_>| {
-            if let WriteProgressEvent::VolumeFinished { volume_number, .. } = event {
-                assert_eq!(
-                    volume_number,
-                    volume_count.fetch_add(1, Ordering::Relaxed) + 1
-                );
+            if let WriteProgressEvent::VolumeFinished { volume_index, .. } = event {
+                assert_eq!(volume_index, volume_count.fetch_add(1, Ordering::Relaxed));
             }
         };
         // Size the volumes first, so the probing writes stay out of the count.

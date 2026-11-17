@@ -244,12 +244,12 @@ fn every_finished_volume_reports_the_size_of_the_set() {
     impl rars::WriteProgress for Totals {
         fn report(&self, event: rars::WriteProgressEvent<'_>) {
             if let rars::WriteProgressEvent::VolumeFinished {
-                volume_number,
+                volume_index,
                 total_volumes,
                 ..
             } = event
             {
-                self.0.lock().unwrap().push((volume_number, total_volumes));
+                self.0.lock().unwrap().push((volume_index, total_volumes));
             }
         }
     }
@@ -266,7 +266,7 @@ fn every_finished_volume_reports_the_size_of_the_set() {
     .unwrap();
     assert_eq!(
         totals.0.into_inner().unwrap(),
-        [(1, Some(4)), (2, Some(4)), (3, Some(4)), (4, Some(4))]
+        [(0, Some(4)), (1, Some(4)), (2, Some(4)), (3, Some(4))]
     );
 }
 

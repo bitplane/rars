@@ -303,7 +303,7 @@ if (engine.__testErrorRecords) check('private error conversion preserves exact c
   for (const error of errors) {
     assert.ok(error instanceof Error);
     assert.deepEqual(error.details.contexts, [
-      {kind: 'volume', number: 3},
+      {kind: 'volume', index: 2},
       {kind: 'archiveOffset', offset: '4294967295'},
       {kind: 'entry', nameBytes: [255, 0, 1], operation: 'reading'},
     ]);

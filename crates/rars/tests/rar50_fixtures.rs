@@ -1272,8 +1272,8 @@ fn a_damaged_rar50_volume_is_reported_by_its_number() {
         source = inner;
     }
     assert!(
-        matches!(source, Error::InVolume { number, source }
-            if *number == damaged + 1 && matches!(**source, Error::Crc32Mismatch { .. })),
+        matches!(source, Error::InVolume { index, source }
+            if *index == damaged && matches!(**source, Error::Crc32Mismatch { .. })),
         "expected volume {} to be named, got {error}",
         damaged + 1
     );
@@ -1312,8 +1312,8 @@ fn a_damaged_winrar_htb_volume_is_reported_by_its_number() {
             source = inner;
         }
         assert!(
-            matches!(source, Error::InVolume { number, source }
-                if *number == damaged + 1 && matches!(**source, Error::HashMismatch { hash_type: 0 })),
+            matches!(source, Error::InVolume { index, source }
+                if *index == damaged && matches!(**source, Error::HashMismatch { hash_type: 0 })),
             "{name}: expected volume {} to be named, got {error}",
             damaged + 1
         );

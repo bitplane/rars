@@ -355,7 +355,7 @@ fn refuses_a_rar5_volume_out_of_order() {
         });
 
     assert!(
-        matches!(result, Err(rars::Error::InVolume { number: 3, .. })),
+        matches!(result, Err(rars::Error::InVolume { index: 2, .. })),
         "{result:?}"
     );
     assert_eq!(pulled, [1, 2]);
@@ -393,7 +393,7 @@ fn reads_rar3_end_block_volume_numbers_and_refuses_a_volume_out_of_order() {
             }
         });
     assert!(
-        matches!(&result, Err(error @ rars::Error::InVolume { number: 3, .. })
+        matches!(&result, Err(error @ rars::Error::InVolume { index: 2, .. })
             if error.root_cause() == &rars::Error::InvalidHeader("volume is out of order")),
         "{result:?}"
     );
@@ -409,8 +409,8 @@ fn a_missing_volume_is_reported_the_same_inside_and_between_members() {
                 (index != missing).then_some(volume)
             });
         assert!(
-            matches!(&result, Err(error @ rars::Error::InVolume { number, .. })
-                if *number == missing + 1 && error.root_cause() == &rars::Error::MissingVolume),
+            matches!(&result, Err(error @ rars::Error::InVolume { index, .. })
+                if *index == missing && error.root_cause() == &rars::Error::MissingVolume),
             "volume {missing}: {result:?}"
         );
     }

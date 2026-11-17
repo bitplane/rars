@@ -733,28 +733,26 @@ impl Archive {
         }
     }
 
-    /// 1-based to match "in volume N" errors; None when the headers don't record it.
-    pub fn volume_number(&self) -> Option<u64> {
+    /// This volume's place in its set, counting the first as 0, as the headers
+    /// store it; None when they don't record it.
+    pub fn volume_index(&self) -> Option<u64> {
         if !self.is_volume() {
-            return Some(1);
+            return Some(0);
         }
         match self {
             Self::Rar13(_) => None,
             // WinRAR 3.00 marks every part-named volume first, so a continued member overrules the flag.
-            Self::Rar15To40(archive) => archive
-                .end_volume_number()
-                .map(|number| u64::from(number) + 1)
-                .or_else(|| {
-                    (archive.main.is_first_volume() && !self.first_member_continues()).then_some(1)
-                }),
-            Self::Rar50Plus(archive) => Some(archive.main.volume_number.unwrap_or(0) + 1),
+            Self::Rar15To40(archive) => archive.end_volume_number().map(u64::from).or_else(|| {
+                (archive.main.is_first_volume() && !self.first_member_continues()).then_some(0)
+            }),
+            Self::Rar50Plus(archive) => Some(archive.main.volume_number.unwrap_or(0)),
         }
     }
 
     /// Whether this volume starts its set, or None when its headers can't tell.
     pub fn is_first_volume(&self) -> Option<bool> {
-        match self.volume_number() {
-            Some(number) => Some(number == 1),
+        match self.volume_index() {
+            Some(index) => Some(index == 0),
             None => self.first_member_continues().then_some(false),
         }
     }
@@ -969,7 +967,7 @@ impl Archive {
                         .is_some_and(|number| number != index as u64)
                     {
                         return Err(Error::InVolume {
-                            number: index + 1,
+                            index,
                             source: Box::new(Error::InvalidHeader("volume is out of order")),
                         });
                     }

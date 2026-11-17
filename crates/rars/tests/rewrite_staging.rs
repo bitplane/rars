@@ -853,7 +853,7 @@ fn volume_set_staging_follows_split_members_into_later_volumes() {
         let names: Vec<_> = members.iter().map(|m| m.member.meta.name.clone()).collect();
         assert_eq!(names, [&b"first"[..], b"dir", b"large", b"last"]);
         assert_eq!(members[2].member.meta.unpacked_size, large.len() as u64);
-        assert_eq!(members[3].volume, later.len());
+        assert_eq!(members[3].volume_index, later.len());
 
         let staged = stage_from_set(&first, &later, &[3, 0, 2]);
         assert_eq!(

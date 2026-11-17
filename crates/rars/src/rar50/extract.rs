@@ -2442,7 +2442,7 @@ mod tests {
                 .unwrap()
             };
             let error = diagnose(&volumes).unwrap();
-            assert!(matches!(error, Error::InVolume { number: 2, source }
+            assert!(matches!(error, Error::InVolume { index: 1, source }
                 if matches!(*source, Error::Crc32Mismatch { expected, actual }
                     if expected == crc32(data) ^ 1 && actual == crc32(data))));
             let Block::File(file) = &mut volumes[1].blocks[0] else {
