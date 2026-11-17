@@ -13,6 +13,7 @@ STORED = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/rar50
         (rars.ArchiveVersion.RAR29, "rar29"),
         (rars.ArchiveFamily.RAR50_PLUS, "rar50_plus"),
         (rars.VolumeNaming.PART, "part"),
+        (rars.AttributeKind.UNIX, "unix"),
         (rars.ProgressPhase.EXTRACTING, "extracting"),
     ],
 )

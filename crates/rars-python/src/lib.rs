@@ -70,6 +70,12 @@ class VolumeNaming(str, enum.Enum):
     OLD = 'old'
 
 
+class AttributeKind(str, enum.Enum):
+    DOS = 'dos'
+    UNIX = 'unix'
+    UNKNOWN = 'unknown'
+
+
 class ProgressPhase(str, enum.Enum):
     READING = 'reading'
     EXTRACTING = 'extracting'
@@ -80,7 +86,7 @@ class ProgressPhase(str, enum.Enum):
     WRITING = 'writing'
 
 
-ENUMS = (ArchiveVersion, ArchiveFamily, VolumeNaming, ProgressPhase)
+ENUMS = (ArchiveVersion, ArchiveFamily, VolumeNaming, AttributeKind, ProgressPhase)
 for cls in ENUMS:
     cls.__str__ = str.__str__
     cls.__format__ = str.__format__
@@ -90,6 +96,7 @@ for cls in ENUMS:
 static ARCHIVE_FAMILY: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static VOLUME_NAMING: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static PROGRESS_PHASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static ATTRIBUTE_KIND: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 fn enum_member<'py>(
     py: Python<'py>,
@@ -795,8 +802,10 @@ struct RarInfo {
     date_time: Option<(u16, u8, u8, u8, u8, u8)>,
     /// Python reads it as `CRC`, the name `zipfile` and `rarfile` use.
     crc: Option<u32>,
+    /// The stored host number, which RAR 5 numbers differently from RAR 1.5 to 4.x.
     #[pyo3(get)]
     host_os: Option<u64>,
+    attr_source: rars_rs::AttrSource,
     #[pyo3(get)]
     is_encrypted: bool,
     #[pyo3(get)]
@@ -829,6 +838,17 @@ impl RarInfo {
     #[getter]
     fn family<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         family_member(py, self.family)
+    }
+
+    /// What `file_attr` holds: DOS attribute bits, a Unix mode, or nothing meaningful.
+    #[getter]
+    fn file_attr_kind<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let value = match self.attr_source {
+            rars_rs::AttrSource::Dos => "dos",
+            rars_rs::AttrSource::Unix => "unix",
+            _ => "unknown",
+        };
+        enum_member(py, &ATTRIBUTE_KIND, "AttributeKind", value)
     }
 
     fn is_dir(&self) -> bool {
@@ -3191,6 +3211,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ArchiveVersion",
         "ArchiveFamily",
         "VolumeNaming",
+        "AttributeKind",
         "ProgressPhase",
     ] {
         m.add(name, enums.getattr(name)?)?;
@@ -4568,6 +4589,7 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         .meta
         .stored_modification_time()
         .and_then(rars_rs::StoredTimestamp::calendar_fields);
+    let attr_source = member.meta.attr_source();
     RarInfo {
         member_index: 0,
         archive_identity: None,
@@ -4578,6 +4600,7 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         date_time,
         crc,
         host_os: member.meta.host_os,
+        attr_source,
         is_encrypted: member.meta.is_encrypted,
         is_solid: solid,
         is_split_before: member.meta.is_split_before,

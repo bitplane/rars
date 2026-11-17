@@ -87,9 +87,11 @@ def test_from_archive_interprets_permissions_using_source_host(format, mode):
     # RAR 1.4/1.5 writers deliberately emit DOS metadata even for Unix input.
     if mode is None or format in ("rar14", "rar15"):
         assert info.host_os == 0
+        assert info.file_attr_kind == rars.AttributeKind.DOS
         assert info.file_attr == 0x20
     else:
         assert info.host_os == 1
+        assert info.file_attr_kind == rars.AttributeKind.UNIX
         assert info.file_attr == 0o100000 | mode
     assert output.read("file.txt") == b"permissions payload"
 
@@ -260,3 +262,14 @@ def test_builder_writes_every_supported_feature_combination(tmp_path, kwargs):
     archive.testrar()
     assert sorted(info.filename for info in archive.infolist()) == ["a.txt", "b.txt"]
     assert archive.read("a.txt") == b"streamed payload\n" * 500
+
+
+@pytest.mark.parametrize("format", ["rar29", "rar50"])
+def test_file_attr_kind_reads_the_host_number_for_its_family(format):
+    builder = rars.RarBuilder(format=format, store=True)
+    builder.add_bytes(b"x", "unix", mode=0o644)
+    builder.add_bytes(b"x", "dos")
+    infos = {info.filename: info for info in rars.RarFile(builder.to_bytes())}
+    assert infos["unix"].file_attr_kind == rars.AttributeKind.UNIX
+    assert infos["unix"].host_os == (3 if format == "rar29" else 1)
+    assert infos["dos"].file_attr_kind == rars.AttributeKind.DOS

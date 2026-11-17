@@ -17,6 +17,7 @@ __all__ = [
     "ArchiveVersion",
     "ArchiveFamily",
     "VolumeNaming",
+    "AttributeKind",
     "ProgressPhase",
     "WriterResources",
     "RepairReport",
@@ -83,6 +84,12 @@ class VolumeNaming(str, Enum):
     def __new__(cls, value: str) -> Self: ...
     PART = "part"
     OLD = "old"
+
+class AttributeKind(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    DOS = "dos"
+    UNIX = "unix"
+    UNKNOWN = "unknown"
 
 class ProgressPhase(str, Enum):
     def __new__(cls, value: str) -> Self: ...
@@ -222,7 +229,10 @@ class RarInfo:
     @property
     def CRC(self) -> int | None: ...
     @property
-    def host_os(self) -> int | None: ...
+    def host_os(self) -> int | None:
+        """The stored host number. RAR 5 numbers hosts differently from RAR 1.5 to 4.x; use file_attr_kind."""
+    @property
+    def file_attr_kind(self) -> AttributeKind: ...
     @property
     def is_encrypted(self) -> bool: ...
     @property
