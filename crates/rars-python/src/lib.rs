@@ -222,7 +222,7 @@ impl CancellationToken {
 #[derive(Debug, Clone, Default)]
 struct WriterResources {
     /// Hard ceiling on the RAR 5 writer's managed allocations; exceeding it
-    /// raises `LimitExceeded`. Legacy formats refuse it.
+    /// raises `LimitExceeded`. `RarBuilder` refuses it for older versions.
     #[pyo3(get)]
     max_memory_bytes: Option<u64>,
 }
@@ -2357,7 +2357,7 @@ impl RarBuilder {
     #[allow(clippy::too_many_arguments)]
     fn new(
         version: &str,
-        level: u8,
+        level: i64,
         solid: bool,
         password: Option<&Bound<'_, PyAny>>,
         encrypt_headers: bool,
@@ -2367,14 +2367,70 @@ impl RarBuilder {
         resources: Option<&WriterResources>,
     ) -> PyResult<Self> {
         let format = parse_version(version)?;
+        let password = py_password(password)?;
+        let comment = py_optional_bytes(comment)?;
+        let level = u8::try_from(level)
+            .ok()
+            .filter(|&level| level <= 5)
+            .ok_or_else(|| PyValueError::new_err("level must be from 0 to 5"))?;
+        // What the version alone decides is refused here, before any member is added.
+        let shape = rars_rs::write_plan::PlanShape::new()
+            .compressed(level > 0)
+            .volumes(volume_size.is_some());
+        let refuse_unless = |option: rars_rs::write_plan::WriterOption| {
+            if rars_rs::write_plan::supports(format, option, shape) {
+                return Ok(());
+            }
+            let set = if shape.volumes {
+                " in a volume set"
+            } else {
+                ""
+            };
+            Err(PyValueError::new_err(format!(
+                "{} cannot write {}{set}",
+                format.as_str(),
+                option.name()
+            )))
+        };
+        if let Some(percent) = recovery_percent {
+            refuse_unless(rars_rs::write_plan::WriterOption::RecoveryRecord)?;
+            if !(1..=100).contains(&percent) {
+                return Err(PyValueError::new_err(
+                    "recovery_percent must be from 1 to 100",
+                ));
+            }
+        }
+        if encrypt_headers {
+            if password.is_none() {
+                return Err(PyValueError::new_err("encrypt_headers needs a password"));
+            }
+            refuse_unless(rars_rs::write_plan::WriterOption::Feature(
+                rars_rs::Feature::HeaderEncryption,
+            ))?;
+        }
+        if comment.is_some() {
+            refuse_unless(rars_rs::write_plan::WriterOption::ArchiveComment)?;
+        }
+        // Only the RAR 5 writer keeps its allocations to a quota.
+        if resources.is_some_and(|resources| resources.max_memory_bytes.is_some())
+            && format.family() != rars_rs::ArchiveFamily::Rar50Plus
+        {
+            return Err(PyValueError::new_err(format!(
+                "{} cannot write to a memory limit; only rar50 and rar70 can",
+                format.as_str()
+            )));
+        }
+        if volume_size == Some(0) {
+            return Err(PyValueError::new_err("volume_size must be more than 0"));
+        }
         Ok(Self {
             inner: rars_rs::Builder::new(format)
                 .compression_level(Some(level))
                 .store(level == 0)
                 .solid(solid)
-                .password(py_password(password)?)
+                .password(password)
                 .header_encryption(encrypt_headers)
-                .comment(py_optional_bytes(comment)?)
+                .comment(comment)
                 .recovery_percent(recovery_percent)
                 .volume_size(volume_size),
             format,

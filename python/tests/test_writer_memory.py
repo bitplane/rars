@@ -33,10 +33,8 @@ def test_writer_memory_failure_preserves_destination(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 def test_legacy_writer_refuses_memory_policy(format):
-    builder = rars.RarBuilder(version=format, level=0, resources=rars.WriterResources(max_memory_bytes=0))
-    builder.add_bytes(b"payload", "member")
-    with pytest.raises(rars.UnsupportedRarFeature):
-        builder.to_bytes()
+    with pytest.raises(ValueError, match="memory limit"):
+        rars.RarBuilder(version=format, level=0, resources=rars.WriterResources(max_memory_bytes=0))
 
 
 @pytest.mark.parametrize("encrypt_headers", [False, True])
