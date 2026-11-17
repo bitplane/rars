@@ -113,7 +113,6 @@ struct ProgressEvent {
     phase: String,
     #[pyo3(get)]
     completed: u64,
-    #[pyo3(get)]
     total: u64,
     #[pyo3(get)]
     pass_number: usize,
@@ -127,7 +126,7 @@ struct ProgressEvent {
     #[pyo3(get)]
     volume_number: Option<usize>,
     finished: bool,
-    /// A set whose last volume hasn't been read yet has no total; `total` is 0 until it does.
+    /// A set whose last volume hasn't been read yet has no total until it is.
     total_known: bool,
 }
 
@@ -177,15 +176,19 @@ impl ProgressEvent {
         enum_member(py, &PROGRESS_PHASE, "ProgressPhase", &self.phase)
     }
 
+    /// Bytes the phase will handle, or None while that isn't known yet.
+    #[getter]
+    fn total(&self) -> Option<u64> {
+        let unknown =
+            !self.total_known || (self.phase == "writing" && self.total == 0 && !self.finished);
+        (!unknown).then_some(self.total)
+    }
+
     #[getter]
     fn percentage(&self) -> Option<f64> {
-        if !self.total_known || (self.phase == "writing" && self.total == 0 && !self.finished) {
-            return None;
-        }
-        if self.total == 0 {
-            Some(100.0)
-        } else {
-            Some(self.completed as f64 * 100.0 / self.total as f64)
+        match self.total()? {
+            0 => Some(100.0),
+            total => Some(self.completed as f64 * 100.0 / total as f64),
         }
     }
 }

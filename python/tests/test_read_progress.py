@@ -52,7 +52,7 @@ def test_a_set_from_a_generator_claims_no_total_before_its_last_volume(tmp_path)
 
     before_last = [event for event in events if event[0] < len(paths)]
     assert before_last
-    assert all(total == 0 and percentage is None for _, total, percentage, _ in before_last)
+    assert all(total is None and percentage is None for _, total, percentage, _ in before_last)
     volumes = [volume for volume, *_ in events]
     assert volumes == sorted(volumes)
     assert volumes[0] == 1
@@ -186,4 +186,4 @@ def test_a_set_with_a_volume_still_missing_falls_back_to_an_unknown_total(tmp_pa
             archive.testrar(progress=events.append)
 
     assert events
-    assert all(event.total == 0 and event.percentage is None for event in events)
+    assert all(event.total is None and event.percentage is None for event in events)

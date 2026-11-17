@@ -128,7 +128,8 @@ class ProgressEvent:
     @property
     def completed(self) -> int: ...
     @property
-    def total(self) -> int: ...
+    def total(self) -> int | None:
+        """Bytes this phase will handle, or None while that isn't known yet."""
     @property
     def pass_number(self) -> int: ...
     @property
