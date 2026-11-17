@@ -59,7 +59,7 @@ def test_extract_and_selected_members_restore_times(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar50", "rar29"])
 def test_volume_sets_restore_times(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder = rars.RarBuilder(format=format, level=0, volume_size=4096)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()
     paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
@@ -76,7 +76,7 @@ def test_volume_sets_restore_times(tmp_path, format):
 
 @pytest.mark.parametrize("members", [None, ["good.txt", "bad.txt"]])
 def test_failed_extraction_restores_completed_outputs_only(tmp_path, members):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"good payload", "good.txt", mtime=1_600_000_000)
     builder.add_bytes(b"spacer", "spacer.txt", mtime=1_600_000_000)
     builder.add_bytes(b"bad payload", "bad.txt", mtime=1_600_000_000)
@@ -92,7 +92,7 @@ def test_failed_extraction_restores_completed_outputs_only(tmp_path, members):
 
 
 def test_cancelled_volume_set_restores_completed_outputs_and_drops_the_rest(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=4096)
+    builder = rars.RarBuilder(level=0, volume_size=4096)
     builder.add_bytes(b"small", "small.txt", mtime=1_600_000_000)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()

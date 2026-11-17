@@ -150,7 +150,7 @@ def test_flat_links_take_the_renamed_target_name(tmp_path):
 @symlinks
 @pytest.mark.parametrize("kind", [HARD_LINK, FILE_COPY])
 def test_flat_redirections_built_by_rars_resolve_too(tmp_path, kind):
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(format="rar50", level=0)
     builder.add_bytes(b"target", "c/target.txt")
     builder.add_unix_symlink("b/link.txt", "c/target.txt")
     data = redirect(builder.to_bytes(), kind)
@@ -162,7 +162,7 @@ def test_flat_redirections_built_by_rars_resolve_too(tmp_path, kind):
 @symlinks
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
 def test_flat_legacy_symlinks_keep_only_bare_targets(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(format=format, level=0)
     builder.add_bytes(b"local", "a/local.txt")
     builder.add_unix_symlink("a/near.txt", "local.txt")
     builder.add_unix_symlink("a/up.txt", "../x/local.txt")
@@ -174,7 +174,7 @@ def test_flat_legacy_symlinks_keep_only_bare_targets(tmp_path, format):
 
 @pytest.mark.parametrize("given", [False, True])
 def test_volume_sets_flatten_the_same_way(tmp_path, given):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=4096)
+    builder = rars.RarBuilder(format="rar50", level=0, volume_size=4096)
     builder.add_bytes(b"\1" * 3000, "a/one.bin")
     builder.add_bytes(b"\2" * 3000, "b/c/two.bin")
     (tmp_path / "made").mkdir()
@@ -204,7 +204,7 @@ def test_member_times_are_restored_on_flattened_and_renamed_files(tmp_path, form
 
 
 def test_rename_without_flatten_refuses_a_repeated_stored_path_as_the_cli_does(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(format="rar50", level=0)
     builder.add_bytes(b"first", "a/readme.txt")
     builder.add_bytes(b"second", "pppppppppppp")
     data = _rewrite_name(builder.to_bytes(), b"pppppppppppp", b"a/readme.txt")

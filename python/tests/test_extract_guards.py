@@ -91,7 +91,7 @@ def _rewrite_name(archive: bytes, placeholder: bytes, replacement: bytes) -> byt
 def hostile_archive(name: bytes, payload: bytes = b"owned\n") -> bytes:
     """A valid archive whose single member is called `name`."""
     placeholder = b"p" * len(name)
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(format="rar50", level=0)
     builder.add_bytes(payload, placeholder.decode())
     return _rewrite_name(builder.to_bytes(), placeholder, name)
 

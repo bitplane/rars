@@ -23,7 +23,7 @@ LATER = ["after.bin", "tail.bin"]
 
 
 def write_set(tmp_path, **options):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=4096, **options)
+    builder = rars.RarBuilder(format="rar50", level=0, volume_size=4096, **options)
     for name, data in MEMBERS.items():
         builder.add_bytes(data, name)
     (tmp_path / "made").mkdir()
@@ -33,7 +33,7 @@ def write_set(tmp_path, **options):
 
 
 def write_legacy_set(tmp_path, format, first, **options):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096, **options)
+    builder = rars.RarBuilder(format=format, level=0, volume_size=4096, **options)
     builder.add_bytes(MEMBERS["large.bin"], "large.bin")
     (tmp_path / "made").mkdir()
     paths = builder.write_volumes(tmp_path / "made" / first)
@@ -254,7 +254,7 @@ def read_bytes_so_far():
 
 @pytest.mark.skipif(not Path("/proc/self/io").exists(), reason="needs Linux read counters")
 def test_listing_a_large_set_reads_headers_only(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=1 << 20)
+    builder = rars.RarBuilder(format="rar50", level=0, volume_size=1 << 20)
     for index in range(4):
         builder.add_bytes(random.Random(index).randbytes(3 << 20), f"{index}.bin")
     (tmp_path / "made").mkdir()

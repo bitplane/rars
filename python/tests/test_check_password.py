@@ -109,7 +109,7 @@ def test_winrar_header_encryption_finds_the_correct_candidate(fixture, password)
 @pytest.mark.parametrize("encrypt_headers", [False, True])
 def test_a_later_volume_checks_the_same_as_the_first(tmp_path, encrypt_headers):
     builder = rars.RarBuilder(
-        format="rar50", store=True, volume_size=4096, password="right", encrypt_headers=encrypt_headers
+        format="rar50", level=0, volume_size=4096, password="right", encrypt_headers=encrypt_headers
     )
     builder.add_bytes(random.Random(6).randbytes(20_000), "large.bin")
     paths = builder.write_volumes(tmp_path / "set.part1.rar")

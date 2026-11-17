@@ -54,7 +54,7 @@ def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password, f
 
 
 def old_comment_archive():
-    builder = rars.RarBuilder(format="rar29", store=True, comment=b"comment")
+    builder = rars.RarBuilder(format="rar29", level=0, comment=b"comment")
     builder.add_bytes(b"payload", "file")
     return builder.to_bytes()
 
@@ -96,7 +96,7 @@ def test_bad_archive_comments_leave_destination_untouched(tmp_path, damage):
 
 
 def test_corrupt_file_comment_fails_before_destination_write(tmp_path):
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"payload", "file")
     builder.set_member_comment("file", b"comment")
     data = bytearray(builder.to_bytes())

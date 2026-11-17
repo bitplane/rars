@@ -4,7 +4,7 @@ import rars
 
 def source_archive(format="rar50", solid=False):
     builder = rars.RarBuilder(
-        format=format, solid=solid, store=not solid or format in ("rar50", "rar70")
+        format=format, solid=solid, level=0 if not solid or format in ("rar50", "rar70") else 3
     )
     builder.add_directory("empty", mtime=1_700_000_000)
     builder.add_bytes(b"first payload", "first", mtime=1_700_000_002)
@@ -156,7 +156,7 @@ def test_staging_progress_counts_decoded_dependencies_during_compression(tmp_pat
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70"])
 @pytest.mark.parametrize("when", ["start", "bytes"])
 def test_staging_callback_cancels_and_preserves_destination(tmp_path, format, when):
-    original = rars.RarBuilder(format=format, store=True)
+    original = rars.RarBuilder(format=format, level=0)
     original.add_bytes(b"payload" * 20000, "file")
     builder = rars.RarBuilder.from_archive(rars.RarFile(original.to_bytes()))
     destination = tmp_path / "archive.rar"

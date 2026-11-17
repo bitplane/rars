@@ -7,7 +7,7 @@ FORMATS = ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50
 
 def make_archive(format="rar50", solid=False):
     builder = rars.RarBuilder(
-        format=format, solid=solid, store=not solid or format in ("rar50", "rar70")
+        format=format, solid=solid, level=0 if not solid or format in ("rar50", "rar70") else 3
     )
     builder.add_bytes(b"first", "first")
     builder.add_bytes(b"second!", "second")
@@ -134,7 +134,7 @@ def test_rar5_dictionary_policy_and_streaming_decode_option(format):
 
 @pytest.mark.parametrize("format", FORMATS)
 def test_selected_extraction_keeps_empty_files_and_completed_prefixes(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(format=format, level=0)
     builder.add_bytes(b"", "empty")
     builder.add_bytes(b"first", "first")
     builder.add_bytes(b"second", "second")
@@ -152,7 +152,7 @@ def test_selected_extraction_keeps_empty_files_and_completed_prefixes(tmp_path, 
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("from_path", [False, True])
 def test_open_options_are_defaults_that_a_calls_options_replace(tmp_path, format, from_path):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(format=format, level=0)
     builder.add_bytes(b"payload", "file")
     data = builder.to_bytes()
     path = tmp_path / "archive.rar"
@@ -190,7 +190,7 @@ def test_open_options_are_defaults_that_a_calls_options_replace(tmp_path, format
 @pytest.mark.parametrize("format", ["rar14", "rar29", "rar50", "rar70"])
 def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, format):
     payload = b"split payload " * 1000
-    builder = rars.RarBuilder(format=format, store=True, volume_size=1024)
+    builder = rars.RarBuilder(format=format, level=0, volume_size=1024)
     builder.add_bytes(payload, "file")
     paths = builder.write_volumes(tmp_path / "archive.rar")
     assert len(paths) > 1

@@ -3,7 +3,7 @@ import rars
 
 
 def legacy_archive():
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"payload", b"caf\x82.txt")
     return builder.to_bytes()
 

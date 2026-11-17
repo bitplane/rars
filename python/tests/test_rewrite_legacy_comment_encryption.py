@@ -59,7 +59,7 @@ def encrypted_comment_source():
     data[offset + 2] = 0x7a
     struct.pack_into("<I", data, offset + 28, 0)
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    plain = rars.RarBuilder(format="rar40", store=True)
+    plain = rars.RarBuilder(format="rar40", level=0)
     plain.add_bytes(b"public", "plain")
     plain_data = plain.to_bytes()
     member = next(offset for offset, kind, _, _ in headers(plain_data) if kind == 0x74)

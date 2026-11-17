@@ -75,7 +75,7 @@ def test_legacy_directories_survive_edits_without_breaking_solid_data(options, m
 
 
 @pytest.mark.parametrize("target", [b"missing", b"../relative-\xff", b"/absolute/target"])
-@pytest.mark.parametrize("options", [{"store": True}, {"solid": True}, {"password": "secret", "encrypt_headers": True}])
+@pytest.mark.parametrize("options", [{"level": 0}, {"solid": True}, {"password": "secret", "encrypt_headers": True}])
 def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
     source = rars.RarBuilder(format="rar40", **options)
     source.add_bytes(b"first" * 200, "first")
@@ -124,7 +124,7 @@ def test_unrar_extracts_rewritten_legacy_directories_and_links(tmp_path, solid, 
 
 @pytest.mark.parametrize("target", [b"", b"bad\0target"])
 def test_invalid_native_link_target_leaves_destination_untouched(tmp_path, target):
-    source = rars.RarBuilder(format="rar29", store=True)
+    source = rars.RarBuilder(format="rar29", level=0)
     source.add_bytes(target, "link", mode=0o120777)
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
@@ -156,7 +156,7 @@ def test_legacy_directory_payload_is_rejected_before_output(tmp_path):
     import struct
     import zlib
     from test_rewrite_legacy import headers
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"unexpected payload", "directory")
     data = bytearray(builder.to_bytes())
     offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)

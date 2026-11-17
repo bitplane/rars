@@ -8,7 +8,7 @@ from test_extract_guards import _rewrite_name
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 @pytest.mark.parametrize("solid", [False, True])
 def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, format, solid):
-    builder = rars.RarBuilder(format=format, solid=solid, store=not solid)
+    builder = rars.RarBuilder(format=format, solid=solid, level=3 if solid else 0)
     builder.add_directory("prefix")
     builder.add_bytes(b"first", "one.txt", mtime=10)
     builder.add_bytes(b"second", "two.txt", mtime=20)
@@ -63,7 +63,7 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
 
 
 def test_membership_length_and_member_equality():
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"a", "a.txt")
     builder.add_bytes(b"b", "b.txt")
     data = builder.to_bytes()

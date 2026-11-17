@@ -67,7 +67,7 @@ def source_bytes(format="rar40", **options):
 
 
 @pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
-@pytest.mark.parametrize("options", [{"store": True}, {}, {"solid": True}])
+@pytest.mark.parametrize("options", [{"level": 0}, {}, {"solid": True}])
 @pytest.mark.parametrize("on_disk", [False, True])
 def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_path, format, options, on_disk):
     original = source_bytes(format, **options)
@@ -97,7 +97,7 @@ def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_
     ("comment", "file comments"),
 ])
 def test_unsupported_legacy_metadata_is_rejected_before_destination_write(tmp_path, damage, message):
-    data = bytearray(source_bytes(store=True))
+    data = bytearray(source_bytes(level=0))
     if damage == "trailing":
         data += b"extra"
     elif damage == "partial_header":
@@ -288,7 +288,7 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
 @pytest.mark.parametrize("format", ["rar20", "rar40"])
 @pytest.mark.parametrize("encrypted_first", [False, True])
 def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format, encrypted_first):
-    plain = rars.RarBuilder(format=format, store=True)
+    plain = rars.RarBuilder(format=format, level=0)
     plain.add_bytes(b"public", "plain")
     encrypted = rars.RarBuilder(format=format, password="secret")
     encrypted.add_bytes(b"private", "encrypted")

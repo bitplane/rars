@@ -5,7 +5,7 @@ import rars
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 @pytest.mark.parametrize("store", [False, True])
 def test_legacy_encoding_callback_exception_preserves_destination(tmp_path, format, store):
-    builder = rars.RarBuilder(format=format, store=store)
+    builder = rars.RarBuilder(format=format, level=0 if store else 3)
     payload = b"legacy cancellation\n" * 8000
     builder.add_bytes(payload, "file")
     destination = tmp_path / "archive.rar"
@@ -27,7 +27,7 @@ def test_legacy_encoding_callback_exception_preserves_destination(tmp_path, form
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 def test_chunked_legacy_encryption_round_trip(format):
-    builder = rars.RarBuilder(format=format, store=True, password="secret")
+    builder = rars.RarBuilder(format=format, level=0, password="secret")
     payload = bytes(range(256)) * 601
     builder.add_bytes(payload, "file")
     archive = rars.RarFile(builder.to_bytes())
@@ -36,7 +36,7 @@ def test_chunked_legacy_encryption_round_trip(format):
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 def test_legacy_streaming_progress_has_unknown_total_until_completion(format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(format=format, level=0)
     payload = b"streamed payload\n" * 8000
     builder.add_bytes(payload, "file")
     events = []

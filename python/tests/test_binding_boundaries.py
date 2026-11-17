@@ -17,7 +17,7 @@ STORED = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
 def test_legacy_volume_name_refusal_preserves_existing_parts(tmp_path):
     # Each volume carries about 70 bytes, so this needs more than the 901
     # names .rar and .r00 through .z99 allow.
-    builder = rars.RarBuilder(format="rar14", store=True, volume_size=150)
+    builder = rars.RarBuilder(format="rar14", level=0, volume_size=150)
     builder.add_bytes(bytes(range(256)) * 400, "payload.bin")
     first = tmp_path / "archive.rar"
     second = tmp_path / "archive.r00"
@@ -50,7 +50,7 @@ def test_reader_context_iteration_and_info_aliases():
 def test_reader_modes_and_noncallable_progress_are_rejected():
     with pytest.raises(NotImplementedError, match="reading"):
         rars.RarFile(STORED, mode="w")
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="progress must be callable"):
         builder.to_bytes(progress=123)
@@ -77,7 +77,7 @@ def test_the_constructor_is_the_one_way_to_open_data():
 
 
 def test_passwords_and_policies_after_the_main_arguments_are_keyword_only(tmp_path):
-    builder = rars.RarBuilder(store=True, password="secret")
+    builder = rars.RarBuilder(level=0, password="secret")
     builder.add_bytes(b"payload", "file.txt", mtime=1_700_000_000, mode=0o644)
     with pytest.raises(TypeError):
         builder.add_bytes(b"payload", "other.txt", 1_700_000_000)
@@ -116,7 +116,7 @@ def test_writer_resources_keep_their_settings():
 
 
 def test_plain_builder_removal_and_decoded_missing_name():
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"payload", b"caf\x82.txt")
     archive = rars.RarFile(
         builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="cp850")
@@ -129,7 +129,7 @@ def test_plain_builder_removal_and_decoded_missing_name():
 
 @pytest.mark.parametrize("operation", ["testrar", "extractall"])
 def test_volume_conversion_errors(operation, tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
     args = (tmp_path / "out",) if operation == "extractall" else ()
@@ -153,7 +153,7 @@ def test_volume_conversion_errors(operation, tmp_path):
 
 @pytest.mark.parametrize("stem", ["archive.part01.rar", "archive.part.rar", "archive.partxy.RAR", "archive", "archive.RAR"])
 def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
-    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / stem)
     base = stem.removesuffix(".rar").removesuffix(".RAR")
@@ -168,7 +168,7 @@ def test_modern_volume_stems_and_roundtrip(tmp_path, stem):
 
 @pytest.mark.parametrize("selected", [False, True])
 def test_directory_only_extraction_preserves_empty_directories(tmp_path, selected):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_directory("empty")
     archive = rars.RarFile(builder.to_bytes())
     paths = archive.extractall(tmp_path, members=["empty"] if selected else None)
@@ -177,7 +177,7 @@ def test_directory_only_extraction_preserves_empty_directories(tmp_path, selecte
 
 
 def test_volume_extraction_directories_overwrite_and_open_failures(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_directory("empty")
     builder.add_bytes(b"payload" * 200, "nested/file.txt")
     paths = builder.write_volumes(tmp_path / "archive.part01.rar")
@@ -194,7 +194,7 @@ def test_volume_extraction_directories_overwrite_and_open_failures(tmp_path):
 def test_volume_decoded_collisions_preserve_first_file(tmp_path):
     from test_rewrite_legacy_unicode import replace_first_name, unicode_wire
 
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"unicode", "first.txt")
     builder.add_bytes(b"legacy", b"caf\x82.txt")
     path = tmp_path / "source.rar"
@@ -211,12 +211,12 @@ def test_invalid_argument_types_and_missing_output_names(tmp_path):
         rars.RarFile(STORED, password=object())
     with pytest.raises(TypeError):
         rars.RarBuilder(comment=object())
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     with pytest.raises(TypeError):
         builder.add_bytes(b"payload", object())
     with pytest.raises(ValueError, match="no file name"):
         builder.add(Path("/"))
-    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="needs a file name"):
         builder.write_volumes(Path("/"))
@@ -240,7 +240,7 @@ def test_missing_members_raise_keyerror(tmp_path, method):
 
 
 def test_invalid_member_ids_are_keyerrors():
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file.txt")
     for identifier in [-1, 1 << 200, 100]:
         with pytest.raises(KeyError):
@@ -261,7 +261,7 @@ def test_member_iterator_exception_survives_selection(tmp_path):
 
 
 def test_selected_file_skips_directory_and_empty_selection(tmp_path):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_directory("unused")
     builder.add_bytes(b"payload", "selected.txt")
     archive = rars.RarFile(builder.to_bytes())
@@ -272,7 +272,7 @@ def test_selected_file_skips_directory_and_empty_selection(tmp_path):
 
 
 def test_cancelled_volume_publication_preserves_old_destination(tmp_path):
-    builder = rars.RarBuilder(format="rar14", store=True, volume_size=512)
+    builder = rars.RarBuilder(format="rar14", level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     cancellation = rars.CancellationToken()
 
@@ -296,7 +296,7 @@ def test_readlink_refuses_regular_members():
 
 
 def test_reading_a_directory_or_link_says_which_it_is():
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_directory("d")
     builder.add_unix_symlink("l", "d")
     archive = rars.RarFile(builder.to_bytes())
@@ -312,7 +312,7 @@ def test_reading_a_directory_or_link_says_which_it_is():
 def test_a_legacy_time_past_2106_converts_to_rar5():
     # Past RAR5's 32-bit seconds, so conversion has to use FILETIME.
     seconds = int(datetime(2107, 12, 31, 23, 59, 58).timestamp())
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"payload", "future.txt", mtime=seconds)
     archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("future.txt").date_time == (2107, 12, 31, 23, 59, 58)
@@ -328,7 +328,7 @@ def test_conversion_refuses_legacy_special_types(host, attributes):
     import zlib
     from test_rewrite_legacy import headers
 
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"payload", "special.txt")
     data = bytearray(builder.to_bytes())
     offset, _, _, size = next(h for h in headers(data) if h[1] == 0x74)
@@ -352,7 +352,7 @@ def test_modern_dos_backslash_name_uses_portable_destination(tmp_path):
 
 
 def test_selected_extraction_creates_only_selected_redirections(tmp_path):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_unix_symlink("link", "target")
     builder.add_bytes(b"payload", "selected")
     archive = rars.RarFile(builder.to_bytes())
@@ -366,7 +366,7 @@ def test_selected_extraction_creates_only_selected_redirections(tmp_path):
 
 
 def test_explicit_none_password_and_comment_arguments_remain_optional():
-    builder = rars.RarBuilder(store=True, password=None, comment=None)
+    builder = rars.RarBuilder(level=0, password=None, comment=None)
     builder.add_bytes(b"payload", "file.txt")
     builder.set_member_comment("file.txt", b"comment")
     builder.set_member_comment("file.txt", None)
@@ -380,7 +380,7 @@ def test_conversion_refuses_unknown_redirection_kind():
     import zlib
     from test_extract_guards import _headers, _read_vint
 
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_unix_symlink("link", "target")
     data = bytearray(builder.to_bytes())
     changed = False
@@ -416,7 +416,7 @@ def test_conversion_refuses_payload_on_legacy_directory():
     import zlib
     from test_rewrite_legacy import headers
 
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"payload", "directory")
     data = bytearray(builder.to_bytes())
     offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)
@@ -443,7 +443,7 @@ def test_selected_solid_file_skips_unselected_directory(tmp_path):
 def test_path_add_explicit_archive_name_and_default_extract_destination(tmp_path, monkeypatch):
     source = tmp_path / "input"
     source.write_bytes(b"payload")
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add(source, arcname="renamed")
     archive = rars.RarFile(builder.to_bytes())
     monkeypatch.chdir(tmp_path)
@@ -454,7 +454,7 @@ def test_path_add_explicit_archive_name_and_default_extract_destination(tmp_path
 
 
 def test_recovery_progress_reports_its_phase_and_percentage():
-    builder = rars.RarBuilder(store=True, recovery_percent=1)
+    builder = rars.RarBuilder(level=0, recovery_percent=1)
     builder.add_bytes(b"payload", "file.txt")
     events = []
     rars.RarFile(builder.to_bytes(progress=events.append)).testrar()
@@ -491,7 +491,7 @@ def test_per_call_password_conversion_errors_are_typeerrors(tmp_path, method):
     ("set_member_comment", ["file.txt", object()]),
 ])
 def test_builder_argument_conversion_errors_are_typeerrors(method, args):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(TypeError):
         getattr(builder, method)(*args)
@@ -503,7 +503,7 @@ def test_pathlike_errors_survive_binding_conversion(tmp_path):
         def __fspath__(self):
             raise RuntimeError("path conversion failed")
 
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     for operation in [lambda: rars.RarFile(BrokenPath()),
                       lambda: builder.add(BrokenPath()),
                       lambda: builder.write(BrokenPath()),
@@ -515,7 +515,7 @@ def test_pathlike_errors_survive_binding_conversion(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar14", "rar50"])
 def test_volume_write_failure_names_an_oserror(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=512)
+    builder = rars.RarBuilder(format=format, level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     with pytest.raises(OSError):
         builder.write_volumes(tmp_path / "missing/archive.rar")
@@ -547,7 +547,7 @@ def test_custom_rar3_vm_programs_are_refused_unless_allowed():
 @pytest.mark.parametrize("first,second", [("archive.rar", "archive.r00"), ("archive.RAR", "archive.R00"), ("archive.Rar", "archive.R00")])
 def test_legacy_volume_names_follow_the_first_extension_case(tmp_path, first, second):
     # unrar looks for archive.R00 after archive.RAR on a case-sensitive filesystem.
-    builder = rars.RarBuilder(format="rar29", store=True, volume_size=512)
+    builder = rars.RarBuilder(format="rar29", level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / first)
     assert [Path(path).name for path in paths[:2]] == [first, second]

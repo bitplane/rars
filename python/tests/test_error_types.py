@@ -5,7 +5,7 @@ import rars
 
 
 def rar_bytes():
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(format="rar50", level=0)
     builder.add_bytes(b"payload", "file.txt")
     return builder.to_bytes()
 
@@ -49,7 +49,7 @@ PAYLOAD = random.Random(22).randbytes(40_000)
 
 
 def write_set(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder = rars.RarBuilder(format=format, level=0, volume_size=4096)
     builder.add_bytes(PAYLOAD, "large.bin")
     first = "set.part01.rar" if format == "rar50" else "set.rar"
     (tmp_path / "made").mkdir()
@@ -99,7 +99,7 @@ def test_a_corrupt_rar5_volume_is_a_checksum_error_naming_member_and_volume(tmp_
 
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
 def test_a_corrupt_payload_is_a_checksum_error_naming_the_member(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(format=format, level=0)
     builder.add_bytes(PAYLOAD, "large.bin")
     path = tmp_path / "single.rar"
     path.write_bytes(builder.to_bytes())
@@ -111,7 +111,7 @@ def test_a_corrupt_payload_is_a_checksum_error_naming_the_member(tmp_path, forma
 
 
 def test_a_corrupt_encrypted_rar4_member_stays_a_bad_password(tmp_path):
-    builder = rars.RarBuilder(format="rar29", store=True, password="pw")
+    builder = rars.RarBuilder(format="rar29", level=0, password="pw")
     builder.add_bytes(PAYLOAD, "large.bin")
     path = tmp_path / "encrypted.rar"
     path.write_bytes(builder.to_bytes())
@@ -122,7 +122,7 @@ def test_a_corrupt_encrypted_rar4_member_stays_a_bad_password(tmp_path):
 
 
 def test_a_corrupt_encrypted_rar5_member_is_a_checksum_error(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, password="pw")
+    builder = rars.RarBuilder(format="rar50", level=0, password="pw")
     builder.add_bytes(PAYLOAD, "large.bin")
     path = tmp_path / "encrypted.rar"
     path.write_bytes(builder.to_bytes())
@@ -144,7 +144,7 @@ def test_a_refusing_limit_is_a_rars_error_not_a_memory_error():
 
 
 def test_password_errors_are_not_damage():
-    builder = rars.RarBuilder(store=True, password="pw", encrypt_headers=True)
+    builder = rars.RarBuilder(level=0, password="pw", encrypt_headers=True)
     builder.add_bytes(b"payload", "file.txt")
     data = builder.to_bytes()
     for password, error in [(None, rars.PasswordRequired), ("wrong", rars.BadPassword)]:
@@ -158,7 +158,7 @@ def test_password_errors_are_not_damage():
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 def test_a_corrupt_member_wholly_in_a_later_volume_names_that_volume(tmp_path, format):
     payloads = [random.Random(index).randbytes(1500) for index in range(6)]
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder = rars.RarBuilder(format=format, level=0, volume_size=4096)
     for index, payload in enumerate(payloads):
         builder.add_bytes(payload, f"m{index}")
     paths = builder.write_volumes(tmp_path / "set.part1.rar")

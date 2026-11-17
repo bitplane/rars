@@ -11,7 +11,7 @@ FORMATS = ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("method", ["to_bytes", "write", "write_volumes"])
 def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, format, method):
-    builder = rars.RarBuilder(format=format, store=True,
+    builder = rars.RarBuilder(format=format, level=0,
                               volume_size=1000 if method == "write_volumes" else None)
     builder.add_bytes(b"payload" * 1000, "file")
     token = rars.CancellationToken()
@@ -32,7 +32,7 @@ def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, f
 
 @pytest.mark.parametrize("phase", ["compression", "staging"])
 def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     payload = b"thread cancellation\n" * 10000
     builder.add_bytes(payload, "file")
     if phase == "staging":
@@ -71,7 +71,7 @@ def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
 
 @pytest.mark.parametrize("rewrite", [False, True])
 def test_callback_failure_does_not_cancel_the_callers_token(tmp_path, rewrite):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file")
     if rewrite:
         builder = rars.RarBuilder.from_archive(rars.RarFile(builder.to_bytes()),
@@ -93,7 +93,7 @@ def test_callback_failure_does_not_cancel_the_callers_token(tmp_path, rewrite):
 
 
 def test_a_cancelled_read_is_neither_an_os_error_nor_a_rars_error():
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file")
     archive = rars.RarFile(builder.to_bytes())
     token = rars.CancellationToken()

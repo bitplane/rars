@@ -28,7 +28,7 @@ def test_extractall_reports_bytes_written_against_a_known_total(tmp_path):
 
 
 def write_set(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=64 * 1024)
+    builder = rars.RarBuilder(format="rar50", level=0, volume_size=64 * 1024)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     tmp_path.mkdir(exist_ok=True)

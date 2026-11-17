@@ -7,7 +7,7 @@ def times(info):
 
 
 def linked_archive():
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(format="rar50", level=0)
     builder.add_bytes(b"payload", "file", mtime=1_700_000_000)
     builder.set_member_comment("file", b"note")
     builder.add_unix_symlink("link", "file")

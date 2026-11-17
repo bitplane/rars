@@ -46,7 +46,7 @@ def test_reads_report_enum_members():
 
 @pytest.mark.parametrize("format", [rars.ArchiveVersion.RAR29, "rar29"])
 def test_builder_takes_a_version_or_its_string(format):
-    builder = rars.RarBuilder(format, store=True)
+    builder = rars.RarBuilder(format, level=0)
     builder.add_bytes(b"payload", "member")
     archive = rars.RarFile(builder.to_bytes())
     assert archive.family is rars.ArchiveFamily.RAR15_40

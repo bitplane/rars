@@ -52,7 +52,7 @@ def test_rar13_directories_between_solid_members_and_after_removal(tmp_path, sol
 
 @pytest.mark.parametrize("damage", ["main_flags", "file_flags", "extra", "version"])
 def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
-    builder = rars.RarBuilder(format="rar13", store=True)
+    builder = rars.RarBuilder(format="rar13", level=0)
     builder.add_bytes(b"data", "file")
     data = bytearray(builder.to_bytes())
     offset = struct.unpack_from("<H", data, 4)[0]
@@ -75,7 +75,7 @@ def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
 
 
 def test_rar13_mixed_encryption_keeps_plain_members_plain(tmp_path):
-    plain = rars.RarBuilder(format="rar13", store=True)
+    plain = rars.RarBuilder(format="rar13", level=0)
     plain.add_bytes(b"public", "plain")
     encrypted = rars.RarBuilder(format="rar13", password="password")
     encrypted.add_bytes(b"private", "secret")

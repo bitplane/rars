@@ -58,7 +58,7 @@ def test_vintage_rar20_preserves_metadata_comments_and_payloads(tmp_path, fixtur
 
 @pytest.mark.parametrize("damage", ["unsupported_version", "salt", "extended"])
 def test_unsupported_rar20_combinations_leave_destination_untouched(tmp_path, damage):
-    data = source_bytes("rar20", store=True)
+    data = source_bytes("rar20", level=0)
     if damage == "extended":
         data = with_extended_times(data, b"\0\0")
     else:

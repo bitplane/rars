@@ -77,7 +77,7 @@ def test_reference_encrypted_unicode_archives_retain_exact_names(tmp_path, fixtu
 
 @pytest.mark.parametrize("raw", [b"fallback\0\0\x80\0\xd8", b"fallback\0\0\xc0\x7f", b"invalid-\xff"])
 def test_malformed_unicode_names_are_refused(tmp_path, raw):
-    source = rars.RarFile(replace_first_name(source_bytes(store=True), raw))
+    source = rars.RarFile(replace_first_name(source_bytes(level=0), raw))
     path = tmp_path / "existing.rar"
     path.write_bytes(b"keep")
     with pytest.raises(rars.UnsupportedRarFeature):
@@ -86,7 +86,7 @@ def test_malformed_unicode_names_are_refused(tmp_path, raw):
 
 
 def test_unicode_rename_retains_non_bmp_characters():
-    source = rars.RarFile(replace_first_name(source_bytes(store=True), unicode_wire("name.txt")))
+    source = rars.RarFile(replace_first_name(source_bytes(level=0), unicode_wire("name.txt")))
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("name.txt", "emoji-😀.txt")
     output = rars.RarFile(editor.to_bytes())

@@ -407,7 +407,6 @@ class RarBuilder:
         format: ArchiveVersion | str = "rar50",
         *,
         level: int = 3,
-        store: bool = False,
         solid: bool = False,
         password: _Password | None = None,
         encrypt_headers: bool = False,

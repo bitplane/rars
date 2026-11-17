@@ -3,7 +3,7 @@ import rars
 
 
 def archive():
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file.txt")
     return rars.RarFile(builder.to_bytes())
 
@@ -19,13 +19,13 @@ def test_a_refused_overwrite_names_the_file_and_the_way_past_it(tmp_path):
 
 
 def test_volume_settings_and_write_methods_must_agree(tmp_path):
-    split = rars.RarBuilder(store=True, volume_size=4096)
+    split = rars.RarBuilder(level=0, volume_size=4096)
     split.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match=r"write_volumes\(\)"):
         split.write(tmp_path / "one.rar")
     with pytest.raises(ValueError, match=r"write_volumes\(\)"):
         split.to_bytes()
-    whole = rars.RarBuilder(store=True)
+    whole = rars.RarBuilder(level=0)
     whole.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="volume_size"):
         whole.write_volumes(tmp_path / "set.part1.rar")

@@ -2336,13 +2336,12 @@ fn map_builder_error(error: rars_rs::Error) -> PyErr {
 #[pymethods]
 impl RarBuilder {
     /// Everything after `format` is keyword-only, so later releases can add
-    /// and regroup settings without breaking callers.
+    /// and regroup settings without breaking callers. `level=0` stores members uncompressed.
     #[new]
     #[pyo3(signature = (
         format = "rar50",
         *,
         level = 3,
-        store = false,
         solid = false,
         password = None,
         encrypt_headers = false,
@@ -2355,7 +2354,6 @@ impl RarBuilder {
     fn new(
         format: &str,
         level: u8,
-        store: bool,
         solid: bool,
         password: Option<&Bound<'_, PyAny>>,
         encrypt_headers: bool,
@@ -2368,7 +2366,7 @@ impl RarBuilder {
         Ok(Self {
             inner: rars_rs::Builder::new(format)
                 .compression_level(Some(level))
-                .store(store)
+                .store(level == 0)
                 .solid(solid)
                 .password(py_password(password)?)
                 .header_encryption(encrypt_headers)

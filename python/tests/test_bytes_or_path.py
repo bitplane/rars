@@ -53,7 +53,7 @@ def test_other_values_are_neither(value):
 
 
 def test_volumes_take_bytes_like_objects_and_paths(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=4096)
+    builder = rars.RarBuilder(level=0, volume_size=4096)
     builder.add_bytes(bytes(range(256)) * 80, "large.bin")
     paths = builder.write_volumes(tmp_path / "set.part01.rar")
     rest = [Path(path) for path in paths[1:]]

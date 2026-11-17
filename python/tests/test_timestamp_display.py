@@ -13,7 +13,7 @@ import rars
     (0xFFFFFFFF, (2106, 2, 7, 6, 28, 15)),
 ])
 def test_rar5_times_are_unix_and_date_time_is_local(seconds, expected):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"time", "file", mtime=seconds)
     info = rars.RarFile(builder.to_bytes()).getinfo("file")
     if seconds is None:
@@ -28,7 +28,7 @@ def test_rar5_times_are_unix_and_date_time_is_local(seconds, expected):
 def test_legacy_date_time_keeps_stored_wall_clock_fields():
     # RAR 1.3-4.x store local wall-clock fields; date_time shows them as stored.
     seconds = int(datetime(2026, 7, 15, 15, 23, 42).timestamp())
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(format="rar29", level=0)
     builder.add_bytes(b"time", "file", mtime=seconds)
     archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("file").date_time == (2026, 7, 15, 15, 23, 42)
@@ -36,7 +36,7 @@ def test_legacy_date_time_keeps_stored_wall_clock_fields():
 
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
 def test_mtime_takes_a_float_as_stat_gives_it(format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(format=format, level=0)
     builder.add_bytes(b"time", "file", mtime=1_700_000_000.25)
     info = rars.RarFile(builder.to_bytes()).getinfo("file")
     if format == "rar50":

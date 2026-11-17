@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 @pytest.mark.parametrize("preserve", [False, True])
 def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
-    source = rars.RarBuilder(store=True)
+    source = rars.RarBuilder(level=0)
     source.add_bytes(b"first", "one.txt", mtime=10)
     source.add_bytes(b"second", "two.txt", mtime=20)
     source.set_member_comment("one.txt", b"first comment")
@@ -138,7 +138,7 @@ def test_rewrite_converts_reference_unix_symlink_archive():
 
 @pytest.mark.parametrize("kind", [0o010000, 0o020000, 0o060000, 0o140000])
 def test_rewrite_rejects_unix_special_file_modes(kind):
-    source = rars.RarBuilder(format="rar29", store=True)
+    source = rars.RarBuilder(format="rar29", level=0)
     source.add_bytes(b"special payload", "special", mode=kind | 0o644)
     archive = rars.RarFile(source.to_bytes())
     assert archive.read("special") == b"special payload"
@@ -172,7 +172,7 @@ def test_legacy_rewrite_uses_extractions_local_zone_and_odd_second(tmp_path, zon
 
 
 def archive_with_dos_flags(flags):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"DOS payload", "file.txt")
     data = bytearray(builder.to_bytes())
     for crc_at, body_at, body_end in _headers(data):
@@ -231,7 +231,7 @@ def test_rewrite_readonly_flag_matches_unrar(tmp_path):
 
 
 def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_unix_symlink("link", "../missing", mtime=123, mode=0o750)
     builder.set_member_comment("link", b"link comment")
     builder.add_unix_symlink("directory-link", "missing-dir", target_is_directory=True)
@@ -255,7 +255,7 @@ def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
 
 @pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
 def test_reference_reader_recognizes_emitted_unix_symlink(tmp_path):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_unix_symlink("link", "target")
     builder.add_bytes(b"payload", "target")
     path = tmp_path / "links.rar"
@@ -268,7 +268,7 @@ def test_reference_reader_recognizes_emitted_unix_symlink(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
 def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
-    source = rars.RarBuilder(format=format, store=True)
+    source = rars.RarBuilder(format=format, level=0)
     source.add_bytes(b"missing-\xff", b"link-\xff", mode=0o120750)
     source.add_bytes(b"payload", b"file-\xff", mode=0o100640)
     archive = rars.RarFile(source.to_bytes())
@@ -283,7 +283,7 @@ def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
 
 @pytest.mark.parametrize("target", [b"", b"invalid\0target"])
 def test_invalid_legacy_link_targets_are_rejected(target):
-    source = rars.RarBuilder(format="rar29", store=True)
+    source = rars.RarBuilder(format="rar29", level=0)
     source.add_bytes(target, "link", mode=0o120777)
     with pytest.raises(ValueError, match="link target"):
         rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()), preserve=False)
