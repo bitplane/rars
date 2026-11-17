@@ -3,10 +3,17 @@
 
 # Everyday checks. The external decoder matrix skips whatever it cannot find,
 # so this passes without unrar or 7zz installed; `just gate` is the strict one.
+# Tests build with the fast-test profile (Cargo.toml) and run every binary at
+# once under cargo-nextest when it is installed, one binary after another under
+# cargo test when it is not; `cargo install cargo-nextest --locked` to get it.
 check:
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
-    cargo test --workspace --all-targets --locked
+    if cargo nextest --version >/dev/null 2>&1; then \
+        cargo nextest run --workspace --all-targets --locked --cargo-profile fast-test; \
+    else \
+        cargo test --workspace --all-targets --locked --profile fast-test; \
+    fi
 
 # A minute of timings over three kinds of data, before and after anything that
 # touches the encoder. A ratio sweep takes an hour and says nothing about speed;

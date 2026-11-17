@@ -103,3 +103,19 @@ opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# `just check` builds its tests here: the dev profile with rars and rars-cli at
+# opt-level 1. On a 32-core machine the workspace tests went from 204-225 s to
+# 75-86 s under cargo test (33-35 s under nextest), and a rebuild after an edit
+# cost about the same CPU. It has its own target directory (target/fast-test),
+# so switching between it and ordinary debug builds rebuilds neither, and debug
+# builds keep opt-level 0 for stepping through. CI's Rust checks job gets the
+# same opt-level from its runner config instead.
+[profile.fast-test]
+inherits = "dev"
+
+[profile.fast-test.package.rars]
+opt-level = 1
+
+[profile.fast-test.package.rars-cli]
+opt-level = 1
