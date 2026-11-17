@@ -57,7 +57,8 @@ The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
 `maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `rar50DictionarySizeLimit` and
 `rar50BufferedDecodeLimit`. Values must be nonnegative safe integer numbers or
 `bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
-the library default. Resource options apply to one call and are not retained by `open()`.
+the library default. Options given to `open()` are the defaults for every later call
+on that archive, and a call's own fields override them one by one.
 Each operation reparses its input; header limits apply per archive/volume.
 `readMany()` accepts an iterable of entries or names and performs one parse and
 decoder traversal for the batch. Results retain request order and duplicates;

@@ -73,7 +73,7 @@ export function createApi(runtime) {
       const operation = operationOptions(options);
       return this._archive._request("read", {
         index: this.index,
-        readOptions: readOptions(operation),
+        readOptions: this._archive._readOptions(operation),
         password: operation.password ?? this._archive._password,
       }, operation);
     }
@@ -91,11 +91,12 @@ export function createApi(runtime) {
         readOptions: readOptions(operation),
         password: operation.password,
       }, operation);
-      return new RarArchive(sources, operation.password, result, operation.legacyNameEncoding);
+      return new RarArchive(sources, operation.password, result, readOptions(operation));
     }
 
-    constructor(sources, password, metadata, legacyNameEncoding) {
-      this._legacyNameEncoding = legacyNameEncoding;
+    constructor(sources, password, metadata, defaults) {
+      this._defaults = defaults;
+      this._legacyNameEncoding = defaults.legacyNameEncoding;
       this._sources = sources;
       this._password = password;
       this._closed = false;
@@ -112,6 +113,11 @@ export function createApi(runtime) {
         if (matches) matches.push(entry);
         else this.#nameEntries.set(entry.name, [entry]);
       }
+    }
+
+    /** Options given to open() are defaults; a call's own fields override them one by one. */
+    _readOptions(operation) {
+      return { ...this._defaults, ...readOptions(operation) };
     }
 
     _request(operation, payload, options) {
@@ -163,7 +169,7 @@ export function createApi(runtime) {
       }
       return this._request("readMany", {
         indices,
-        readOptions: readOptions(operation),
+        readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
     }
@@ -172,14 +178,14 @@ export function createApi(runtime) {
       const operation = operationOptions(options);
       return this._request("readComment", {
         password: operation.password ?? this._password,
-        readOptions: readOptions(operation),
+        readOptions: this._readOptions(operation),
       }, operation);
     }
 
     async test(options) {
       const operation = operationOptions(options);
       await this._request("test", {
-        readOptions: readOptions(operation),
+        readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
     }

@@ -189,7 +189,7 @@ await check("invalid options fail before starting a worker", async () => {
   assert.throws(() => writer.add("b.txt", HELLO), (error) => error.code === "CLOSED");
 });
 
-await check("read limits and fresh comment policies cover every format", async () => {
+await check("read limits cover every format, and open()'s become later calls' defaults", async () => {
   const limited = (error) => error instanceof RarError && error.code === "RESOURCE_LIMIT";
   for (const format of formats) {
     const bytes = await new RarWriter({ format, comment: "comment", level: 0 })
@@ -204,7 +204,9 @@ await check("read limits and fresh comment policies cover every format", async (
     await assert.rejects(archive.entries[0].bytes({ maxMemberOutputBytes: HELLO.length - 1 }), limited);
     await assert.rejects(archive.test({ maxTotalOutputBytes: HELLO.length }), limited);
     await assert.rejects(archive.entries[0].bytes({ maxHeaderCount: 0 }), limited);
-    assert.deepEqual(await archive.entries[0].bytes(), HELLO);
+    // open()'s 7-byte output limit still applies until a call overrides it.
+    await assert.rejects(archive.entries[0].bytes(), limited);
+    assert.deepEqual(await archive.entries[0].bytes({ maxTotalOutputBytes: HELLO.length }), HELLO);
     await archive.test({ maxTotalOutputBytes: BigInt(HELLO.length + SECOND.length) });
   }
 });

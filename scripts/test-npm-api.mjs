@@ -84,7 +84,7 @@ for (const settings of [{}, { legacyNameEncoding: "cp850" }]) {
 assert.deepEqual(duplicateRequests, [0, 1, 0, 1]);
 assert.deepEqual(batchRequests, [
   [[0, 1, 1], {maxTotalOutputBytes: 11}, "secret"],
-  [[0, 1, 1], {maxTotalOutputBytes: 11}, "secret"],
+  [[0, 1, 1], {legacyNameEncoding: "cp850", maxTotalOutputBytes: 11}, "secret"],
 ]);
 console.log("npm duplicate member identity checks passed");
 
@@ -114,10 +114,15 @@ const { RarArchive: QuotaArchive } = createApi({
 const quotaArchive = await QuotaArchive.open(new Uint8Array(), { maxReaderWorkspaceBytes: 8192n });
 await quotaArchive.test({ maxReaderWorkspaceBytes: 4096 });
 await quotaArchive.readComment({ maxReaderWorkspaceBytes: 2048n });
+await quotaArchive.test();
+await quotaArchive.test({ maxHeaderCount: 9 });
 assert.deepEqual(quotaRequests, [
   ["open", { maxReaderWorkspaceBytes: 8192n }],
   ["test", { maxReaderWorkspaceBytes: 4096 }],
   ["readComment", { maxReaderWorkspaceBytes: 2048n }],
+  // What open() was given carries to later calls, field by field.
+  ["test", { maxReaderWorkspaceBytes: 8192n }],
+  ["test", { maxReaderWorkspaceBytes: 8192n, maxHeaderCount: 9 }],
 ]);
 for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, -1n, 1n << 64n]) {
   await assert.rejects(QuotaArchive.open(new Uint8Array(), { maxReaderWorkspaceBytes: value }),
@@ -125,7 +130,7 @@ for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, -1n, 1n << 64n]) {
 }
 quotaRequests.length = 0;
 await quotaArchive.test({ allowRar3VmPrograms: true });
-assert.deepEqual(quotaRequests, [["test", { allowRar3VmPrograms: true }]]);
+assert.deepEqual(quotaRequests, [["test", { maxReaderWorkspaceBytes: 8192n, allowRar3VmPrograms: true }]]);
 await assert.rejects(quotaArchive.test({ allowRar3VmPrograms: 1 }),
   (error) => error.code === "INVALID_OPTION");
 console.log("npm reader workspace forwarding checks passed");
