@@ -107,6 +107,8 @@ mod stored_copy;
 mod streaming;
 mod temp_file;
 pub mod timestamp;
+#[doc(hidden)]
+pub mod volume_order;
 pub use file_times::{FileTimes, Timestamp};
 mod tzif;
 pub mod version;
@@ -958,24 +960,18 @@ impl Archive {
                 .map_err(|error| error.in_member_volume(feed.current_index()))
             }
             Self::Rar50Plus(first) => {
-                let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
+                let mut order = volume_order::VolumeOrder::after(self);
+                let mut checked = volumes.by_ref().enumerate().map(|(index, volume)| {
+                    let volume = volume?;
+                    order.next(&volume).map_err(|error| Error::InVolume {
+                        index: index + 1,
+                        source: Box::new(error),
+                    })?;
+                    Ok(volume)
+                });
+                let mut set = with_later_volumes(first, &mut checked, |volume| match volume {
                     Self::Rar50Plus(volume) => Some(volume),
                     _ => None,
-                })
-                .enumerate()
-                .map(|(index, volume)| {
-                    let volume = volume?;
-                    if volume
-                        .main
-                        .volume_number
-                        .is_some_and(|number| number != index as u64)
-                    {
-                        return Err(Error::InVolume {
-                            index,
-                            source: Box::new(Error::InvalidHeader("volume is out of order")),
-                        });
-                    }
-                    Ok(volume)
                 });
                 let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
                 let emit = link.is_some();
@@ -1821,6 +1817,7 @@ where
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
     };
+    volume_order::check_set(archives)?;
 
     match first.family() {
         ArchiveFamily::Rar13 => {
@@ -1865,6 +1862,7 @@ where
         return Err(Error::InvalidHeader("volume set is empty"));
     };
     if first.family() == ArchiveFamily::Rar50Plus {
+        volume_order::check_set(archives)?;
         let typed = rar50_volumes(archives)?;
         return rar50::test_volumes_to(&typed, options, |meta| tested(&rar50_meta(meta)));
     }
@@ -1888,6 +1886,7 @@ pub fn volume_members(archives: &[Archive]) -> Result<Vec<ArchiveMember>> {
     {
         return Err(Error::InvalidHeader("mixed archive families in volume set"));
     }
+    volume_order::check_set(archives)?;
 
     let mut members: Vec<ArchiveMember> = Vec::new();
     for archive in archives {

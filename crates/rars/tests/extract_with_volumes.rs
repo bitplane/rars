@@ -355,7 +355,8 @@ fn refuses_a_rar5_volume_out_of_order() {
         });
 
     assert!(
-        matches!(result, Err(rars::Error::InVolume { index: 2, .. })),
+        matches!(&result, Err(error @ rars::Error::InVolume { index: 2, .. })
+            if error.root_cause() == &rars::Error::VolumeOutOfOrder),
         "{result:?}"
     );
     assert_eq!(pulled, [1, 2]);
@@ -394,10 +395,63 @@ fn reads_rar3_end_block_volume_numbers_and_refuses_a_volume_out_of_order() {
         });
     assert!(
         matches!(&result, Err(error @ rars::Error::InVolume { index: 2, .. })
-            if error.root_cause() == &rars::Error::InvalidHeader("volume is out of order")),
+            if error.root_cause() == &rars::Error::VolumeOutOfOrder),
         "{result:?}"
     );
     assert_eq!(pulled, [1, 2]);
+}
+
+#[test]
+fn a_set_given_whole_reports_a_swapped_volume_from_every_reader() {
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let (_, volumes) = build_set(version, true);
+        let mut archives: Vec<Archive> = volumes
+            .iter()
+            .map(|volume| ArchiveReader::read_owned(volume.clone()).unwrap())
+            .collect();
+        archives.swap(1, 2);
+        let out_of_order = |result: rars::Result<()>| {
+            assert!(
+                matches!(&result, Err(error @ rars::Error::InVolume { index: 1, .. })
+                    if error.root_cause() == &rars::Error::VolumeOutOfOrder),
+                "{version:?}: {result:?}"
+            );
+        };
+        out_of_order(rars::volume_members(&archives).map(drop));
+        let (_, open) = collector();
+        out_of_order(rars::extract_volumes_to(&archives, None, open));
+        out_of_order(rars::test_volumes_with_options(
+            &archives,
+            ArchiveReadOptions::new(),
+        ));
+        out_of_order(rars::read_volume_member_at(&archives, 0, None).map(drop));
+    }
+}
+
+#[test]
+fn volumes_without_a_recorded_number_cannot_be_reported_out_of_order() {
+    for version in [ArchiveVersion::Rar13, ArchiveVersion::Rar20] {
+        let (_, volumes) = build_set(version, true);
+        let (result, _) =
+            extract_from_bytes(&volumes, ArchiveReadOptions::new(), |index, volume| {
+                if index == 2 {
+                    Some(ArchiveReader::read_owned(volumes[3].clone()).unwrap())
+                } else {
+                    Some(volume)
+                }
+            });
+        let error = result.expect_err("a swapped set fails somewhere");
+        assert_ne!(
+            error.root_cause(),
+            &rars::Error::VolumeOutOfOrder,
+            "{version:?}"
+        );
+        assert_eq!(
+            error.kind(),
+            rars::ErrorKind::ChecksumMismatch,
+            "{version:?}: {error:?}"
+        );
+    }
 }
 
 #[test]
