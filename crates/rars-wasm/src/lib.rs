@@ -167,9 +167,10 @@ mod error_detail_tests {
 }
 
 fn js_error(error: rars_rs::Error) -> JsValue {
-    // A volume still to come is not damage, so it gets its own code, as Python's MissingVolume.
+    // Volume faults the caller fixes are not damage, so they get their own codes, as in Python.
     let code = match error.root_cause() {
         rars_rs::Error::MissingVolume => "MISSING_VOLUME",
+        rars_rs::Error::VolumeOutOfOrder => "VOLUME_ORDER",
         _ => error.kind().code(),
     };
     let record = binding_error(code, &error.to_string());

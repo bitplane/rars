@@ -580,6 +580,38 @@ await check("custom RAR 3 VM programs run only when allowed", async () => {
     (error) => error.code === "INVALID_OPTION");
 });
 
+await check("volumes out of order reject with VOLUME_ORDER and the volume's index", async () => {
+  const payload = new Uint8Array(180000).fill(5);
+  const outOfOrder = (error) => error instanceof RarError && error.code === "VOLUME_ORDER"
+    && error.details.contexts.some((context) => context.kind === "volume" && context.index === 1);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-order-"));
+  try {
+    for (const version of ["rar29", "rar50"]) {
+      const writer = new RarWriter({ version, level: 0, volumeSize: 64 * 1024 }).add("large.bin", payload);
+      const parts = await writer.volumes();
+      assert.ok(parts.length > 2);
+      await assert.rejects(RarArchive.open([parts[0], parts[2], parts[1], ...parts.slice(3)]), outOfOrder);
+      const first = await RarArchive.open(parts[0]);
+      await assert.rejects(first.test({ volumes: [parts[2], parts[1], ...parts.slice(3)] }), outOfOrder);
+      first.close();
+
+      const paths = await writer.writeTo(path.join(directory, `${version}.rar`));
+      const archive = await RarArchive.open(paths[0]);
+      await writeFile(paths[1], parts[2]);
+      await writeFile(paths[2], parts[1]);
+      await assert.rejects(archive.extractAll(path.join(directory, `${version}-out`)), outOfOrder);
+      archive.close();
+    }
+    // RAR 2.0 volumes record no number, so a swap shows only as damage.
+    const parts = await new RarWriter({ version: "rar20", level: 0, volumeSize: 64 * 1024 })
+      .add("large.bin", payload).volumes();
+    const unnumbered = await RarArchive.open([parts[0], parts[2], parts[1], ...parts.slice(3)]);
+    await assert.rejects(unnumbered.entries[0].bytes(), (error) => error.code === "INVALID_ARCHIVE");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 await check("RAR5 decoder and volume budgets reach WASM", async () => {
   const limited = (error) => error.code === "RESOURCE_LIMIT";
   const compressed = await new RarWriter({ version: "rar50", level: 5 }).add("a.txt", HELLO).bytes();
