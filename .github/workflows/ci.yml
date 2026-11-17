@@ -9,9 +9,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request supersedes its last run. Pushes to master all
+# finish: each one saves the dependency caches pull requests restore, and a
+# cancelled run saves nothing.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -340,35 +343,31 @@ jobs:
       - name: Check library, CLI and tests
         run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
 
+  # Every optional-feature combination of the library, without workspace
+  # feature unification. Four jobs of four sets each: a set shares most of its
+  # dependency builds with the others in its job, and four jobs leave runners
+  # free for the rest of CI.
   unit-features:
-    name: Library unit features (${{ matrix.features }})
+    name: Library unit features (${{ matrix.group }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      max-parallel: 4
       matrix:
-        features:
-          - none
-          - parallel
-          - encryption
-          - encryption,parallel
-          - recovery
-          - recovery,parallel
-          - recovery,encryption
-          - recovery,encryption,parallel
-          - write
-          - write,parallel
-          - write,encryption
-          - write,encryption,parallel
-          - write,recovery
-          - write,recovery,parallel
-          - write,recovery,encryption
-          - write,recovery,encryption,parallel
+        include:
+          - group: read
+            features: none parallel encryption encryption,parallel
+          - group: recovery
+            features: recovery recovery,parallel recovery,encryption recovery,encryption,parallel
+          - group: write
+            features: write write,parallel write,encryption write,encryption,parallel
+            memory: write write,parallel
+          - group: write and recovery
+            features: write,recovery write,recovery,parallel write,recovery,encryption write,recovery,encryption,parallel
     env:
-      CARGO_BUILD_JOBS: 1
+      CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0
-      RUST_TEST_THREADS: 2
+      RUST_TEST_THREADS: 4
       RAYON_NUM_THREADS: 2
     steps:
       - uses: actions/checkout@v7
@@ -378,9 +377,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: ${{ matrix.features }}
+          key: ${{ matrix.group }}
       - name: Test the library without workspace feature unification
-        run: python3 scripts/check-unit-features.py --features '${{ matrix.features }}'
+        env:
+          SETS: ${{ matrix.features }}
+        run: |
+          set -euo pipefail
+          for features in $SETS; do
+            python3 scripts/check-unit-features.py --features "$features"
+          done
       - name: Check encoder memory bounds without workspace feature unification
-        if: matrix.features == 'write' || matrix.features == 'write,parallel'
-        run: cargo test -p rars --locked --no-default-features --features '${{ matrix.features }}' --test encoder_memory_regression
+        if: matrix.memory != ''
+        env:
+          SETS: ${{ matrix.memory }}
+        run: |
+          set -euo pipefail
+          for features in $SETS; do
+            cargo test -p rars --locked --no-default-features --features "$features" --test encoder_memory_regression
+          done
