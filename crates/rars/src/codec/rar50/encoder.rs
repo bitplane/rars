@@ -818,6 +818,29 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     if first == blocks.len() {
         return Ok(output);
     }
+    if pipelines::<B>(options) {
+        let mut block_start = at;
+        pipelined_optimal_blocks(
+            &combined,
+            blocks[first..].iter().map(|&(end, is_last)| {
+                let block = block_start..start + end;
+                block_start = block.end;
+                (block, NO_RECORDS, is_last)
+            }),
+            OptimalCollector::with_allowance(&combined, at, options, allowance)?,
+            algorithm_version,
+            options,
+            &mut |block, packed| {
+                output.push_admitted(packed);
+                if !report(block.end - start, &mut block_done) {
+                    return Err(Error::Cancelled);
+                }
+                Ok(())
+            },
+            allowance,
+        )?;
+        return Ok(output);
+    }
     let mut search = if options.optimal_parse {
         SharedMemberSearch::Optimal(OptimalCollector::with_allowance(
             &combined, at, options, allowance,
@@ -1012,6 +1035,27 @@ fn filtered_lz_blocks<B: Budget>(
     let start = history.len();
     let mut combined = Buffer::from_slices(&[history, data], allowance)?;
     let blocks = filter_blocks_in_place(&mut combined[start..], filters, file_offset, allowance)?;
+    if pipelines::<B>(options) {
+        let mut out = Buffer::new(allowance);
+        let end = combined.len();
+        pipelined_optimal_blocks(
+            &combined,
+            blocks.into_iter().map(|(block, records)| {
+                let block = start + block.start..start + block.end;
+                let last = is_last && block.end == end;
+                (block, records, last)
+            }),
+            OptimalCollector::with_allowance(&combined, start, options, allowance)?,
+            algorithm_version,
+            options,
+            &mut |block, packed| {
+                out.extend_from_slice(&packed).map_err(Into::into)?;
+                report_through(&mut progress, block.end - start)
+            },
+            allowance,
+        )?;
+        return Ok(out);
+    }
 
     // One search state for the whole member, as the unfiltered path has.
     let mut search = if options.optimal_parse {
@@ -1178,6 +1222,23 @@ fn encode_member_with_allowance<B: Budget>(
         // 16 MiB member that was half the encode. The optimal parse used to be
         // worse still, rebuilding per pass; its collector searches each block
         // once and lets the passes replay the answers.
+        if pipelines::<B>(options) {
+            let mut out = Buffer::new(allowance);
+            pipelined_optimal_blocks(
+                combined,
+                MemberBlocks::new(combined, start)
+                    .map(|block| (block.clone(), NO_RECORDS, block.end == combined.len())),
+                OptimalCollector::with_allowance(combined, start, options, allowance)?,
+                algorithm_version,
+                options,
+                &mut |block, packed| {
+                    out.extend_from_slice(&packed).map_err(Into::into)?;
+                    report_through(&mut progress, block.end - start)
+                },
+                allowance,
+            )?;
+            return Ok(out);
+        }
         let mut search = if options.optimal_parse {
             SharedMemberSearch::Optimal(OptimalCollector::with_allowance(
                 combined, start, options, allowance,
@@ -1190,31 +1251,17 @@ fn encode_member_with_allowance<B: Budget>(
 
         let mut out = Buffer::new(allowance);
         let mut completed = 0usize;
-        let mut block_start = start;
-        let mut splitter = BlockSplitter::new();
-        while block_start < combined.len() {
-            // Take one chunk, then keep taking them while the data is not
-            // moving. See [`BlockSplitter`].
-            splitter.reset();
-            let mut block_end = (block_start + LZ_BLOCK_SIZE).min(combined.len());
-            splitter.accept(&combined[block_start..block_end]);
-            while block_end < combined.len() {
-                let next_end = (block_end + LZ_BLOCK_SIZE).min(combined.len());
-                let next = &combined[block_end..next_end];
-                if !splitter.try_extend(next) {
-                    break;
-                }
-                block_end = next_end;
-            }
-            let is_last = block_end == combined.len();
+        for block in MemberBlocks::new(combined, start) {
+            let is_last = block.end == combined.len();
             let mut chunk_progress = |position: usize| {
                 progress
                     .as_deref_mut()
                     .is_none_or(|report| report(completed.saturating_add(position)))
             };
+            let len = block.end - block.start;
             let packed = encode_lz_block_with_allowance(
                 combined,
-                block_start..block_end,
+                block,
                 search.borrow(),
                 algorithm_version,
                 &[],
@@ -1224,8 +1271,7 @@ fn encode_member_with_allowance<B: Budget>(
                 allowance,
             )?;
             out.extend_from_slice(&packed).map_err(Into::into)?;
-            completed = completed.saturating_add(block_end - block_start);
-            block_start = block_end;
+            completed = completed.saturating_add(len);
         }
         return Ok(out);
     }
@@ -1240,6 +1286,179 @@ fn encode_member_with_allowance<B: Budget>(
         progress,
         allowance,
     )
+}
+
+/// A member's LZ blocks, from `start` to the end of `combined`: one chunk at a
+/// time, extended while the data is not moving. See [`BlockSplitter`].
+struct MemberBlocks<'a> {
+    combined: &'a [u8],
+    start: usize,
+    splitter: BlockSplitter,
+}
+
+impl<'a> MemberBlocks<'a> {
+    fn new(combined: &'a [u8], start: usize) -> Self {
+        Self {
+            combined,
+            start,
+            splitter: BlockSplitter::new(),
+        }
+    }
+}
+
+impl Iterator for MemberBlocks<'_> {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let combined = self.combined;
+        let block_start = self.start;
+        if block_start >= combined.len() {
+            return None;
+        }
+        self.splitter.reset();
+        let mut block_end = (block_start + LZ_BLOCK_SIZE).min(combined.len());
+        self.splitter.accept(&combined[block_start..block_end]);
+        while block_end < combined.len() {
+            let next_end = (block_end + LZ_BLOCK_SIZE).min(combined.len());
+            if !self.splitter.try_extend(&combined[block_end..next_end]) {
+                break;
+            }
+            block_end = next_end;
+        }
+        self.start = block_end;
+        Some(block_start..block_end)
+    }
+}
+
+/// How many bytes of blocks the pipelined parse holds at once, collected or
+/// being priced. A member over this size is charged for one block of it (see
+/// `tree_lz_workspace`), and a block's matches and parse arrays grow with its
+/// bytes, so several smaller blocks in flight fit the same charge.
+const PIPELINED_BLOCK_BYTES: usize = MAX_LZ_BLOCK_SIZE;
+
+/// A member's optimal parse with its blocks priced on other threads.
+///
+/// The collector has to visit the blocks in order, one at a time, but nothing
+/// it finds depends on prices, and no block's parse depends on another's. So
+/// this thread collects the next batch while the pool prices the one before.
+/// Each block is coded by the same functions as the sequential walk, so the
+/// output is the same at every thread count.
+///
+/// `blocks` gives each block with the filter records it opens with and whether
+/// it is the last. `emit` takes each block's packed bytes in order.
+fn pipelined_optimal_blocks<B: Budget, R: std::ops::Deref<Target = [EncodeFilter]> + Send>(
+    combined: &[u8],
+    blocks: impl Iterator<Item = (std::ops::Range<usize>, R, bool)> + Send,
+    mut collector: OptimalCollector<B>,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    emit: &mut dyn FnMut(std::ops::Range<usize>, Buffer<u8, B>) -> Result<()>,
+    allowance: &B,
+) -> Result<()> {
+    let distance_size = match algorithm_version {
+        0 => DISTANCE_TABLE_SIZE_50,
+        1 => DISTANCE_TABLE_SIZE_70,
+        _ => {
+            return Err(Error::InvalidData(
+                "RAR 5 unknown compression algorithm version",
+            ))
+        }
+    };
+    type Collected<B, R> = Vec<(std::ops::Range<usize>, R, bool, BlockMatches<B>)>;
+    let mut blocks = blocks.peekable();
+    // Takes blocks while they fit `room`, and one anyway when `at_least_one`,
+    // so a lone block larger than the room still makes progress.
+    let mut collect = |collector: &mut OptimalCollector<B>,
+                       room: usize,
+                       at_least_one: bool|
+     -> Result<Collected<B, R>> {
+        let mut batch = Vec::new();
+        let mut bytes = 0usize;
+        while let Some((block, _, _)) = blocks.peek() {
+            let len = block.end - block.start;
+            if bytes + len > room && !(at_least_one && batch.is_empty()) {
+                break;
+            }
+            let (block, records, is_last) = blocks.next().expect("peeked");
+            bytes += len;
+            let matches = collector.collect(combined, block.clone(), options)?;
+            batch.push((block, records, is_last, matches));
+        }
+        Ok(batch)
+    };
+    let price =
+        |(block, records, is_last, matches): (std::ops::Range<usize>, R, bool, BlockMatches<B>)| {
+            let mut tokens = optimal_tokens_for_matches(
+                combined,
+                block.clone(),
+                options,
+                distance_size,
+                &records,
+                &matches,
+                allowance,
+            )?;
+            drop(matches);
+            if !records.is_empty() {
+                tokens.prepend(records.iter().copied().map(EncodeToken::Filter))?;
+            }
+            let packed = encode_token_block_with_allowance(
+                &tokens,
+                algorithm_version,
+                distance_size,
+                is_last,
+                allowance,
+            )?;
+            Ok::<_, Error>((block, packed))
+        };
+
+    let mut pending = collect(&mut collector, PIPELINED_BLOCK_BYTES / 2, true)?;
+    while !pending.is_empty() {
+        let held: usize = pending
+            .iter()
+            .map(|(block, _, _, _)| block.end - block.start)
+            .sum();
+        let room = PIPELINED_BLOCK_BYTES
+            .saturating_sub(held)
+            .min(PIPELINED_BLOCK_BYTES / 2);
+        let (collected, (packed, failure)) = crate::parallel::join(
+            || collect(&mut collector, room, false),
+            || crate::parallel::map_prefix(pending, price),
+        );
+        for (block, packed) in packed {
+            emit(block, packed)?;
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        pending = collected?;
+        if pending.is_empty() {
+            pending = collect(&mut collector, PIPELINED_BLOCK_BYTES / 2, true)?;
+        }
+    }
+    Ok(())
+}
+
+const NO_RECORDS: &[EncodeFilter] = &[];
+
+/// Reports progress through `position`, turning a refusal into cancellation.
+fn report_through(
+    progress: &mut Option<&mut dyn FnMut(usize) -> bool>,
+    position: usize,
+) -> Result<()> {
+    if progress
+        .as_deref_mut()
+        .is_some_and(|report| !report(position))
+    {
+        return Err(Error::Cancelled);
+    }
+    Ok(())
+}
+
+/// Whether a member's optimal parse may price its blocks on other threads.
+/// A limited allowance is admitted for one block's workspace at a time, and
+/// keeps that.
+fn pipelines<B: Budget>(options: EncodeOptions) -> bool {
+    options.optimal_parse && !B::LIMITED && crate::parallel::may_nest()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2911,69 +3130,15 @@ fn encode_tokens_with_allowance<B: Budget>(
                 own.collect(combined, block.clone(), options)?
             }
         };
-        // The prices come from the Huffman tables, and the tables come from
-        // the parse, so the first pass has to guess. Each pass after it prices
-        // against what the pass before actually produced.
-        let mut workspace = OptimalWorkspace::new(allowance);
-        let mut tokens = optimal_tokens_in_workspace(
+        let tokens = optimal_tokens_for_matches(
             combined,
-            block.clone(),
+            block,
             options,
             distance_size,
-            None,
+            initial_filters,
             &matches,
-            &mut workspace,
+            allowance,
         )?;
-        let mut lengths =
-            table_lengths_with_allowance(&tokens, initial_filters, distance_size, allowance)?;
-        let mut best_bits = token_stream_bits(&tokens, initial_filters, &lengths, distance_size)?;
-        // Without a collected match, every pass starts with no remembered
-        // distance and can only produce the same literals. Keep the first
-        // tables and stream validation before skipping the equal reparse.
-        // Limited callers retain every original admission and refusal point.
-        let passes = if !B::LIMITED && matches.runs.is_empty() {
-            1
-        } else {
-            options.parse_passes.max(1)
-        };
-        let mut best = None;
-        for _ in 1..passes {
-            let prices = TokenPrices {
-                lengths: lengths.slices(),
-            };
-            let next = optimal_tokens_in_workspace(
-                combined,
-                block.clone(),
-                options,
-                distance_size,
-                Some(&prices),
-                &matches,
-                &mut workspace,
-            )?;
-            if next == tokens {
-                break;
-            }
-            let next_lengths =
-                table_lengths_with_allowance(&next, initial_filters, distance_size, allowance)?;
-            let tables_converged = lengths.slices() == next_lengths.slices();
-            lengths = next_lengths;
-            let bits = token_stream_bits(&next, initial_filters, &lengths, distance_size)?;
-            if bits < best_bits {
-                best_bits = bits;
-                best = None;
-            } else if best.is_none() {
-                // Keep an earlier winner only when repricing actually loses.
-                best = Some(std::mem::replace(&mut tokens, Buffer::new(allowance)));
-            }
-            tokens = next;
-            if tables_converged {
-                // With the same matches, initial state and table prices, the
-                // next pass would reproduce these tokens and stop above. Keep
-                // the normal winner and tie handling before skipping it.
-                break;
-            }
-        }
-        let tokens = best.unwrap_or(tokens);
         if progress.is_some_and(|report| !report(end - start)) {
             return Err(Error::Cancelled);
         }
@@ -3050,6 +3215,86 @@ fn encode_tokens_with_allowance<B: Budget>(
         return Err(Error::Cancelled);
     }
     Ok(tokens)
+}
+
+/// The optimal parse of one block whose matches are already collected.
+///
+/// Nothing here reads state from another block: every parse starts with empty
+/// distance memory, and its prices come from its own passes. That is what lets
+/// a member's blocks be priced on several threads once the collector, which is
+/// sequential, has been through them.
+fn optimal_tokens_for_matches<B: Budget>(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    options: EncodeOptions,
+    distance_size: usize,
+    initial_filters: &[EncodeFilter],
+    matches: &BlockMatches<B>,
+    allowance: &B,
+) -> Result<Buffer<EncodeToken, B>> {
+    // The prices come from the Huffman tables, and the tables come from
+    // the parse, so the first pass has to guess. Each pass after it prices
+    // against what the pass before actually produced.
+    let mut workspace = OptimalWorkspace::new(allowance);
+    let mut tokens = optimal_tokens_in_workspace(
+        combined,
+        block.clone(),
+        options,
+        distance_size,
+        None,
+        matches,
+        &mut workspace,
+    )?;
+    let mut lengths =
+        table_lengths_with_allowance(&tokens, initial_filters, distance_size, allowance)?;
+    let mut best_bits = token_stream_bits(&tokens, initial_filters, &lengths, distance_size)?;
+    // Without a collected match, every pass starts with no remembered
+    // distance and can only produce the same literals. Keep the first
+    // tables and stream validation before skipping the equal reparse.
+    // Limited callers retain every original admission and refusal point.
+    let passes = if !B::LIMITED && matches.runs.is_empty() {
+        1
+    } else {
+        options.parse_passes.max(1)
+    };
+    let mut best = None;
+    for _ in 1..passes {
+        let prices = TokenPrices {
+            lengths: lengths.slices(),
+        };
+        let next = optimal_tokens_in_workspace(
+            combined,
+            block.clone(),
+            options,
+            distance_size,
+            Some(&prices),
+            matches,
+            &mut workspace,
+        )?;
+        if next == tokens {
+            break;
+        }
+        let next_lengths =
+            table_lengths_with_allowance(&next, initial_filters, distance_size, allowance)?;
+        let tables_converged = lengths.slices() == next_lengths.slices();
+        lengths = next_lengths;
+        let bits = token_stream_bits(&next, initial_filters, &lengths, distance_size)?;
+        if bits < best_bits {
+            best_bits = bits;
+            best = None;
+        } else if best.is_none() {
+            // Keep an earlier winner only when repricing actually loses.
+            best = Some(std::mem::replace(&mut tokens, Buffer::new(allowance)));
+        }
+        tokens = next;
+        if tables_converged {
+            // With the same matches, initial state and table prices, the
+            // next pass would reproduce these tokens and stop above. Keep
+            // the normal winner and tie handling before skipping it.
+            break;
+        }
+    }
+    Ok(best.unwrap_or(tokens))
 }
 
 #[cfg(test)]
