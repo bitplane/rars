@@ -35,122 +35,70 @@ fn stream(
     Ok(sink.take())
 }
 
-// Lengths and CRCs of what the in-memory writer produced before it streamed,
-// updated when later volumes moved the producer record after their files.
+/// Lengths and CRCs of what the in-memory writer produced before it streamed,
+/// updated when later volumes moved the producer record after their files; one
+/// line per case, in `tests/fixtures/golden`.
+///
+/// Every set carries a producer record naming the library version, so a version
+/// bump changes these. The release hook regenerates them with the RAR 5
+/// fixtures: `RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_streaming_volumes`.
 #[test]
 fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
-    type Golden = &'static [(usize, u32)];
-    let cases: [(ArchiveVersion, Option<&[u8]>, usize, Golden); 14] = [
-        (
-            ArchiveVersion::Rar15,
-            None,
-            3000,
-            &[
-                (0xbb8, 0x944c6d0a),
-                (0xbb8, 0x0ee85015),
-                (0xbb8, 0xaaf9d913),
-                (0x5db, 0xa8c63371),
+    let mut cases = Vec::new();
+    for password in [None, Some(&b"secret"[..])] {
+        let targets: &[ArchiveVersion] = match password {
+            None => &[
+                ArchiveVersion::Rar15,
+                ArchiveVersion::Rar20,
+                ArchiveVersion::Rar29,
+                ArchiveVersion::Rar30,
+                ArchiveVersion::Rar40,
             ],
-        ),
-        (ArchiveVersion::Rar15, None, 20_000, &[(0x278f, 0x07b254b4)]),
-        (
-            ArchiveVersion::Rar20,
-            None,
-            3000,
-            &[
-                (0xbb8, 0x760ca9ab),
-                (0xbb8, 0x926a1649),
-                (0xbb8, 0x367b9f4f),
-                (0x5db, 0x454d69f5),
-            ],
-        ),
-        (ArchiveVersion::Rar20, None, 20_000, &[(0x278f, 0x5b60263c)]),
-        (
-            ArchiveVersion::Rar29,
-            None,
-            3000,
-            &[
-                (0xbb8, 0xbc1bc861),
-                (0xbb8, 0x5d897040),
-                (0xbb8, 0xfb959952),
-                (0x62b, 0xaa3758d2),
-            ],
-        ),
-        (ArchiveVersion::Rar29, None, 20_000, &[(0x27a3, 0xf4d366e3)]),
-        (
-            ArchiveVersion::Rar30,
-            None,
-            3000,
-            &[
-                (0xbb8, 0x96024d59),
-                (0xbb8, 0x92bac3ae),
-                (0xbb8, 0x34a62abc),
-                (0x62b, 0x5f0adc66),
-            ],
-        ),
-        (ArchiveVersion::Rar30, None, 20_000, &[(0x27a3, 0xc6b130f9)]),
-        (
-            ArchiveVersion::Rar40,
-            None,
-            3000,
-            &[
-                (0xbb8, 0x96024d59),
-                (0xbb8, 0x92bac3ae),
-                (0xbb8, 0x34a62abc),
-                (0x62b, 0x5f0adc66),
-            ],
-        ),
-        (ArchiveVersion::Rar40, None, 20_000, &[(0x27a3, 0xc6b130f9)]),
-        (
-            ArchiveVersion::Rar15,
-            Some(b"secret"),
-            3000,
-            &[
-                (0xbb8, 0x1786223f),
-                (0xbb8, 0xd758ad7e),
-                (0xbb8, 0x07d0d5d4),
-                (0x5db, 0xd9df9f4a),
-            ],
-        ),
-        (
-            ArchiveVersion::Rar15,
-            Some(b"secret"),
-            20_000,
-            &[(0x278f, 0xbeba0019)],
-        ),
-        (
-            ArchiveVersion::Rar20,
-            Some(b"secret"),
-            3000,
-            &[
-                (0xbb8, 0xbb0b111c),
-                (0xbb8, 0x1aee5156),
-                (0xbb8, 0xaabdeb2b),
-                (0x5e8, 0x043f7837),
-            ],
-        ),
-        (
-            ArchiveVersion::Rar20,
-            Some(b"secret"),
-            20_000,
-            &[(0x279c, 0x7bb3e995)],
-        ),
-    ];
-    for (target, password, volume_size, golden) in cases {
+            Some(_) => &[ArchiveVersion::Rar15, ArchiveVersion::Rar20],
+        };
+        for &target in targets {
+            for volume_size in [3000, 20_000] {
+                cases.push((target, password, volume_size));
+            }
+        }
+    }
+    let mut produced = String::new();
+    for (index, (target, password, volume_size)) in cases.into_iter().enumerate() {
         let entry = entry(EntrySource::from_bytes(data()), password);
         let options = WriterOptions::new(target, FeatureSet::store_only());
         let volumes = stream(&entry, options, volume_size).unwrap();
-        let got: Vec<(usize, u32)> = volumes
+        let fingerprint: Vec<String> = volumes
             .iter()
-            .map(|volume| (volume.len(), rars::crc32::crc32(volume)))
+            .map(|volume| format!("{}:{}", volume.len(), rars::crc32::crc32(volume)))
             .collect();
+        produced.push_str(&format!(
+            "{index} {target:?} encrypted={} size={volume_size} {}\n",
+            password.is_some(),
+            fingerprint.join(" ")
+        ));
+    }
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/golden/legacy_streaming_volumes.txt");
+    if std::env::var_os("RARS_BLESS_GOLDEN").is_some() {
+        std::fs::write(&path, &produced).expect("write golden fixture");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "missing golden fixture {}: {error}\n\
+             regenerate with RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_streaming_volumes",
+            path.display()
+        )
+    });
+    for (expected, produced) in expected.lines().zip(produced.lines()) {
         assert_eq!(
-            got,
-            golden,
-            "{target:?} password={} size={volume_size}",
-            password.is_some()
+            produced, expected,
+            "if this change is intentional, regenerate with \
+             RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_streaming_volumes"
         );
     }
+    assert_eq!(expected.lines().count(), produced.lines().count());
 }
 
 fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {

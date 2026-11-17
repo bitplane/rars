@@ -57,6 +57,8 @@ def main() -> None:
                 "rar50_golden",
                 "--test",
                 "legacy_compressed_volumes",
+                "--test",
+                "legacy_streaming_volumes",
                 "--locked",
             ],
             cwd=root,
