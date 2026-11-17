@@ -1,6 +1,7 @@
 const { parentPort } = require("node:worker_threads");
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const os = require("node:os");
 const wasm = require("./wasm/rars_wasm.js");
 const { startWorker } = require("./worker-engine.cjs");
 
@@ -37,11 +38,45 @@ function volumePaths(firstPath, total, format) {
   return paths;
 }
 
-async function writeAtomic(target, bytes) {
+// What writeTo() raises for an existing file without { overwrite: true }, shaped as
+// Node's own EEXIST so it reaches callers as an IO RarError like any other.
+function alreadyExists(target) {
+  return Object.assign(
+    new Error(`${target} already exists; pass { overwrite: true } to replace it`),
+    { code: "EEXIST", errno: -os.constants.errno.EEXIST, syscall: "open", path: target },
+  );
+}
+
+async function refuseExisting(target) {
+  try {
+    await fs.lstat(target);
+  } catch (error) {
+    if (error.code === "ENOENT") return;
+    throw error;
+  }
+  throw alreadyExists(target);
+}
+
+async function writeAtomic(target, bytes, overwrite) {
+  if (!overwrite) await refuseExisting(target);
   const temporary = `${target}.rars-${process.pid}-${Date.now()}.tmp`;
   try {
     await fs.writeFile(temporary, bytes);
-    await fs.rename(temporary, target);
+    if (overwrite) {
+      await fs.rename(temporary, target);
+      return;
+    }
+    // A hard link publishes only where nothing is, so a file that appears meanwhile survives.
+    try {
+      await fs.link(temporary, target);
+    } catch (error) {
+      if (error.code === "EEXIST") throw alreadyExists(target);
+      // Filesystems without hard links: an exclusive copy keeps the guarantee.
+      await fs.copyFile(temporary, target, fs.constants.COPYFILE_EXCL).catch((copyError) => {
+        throw copyError.code === "EEXIST" ? alreadyExists(target) : copyError;
+      });
+    }
+    await fs.unlink(temporary);
   } catch (error) {
     await fs.unlink(temporary).catch(() => {});
     throw error;
@@ -54,10 +89,11 @@ startWorker({
 }, wasm, {
   readFile: async (file) => new Uint8Array(await fs.readFile(file)),
   writeAtomic,
-  async writeVolumes(firstPath, parts, format) {
+  async writeVolumes(firstPath, parts, format, overwrite) {
     // Validate the whole set before publishing any volume.
     const paths = volumePaths(firstPath, parts.length, format);
-    await Promise.all(parts.map((part, index) => writeAtomic(paths[index], part)));
+    if (!overwrite) for (const file of paths) await refuseExisting(file);
+    await Promise.all(parts.map((part, index) => writeAtomic(paths[index], part, overwrite)));
     return paths;
   },
 });

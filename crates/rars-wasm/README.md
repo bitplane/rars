@@ -111,7 +111,9 @@ const parts = await split.volumes();
 `encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
 `volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
 additionally provides `addFile()` and `writeTo(path)`, which writes the archive,
-or every part of a set, and returns the paths written.
+or every part of a set, and returns the paths written. It refuses an existing
+file unless given `{ overwrite: true }`; a set checks every
+part before writing any.
 For legacy formats, `writeTo()` keeps the first path of a set and names later
 volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
 same directory. Sets exceeding 901 volumes or containing overlapping output

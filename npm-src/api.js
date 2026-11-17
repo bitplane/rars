@@ -391,7 +391,9 @@ export function createApi(runtime) {
 
     /** Writes the archive, or with `volumeSize` every part of the set, and returns the paths written. */
     writeTo(path, options) {
-      return this._build("writeTo", { path: runtime.prepareOutputPath(path) }, options);
+      const overwrite = options?.overwrite ?? false;
+      if (typeof overwrite !== "boolean") throw new TypeError("overwrite must be a boolean");
+      return this._build("writeTo", { path: runtime.prepareOutputPath(path), overwrite }, options);
     }
 
     close() {

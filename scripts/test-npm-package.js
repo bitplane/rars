@@ -6,7 +6,7 @@ import "./test-npm-client.mjs";
 import "./test-npm-node.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import assert from "node:assert/strict";
@@ -178,6 +178,13 @@ await check("Node path input and atomic file output work", async () => {
     await writeFile(source, HELLO);
     const writer = new RarWriter().addFile("source.txt", source);
     assert.deepEqual(await writer.writeTo(output), [output]);
+    const existing = (error) => error instanceof RarError && error.code === "IO"
+      && error.details.systemCode === "EEXIST" && /overwrite: true/.test(error.message);
+    await writeFile(output, "precious");
+    await assert.rejects(writer.writeTo(output), existing);
+    assert.equal(await readFile(output, "utf8"), "precious");
+    assert.deepEqual(await writer.writeTo(output, { overwrite: true }), [output]);
+    assert.ok((await RarArchive.open(output)).entries.length === 1);
     const archive = await RarArchive.open(output);
     assert.deepEqual(await archive.entries[0].bytes(), new Uint8Array(await readFile(source)));
 
@@ -185,6 +192,13 @@ await check("Node path input and atomic file output work", async () => {
       .add("large.bin", new Uint8Array(180000).fill(9));
     const paths = await split.writeTo(path.join(directory, "split.rar"));
     assert.ok(paths.length > 1);
+    // One existing part refuses the whole set before anything is written.
+    for (const part of paths.slice(0, -1)) await rm(part);
+    await writeFile(paths.at(-1), "precious");
+    await assert.rejects(split.writeTo(path.join(directory, "split.rar")), existing);
+    assert.equal(await readFile(paths.at(-1), "utf8"), "precious");
+    assert.equal((await readdir(directory)).filter((name) => name.startsWith("split.")).length, 1);
+    assert.deepEqual(await split.writeTo(path.join(directory, "split.rar"), { overwrite: true }), paths);
     const volumeArchive = await RarArchive.open(paths[0]);
     assert.equal((await volumeArchive.entries[0].bytes()).length, 180000);
   } finally {

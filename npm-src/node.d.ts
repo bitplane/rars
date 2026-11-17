@@ -30,8 +30,12 @@ export class RarWriter {
   rename(from: RarName, to: RarName): this;
   bytes(options?: OperationOptions): Promise<Uint8Array>;
   volumes(options?: OperationOptions): Promise<readonly Uint8Array[]>;
-  /** Writes the archive, or with `volumeSize` every part of the set, and returns the paths written. */
-  writeTo(path: NodePath, options?: OperationOptions): Promise<readonly string[]>;
+  /**
+   * Writes the archive, or with `volumeSize` every part of the set, and returns the paths
+   * written. An existing file is refused unless `overwrite: true`; a set checks every part
+   * before writing any.
+   */
+  writeTo(path: NodePath, options?: OperationOptions & { overwrite?: boolean }): Promise<readonly string[]>;
   close(): void;
 }
 

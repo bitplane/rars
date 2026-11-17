@@ -155,11 +155,11 @@ export function startWorker(port, wasm, platform) {
       } else if (operation === "writeTo") {
         if (payload.writerOptions.volumeSize === undefined) {
           const bytes = await build(wasm, payload, platform, false);
-          await platform.writeAtomic(payload.path, bytes);
+          await platform.writeAtomic(payload.path, bytes, payload.overwrite);
           result = [payload.path];
         } else {
           const parts = await build(wasm, payload, platform, true);
-          result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version);
+          result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version, payload.overwrite);
         }
       } else {
         throw new Error(`unknown worker operation: ${operation}`);
