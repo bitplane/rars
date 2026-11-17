@@ -77,7 +77,7 @@ async function openArchive(wasm, sources, password, platform, options) {
 async function build(wasm, payload, platform, volumes) {
   const options = payload.writerOptions;
   const builder = new wasm.RarBuilder({
-    format: options.format,
+    format: options.version,
     compression: options.level,
     store: options.level === 0,
     solid: options.solid,
@@ -158,7 +158,7 @@ export function startWorker(port, wasm, platform) {
         result = undefined;
       } else if (operation === "writeVolumesTo") {
         const parts = await build(wasm, payload, platform, true);
-        result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.format);
+        result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version);
       } else {
         throw new Error(`unknown worker operation: ${operation}`);
       }

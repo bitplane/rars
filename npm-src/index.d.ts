@@ -1,7 +1,7 @@
-export type RarFormat =
+export type ArchiveVersion =
   | "rar13" | "rar14" | "rar15" | "rar20" | "rar29"
   | "rar30" | "rar40" | "rar50" | "rar70";
-export type RarFamily = "rar13" | "rar15_40" | "rar50_plus";
+export type ArchiveFamily = "rar13" | "rar15_40" | "rar50_plus" | "unknown";
 export type RarInput = Blob | ArrayBuffer | ArrayBufferView;
 export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
@@ -56,7 +56,7 @@ export interface RepairResult {
 }
 
 export interface RarWriterOptions {
-  format?: RarFormat;
+  version?: ArchiveVersion;
   level?: 0 | 1 | 2 | 3 | 4 | 5;
   solid?: boolean;
   password?: string | Uint8Array;
@@ -109,7 +109,7 @@ export class RarEntry {
 export class RarArchive {
   static open(input: RarInput | readonly RarInput[], options?: ReadOptions): Promise<RarArchive>;
   readonly entries: readonly RarEntry[];
-  readonly family: RarFamily;
+  readonly family: ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;
   readonly comment?: Uint8Array;
@@ -136,4 +136,4 @@ export class RarWriter {
 export function repair(input: RarInput, options?: OperationOptions): Promise<Uint8Array>;
 export function repairDetailed(input: RarInput, options?: OperationOptions): Promise<RepairResult>;
 export const version: string;
-export const formats: readonly RarFormat[];
+export const archiveVersions: readonly ArchiveVersion[];

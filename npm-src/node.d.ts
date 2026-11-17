@@ -10,7 +10,7 @@ export type NodePath = string | URL;
 export class RarArchive {
   static open(input: NodeRarInput | readonly NodeRarInput[], options?: ReadOptions): Promise<RarArchive>;
   readonly entries: readonly import("./base.js").RarEntry[];
-  readonly family: import("./base.js").RarFamily;
+  readonly family: import("./base.js").ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;
   readonly comment?: Uint8Array;

@@ -1,6 +1,12 @@
-const FORMATS = Object.freeze([
+const ARCHIVE_VERSIONS = Object.freeze([
   "rar13", "rar14", "rar15", "rar20", "rar29",
   "rar30", "rar40", "rar50", "rar70",
+]);
+
+// Unknown keys are refused, so a misspelt or renamed setting can't be silently ignored.
+const WRITER_OPTIONS = Object.freeze([
+  "version", "level", "solid", "password", "encryptHeaders", "comment",
+  "recoveryPercent", "maxMemoryBytes",
 ]);
 
 export function createApi(runtime) {
@@ -229,8 +235,16 @@ export function createApi(runtime) {
     if (options == null || typeof options !== "object") {
       throw new TypeError("writer options must be an object");
     }
-    const format = options.format ?? "rar50";
-    if (!FORMATS.includes(format)) throw new TypeError(`unsupported RAR format: ${format}`);
+    for (const key of Object.keys(options)) {
+      if (!WRITER_OPTIONS.includes(key)) {
+        throw new TypeError(`unknown writer option ${JSON.stringify(key)}`
+          + (key === "format" ? "; it is now called version" : ""));
+      }
+    }
+    const version = options.version ?? "rar50";
+    if (!ARCHIVE_VERSIONS.includes(version)) {
+      throw new TypeError(`unknown RAR version ${JSON.stringify(version)}; expected one of ${ARCHIVE_VERSIONS.join(", ")}`);
+    }
     const level = options.level ?? 3;
     if (!Number.isInteger(level) || level < 0 || level > 5) {
       throw new TypeError("level must be an integer from 0 to 5");
@@ -245,7 +259,7 @@ export function createApi(runtime) {
          options.recoveryPercent < 1 || options.recoveryPercent > 100)) {
       throw new TypeError("recoveryPercent must be an integer from 1 to 100");
     }
-    return { ...options, format, level };
+    return { ...options, version, level };
   }
 
   function validateEntryOptions(options = {}) {
@@ -398,7 +412,7 @@ export function createApi(runtime) {
     RarError,
     RarWriter,
     repair, repairDetailed,
-    formats: FORMATS,
+    archiveVersions: ARCHIVE_VERSIONS,
     version: runtime.version,
   };
 }
