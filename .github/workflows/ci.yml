@@ -9,9 +9,12 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request supersedes its last run. Pushes to master all
+# finish: each one saves the dependency caches pull requests restore, and a
+# cancelled run saves nothing.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
