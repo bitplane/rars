@@ -214,6 +214,19 @@ too, under the same overwrite rules. A symbolic link that could lead outside the
 directory, directly or through a link already there, is skipped with an
 `UnsafeLinkWarning` process warning. It returns the files and links written.
 
+In Node, `test()` and `extractAll()` also take `volumes`, an iterable or async
+iterable of a set's later parts, paths or bytes, to read a set while it is still
+arriving, as Python's `volumes=`. The archive is opened with its first volume
+alone, and each later part is pulled only when extraction reaches it:
+
+```js
+const archive = await RarArchive.open(firstPart);
+await archive.extractAll("out", { volumes: downloads() }); // an async generator
+```
+
+A part the iterator never yields fails with `MISSING_VOLUME`, and an error it
+throws is raised as it was. Browsers take every volume up front instead.
+
 ## Repair
 
 ```js

@@ -193,6 +193,30 @@ function extractor(directory, { overwrite, restoreTimes }) {
   };
 }
 
+// The next volume of a set, waited for while the main thread pulls it from the caller's
+// iterator: the engine runs synchronously, so this blocks the worker until it arrives.
+function nextVolume(feed) {
+  if (feed === undefined) return undefined;
+  const { receiveMessageOnPort } = require("node:worker_threads");
+  const fsSync = require("node:fs");
+  return () => {
+    Atomics.store(feed.flag, 0, 0);
+    feed.port.postMessage("next");
+    for (;;) {
+      Atomics.wait(feed.flag, 0, 0);
+      const received = receiveMessageOnPort(feed.port);
+      if (received !== undefined) {
+        const reply = received.message;
+        if (reply.error) throw new Error("volumes raised an exception");
+        if (reply.done) return undefined;
+        return reply.path !== undefined ? new Uint8Array(fsSync.readFileSync(reply.path)) : reply.bytes;
+      }
+      // The reply is posted before the flag is set, but may not be readable yet.
+      Atomics.wait(feed.flag, 0, 1, 5);
+    }
+  };
+}
+
 startWorker({
   onMessage(callback) { parentPort.on("message", callback); },
   post(message, transfers = []) { parentPort.postMessage(message, transfers); },
@@ -216,6 +240,7 @@ startWorker({
   writeAtomic,
   refuseExisting,
   extractor,
+  nextVolume,
   posix: process.platform !== "win32",
   async writeVolumes(firstPath, parts, format, overwrite) {
     // Validate the whole set before publishing any volume.

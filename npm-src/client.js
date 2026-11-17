@@ -93,7 +93,7 @@ export function createClient(spawnWorker) {
         ensureWorker().post({
           id: task.id, operation: task.operation, payload: task.payload,
           progress: typeof task.onProgress === "function",
-        });
+        }, task.transfer ?? []);
       } catch (error) {
         if (active !== task) continue;
         stopWorker();
@@ -116,6 +116,7 @@ export function createClient(spawnWorker) {
           reject,
           signal: options.signal,
           onProgress: options.onProgress,
+          transfer: options.transfer,
         };
         if (task.signal?.aborted) {
           reject(new DOMException("The operation was aborted", "AbortError"));

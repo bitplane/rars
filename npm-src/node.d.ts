@@ -5,6 +5,8 @@ import type {
 } from "./base.js";
 
 export type NodeRarInput = RarInput | string | URL;
+/** A set's later volumes, in order: what Python takes as `volumes=`. */
+export type VolumeSource = Iterable<NodeRarInput> | AsyncIterable<NodeRarInput>;
 export type NodePath = string | URL;
 
 export class RarArchive {
@@ -33,15 +35,21 @@ export class RarArchive {
     options?: ReadOptions,
   ): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
-  test(options?: ReadOptions): Promise<void>;
+  /**
+   * `volumes` gives the set's later parts, paths or bytes, pulled one at a time as the
+   * engine reaches them, so a set can be checked while it is still arriving.
+   */
+  test(options?: ReadOptions & { volumes?: VolumeSource }): Promise<void>;
   /**
    * Extracts entries under `directory` in one pass and returns the files written. Each is
    * written only once verified. `overwrite` is false (refuse an existing file), true, or
    * "rename" (write beside it as name(N).ext); `flatten` drops stored directories;
    * `restoreTimes` (default true) sets modification times. Links are written too; one that
    * could lead outside `directory` is skipped with an `UnsafeLinkWarning` process warning.
+   * `volumes` gives the set's later parts as they arrive, as for `test()`.
    */
   extractAll(directory: NodePath, options?: ReadOptions & {
+    volumes?: VolumeSource;
     members?: Iterable<import("./base.js").RarEntry | RarName>;
     overwrite?: boolean | "rename";
     flatten?: boolean;

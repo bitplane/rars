@@ -667,14 +667,32 @@ impl RarFile {
     }
 
     /// Decode every member and discard the bytes, throwing on the first
-    /// checksum failure or wrong password.
+    /// checksum failure or wrong password. Given `nextVolume`, the set's later
+    /// volumes are each pulled from it as needed, until it returns undefined.
     pub fn test(
         &self,
         password: Option<Password>,
         settings: JsValue,
         progress: Option<js_sys::Function>,
+        next_volume: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
+        if next_volume.is_some() {
+            let options = read_options(password.as_deref(), &settings)?;
+            return progress::watching(progress, || {
+                let count = progress::ReadCount::with_total("testing", None);
+                let result = with_later_volumes(&self.archives, options, next_volume, |later| {
+                    self.archives[0].extract_with_volumes(later, options, |_| {
+                        Ok(count.counted(Box::new(std::io::sink())))
+                    })
+                });
+                if matches!(result, Ok(Ok(()))) {
+                    count.finish();
+                }
+                result
+            })?
+            .map_err(js_error);
+        }
         if progress.is_some() {
             let options = read_options(password.as_deref(), &settings)?;
             return progress::watching(progress, || test_counted(&self.archives, options))
@@ -808,6 +826,7 @@ impl RarFile {
         posix: bool,
         deliver: js_sys::Function,
         read_link: js_sys::Function,
+        next_volume: Option<js_sys::Function>,
         progress: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
         use rars_rs::ExtractedLink;
@@ -825,12 +844,14 @@ impl RarFile {
                 .collect()
         });
         let chosen = |name: &[u8]| selected.as_ref().is_none_or(|set| set.contains(name));
-        let total = self
-            .infos
-            .iter()
-            .filter(|info| chosen(&info.name) && !info.link && !info.directory)
-            .map(|info| info.size as u64)
-            .sum();
+        // Later volumes still to arrive have members not listed yet.
+        let total = next_volume.is_none().then(|| {
+            self.infos
+                .iter()
+                .filter(|info| chosen(&info.name) && !info.link && !info.directory)
+                .map(|info| info.size as u64)
+                .sum()
+        });
         let family = self.archives[0].family();
         let encoding = options.legacy_name_encoding;
         let tree = JsTree(read_link);
@@ -866,7 +887,7 @@ impl RarFile {
                 Ok((entry, path))
             };
         let result = progress::watching(progress, || {
-            let count = progress::ReadCount::new("extracting", total);
+            let count = progress::ReadCount::with_total("extracting", total);
             let open =
                 |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<Box<dyn std::io::Write>> {
                     flush()?;
@@ -917,16 +938,17 @@ impl RarFile {
                 }
                 hand_over(&entry, &JsValue::UNDEFINED)
             };
-            let later = self.archives[1..].iter().cloned().map(Ok);
-            let result = rars_rs::output_links::extract_arriving_with_links(
-                &self.archives[0],
-                later,
-                options,
-                open,
-                link,
-            )
-            .and_then(|()| flush());
-            if result.is_ok() {
+            let result = with_later_volumes(&self.archives, options, next_volume, |later| {
+                rars_rs::output_links::extract_arriving_with_links(
+                    &self.archives[0],
+                    later,
+                    options,
+                    open,
+                    link,
+                )
+                .and_then(|()| flush())
+            });
+            if matches!(result, Ok(Ok(()))) {
                 count.finish();
             }
             result
@@ -934,7 +956,7 @@ impl RarFile {
         if let Some(error) = raised.into_inner() {
             return Err(error);
         }
-        result.map_err(js_error)
+        result?.map_err(js_error)
     }
 
     /// Volume `index` of the set this first volume begins, named as RAR names it from
@@ -1040,6 +1062,73 @@ impl std::io::Write for SharedBytes {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+thread_local! {
+    /// The caller's next-volume function for the call in progress, and what it threw.
+    /// It is kept here, not in the volume iterator, because the core reads later volumes
+    /// through an iterator that must be `Send`, which a JavaScript function isn't; bare
+    /// WebAssembly has one thread, so the call that set it is the one that reads it.
+    static NEXT_VOLUME: std::cell::RefCell<Option<js_sys::Function>> =
+        const { std::cell::RefCell::new(None) };
+    static VOLUME_RAISED: std::cell::RefCell<Option<JsValue>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// A set's later volumes, pulled from the caller's function as the core reaches them.
+struct Arriving<'a> {
+    session: rars_rs::read_session::ReadSession<'a>,
+}
+
+impl Iterator for Arriving<'_> {
+    type Item = rars_rs::Result<rars_rs::Archive>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let answer = NEXT_VOLUME.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|next| next.call0(&JsValue::NULL))
+        })?;
+        match answer {
+            Ok(volume) if volume.is_undefined() || volume.is_null() => None,
+            Ok(volume) => match volume.dyn_into::<js_sys::Uint8Array>() {
+                Ok(bytes) => Some(self.session.read_owned(bytes.to_vec())),
+                Err(_) => Some(Err(rars_rs::Error::InvalidArgument(
+                    "a volume must be a Uint8Array",
+                ))),
+            },
+            Err(error) => {
+                VOLUME_RAISED.with(|slot| *slot.borrow_mut() = Some(error));
+                Some(Err(rars_rs::Error::InvalidArgument(
+                    "volumes raised an exception",
+                )))
+            }
+        }
+    }
+}
+
+/// Runs `run` with the set's later volumes: those opened with `archives`, or, given
+/// `next`, each pulled from it as needed until it returns undefined. What `next` threw
+/// is raised in place of the error it caused.
+fn with_later_volumes<T>(
+    archives: &[rars_rs::Archive],
+    options: rars_rs::ArchiveReadOptions<'_>,
+    next: Option<js_sys::Function>,
+    run: impl FnOnce(
+        Box<dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send + '_>,
+    ) -> rars_rs::Result<T>,
+) -> Result<rars_rs::Result<T>, JsValue> {
+    let Some(next) = next else {
+        return Ok(run(Box::new(archives[1..].iter().cloned().map(Ok))));
+    };
+    let session = rars_rs::read_session::ReadSession::continuing(&archives[0], options);
+    NEXT_VOLUME.with(|slot| *slot.borrow_mut() = Some(next));
+    let result = run(Box::new(Arriving { session }));
+    NEXT_VOLUME.with(|slot| *slot.borrow_mut() = None);
+    match VOLUME_RAISED.with(|slot| slot.borrow_mut().take()) {
+        Some(error) => Err(error),
+        None => Ok(result),
     }
 }
 

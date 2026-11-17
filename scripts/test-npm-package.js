@@ -232,6 +232,51 @@ await check("RarWriter.fromArchive carries members over, and edits before writin
   await assert.rejects(capped.bytes(), (error) => error.code === "RESOURCE_LIMIT");
 });
 
+await check("Node reads a volume set while its later parts arrive", async () => {
+  const big = new Uint8Array(200 * 1024).map((_, index) => (index * 7919) % 251);
+  const parts = await new RarWriter({ level: 0, volumeSize: 64 * 1024 })
+    .add("big.bin", big).add("small.txt", HELLO).volumes();
+  assert.ok(parts.length > 2);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-arriving-"));
+  try {
+    const archive = await RarArchive.open(parts[0]);
+    const pulled = [];
+    async function* arriving() {
+      for (let index = 1; index < parts.length; index++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        pulled.push(index);
+        yield parts[index];
+      }
+    }
+    const written = await archive.extractAll(path.join(directory, "out"), { volumes: arriving() });
+    assert.deepEqual(pulled, parts.slice(1).map((_, index) => index + 1));
+    assert.deepEqual(written.map((file) => path.basename(file)).sort(), ["big.bin", "small.txt"]);
+    assert.deepEqual(new Uint8Array(await readFile(path.join(directory, "out", "big.bin"))), big);
+    // Paths work too, from a plain iterable.
+    const files = [];
+    for (const [index, part] of parts.entries()) {
+      files.push(path.join(directory, `set.part${index + 1}.rar`));
+      await writeFile(files.at(-1), part);
+    }
+    await archive.test({ volumes: files.slice(1) });
+    // A set that stops short, and an iterator that throws.
+    await assert.rejects(archive.test({ volumes: parts.slice(1, -1) }), (error) => error.code === "MISSING_VOLUME");
+    const thrown = new Error("download failed");
+    await assert.rejects(archive.test({ volumes: (function* () { yield parts[1]; throw thrown; })() }),
+      (error) => error === thrown);
+    // Aborting while the worker waits for a part that never comes ends the call.
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), 50);
+    await assert.rejects(archive.test({ signal: controller.signal, volumes: (async function* () {
+      yield parts[1];
+      await new Promise(() => {});
+    })() }), (error) => error.name === "AbortError");
+    await archive.test({ volumes: parts.slice(1) });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 await check("Node extraction writes links, and skips one that could leave the directory", async () => {
   const bytes = await new RarWriter({ level: 0 })
     .add("data/file.txt", HELLO)

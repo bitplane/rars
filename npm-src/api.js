@@ -171,7 +171,29 @@ export function createApi(runtime) {
 
     _request(operation, payload, options) {
       assertOpen(this);
-      return runtime.request(operation, { ...payload, sources: this._sources }, options);
+      return runtime.request(operation, { sources: this._sources, ...payload }, options);
+    }
+
+    /**
+     * Runs `operation` with the set's later volumes pulled from `volumes` as the engine
+     * reaches them, rather than those this archive was opened with, as Python's `volumes=`.
+     */
+    async _withVolumes(operation, payload, options) {
+      if (options.volumes === undefined) return this._request(operation, payload, options);
+      if (!runtime.volumeFeed) {
+        throw new RarError("UNSUPPORTED_FEATURE",
+          "volumes as they arrive need Node; open the archive with every volume instead");
+      }
+      const feed = runtime.volumeFeed(options.volumes);
+      try {
+        return await this._request(operation, {
+          ...payload, sources: this._sources.slice(0, 1), volumeFeed: feed.channel,
+        }, { ...options, transfer: feed.transfer });
+      } catch (error) {
+        throw feed.failure ?? error;
+      } finally {
+        feed.close();
+      }
     }
 
     get(name) {
@@ -252,7 +274,7 @@ export function createApi(runtime) {
           indices.push(entry.index);
         }
       }
-      const { written, skipped } = await this._request("extract", {
+      const { written, skipped } = await this._withVolumes("extract", {
         directory: runtime.prepareOutputPath(directory),
         indices,
         overwrite,
@@ -280,7 +302,7 @@ export function createApi(runtime) {
 
     async test(options) {
       const operation = operationOptions(options);
-      await this._request("test", {
+      await this._withVolumes("test", {
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
