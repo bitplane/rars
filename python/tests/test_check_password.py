@@ -117,6 +117,18 @@ def test_a_later_volume_checks_the_same_as_the_first(tmp_path, encrypt_headers):
         check = rars.check_password(path, ["wrong", "right"])
         assert check.correct == "right"
         assert check.archive.namelist() == ["large.bin"]
+        assert not check.archive.first_volume_only
+
+
+def test_the_checked_archive_lists_the_whole_set(tmp_path):
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=4096, password="right")
+    builder.add_bytes(random.Random(7).randbytes(10_000), "first.bin")
+    builder.add_bytes(b"tail", "tail.txt")
+    paths = builder.write(tmp_path / "set.part1.rar")
+    check = rars.check_password(paths[0], ["right"])
+    assert check.archive.namelist() == rars.RarFile(paths[0]).namelist() == ["first.bin", "tail.txt"]
+    assert check.archive.read("tail.txt", password="right") == b"tail"
+    assert rars.RarFile(paths[0], first_volume_only=True).first_volume_only
 
 
 @pytest.mark.parametrize(

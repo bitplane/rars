@@ -1575,6 +1575,12 @@ impl RarFile {
         self.closed.store(true, Ordering::Relaxed);
     }
 
+    /// Whether the archive was opened with `first_volume_only=True`.
+    #[getter]
+    fn first_volume_only(&self) -> bool {
+        self.first_volume_only
+    }
+
     #[getter]
     fn closed(&self) -> bool {
         self.closed.load(Ordering::Relaxed)
@@ -3281,7 +3287,7 @@ fn check_password(
         .map(|archive| -> PyResult<Py<RarFile>> {
             let mut file = RarFile::parse(py, password, options, |_| Ok(archive))?;
             file.path = path;
-            Py::new(py, file.with_set(true, None))
+            Py::new(py, file)
         })
         .transpose()?;
     Ok(PasswordCheck {
