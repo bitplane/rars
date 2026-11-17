@@ -87,8 +87,10 @@ try {
   }
 
   // RAR follows the case of the first extension, and unrar looks only for that name.
-  for (const [firstName, later] of [["archive.RAR", "R"], ["archive.Rar", "R"], ["archive.rAR", "r"]]) {
-    const directory = path.join(temporary, `legacy-case-${firstName}`);
+  // Directories are numbered, as names differing only in case are one directory on macOS.
+  const cases = [["archive.RAR", "R"], ["archive.Rar", "R"], ["archive.rAR", "r"]];
+  for (const [index, [firstName, later]] of cases.entries()) {
+    const directory = path.join(temporary, `legacy-case-${index}`);
     const actual = await writeVolumes(directory, firstName, 3);
     assert.deepEqual(actual, [firstName, `archive.${later}00`, `archive.${later}01`].map((name) => path.join(directory, name)));
   }
