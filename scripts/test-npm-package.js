@@ -593,6 +593,12 @@ await check("volumes out of order reject with VOLUME_ORDER and the volume's inde
       await assert.rejects(RarArchive.open([parts[0], parts[2], parts[1], ...parts.slice(3)]), outOfOrder);
       const first = await RarArchive.open(parts[0]);
       await assert.rejects(first.test({ volumes: [parts[2], parts[1], ...parts.slice(3)] }), outOfOrder);
+      // Parts arriving one by one, read as they come.
+      async function* swapped() {
+        for (const part of [parts[2], parts[1], ...parts.slice(3)]) yield part;
+      }
+      await assert.rejects(first.extractAll(path.join(directory, `${version}-arriving`), { volumes: swapped() }),
+        outOfOrder);
       first.close();
 
       const paths = await writer.writeTo(path.join(directory, `${version}.rar`));
