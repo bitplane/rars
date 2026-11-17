@@ -8,8 +8,11 @@ export type RarName = string | Uint8Array;
 
 export interface RarProgress {
   operation: "open" | "read" | "readMany" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
-  phase: string;
+  /** Python's ProgressPhase names, plus "repairing". */
+  phase: "reading" | "testing" | "compressing" | "repairing";
+  /** Bytes; the work runs in one step, so `completed` reaches `total` only on the last event. */
   completed: number;
+  /** Absent while not known yet. */
   total?: number;
 }
 

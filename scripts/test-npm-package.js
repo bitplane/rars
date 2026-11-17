@@ -160,6 +160,19 @@ await check("repair restores damaged bytes", async () => {
   }
 });
 
+await check("progress names its phase and leaves the total out until known", async () => {
+  const events = [];
+  const bytes = await new RarWriter().add("hello.txt", HELLO).bytes({ onProgress: (event) => events.push(event) });
+  assert.deepEqual(events.map((event) => event.phase), ["compressing", "compressing"]);
+  assert.equal(events[0].total, undefined);
+  assert.equal(events.at(-1).completed, bytes.length);
+  assert.equal(events.at(-1).total, bytes.length);
+  const read = [];
+  const archive = await RarArchive.open(bytes);
+  await archive.entries[0].bytes({ onProgress: (event) => read.push(event.phase) });
+  assert.deepEqual(read, ["reading", "reading"]);
+});
+
 await check("codec work leaves the Node event loop responsive", async () => {
   const writer = new RarWriter({ version: "rar50", level: 5 });
   writer.add("large.txt", new Uint8Array(4_000_000).fill(120));

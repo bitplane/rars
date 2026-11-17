@@ -16,7 +16,7 @@ async function failure(error, options = {}) {
     sources: options.sources ?? [new Uint8Array([0])],
   } });
   assert.equal(replies.filter((message) => message.error).length, 1);
-  assert.equal(replies.filter((message) => message.progress?.phase === "complete").length, 0);
+  assert.equal(replies.filter((message) => message.progress?.total !== undefined).length, 0);
   return replies.find((message) => message.error).error;
 }
 
@@ -59,7 +59,9 @@ for (const operation of ["read", "readMany", "test", "readComment"]) {
     assert.equal(opened, 1);
     assert.equal(freed, 1);
     assert.equal(replies.filter((reply) => reply.error).length, fails ? 1 : 0);
-    assert.equal(replies.filter((reply) => reply.progress?.phase === "complete").length, fails ? 0 : 1);
+    assert.equal(replies.filter((reply) => reply.progress?.total !== undefined).length, fails ? 0 : 1);
+    assert.ok(replies.filter((reply) => reply.progress).every((reply) =>
+      ["reading", "testing"].includes(reply.progress.phase)));
   }
 }
 console.log("npm reader parse ownership and failure cleanup checks passed");

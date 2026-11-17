@@ -110,11 +110,30 @@ async function build(wasm, payload, platform, volumes) {
   }
 }
 
+// The phase names Python's ProgressPhase uses, plus repairing, which Python reports none for.
+const PHASES = {
+  open: "reading", read: "reading", readMany: "reading", readComment: "reading",
+  test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
+  repair: "repairing",
+};
+
+// Bytes the call produced, where its result is bytes.
+function producedBytes(result) {
+  if (result instanceof Uint8Array) return result.length;
+  if (Array.isArray(result) && result.every((part) => part instanceof Uint8Array)) {
+    return result.reduce((sum, part) => sum + part.length, 0);
+  }
+  if (result?.data instanceof Uint8Array) return result.data.length;
+  return 0;
+}
+
 export function startWorker(port, wasm, platform) {
   port.onMessage(async (message) => {
     const { id, operation, payload } = message;
     try {
-      port.post({ id, progress: { operation, phase: "working", completed: 0 } });
+      const phase = PHASES[operation];
+      // The engine reports nothing while it runs, so the total is unknown until it ends.
+      port.post({ id, progress: { operation, phase, completed: 0 } });
       let result;
       if (operation === "open" || operation === "read" || operation === "readMany"
           || operation === "test" || operation === "readComment") {
@@ -171,7 +190,8 @@ export function startWorker(port, wasm, platform) {
       } else {
         throw new Error(`unknown worker operation: ${operation}`);
       }
-      port.post({ id, progress: { operation, phase: "complete", completed: 1, total: 1 } });
+      const produced = producedBytes(result);
+      port.post({ id, progress: { operation, phase, completed: produced, total: produced } });
       const transfers = [];
       if (result instanceof Uint8Array) transfers.push(result.buffer);
       else if (Array.isArray(result)) {
