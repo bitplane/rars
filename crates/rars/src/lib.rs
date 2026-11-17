@@ -94,7 +94,9 @@ pub mod recovery;
 mod rewrite;
 #[cfg(feature = "write")]
 mod rewrite_plan;
+#[cfg(feature = "write")]
 pub use rewrite_plan::{rewrite_payload_bytes, RewritePayload};
+#[cfg(feature = "write")]
 mod rewrite_staging;
 #[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
