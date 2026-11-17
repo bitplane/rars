@@ -6,7 +6,7 @@ import "./test-npm-client.mjs";
 import "./test-npm-node.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import assert from "node:assert/strict";
@@ -194,6 +194,40 @@ await check("checkPassword finds the right candidate and opens the archive", asy
   assert.equal(plain.correct, undefined);
   assert.deepEqual(plain.archive.entries.map((entry) => entry.name), ["a.txt"]);
   await assert.rejects(checkPassword(new Uint8Array(1), [1]), TypeError);
+});
+
+await check("Node extraction writes links, and skips one that could leave the directory", async () => {
+  const bytes = await new RarWriter({ level: 0 })
+    .add("data/file.txt", HELLO)
+    .addSymlink("data/near", "file.txt")
+    .addSymlink("data/far", "../../outside")
+    .bytes();
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-links-"));
+  const warnings = [];
+  const listen = (warning) => { if (warning.name === "UnsafeLinkWarning") warnings.push(warning.message); };
+  process.on("warning", listen);
+  try {
+    const archive = await RarArchive.open(bytes);
+    const written = await archive.extractAll(directory);
+    assert.deepEqual(written.map((file) => path.relative(directory, file)).sort(),
+      [path.join("data", "file.txt"), path.join("data", "near")].sort());
+    assert.equal(await readlink(path.join(directory, "data", "near")), "file.txt");
+    assert.deepEqual(new Uint8Array(await readFile(path.join(directory, "data", "near"))), HELLO);
+    await assert.rejects(lstat(path.join(directory, "data", "far")));
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /data\/far/);
+    // A hard link names an earlier member, which is written first and linked to.
+    const hard = path.join(directory, "hard");
+    const fixture = await RarArchive.open(path.join(here, "..", "crates/rars/tests/fixtures/rar50/wild/hardlink.rar"));
+    const files = await fixture.extractAll(hard);
+    assert.equal(files.length, fixture.entries.length);
+    const [first, second] = await Promise.all(files.map((file) => stat(file)));
+    assert.equal(first.ino, second.ino);
+  } finally {
+    process.off("warning", listen);
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 await check("Node extracts entries once verified, refusing to overwrite by default", async () => {

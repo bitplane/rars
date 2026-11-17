@@ -206,7 +206,7 @@ export function startWorker(port, wasm, platform) {
             case "extract": {
               const output = platform.extractor(payload.directory, payload);
               archive.extractEach(payload.indices, payload.password, payload.readOptions,
-                payload.flatten, platform.posix, output.deliver, report);
+                payload.flatten, platform.posix, output.deliver, output.readLink, report);
               result = output.finish();
               break;
             }

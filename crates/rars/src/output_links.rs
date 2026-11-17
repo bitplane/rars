@@ -66,8 +66,52 @@ pub fn check_legacy_symlink_target(name: &[u8], size: u64, target: Option<&[u8]>
     }
 }
 
+/// What the containment check needs to know about the output directory: which
+/// paths already there are symbolic links, and where they point. A link already
+/// in the output can carry a new one out of it, so the check follows them.
+pub trait OutputTree {
+    /// The target of the symbolic link at `path`, or `None` when nothing is
+    /// there or it is not a link.
+    fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>>;
+}
+
+/// The output directory as the filesystem has it.
+pub struct Filesystem;
+
+impl OutputTree for Filesystem {
+    fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => fs::read_link(path).map(Some),
+            Ok(_) => Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
 /// Where `link` at `relative` under `root` points, or `None` for a symlink to skip because it could leave `root`.
 pub fn link_target(
+    root: &Path,
+    relative: &Path,
+    meta: &crate::ExtractedEntryMeta,
+    link: ExtractedLink<'_>,
+    family: ArchiveFamily,
+    flat: bool,
+) -> Result<Option<PathBuf>> {
+    link_target_in(&Filesystem, root, relative, meta, link, family, flat)
+}
+
+/// [`link_target`], asking `tree` about the links already in the output, for a
+/// caller that cannot reach the filesystem itself.
+pub fn link_target_in(
+    tree: &dyn OutputTree,
     root: &Path,
     relative: &Path,
     meta: &crate::ExtractedEntryMeta,
@@ -84,16 +128,17 @@ pub fn link_target(
                 .map_err(|_| Error::InvalidHeader("unsafe archive redirection target"))
         }
         ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target } if flat => {
-            Ok(flat_symlink_target(root, target, family, unix_host)?)
+            Ok(flat_symlink_target(tree, root, target, family, unix_host)?)
         }
         ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target } => Ok(
-            safe_symlink_target(root, relative, target, family, unix_host)?,
+            safe_symlink_target(tree, root, relative, target, family, unix_host)?,
         ),
     }
 }
 
 /// A bare name can still lead out through a link already in `root`, as in nested output.
 fn flat_symlink_target(
+    tree: &dyn OutputTree,
     root: &Path,
     target: &[u8],
     family: ArchiveFamily,
@@ -103,7 +148,7 @@ fn flat_symlink_target(
         return Ok(None);
     };
     let step = Step::Down(name.clone().into_os_string());
-    Ok(stays_inside(root, Vec::new(), &[step])?.then_some(name))
+    Ok(stays_inside(tree, root, Vec::new(), &[step])?.then_some(name))
 }
 
 /// Flat output has no directories, so only a symlink to a bare name still means what it did.
@@ -130,6 +175,7 @@ fn flat_target(target: &[u8], family: ArchiveFamily, unix_host: bool) -> Option<
 }
 
 fn safe_symlink_target(
+    tree: &dyn OutputTree,
     root: &Path,
     relative: &Path,
     target: &[u8],
@@ -165,7 +211,7 @@ fn safe_symlink_target(
     let Some(start) = start else {
         return Ok(None);
     };
-    if !stays_inside(root, start, &steps)? {
+    if !stays_inside(tree, root, start, &steps)? {
         return Ok(None);
     }
     Ok(Some(
@@ -197,7 +243,12 @@ fn path_steps(path: &Path) -> Option<Vec<Step>> {
 }
 
 /// `..` may only leave a directory holding the link or a followed link: any other could still become a link.
-fn stays_inside(root: &Path, start: Vec<OsString>, steps: &[Step]) -> std::io::Result<bool> {
+fn stays_inside(
+    tree: &dyn OutputTree,
+    root: &Path,
+    start: Vec<OsString>,
+    steps: &[Step],
+) -> std::io::Result<bool> {
     let mut at = start;
     let mut stable = at.len();
     let mut todo: Vec<Step> = steps.iter().rev().cloned().collect();
@@ -216,27 +267,17 @@ fn stays_inside(root: &Path, start: Vec<OsString>, steps: &[Step]) -> std::io::R
                 let path: PathBuf = std::iter::once(root.as_os_str())
                     .chain(at.iter().map(OsString::as_os_str))
                     .collect();
-                match fs::symlink_metadata(&path) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        hops += 1;
-                        let Some(next) = (hops <= 40).then(|| fs::read_link(&path)).transpose()?
-                        else {
-                            return Ok(false);
-                        };
-                        let Some(next) = path_steps(&next) else {
-                            return Ok(false);
-                        };
-                        at.pop();
-                        stable = at.len();
-                        todo.extend(next.into_iter().rev());
+                if let Some(next) = tree.read_link(&path)? {
+                    hops += 1;
+                    if hops > 40 {
+                        return Ok(false);
                     }
-                    Ok(_) => {}
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
-                        ) => {}
-                    Err(error) => return Err(error),
+                    let Some(next) = path_steps(&next) else {
+                        return Ok(false);
+                    };
+                    at.pop();
+                    stable = at.len();
+                    todo.extend(next.into_iter().rev());
                 }
             }
         }
@@ -341,8 +382,53 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::symlink;
 
+    /// An output directory described rather than on disk, as the wasm engine sees it.
+    struct Described(HashMap<PathBuf, PathBuf>);
+
+    impl OutputTree for Described {
+        fn read_link(&self, path: &Path) -> std::io::Result<Option<PathBuf>> {
+            Ok(self.0.get(path).cloned())
+        }
+    }
+
+    #[test]
+    fn a_described_tree_is_followed_like_the_filesystem() {
+        let meta = crate::ExtractedEntryMeta::new(b"x".to_vec(), None, 0o120777, false)
+            .with_attr_source(crate::AttrSource::Unix);
+        let link = ExtractedLink::Symlink {
+            target: b"dir/x",
+            directory: false,
+        };
+        let target = |tree: &dyn OutputTree| {
+            link_target_in(
+                tree,
+                Path::new(""),
+                Path::new("x"),
+                &meta,
+                link,
+                ArchiveFamily::Rar50Plus,
+                false,
+            )
+            .unwrap()
+        };
+        // Nothing there yet: the target stays inside.
+        assert_eq!(
+            target(&Described(HashMap::new())),
+            Some(PathBuf::from("dir/x"))
+        );
+        // `dir` is already a link out of the root, so following the target leaves it.
+        let escape = Described(HashMap::from([(PathBuf::from("dir"), PathBuf::from(".."))]));
+        assert_eq!(target(&escape), None);
+        let inside = Described(HashMap::from([(
+            PathBuf::from("dir"),
+            PathBuf::from("sub"),
+        )]));
+        assert_eq!(target(&inside), Some(PathBuf::from("dir/x")));
+    }
+
     fn check(root: &Path, link: &str, target: &[u8]) -> Option<PathBuf> {
         safe_symlink_target(
+            &Filesystem,
             root,
             Path::new(link),
             target,
@@ -410,6 +496,7 @@ mod tests {
         }
         assert_eq!(check(&root, "sym", b".."), None);
         let windows = safe_symlink_target(
+            &Filesystem,
             &root,
             Path::new("sym"),
             br"C:\Windows",
@@ -419,6 +506,7 @@ mod tests {
         .unwrap();
         assert_eq!(windows, None);
         let legacy = safe_symlink_target(
+            &Filesystem,
             &root,
             Path::new("a/sym"),
             b"../../outside",
@@ -461,7 +549,7 @@ mod tests {
         symlink("/", root.join("escape")).unwrap();
         symlink("local", root.join("inside")).unwrap();
         let flat = |target: &[u8]| {
-            flat_symlink_target(&root, target, ArchiveFamily::Rar50Plus, true).unwrap()
+            flat_symlink_target(&Filesystem, &root, target, ArchiveFamily::Rar50Plus, true).unwrap()
         };
         assert_eq!(flat(b"escape"), None);
         assert_eq!(flat(b"inside"), Some(PathBuf::from("inside")));

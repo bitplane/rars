@@ -193,7 +193,10 @@ verified, under paths the core checks stay inside the directory. An existing
 file is refused unless `overwrite` is `true`, or kept with the new one written
 beside it as `name(N).ext` under `"rename"`. `members` selects entries,
 `flatten: true` drops stored directories, and `restoreTimes` (on by default)
-sets modification times. Links are skipped. It returns the files written.
+sets modification times. Symbolic links, hard links and file copies are written
+too, under the same overwrite rules. A symbolic link that could lead outside the
+directory, directly or through a link already there, is skipped with an
+`UnsafeLinkWarning` process warning. It returns the files and links written.
 
 ## Repair
 

@@ -73,7 +73,49 @@ function extractor(directory, { overwrite, restoreTimes }) {
   const root = path.resolve(directory);
   const written = [];
   const directories = [];
+  const skipped = [];
+  // Where each stored path went, for hard links and copies that name an earlier member.
+  const created = new Map();
   const fsSync = require("node:fs");
+  const under = (relative) => path.join(root, ...relative.split("/"));
+  // Places something new at `target` under the overwrite policy, by calling `make(path)`,
+  // which must fail with EEXIST when something is already there.
+  function place(target, make) {
+    if (overwrite === true) {
+      fsSync.rmSync(target, { force: true });
+      make(target);
+      return target;
+    }
+    const parsed = path.parse(target);
+    for (let number = 0; ; number++) {
+      const candidate = number === 0 ? target
+        : path.join(parsed.dir, `${parsed.name}(${number})${parsed.ext}`);
+      try {
+        make(candidate);
+        return candidate;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        if (overwrite !== "rename") throw alreadyExists(candidate);
+      }
+    }
+  }
+  function link(entry, target) {
+    const { kind, target: to, directory } = entry.link;
+    if (kind === "hardlink" || kind === "copy") {
+      const source = created.get(to);
+      if (source === undefined) {
+        throw Object.assign(new Error(`${entry.path} links to ${to}, which was not extracted`),
+          { code: "INVALID_ARCHIVE" });
+      }
+      return place(target, (file) => kind === "hardlink"
+        ? fsSync.linkSync(source, file)
+        : fsSync.copyFileSync(source, file, fsSync.constants.COPYFILE_EXCL));
+    }
+    // A junction is a directory link; elsewhere than Windows it is made as a symlink.
+    const type = process.platform === "win32" ? (kind === "junction" ? "junction" : directory ? "dir" : "file")
+      : undefined;
+    return place(target, (file) => fsSync.symlinkSync(to.split("/").join(path.sep), file, type));
+  }
   function setTime(file, mtime) {
     if (restoreTimes && mtime !== undefined) fsSync.utimesSync(file, mtime, mtime);
   }
@@ -98,10 +140,21 @@ function extractor(directory, { overwrite, restoreTimes }) {
   }
   return {
     deliver(entry, bytes) {
-      const target = path.join(root, ...entry.path.split("/"));
+      const target = under(entry.path);
       const relative = path.relative(root, target);
       if (relative.startsWith("..") || path.isAbsolute(relative)) {
         throw Object.assign(new Error(`unsafe archive path: ${entry.path}`), { code: "UNSAFE_ENTRY_NAME" });
+      }
+      if (entry.skipped) {
+        skipped.push({ name: entry.stored, target: entry.target });
+        return;
+      }
+      if (entry.link) {
+        fsSync.mkdirSync(path.dirname(target), { recursive: true });
+        const placed = link(entry, target);
+        created.set(entry.stored, placed);
+        written.push(placed);
+        return;
       }
       if (entry.isDirectory) {
         fsSync.mkdirSync(target, { recursive: true });
@@ -113,15 +166,29 @@ function extractor(directory, { overwrite, restoreTimes }) {
       try {
         fsSync.writeFileSync(temporary, bytes, { flag: "wx" });
         setTime(temporary, entry.mtime);
-        written.push(publish(temporary, target));
+        const placed = publish(temporary, target);
+        created.set(entry.stored, placed);
+        written.push(placed);
       } catch (error) {
         try { fsSync.unlinkSync(temporary); } catch {}
         throw error;
       }
     },
+    // The engine's question for its containment check: the target of the link already at
+    // this relative path, or undefined.
+    readLink(relative) {
+      const file = under(relative);
+      try {
+        if (!fsSync.lstatSync(file).isSymbolicLink()) return undefined;
+        return fsSync.readlinkSync(file).split(path.sep).join("/");
+      } catch (error) {
+        if (error.code === "ENOENT" || error.code === "ENOTDIR") return undefined;
+        throw error;
+      }
+    },
     finish() {
       for (const [target, mtime] of directories.reverse()) setTime(target, mtime);
-      return written;
+      return { written, skipped };
     },
   };
 }
