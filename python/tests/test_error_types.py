@@ -130,3 +130,13 @@ def test_a_corrupt_encrypted_rar5_member_is_a_checksum_error(tmp_path):
         with pytest.raises(rars.ChecksumError) as raised:
             archive.testrar()
     assert raised.value.member == "large.bin"
+
+
+def test_a_refusing_limit_is_a_rars_error_not_a_memory_error():
+    archive = rars.RarFile(rar_bytes())
+    with pytest.raises(rars.LimitExceeded) as raised:
+        archive.read("file.txt", options=rars.ReadOptions(max_member_output_bytes=1))
+    assert isinstance(raised.value, rars.Error)
+    assert not isinstance(raised.value, MemoryError)
+    with pytest.raises(rars.LimitExceeded):
+        rars.RarFile(rar_bytes(), options=rars.ReadOptions(max_header_count=1))

@@ -22,7 +22,7 @@ def test_member_limits_apply_before_publication_and_do_not_change_defaults(tmp_p
     options = rars.ReadOptions(max_member_output_bytes=4)
     target = tmp_path / "first"
     target.write_bytes(b"keep")
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         if method in ("read", "open"):
             getattr(archive, method)("first", options=options)
         elif method == "extract":
@@ -47,14 +47,14 @@ def test_total_budget_counts_solid_dependencies_and_resets_per_call(tmp_path, fo
         assert archive.read("last", options=options) == b"end"
         assert archive.open("last", options=options).read() == b"end"
     too_small = rars.ReadOptions(max_total_output_bytes=required - 1)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.read("last", options=too_small)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.extractall(tmp_path, members=["last"], options=too_small)
     assert list(tmp_path.iterdir()) == []
     assert archive.extractall(tmp_path, members=["last"], options=options) == [tmp_path / "last"]
     assert (tmp_path / "last").read_bytes() == b"end"
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.testrar(options=rars.ReadOptions(max_total_output_bytes=14))
     archive.testrar(options=rars.ReadOptions(max_total_output_bytes=15))
 
@@ -123,9 +123,9 @@ def test_rar5_dictionary_policy_and_streaming_decode_option(format):
     builder.add_bytes(payload, "file")
     archive = rars.RarFile(builder.to_bytes())
     refused = rars.ReadOptions(rar50_dictionary_size_limit=0)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.read("file", options=refused)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.testrar(options=refused)
     streaming = rars.ReadOptions(rar50_buffered_decode_limit=0)
     assert archive.read("file", options=streaming) == payload
@@ -142,7 +142,7 @@ def test_selected_extraction_keeps_empty_files_and_completed_prefixes(tmp_path, 
     zero = rars.ReadOptions(max_total_output_bytes=0)
     assert archive.extract("empty", tmp_path, options=zero) == tmp_path / "empty"
     assert (tmp_path / "empty").read_bytes() == b""
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.extractall(tmp_path, members=["first", "second"],
                            options=rars.ReadOptions(max_total_output_bytes=5))
     assert (tmp_path / "first").read_bytes() == b"first"
@@ -162,7 +162,7 @@ def test_open_options_are_defaults_that_a_calls_options_replace(tmp_path, format
             return rars.RarFile(path, options=options, cancellation=cancellation)
         return rars.RarFile(data, options=options, cancellation=cancellation)
     for options in [rars.ReadOptions(max_header_count=0), rars.ReadOptions(max_header_bytes=0)]:
-        with pytest.raises(MemoryError):
+        with pytest.raises(rars.LimitExceeded):
             open_archive(options)
     token = rars.CancellationToken()
     token.cancel()
@@ -171,11 +171,11 @@ def test_open_options_are_defaults_that_a_calls_options_replace(tmp_path, format
     options = rars.ReadOptions(max_header_count=100, max_header_bytes=10000, max_member_output_bytes=0)
     assert options.max_header_count == 100
     archive = open_archive(options)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.read("file")
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.extractall(tmp_path / "out")
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.testrar()
     assert archive.read("file", options=rars.ReadOptions()) == b"payload"
     # Opening's cancellation is not a default.
@@ -203,9 +203,9 @@ def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, forma
                     rars.ReadOptions(max_total_output_bytes=len(payload) - 1),
                     rars.ReadOptions(max_header_count=0),
                     rars.ReadOptions(max_header_bytes=0)]:
-        with pytest.raises(MemoryError):
+        with pytest.raises(rars.LimitExceeded):
             rars.RarFile(paths[0]).testrar(options=options, volumes=paths[1:])
-        with pytest.raises(MemoryError):
+        with pytest.raises(rars.LimitExceeded):
             rars.RarFile(paths[0]).extractall(output, overwrite=True, options=options, volumes=paths[1:])
         assert target.read_bytes() == b"keep"
     options = rars.ReadOptions(max_member_output_bytes=len(payload), max_total_output_bytes=len(payload))

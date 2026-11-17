@@ -67,5 +67,5 @@ def test_repair_token_keeps_damaged_header_fallback_working(tmp_path, to_file):
 def test_repair_reads_with_the_options_given():
     builder = rars.RarBuilder(format="rar50", store=True, recovery_percent=10)
     builder.add_bytes(b"recoverable payload " * 1000, "file")
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         rars.repair(builder.to_bytes(), options=rars.ReadOptions(max_header_count=0))

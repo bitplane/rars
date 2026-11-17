@@ -35,6 +35,7 @@ __all__ = [
     "UnsupportedRarFeature",
     "NotRarFile",
     "UnsafeArchivePath",
+    "LimitExceeded",
     "UnsafeLinkWarning",
     "Cancelled",
     "RAR13",
@@ -119,6 +120,9 @@ class ChecksumError(BadRarFile):
 class UnsupportedRarFeature(Error): ...
 class NotRarFile(Error): ...
 class UnsafeArchivePath(Error): ...
+
+class LimitExceeded(Error):
+    """A configured limit refused the archive or the write."""
 class UnsafeLinkWarning(UserWarning): ...
 
 class Cancelled(Exception):

@@ -23,9 +23,9 @@ def test_writer_memory_failure_preserves_destination(tmp_path):
     destination = tmp_path / "archive.rar"
     destination.write_bytes(b"original")
     for _ in range(3):
-        with pytest.raises(MemoryError):
+        with pytest.raises(rars.LimitExceeded):
             builder.to_bytes()
-        with pytest.raises(MemoryError):
+        with pytest.raises(rars.LimitExceeded):
             builder.write(destination)
         assert destination.read_bytes() == b"original"
         assert list(tmp_path.iterdir()) == [destination]

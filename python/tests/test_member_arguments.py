@@ -67,7 +67,7 @@ def test_member_comments_honour_output_limits(format):
     archive = rars.RarFile(builder.to_bytes())
     for field in ["max_member_output_bytes", "max_total_output_bytes"]:
         assert archive.getcomment("file", options=rars.ReadOptions(**{field: 4})) == b"note"
-        with pytest.raises(MemoryError):
+        with pytest.raises(rars.LimitExceeded):
             archive.getcomment("file", options=rars.ReadOptions(**{field: 3}))
 
 
@@ -80,7 +80,7 @@ def legacy_link(encrypt_headers):
 def test_legacy_link_targets_honour_output_limits():
     archive = rars.RarFile(legacy_link(False), password="right")
     assert archive.readlink("link", options=rars.ReadOptions(max_member_output_bytes=6)) == b"target"
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.readlink("link", options=rars.ReadOptions(max_member_output_bytes=5))
 
 

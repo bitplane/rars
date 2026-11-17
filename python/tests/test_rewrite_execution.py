@@ -49,7 +49,7 @@ def test_limit_is_lazy_per_write_and_counts_only_retained_payloads(tmp_path):
     builder = rars.RarBuilder.from_archive(
         rars.RarFile(source_archive()), max_staged_bytes=14,
     )
-    with pytest.raises(MemoryError, match="rewrite staging limit"):
+    with pytest.raises(rars.LimitExceeded, match="rewrite staging limit"):
         builder.write(destination)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
@@ -111,7 +111,7 @@ def test_no_retained_payloads_need_no_staging_directory(tmp_path):
         rars.RarFile(source_archive()),
         staging_dir=tmp_path / "missing", max_staged_bytes=0,
     )
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         builder.to_bytes()
     builder.remove("first")
     builder.remove("second")

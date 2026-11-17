@@ -1,6 +1,4 @@
-use pyo3::exceptions::{
-    PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
@@ -34,6 +32,7 @@ create_exception!(rars, ChecksumError, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
+create_exception!(rars, LimitExceeded, Error);
 create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
 // Outside `Error`, so a loop that skips bad archives doesn't swallow a cancel.
 create_exception!(rars, Cancelled, pyo3::exceptions::PyException);
@@ -210,7 +209,7 @@ impl CancellationToken {
 #[derive(Debug, Clone, Default)]
 struct WriterResources {
     /// Hard ceiling on the RAR 5 writer's managed allocations; exceeding it
-    /// raises `MemoryError`. Legacy formats refuse it.
+    /// raises `LimitExceeded`. Legacy formats refuse it.
     #[pyo3(get)]
     max_memory: Option<u64>,
 }
@@ -3160,6 +3159,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("NotRarFile", py.get_type::<NotRarFile>())?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
+    m.add("LimitExceeded", py.get_type::<LimitExceeded>())?;
     m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
     m.add("Cancelled", py.get_type::<Cancelled>())?;
     let enums = PyModule::from_code(py, ENUMS, c"rars/_enums.py", c"rars._enums")?;
@@ -4740,7 +4740,7 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
         },
         ErrorKind::InvalidArgument | ErrorKind::DuplicateEntry => PyValueError::new_err(message),
         ErrorKind::EntryNotFound => PyKeyError::new_err(message),
-        ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
+        ErrorKind::ResourceLimit => LimitExceeded::new_err(message),
         ErrorKind::Cancelled => Cancelled::new_err(message),
         ErrorKind::WriterFailure => pyo3::exceptions::PyRuntimeError::new_err(message),
         _ => BadRarFile::new_err(message),
@@ -5148,7 +5148,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_workspace_options_reach_the_decoder_and_raise_memory_error() {
+    fn reader_workspace_options_reach_the_decoder_and_raise_limit_exceeded() {
         Python::initialize();
         Python::attach(|py| {
             let kwargs = pyo3::types::PyDict::new(py);
@@ -5179,7 +5179,7 @@ mod tests {
                 .unwrap();
             let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             let error = map_error(archive.test_with_options(options).unwrap_err());
-            assert!(error.is_instance_of::<PyMemoryError>(py));
+            assert!(error.is_instance_of::<LimitExceeded>(py));
         });
     }
 
@@ -5551,7 +5551,7 @@ mod tests {
                         exception.is_instance_of::<UnsupportedRarFeature>(py)
                     }
                     rars_rs::ErrorKind::ResourceLimit => {
-                        exception.is_instance_of::<PyMemoryError>(py)
+                        exception.is_instance_of::<LimitExceeded>(py)
                     }
                     rars_rs::ErrorKind::Cancelled => exception.is_instance_of::<Cancelled>(py),
                     rars_rs::ErrorKind::WriterFailure => {

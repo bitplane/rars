@@ -28,7 +28,7 @@ def payload_archive():
 def test_limits_apply_while_the_source_is_read(preserve):
     tight = rars.ReadOptions(max_member_output_bytes=10)
     rewrite = rars.RarBuilder.from_archive(payload_archive(), options=tight, preserve=preserve)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         rewrite.to_bytes()
 
 
@@ -57,14 +57,14 @@ def test_a_rarfile_opened_with_a_token_does_not_stop_a_later_rewrite():
 def test_options_override_those_a_rarfile_was_opened_with():
     tight = rars.ReadOptions(max_member_output_bytes=10)
     opened_tight = rars.RarFile(payload_archive(), options=tight)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         rars.RarBuilder.from_archive(opened_tight).to_bytes()
 
     loose = rars.RarBuilder.from_archive(opened_tight, options=rars.ReadOptions())
     assert rars.RarFile(loose.to_bytes()).read("payload.txt") == b"payload" * 100
 
     opened = rars.RarFile(payload_archive())
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         rars.RarBuilder.from_archive(opened, options=tight).to_bytes()
 
 
@@ -76,5 +76,5 @@ def test_limits_apply_to_comments_read_from_the_source(format, where):
     if where == "member":
         builder.set_file_comment("x", b"long comment")
     tight = rars.ReadOptions(max_member_output_bytes=4)
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         rars.RarBuilder.from_archive(builder.to_bytes(), options=tight)

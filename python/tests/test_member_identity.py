@@ -24,7 +24,7 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     assert archive.read_many([second, first, second]) == [b"second", b"first", b"second"]
     assert archive.read_many(iter([first, "one.txt", second])) == [b"first", b"second", b"second"]
     assert archive.read_many([second, first, second], options=rars.ReadOptions(max_total_output_bytes=11)) == [b"second", b"first", b"second"]
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.read_many([second, first], options=rars.ReadOptions(max_total_output_bytes=10))
     assert archive.read_many([]) == []
     with pytest.raises(KeyError):
