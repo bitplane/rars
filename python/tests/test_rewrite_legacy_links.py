@@ -15,7 +15,7 @@ def times(info):
 @pytest.mark.parametrize("solid", [False, True])
 @pytest.mark.parametrize("preserve", [False, True])
 def test_batch_link_metadata_leaves_unrelated_corrupt_payload_for_writing(tmp_path, solid, preserve):
-    source = rars.RarBuilder(format="rar29", solid=solid)
+    source = rars.RarBuilder(version="rar29", solid=solid)
     source.add_unix_symlink("link1", b"first-target-\xff")
     source.add_directory("empty")
     source.add_unix_symlink("link2", b"../second-target")
@@ -53,7 +53,7 @@ def test_batch_link_metadata_leaves_unrelated_corrupt_payload_for_writing(tmp_pa
 @pytest.mark.parametrize("options", [{}, {"solid": True}, {"password": "secret"}, {"password": "secret", "encrypt_headers": True, "solid": True}])
 @pytest.mark.parametrize("mode", [None, 0o2750])
 def test_legacy_directories_survive_edits_without_breaking_solid_data(options, mode):
-    source = rars.RarBuilder(format="rar40", **options)
+    source = rars.RarBuilder(version="rar40", **options)
     source.add_bytes(b"first payload " * 200, "first", mtime=DOS_TIME)
     source.add_directory("empty", mtime=DOS_TIME, mode=mode)
     source.add_bytes(b"first payload " * 200 + b"second", "second", mtime=DOS_TIME)
@@ -77,7 +77,7 @@ def test_legacy_directories_survive_edits_without_breaking_solid_data(options, m
 @pytest.mark.parametrize("target", [b"missing", b"../relative-\xff", b"/absolute/target"])
 @pytest.mark.parametrize("options", [{"level": 0}, {"solid": True}, {"password": "secret", "encrypt_headers": True}])
 def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
-    source = rars.RarBuilder(format="rar40", **options)
+    source = rars.RarBuilder(version="rar40", **options)
     source.add_bytes(b"first" * 200, "first")
     source.add_unix_symlink(b"link-\xff", target, mtime=DOS_TIME, mode=0o755)
     source.add_bytes(b"last" * 200, "last")
@@ -100,7 +100,7 @@ def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
 @pytest.mark.parametrize("links", [False, True])
 @pytest.mark.parametrize("format", ["rar20", "rar40"])
 def test_unrar_extracts_rewritten_legacy_directories_and_links(tmp_path, solid, links, format):
-    source = rars.RarBuilder(format=format, solid=solid)
+    source = rars.RarBuilder(version=format, solid=solid)
     source.add_bytes(b"payload" * 300, "file", mtime=DOS_TIME)
     source.add_directory("empty", mtime=DOS_TIME, mode=0o750)
     if links:
@@ -124,7 +124,7 @@ def test_unrar_extracts_rewritten_legacy_directories_and_links(tmp_path, solid, 
 
 @pytest.mark.parametrize("target", [b"", b"bad\0target"])
 def test_invalid_native_link_target_leaves_destination_untouched(tmp_path, target):
-    source = rars.RarBuilder(format="rar29", level=0)
+    source = rars.RarBuilder(version="rar29", level=0)
     source.add_bytes(target, "link", mode=0o120777)
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
@@ -156,7 +156,7 @@ def test_legacy_directory_payload_is_rejected_before_output(tmp_path):
     import struct
     import zlib
     from test_rewrite_legacy import headers
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"unexpected payload", "directory")
     data = bytearray(builder.to_bytes())
     offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)

@@ -7,7 +7,7 @@ def times(info):
 
 
 def linked_archive():
-    builder = rars.RarBuilder(format="rar50", level=0)
+    builder = rars.RarBuilder(version="rar50", level=0)
     builder.add_bytes(b"payload", "file", mtime=1_700_000_000)
     builder.set_member_comment("file", b"note")
     builder.add_unix_symlink("link", "file")
@@ -64,7 +64,7 @@ def test_metadata_reads_honour_cancellation(method):
 
 @pytest.mark.parametrize("format", ["rar15", "rar20", "rar29", "rar50"])
 def test_member_comments_honour_output_limits(format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_bytes(b"payload", "file")
     builder.set_member_comment("file", b"note")
     archive = rars.RarFile(builder.to_bytes())
@@ -75,7 +75,7 @@ def test_member_comments_honour_output_limits(format):
 
 
 def legacy_link(encrypt_headers):
-    builder = rars.RarBuilder(format="rar40", password="right", encrypt_headers=encrypt_headers)
+    builder = rars.RarBuilder(version="rar40", password="right", encrypt_headers=encrypt_headers)
     builder.add_bytes(b"target", "link", mtime=1_700_000_000, mode=0o120777)
     return builder.to_bytes()
 

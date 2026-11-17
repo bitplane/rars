@@ -8,7 +8,7 @@ from test_rewrite_legacy_comment_encryption import encrypted_comment_source
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("comment", [None, b"", b"archive comment\xff"])
 def test_comment_policies_keep_defaults_and_reset_budgets(format, comment):
-    builder = rars.RarBuilder(format=format, comment=comment)
+    builder = rars.RarBuilder(version=format, comment=comment)
     builder.add_bytes(b"payload", "file")
     archive = rars.RarFile(builder.to_bytes())
     assert archive.comment == comment

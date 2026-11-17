@@ -5,7 +5,7 @@ import rars
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 @pytest.mark.parametrize("store,solid,recovery", [(True, False, None), (False, False, None), (False, True, 10)])
 def test_writer_memory_preserves_output(format, store, solid, recovery):
-    options = dict(format=format, level=0 if store else 3, solid=solid, recovery_percent=recovery)
+    options = dict(version=format, level=0 if store else 3, solid=solid, recovery_percent=recovery)
     plain = rars.RarBuilder(**options)
     limited = rars.RarBuilder(**options, resources=rars.WriterResources(max_memory=256 << 20))
     for builder in (plain, limited):
@@ -18,7 +18,7 @@ def test_writer_memory_preserves_output(format, store, solid, recovery):
 
 
 def test_writer_memory_failure_preserves_destination(tmp_path):
-    builder = rars.RarBuilder(format="rar50", level=0, resources=rars.WriterResources(max_memory=1024))
+    builder = rars.RarBuilder(version="rar50", level=0, resources=rars.WriterResources(max_memory=1024))
     builder.add_bytes(b"payload" * 1024, "member")
     destination = tmp_path / "archive.rar"
     destination.write_bytes(b"original")
@@ -33,7 +33,7 @@ def test_writer_memory_failure_preserves_destination(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 def test_legacy_writer_refuses_memory_policy(format):
-    builder = rars.RarBuilder(format=format, level=0, resources=rars.WriterResources(max_memory=0))
+    builder = rars.RarBuilder(version=format, level=0, resources=rars.WriterResources(max_memory=0))
     builder.add_bytes(b"payload", "member")
     with pytest.raises(rars.UnsupportedRarFeature):
         builder.to_bytes()
@@ -41,7 +41,7 @@ def test_legacy_writer_refuses_memory_policy(format):
 
 @pytest.mark.parametrize("encrypt_headers", [False, True])
 def test_encrypted_recovery_and_volume_output_obey_memory_policy(tmp_path, encrypt_headers):
-    options = dict(format="rar50", level=0, password="secret",
+    options = dict(version="rar50", level=0, password="secret",
                    encrypt_headers=encrypt_headers, recovery_percent=10,
                    resources=rars.WriterResources(max_memory=32 << 20))
     builder = rars.RarBuilder(**options)

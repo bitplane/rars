@@ -11,7 +11,7 @@ FORMATS = ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("method", ["to_bytes", "write", "write_volumes"])
 def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, format, method):
-    builder = rars.RarBuilder(format=format, level=0,
+    builder = rars.RarBuilder(version=format, level=0,
                               volume_size=1000 if method == "write_volumes" else None)
     builder.add_bytes(b"payload" * 1000, "file")
     token = rars.CancellationToken()

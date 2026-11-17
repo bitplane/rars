@@ -9,7 +9,7 @@ FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
 
 
 def write_set(tmp_path, format, first):
-    builder = rars.RarBuilder(format=format, level=0, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(random.Random(22).randbytes(40_000), "large.bin")
     paths = builder.write_volumes(tmp_path / first)
     assert len(paths) > 3

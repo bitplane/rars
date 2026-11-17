@@ -17,7 +17,7 @@ STORED = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
 def test_legacy_volume_name_refusal_preserves_existing_parts(tmp_path):
     # Each volume carries about 70 bytes, so this needs more than the 901
     # names .rar and .r00 through .z99 allow.
-    builder = rars.RarBuilder(format="rar14", level=0, volume_size=150)
+    builder = rars.RarBuilder(version="rar14", level=0, volume_size=150)
     builder.add_bytes(bytes(range(256)) * 400, "payload.bin")
     first = tmp_path / "archive.rar"
     second = tmp_path / "archive.r00"
@@ -63,7 +63,7 @@ def test_builder_settings_after_format_are_keyword_only():
         rars.RarBuilder(compression=5)
     with pytest.raises(TypeError, match="filters"):
         rars.RarBuilder(filters=None)
-    builder = rars.RarBuilder(rars.RAR29, level=0)
+    builder = rars.RarBuilder(rars.ArchiveVersion.RAR29, level=0)
     builder.add_bytes(b"payload" * 64, "file.txt")
     archive = rars.RarFile(builder.to_bytes())
     assert archive.infolist()[0].compress_size == archive.infolist()[0].file_size
@@ -116,7 +116,7 @@ def test_writer_resources_keep_their_settings():
 
 
 def test_plain_builder_removal_and_decoded_missing_name():
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", b"caf\x82.txt")
     archive = rars.RarFile(
         builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="cp850")
@@ -194,7 +194,7 @@ def test_volume_extraction_directories_overwrite_and_open_failures(tmp_path):
 def test_volume_decoded_collisions_preserve_first_file(tmp_path):
     from test_rewrite_legacy_unicode import replace_first_name, unicode_wire
 
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"unicode", "first.txt")
     builder.add_bytes(b"legacy", b"caf\x82.txt")
     path = tmp_path / "source.rar"
@@ -272,7 +272,7 @@ def test_selected_file_skips_directory_and_empty_selection(tmp_path):
 
 
 def test_cancelled_volume_publication_preserves_old_destination(tmp_path):
-    builder = rars.RarBuilder(format="rar14", level=0, volume_size=512)
+    builder = rars.RarBuilder(version="rar14", level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     cancellation = rars.CancellationToken()
 
@@ -312,7 +312,7 @@ def test_reading_a_directory_or_link_says_which_it_is():
 def test_a_legacy_time_past_2106_converts_to_rar5():
     # Past RAR5's 32-bit seconds, so conversion has to use FILETIME.
     seconds = int(datetime(2107, 12, 31, 23, 59, 58).timestamp())
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", "future.txt", mtime=seconds)
     archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("future.txt").date_time == (2107, 12, 31, 23, 59, 58)
@@ -328,7 +328,7 @@ def test_conversion_refuses_legacy_special_types(host, attributes):
     import zlib
     from test_rewrite_legacy import headers
 
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", "special.txt")
     data = bytearray(builder.to_bytes())
     offset, _, _, size = next(h for h in headers(data) if h[1] == 0x74)
@@ -416,7 +416,7 @@ def test_conversion_refuses_payload_on_legacy_directory():
     import zlib
     from test_rewrite_legacy import headers
 
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", "directory")
     data = bytearray(builder.to_bytes())
     offset, _, flags, size = next(h for h in headers(data) if h[1] == 0x74)
@@ -431,7 +431,7 @@ def test_conversion_refuses_payload_on_legacy_directory():
 
 
 def test_selected_solid_file_skips_unselected_directory(tmp_path):
-    builder = rars.RarBuilder(format="rar29", solid=True)
+    builder = rars.RarBuilder(version="rar29", solid=True)
     builder.add_directory("unused")
     builder.add_bytes(b"payload", "selected")
     archive = rars.RarFile(builder.to_bytes())
@@ -515,7 +515,7 @@ def test_pathlike_errors_survive_binding_conversion(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar14", "rar50"])
 def test_volume_write_failure_names_an_oserror(tmp_path, format):
-    builder = rars.RarBuilder(format=format, level=0, volume_size=512)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     with pytest.raises(OSError):
         builder.write_volumes(tmp_path / "missing/archive.rar")
@@ -547,7 +547,7 @@ def test_custom_rar3_vm_programs_are_refused_unless_allowed():
 @pytest.mark.parametrize("first,second", [("archive.rar", "archive.r00"), ("archive.RAR", "archive.R00"), ("archive.Rar", "archive.R00")])
 def test_legacy_volume_names_follow_the_first_extension_case(tmp_path, first, second):
     # unrar looks for archive.R00 after archive.RAR on a case-sensitive filesystem.
-    builder = rars.RarBuilder(format="rar29", level=0, volume_size=512)
+    builder = rars.RarBuilder(version="rar29", level=0, volume_size=512)
     builder.add_bytes(b"payload" * 200, "file.txt")
     paths = builder.write_volumes(tmp_path / first)
     assert [Path(path).name for path in paths[:2]] == [first, second]

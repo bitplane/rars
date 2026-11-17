@@ -56,7 +56,7 @@ archive.testrar()
 first = archive.read(names[0])
 assert isinstance(first, bytes)
 
-builder = rars.RarBuilder(format="rar50", level=0)
+builder = rars.RarBuilder(version="rar50", level=0)
 builder.add_bytes(b"alpha", "alpha.txt")
 builder.add_bytes(b"beta", "nested/beta.txt")
 rebuilt = rars.RarFile(builder.to_bytes())

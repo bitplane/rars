@@ -2335,11 +2335,11 @@ fn map_builder_error(error: rars_rs::Error) -> PyErr {
 
 #[pymethods]
 impl RarBuilder {
-    /// Everything after `format` is keyword-only, so later releases can add
+    /// Everything after `version` is keyword-only, so later releases can add
     /// and regroup settings without breaking callers. `level=0` stores members uncompressed.
     #[new]
     #[pyo3(signature = (
-        format = "rar50",
+        version = "rar50",
         *,
         level = 3,
         solid = false,
@@ -2352,7 +2352,7 @@ impl RarBuilder {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        format: &str,
+        version: &str,
         level: u8,
         solid: bool,
         password: Option<&Bound<'_, PyAny>>,
@@ -2362,7 +2362,7 @@ impl RarBuilder {
         volume_size: Option<usize>,
         resources: Option<&WriterResources>,
     ) -> PyResult<Self> {
-        let format = parse_version(format)?;
+        let format = parse_version(version)?;
         Ok(Self {
             inner: rars_rs::Builder::new(format)
                 .compression_level(Some(level))
@@ -3336,11 +3336,6 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ProgressPhase",
     ] {
         m.add(name, enums.getattr(name)?)?;
-    }
-    // Kept as the module-level spellings of ArchiveVersion's members.
-    for member in enums.getattr("ArchiveVersion")?.try_iter()? {
-        let member = member?;
-        m.add(member.getattr("name")?.extract::<String>()?, member)?;
     }
     Ok(())
 }
@@ -4792,9 +4787,15 @@ fn family_member(py: Python<'_>, family: rars_rs::ArchiveFamily) -> PyResult<Bou
     enum_member(py, &ARCHIVE_FAMILY, "ArchiveFamily", value)
 }
 
+/// Exactly an `ArchiveVersion` value, so one version has one spelling.
 fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
     rars_rs::ArchiveVersion::from_name(value)
-        .ok_or_else(|| PyValueError::new_err(format!("unsupported RAR format: {value}")))
+        .filter(|version| version.as_str() == value)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown RAR version {value:?}; expected an ArchiveVersion such as \"rar50\""
+            ))
+        })
 }
 
 /// The member's stored relative path, and where it goes under `out_dir`.
@@ -5829,9 +5830,11 @@ mod tests {
     #[test]
     fn parses_python_version_names() {
         assert_eq!(
-            parse_version("rar5").unwrap(),
+            parse_version("rar50").unwrap(),
             rars_rs::ArchiveVersion::Rar50
         );
+        assert!(parse_version("rar5").is_err());
+        assert!(parse_version("RAR50").is_err());
         assert_eq!(
             parse_version("rar70").unwrap(),
             rars_rs::ArchiveVersion::Rar70

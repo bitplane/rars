@@ -60,7 +60,7 @@ def file_metadata(data):
 
 
 def source_bytes(format="rar40", **options):
-    builder = rars.RarBuilder(format=format, **options)
+    builder = rars.RarBuilder(version=format, **options)
     builder.add_bytes(b"payload" * 50, b"raw-\xff", mtime=MTIME, mode=0o100640)
     builder.add_bytes(b"second", "second")
     return builder.to_bytes()
@@ -122,7 +122,7 @@ def test_unsupported_legacy_metadata_is_rejected_before_destination_write(tmp_pa
 
 @pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
 def test_unrar_extracts_native_legacy_rewrite(tmp_path):
-    source = rars.RarBuilder(format="rar40", solid=True)
+    source = rars.RarBuilder(version="rar40", solid=True)
     source.add_bytes(b"first" * 100, "first", mtime=MTIME)
     source.add_bytes(b"second" * 100, "second", mtime=MTIME)
     builder = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
@@ -288,9 +288,9 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
 @pytest.mark.parametrize("format", ["rar20", "rar40"])
 @pytest.mark.parametrize("encrypted_first", [False, True])
 def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format, encrypted_first):
-    plain = rars.RarBuilder(format=format, level=0)
+    plain = rars.RarBuilder(version=format, level=0)
     plain.add_bytes(b"public", "plain")
-    encrypted = rars.RarBuilder(format=format, password="secret")
+    encrypted = rars.RarBuilder(version=format, password="secret")
     encrypted.add_bytes(b"private", "encrypted")
     first, second = (encrypted, plain) if encrypted_first else (plain, encrypted)
     second_bytes = second.to_bytes()

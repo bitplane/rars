@@ -9,7 +9,7 @@ PAYLOAD = random.Random(31).randbytes(30_000)
 
 
 def write_set(tmp_path, format):
-    builder = rars.RarBuilder(format=format, volume_size=8192)
+    builder = rars.RarBuilder(version=format, volume_size=8192)
     if format == "rar50":
         builder.add_bytes(b"head", "head.txt")
         builder.add_directory("dir")

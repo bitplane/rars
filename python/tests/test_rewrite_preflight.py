@@ -90,7 +90,7 @@ def test_trailing_bytes_or_missing_end_cannot_pass_preflight(suffix):
 
 
 def test_legacy_trailing_data_is_rejected():
-    builder = rars.RarBuilder(format="rar13", level=0)
+    builder = rars.RarBuilder(version="rar13", level=0)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes() + b"extra")
     assert any("trailing bytes" in issue for issue in source.rewrite_preservation_issues())
@@ -101,7 +101,7 @@ def test_legacy_trailing_data_is_rejected():
 def test_preflight_checks_on_disk_requirements_not_creator_version():
     # The RAR7 writer may emit fully RAR5-compatible headers. Its creating
     # release cannot be inferred from these bytes and is not a preservation promise.
-    compatible = rars.RarFile(archive_bytes(format="rar70"))
+    compatible = rars.RarFile(archive_bytes(version="rar70"))
     assert compatible.rewrite_preservation_issues() == []
     fixture = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/rar50/algorithm_version_2_stored.rar"
     future = rars.RarFile(fixture)
@@ -160,7 +160,7 @@ def test_file_comments_survive_edits_and_distinguish_empty_from_absent():
 
 @pytest.mark.parametrize("format", ["rar14", "rar15", "rar20", "rar29"])
 def test_conversion_retains_legacy_file_comments(format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_bytes(b"payload", "file")
     builder.set_member_comment("file", b"comment\xff")
     source = rars.RarFile(builder.to_bytes())
@@ -334,7 +334,7 @@ def test_rewrite_can_replace_its_source_after_reading(tmp_path):
 
 
 def test_legacy_default_rejection_explains_explicit_conversion(tmp_path):
-    builder = rars.RarBuilder(format="rar13", level=0)
+    builder = rars.RarBuilder(version="rar13", level=0)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes() + b"extra")
     destination = tmp_path / "existing.rar"

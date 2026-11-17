@@ -3,7 +3,7 @@ from collections.abc import Callable, Iterable, Iterator
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Final, Literal, Protocol, final
+from typing import IO, Literal, Protocol, final
 
 from typing_extensions import Buffer, Self, TypeAlias
 
@@ -39,15 +39,6 @@ __all__ = [
     "LimitExceeded",
     "UnsafeLinkWarning",
     "Cancelled",
-    "RAR13",
-    "RAR14",
-    "RAR15",
-    "RAR20",
-    "RAR29",
-    "RAR30",
-    "RAR40",
-    "RAR50",
-    "RAR70",
 ]
 
 class _BinaryReader(Protocol):
@@ -101,15 +92,6 @@ class ProgressPhase(str, Enum):
     RECOVERY = "recovery"
     WRITING = "writing"
 
-RAR13: Final = ArchiveVersion.RAR13
-RAR14: Final = ArchiveVersion.RAR14
-RAR15: Final = ArchiveVersion.RAR15
-RAR20: Final = ArchiveVersion.RAR20
-RAR29: Final = ArchiveVersion.RAR29
-RAR30: Final = ArchiveVersion.RAR30
-RAR40: Final = ArchiveVersion.RAR40
-RAR50: Final = ArchiveVersion.RAR50
-RAR70: Final = ArchiveVersion.RAR70
 
 class Error(Exception): ...
 
@@ -404,7 +386,7 @@ class RarFile:
 class RarBuilder:
     def __new__(
         cls,
-        format: ArchiveVersion | str = "rar50",
+        version: ArchiveVersion | str = "rar50",
         *,
         level: int = 3,
         solid: bool = False,

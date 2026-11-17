@@ -8,7 +8,7 @@ PAYLOAD = random.Random(5).randbytes(300_000)
 
 
 def single_archive():
-    builder = rars.RarBuilder(format="rar50", level=3)
+    builder = rars.RarBuilder(version="rar50", level=3)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     builder.add_directory("empty")
@@ -28,7 +28,7 @@ def test_extractall_reports_bytes_written_against_a_known_total(tmp_path):
 
 
 def write_set(tmp_path):
-    builder = rars.RarBuilder(format="rar50", level=0, volume_size=64 * 1024)
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=64 * 1024)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     tmp_path.mkdir(exist_ok=True)

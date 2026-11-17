@@ -44,7 +44,7 @@ def test_vintage_rar15_preservation(tmp_path, fixture):
 @pytest.mark.parametrize("solid", [False, True])
 @pytest.mark.parametrize("password", [None, "password"])
 def test_older_formats_keep_version_and_solid_directory_state(tmp_path, version, solid, password):
-    builder = rars.RarBuilder(format="rar15" if version == 15 else "rar20", solid=solid, password=password)
+    builder = rars.RarBuilder(version="rar15" if version == 15 else "rar20", solid=solid, password=password)
     builder.add_bytes(b"first " * 300, b"raw-\xff", mtime=DOS_TIME)
     builder.add_directory("empty", mtime=DOS_TIME)
     builder.add_bytes(b"first " * 300 + b"end", "last", mtime=DOS_TIME)

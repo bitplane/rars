@@ -12,7 +12,7 @@ PAYLOAD = random.Random(22).randbytes(40_000)
 
 
 def write_set(tmp_path, compressed, format="rar50"):
-    builder = rars.RarBuilder(format=format, level=3 if compressed else 0, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=3 if compressed else 0, volume_size=4096)
     builder.add_bytes(PAYLOAD, "large.bin")
     if format == "rar50":
         builder.add_bytes(b"small", "small.txt")
@@ -102,7 +102,7 @@ FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
 
 
 def write_named_set(tmp_path, format):
-    builder = rars.RarBuilder(format=format, level=0, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(PAYLOAD, "large.bin")
     first = "set.part01.rar" if format == "rar50" else "set.rar"
     (tmp_path / "made").mkdir()
@@ -202,7 +202,7 @@ def test_a_set_opened_from_bytes_points_at_volumes(tmp_path, format):
 
 def write_mixed_set(tmp_path, format="rar50", compressed=False, solid=False):
     builder = rars.RarBuilder(
-        format=format, level=3 if compressed else 0, solid=solid, volume_size=4096
+        version=format, level=3 if compressed else 0, solid=solid, volume_size=4096
     )
     if format == "rar50":
         builder.add_bytes(b"head", "head.txt")

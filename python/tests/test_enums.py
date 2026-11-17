@@ -28,9 +28,13 @@ def test_members_stand_in_for_the_strings_they_replace(member, value):
     assert type(member).__module__ == "rars"
 
 
-def test_module_constants_are_archive_versions():
+def test_builder_takes_exactly_the_version_values():
     for version in rars.ArchiveVersion:
-        assert getattr(rars, version.name) is version
+        rars.RarBuilder(version.value)
+        assert not hasattr(rars, version.name)
+    for spelling in ["RAR50", "rar5", "5", "rar_50"]:
+        with pytest.raises(ValueError, match="ArchiveVersion"):
+            rars.RarBuilder(spelling)
 
 
 def test_reads_report_enum_members():

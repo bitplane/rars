@@ -36,7 +36,7 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
 
 @pytest.mark.parametrize("solid", [False, True])
 def test_rar13_directories_between_solid_members_and_after_removal(tmp_path, solid):
-    builder = rars.RarBuilder(format="rar13", solid=solid, password="password")
+    builder = rars.RarBuilder(version="rar13", solid=solid, password="password")
     builder.add_bytes(b"data " * 500, b"raw-\xff", mtime=DOS_TIME)
     builder.add_directory("empty", mtime=DOS_TIME)
     builder.add_bytes(b"data " * 500 + b"end", "last", mtime=DOS_TIME)
@@ -52,7 +52,7 @@ def test_rar13_directories_between_solid_members_and_after_removal(tmp_path, sol
 
 @pytest.mark.parametrize("damage", ["main_flags", "file_flags", "extra", "version"])
 def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
-    builder = rars.RarBuilder(format="rar13", level=0)
+    builder = rars.RarBuilder(version="rar13", level=0)
     builder.add_bytes(b"data", "file")
     data = bytearray(builder.to_bytes())
     offset = struct.unpack_from("<H", data, 4)[0]
@@ -75,9 +75,9 @@ def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
 
 
 def test_rar13_mixed_encryption_keeps_plain_members_plain(tmp_path):
-    plain = rars.RarBuilder(format="rar13", level=0)
+    plain = rars.RarBuilder(version="rar13", level=0)
     plain.add_bytes(b"public", "plain")
-    encrypted = rars.RarBuilder(format="rar13", password="password")
+    encrypted = rars.RarBuilder(version="rar13", password="password")
     encrypted.add_bytes(b"private", "secret")
     data = encrypted.to_bytes()
     source = rars.RarFile(plain.to_bytes() + data[struct.unpack_from("<H", data, 4)[0]:], password="password")

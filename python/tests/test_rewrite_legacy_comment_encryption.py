@@ -12,7 +12,7 @@ from test_rewrite_older import check_unrar
 
 @pytest.mark.parametrize("encrypted_headers,file_comments", [(False, False), (True, False), (False, True)])
 def test_comments_survive_encrypted_headers_and_cmt_combinations(tmp_path, encrypted_headers, file_comments):
-    builder = rars.RarBuilder(format="rar40", password="password", encrypt_headers=encrypted_headers, comment=b"archive comment", solid=True)
+    builder = rars.RarBuilder(version="rar40", password="password", encrypt_headers=encrypted_headers, comment=b"archive comment", solid=True)
     builder.add_bytes(b"data " * 100, "file")
     builder.add_directory("directory")
     builder.add_bytes(b"data " * 100 + b"end", "last")
@@ -52,14 +52,14 @@ def test_comments_survive_encrypted_headers_and_cmt_combinations(tmp_path, encry
 
 
 def encrypted_comment_source():
-    comment = rars.RarBuilder(format="rar40", password="password")
+    comment = rars.RarBuilder(version="rar40", password="password")
     comment.add_bytes(b"secret archive comment", "CMT")
     data = bytearray(comment.to_bytes())
     offset, _, _, size = next(h for h in headers(data) if h[1] == 0x74)
     data[offset + 2] = 0x7a
     struct.pack_into("<I", data, offset + 28, 0)
     struct.pack_into("<H", data, offset, zlib.crc32(data[offset + 2:offset + size]) & 0xffff)
-    plain = rars.RarBuilder(format="rar40", level=0)
+    plain = rars.RarBuilder(version="rar40", level=0)
     plain.add_bytes(b"public", "plain")
     plain_data = plain.to_bytes()
     member = next(offset for offset, kind, _, _ in headers(plain_data) if kind == 0x74)
@@ -94,7 +94,7 @@ def test_encrypted_comment_failure_leaves_destination_intact(tmp_path, password)
 
 
 def test_embedded_file_comments_with_encrypted_headers_fail_before_writing(tmp_path):
-    builder = rars.RarBuilder(format="rar40", password="password", encrypt_headers=True)
+    builder = rars.RarBuilder(version="rar40", password="password", encrypt_headers=True)
     builder.add_bytes(b"data", "file")
     builder.set_member_comment("file", b"comment")
     path = tmp_path / "existing.rar"

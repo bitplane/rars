@@ -32,7 +32,7 @@ PEAK_RSS = textwrap.dedent("""
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
 @pytest.mark.parametrize("source", ["path", "file"])
 def test_open_and_extract_do_not_hold_the_archive_in_memory(tmp_path, format, source):
-    builder = rars.RarBuilder(format=format, level=0)
+    builder = rars.RarBuilder(version=format, level=0)
     for index in range(MEMBERS):
         builder.add_bytes(os.urandom(MEMBER_BYTES), f"member{index}")
     archive = tmp_path / "archive.rar"
@@ -49,7 +49,7 @@ def test_open_and_extract_do_not_hold_the_archive_in_memory(tmp_path, format, so
 
 
 def test_path_open_parses_cancellably(tmp_path):
-    builder = rars.RarBuilder(format="rar50", level=0)
+    builder = rars.RarBuilder(version="rar50", level=0)
     builder.add_bytes(b"payload", "member")
     archive = tmp_path / "archive.rar"
     builder.write(archive)
@@ -63,7 +63,7 @@ def test_path_open_parses_cancellably(tmp_path):
 @pytest.mark.parametrize("format", ["rar14", "rar29", "rar50"])
 @pytest.mark.parametrize("as_path", [False, True])
 def test_relative_path_survives_working_directory_change(tmp_path, monkeypatch, format, as_path):
-    builder = rars.RarBuilder(format=format, level=0)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add_bytes(b"payload", "member")
     builder.write(tmp_path / "archive.rar")
     monkeypatch.chdir(tmp_path)

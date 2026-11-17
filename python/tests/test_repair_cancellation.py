@@ -19,7 +19,7 @@ def test_cancelled_repair_does_not_read_input_or_touch_output(tmp_path, to_file,
 
 @pytest.mark.parametrize("format", ["rar20", "rar40", "rar50", "rar70"])
 def test_repair_token_is_reusable_and_path_publication_cleans_up(tmp_path, format):
-    builder = rars.RarBuilder(format=format, level=0, recovery_percent=10 if format in ("rar50", "rar70") else None)
+    builder = rars.RarBuilder(version=format, level=0, recovery_percent=10 if format in ("rar50", "rar70") else None)
     payload = b"recoverable payload " * 1000
     builder.add_bytes(payload, "file")
     original = builder.to_bytes()
@@ -50,7 +50,7 @@ def test_repair_token_is_reusable_and_path_publication_cleans_up(tmp_path, forma
 
 @pytest.mark.parametrize("to_file", [False, True])
 def test_repair_token_keeps_damaged_header_fallback_working(tmp_path, to_file):
-    builder = rars.RarBuilder(format="rar50", level=0, recovery_percent=10)
+    builder = rars.RarBuilder(version="rar50", level=0, recovery_percent=10)
     payload = b"recoverable payload " * 1000
     builder.add_bytes(payload, "file")
     damaged = bytearray(builder.to_bytes())
@@ -65,7 +65,7 @@ def test_repair_token_keeps_damaged_header_fallback_working(tmp_path, to_file):
 
 
 def test_repair_reads_with_the_options_given():
-    builder = rars.RarBuilder(format="rar50", level=0, recovery_percent=10)
+    builder = rars.RarBuilder(version="rar50", level=0, recovery_percent=10)
     builder.add_bytes(b"recoverable payload " * 1000, "file")
     with pytest.raises(rars.LimitExceeded):
         rars.repair(builder.to_bytes(), options=rars.ReadOptions(max_header_count=0))

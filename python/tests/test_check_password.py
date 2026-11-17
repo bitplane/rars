@@ -10,7 +10,7 @@ FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
 
 
 def encrypted(format, *, encrypt_headers=False):
-    builder = rars.RarBuilder(format=format, password="right", encrypt_headers=encrypt_headers)
+    builder = rars.RarBuilder(version=format, password="right", encrypt_headers=encrypt_headers)
     builder.add_bytes(b"secret payload " * 64, "file.txt")
     return builder.to_bytes()
 
@@ -109,7 +109,7 @@ def test_winrar_header_encryption_finds_the_correct_candidate(fixture, password)
 @pytest.mark.parametrize("encrypt_headers", [False, True])
 def test_a_later_volume_checks_the_same_as_the_first(tmp_path, encrypt_headers):
     builder = rars.RarBuilder(
-        format="rar50", level=0, volume_size=4096, password="right", encrypt_headers=encrypt_headers
+        version="rar50", level=0, volume_size=4096, password="right", encrypt_headers=encrypt_headers
     )
     builder.add_bytes(random.Random(6).randbytes(20_000), "large.bin")
     paths = builder.write_volumes(tmp_path / "set.part1.rar")
@@ -140,7 +140,7 @@ def test_a_later_rar4_volume_with_file_encryption_is_undetermined():
 
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
 def test_an_unencrypted_volume_needs_no_password(format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_bytes(b"open", "file.txt")
     check = rars.check_password(builder.to_bytes(), ["wrong", "right"])
     assert not check.needs_password

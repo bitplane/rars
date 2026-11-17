@@ -20,7 +20,7 @@ def test_extractall_restores_rar5_times_with_sub_second_precision(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar13", "rar15", "rar20", "rar29", "rar40", "rar50"])
 def test_extractall_restores_file_and_directory_times(tmp_path, format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_directory("dir", mtime=1_600_000_000)
     builder.add_bytes(b"payload", "dir/file.txt", mtime=1_650_000_000)
     archive = rars.RarFile(builder.to_bytes())
@@ -59,7 +59,7 @@ def test_extract_and_selected_members_restore_times(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar50", "rar29"])
 def test_volume_sets_restore_times(tmp_path, format):
-    builder = rars.RarBuilder(format=format, level=0, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()
     paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")

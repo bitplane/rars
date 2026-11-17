@@ -75,7 +75,7 @@ def test_rewrite_source_indices_survive_directory_and_file_edits():
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 @pytest.mark.parametrize("mode", [None, 0o750])
 def test_rewrite_retains_empty_directories_and_metadata(format, mode):
-    source = rars.RarBuilder(format=format, solid=True)
+    source = rars.RarBuilder(version=format, solid=True)
     source.add_directory("empty", mtime=1_700_000_002, mode=mode)
     source.add_directory("nested", mode=mode)
     source.add_bytes(b"payload", "nested/file")
@@ -138,7 +138,7 @@ def test_rewrite_converts_reference_unix_symlink_archive():
 
 @pytest.mark.parametrize("kind", [0o010000, 0o020000, 0o060000, 0o140000])
 def test_rewrite_rejects_unix_special_file_modes(kind):
-    source = rars.RarBuilder(format="rar29", level=0)
+    source = rars.RarBuilder(version="rar29", level=0)
     source.add_bytes(b"special payload", "special", mode=kind | 0o644)
     archive = rars.RarFile(source.to_bytes())
     assert archive.read("special") == b"special payload"
@@ -268,7 +268,7 @@ def test_reference_reader_recognizes_emitted_unix_symlink(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
 def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
-    source = rars.RarBuilder(format=format, level=0)
+    source = rars.RarBuilder(version=format, level=0)
     source.add_bytes(b"missing-\xff", b"link-\xff", mode=0o120750)
     source.add_bytes(b"payload", b"file-\xff", mode=0o100640)
     archive = rars.RarFile(source.to_bytes())
@@ -283,7 +283,7 @@ def test_legacy_unix_link_targets_are_converted_without_utf8_loss(format):
 
 @pytest.mark.parametrize("target", [b"", b"invalid\0target"])
 def test_invalid_legacy_link_targets_are_rejected(target):
-    source = rars.RarBuilder(format="rar29", level=0)
+    source = rars.RarBuilder(version="rar29", level=0)
     source.add_bytes(target, "link", mode=0o120777)
     with pytest.raises(ValueError, match="link target"):
         rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()), preserve=False)

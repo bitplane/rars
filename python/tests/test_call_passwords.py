@@ -10,7 +10,7 @@ ENCRYPTED = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/ra
 
 
 def encrypted(format, compressed=True):
-    builder = rars.RarBuilder(format=format, level=3 if compressed else 0, password="right")
+    builder = rars.RarBuilder(version=format, level=3 if compressed else 0, password="right")
     builder.add_bytes(PAYLOAD, "file")
     return builder.to_bytes()
 
@@ -56,7 +56,7 @@ def test_a_call_password_opens_an_archive_opened_without_one(tmp_path, format):
 
 
 def test_a_call_password_wins_in_later_volumes(tmp_path):
-    builder = rars.RarBuilder(format="rar50", level=0, volume_size=4096, password="right")
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=4096, password="right")
     builder.add_bytes(bytes(range(256)) * 64, "large.bin")
     paths = builder.write_volumes(tmp_path / "set.part01.rar")
     archive = rars.RarFile(paths[0], password="right")

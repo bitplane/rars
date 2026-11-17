@@ -3,7 +3,7 @@ import rars
 
 
 def legacy_archive():
-    builder = rars.RarBuilder(format="rar29", level=0)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", b"caf\x82.txt")
     return builder.to_bytes()
 
@@ -71,7 +71,7 @@ def test_options_override_those_a_rarfile_was_opened_with():
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
 @pytest.mark.parametrize("where", ["archive", "member"])
 def test_limits_apply_to_comments_read_from_the_source(format, where):
-    builder = rars.RarBuilder(format=format, comment=b"long comment" if where == "archive" else None)
+    builder = rars.RarBuilder(version=format, comment=b"long comment" if where == "archive" else None)
     builder.add_bytes(b"x", "x")
     if where == "member":
         builder.set_member_comment("x", b"long comment")

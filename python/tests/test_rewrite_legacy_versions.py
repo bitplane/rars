@@ -13,7 +13,7 @@ def times(info):
 
 
 def versioned_file(version, name, password=None):
-    builder = rars.RarBuilder(format={15: "rar15", 20: "rar20", 26: "rar20", 29: "rar29"}[version], password=password)
+    builder = rars.RarBuilder(version={15: "rar15", 20: "rar20", 26: "rar20", 29: "rar29"}[version], password=password)
     builder.add_bytes(name.encode() * 100, name, mtime=DOS_TIME)
     data = bytearray(builder.to_bytes())
     if version == 26:
@@ -46,7 +46,7 @@ def test_mixed_unpackers_keep_archive_requirement_even_after_removing_newer_memb
 
 
 def test_rar15_dos_directory_without_later_directory_marker(tmp_path):
-    builder = rars.RarBuilder(format="rar15")
+    builder = rars.RarBuilder(version="rar15")
     builder.add_bytes(b"first" * 100, "first", mtime=DOS_TIME)
     builder.add_directory("directory", mtime=DOS_TIME)
     builder.add_bytes(b"last" * 100, "last", mtime=DOS_TIME)
