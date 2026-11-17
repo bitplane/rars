@@ -60,3 +60,26 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     with pytest.raises(ValueError, match="different archive"):
         other.read_many([first])
     assert not (tmp_path / "foreign").exists()
+
+
+def test_membership_length_and_member_equality():
+    builder = rars.RarBuilder(store=True)
+    builder.add_bytes(b"a", "a.txt")
+    builder.add_bytes(b"b", "b.txt")
+    data = builder.to_bytes()
+    archive = rars.RarFile(data)
+    assert len(archive) == 2
+    assert "a.txt" in archive
+    assert b"b.txt" in archive
+    assert "missing" not in archive
+    info = archive.getinfo("a.txt")
+    assert info in archive
+    assert info == archive.getinfo("a.txt")
+    assert info in archive.infolist()
+    assert hash(info) == hash(archive.getinfo("a.txt"))
+    assert info != archive.getinfo("b.txt")
+    assert len({info, archive.getinfo("a.txt"), archive.getinfo("b.txt")}) == 2
+    other = rars.RarFile(data)
+    assert info not in other
+    assert info != other.getinfo("a.txt")
+    assert info != "a.txt"

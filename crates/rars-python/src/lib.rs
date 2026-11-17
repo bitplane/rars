@@ -861,6 +861,26 @@ impl RarInfo {
         self.volume + 1
     }
 
+    /// The same member of the same opened archive, however many times it was looked up.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.member_index == other.member_index
+            && match (&self.archive_identity, &other.archive_identity) {
+                (Some(this), Some(that)) => Arc::ptr_eq(this, that),
+                _ => false,
+            }
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.archive_identity
+            .as_ref()
+            .map(Arc::as_ptr)
+            .hash(&mut hasher);
+        self.member_index.hash(&mut hasher);
+        hasher.finish()
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "RarInfo(filename={:?}, file_size={}, compress_size={})",
@@ -1534,6 +1554,27 @@ impl RarFile {
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let list = PyList::new(py, self.listing(py)?.infos.clone())?;
         Ok(list.call_method0("__iter__")?.unbind())
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        Ok(self.listing(py)?.infos.len())
+    }
+
+    /// Takes what `getinfo` takes; a `RarInfo` from another archive is not in this one.
+    fn __contains__(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<bool> {
+        if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
+            return Ok(info
+                .archive_identity
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.identity)));
+        }
+        match self.resolve_index(py, member) {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_instance_of::<PyKeyError>(py) => Ok(false),
+            // Two members decode to this name.
+            Err(error) if error.is_instance_of::<PyValueError>(py) => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 }
 
