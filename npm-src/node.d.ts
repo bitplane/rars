@@ -21,6 +21,8 @@ export class RarArchive {
   readonly isFirstVolume?: boolean;
   /** How the set names its volume files. */
   readonly volumeNaming: "part" | "old";
+  /** The files opened, when opened from paths: a first volume's path brings the later ones found beside it. */
+  readonly volumePaths?: readonly string[];
   readonly comment?: Uint8Array;
   get(name: RarName): import("./base.js").RarEntry | undefined;
   getAll(name: RarName): readonly import("./base.js").RarEntry[];

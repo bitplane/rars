@@ -82,6 +82,30 @@ function metadata(archive, password, options) {
   };
 }
 
+// A set opened from its first volume's path finds the later ones by the names the core
+// gives them, as Python and the CLI do, and stops at the first that isn't there.
+async function discoverVolumes(wasm, source, password, platform, options) {
+  const first = new wasm.RarFile(await platform.readFile(source.path), password, options);
+  try {
+    // Undefined when the headers can't tell, as in RAR 1.3 to 2.0 sets.
+    if (!first.isVolume || first.isFirstVolume === false) return [source];
+    const found = [source];
+    const seen = new Set([source.path]);
+    const name = platform.baseName(source.path);
+    for (let index = 1; ; index++) {
+      const next = first.volumeName(name, index);
+      if (next === undefined) break;
+      const file = platform.sibling(source.path, next);
+      if (seen.has(file) || !(await platform.isFile(file))) break;
+      seen.add(file);
+      found.push({ kind: "path", path: file });
+    }
+    return found;
+  } finally {
+    first.free();
+  }
+}
+
 async function openArchive(wasm, sources, password, platform, options) {
   const volumes = [];
   for (const source of sources) volumes.push(await sourceBytes(source, platform));
@@ -153,10 +177,15 @@ export function startWorker(port, wasm, platform) {
       let result;
       if (operation === "open" || operation === "read" || operation === "readMany"
           || operation === "test" || operation === "readComment" || operation === "readMemberComment") {
+        if (operation === "open" && payload.sources.length === 1 && payload.sources[0]?.kind === "path") {
+          payload.sources = await discoverVolumes(wasm, payload.sources[0], payload.password, platform, payload.readOptions);
+        }
         const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
         try {
           switch (operation) {
-            case "open": result = metadata(archive, payload.password, payload.readOptions); break;
+            case "open":
+              result = { ...metadata(archive, payload.password, payload.readOptions), sources: payload.sources };
+              break;
             case "read": result = archive.readAt(payload.index, payload.password, payload.readOptions); break;
             case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions); break;
             case "test": archive.test(payload.password, payload.readOptions); break;

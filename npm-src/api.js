@@ -110,13 +110,17 @@ export function createApi(runtime) {
         readOptions: readOptions(operation),
         password: operation.password,
       }, operation);
-      return new RarArchive(sources, operation.password, result, readOptions(operation));
+      // A path to a set's first volume comes back with the later volumes found beside it.
+      return new RarArchive(result.sources ?? sources, operation.password, result, readOptions(operation));
     }
 
     constructor(sources, password, metadata, defaults) {
       this._defaults = defaults;
       this._legacyNameEncoding = defaults.legacyNameEncoding;
       this._sources = sources;
+      if (sources.every((source) => source?.kind === "path")) {
+        this.volumePaths = Object.freeze(sources.map((source) => source.path));
+      }
       this._password = password;
       this._closed = false;
       this.family = metadata.family;

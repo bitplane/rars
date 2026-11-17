@@ -303,6 +303,18 @@ await check("Node path input and atomic file output work", async () => {
     assert.deepEqual(await split.writeTo(path.join(directory, "split.rar"), { overwrite: true }), paths);
     const volumeArchive = await RarArchive.open(paths[0]);
     assert.equal((await volumeArchive.entries[0].bytes()).length, 180000);
+    // The later volumes are found by the names the core gives them.
+    assert.deepEqual(volumeArchive.volumePaths, paths);
+    const later = await RarArchive.open(paths[1]);
+    assert.deepEqual(later.volumePaths, [paths[1]]);
+    later.close();
+    const legacy = await new RarWriter({ version: "rar29", level: 0, volumeSize: 64 * 1024 })
+      .add("large.bin", new Uint8Array(180000).fill(9)).writeTo(path.join(directory, "old.rar"));
+    assert.deepEqual(legacy.map((file) => path.basename(file)), ["old.rar", "old.r00", "old.r01"]);
+    const legacyArchive = await RarArchive.open(legacy[0]);
+    assert.deepEqual(legacyArchive.volumePaths, legacy);
+    assert.equal((await legacyArchive.entries[0].bytes()).length, 180000);
+    assert.equal(await isRarFile(paths[0]), true);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

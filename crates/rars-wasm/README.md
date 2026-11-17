@@ -35,8 +35,9 @@ sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
 `volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
 `entry.readComment()` returns the comment attached to an entry, or undefined.
 
-Node also accepts paths and file URLs. Passing the first path of a conventional
-volume set discovers its siblings automatically.
+Node also accepts paths and file URLs. Opening the first volume of a set by path
+finds the later volumes beside it, by the names RAR gives them, and stops at the
+first that isn't there; `archive.volumePaths` lists the files it opened.
 
 For legacy byte names, pass `legacyNameEncoding: "cp850"` to `open()`.
 Supported encodings are `cp437`, `cp850`, `cp852`, `cp866`, `windows-1251`,

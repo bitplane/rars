@@ -55,6 +55,36 @@ pub fn check_password(
     Ok(result.into())
 }
 
+/// The file names of a `total`-volume set written as `version`, derived from the first
+/// volume's name as RAR derives them.
+#[wasm_bindgen(js_name = volumeNames)]
+pub fn volume_names(first_name: &str, total: usize, version: &str) -> Result<Vec<String>, JsValue> {
+    let version = parse_format(version)?;
+    let first = std::path::Path::new(first_name);
+    let part = matches!(version, ArchiveVersion::Rar50 | ArchiveVersion::Rar70);
+    let width = total.to_string().len().max(2);
+    (0..total)
+        .map(|index| {
+            let name = if part {
+                rars_rs::volume_name::part_style(first, index, width)
+            } else {
+                rars_rs::volume_name::old_style(first, index)
+            };
+            name.map(|name| name.to_string_lossy().into_owned())
+                .ok_or_else(|| {
+                    binding_error(
+                        "INVALID_OPTION",
+                        if part {
+                            "volume output needs a file name"
+                        } else {
+                            "old-style volume names run out after .z99"
+                        },
+                    )
+                })
+        })
+        .collect()
+}
+
 /// Whether `prefix` starts with a RAR signature.
 #[wasm_bindgen(js_name = isRarFile)]
 pub fn is_rar_file(prefix: &[u8]) -> bool {
@@ -671,6 +701,15 @@ impl RarFile {
     #[wasm_bindgen(getter, js_name = needsPassword)]
     pub fn needs_password(&self) -> bool {
         self.infos.iter().any(|info| info.encrypted)
+    }
+
+    /// Volume `index` of the set this first volume begins, named as RAR names it from
+    /// `first_name`; undefined when the name can't take one.
+    #[wasm_bindgen(js_name = volumeName)]
+    pub fn volume_name(&self, first_name: &str, index: usize) -> Option<String> {
+        self.archives[0]
+            .volume_path(std::path::Path::new(first_name), index)
+            .map(|name| name.to_string_lossy().into_owned())
     }
 
     /// Whether the (first) archive opened is one volume of a set.

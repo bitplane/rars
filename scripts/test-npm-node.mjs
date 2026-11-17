@@ -5,9 +5,11 @@ import { spawnSync } from "node:child_process";
 import { mkdtemp, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const sources = new URL("../npm-src/", import.meta.url);
+// The built engine, whose volume naming the stub below forwards to.
+const builtWasm = new URL("../npm/node/wasm/rars_wasm.js", import.meta.url);
 const temporary = await mkdtemp(path.join(os.tmpdir(), "rars-node-adapters-"));
 
 async function stageNodeAdapter(directory, worker) {
@@ -59,6 +61,8 @@ try {
   // The stub supplies one distinct byte per volume. Only the codec is replaced:
   // the public API, worker engine, path planning and writes are production code.
   await writeFile(path.join(node, "wasm", "rars_wasm.js"), `
+    // Volume names come from the core, through the built engine.
+    exports.volumeNames = require(${JSON.stringify(fileURLToPath(builtWasm))}).volumeNames;
     exports.RarBuilder = class {
       constructor(options) { this.total = options.volumeSize; }
       addBytes() {}
