@@ -325,6 +325,7 @@ pub struct RarInfo {
     split_before: bool,
     split_after: bool,
     volume_index: usize,
+    link: bool,
 }
 
 #[wasm_bindgen]
@@ -432,6 +433,12 @@ impl RarInfo {
     #[wasm_bindgen(getter, js_name = volumeIndex)]
     pub fn volume_index(&self) -> usize {
         self.volume_index
+    }
+
+    /// Whether the member is a link, whose target `readLink` reads.
+    #[wasm_bindgen(getter, js_name = isLink)]
+    pub fn is_link(&self) -> bool {
+        self.link
     }
 }
 
@@ -726,6 +733,53 @@ impl RarFile {
                 read_options(password.as_deref(), &settings)?,
             )
             .map_err(js_error)
+    }
+
+    /// The raw target of the link at `index`; it is read from the headers and never followed.
+    #[wasm_bindgen(js_name = readLink)]
+    pub fn read_link(
+        &self,
+        index: usize,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<Vec<u8>, JsValue> {
+        let &(volume, index_in_volume) = self.places.get(index).ok_or_else(|| {
+            binding_error(
+                "ENTRY_NOT_FOUND",
+                &format!("no such archive entry index: {index}"),
+            )
+        })?;
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        let options = read_options(password.as_deref(), &settings)?;
+        let archive = &self.archives[volume];
+        let member = archive
+            .members()
+            .nth(index_in_volume)
+            .ok_or_else(|| binding_error("ENTRY_NOT_FOUND", "no such archive entry"))?;
+        if member.is_legacy_unix_symlink() {
+            return archive
+                .legacy_symlink_target_at_with_options(index_in_volume, options)
+                .map_err(js_error)?
+                .ok_or_else(|| binding_error("INVALID_ARCHIVE", "link has no target"));
+        }
+        if !member.meta.is_redirection {
+            return Err(binding_error(
+                "INVALID_OPTION",
+                &format!(
+                    "{} is not a link",
+                    String::from_utf8_lossy(&member.meta.name)
+                ),
+            ));
+        }
+        member
+            .supported_redirection()
+            .map(|link| link.target_name.clone())
+            .ok_or_else(|| {
+                binding_error(
+                    "UNSUPPORTED_FEATURE",
+                    "member is a kind of link rars cannot read",
+                )
+            })
     }
 
     /// Whether any member is encrypted.
@@ -1074,6 +1128,7 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         modified: member.meta.modification_time(),
         ..Default::default()
     });
+    let link = member.meta.is_redirection || member.is_legacy_unix_symlink();
     let seconds = |time: Option<rars_rs::Timestamp>| {
         time.map(|time| time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9)
     };
@@ -1095,6 +1150,7 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         split_before: member.meta.is_split_before,
         split_after: member.meta.is_split_after,
         volume_index: 0,
+        link,
     }
 }
 
@@ -1145,14 +1201,13 @@ extern "C" {
 }
 
 impl RarBuilder {
-    /// Queues one member with its `mtime`, `mode` and `comment` options.
+    /// Queues one member with its `mtime`, `mode`, `atime`, `birthtime` and `comment` options.
     fn add_entry(
         &mut self,
         name: Vec<u8>,
         data: Vec<u8>,
         options: &JsValue,
     ) -> Result<(), JsValue> {
-        let comment = opt_bytes(options, "comment")?;
         self.inner
             .add_bytes(
                 name,
@@ -1161,10 +1216,31 @@ impl RarBuilder {
                 opt_number(options, "mode")?.map(|n| n as u32),
             )
             .map_err(js_error)?;
+        self.finish_entry(options)
+    }
+
+    /// The options every kind of member takes once it is queued: its comment, and access and
+    /// creation times, which only RAR 5 keeps.
+    fn finish_entry(&mut self, options: &JsValue) -> Result<(), JsValue> {
+        let id = self.inner.member_ids().last().expect("member just added");
+        let comment = opt_bytes(options, "comment")?;
         if comment.is_some() {
-            let id = self.inner.member_ids().last().expect("member just added");
             self.inner
                 .set_file_comment_by_id(id, comment)
+                .map_err(js_error)?;
+        }
+        let accessed = opt_timestamp(options, "atime")?;
+        let created = opt_timestamp(options, "birthtime")?;
+        if accessed.is_some() || created.is_some() {
+            self.inner
+                .set_times_by_id(
+                    id,
+                    rars_rs::FileTimes {
+                        modified: None,
+                        created,
+                        accessed,
+                    },
+                )
                 .map_err(js_error)?;
         }
         Ok(())
@@ -1244,6 +1320,45 @@ impl RarBuilder {
             None => JsValue::UNDEFINED,
         };
         self.add_entry(name, data, &options)
+    }
+
+    /// Queue an explicit, possibly empty directory.
+    #[wasm_bindgen(js_name = addDirectory)]
+    pub fn add_directory(
+        &mut self,
+        name: Vec<u8>,
+        options: Option<RarEntryOptions>,
+    ) -> Result<(), JsValue> {
+        let options: JsValue = options.map_or(JsValue::UNDEFINED, Into::into);
+        self.inner
+            .add_directory(
+                name,
+                opt_timestamp(&options, "mtime")?,
+                opt_number(&options, "mode")?.map(|n| n as u32),
+            )
+            .map_err(js_error)?;
+        self.finish_entry(&options)
+    }
+
+    /// Queue a Unix symbolic link to `target`, which is stored as given and never followed.
+    #[wasm_bindgen(js_name = addSymlink)]
+    pub fn add_symlink(
+        &mut self,
+        name: Vec<u8>,
+        target: Vec<u8>,
+        options: Option<RarEntryOptions>,
+    ) -> Result<(), JsValue> {
+        let options: JsValue = options.map_or(JsValue::UNDEFINED, Into::into);
+        self.inner
+            .add_unix_symlink(
+                name,
+                target,
+                opt_bool(&options, "targetIsDirectory")?,
+                opt_timestamp(&options, "mtime")?,
+                opt_number(&options, "mode")?.map(|n| n as u32),
+            )
+            .map_err(js_error)?;
+        self.finish_entry(&options)
     }
 
     /// Drop the member called `name`.

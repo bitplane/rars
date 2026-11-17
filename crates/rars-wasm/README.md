@@ -34,6 +34,8 @@ volume the entry starts in, counting the first as 0. The archive says where it
 sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
 `volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
 `entry.readComment()` returns the comment attached to an entry, or undefined.
+`entry.isLink` says whether it is a link, and `entry.readLink()` returns its raw
+target from the headers without following it.
 
 Node also accepts paths and file URLs. Opening the first volume of a set by path
 finds the later volumes beside it, by the names RAR gives them, and stops at the
@@ -124,7 +126,9 @@ const split = new RarWriter({ volumeSize: 5 * 1024 * 1024 }).add("big.bin", payl
 const parts = await split.volumes();
 ```
 
-`add()` takes `mode`, `mtime` and a `comment` for the member. `level` runs
+`add()` takes `mode`, `mtime` and a `comment` for the member, and for RAR 5
+`atime` and `birthtime`. `addDirectory(name)` queues an explicit directory and
+`addSymlink(name, target)` a Unix symbolic link, stored as given. `level` runs
 from 0 (stored) to 5. Other writer options are `solid`, `password`,
 `encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
 `volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node

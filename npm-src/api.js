@@ -96,6 +96,18 @@ export function createApi(runtime) {
       return written;
     }
 
+    /** The raw target of this link, read from the headers and never followed; Python's readlink(). */
+    async readLink(options) {
+      assertOpen(this._archive);
+      if (!this.isLink) throw new RarError("INVALID_OPTION", `${this.name} is not a link`);
+      const operation = operationOptions(options);
+      return this._archive._request("readLink", {
+        index: this.index,
+        readOptions: this._archive._readOptions(operation),
+        password: operation.password ?? this._archive._password,
+      }, operation);
+    }
+
     /** The comment attached to this entry, or undefined; Python's member_comment(). */
     async readComment(options) {
       assertOpen(this._archive);
@@ -360,11 +372,15 @@ export function createApi(runtime) {
     if (options == null || typeof options !== "object") {
       throw new TypeError("entry options must be an object");
     }
-    // As fs.utimes takes it: a Date, or a number of Unix seconds.
-    const mtime = options.mtime instanceof Date ? options.mtime.valueOf() / 1000 : options.mtime;
-    if (mtime !== undefined && (typeof mtime !== "number" || !Number.isFinite(mtime))) {
-      throw new TypeError("mtime must be a valid Date or a number of Unix seconds");
-    }
+    // As fs.utimes takes them: a Date, or a number of Unix seconds.
+    const seconds = (key) => {
+      const value = options[key] instanceof Date ? options[key].valueOf() / 1000 : options[key];
+      if (value !== undefined && (typeof value !== "number" || !Number.isFinite(value))) {
+        throw new TypeError(`${key} must be a valid Date or a number of Unix seconds`);
+      }
+      return value;
+    };
+    const mtime = seconds("mtime");
     if (options.mode !== undefined &&
         (!Number.isSafeInteger(options.mode) || options.mode < 0)) {
       throw new TypeError("mode must be a non-negative safe integer");
@@ -373,10 +389,17 @@ export function createApi(runtime) {
         && !(options.comment instanceof Uint8Array)) {
       throw new TypeError("comment must be a string or Uint8Array");
     }
+    if (options.targetIsDirectory !== undefined && typeof options.targetIsDirectory !== "boolean") {
+      throw new TypeError("targetIsDirectory must be a boolean");
+    }
+    // Access and creation times are kept by RAR 5 only; older versions refuse them.
     return {
       mtime,
+      atime: seconds("atime"),
+      birthtime: seconds("birthtime"),
       mode: options.mode,
       comment: options.comment,
+      targetIsDirectory: options.targetIsDirectory,
     };
   }
 
@@ -389,15 +412,37 @@ export function createApi(runtime) {
 
     add(name, data, options) {
       assertOpen(this);
-      const checkedName = validateName(name);
-      if (this._entries.some((entry) => sameName(entry.name, checkedName))) {
-        throw new RarError("DUPLICATE_ENTRY", "duplicate archive entry name");
-      }
-      this._entries.push({
-        name: checkedName,
+      return this.#queue({
+        name: validateName(name),
         data: runtime.prepareEntryData(data),
         options: validateEntryOptions(options),
       });
+    }
+
+    /** Queues an explicit, possibly empty directory. */
+    addDirectory(name, options) {
+      assertOpen(this);
+      return this.#queue({ name: validateName(name), kind: "directory", options: validateEntryOptions(options) });
+    }
+
+    /** Queues a Unix symbolic link to `target`, stored as given and never followed. */
+    addSymlink(name, target, options) {
+      assertOpen(this);
+      if (!((typeof target === "string" || target instanceof Uint8Array) && target.length > 0)) {
+        throw new TypeError("link target must be a non-empty string or Uint8Array");
+      }
+      return this.#queue({
+        name: validateName(name), kind: "symlink",
+        target: typeof target === "string" ? target : Uint8Array.from(target),
+        options: validateEntryOptions(options),
+      });
+    }
+
+    #queue(entry) {
+      if (this._entries.some((queued) => sameName(queued.name, entry.name))) {
+        throw new RarError("DUPLICATE_ENTRY", "duplicate archive entry name");
+      }
+      this._entries.push(entry);
       return this;
     }
 

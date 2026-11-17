@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "checkPassword" | "extract" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
+  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "readLink" | "checkPassword" | "extract" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
   /** Python's ProgressPhase names, plus "repairing". */
   phase: "reading" | "extracting" | "testing" | "compressing" | "protecting" | "writing" | "repairing";
   /**
@@ -81,6 +81,9 @@ export interface RarEntryOptions {
   mtime?: Date | number;
   /** A comment attached to this member. */
   comment?: string | Uint8Array;
+  /** Access and creation times, as `mtime` takes them; only RAR 5 keeps them. */
+  atime?: Date | number;
+  birthtime?: Date | number;
   mode?: number;
 }
 
@@ -120,9 +123,13 @@ export class RarEntry {
   readonly isSplitAfter: boolean;
   /** The volume the entry starts in, counting the first as 0. */
   readonly volumeIndex: number;
+  /** Whether the entry is a link, whose target `readLink()` reads. */
+  readonly isLink: boolean;
   bytes(options?: ReadOptions): Promise<Uint8Array>;
   /** The comment attached to this entry, or undefined. */
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
+  /** The raw target of this link, read from the headers and never followed. */
+  readLink(options?: ReadOptions): Promise<Uint8Array>;
   /** Node only: extracts this entry under `directory`, as `archive.extractAll()` does, and returns the path written. */
   extract(directory: string | URL, options?: ReadOptions & { overwrite?: boolean | "rename"; flatten?: boolean; restoreTimes?: boolean }): Promise<string>;
 }
@@ -156,6 +163,10 @@ export class RarWriter {
   constructor(options?: RarWriterOptions);
   readonly names: readonly RarName[];
   add(name: RarName, data: RarData, options?: RarEntryOptions): this;
+  /** An explicit, possibly empty directory. */
+  addDirectory(name: RarName, options?: RarEntryOptions): this;
+  /** A Unix symbolic link to `target`, stored as given and never followed. */
+  addSymlink(name: RarName, target: string | Uint8Array, options?: RarEntryOptions & { targetIsDirectory?: boolean }): this;
   remove(name: RarName): this;
   rename(from: RarName, to: RarName): this;
   bytes(options?: OperationOptions): Promise<Uint8Array>;
