@@ -54,6 +54,10 @@ export class RarWriter {
   readonly names: readonly RarName[];
   add(name: RarName, data: RarData, options?: RarEntryOptions): this;
   addFile(name: RarName, path: NodePath, options?: RarEntryOptions): this;
+  /** An explicit, possibly empty directory. */
+  addDirectory(name: RarName, options?: RarEntryOptions): this;
+  /** A Unix symbolic link to `target`, stored as given and never followed. */
+  addSymlink(name: RarName, target: string | Uint8Array, options?: RarEntryOptions & { targetIsDirectory?: boolean }): this;
   remove(name: RarName): this;
   rename(from: RarName, to: RarName): this;
   bytes(options?: OperationOptions): Promise<Uint8Array>;

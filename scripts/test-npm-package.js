@@ -241,6 +241,38 @@ await check("Node extracts entries once verified, refusing to overwrite by defau
   }
 });
 
+await check("directories, links and every time round-trip", async () => {
+  const mtime = new Date("2024-01-02T03:04:06Z");
+  const atime = new Date("2024-02-03T04:05:06Z");
+  const birthtime = new Date("2023-12-01T00:00:00Z");
+  for (const format of ["rar29", "rar50"]) {
+    const modern = format === "rar50";
+    const writer = new RarWriter({ version: format, level: 0 })
+      .addDirectory("empty", { mtime })
+      .add("file.txt", HELLO, modern ? { mtime, atime, birthtime } : { mtime })
+      .addSymlink("link", "file.txt");
+    const archive = await RarArchive.open(await writer.bytes());
+    const empty = archive.get("empty");
+    assert.equal(empty.isDirectory, true, format);
+    assert.equal(empty.mtime.valueOf(), mtime.valueOf(), format);
+    const link = archive.get("link");
+    assert.equal(link.isLink, true, format);
+    assert.equal(decode(await link.readLink()), "file.txt", format);
+    const file = archive.get("file.txt");
+    assert.equal(file.isLink, false);
+    await assert.rejects(file.readLink(), (error) => error.code === "INVALID_OPTION");
+    if (modern) {
+      assert.equal(file.atime.valueOf(), atime.valueOf());
+      assert.equal(file.birthtime.valueOf(), birthtime.valueOf());
+    }
+    archive.close();
+  }
+  await assert.rejects(new RarWriter({ version: "rar29" }).add("a", "a", { atime: 1 }).bytes(),
+    (error) => error instanceof RarError);
+  assert.throws(() => new RarWriter().addSymlink("link", ""), TypeError);
+  assert.throws(() => new RarWriter().addDirectory("a").addDirectory("a"), (error) => error.code === "DUPLICATE_ENTRY");
+});
+
 await check("member comments round-trip", async () => {
   for (const format of ["rar15", "rar29", "rar50"]) {
     const bytes = await new RarWriter({ version: format, level: 0 })
