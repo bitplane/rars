@@ -74,6 +74,236 @@ fn decode_before_scalar(input: &[u8], end: usize) -> (u32, usize) {
     (delta, end - start)
 }
 
+/// What a candidate must hold to beat the best length so far.
+struct Probe {
+    /// Where the four bytes compared start, from the candidate.
+    offset: usize,
+    /// The position's own bytes there.
+    wanted: u32,
+    /// Which of them count.
+    mask: u32,
+}
+
+impl Probe {
+    #[inline(always)]
+    fn new(input: &[u8], pos: usize, longest: usize) -> Self {
+        let offset = longest.saturating_sub(3);
+        let counted = (longest + 1).min(4) as u32;
+        Self {
+            offset,
+            wanted: u32::from_le_bytes(input[pos + offset..pos + offset + 4].try_into().unwrap()),
+            mask: u32::MAX >> (32 - 8 * counted),
+        }
+    }
+}
+
+/// Input up to this long has no delta of 2^30 or more, so every record is one
+/// unit or two.
+const PAIRED_INPUT_LIMIT: usize = 1 << 30;
+/// Units decoded at a time once a walk is past its first candidates: one
+/// cache line of the stream.
+const UNITS: usize = 32;
+/// The first stretch is short: a walk that ends at its first candidate, as it
+/// does across a long repeat, has decoded little it did not need.
+const FIRST_UNITS: usize = 4;
+
+/// The top bit of each unit in an eight-byte word. A unit that carries it is
+/// the first of a two-unit record.
+const TOPS: u64 = 0x8000_8000_8000_8000;
+/// The top bits of a word of two-unit records that starts with a record's
+/// first unit.
+const JOINED_FROM_FIRST: u64 = 0x0000_8000_0000_8000;
+/// The same for a word that starts with a record's last unit.
+const JOINED_FROM_LAST: u64 = 0x8000_0000_8000_0000;
+
+/// Which units of a stretch of whole eight-byte words carry the top bit.
+struct Stretch {
+    /// The top bits set in any word.
+    any: u64,
+    /// The top bits set in every word.
+    all: u64,
+}
+
+impl Stretch {
+    /// Whether every word's top bits are exactly `tops`.
+    #[inline(always)]
+    fn is(&self, tops: u64) -> bool {
+        self.any == tops && self.all == tops
+    }
+}
+
+#[inline(always)]
+fn survey(bytes: &[u8]) -> Stretch {
+    let mut any = 0;
+    let mut all = TOPS;
+    for word in bytes.as_chunks::<8>().0 {
+        let word = u64::from_le_bytes(*word);
+        any |= word;
+        all &= word;
+    }
+    Stretch {
+        any: any & TOPS,
+        all,
+    }
+}
+
+/// The deltas of `bytes`, all two-unit records, newest first.
+#[inline(always)]
+fn join_all(deltas: &mut [u32], bytes: &[u8]) {
+    for (delta, record) in deltas.iter_mut().zip(bytes.rchunks_exact(4)) {
+        let record = u32::from_le_bytes(record.try_into().unwrap());
+        *delta = (record & 0x7FFF) | (record >> 16 << 15);
+    }
+}
+
+/// The deltas of a stretch that mixes both record widths, and how many.
+/// Every unit is read as if it ended a record, and kept only if it does.
+/// `newer` is the unit after `older`, and the newest not yet decoded.
+#[inline(always)]
+fn decode_mixed(deltas: &mut [u32; UNITS], older: &[u8], mut newer: u32) -> usize {
+    let mut records = 0;
+    for bytes in older.rchunks_exact(2) {
+        let unit = u32::from(u16::from_le_bytes(bytes.try_into().unwrap()));
+        deltas[records % UNITS] = if unit & 0x8000 != 0 {
+            (newer << 15) | (unit & 0x7FFF)
+        } else {
+            newer
+        };
+        records += usize::from(newer & 0x8000 == 0);
+        newer = unit;
+    }
+    records
+}
+
+/// One position's walk over a stream whose records are one unit or two.
+///
+/// It stands apart from its caller so the loops keep their state in
+/// registers: inlined into the block loop, they spill on every candidate.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn walk_paired<B: Budget>(
+    packed: &[u8],
+    input: &[u8],
+    pos: usize,
+    mut cursor: usize,
+    limit: usize,
+    max_length: usize,
+    max_distance: usize,
+    cut: usize,
+    out: &mut Buffer<(u32, u32), B>,
+) -> std::result::Result<(), B::Failure> {
+    let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+    // The oldest position still within reach.
+    let floor = pos.saturating_sub(max_distance);
+    let mut candidate = pos;
+    let mut longest = 0;
+    let mut remaining = cut;
+    if remaining == 0 || limit == 0 {
+        return Ok(());
+    }
+    // An improving match shares every byte up to and including the one at the
+    // best length so far. The test is on the last four of those, or on all of
+    // them while there are fewer: one comparison, and far fewer candidates
+    // reach the full measurement than a single byte lets through.
+    let mut probe = Probe::new(input, pos, 0);
+    let mut deltas = [0; UNITS];
+    let mut units = FIRST_UNITS;
+    'walk: loop {
+        // A stretch of the stream is decoded before any of its candidates is
+        // tested. Where a stretch starts and stops does not depend on what is
+        // in it, so decoding one is not kept waiting on the lengths in the
+        // one before, and the tests run one after another with nothing
+        // between them.
+        let records = if cursor >= 2 * units + 2 {
+            let stretch = &packed[cursor - 2 * units - 2..cursor];
+            let (older, newest) = stretch.split_at(2 * units);
+            let newer = u32::from(u16::from_le_bytes(newest.try_into().unwrap()));
+            let whole = newer & 0x8000 == 0;
+            let held = survey(older);
+            cursor -= 2 * units;
+            if units != UNITS {
+                // The first stretch is too short to be worth telling apart.
+                decode_mixed(&mut deltas, older, newer)
+            } else if held.is(0) && whole {
+                // Every record here is a single unit, as they are wherever a
+                // bucket is busy, and the units are the deltas as they stand.
+                for (delta, bytes) in deltas.iter_mut().zip(stretch[2..].rchunks_exact(2)) {
+                    *delta = u32::from(u16::from_le_bytes(bytes.try_into().unwrap()));
+                }
+                UNITS
+            } else if held.is(JOINED_FROM_LAST) {
+                // Every record is two units, as they are wherever a bucket
+                // is quiet. The newest unit ends the record the one before it
+                // starts, and the oldest surveyed is left for the next
+                // stretch.
+                join_all(&mut deltas[..UNITS / 2], &stretch[2..]);
+                UNITS / 2
+            } else if held.is(JOINED_FROM_FIRST) && !whole {
+                // The same, where the last stretch stopped between the newest
+                // record's two units.
+                join_all(&mut deltas[..UNITS / 2], older);
+                UNITS / 2
+            } else {
+                decode_mixed(&mut deltas, older, newer)
+            }
+        } else {
+            // Too near the start of the stream for a stretch. The last
+            // stretch may have stopped between a record's two units.
+            if cursor >= 2 && packed[cursor - 1] & 0x80 != 0 {
+                cursor -= 2;
+            }
+            if cursor < 2 {
+                break;
+            }
+            let (delta, length) = decode_before(packed, cursor);
+            cursor -= length;
+            deltas[0] = delta;
+            1
+        };
+        units = UNITS;
+        let records = records.min(remaining);
+        for &delta in &deltas[..records] {
+            let delta = delta as usize;
+            // A bucket's first record is zero, and nothing past it is this
+            // bucket's.
+            if delta.wrapping_sub(1) >= candidate - floor {
+                break 'walk;
+            }
+            candidate -= delta;
+            let found = u32::from_le_bytes(
+                input[candidate + probe.offset..candidate + probe.offset + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            if (found ^ probe.wanted) & probe.mask == 0 {
+                let difference = prefix
+                    ^ u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap());
+                let distance = pos - candidate;
+                let length = if difference != 0 {
+                    (difference.trailing_zeros() / 8) as usize
+                } else {
+                    4 + super::fast::match_length(input, pos + 4, distance, max_length - 4)
+                };
+                if length > longest {
+                    if length >= 4 {
+                        out.push((length as u32, distance as u32))?;
+                    }
+                    longest = length;
+                    if longest >= limit {
+                        break 'walk;
+                    }
+                    probe = Probe::new(input, pos, longest);
+                }
+            }
+        }
+        remaining -= records;
+        if remaining == 0 {
+            break;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(crate) struct PackedMatchFinder<B: Budget = Allowance> {
     cursor: Buffer<u32, B>,
@@ -186,6 +416,46 @@ impl<B: Budget> PackedMatchFinder<B> {
     ) -> std::result::Result<(), B::Failure> {
         debug_assert!(max_length >= 4 && pos + max_length <= input.len());
         debug_assert_eq!(self.next_position, pos + 1);
+        if input.len() > PAIRED_INPUT_LIMIT {
+            return self.collect_improving_wide(
+                input,
+                pos,
+                end_cursor,
+                max_length,
+                max_distance,
+                cut,
+                nice,
+                out,
+            );
+        }
+        walk_paired(
+            &self.packed,
+            input,
+            pos,
+            end_cursor,
+            max_length.min(nice),
+            max_length,
+            max_distance,
+            cut,
+            out,
+        )
+    }
+
+    /// The walk for input long enough to hold a three-unit record, which the
+    /// paired decode does not read.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn collect_improving_wide(
+        &self,
+        input: &[u8],
+        pos: usize,
+        end_cursor: usize,
+        max_length: usize,
+        max_distance: usize,
+        cut: usize,
+        nice: usize,
+        out: &mut Buffer<(u32, u32), B>,
+    ) -> std::result::Result<(), B::Failure> {
         let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
         let mut candidate = pos;
         let mut cursor = end_cursor;
@@ -336,6 +606,192 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn survey_tells_single_units_and_both_orders_of_joined_units_apart() {
+        let plain = [0x34u8, 0x12].repeat(32);
+        assert!(survey(&plain).is(0));
+        for unit in 0..32 {
+            let mut bytes = plain.clone();
+            bytes[2 * unit + 1] |= 0x80;
+            let held = survey(&bytes);
+            assert!(!held.is(0), "joined unit{unit}");
+            assert!(!held.is(JOINED_FROM_FIRST) && !held.is(JOINED_FROM_LAST));
+        }
+
+        // Two-unit records throughout, from a record's first unit and from
+        // its last, and neither once a single unit is out of step.
+        let from_first = [0x34u8, 0x92, 0x56, 0x00].repeat(16);
+        let from_last = [0x56u8, 0x00, 0x34, 0x92].repeat(16);
+        assert!(survey(&from_first).is(JOINED_FROM_FIRST));
+        assert!(!survey(&from_first).is(JOINED_FROM_LAST));
+        assert!(survey(&from_last).is(JOINED_FROM_LAST));
+        assert!(!survey(&from_last).is(JOINED_FROM_FIRST));
+        for unit in 0..32 {
+            for bytes in [&from_first, &from_last] {
+                let mut bytes = bytes.clone();
+                bytes[2 * unit + 1] ^= 0x80;
+                let held = survey(&bytes);
+                assert!(!held.is(JOINED_FROM_FIRST) && !held.is(JOINED_FROM_LAST));
+                assert!(!held.is(0));
+            }
+        }
+        let mut deltas = [0; 16];
+        join_all(&mut deltas, &from_first);
+        assert_eq!(deltas, [(0x56 << 15) | 0x1234; 16]);
+    }
+
+    /// Chains long enough for most of the ways the paired walk reads a
+    /// stream: stretches of single units, stretches that mix both record
+    /// widths, records split across two stretches, and buckets at the very
+    /// start of the stream.
+    fn long_chain_fixture() -> Vec<u8> {
+        let mut input = fixture(420_000);
+        // A busy bucket whose deltas all fit one unit.
+        for pos in (50_000..input.len() - 64).step_by(61) {
+            input[pos..pos + 12].copy_from_slice(b"busy-bucket!");
+        }
+        // One whose deltas straddle the one-unit limit, in no fixed order.
+        let mut pos = 1_000;
+        let mut state = 0x1234_5678u32;
+        while pos + 64 < input.len() {
+            input[pos..pos + 14].copy_from_slice(b"edge-of-a-unit");
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            pos += if state >> 31 == 0 { 2_000 } else { 33_000 } + (state >> 20) as usize % 700;
+        }
+        // One that is busy in bursts with a long gap between them, so that
+        // a two-unit record split across two stretches is followed by a
+        // stretch of single units.
+        let mut pos = 3_000;
+        while pos + 64 < input.len() {
+            for _ in 0..45 {
+                if pos + 64 >= input.len() {
+                    break;
+                }
+                input[pos..pos + 12].copy_from_slice(b"burst-bucket");
+                pos += 300;
+            }
+            pos += 34_000;
+        }
+        input
+    }
+
+    /// Check the paired walk against the record-at-a-time walk at every
+    /// position `sampled` picks, given the position and where its stream
+    /// ends. Returns how many walks were compared.
+    fn compare_walks(input: &[u8], sampled: impl Fn(usize, usize) -> bool) -> usize {
+        let allowance = Allowance::default();
+        let mut finder = PackedMatchFinder::with_allowance(input, &allowance).unwrap();
+        let mut compared = 0;
+        for pos in 0..input.len() - 3 {
+            let end = finder.insert(input, pos);
+            if !sampled(pos, end) {
+                continue;
+            }
+            for (cut, cap, nice, window) in [
+                (1, 512, 512, usize::MAX),
+                (3, 512, 512, usize::MAX),
+                (128, 512, 512, usize::MAX),
+                (128, 40, 16, usize::MAX),
+                (128, 512, 512, 100_000),
+                (300, 512, 512, usize::MAX),
+                (5_000, 4_096, 4_096, usize::MAX),
+            ] {
+                let max_length = cap.min(input.len() - pos);
+                if max_length < 4 {
+                    continue;
+                }
+                let max_distance = pos.min(window);
+                let mut expected = Buffer::new(&allowance);
+                let mut actual = Buffer::new(&allowance);
+                finder
+                    .collect_improving_wide(
+                        input,
+                        pos,
+                        end,
+                        max_length,
+                        max_distance,
+                        cut,
+                        nice,
+                        &mut expected,
+                    )
+                    .unwrap();
+                finder
+                    .collect_improving(
+                        input,
+                        pos,
+                        end,
+                        max_length,
+                        max_distance,
+                        cut,
+                        nice,
+                        &mut actual,
+                    )
+                    .unwrap();
+                assert_eq!(
+                    &actual[..],
+                    &expected[..],
+                    "pos{pos} cut{cut} cap{cap} nice{nice} window{window}"
+                );
+                compared += 1;
+            }
+        }
+        compared
+    }
+
+    #[test]
+    fn paired_walk_matches_the_record_at_a_time_walk_on_long_chains() {
+        let input = long_chain_fixture();
+        let finder = PackedMatchFinder::with_allowance(&input, &Allowance::default()).unwrap();
+        let mut widths = [0usize; 2];
+        let mut end = finder.packed.len();
+        while end > 0 {
+            let (_, length) = decode_before(&finder.packed, end);
+            widths[length / 2 - 1] += 1;
+            end -= length;
+        }
+        assert!(widths[0] > 1_000 && widths[1] > 1_000, "{widths:?}");
+        // Every position near the stream's start, where a stretch does not
+        // fit, and a sample of the rest.
+        let compared = compare_walks(&input, |pos, end| end <= 4 * UNITS || pos % 5 == 0);
+        assert!(compared > 500_000, "{compared}");
+    }
+
+    #[test]
+    fn paired_walk_matches_the_record_at_a_time_walk_on_quiet_buckets() {
+        // Buckets that hold nothing but one phrase, far enough apart that
+        // every delta takes two units: whole stretches of two-unit records.
+        // The filler is one long run, all in a bucket of its own.
+        const SPACING: usize = 33_500;
+        const PHRASE: &[u8] = b"quiet-bucket";
+        let mut input = vec![0xAA; 45 * SPACING];
+        // Each copy is followed by the same tail with one byte of its own, in
+        // a different place each time. How far a copy matches a later one
+        // then varies down the chain, so the runs a walk stores depend on
+        // every candidate it visits and not just the nearest.
+        const TAIL: &[u8] = b"-and-a-tail-that-every-copy-shares-in-part";
+        let mut copies = 0usize;
+        let mut place = |input: &mut [u8], pos: usize| {
+            let tail = pos + PHRASE.len();
+            input[pos..tail].copy_from_slice(PHRASE);
+            input[tail..tail + TAIL.len()].copy_from_slice(TAIL);
+            input[tail + copies * 7_919 % TAIL.len()] = 0x80 | copies as u8;
+            copies += 1;
+        };
+        for pos in (700..input.len() - 64).step_by(SPACING) {
+            place(&mut input, pos);
+        }
+        // Two close pairs put a single-unit record among them. A walk that
+        // starts after one meets the stretches beyond it between a record's
+        // two units, and after both, on a record again.
+        for near in [700 + 30 * SPACING + 100, 700 + 36 * SPACING + 100] {
+            place(&mut input, near);
+        }
+        let compared = compare_walks(&input, |pos, _| {
+            !(170..=SPACING - 8).contains(&((pos + SPACING - 700) % SPACING))
+        });
+        assert!(compared > 40_000, "{compared}");
     }
 
     #[test]
