@@ -24,10 +24,11 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod scratch;
 
 create_exception!(rars, Error, pyo3::exceptions::PyException);
+// `BadRarFile` is damage; a password or a volume still to come is not.
 create_exception!(rars, BadRarFile, Error);
-create_exception!(rars, BadPassword, BadRarFile);
-create_exception!(rars, PasswordRequired, BadRarFile);
-create_exception!(rars, MissingVolume, BadRarFile);
+create_exception!(rars, BadPassword, Error);
+create_exception!(rars, PasswordRequired, Error);
+create_exception!(rars, MissingVolume, Error);
 create_exception!(rars, ChecksumError, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, NotRarFile, Error);

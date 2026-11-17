@@ -65,7 +65,8 @@ def test_a_removed_volume_is_a_missing_volume(tmp_path, format):
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(rars.MissingVolume) as raised:
             archive.testrar()
-    assert isinstance(raised.value, rars.BadRarFile)
+    assert isinstance(raised.value, rars.Error)
+    assert not isinstance(raised.value, rars.BadRarFile)
     assert raised.value.volume_number == 3
     assert raised.value.path == paths[2]
 
@@ -140,3 +141,14 @@ def test_a_refusing_limit_is_a_rars_error_not_a_memory_error():
     assert not isinstance(raised.value, MemoryError)
     with pytest.raises(rars.LimitExceeded):
         rars.RarFile(rar_bytes(), options=rars.ReadOptions(max_header_count=1))
+
+
+def test_password_errors_are_not_damage():
+    builder = rars.RarBuilder(store=True, password="pw", encrypt_headers=True)
+    builder.add_bytes(b"payload", "file.txt")
+    data = builder.to_bytes()
+    for password, error in [(None, rars.PasswordRequired), ("wrong", rars.BadPassword)]:
+        with pytest.raises(error) as raised:
+            rars.RarFile(data, password=password)
+        assert isinstance(raised.value, rars.Error)
+        assert not isinstance(raised.value, rars.BadRarFile)
