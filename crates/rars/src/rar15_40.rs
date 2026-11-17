@@ -577,6 +577,7 @@ impl FileHeader {
             | Error::AtEntry { .. }
             | Error::InVolume { .. }
             | Error::MissingVolume
+            | Error::VolumeOutOfOrder
             | Error::Cancelled
             | Error::InvalidArgument(_)
             | Error::WriterFailure(_)

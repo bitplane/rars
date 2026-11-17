@@ -32,6 +32,7 @@ __all__ = [
     "BadPassword",
     "PasswordRequired",
     "MissingVolume",
+    "VolumeOrderError",
     "ChecksumError",
     "UnsupportedRarFeature",
     "NotRarFile",
@@ -105,6 +106,10 @@ class PasswordRequired(Error): ...
 class MissingVolume(Error):
     volume_index: int | None
     path: Path | None
+
+class VolumeOrderError(Error):
+    """`volumes` gave a volume out of order; `volume_index` is where the order broke."""
+    volume_index: int | None
 
 class ChecksumError(BadRarFile):
     member: str | None

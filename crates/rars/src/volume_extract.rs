@@ -14,7 +14,7 @@ pub(crate) trait PlacedVolume {
 
 impl PlacedVolume for crate::rar13::Archive {}
 
-// RAR 5 checks its main header's number in `extract_with_volumes`.
+// RAR 5 checks its main header's number with `volume_order` instead.
 impl PlacedVolume for crate::rar50::Archive {}
 
 impl PlacedVolume for crate::rar15_40::Archive {
@@ -93,7 +93,7 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
             self.ended = true;
             return Err(crate::Error::InVolume {
                 index: self.index - 1,
-                source: Box::new(crate::Error::InvalidHeader("volume is out of order")),
+                source: Box::new(crate::Error::VolumeOutOfOrder),
             });
         }
         self.options.check_cancelled()?;

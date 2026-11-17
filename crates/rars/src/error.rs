@@ -100,6 +100,8 @@ pub enum Error {
     },
     /// The set needs a volume that never arrived; [`Error::InVolume`] around it numbers it.
     MissingVolume,
+    /// A volume's recorded number doesn't follow the one before; [`Error::InVolume`] around it numbers it.
+    VolumeOutOfOrder,
     UnsupportedVersion(ArchiveVersion),
     /// The requested implementation was omitted at compile time.
     FeatureDisabled {
@@ -256,6 +258,7 @@ impl std::fmt::Display for Error {
             }
             Self::InVolume { index, source } => write!(f, "in volume {}: {source}", index + 1),
             Self::MissingVolume => f.write_str("volume is missing"),
+            Self::VolumeOutOfOrder => f.write_str("volume is out of order"),
             Self::AtEntry {
                 name,
                 operation,
@@ -524,6 +527,7 @@ impl Error {
             Self::TooShort
             | Self::InvalidHeader(_)
             | Self::MissingVolume
+            | Self::VolumeOutOfOrder
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)
@@ -779,6 +783,7 @@ mod tests {
                 Error::WriterFailure("layout failure"),
                 ErrorKind::WriterFailure,
             ),
+            (Error::VolumeOutOfOrder, ErrorKind::InvalidArchive),
             (Error::EntryNotFound, ErrorKind::EntryNotFound),
             (Error::DuplicateEntry, ErrorKind::DuplicateEntry),
             (Error::InputSymlink, ErrorKind::InvalidArgument),

@@ -29,6 +29,7 @@ create_exception!(rars, BadRarFile, Error);
 create_exception!(rars, BadPassword, Error);
 create_exception!(rars, PasswordRequired, Error);
 create_exception!(rars, MissingVolume, Error);
+create_exception!(rars, VolumeOrderError, Error);
 create_exception!(rars, ChecksumError, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, NotRarFile, Error);
@@ -1227,7 +1228,11 @@ impl RarFile {
     /// read as `RarFile` reads them. Each is pulled when needed, so a
     /// generator may wait for downloads. If the last volume isn't marked as last
     /// (all RAR 1.3 to 2.0 sets, some later ones), the iterator is advanced once
-    /// more and must stop, not wait.
+    /// more and must stop, not wait. A volume whose recorded number doesn't
+    /// follow the one before raises `VolumeOrderError` with its `volume_index`;
+    /// files written before it are complete, so call again in order with
+    /// `overwrite=True`. RAR 1.3 to 2.0 volumes record no number, so a wrong
+    /// order shows as damage instead.
     ///
     /// Each file is written to a private directory inside `path` and moved into
     /// place once verified. `in_place=True` writes the destination itself
@@ -3130,6 +3135,9 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     missing_volume.setattr("volume_index", py.None())?;
     missing_volume.setattr("path", py.None())?;
     m.add("MissingVolume", missing_volume)?;
+    let volume_order = py.get_type::<VolumeOrderError>();
+    volume_order.setattr("volume_index", py.None())?;
+    m.add("VolumeOrderError", volume_order)?;
     let checksum_error = py.get_type::<ChecksumError>();
     checksum_error.setattr("member", py.None())?;
     checksum_error.setattr("volume_index", py.None())?;
@@ -4320,6 +4328,10 @@ fn is_missing_volume(error: &rars_rs::Error) -> bool {
     matches!(error, rars_rs::Error::MissingVolume)
 }
 
+fn is_volume_out_of_order(error: &rars_rs::Error) -> bool {
+    matches!(error, rars_rs::Error::VolumeOutOfOrder)
+}
+
 fn is_checksum_mismatch(error: &rars_rs::Error) -> bool {
     matches!(
         error,
@@ -4414,6 +4426,7 @@ fn volumes_to_last<'a>(
     volumes: &'a mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
 ) -> impl Iterator<Item = rars_rs::Result<rars_rs::Archive>> + 'a {
     let mut end = volume_end(first);
+    let mut order = rars_rs::volume_order::VolumeOrder::after(first);
     let mut index = 0;
     std::iter::from_fn(move || {
         if end == VolumeEnd::Last {
@@ -4425,6 +4438,7 @@ fn volumes_to_last<'a>(
             None if end == VolumeEnd::More => Err(rars_rs::Error::MissingVolume),
             None => return None,
         };
+        let volume = volume.and_then(|volume| order.next(&volume).map(|()| volume));
         end = volume.as_ref().map_or(VolumeEnd::Last, volume_end);
         Some(volume.map_err(|error| rars_rs::Error::InVolume {
             index,
@@ -4747,6 +4761,16 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
             with_attribute(
                 py,
                 MissingVolume::new_err(message),
+                "volume_index",
+                fault.volume_index,
+            )
+        });
+    }
+    if let Some(fault) = set_fault(&error, is_volume_out_of_order) {
+        return Python::attach(|py| {
+            with_attribute(
+                py,
+                VolumeOrderError::new_err(message),
                 "volume_index",
                 fault.volume_index,
             )

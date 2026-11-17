@@ -224,8 +224,10 @@ const archive = await RarArchive.open(firstPart);
 await archive.extractAll("out", { volumes: downloads() }); // an async generator
 ```
 
-A part the iterator never yields fails with `MISSING_VOLUME`, and an error it
-throws is raised as it was. Browsers take every volume up front instead.
+A part the iterator never yields fails with `MISSING_VOLUME`, and a part out of
+order with `VOLUME_ORDER`, both naming the volume in the error's `volume`
+context. An error the iterator throws is raised as it was. Browsers take every
+volume up front instead.
 
 ## Repair
 
