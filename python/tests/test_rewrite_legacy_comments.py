@@ -16,7 +16,7 @@ def test_native_archive_comments_survive_rewrites(format, comment, password):
     builder = rars.RarBuilder(version=format, comment=comment, password=password)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes(), password=password)
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     data = editor.to_bytes()
@@ -24,7 +24,7 @@ def test_native_archive_comments_survive_rewrites(format, comment, password):
     assert output.family == "rar15_40"
     assert output.comment == comment
     assert output.read("renamed") == b"payload"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert rars.RarFile(rars.RarBuilder.from_archive(output).to_bytes(), password=password).comment == comment
 
 

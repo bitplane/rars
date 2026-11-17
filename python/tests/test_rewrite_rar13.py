@@ -21,7 +21,7 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
     data = editor.to_bytes()
     output = rars.RarFile(data, password="password")
     assert output.family == source.family == "rar13"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert output.comment == source.comment
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert output.getinfo(after).is_dir() == source.getinfo(before).is_dir()

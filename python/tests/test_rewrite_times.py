@@ -20,7 +20,7 @@ def test_rewrite_preserves_all_file_times_without_narrowing(given):
     expected = (given.get("mtime_ns"), given.get("birthtime_ns"), given.get("atime_ns"))
     source = rars.RarFile(builder.to_bytes())
     assert times(source.getinfo("file")) == expected
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source, preserve=True)
     rewritten.rename("file", "renamed")
     output = rars.RarFile(rewritten.to_bytes())

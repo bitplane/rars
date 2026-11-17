@@ -237,7 +237,7 @@ def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
     builder.add_unix_symlink("directory-link", "missing-dir", target_is_directory=True)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes())
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source, preserve=True)
     rewritten.rename("link", "renamed")
     destination = tmp_path / "rewritten.rar"
@@ -247,7 +247,7 @@ def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
     assert output.readlink("directory-link") == b"missing-dir"
     assert output.member_comment("renamed") == b"link comment"
     assert output.read("file") == b"payload"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert not (tmp_path / "missing-dir").exists()
     rewritten.remove("renamed")
     assert "renamed" not in rars.RarFile(rewritten.to_bytes()).namelist()

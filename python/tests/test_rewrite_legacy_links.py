@@ -68,7 +68,7 @@ def test_legacy_directories_survive_edits_without_breaking_solid_data(options, m
     assert times(output.getinfo("renamed")) == times(archive.getinfo("empty"))
     assert output.read("first") == b"first payload " * 200
     assert output.read("second") == b"first payload " * 200 + b"second"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     editor.remove("first")
     output = rars.RarFile(editor.to_bytes(), password=options.get("password"))
     assert output.read("second") == b"first payload " * 200 + b"second"
@@ -92,7 +92,7 @@ def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
     assert times(output.getinfo(b"renamed-\xfe")) == times(archive.getinfo(b"link-\xff"))
     assert output.read("first") == b"first" * 200
     assert output.read("last") == b"last" * 200
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
 
 
 @pytest.mark.skipif(os.name != "posix" or not shutil.which("unrar"), reason="requires Unix and unrar")

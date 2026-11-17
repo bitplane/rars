@@ -30,7 +30,7 @@ def test_vintage_rar15_preservation(tmp_path, fixture):
     editor.rename(source.namelist()[0], "renamed")
     data = editor.to_bytes()
     output = rars.RarFile(data, password="password")
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert source.read(before) == output.read(after)
         assert times(source.getinfo(before)) == times(output.getinfo(after))

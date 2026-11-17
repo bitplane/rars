@@ -26,7 +26,7 @@ def test_comments_survive_encrypted_headers_and_cmt_combinations(tmp_path, encry
     editor.rename("file", "renamed")
     data = editor.to_bytes()
     output = rars.RarFile(data, password="password")
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert output.comment == source.comment
     assert output.read("renamed") == b"data " * 100
     assert output.read("last") == b"data " * 100 + b"end"

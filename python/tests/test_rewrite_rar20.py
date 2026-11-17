@@ -28,7 +28,7 @@ def test_vintage_rar20_preserves_metadata_comments_and_payloads(tmp_path, fixtur
     editor.rename(name, "renamed")
     data = editor.to_bytes()
     output = rars.RarFile(data, password="password")
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert output.comment == source.comment
     assert bool(next(headers(data))[2] & 8) == bool(next(headers(path.read_bytes()))[2] & 8)
     for before, after in zip(source.namelist(), output.namelist(), strict=True):

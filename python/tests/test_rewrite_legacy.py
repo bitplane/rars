@@ -83,7 +83,7 @@ def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_
     output = rars.RarFile(data)
     assert output.family == "rar15_40"
     assert output.read(b"renamed-\xfe") == b"payload" * 50
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     expected = file_metadata(original)[0]
     assert file_metadata(data) == [(b"renamed-\xfe", *expected[1:])]
     assert bool(next(headers(data))[2] & 8) == options.get("solid", False)
@@ -209,7 +209,7 @@ def test_native_extended_times_retain_all_four_slots_and_precision(width, solid)
             raw += struct.pack("<I", DOS_TIME + index)
         raw += b"\x01" * width
     source = rars.RarFile(with_extended_times(source_bytes(solid=solid), raw))
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     builder = rars.RarBuilder.from_archive(source)
     builder.rename(b"raw-\xff", "renamed")
     builder.remove("second")
@@ -265,7 +265,7 @@ def test_reference_rar420_extended_times_survive_native_rewrite(tmp_path):
 def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
     original = source_bytes(password="secret", encrypt_headers=header_encryption, solid=solid)
     source = rars.RarFile(original, password="secret")
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     builder = rars.RarBuilder.from_archive(source)
     builder.rename(b"raw-\xff", "renamed")
     output_bytes = builder.to_bytes()
@@ -273,7 +273,7 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
         with pytest.raises(rars.PasswordRequired):
             rars.RarFile(output_bytes)
     output = rars.RarFile(output_bytes, password="secret")
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     for name in output.namelist():
         assert output.getinfo(name).is_encrypted
     assert output.read("renamed") == b"payload" * 50

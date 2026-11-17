@@ -1472,13 +1472,6 @@ impl RarFile {
             })
     }
 
-    /// Metadata/settings the current rewrite implementation cannot preserve.
-    /// This is a conservative metadata check, not a payload integrity test.
-    fn rewrite_preservation_issues(&self) -> PyResult<Vec<String>> {
-        self.check_open()?;
-        Ok(self.archive.rewrite_preservation_issues())
-    }
-
     /// Stops at the first volume missing or unreadable rather than raising, so clean-up gets what is there.
     fn volume_paths(&self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
         self.check_open()?;
