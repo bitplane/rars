@@ -16,6 +16,12 @@ export class RarArchive {
   readonly comment?: Uint8Array;
   get(name: RarName): import("./base.js").RarEntry | undefined;
   getAll(name: RarName): readonly import("./base.js").RarEntry[];
+  has(name: RarName): boolean;
+  /** One session and shared output budgets; request order and duplicates are retained. */
+  readMany(
+    members: Iterable<import("./base.js").RarEntry | RarName>,
+    options?: ReadOptions,
+  ): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
   test(options?: ReadOptions): Promise<void>;
   close(): void;

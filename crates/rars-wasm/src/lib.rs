@@ -234,6 +234,7 @@ pub struct RarInfo {
     directory: bool,
     split_before: bool,
     split_after: bool,
+    volume_index: usize,
 }
 
 #[wasm_bindgen]
@@ -336,6 +337,12 @@ impl RarInfo {
     pub fn is_split_after(&self) -> bool {
         self.split_after
     }
+
+    /// The volume the member starts in, counting the first as 0.
+    #[wasm_bindgen(getter, js_name = volumeIndex)]
+    pub fn volume_index(&self) -> usize {
+        self.volume_index
+    }
 }
 
 /// An archive opened for reading.
@@ -398,10 +405,23 @@ impl RarFile {
                 rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
             );
         }
+        // A member starts in the volume holding its first part.
+        let starts = archives.iter().enumerate().flat_map(|(index, archive)| {
+            archive
+                .members()
+                .filter(|member| !member.meta.is_split_before)
+                .map(move |_| index)
+        });
         let infos = rars_rs::volume_members(&archives)
             .map_err(js_error)?
             .into_iter()
-            .map(|member| info_with_encoding(member, options.legacy_name_encoding))
+            .zip(starts)
+            .map(|(member, volume_index)| {
+                info_with_encoding(member, options.legacy_name_encoding).map(|info| RarInfo {
+                    volume_index,
+                    ..info
+                })
+            })
             .collect::<rars_rs::Result<Vec<_>>>()
             .map_err(js_error)?;
         Ok(Self {
@@ -623,6 +643,7 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         directory: member.meta.is_directory,
         split_before: member.meta.is_split_before,
         split_after: member.meta.is_split_after,
+        volume_index: 0,
     }
 }
 

@@ -133,6 +133,9 @@ await check("volume sets are logical archives", async () => {
   })(), (error) => error instanceof RarError && error.code === "MISSING_VOLUME");
   const archive = await RarArchive.open(volumes);
   assert.deepEqual(archive.entries.map((entry) => entry.name), ["big.bin"]);
+  assert.equal(archive.entries[0].volumeIndex, 0);
+  assert.ok(archive.has("big.bin"));
+  assert.ok(!archive.has("missing"));
   assert.deepEqual(await archive.entries[0].bytes(), payload);
 });
 
@@ -311,6 +314,8 @@ await check("RAR5 decoder and volume budgets reach WASM", async () => {
     await assert.rejects(volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length - (modern ? 0 : 1) }), limited);
     await assert.rejects(volumes.test({ maxMemberOutputBytes: payload.length - 1 }), limited);
     assert.deepEqual(await volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length + SECOND.length }), payload);
+    // b.txt starts after a.bin has filled the first volumes.
+    if (modern) assert.equal(volumes.get("b.txt").volumeIndex, parts.length - 1);
   }
 });
 

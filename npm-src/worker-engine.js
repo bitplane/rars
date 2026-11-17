@@ -55,6 +55,7 @@ function metadata(archive, password, options) {
       isSolid: info.isSolid,
       isSplitBefore: info.isSplitBefore,
       isSplitAfter: info.isSplitAfter,
+      volumeIndex: info.volumeIndex,
     };
     info.free();
     return entry;

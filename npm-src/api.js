@@ -146,6 +146,11 @@ export function createApi(runtime) {
       return this.#matchingEntries(name, true);
     }
 
+    /** Whether the archive holds an entry with this name, as Python's `name in archive`. */
+    has(name) {
+      return this.#matchingEntries(name, false).length > 0;
+    }
+
     #matchingEntries(name, copy) {
       assertOpen(this);
       if (typeof name === "string" && this.entries === this.#indexedEntries) {

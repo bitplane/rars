@@ -28,7 +28,9 @@ duplicate names and non-UTF-8 names remain unambiguous; `nameBytes` contains
 the exact header bytes.
 
 `get(name)` selects the last matching entry; `getAll(name)` returns every match
-in archive order. Each returned entry reads its own payload by index.
+in archive order, and `has(name)` says whether there is one. Each returned entry
+reads its own payload by index. In a volume set, `entry.volumeIndex` is the
+volume the entry starts in, counting the first as 0.
 
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.

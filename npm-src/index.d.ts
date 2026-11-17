@@ -113,6 +113,8 @@ export class RarEntry {
   readonly isSolid: boolean;
   readonly isSplitBefore: boolean;
   readonly isSplitAfter: boolean;
+  /** The volume the entry starts in, counting the first as 0. */
+  readonly volumeIndex: number;
   bytes(options?: ReadOptions): Promise<Uint8Array>;
 }
 
@@ -125,6 +127,7 @@ export class RarArchive {
   readonly comment?: Uint8Array;
   get(name: RarName): RarEntry | undefined;
   getAll(name: RarName): readonly RarEntry[];
+  has(name: RarName): boolean;
   /** One session and shared output budgets; request order and duplicates are retained. */
   readMany(members: Iterable<RarEntry | RarName>, options?: ReadOptions): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
