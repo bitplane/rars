@@ -201,14 +201,14 @@ check('reader quota errors retain structured exact amounts and contexts', () => 
   }
   archive.free();
   const compressed = new engine.RarFile(fixture('rar50/m3_default.rar'));
-  for (const settings of [{maxReaderWorkspaceBytes: 1}, {rar50DictionarySizeLimit: 1}])
+  for (const settings of [{maxReaderWorkspaceBytes: 1}, {maxRar50DictionaryBytes: 1}])
     refuses(() => compressed.test(undefined, settings), 'RESOURCE_LIMIT');
   compressed.free();
   const filtered = new engine.RarFile(fixture('rar50/filter_delta.rar'));
   const expected = filtered.readAt(0);
   assert.ok(expected.length > 0);
-  assert.doesNotThrow(() => filtered.test(undefined, {rar50BufferedDecodeLimit: 1}));
-  assert.deepEqual(filtered.readAt(0, undefined, {rar50BufferedDecodeLimit: 1}), expected);
+  assert.doesNotThrow(() => filtered.test(undefined, {maxRar50BufferedMemberBytes: 1}));
+  assert.deepEqual(filtered.readAt(0, undefined, {maxRar50BufferedMemberBytes: 1}), expected);
   filtered.free();
 });
 check('legacy decoded names and JavaScript getter failures survive conversion', () => {
@@ -244,7 +244,7 @@ check('encrypted recovery forwards passwords and all reader policy errors', () =
   const stored = fixture('rar50/stored.rar');
   for (const key of ['maxHeaderCount', 'maxHeaderBytes', 'maxMemberOutputBytes',
                     'maxTotalOutputBytes', 'maxReaderWorkspaceBytes',
-                    'rar50DictionarySizeLimit', 'rar50BufferedDecodeLimit'])
+                    'maxRar50DictionaryBytes', 'maxRar50BufferedMemberBytes'])
     refuses(() => new engine.RarFile(stored, undefined, {[key]: 'bad'}), 'INVALID_OPTION');
   const archive = new engine.RarFile(stored);
   for (const run of [() => archive.read(archive.names()[0], 1), () => archive.readAt(0, 1),

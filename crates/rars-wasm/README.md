@@ -54,8 +54,8 @@ const comment = await archive.readComment(limits); // undefined if absent
 ```
 
 The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
-`maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `rar50DictionarySizeLimit` and
-`rar50BufferedDecodeLimit`. Values must be nonnegative safe integer numbers or
+`maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `maxRar50DictionaryBytes` and
+`maxRar50BufferedMemberBytes`. Values must be nonnegative safe integer numbers or
 `bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
 the library default. Options given to `open()` are the defaults for every later call
 on that archive, and a call's own fields override them one by one.

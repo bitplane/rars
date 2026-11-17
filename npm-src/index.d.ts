@@ -29,8 +29,10 @@ export interface ReadOptions extends OperationOptions {
   maxTotalOutputBytes?: number | bigint;
   /** Aggregate reader workspace capacity per call; excludes sources and final output. */
   maxReaderWorkspaceBytes?: number | bigint;
-  rar50DictionarySizeLimit?: number | bigint;
-  rar50BufferedDecodeLimit?: number | bigint;
+  /** Refuse a compressed RAR 5 member whose dictionary is larger than this. */
+  maxRar50DictionaryBytes?: number | bigint;
+  /** The largest RAR 5 member decoded whole in memory; larger ones stream. */
+  maxRar50BufferedMemberBytes?: number | bigint;
   /**
    * Run RAR 3 VM filter programs other than the six standard ones. Off by
    * default: they are arbitrary bytecode from the archive and can use a lot of

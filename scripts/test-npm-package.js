@@ -213,7 +213,7 @@ await check("read limits cover every format, and open()'s become later calls' de
 
 await check("read options preserve integer precision and reject invalid limits", async () => {
   const bytes = await new RarWriter().add("a.txt", HELLO).bytes();
-  for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "rar50DictionarySizeLimit", "rar50BufferedDecodeLimit"]) {
+  for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "maxRar50DictionaryBytes", "maxRar50BufferedMemberBytes"]) {
     for (const value of [-1, 0.5, Infinity, NaN, 2 ** 53, -1n, 2n ** 64n, "1"]) {
       await assert.rejects(RarArchive.open(bytes, { [key]: value }), (error) => error.code === "INVALID_OPTION");
     }
@@ -236,12 +236,12 @@ await check("RAR5 decoder and volume budgets reach WASM", async () => {
   const limited = (error) => error.code === "RESOURCE_LIMIT";
   const compressed = await new RarWriter({ format: "rar50", level: 5 }).add("a.txt", HELLO).bytes();
   const archive = await RarArchive.open(compressed);
-  await assert.rejects(archive.entries[0].bytes({ rar50DictionarySizeLimit: 0 }), limited);
+  await assert.rejects(archive.entries[0].bytes({ maxRar50DictionaryBytes: 0 }), limited);
   const filtered = await RarArchive.open(await readFile(new URL(
     "../crates/rars/tests/fixtures/rar50/filter_e8.rar", import.meta.url)));
   const expected = await filtered.entries[0].bytes();
   assert.ok(expected.length > 0);
-  assert.deepEqual(await filtered.entries[0].bytes({ rar50BufferedDecodeLimit: 0 }), expected);
+  assert.deepEqual(await filtered.entries[0].bytes({ maxRar50BufferedMemberBytes: 0 }), expected);
   const payload = new Uint8Array(180000).fill(9);
   for (const format of ["rar14", "rar29", "rar50", "rar70"]) {
     const writer = new RarWriter({ format, level: 0 }).add("a.bin", payload);
