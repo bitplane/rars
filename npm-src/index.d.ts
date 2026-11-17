@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
+  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "checkPassword" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
   /** Python's ProgressPhase names, plus "repairing". */
   phase: "reading" | "testing" | "compressing" | "repairing";
   /** Bytes; the work runs in one step, so `completed` reaches `total` only on the last event. */
@@ -158,6 +158,22 @@ export class RarWriter {
   close(): void;
 }
 
+export interface PasswordCheck<Archive = RarArchive> {
+  /** The first candidate proved correct, if any. */
+  correct?: string | Uint8Array;
+  /** Candidates the archive couldn't prove right or wrong without decoding data. */
+  undetermined: (string | Uint8Array)[];
+  needsPassword: boolean;
+  /** Opened with `correct`, or without a password when the headers aren't encrypted. */
+  archive?: Archive;
+}
+
+/** Tries candidates in order against one volume, stopping at the first proved correct. */
+export function checkPassword(
+  input: RarInput,
+  candidates: Iterable<string | Uint8Array>,
+  options?: ReadOptions,
+): Promise<PasswordCheck>;
 export function repair(input: RarInput, options?: OperationOptions): Promise<RepairResult>;
 /** Whether the input starts with a RAR signature. */
 export function isRarFile(input: RarInput): Promise<boolean>;

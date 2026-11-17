@@ -101,6 +101,12 @@ and byte details.
 stub or not. Only the bytes those need are read, and a path that can't be read
 is not RAR.
 
+`checkPassword(input, candidates)` tries passwords in order against one volume and
+stops at the first proved correct. It returns `{ correct, undetermined,
+needsPassword, archive }`: `undetermined` holds candidates a RAR 4 archive can't
+prove without decoding data, and `archive` is opened with the correct one, or
+without a password when the headers aren't encrypted.
+
 ## Write
 
 ```js

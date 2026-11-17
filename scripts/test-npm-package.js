@@ -15,7 +15,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const commonjs = require(path.join(here, "..", "npm"));
 const esm = await import(pathToFileURL(path.join(here, "..", "npm", "node", "index.js")));
-const { RarArchive, RarWriter, RarError, repair, isRarFile, isRarFileSfx, version, archiveVersions } = esm;
+const { RarArchive, RarWriter, RarError, repair, isRarFile, isRarFileSfx, checkPassword, version, archiveVersions } = esm;
 
 let passed = 0;
 async function check(name, body) {
@@ -176,6 +176,24 @@ await check("repair restores damaged bytes", async () => {
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+await check("checkPassword finds the right candidate and opens the archive", async () => {
+  for (const encryptHeaders of [false, true]) {
+    const bytes = await new RarWriter({ password: "right", encryptHeaders }).add("a.txt", HELLO).bytes();
+    const found = await checkPassword(bytes, ["wrong", text.encode("also wrong"), "right", "later"]);
+    assert.equal(found.correct, "right");
+    assert.equal(found.needsPassword, true);
+    assert.deepEqual(await found.archive.get("a.txt").bytes(), HELLO);
+    const none = await checkPassword(bytes, ["wrong"]);
+    assert.equal(none.correct, undefined);
+    assert.equal(none.archive === undefined, encryptHeaders);
+  }
+  const plain = await checkPassword(await new RarWriter().add("a.txt", "a").bytes(), ["unused"]);
+  assert.equal(plain.needsPassword, false);
+  assert.equal(plain.correct, undefined);
+  assert.deepEqual(plain.archive.entries.map((entry) => entry.name), ["a.txt"]);
+  await assert.rejects(checkPassword(new Uint8Array(1), [1]), TypeError);
 });
 
 await check("member comments round-trip", async () => {

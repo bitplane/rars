@@ -431,6 +431,36 @@ export function createApi(runtime) {
     }
   }
 
+  /**
+   * Tries `candidates` in order against one volume and stops at the first proved
+   * correct, as Python's check_password(). `archive` is opened with it, or without one
+   * when the headers aren't encrypted; it is undefined only when they are and no
+   * candidate opened them.
+   */
+  async function checkPassword(input, candidates, options) {
+    const operation = operationOptions(options);
+    const list = Array.from(candidates);
+    for (const candidate of list) {
+      if (typeof candidate !== "string" && !(candidate instanceof Uint8Array)) {
+        throw new TypeError("each candidate must be a string or Uint8Array");
+      }
+    }
+    const [source] = await runtime.prepareArchiveSources(input);
+    const found = await runtime.request("checkPassword", {
+      sources: [source], candidates: list, readOptions: readOptions(operation),
+    }, operation);
+    const correct = found.correct === undefined ? undefined : list[found.correct];
+    const archive = correct !== undefined || !found.headersEncrypted
+      ? await RarArchive.open(input, { ...operation, password: correct })
+      : undefined;
+    return {
+      correct,
+      undetermined: found.undetermined.map((index) => list[index]),
+      needsPassword: found.needsPassword,
+      archive,
+    };
+  }
+
   async function probe(input, sfx) {
     if (Array.isArray(input)) throw new TypeError("expected one archive source");
     const [source] = await runtime.prepareArchiveSources(input);
@@ -475,7 +505,7 @@ export function createApi(runtime) {
     RarEntry,
     RarError,
     RarWriter,
-    repair, isRarFile, isRarFileSfx,
+    repair, isRarFile, isRarFileSfx, checkPassword,
     archiveVersions: ARCHIVE_VERSIONS,
     version: runtime.version,
   };

@@ -16,6 +16,45 @@ pub fn version() -> String {
 }
 
 /// The format names `RarBuilder` accepts, newest last.
+/// Tries `candidates` in order against one volume, stopping at the first proved correct.
+/// Returns `{ correct, undetermined, needsPassword, headersEncrypted }`, with candidates
+/// given by their index in `candidates`.
+#[wasm_bindgen(js_name = checkPassword)]
+pub fn check_password(
+    data: Vec<u8>,
+    candidates: js_sys::Array,
+    settings: JsValue,
+) -> Result<JsValue, JsValue> {
+    use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
+    let options = read_options(None, &settings)?;
+    let probe = PasswordProbe::read_owned(data, options).map_err(js_error)?;
+    let result = js_sys::Object::new();
+    let undetermined = js_sys::Array::new();
+    if probe.needs_password() {
+        for (index, candidate) in candidates.iter().enumerate() {
+            let password = password_bytes(Some(candidate.unchecked_into()))?.unwrap_or_default();
+            match probe.check(&password, options).map_err(js_error)? {
+                PasswordVerdict::Correct => {
+                    set_error_field(&result, "correct", &(index as f64).into());
+                    break;
+                }
+                PasswordVerdict::Undetermined => {
+                    undetermined.push(&(index as f64).into());
+                }
+                PasswordVerdict::Wrong => {}
+            }
+        }
+    }
+    set_error_field(&result, "undetermined", &undetermined);
+    set_error_field(&result, "needsPassword", &probe.needs_password().into());
+    set_error_field(
+        &result,
+        "headersEncrypted",
+        &probe.headers_encrypted().into(),
+    );
+    Ok(result.into())
+}
+
 /// Whether `prefix` starts with a RAR signature.
 #[wasm_bindgen(js_name = isRarFile)]
 pub fn is_rar_file(prefix: &[u8]) -> bool {

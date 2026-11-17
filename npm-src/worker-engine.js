@@ -130,7 +130,7 @@ const PHASES = {
   open: "reading", read: "reading", readMany: "reading", readComment: "reading",
   readMemberComment: "reading",
   test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
-  repair: "repairing", probe: "reading",
+  repair: "repairing", probe: "reading", checkPassword: "testing",
 };
 
 // Bytes the call produced, where its result is bytes.
@@ -166,6 +166,9 @@ export function startWorker(port, wasm, platform) {
         } finally {
           archive.free();
         }
+      } else if (operation === "checkPassword") {
+        const bytes = await sourceBytes(payload.sources[0], platform);
+        result = wasm.checkPassword(bytes, payload.candidates, payload.readOptions);
       } else if (operation === "probe") {
         // Only the signature at offset 0, or an archive start within the SFX scan; a
         // source that can't be read is not RAR, as Python's is_rarfile has it.
