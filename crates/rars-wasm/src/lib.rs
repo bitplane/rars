@@ -734,6 +734,108 @@ impl RarFile {
         self.infos.iter().any(|info| info.encrypted)
     }
 
+    /// Decodes the entries at `indices` (every entry when undefined) in one pass and hands
+    /// each file and directory to `deliver(entry, bytes)` once the core has verified it.
+    /// `entry` is `{ index, path, isDirectory, mtime }`, where `path` is the safe relative
+    /// output path, `/`-separated, built by the core's rules; links are skipped.
+    #[wasm_bindgen(js_name = extractEach)]
+    #[allow(clippy::too_many_arguments)] // JavaScript arguments.
+    pub fn extract_each(
+        &self,
+        indices: Option<Vec<u32>>,
+        password: Option<Password>,
+        settings: JsValue,
+        flatten: bool,
+        posix: bool,
+        deliver: js_sys::Function,
+        progress: Option<js_sys::Function>,
+    ) -> Result<(), JsValue> {
+        use std::cell::RefCell;
+        use std::collections::HashSet;
+        use std::rc::Rc;
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        let options = read_options(password.as_deref(), &settings)?;
+        let members: Vec<rars_rs::ArchiveMember> = if self.archives.len() == 1 {
+            self.archives[0].members().collect()
+        } else {
+            rars_rs::volume_members(&self.archives).map_err(js_error)?
+        };
+        let selected: Option<HashSet<usize>> =
+            indices.map(|indices| indices.into_iter().map(|index| index as usize).collect());
+        let chosen = |index: usize| selected.as_ref().is_none_or(|set| set.contains(&index));
+        // The core calls back for regular entries and directories in archive order, skipping links.
+        let order: Vec<usize> = members
+            .iter()
+            .enumerate()
+            .filter(|(_, member)| !member.meta.is_redirection)
+            .map(|(index, _)| index)
+            .collect();
+        let total = members
+            .iter()
+            .enumerate()
+            .filter(|(index, member)| {
+                chosen(*index) && !member.meta.is_redirection && !member.meta.is_directory
+            })
+            .map(|(_, member)| member.meta.unpacked_size)
+            .sum();
+        let family = self.archives[0].family();
+        let encoding = options.legacy_name_encoding;
+        let raised: RefCell<Option<JsValue>> = RefCell::new(None);
+        type Pending = (JsValue, Rc<RefCell<Vec<u8>>>);
+        let pending: RefCell<Option<Pending>> = RefCell::new(None);
+        // Hands over the entry before; the core has verified it by the time it opens the next.
+        let flush = || -> rars_rs::Result<()> {
+            if let Some((entry, buffer)) = pending.borrow_mut().take() {
+                let bytes = js_sys::Uint8Array::from(buffer.borrow().as_slice());
+                if let Err(error) = deliver.call2(&JsValue::NULL, &entry, &bytes) {
+                    *raised.borrow_mut() = Some(error);
+                    return Err(rars_rs::Error::InvalidArgument("extraction output failed"));
+                }
+            }
+            Ok(())
+        };
+        let mut next = 0;
+        let result = progress::watching(progress, || {
+            let count = progress::ReadCount::new("extracting", total);
+            let mut open =
+                |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<Box<dyn std::io::Write>> {
+                    flush()?;
+                    let index = order.get(next).copied().unwrap_or(usize::MAX);
+                    next += 1;
+                    if !chosen(index) {
+                        return Ok(Box::new(std::io::sink()));
+                    }
+                    let path = output_path(meta, family, encoding, flatten, posix)?;
+                    let entry = js_sys::Object::new();
+                    set_error_field(&entry, "index", &(index as f64).into());
+                    set_error_field(&entry, "path", &path.into());
+                    set_error_field(&entry, "isDirectory", &meta.is_directory.into());
+                    if let Some(time) = meta.modified {
+                        let seconds =
+                            time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9;
+                        set_error_field(&entry, "mtime", &seconds.into());
+                    }
+                    let buffer = Rc::new(RefCell::new(Vec::new()));
+                    *pending.borrow_mut() = Some((entry.into(), Rc::clone(&buffer)));
+                    Ok(count.counted(Box::new(SharedBytes(buffer))))
+                };
+            let extracted = if self.archives.len() == 1 {
+                self.archives[0].extract_to_with_options(options, &mut open)
+            } else {
+                rars_rs::extract_volumes_to_with_options(&self.archives, options, &mut open)
+            };
+            let result = extracted.and_then(|()| flush());
+            if result.is_ok() {
+                count.finish();
+            }
+            result
+        });
+        if let Some(error) = raised.into_inner() {
+            return Err(error);
+        }
+        result.map_err(js_error)
+    }
+
     /// Volume `index` of the set this first volume begins, named as RAR names it from
     /// `first_name`; undefined when the name can't take one.
     #[wasm_bindgen(js_name = volumeName)]
@@ -824,6 +926,55 @@ fn test_counted(
     }
     count.finish();
     Ok(())
+}
+
+/// Collects one member's bytes for `extractEach`.
+struct SharedBytes(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl std::io::Write for SharedBytes {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The member's relative output path, `/`-separated, by the rules Python's extraction uses:
+/// the name is validated, RAR 5 names are made native, older ones decoded, and the path
+/// must stay inside the output directory.
+fn output_path(
+    meta: &rars_rs::ExtractedEntryMeta,
+    family: rars_rs::ArchiveFamily,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    flatten: bool,
+    posix: bool,
+) -> rars_rs::Result<String> {
+    rars_rs::validate_entry_name(meta.name.clone())?;
+    let rar50 = family == rars_rs::ArchiveFamily::Rar50Plus;
+    let name = if !rar50 {
+        rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
+    } else if posix && meta.attr_source == rars_rs::AttrSource::Unix {
+        rars_rs::filename::decode_rar50(&meta.name).into_owned()
+    } else {
+        rars_rs::output_links::rar50_native_name(&meta.name, false)
+    };
+    let stored = rars_rs::filename::relative_path(&name, !rar50)?;
+    let relative = if flatten {
+        rars_rs::output_staging::flat_relative(&stored)
+    } else {
+        stored
+    };
+    let parts = relative
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    if parts.is_empty() {
+        return Err(rars_rs::Error::UnsafePath("empty output path"));
+    }
+    Ok(parts.join("/"))
 }
 
 /// Selected members decoded in one pass, counted as they decode. Unselected solid

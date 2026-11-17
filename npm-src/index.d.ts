@@ -7,9 +7,9 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "checkPassword" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
+  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "checkPassword" | "extract" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
   /** Python's ProgressPhase names, plus "repairing". */
-  phase: "reading" | "testing" | "compressing" | "protecting" | "writing" | "repairing";
+  phase: "reading" | "extracting" | "testing" | "compressing" | "protecting" | "writing" | "repairing";
   /**
    * Bytes. Writing, testing and reading from one archive report as the engine goes;
    * reading selected entries of a volume set and repairing report only start and end.
@@ -123,6 +123,8 @@ export class RarEntry {
   bytes(options?: ReadOptions): Promise<Uint8Array>;
   /** The comment attached to this entry, or undefined. */
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
+  /** Node only: extracts this entry under `directory`, as `archive.extractAll()` does, and returns the path written. */
+  extract(directory: string | URL, options?: ReadOptions & { overwrite?: boolean | "rename"; flatten?: boolean; restoreTimes?: boolean }): Promise<string>;
 }
 
 export class RarArchive {

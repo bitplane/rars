@@ -34,6 +34,18 @@ export class RarArchive {
   ): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
   test(options?: ReadOptions): Promise<void>;
+  /**
+   * Extracts entries under `directory` in one pass and returns the files written. Each is
+   * written only once verified. `overwrite` is false (refuse an existing file), true, or
+   * "rename" (write beside it as name(N).ext); `flatten` drops stored directories;
+   * `restoreTimes` (default true) sets modification times. Links are skipped.
+   */
+  extractAll(directory: NodePath, options?: ReadOptions & {
+    members?: Iterable<import("./base.js").RarEntry | RarName>;
+    overwrite?: boolean | "rename";
+    flatten?: boolean;
+    restoreTimes?: boolean;
+  }): Promise<readonly string[]>;
   close(): void;
 }
 

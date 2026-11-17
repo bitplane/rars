@@ -86,6 +86,16 @@ export function createApi(runtime) {
       }, operation);
     }
 
+    /** Extracts this entry under `directory` (Node) and returns the path written. */
+    async extract(directory, options) {
+      if (this.isDirectory) {
+        throw new RarError("ENTRY_IS_DIRECTORY", `cannot extract directory entry as a file: ${this.name}`);
+      }
+      const [written] = await this._archive.extractAll(directory, { ...options, members: [this] });
+      if (written === undefined) throw new RarError("ENTRY_NOT_FOUND", `${this.name} has no file data`);
+      return written;
+    }
+
     /** The comment attached to this entry, or undefined; Python's member_comment(). */
     async readComment(options) {
       assertOpen(this._archive);
@@ -201,6 +211,41 @@ export function createApi(runtime) {
       }
       return this._request("readMany", {
         indices,
+        readOptions: this._readOptions(operation),
+        password: operation.password ?? this._password,
+      }, operation);
+    }
+
+    /**
+     * Extracts entries under `directory` (Node) in one pass and returns the files written.
+     * `members` selects some; `overwrite` is false (refuse), true or "rename" (name(N).ext);
+     * `flatten` drops stored directories; `restoreTimes` (default true) sets modification times.
+     */
+    async extractAll(directory, options) {
+      assertOpen(this);
+      const operation = operationOptions(options);
+      const overwrite = operation.overwrite ?? false;
+      if (overwrite !== true && overwrite !== false && overwrite !== "rename") {
+        throw new TypeError('overwrite must be true, false or "rename"');
+      }
+      let indices;
+      if (operation.members !== undefined) {
+        indices = [];
+        for (const member of operation.members) {
+          const entry = member instanceof RarEntry ? member : this.get(member);
+          if (!entry) throw new RarError("ENTRY_NOT_FOUND", "no such archive entry");
+          if (entry._archive !== this) {
+            throw new RarError("INVALID_OPTION", "entry belongs to a different archive");
+          }
+          indices.push(entry.index);
+        }
+      }
+      return this._request("extract", {
+        directory: runtime.prepareOutputPath(directory),
+        indices,
+        overwrite,
+        flatten: operation.flatten ?? false,
+        restoreTimes: operation.restoreTimes ?? true,
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);

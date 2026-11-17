@@ -177,6 +177,20 @@ Caller inputs, returned caller-owned bytes, JavaScript
 runtime objects, allocator overhead, stacks and OS memory are excluded. This is
 not a process-memory ceiling and does not bound reading or rewrite staging.
 
+## Extract (Node)
+
+```js
+const written = await archive.extractAll("out", { overwrite: "rename" });
+const one = await archive.get("docs/readme.txt").extract("out");
+```
+
+`extractAll()` decodes in one pass and writes each file only once it has been
+verified, under paths the core checks stay inside the directory. An existing
+file is refused unless `overwrite` is `true`, or kept with the new one written
+beside it as `name(N).ext` under `"rename"`. `members` selects entries,
+`flatten: true` drops stored directories, and `restoreTimes` (on by default)
+sets modification times. Links are skipped. It returns the files written.
+
 ## Repair
 
 ```js

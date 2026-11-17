@@ -6,7 +6,7 @@ import "./test-npm-client.mjs";
 import "./test-npm-node.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import assert from "node:assert/strict";
@@ -196,6 +196,51 @@ await check("checkPassword finds the right candidate and opens the archive", asy
   await assert.rejects(checkPassword(new Uint8Array(1), [1]), TypeError);
 });
 
+await check("Node extracts entries once verified, refusing to overwrite by default", async () => {
+  const mtime = new Date("2024-05-06T07:08:10Z");
+  const bytes = await new RarWriter({ level: 0 })
+    .add("top.txt", HELLO, { mtime })
+    .add("nested/deep/inner.txt", SECOND, { mtime })
+    .add("nested/other.txt", "other").bytes();
+  const archive = await RarArchive.open(bytes);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-extract-"));
+  try {
+    const out = path.join(directory, "out");
+    const written = await archive.extractAll(out);
+    assert.deepEqual(written, ["top.txt", "nested/deep/inner.txt", "nested/other.txt"]
+      .map((name) => path.join(out, ...name.split("/"))));
+    assert.deepEqual(new Uint8Array(await readFile(path.join(out, "top.txt"))), HELLO);
+    assert.equal(await readFile(path.join(out, "nested", "deep", "inner.txt"), "utf8"), decode(SECOND));
+    assert.equal((await stat(path.join(out, "top.txt"))).mtime.valueOf(), mtime.valueOf());
+    const existing = (error) => error instanceof RarError && error.code === "IO"
+      && error.details.systemCode === "EEXIST";
+    await writeFile(path.join(out, "top.txt"), "precious");
+    await assert.rejects(archive.extractAll(out), existing);
+    assert.equal(await readFile(path.join(out, "top.txt"), "utf8"), "precious");
+    const renamed = await archive.extractAll(out, { overwrite: "rename", members: ["top.txt"] });
+    assert.deepEqual(renamed, [path.join(out, "top(1).txt")]);
+    assert.deepEqual(await archive.extractAll(out, { overwrite: true, members: ["top.txt"] }),
+      [path.join(out, "top.txt")]);
+    assert.deepEqual(new Uint8Array(await readFile(path.join(out, "top.txt"))), HELLO);
+    const flat = path.join(directory, "flat");
+    assert.deepEqual(await archive.get("nested/deep/inner.txt").extract(flat, { flatten: true }),
+      path.join(flat, "inner.txt"));
+    // A member that fails verification is never written.
+    const damaged = Uint8Array.from(bytes);
+    const at = Buffer.from(bytes).indexOf(Buffer.from(SECOND));
+    assert.ok(at > 0);
+    damaged[at + 2] ^= 0xff;
+    const broken = path.join(directory, "broken");
+    await assert.rejects((await RarArchive.open(damaged)).extractAll(broken));
+    assert.equal(await stat(path.join(broken, "nested", "deep", "inner.txt")).catch(() => undefined), undefined);
+    // Entries before it verified and were written.
+    assert.deepEqual(new Uint8Array(await readFile(path.join(broken, "top.txt"))), HELLO);
+  } finally {
+    archive.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 await check("member comments round-trip", async () => {
   for (const format of ["rar15", "rar29", "rar50"]) {
     const bytes = await new RarWriter({ version: format, level: 0 })
@@ -317,6 +362,8 @@ await check("Node path input and atomic file output work", async () => {
     assert.equal((await volumeArchive.entries[0].bytes()).length, 180000);
     // The later volumes are found by the names the core gives them.
     assert.deepEqual(volumeArchive.volumePaths, paths);
+    const [extracted] = await volumeArchive.extractAll(path.join(directory, "from-set"));
+    assert.equal((await readFile(extracted)).length, 180000);
     const later = await RarArchive.open(paths[1]);
     assert.deepEqual(later.volumePaths, [paths[1]]);
     later.close();

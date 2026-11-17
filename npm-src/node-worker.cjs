@@ -66,6 +66,66 @@ async function writeAtomic(target, bytes, overwrite) {
   }
 }
 
+// Writes verified entries under `directory`, as Python's extractall does: an existing file
+// is refused unless overwrite is true, or kept with the new one beside it as name(N).ext
+// under "rename". Directory times are set last, after their contents are written.
+function extractor(directory, { overwrite, restoreTimes }) {
+  const root = path.resolve(directory);
+  const written = [];
+  const directories = [];
+  const fsSync = require("node:fs");
+  function setTime(file, mtime) {
+    if (restoreTimes && mtime !== undefined) fsSync.utimesSync(file, mtime, mtime);
+  }
+  function publish(temporary, target) {
+    if (overwrite === true) {
+      fsSync.renameSync(temporary, target);
+      return target;
+    }
+    const parsed = path.parse(target);
+    for (let number = 0; ; number++) {
+      const candidate = number === 0 ? target
+        : path.join(parsed.dir, `${parsed.name}(${number})${parsed.ext}`);
+      try {
+        fsSync.linkSync(temporary, candidate);
+        fsSync.unlinkSync(temporary);
+        return candidate;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        if (overwrite !== "rename") throw alreadyExists(candidate);
+      }
+    }
+  }
+  return {
+    deliver(entry, bytes) {
+      const target = path.join(root, ...entry.path.split("/"));
+      const relative = path.relative(root, target);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw Object.assign(new Error(`unsafe archive path: ${entry.path}`), { code: "UNSAFE_ENTRY_NAME" });
+      }
+      if (entry.isDirectory) {
+        fsSync.mkdirSync(target, { recursive: true });
+        directories.push([target, entry.mtime]);
+        return;
+      }
+      fsSync.mkdirSync(path.dirname(target), { recursive: true });
+      const temporary = `${target}.rars-${process.pid}-${Date.now()}.tmp`;
+      try {
+        fsSync.writeFileSync(temporary, bytes, { flag: "wx" });
+        setTime(temporary, entry.mtime);
+        written.push(publish(temporary, target));
+      } catch (error) {
+        try { fsSync.unlinkSync(temporary); } catch {}
+        throw error;
+      }
+    },
+    finish() {
+      for (const [target, mtime] of directories.reverse()) setTime(target, mtime);
+      return written;
+    },
+  };
+}
+
 startWorker({
   onMessage(callback) { parentPort.on("message", callback); },
   post(message, transfers = []) { parentPort.postMessage(message, transfers); },
@@ -88,6 +148,8 @@ startWorker({
   },
   writeAtomic,
   refuseExisting,
+  extractor,
+  posix: process.platform !== "win32",
   async writeVolumes(firstPath, parts, format, overwrite) {
     // Validate the whole set before publishing any volume.
     const paths = volumePaths(firstPath, parts.length, format);

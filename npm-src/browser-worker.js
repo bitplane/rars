@@ -10,6 +10,7 @@ startWorker({
   readFile() { throw new Error("filesystem input is only available in Node"); },
   readPrefix() { throw new Error("filesystem input is only available in Node"); },
   isFile() { throw new Error("filesystem input is only available in Node"); },
+  extractor() { throw new Error("filesystem output is only available in Node"); },
   writeAtomic() { throw new Error("filesystem output is only available in Node"); },
   writeVolumes() { throw new Error("filesystem output is only available in Node"); },
 });

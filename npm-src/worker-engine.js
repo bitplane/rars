@@ -152,7 +152,7 @@ async function build(wasm, payload, platform, volumes, report) {
 // The phase names Python's ProgressPhase uses, plus repairing, which Python reports none for.
 const PHASES = {
   open: "reading", read: "reading", readMany: "reading", readComment: "reading",
-  readMemberComment: "reading",
+  readMemberComment: "reading", extract: "extracting",
   test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
   repair: "repairing", probe: "reading", checkPassword: "testing",
 };
@@ -180,7 +180,8 @@ export function startWorker(port, wasm, platform) {
       port.post({ id, progress: { operation, phase, completed: 0 } });
       let result;
       if (operation === "open" || operation === "read" || operation === "readMany"
-          || operation === "test" || operation === "readComment" || operation === "readMemberComment") {
+          || operation === "test" || operation === "readComment" || operation === "readMemberComment"
+          || operation === "extract") {
         if (operation === "open" && payload.sources.length === 1 && payload.sources[0]?.kind === "path") {
           payload.sources = await discoverVolumes(wasm, payload.sources[0], payload.password, platform, payload.readOptions);
         }
@@ -195,6 +196,13 @@ export function startWorker(port, wasm, platform) {
             case "test": archive.test(payload.password, payload.readOptions, report); break;
             case "readComment": result = archive.readComment(payload.password, payload.readOptions); break;
             case "readMemberComment": result = archive.readMemberComment(payload.index, payload.password, payload.readOptions); break;
+            case "extract": {
+              const output = platform.extractor(payload.directory, payload);
+              archive.extractEach(payload.indices, payload.password, payload.readOptions,
+                payload.flatten, platform.posix, output.deliver, report);
+              result = output.finish();
+              break;
+            }
           }
         } finally {
           archive.free();
