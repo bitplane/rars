@@ -147,5 +147,9 @@ export class RarWriter {
 }
 
 export function repair(input: RarInput, options?: OperationOptions): Promise<RepairResult>;
+/** Whether the input starts with a RAR signature. */
+export function isRarFile(input: RarInput): Promise<boolean>;
+/** Whether a RAR archive starts in the input, at its start or behind a self-extractor stub. */
+export function isRarFileSfx(input: RarInput): Promise<boolean>;
 export const version: string;
 export const archiveVersions: readonly ArchiveVersion[];

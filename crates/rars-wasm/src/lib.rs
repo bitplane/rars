@@ -16,6 +16,25 @@ pub fn version() -> String {
 }
 
 /// The format names `RarBuilder` accepts, newest last.
+/// Whether `prefix` starts with a RAR signature.
+#[wasm_bindgen(js_name = isRarFile)]
+pub fn is_rar_file(prefix: &[u8]) -> bool {
+    rars_rs::detect_archive_family(prefix).is_some()
+}
+
+/// Whether a RAR archive starts in `prefix`, at its start or behind a self-extractor stub,
+/// found the way opening finds it.
+#[wasm_bindgen(js_name = isRarFileSfx)]
+pub fn is_rar_file_sfx(prefix: &[u8]) -> bool {
+    rars_rs::find_archive_start(prefix, rars_rs::SFX_SCAN_LIMIT).is_some()
+}
+
+/// How many leading bytes `isRarFileSfx` needs.
+#[wasm_bindgen(js_name = sfxProbeBytes)]
+pub fn sfx_probe_bytes() -> f64 {
+    (rars_rs::SFX_SCAN_LIMIT + rars_rs::detect::RAR50_SIGNATURE.len()) as f64
+}
+
 #[wasm_bindgen(js_name = formats)]
 pub fn formats() -> Vec<String> {
     ArchiveVersion::ALL

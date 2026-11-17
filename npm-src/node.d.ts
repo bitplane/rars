@@ -49,6 +49,10 @@ export class RarWriter {
  * With `output`, the repaired archive is written there and `data` is undefined; an
  * existing file is refused unless `overwrite: true`.
  */
+/** Whether the input starts with a RAR signature; an unreadable path is not RAR. */
+export function isRarFile(input: NodeRarInput): Promise<boolean>;
+/** Whether a RAR archive starts in the input, at its start or behind a self-extractor stub. */
+export function isRarFileSfx(input: NodeRarInput): Promise<boolean>;
 export function repair(
   input: NodeRarInput,
   options?: OperationOptions & { output?: NodePath; overwrite?: boolean },

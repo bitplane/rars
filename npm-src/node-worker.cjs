@@ -88,6 +88,16 @@ startWorker({
   post(message, transfers = []) { parentPort.postMessage(message, transfers); },
 }, wasm, {
   readFile: async (file) => new Uint8Array(await fs.readFile(file)),
+  async readPrefix(file, limit) {
+    const handle = await fs.open(file, "r");
+    try {
+      const buffer = new Uint8Array(limit);
+      const { bytesRead } = await handle.read(buffer, 0, limit, 0);
+      return buffer.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+  },
   writeAtomic,
   refuseExisting,
   async writeVolumes(firstPath, parts, format, overwrite) {

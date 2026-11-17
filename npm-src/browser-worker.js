@@ -8,6 +8,7 @@ startWorker({
   post(message, transfers = []) { self.postMessage(message, transfers); },
 }, wasm, {
   readFile() { throw new Error("filesystem input is only available in Node"); },
+  readPrefix() { throw new Error("filesystem input is only available in Node"); },
   writeAtomic() { throw new Error("filesystem output is only available in Node"); },
   writeVolumes() { throw new Error("filesystem output is only available in Node"); },
 });

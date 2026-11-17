@@ -34,6 +34,15 @@ async function sourceBytes(source, platform) {
   throw new TypeError("unsupported binary source");
 }
 
+// The first `limit` bytes, read no further than that.
+async function sourcePrefix(source, platform, limit) {
+  if (source?.kind === "path") return platform.readPrefix(source.path, limit);
+  if (typeof Blob !== "undefined" && source instanceof Blob) {
+    return new Uint8Array(await source.slice(0, limit).arrayBuffer());
+  }
+  return (await sourceBytes(source, platform)).subarray(0, limit);
+}
+
 function metadata(archive, password, options) {
   const entries = archive.entries().map((info, index) => {
     if (!Number.isSafeInteger(info.size) || !Number.isSafeInteger(info.packedSize)) {
@@ -115,7 +124,7 @@ async function build(wasm, payload, platform, volumes) {
 const PHASES = {
   open: "reading", read: "reading", readMany: "reading", readComment: "reading",
   test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
-  repair: "repairing",
+  repair: "repairing", probe: "reading",
 };
 
 // Bytes the call produced, where its result is bytes.
@@ -150,6 +159,18 @@ export function startWorker(port, wasm, platform) {
         } finally {
           archive.free();
         }
+      } else if (operation === "probe") {
+        // Only the signature at offset 0, or an archive start within the SFX scan; a
+        // source that can't be read is not RAR, as Python's is_rarfile has it.
+        const limit = payload.sfx ? wasm.sfxProbeBytes() : 8;
+        let prefix;
+        try {
+          prefix = await sourcePrefix(payload.sources[0], platform, limit);
+        } catch (error) {
+          if (typeof error?.errno !== "number") throw error;
+        }
+        result = prefix !== undefined
+          && (payload.sfx ? wasm.isRarFileSfx(prefix) : wasm.isRarFile(prefix));
       } else if (operation === "repair") {
         // An existing output is refused before the work, not after it.
         if (payload.output !== undefined && !payload.overwrite) {

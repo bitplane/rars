@@ -93,6 +93,11 @@ objects and returned bytes are outside the quota. Capacity replacement overlap
 counts; this is not a process RAM limit. Refusals retain the resource error code
 and byte details.
 
+`isRarFile(input)` says whether the input starts with a RAR signature, and
+`isRarFileSfx(input)` whether an archive starts in it, behind a self-extractor
+stub or not. Only the bytes those need are read, and a path that can't be read
+is not RAR.
+
 ## Write
 
 ```js

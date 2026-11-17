@@ -15,7 +15,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const commonjs = require(path.join(here, "..", "npm"));
 const esm = await import(pathToFileURL(path.join(here, "..", "npm", "node", "index.js")));
-const { RarArchive, RarWriter, RarError, repair, version, archiveVersions } = esm;
+const { RarArchive, RarWriter, RarError, repair, isRarFile, isRarFileSfx, version, archiveVersions } = esm;
 
 let passed = 0;
 async function check(name, body) {
@@ -162,6 +162,30 @@ await check("repair restores damaged bytes", async () => {
     await assert.rejects(repair(damaged, { output }),
       (error) => error.code === "IO" && error.details.systemCode === "EEXIST");
     assert.equal((await repair(damaged, { output, overwrite: true })).data, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+await check("isRarFile and isRarFileSfx answer for bytes, Blobs and paths", async () => {
+  const bytes = await new RarWriter().add("a.txt", "a").bytes();
+  const sfx = new Uint8Array(4096 + bytes.length);
+  sfx.set(text.encode("MZ"));
+  sfx.set(bytes, 4096);
+  assert.equal(await isRarFile(bytes), true);
+  assert.equal(await isRarFile(new Blob([bytes])), true);
+  assert.equal(await isRarFile(text.encode("PK\x03\x04 not a rar")), false);
+  assert.equal(await isRarFile(sfx), false);
+  assert.equal(await isRarFileSfx(sfx), true);
+  assert.equal(await isRarFileSfx(text.encode("no archive here")), false);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-probe-"));
+  try {
+    const file = path.join(directory, "a.rar");
+    await writeFile(file, bytes);
+    assert.equal(await isRarFile(file), true);
+    // An unreadable source is not RAR, as Python's is_rarfile has it.
+    assert.equal(await isRarFile(path.join(directory, "missing.rar")), false);
+    assert.equal(await isRarFile(directory), false);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

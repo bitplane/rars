@@ -411,6 +411,22 @@ export function createApi(runtime) {
     }
   }
 
+  async function probe(input, sfx) {
+    if (Array.isArray(input)) throw new TypeError("expected one archive source");
+    const [source] = await runtime.prepareArchiveSources(input);
+    return runtime.request("probe", { sources: [source], sfx }, {});
+  }
+
+  /** Whether the source starts with a RAR signature; an unreadable source is not RAR. */
+  function isRarFile(input) {
+    return probe(input, false);
+  }
+
+  /** Whether a RAR archive starts in the source, behind a self-extractor stub or not. */
+  function isRarFileSfx(input) {
+    return probe(input, true);
+  }
+
   /** With `output` (Node), the repaired archive is written there and `data` is undefined. */
   async function repair(input, options) {
     const operation = operationOptions(options);
@@ -439,7 +455,7 @@ export function createApi(runtime) {
     RarEntry,
     RarError,
     RarWriter,
-    repair,
+    repair, isRarFile, isRarFileSfx,
     archiveVersions: ARCHIVE_VERSIONS,
     version: runtime.version,
   };
