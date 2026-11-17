@@ -329,7 +329,7 @@ mod tests {
             (Error::InvalidHeader("broken header"), false, false),
         ] {
             let volume = Error::InVolume {
-                number: 2,
+                index: 1,
                 source: Box::new(cause.clone()),
             };
             let nested = Error::AtEntry {

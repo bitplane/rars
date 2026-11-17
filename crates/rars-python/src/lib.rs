@@ -1525,7 +1525,7 @@ impl RarFile {
     /// This volume's place in its set, counting the first as 0; None when the headers don't record it.
     #[getter]
     fn volume_index(&self) -> Option<u64> {
-        self.archive.volume_number().map(|number| number - 1)
+        self.archive.volume_index()
     }
 
     #[getter]
@@ -1818,7 +1818,7 @@ impl RarFile {
                         .volume_set_members(&later)?
                         .into_iter()
                         .map(|set_member| {
-                            let (comments, links, encrypted) = &mut read[set_member.volume];
+                            let (comments, links, encrypted) = &mut read[set_member.volume_index];
                             let index = set_member.index_in_volume;
                             SourceMember {
                                 member: set_member.member,
@@ -1856,7 +1856,7 @@ impl RarFile {
         let archive = self.extract_set(py, None, options, |volumes| {
             volumes.nth(volume - 1).unwrap_or_else(|| {
                 Err(rars_rs::Error::InVolume {
-                    number: volume + 1,
+                    index: volume,
                     source: Box::new(rars_rs::Error::MissingVolume),
                 })
             })
@@ -4517,9 +4517,7 @@ fn set_fault(
             continue;
         };
         match error {
-            rars_rs::Error::InVolume { number, .. } => {
-                fault.volume_index = number.checked_sub(1);
-            }
+            rars_rs::Error::InVolume { index, .. } => fault.volume_index = Some(*index),
             rars_rs::Error::AtEntry { name, .. } if fault.member.is_none() => {
                 fault.member = Some(String::from_utf8_lossy(name).into_owned());
             }
@@ -4636,12 +4634,12 @@ fn volumes_to_last<'a>(
     volumes: &'a mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
 ) -> impl Iterator<Item = rars_rs::Result<rars_rs::Archive>> + 'a {
     let mut end = volume_end(first);
-    let mut number = 1;
+    let mut index = 0;
     std::iter::from_fn(move || {
         if end == VolumeEnd::Last {
             return None;
         }
-        number += 1;
+        index += 1;
         let volume = match volumes.next() {
             Some(volume) => volume,
             None if end == VolumeEnd::More => Err(rars_rs::Error::MissingVolume),
@@ -4649,7 +4647,7 @@ fn volumes_to_last<'a>(
         };
         end = volume.as_ref().map_or(VolumeEnd::Last, volume_end);
         Some(volume.map_err(|error| rars_rs::Error::InVolume {
-            number,
+            index,
             source: Box::new(error),
         }))
     })
@@ -4690,7 +4688,7 @@ fn list_later_volumes(
     identity: &Arc<()>,
 ) -> rars_rs::Result<SetListing> {
     let in_volume = |index: usize, error: rars_rs::Error| rars_rs::Error::InVolume {
-        number: index + 1,
+        index,
         source: Box::new(error),
     };
     let broken = rars_rs::Error::InvalidHeader(
@@ -5794,7 +5792,7 @@ mod tests {
             for cause in cases {
                 let kind = cause.kind();
                 let wrapped = CoreError::InVolume {
-                    number: 2,
+                    index: 1,
                     source: Box::new(
                         cause
                             .at_entry(b"member".to_vec(), "reading")
@@ -5831,7 +5829,7 @@ mod tests {
                 assert!(exception.to_string().contains("member"));
             }
             let missing = CoreError::InVolume {
-                number: 2,
+                index: 1,
                 source: Box::new(CoreError::EntryNotFound.at_entry(b"gone".to_vec(), "removing")),
             };
             assert!(map_builder_error(missing).is_instance_of::<PyKeyError>(py));
@@ -5847,7 +5845,7 @@ mod tests {
             (Error::InvalidHeader("broken header"), false, false),
         ] {
             let volume = Error::InVolume {
-                number: 2,
+                index: 1,
                 source: Box::new(cause.clone()),
             };
             let nested = Error::AtEntry {

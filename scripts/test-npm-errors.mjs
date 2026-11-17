@@ -21,7 +21,7 @@ async function failure(error, options = {}) {
 }
 
 const details = {
-  contexts: [{ kind: "volume", number: 3 }, { kind: "entry", nameBytes: [255, 97], operation: "reading" }],
+  contexts: [{ kind: "volume", index: 2 }, { kind: "entry", nameBytes: [255, 97], operation: "reading" }],
   limitBytes: "9007199254740993", requiredBytes: "9007199254740994",
 };
 for (const code of ["IO", "INVALID_ARCHIVE", "UNSUPPORTED_FEATURE", "PASSWORD_REQUIRED",

@@ -126,7 +126,8 @@ const bytes = await writer.bytes({
 Errors are `RarError` instances with a stable `code`; client `AbortSignal`
 cancellation uses the standard `AbortError`. Core errors carry their code through
 WASM and the worker without parsing message text. `details.contexts` retains
-entry names as raw byte arrays, operations, archive offsets and volume numbers.
+entry names as raw byte arrays, operations, archive offsets and volume indices,
+counting the first volume as 0.
 Resource-limit details use decimal strings for byte counts, preserving values
 beyond JavaScript’s exact integer range. Node filesystem errors use `IO` with
 the original system code, errno and syscall in `details`.

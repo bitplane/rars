@@ -606,7 +606,7 @@ impl<'a> VolumePacker<'a> {
         drop(volume.out);
         self.sink.finish_volume(self.index, len)?;
         self.progress.report(WriteProgressEvent::VolumeFinished {
-            volume_number: self.index as usize + 1,
+            volume_index: self.index as usize,
             total_volumes: if more {
                 self.total_volumes
             } else {

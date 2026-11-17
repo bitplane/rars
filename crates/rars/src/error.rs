@@ -92,9 +92,10 @@ pub enum Error {
         operation: &'static str,
         source: Box<Error>,
     },
-    /// A fault traced to one volume of a set, numbered from one.
+    /// A fault traced to one volume of a set, counting the first as 0. The
+    /// message counts from 1, as volume file names do.
     InVolume {
-        number: usize,
+        index: usize,
         source: Box<Error>,
     },
     /// The set needs a volume that never arrived; [`Error::InVolume`] around it numbers it.
@@ -248,7 +249,7 @@ impl std::fmt::Display for Error {
             Self::AtArchiveOffset { offset, source } => {
                 write!(f, "at archive offset {offset:#x}: {source}")
             }
-            Self::InVolume { number, source } => write!(f, "in volume {number}: {source}"),
+            Self::InVolume { index, source } => write!(f, "in volume {}: {source}", index + 1),
             Self::MissingVolume => f.write_str("volume is missing"),
             Self::AtEntry {
                 name,
@@ -434,7 +435,7 @@ impl Error {
             return self;
         }
         Self::InVolume {
-            number: index + 1,
+            index,
             source: Box::new(self),
         }
     }
@@ -800,7 +801,7 @@ mod tests {
                         0 => wrapped.at_archive_offset(42),
                         1 => wrapped.at_entry(b"member".to_vec(), "reading"),
                         _ => Error::InVolume {
-                            number: 3,
+                            index: 2,
                             source: Box::new(wrapped),
                         },
                     };

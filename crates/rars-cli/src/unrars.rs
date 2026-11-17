@@ -694,9 +694,9 @@ where
 
 fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error) -> i32 {
     let member = rars::output_staging::failed_entry_name(error).map(display_name);
-    if let Some(number) = missing_volume(error) {
+    if let Some(index) = missing_volume(error) {
         let name = archive
-            .volume_path(path, number.saturating_sub(1))
+            .volume_path(path, index)
             .unwrap_or_else(|| path.to_path_buf());
         out.error(&format!("Cannot find volume {}", name.display()));
         out.info("Total errors: 1");
@@ -723,8 +723,8 @@ fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error)
 
 fn missing_volume(error: &rars::Error) -> Option<usize> {
     match error {
-        rars::Error::InVolume { number, source } if **source == rars::Error::MissingVolume => {
-            Some(*number)
+        rars::Error::InVolume { index, source } if **source == rars::Error::MissingVolume => {
+            Some(*index)
         }
         rars::Error::AtEntry { source, .. }
         | rars::Error::AtArchiveOffset { source, .. }

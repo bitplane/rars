@@ -596,7 +596,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
                 }
             };
             return Some(Error::InVolume {
-                number: fragment.volume + 1,
+                index: fragment.volume,
                 source: Box::new(source),
             });
         }

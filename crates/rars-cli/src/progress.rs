@@ -404,7 +404,7 @@ mod tests {
         });
         assert!(progress.bar.message().contains("name\\u{1b}"));
         progress.report(WriteProgressEvent::VolumeFinished {
-            volume_number: 1,
+            volume_index: 0,
             total_volumes: Some(1),
             bytes: 999,
         });

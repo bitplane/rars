@@ -59,7 +59,8 @@ pub enum WriteProgressEvent<'a> {
     BytesWritten { completed_bytes: u64 },
     /// One volume of a multi-volume set has been written out.
     VolumeFinished {
-        volume_number: usize,
+        /// Counting the set's first volume as 0.
+        volume_index: usize,
         total_volumes: Option<usize>,
         bytes: u64,
     },

@@ -332,7 +332,7 @@ mod tests {
             })
             .unwrap_err();
         let err = Error::InVolume {
-            number: 2,
+            index: 1,
             source: Box::new(err),
         };
         assert_eq!(budget.used, 4);
