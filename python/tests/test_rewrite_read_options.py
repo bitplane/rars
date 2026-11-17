@@ -35,14 +35,14 @@ def test_limits_apply_while_the_source_is_read(preserve):
 def test_each_call_that_reads_the_source_takes_its_own_cancellation():
     cancelled = rars.CancellationToken()
     cancelled.cancel()
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         rars.RarBuilder.from_archive(payload_archive(), cancellation=cancelled)
     live = rars.CancellationToken()
     rewrite = rars.RarBuilder.from_archive(payload_archive(), cancellation=live)
     live.cancel()
     # from_archive's token ended with that call; staging follows the write's.
     assert rars.RarFile(rewrite.to_bytes()).read("payload.txt") == b"payload" * 100
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         rewrite.to_bytes(cancellation=cancelled)
 
 

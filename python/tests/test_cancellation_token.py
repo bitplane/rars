@@ -21,7 +21,7 @@ def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, f
     assert token.is_cancelled()
     destination = tmp_path / "archive.rar"
     destination.write_bytes(b"keep")
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         if method == "to_bytes":
             builder.to_bytes(cancellation=token)
         else:
@@ -56,11 +56,11 @@ def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
             token.cancel()
         finally:
             resume.set()
-        with pytest.raises(InterruptedError):
+        with pytest.raises(rars.Cancelled):
             future.result(timeout=10)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         builder.write(destination, cancellation=token)
     fresh = rars.CancellationToken()
     builder.write(destination, cancellation=fresh)
@@ -89,3 +89,15 @@ def test_callback_failure_does_not_cancel_the_callers_token(tmp_path, rewrite):
     output = rars.RarFile(builder.to_bytes(cancellation=token))
     assert output.read("file") == b"payload"
     assert not token.is_cancelled()
+
+
+def test_a_cancelled_read_is_neither_an_os_error_nor_a_rars_error():
+    builder = rars.RarBuilder(store=True)
+    builder.add_bytes(b"payload", "file")
+    archive = rars.RarFile(builder.to_bytes())
+    token = rars.CancellationToken()
+    token.cancel()
+    with pytest.raises(rars.Cancelled) as raised:
+        archive.read("file", cancellation=token)
+    assert not isinstance(raised.value, (OSError, rars.Error))
+    assert "writing" not in str(raised.value)

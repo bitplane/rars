@@ -23,7 +23,7 @@ def test_comment_policies_keep_defaults_and_reset_budgets(format, comment):
                 archive.read_comment(options=rars.ReadOptions(**{field: size - 1}))
     token = rars.CancellationToken()
     token.cancel()
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         archive.read_comment(cancellation=token)
     assert archive.comment == comment
     assert archive.read_comment() == comment

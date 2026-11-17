@@ -36,6 +36,7 @@ __all__ = [
     "NotRarFile",
     "UnsafeArchivePath",
     "UnsafeLinkWarning",
+    "Cancelled",
     "RAR13",
     "RAR14",
     "RAR15",
@@ -119,6 +120,9 @@ class UnsupportedRarFeature(Error): ...
 class NotRarFile(Error): ...
 class UnsafeArchivePath(Error): ...
 class UnsafeLinkWarning(UserWarning): ...
+
+class Cancelled(Exception):
+    """A CancellationToken or progress callback stopped the call. Not a rars.Error."""
 
 @final
 class ProgressEvent:

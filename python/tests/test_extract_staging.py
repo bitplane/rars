@@ -154,7 +154,7 @@ def test_no_staging_remains_after_success_cancellation_or_a_raising_volumes_iter
             token.cancel()
             yield from paths[1:]
 
-        with pytest.raises(InterruptedError):
+        with pytest.raises(rars.Cancelled):
             archive.extractall(tmp_path / "cancelled", volumes=cancelling(),
                                cancellation=token)
 

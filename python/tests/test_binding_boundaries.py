@@ -278,7 +278,7 @@ def test_cancelled_volume_publication_preserves_old_destination(tmp_path):
 
     first = tmp_path / "archive.rar"
     first.write_bytes(b"original")
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         builder.write_volumes(first, progress=finish, cancellation=cancellation)
     assert cancellation.is_cancelled()
     assert first.read_bytes() == b"original"

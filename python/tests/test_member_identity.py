@@ -34,7 +34,7 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     token = rars.CancellationToken()
     token.cancel()
     for members in [[], ["missing"], [first]]:
-        with pytest.raises(InterruptedError):
+        with pytest.raises(rars.Cancelled):
             archive.read_many(members, cancellation=token)
     for info, payload, timestamp, comment in [
         (first, b"first", 10, b"first comment"),

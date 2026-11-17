@@ -66,7 +66,7 @@ def test_cancelled_reader_operations_do_no_output_work(tmp_path, method, empty_s
     token = rars.CancellationToken()
     token.cancel()
     name = "missing" if empty_selection else "first"
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         if method in ("read", "open"):
             getattr(archive, method)(name, cancellation=token)
         elif method == "extract":
@@ -166,7 +166,7 @@ def test_open_options_are_defaults_that_a_calls_options_replace(tmp_path, format
             open_archive(options)
     token = rars.CancellationToken()
     token.cancel()
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         open_archive(None, cancellation=token)
     options = rars.ReadOptions(max_header_count=100, max_header_bytes=10000, max_member_output_bytes=0)
     assert options.max_header_count == 100
@@ -214,7 +214,7 @@ def test_volume_policies_cover_parsing_and_logical_member_limits(tmp_path, forma
     assert target.read_bytes() == payload
     token = rars.CancellationToken()
     token.cancel()
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         rars.RarFile(paths[0]).testrar(cancellation=token, volumes=[tmp_path / "missing.rar"])
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         rars.RarFile(paths[0]).extractall(output, cancellation=token, volumes=[tmp_path / "missing.rar"])

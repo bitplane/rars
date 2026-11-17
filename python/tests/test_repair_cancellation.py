@@ -11,7 +11,7 @@ def test_cancelled_repair_does_not_read_input_or_touch_output(tmp_path, to_file,
     token.cancel()
     output = tmp_path / "existing.rar"
     output.write_bytes(b"keep")
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         rars.repair(source, output=output if to_file else None, cancellation=token)
     assert output.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [output]
@@ -41,7 +41,7 @@ def test_repair_token_is_reusable_and_path_publication_cleans_up(tmp_path, forma
     assert not token.is_cancelled()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["input.rar", "output.rar"]
     token.cancel()
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         rars.repair(source, output=output, cancellation=token)
     assert output.read_bytes() == repaired
     rars.repair(source, output=source)

@@ -103,7 +103,7 @@ def test_cancelled_volume_set_restores_completed_outputs_and_drops_the_rest(tmp_
         token.cancel()
         yield from paths[1:]
 
-    with rars.RarFile(paths[0]) as archive, pytest.raises(InterruptedError):
+    with rars.RarFile(paths[0]) as archive, pytest.raises(rars.Cancelled):
         archive.extractall(tmp_path / "out", volumes=volumes(), cancellation=token)
 
     assert os.stat(tmp_path / "out/small.txt").st_mtime == 1_600_000_000

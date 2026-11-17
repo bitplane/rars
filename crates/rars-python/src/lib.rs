@@ -1,6 +1,5 @@
 use pyo3::exceptions::{
-    PyInterruptedError, PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError,
-    PyValueError,
+    PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
@@ -36,6 +35,8 @@ create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
 create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
+// Outside `Error`, so a loop that skips bad archives doesn't swallow a cancel.
+create_exception!(rars, Cancelled, pyo3::exceptions::PyException);
 
 /// `str` subclasses, so each member still compares, hashes and formats as its
 /// value did when these were plain strings. Python 3.10 has no `StrEnum`.
@@ -2875,7 +2876,7 @@ fn output_directory(path: &Path) -> &Path {
 
 fn check_python_cancellation(cancellation: Option<&CancellationToken>) -> PyResult<()> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(PyInterruptedError::new_err("operation cancelled"));
+        return Err(Cancelled::new_err(rars_rs::Error::Cancelled.to_string()));
     }
     Ok(())
 }
@@ -3160,6 +3161,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("NotRarFile", py.get_type::<NotRarFile>())?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
     m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
+    m.add("Cancelled", py.get_type::<Cancelled>())?;
     let enums = PyModule::from_code(py, ENUMS, c"rars/_enums.py", c"rars._enums")?;
     for name in [
         "ArchiveVersion",
@@ -4739,7 +4741,7 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
         ErrorKind::InvalidArgument | ErrorKind::DuplicateEntry => PyValueError::new_err(message),
         ErrorKind::EntryNotFound => PyKeyError::new_err(message),
         ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
-        ErrorKind::Cancelled => PyInterruptedError::new_err(message),
+        ErrorKind::Cancelled => Cancelled::new_err(message),
         ErrorKind::WriterFailure => pyo3::exceptions::PyRuntimeError::new_err(message),
         _ => BadRarFile::new_err(message),
     }
@@ -5269,10 +5271,7 @@ mod tests {
                     )
                     .unwrap_err();
                 py.detach(|| worker.join().unwrap());
-                assert!(
-                    error.is_instance_of::<PyInterruptedError>(py),
-                    "{format}: {error}"
-                );
+                assert!(error.is_instance_of::<Cancelled>(py), "{format}: {error}");
                 assert_eq!(
                     file.read(py, name.as_any(), None, None, None, None, None)
                         .unwrap(),
@@ -5554,9 +5553,7 @@ mod tests {
                     rars_rs::ErrorKind::ResourceLimit => {
                         exception.is_instance_of::<PyMemoryError>(py)
                     }
-                    rars_rs::ErrorKind::Cancelled => {
-                        exception.is_instance_of::<PyInterruptedError>(py)
-                    }
+                    rars_rs::ErrorKind::Cancelled => exception.is_instance_of::<Cancelled>(py),
                     rars_rs::ErrorKind::WriterFailure => {
                         exception.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)
                     }

@@ -54,7 +54,7 @@ def test_metadata_reads_honour_cancellation(method):
     token = rars.CancellationToken()
     token.cancel()
     member = "link" if method == "readlink" else "file"
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         getattr(archive, method)(member, cancellation=token)
     assert getattr(archive, method)(member, options=rars.ReadOptions())
 

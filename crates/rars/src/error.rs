@@ -213,7 +213,7 @@ pub enum Error {
     Io(IoError),
     NeedPassword,
     WrongPasswordOrCorruptData,
-    /// Archive writing was cancelled by a token or progress callback.
+    /// The operation was cancelled by a token or progress callback.
     Cancelled,
     CrcMismatch {
         expected: u16,
@@ -342,7 +342,7 @@ impl std::fmt::Display for Error {
             Self::WrongPasswordOrCorruptData => {
                 write!(f, "wrong password or corrupt encrypted data")
             }
-            Self::Cancelled => f.write_str("archive writing was cancelled"),
+            Self::Cancelled => f.write_str("operation cancelled"),
             Self::CrcMismatch { expected, actual } => {
                 write!(
                     f,
