@@ -13,7 +13,7 @@ def test_legacy_encoding_callback_exception_preserves_destination(tmp_path, form
     failure = RuntimeError("cancel encoding")
 
     def stop(event):
-        if event.phase == "compression" and event.completed > 0:
+        if event.phase == "compressing" and event.completed > 0:
             raise failure
 
     with pytest.raises(RuntimeError) as caught:

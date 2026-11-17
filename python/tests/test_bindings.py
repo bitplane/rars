@@ -163,7 +163,7 @@ def test_builder_reports_compression_progress():
 
     assert data
     assert events
-    compression = [event for event in events if event.phase == "compression"]
+    compression = [event for event in events if event.phase == "compressing"]
     assert compression
     assert compression[-1].completed == compression[-1].total
     assert compression[-1].percentage == 100.0

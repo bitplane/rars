@@ -88,8 +88,9 @@ class ProgressPhase(str, Enum):
     EXTRACTING = "extracting"
     TESTING = "testing"
     STAGING = "staging"
-    COMPRESSION = "compression"
-    RECOVERY = "recovery"
+    COMPRESSING = "compressing"
+    PROTECTING = "protecting"
+    """Adding a recovery record."""
     WRITING = "writing"
 
 

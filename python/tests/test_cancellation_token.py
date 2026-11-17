@@ -30,7 +30,7 @@ def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, f
     assert list(tmp_path.iterdir()) == [destination]
 
 
-@pytest.mark.parametrize("phase", ["compression", "staging"])
+@pytest.mark.parametrize("phase", ["compressing", "staging"])
 def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
     builder = rars.RarBuilder(level=0)
     payload = b"thread cancellation\n" * 10000

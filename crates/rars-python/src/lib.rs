@@ -81,8 +81,8 @@ class ProgressPhase(str, enum.Enum):
     EXTRACTING = 'extracting'
     TESTING = 'testing'
     STAGING = 'staging'
-    COMPRESSION = 'compression'
-    RECOVERY = 'recovery'
+    COMPRESSING = 'compressing'
+    PROTECTING = 'protecting'
     WRITING = 'writing'
 
 
@@ -777,8 +777,8 @@ impl Drop for CountedWriter {
 fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
     match operation {
         rars_rs::WriteOperation::Staging => "staging",
-        rars_rs::WriteOperation::Compression => "compression",
-        rars_rs::WriteOperation::Recovery => "recovery",
+        rars_rs::WriteOperation::Compression => "compressing",
+        rars_rs::WriteOperation::Recovery => "protecting",
         _ => "writing",
     }
 }

@@ -72,7 +72,7 @@ def test_default_directory_and_cleanup_after_writer_callback_failure(tmp_path, m
     expected = cwd if method == "to_bytes" else output_dir
 
     def stop(event):
-        if event.phase != "compression" or not list(expected.glob(".rars-spool-*")):
+        if event.phase != "compressing" or not list(expected.glob(".rars-spool-*")):
             return
         # Abort while the writer owns staged payloads, before publication.
         raise RuntimeError("stop after staging")
@@ -149,7 +149,7 @@ def test_staging_progress_counts_decoded_dependencies_during_compression(tmp_pat
     assert [event.completed for event in staging] == sorted(event.completed for event in staging)
     names = {event.entry_name for event in staging if event.entry_name is not None}
     assert names == ({b"first", b"second"} if solid else {b"second"})
-    assert any(event.phase == "compression" for event in events)
+    assert any(event.phase == "compressing" for event in events)
     assert list(tmp_path.iterdir()) == []
 
 
