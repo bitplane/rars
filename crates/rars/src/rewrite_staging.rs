@@ -32,6 +32,31 @@ pub struct VolumeSetMember {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod pipeline;
 
+/// Bare WebAssembly has no threads to overlap staging with writing, so payloads
+/// are all staged, in memory, before the write starts and nothing delivers early.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+mod pipeline {
+    use crate::atomic64::AtomicU64;
+    use crate::{EntrySource, Result};
+    use std::sync::Arc;
+
+    pub(super) enum Delivery {}
+
+    impl Delivery {
+        pub(super) fn used(&self) -> &Arc<AtomicU64> {
+            match *self {}
+        }
+
+        pub(super) fn wait_for(&self, _: usize) -> Result<()> {
+            match *self {}
+        }
+
+        pub(super) fn publish(&self, _: usize, _: EntrySource) -> Result<()> {
+            match *self {}
+        }
+    }
+}
+
 impl Archive {
     /// Set rewrites number members by this list, each counted once however many volumes it spans.
     #[doc(hidden)]
@@ -105,10 +130,15 @@ impl Archive {
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
-            let _ = (later_volumes, indices, options, staging, progress, consume);
-            Err(crate::Error::InvalidArgument(
-                "rewrite staging requires disk storage",
-            ))
+            consume(native::stage(
+                self,
+                later_volumes,
+                indices,
+                options,
+                staging,
+                progress,
+                None,
+            )?)
         }
     }
 
@@ -146,10 +176,15 @@ impl Archive {
         }
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
-            let _ = (indices, options, staging, progress, consume);
-            Err(crate::Error::InvalidArgument(
-                "rewrite staging requires disk storage",
-            ))
+            consume(native::stage(
+                self,
+                &[],
+                indices,
+                options,
+                staging,
+                progress,
+                None,
+            )?)
         }
     }
 
@@ -167,7 +202,7 @@ impl Archive {
     /// until the last source or open reader drops. This stages the entire
     /// selection before returning, with an explicit disk limit; it is not a
     /// total memory limit or an incremental writer pipeline. Bare WebAssembly
-    /// is unsupported because this operation requires disk storage.
+    /// has no disk, so there the payloads are held in memory, under the same limit.
     pub fn stage_rewrite_sources(
         &self,
         indices: &[usize],
@@ -193,21 +228,10 @@ impl Archive {
         staging: &RewriteStaging,
         progress: Option<Arc<dyn crate::WriteProgress>>,
     ) -> Result<Vec<EntrySource>> {
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
-            native::stage(self, &[], indices, options, staging, progress, None)
-        }
-        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-        {
-            let _ = (indices, options, staging, progress);
-            Err(crate::Error::InvalidArgument(
-                "rewrite staging requires disk storage",
-            ))
-        }
+        native::stage(self, &[], indices, options, staging, progress, None)
     }
 }
 
-#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
     use super::*;
     use crate::atomic64::AtomicU64;
@@ -431,7 +455,7 @@ mod native {
         let resources = WriterResources::new(0).with_temp_dir(&staging.directory);
         let used = delivery.map_or_else(
             || Arc::new(AtomicU64::new(0)),
-            |delivery| delivery.used.clone(),
+            |delivery| delivery.used().clone(),
         );
         let mut index = 0;
         let mut pending = None;

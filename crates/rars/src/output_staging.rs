@@ -347,6 +347,7 @@ fn replace_in_place(path: &Path) -> std::io::Result<File> {
     }
 }
 
+#[cfg(any(unix, windows))]
 fn refused_in_place() -> std::io::Error {
     std::io::Error::other("refusing to write in place through a link or special file")
 }

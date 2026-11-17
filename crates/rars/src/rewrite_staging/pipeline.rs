@@ -24,6 +24,12 @@ pub(super) struct Delivery {
     max_preparation_window: usize,
 }
 
+impl Delivery {
+    pub(super) fn used(&self) -> &Arc<AtomicU64> {
+        &self.used
+    }
+}
+
 struct Lease {
     source: Option<EntrySource>,
     size: u64,
