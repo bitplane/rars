@@ -155,6 +155,19 @@ Caller inputs, returned caller-owned bytes, JavaScript
 runtime objects, allocator overhead, stacks and OS memory are excluded. This is
 not a process-memory ceiling and does not bound reading or rewrite staging.
 
+## Repair
+
+```js
+import { repair } from "@bitplane/rars";
+
+const { data, report } = await repair(damaged, { password: "optional" });
+console.log(report.dataRepaired, report.recoveryRecordRebuilt);
+```
+
+`repair()` rebuilds a RAR 5 archive from its recovery record. In Node,
+`{ output: path }` writes the result there instead and leaves `data` undefined;
+an existing file is refused unless `overwrite: true`.
+
 ## Loading
 
 ES modules, Node `require`, Vite, webpack, Rollup and direct browser imports use

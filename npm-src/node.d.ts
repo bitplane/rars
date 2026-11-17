@@ -39,5 +39,11 @@ export class RarWriter {
   close(): void;
 }
 
-export function repair(input: NodeRarInput, options?: OperationOptions): Promise<Uint8Array>;
-export function repairDetailed(input: NodeRarInput, options?: OperationOptions): Promise<import("./base.js").RepairResult>;
+/**
+ * With `output`, the repaired archive is written there and `data` is undefined; an
+ * existing file is refused unless `overwrite: true`.
+ */
+export function repair(
+  input: NodeRarInput,
+  options?: OperationOptions & { output?: NodePath; overwrite?: boolean },
+): Promise<import("./base.js").RepairResult>;

@@ -129,9 +129,10 @@ export function startWorker(port, wasm, platform) {
           archive.free();
         }
       } else if (operation === "repair") {
-        const bytes = await sourceBytes(payload.sources[0], platform);
-        result = wasm.repair(bytes, payload.password);
-      } else if (operation === "repairDetailed") {
+        // An existing output is refused before the work, not after it.
+        if (payload.output !== undefined && !payload.overwrite) {
+          await platform.refuseExisting(payload.output);
+        }
         const bytes = await sourceBytes(payload.sources[0], platform);
         const detailed = wasm.repairDetailed(bytes, payload.password);
         const report = detailed.report;
@@ -147,6 +148,10 @@ export function startWorker(port, wasm, platform) {
         } finally {
           report.free();
           detailed.free();
+        }
+        if (payload.output !== undefined) {
+          await platform.writeAtomic(payload.output, result.data, payload.overwrite);
+          result.data = undefined;
         }
       } else if (operation === "build") {
         result = await build(wasm, payload, platform, false);

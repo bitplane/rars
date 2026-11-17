@@ -89,6 +89,7 @@ startWorker({
 }, wasm, {
   readFile: async (file) => new Uint8Array(await fs.readFile(file)),
   writeAtomic,
+  refuseExisting,
   async writeVolumes(firstPath, parts, format, overwrite) {
     // Validate the whole set before publishing any volume.
     const paths = volumePaths(firstPath, parts.length, format);

@@ -15,7 +15,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const commonjs = require(path.join(here, "..", "npm"));
 const esm = await import(pathToFileURL(path.join(here, "..", "npm", "node", "index.js")));
-const { RarArchive, RarWriter, RarError, repair, repairDetailed, version, archiveVersions } = esm;
+const { RarArchive, RarWriter, RarError, repair, version, archiveVersions } = esm;
 
 let passed = 0;
 async function check(name, body) {
@@ -134,16 +134,26 @@ await check("repair restores damaged bytes", async () => {
   writer.add("payload.bin", payload);
   const damaged = Uint8Array.from(await writer.bytes());
   for (let i = 0; i < 64; i += 1) damaged[Math.floor(damaged.length / 2) + i] ^= 0xff;
-  const fixed = await repair(damaged);
-  const archive = await RarArchive.open(fixed);
+  const repaired = await repair(damaged);
+  assert.equal(repaired.report.changed, true);
+  assert.equal(repaired.report.dataRepaired, true);
+  assert.ok(repaired.report.expectedRecoveryShards >= 1);
+  const archive = await RarArchive.open(repaired.data);
   assert.deepEqual(await archive.entries[0].bytes(), payload);
 
-  const detailed = await repairDetailed(damaged);
-  assert.equal(detailed.report.changed, true);
-  assert.equal(detailed.report.dataRepaired, true);
-  assert.ok(detailed.report.expectedRecoveryShards >= 1);
-  const detailedArchive = await RarArchive.open(detailed.data);
-  assert.deepEqual(await detailedArchive.entries[0].bytes(), payload);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-repair-"));
+  try {
+    const output = path.join(directory, "fixed.rar");
+    const written = await repair(damaged, { output });
+    assert.equal(written.data, undefined);
+    assert.equal(written.report.dataRepaired, true);
+    assert.deepEqual(await (await RarArchive.open(output)).entries[0].bytes(), payload);
+    await assert.rejects(repair(damaged, { output }),
+      (error) => error.code === "IO" && error.details.systemCode === "EEXIST");
+    assert.equal((await repair(damaged, { output, overwrite: true })).data, undefined);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 await check("codec work leaves the Node event loop responsive", async () => {

@@ -11,7 +11,7 @@ async function failure(error, options = {}) {
   startWorker({
     onMessage(callback) { dispatch = callback; },
     post(message) { replies.push(structuredClone(message)); },
-  }, { repair() { throw error; } }, options.platform ?? {});
+  }, { repairDetailed() { throw error; } }, options.platform ?? {});
   await dispatch({ id: 7, operation: "repair", payload: {
     sources: options.sources ?? [new Uint8Array([0])],
   } });

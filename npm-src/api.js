@@ -403,8 +403,12 @@ export function createApi(runtime) {
     }
   }
 
+  /** With `output` (Node), the repaired archive is written there and `data` is undefined. */
   async function repair(input, options) {
     const operation = operationOptions(options);
+    const overwrite = operation.overwrite ?? false;
+    if (typeof overwrite !== "boolean") throw new TypeError("overwrite must be a boolean");
+    const output = operation.output == null ? undefined : runtime.prepareOutputPath(operation.output);
     const sources = await runtime.prepareArchiveSources(input);
     if (sources.length !== 1) {
       throw new RarError("UNSUPPORTED_FEATURE", "repair currently accepts one archive volume");
@@ -412,16 +416,9 @@ export function createApi(runtime) {
     return runtime.request("repair", {
       sources,
       password: operation.password,
+      output,
+      overwrite,
     }, operation);
-  }
-
-  async function repairDetailed(input, options) {
-    const operation = operationOptions(options);
-    const sources = await runtime.prepareArchiveSources(input);
-    if (sources.length !== 1) {
-      throw new RarError("UNSUPPORTED_FEATURE", "repair currently accepts one archive volume");
-    }
-    return runtime.request("repairDetailed", { sources, password: operation.password }, operation);
   }
 
   runtime.setErrorFactory((error) => {
@@ -434,7 +431,7 @@ export function createApi(runtime) {
     RarEntry,
     RarError,
     RarWriter,
-    repair, repairDetailed,
+    repair,
     archiveVersions: ARCHIVE_VERSIONS,
     version: runtime.version,
   };
