@@ -376,6 +376,20 @@ impl WriterResources {
         }
     }
 
+    /// Replace the compression workspace budget, keeping the rest of the policy.
+    ///
+    /// Unlike [`WriterResources::new`], each job is still planned within the
+    /// limit it had, or within `limit` when that is lower. A budget at or above
+    /// [`DEFAULT_WRITER_MEMORY_LIMIT`] therefore changes only how many jobs run
+    /// at once, never the archive written; a lower one also plans smaller jobs.
+    /// Configure before execution; clones share the new budget.
+    pub fn with_memory_limit(mut self, limit: u64) -> Self {
+        self.memory_limit = limit;
+        self.planning_limit = self.planning_limit.min(limit);
+        self.budget = Arc::new(MemoryBudget::new(limit));
+        self
+    }
+
     /// Set a hard ceiling on managed writer allocation capacity for RAR5/7.
     /// Includes active work, retained spools/headers, conversion and owned output.
     /// Caller-owned inputs and external sinks, allocator/runtime overhead, stacks
@@ -1217,6 +1231,23 @@ mod tests {
 
         // A 2 GiB container on a 32-thread host gets a quarter of its limit.
         assert_eq!(scaled_writer_memory_limit(32, Some(2 * GIB)), GIB / 2);
+    }
+
+    #[test]
+    fn a_new_budget_keeps_jobs_planned_as_before_unless_it_is_smaller() {
+        use super::*;
+
+        const MIB: u64 = 1024 * 1024;
+        let raised = WriterResources::default().with_memory_limit(4096 * MIB);
+        assert_eq!(raised.memory_limit(), 4096 * MIB);
+        assert_eq!(raised.planning_memory_limit(), DEFAULT_WRITER_MEMORY_LIMIT);
+        let lowered = WriterResources::default().with_memory_limit(64 * MIB);
+        assert_eq!(lowered.memory_limit(), 64 * MIB);
+        assert_eq!(lowered.planning_memory_limit(), 64 * MIB);
+        let quota = WriterResources::default()
+            .with_max_memory_bytes(MIB)
+            .with_memory_limit(512 * MIB);
+        assert_eq!(quota.max_memory_bytes(), Some(MIB));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import random
 import pytest
 import rars
 
@@ -55,3 +56,61 @@ def test_encrypted_recovery_and_volume_output_obey_memory_policy(tmp_path, encry
         archive.testrar(volumes=parts[1:])
         archive.extractall(output, volumes=parts[1:])
     assert (output / "member").read_bytes() == b"payload" * 1024
+
+
+ALL_VERSIONS = ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70"]
+
+
+def _members(builder):
+    # Text and noise, so compressed members take real work.
+    builder.add_bytes(b"workspace budget " * 40000, "text.txt")
+    builder.add_bytes(random.Random(1).randbytes(300000), "noise.bin")
+    return builder
+
+
+@pytest.mark.parametrize("format", ALL_VERSIONS)
+def test_a_workspace_budget_changes_no_bytes(tmp_path, format):
+    level = 0 if format == "rar13" else 3
+    expected = _members(rars.RarBuilder(version=format, level=level)).to_bytes()
+    for budget in (256 << 20, 4 << 30):
+        resources = rars.WriterResources(max_workspace_bytes=budget)
+        builder = _members(rars.RarBuilder(version=format, level=level, resources=resources))
+        assert builder.to_bytes() == expected
+        [path] = builder.write(tmp_path / f"{format}-{budget}.rar")
+        assert path.read_bytes() == expected
+
+
+@pytest.mark.parametrize("format", ["rar20", "rar29", "rar50"])
+def test_a_small_workspace_budget_still_writes_readable_volumes(tmp_path, format):
+    # Below the 256 MiB a job plans within, though above what one RAR 5 job needs.
+    payload = random.Random(1).randbytes(300000)
+    resources = rars.WriterResources(max_workspace_bytes=128 << 20)
+    builder = rars.RarBuilder(version=format, level=3, volume_size=200000, resources=resources)
+    plain = rars.RarBuilder(version=format, level=3, volume_size=200000)
+    for each in (builder, plain):
+        each.add_bytes(payload, "text.txt")
+    parts = builder.write(tmp_path / f"{format}.rar")
+    assert len(parts) > 1
+    if format != "rar50":
+        # Legacy writers plan nothing by workspace, so the bytes match too.
+        expected = plain.write(tmp_path / f"{format}-plain.rar")
+        assert [part.read_bytes() for part in parts] == [part.read_bytes() for part in expected]
+    with rars.RarFile(parts[0]) as archive:
+        archive.testrar(volumes=parts[1:])
+        assert archive.read("text.txt", volumes=parts[1:]) == payload
+
+
+def test_a_workspace_budget_too_small_for_one_job_is_refused():
+    resources = rars.WriterResources(max_workspace_bytes=16 << 20)
+    builder = rars.RarBuilder(version="rar50", level=3, resources=resources)
+    builder.add_bytes(b"x" * 300000, "a")
+    with pytest.raises(rars.LimitExceeded, match="working memory"):
+        builder.to_bytes()
+
+
+def test_workspace_budget_reads_back_and_refuses_zero():
+    assert rars.WriterResources().max_workspace_bytes is None
+    resources = rars.WriterResources(max_workspace_bytes=1 << 30, max_memory_bytes=1 << 31)
+    assert (resources.max_workspace_bytes, resources.max_memory_bytes) == (1 << 30, 1 << 31)
+    with pytest.raises(ValueError, match="max_workspace_bytes"):
+        rars.WriterResources(max_workspace_bytes=0)

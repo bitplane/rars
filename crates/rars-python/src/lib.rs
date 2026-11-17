@@ -224,20 +224,38 @@ struct WriterResources {
     /// raises `LimitExceeded`. `RarBuilder` refuses it for older versions.
     #[pyo3(get)]
     max_memory_bytes: Option<u64>,
+    /// How much the members compressing at once may plan to use, for every
+    /// version; the CLI's `--memory-limit`. The default is 256 MiB plus 160 MiB
+    /// for each thread past the first, up to a quarter of memory on Linux.
+    /// Lowering it runs fewer members at once; below 256 MiB it also plans
+    /// smaller jobs, which can change the archive written.
+    #[pyo3(get)]
+    max_workspace_bytes: Option<u64>,
 }
 
 #[pymethods]
 impl WriterResources {
     #[new]
-    #[pyo3(signature = (*, max_memory_bytes = None))]
-    fn new(max_memory_bytes: Option<u64>) -> Self {
-        Self { max_memory_bytes }
+    #[pyo3(signature = (*, max_memory_bytes = None, max_workspace_bytes = None))]
+    fn new(max_memory_bytes: Option<u64>, max_workspace_bytes: Option<u64>) -> PyResult<Self> {
+        if max_workspace_bytes == Some(0) {
+            return Err(PyValueError::new_err(
+                "max_workspace_bytes must be more than 0",
+            ));
+        }
+        Ok(Self {
+            max_memory_bytes,
+            max_workspace_bytes,
+        })
     }
 }
 
 impl WriterResources {
     fn core(&self) -> rars_rs::WriterResources {
-        let resources = rars_rs::WriterResources::default();
+        let mut resources = rars_rs::WriterResources::default();
+        if let Some(limit) = self.max_workspace_bytes {
+            resources = resources.with_memory_limit(limit);
+        }
         match self.max_memory_bytes {
             Some(limit) => resources.with_max_memory_bytes(limit),
             None => resources,
@@ -2647,7 +2665,11 @@ impl RarBuilder {
                 progress,
                 cancellation,
                 Path::new("."),
-                |builder, progress| builder.to_bytes_with_progress(progress),
+                |builder, progress| {
+                    let mut output = Vec::new();
+                    builder.write_to(&mut output, &self.resources, progress)?;
+                    Ok(output)
+                },
             )?;
             return Ok(PyBytes::new(py, &bytes).unbind());
         }
@@ -2726,7 +2748,7 @@ impl RarBuilder {
                         .map(PythonVolumes::Tracked)
                 } else {
                     builder
-                        .build_volumes(progress)
+                        .build_volumes_with_resources(&self.resources, progress)
                         .map(PythonVolumes::Untracked)
                 }
             },
