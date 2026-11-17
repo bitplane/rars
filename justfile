@@ -33,12 +33,12 @@ npm:
 gate:
     ./scripts/release-gate.sh
 
-# Bump the version (patch/minor/major or X.Y.Z), commit, tag vX.Y.Z and push.
-# The pushed tag triggers the release workflow, which publishes the Rust crates,
-# Python package, binaries, and GitHub release after its checks pass.
-# Cut and push a versioned release; defaults to a patch bump.
+# Open a release PR: bump the version (patch/minor/major or X.Y.Z) on
+# release/vX.Y.Z, push it and open the pull request. Merging it tags vX.Y.Z and
+# runs the release workflow, which publishes the Rust crates, Python package,
+# npm package, binaries and GitHub release after its gate and an approval.
 release level="patch":
-    cargo release {{ level }} --execute --no-confirm
+    ./scripts/release-pr.sh {{ level }}
 
 # Native Rust and Python coverage, raw counters, production summary and HTML.
 # Use --branches --toolchain nightly for instrumented branch outcomes.

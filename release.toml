@@ -1,8 +1,10 @@
-# `just release [level]` drives this via cargo-release.
-publish = false            # the v* tag workflow publishes after CI checks
-verify = false             # `just check` is the pre-release gate
-push = true
-tag-name = "v{{version}}"
-allow-branch = ["master"]
+# `just release [level]` drives this via cargo-release, on a release branch.
+# The bump goes through a pull request; merging it to master is what tags and
+# publishes (.github/workflows/release.yml), so nothing here pushes or tags.
+publish = false            # the release workflow publishes after its gate
+verify = false             # CI on the release PR is the pre-release check
+push = false
+tag = false
+allow-branch = ["release/*"]
 # cargo-release runs workspace hooks from each member's manifest directory.
 pre-release-hook = ["python3", "../../tools/sync-release-version.py", "{{version}}"]
