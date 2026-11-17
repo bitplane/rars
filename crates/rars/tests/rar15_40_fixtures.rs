@@ -7478,7 +7478,7 @@ fn rejects_incomplete_rar300_stored_volume_set() {
 
     assert!(matches!(
         collect_extract_volumes(&archives),
-        Err(Error::InvalidHeader("RAR 1.5 split entry is incomplete"))
+        Err(Error::InVolume { index: 2, ref source }) if **source == Error::MissingVolume
     ));
 }
 

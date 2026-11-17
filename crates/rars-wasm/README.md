@@ -28,7 +28,9 @@ duplicate names and non-UTF-8 names remain unambiguous; `nameBytes` contains
 the exact header bytes.
 
 `get(name)` selects the last matching entry; `getAll(name)` returns every match
-in archive order. Each returned entry reads its own payload by index.
+in archive order, and `has(name)` says whether there is one. Each returned entry
+reads its own payload by index. In a volume set, `entry.volumeIndex` is the
+volume the entry starts in, counting the first as 0.
 
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.
@@ -54,10 +56,11 @@ const comment = await archive.readComment(limits); // undefined if absent
 ```
 
 The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
-`maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `rar50DictionarySizeLimit` and
-`rar50BufferedDecodeLimit`. Values must be nonnegative safe integer numbers or
+`maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `maxRar50DictionaryBytes` and
+`maxRar50BufferedMemberBytes`. Values must be nonnegative safe integer numbers or
 `bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
-the library default. Resource options apply to one call and are not retained by `open()`.
+the library default. Options given to `open()` are the defaults for every later call
+on that archive, and a call's own fields override them one by one.
 Each operation reparses its input; header limits apply per archive/volume.
 `readMany()` accepts an iterable of entries or names and performs one parse and
 decoder traversal for the batch. Results retain request order and duplicates;
@@ -95,19 +98,25 @@ and byte details.
 ```js
 import { RarWriter } from "@bitplane/rars";
 
-const writer = new RarWriter({ format: "rar50", level: 5 });
+const writer = new RarWriter({ version: "rar50", level: 5 });
 writer
   .add("hello.txt", "hello")
-  .add("data.bin", payload, { mode: 0o644, modifiedAt: new Date() });
+  .add("data.bin", payload, { mode: 0o644, mtime: new Date() });
 
 const bytes = await writer.bytes();
-const parts = await writer.volumes(5 * 1024 * 1024);
+
+const split = new RarWriter({ volumeSize: 5 * 1024 * 1024 }).add("big.bin", payload);
+const parts = await split.volumes();
 ```
 
 `level` runs from 0 (stored) to 5. Other options are `solid`, `password`,
-`encryptHeaders`, `comment` and `recoveryPercent`. Node additionally provides
-`addFile()`, `writeTo()` and `writeVolumesTo()`.
-For legacy formats, `writeVolumesTo()` keeps the first path and names later
+`encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
+`volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
+additionally provides `addFile()` and `writeTo(path)`, which writes the archive,
+or every part of a set, and returns the paths written. It refuses an existing
+file unless given `{ overwrite: true }`; a set checks every
+part before writing any.
+For legacy formats, `writeTo()` keeps the first path of a set and names later
 volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
 same directory. Sets exceeding 901 volumes or containing overlapping output
 paths are rejected before any file is written.
@@ -142,10 +151,24 @@ staged temporary files. No separate cancellation-token object is needed in JS.
 through `2n ** 64n - 1n`. It caps managed RAR5/7 execution allocation capacity,
 including retained WASM spools, archive/volume output and the final JavaScript
 payload copy. The default is unlimited; zero admits no managed allocation.
-A refusal has code `RESOURCE_LIMIT`; legacy formats reject the requested policy
-with `UNSUPPORTED_FEATURE`. Caller inputs, returned caller-owned bytes, JavaScript
+A refusal has code `RESOURCE_LIMIT`; the constructor refuses it for older
+versions with `INVALID_OPTION`, as it does any setting the version can't write.
+Caller inputs, returned caller-owned bytes, JavaScript
 runtime objects, allocator overhead, stacks and OS memory are excluded. This is
 not a process-memory ceiling and does not bound reading or rewrite staging.
+
+## Repair
+
+```js
+import { repair } from "@bitplane/rars";
+
+const { data, report } = await repair(damaged, { password: "optional" });
+console.log(report.dataRepaired, report.recoveryRecordRebuilt);
+```
+
+`repair()` rebuilds a RAR 5 archive from its recovery record. In Node,
+`{ output: path }` writes the result there instead and leaves `data` undefined;
+an existing file is refused unless `overwrite: true`.
 
 ## Loading
 

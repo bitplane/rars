@@ -45,7 +45,9 @@ function metadata(archive, password, options) {
       nameBytes: info.nameBytes,
       size: info.size,
       compressedSize: info.packedSize,
-      modifiedAt: info.mtime === undefined ? undefined : info.mtime * 1000,
+      mtime: info.mtime === undefined ? undefined : info.mtime * 1000,
+      atime: info.atime === undefined ? undefined : info.atime * 1000,
+      birthtime: info.birthtime === undefined ? undefined : info.birthtime * 1000,
       crc32: info.crc,
       isDirectory: info.isDirectory,
       isEncrypted: info.isEncrypted,
@@ -53,6 +55,7 @@ function metadata(archive, password, options) {
       isSolid: info.isSolid,
       isSplitBefore: info.isSplitBefore,
       isSplitAfter: info.isSplitAfter,
+      volumeIndex: info.volumeIndex,
     };
     info.free();
     return entry;
@@ -77,7 +80,7 @@ async function openArchive(wasm, sources, password, platform, options) {
 async function build(wasm, payload, platform, volumes) {
   const options = payload.writerOptions;
   const builder = new wasm.RarBuilder({
-    format: options.format,
+    format: options.version,
     compression: options.level,
     store: options.level === 0,
     solid: options.solid,
@@ -86,7 +89,7 @@ async function build(wasm, payload, platform, volumes) {
     comment: options.comment,
     recoveryPercent: options.recoveryPercent,
     maxMemoryBytes: options.maxMemoryBytes,
-    volumeSize: volumes ? payload.size : undefined,
+    volumeSize: options.volumeSize,
   });
   try {
     for (const entry of payload.entries) {
@@ -96,7 +99,7 @@ async function build(wasm, payload, platform, volumes) {
           ? new TextEncoder().encode(entry.data)
           : await sourceBytes(entry.data, platform);
       const entryOptions = {
-        mtime: entry.options.modifiedAt === undefined ? undefined : entry.options.modifiedAt / 1000,
+        mtime: entry.options.mtime,
         mode: entry.options.mode,
       };
       if (typeof entry.name === "string") builder.addBytes(entry.name, data, entryOptions);
@@ -108,11 +111,30 @@ async function build(wasm, payload, platform, volumes) {
   }
 }
 
+// The phase names Python's ProgressPhase uses, plus repairing, which Python reports none for.
+const PHASES = {
+  open: "reading", read: "reading", readMany: "reading", readComment: "reading",
+  test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
+  repair: "repairing",
+};
+
+// Bytes the call produced, where its result is bytes.
+function producedBytes(result) {
+  if (result instanceof Uint8Array) return result.length;
+  if (Array.isArray(result) && result.every((part) => part instanceof Uint8Array)) {
+    return result.reduce((sum, part) => sum + part.length, 0);
+  }
+  if (result?.data instanceof Uint8Array) return result.data.length;
+  return 0;
+}
+
 export function startWorker(port, wasm, platform) {
   port.onMessage(async (message) => {
     const { id, operation, payload } = message;
     try {
-      port.post({ id, progress: { operation, phase: "working", completed: 0 } });
+      const phase = PHASES[operation];
+      // The engine reports nothing while it runs, so the total is unknown until it ends.
+      port.post({ id, progress: { operation, phase, completed: 0 } });
       let result;
       if (operation === "open" || operation === "read" || operation === "readMany"
           || operation === "test" || operation === "readComment") {
@@ -129,9 +151,10 @@ export function startWorker(port, wasm, platform) {
           archive.free();
         }
       } else if (operation === "repair") {
-        const bytes = await sourceBytes(payload.sources[0], platform);
-        result = wasm.repair(bytes, payload.password);
-      } else if (operation === "repairDetailed") {
+        // An existing output is refused before the work, not after it.
+        if (payload.output !== undefined && !payload.overwrite) {
+          await platform.refuseExisting(payload.output);
+        }
         const bytes = await sourceBytes(payload.sources[0], platform);
         const detailed = wasm.repairDetailed(bytes, payload.password);
         const report = detailed.report;
@@ -148,21 +171,28 @@ export function startWorker(port, wasm, platform) {
           report.free();
           detailed.free();
         }
+        if (payload.output !== undefined) {
+          await platform.writeAtomic(payload.output, result.data, payload.overwrite);
+          result.data = undefined;
+        }
       } else if (operation === "build") {
         result = await build(wasm, payload, platform, false);
       } else if (operation === "buildVolumes") {
         result = await build(wasm, payload, platform, true);
       } else if (operation === "writeTo") {
-        const bytes = await build(wasm, payload, platform, false);
-        await platform.writeAtomic(payload.path, bytes);
-        result = undefined;
-      } else if (operation === "writeVolumesTo") {
-        const parts = await build(wasm, payload, platform, true);
-        result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.format);
+        if (payload.writerOptions.volumeSize === undefined) {
+          const bytes = await build(wasm, payload, platform, false);
+          await platform.writeAtomic(payload.path, bytes, payload.overwrite);
+          result = [payload.path];
+        } else {
+          const parts = await build(wasm, payload, platform, true);
+          result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version, payload.overwrite);
+        }
       } else {
         throw new Error(`unknown worker operation: ${operation}`);
       }
-      port.post({ id, progress: { operation, phase: "complete", completed: 1, total: 1 } });
+      const produced = producedBytes(result);
+      port.post({ id, progress: { operation, phase, completed: produced, total: produced } });
       const transfers = [];
       if (result instanceof Uint8Array) transfers.push(result.buffer);
       else if (Array.isArray(result)) {

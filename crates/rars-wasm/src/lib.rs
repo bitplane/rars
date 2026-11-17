@@ -77,7 +77,12 @@ mod error_detail_tests {
 }
 
 fn js_error(error: rars_rs::Error) -> JsValue {
-    let record = binding_error(error.kind().code(), &error.to_string());
+    // A volume still to come is not damage, so it gets its own code, as Python's MissingVolume.
+    let code = match error.root_cause() {
+        rars_rs::Error::MissingVolume => "MISSING_VOLUME",
+        _ => error.kind().code(),
+    };
+    let record = binding_error(code, &error.to_string());
     let details = js_sys::Object::new();
     let contexts = js_sys::Array::new();
     let mut cause = &error;
@@ -221,12 +226,15 @@ pub struct RarInfo {
     host_os: Option<f64>,
     file_attr: f64,
     mtime: Option<f64>,
+    atime: Option<f64>,
+    birthtime: Option<f64>,
     encrypted: bool,
     stored: bool,
     solid: bool,
     directory: bool,
     split_before: bool,
     split_after: bool,
+    volume_index: usize,
 }
 
 #[wasm_bindgen]
@@ -281,6 +289,18 @@ impl RarInfo {
         self.mtime
     }
 
+    /// Access time in Unix seconds, where the archive records one.
+    #[wasm_bindgen(getter)]
+    pub fn atime(&self) -> Option<f64> {
+        self.atime
+    }
+
+    /// Creation time in Unix seconds, where the archive records one.
+    #[wasm_bindgen(getter)]
+    pub fn birthtime(&self) -> Option<f64> {
+        self.birthtime
+    }
+
     /// Whether the member's data is encrypted.
     #[wasm_bindgen(getter, js_name = isEncrypted)]
     pub fn is_encrypted(&self) -> bool {
@@ -316,6 +336,12 @@ impl RarInfo {
     #[wasm_bindgen(getter, js_name = isSplitAfter)]
     pub fn is_split_after(&self) -> bool {
         self.split_after
+    }
+
+    /// The volume the member starts in, counting the first as 0.
+    #[wasm_bindgen(getter, js_name = volumeIndex)]
+    pub fn volume_index(&self) -> usize {
+        self.volume_index
     }
 }
 
@@ -379,10 +405,23 @@ impl RarFile {
                 rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
             );
         }
+        // A member starts in the volume holding its first part.
+        let starts = archives.iter().enumerate().flat_map(|(index, archive)| {
+            archive
+                .members()
+                .filter(|member| !member.meta.is_split_before)
+                .map(move |_| index)
+        });
         let infos = rars_rs::volume_members(&archives)
             .map_err(js_error)?
             .into_iter()
-            .map(|member| info_with_encoding(member, options.legacy_name_encoding))
+            .zip(starts)
+            .map(|(member, volume_index)| {
+                info_with_encoding(member, options.legacy_name_encoding).map(|info| RarInfo {
+                    volume_index,
+                    ..info
+                })
+            })
             .collect::<rars_rs::Result<Vec<_>>>()
             .map_err(js_error)?;
         Ok(Self {
@@ -579,12 +618,18 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
         _ => None,
     };
-    let mtime = member
-        .meta
-        .modification_time()
-        .map(|time| time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9);
+    // A malformed extended time record still leaves the main header's time.
+    let times = member.times().unwrap_or_else(|_| rars_rs::FileTimes {
+        modified: member.meta.modification_time(),
+        ..Default::default()
+    });
+    let seconds = |time: Option<rars_rs::Timestamp>| {
+        time.map(|time| time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9)
+    };
     RarInfo {
-        mtime,
+        mtime: seconds(times.modified),
+        atime: seconds(times.accessed),
+        birthtime: seconds(times.created),
         display_name: String::from_utf8_lossy(&member.meta.name).into_owned(),
         name: member.meta.name,
         size: member.meta.unpacked_size as f64,
@@ -598,6 +643,7 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         directory: member.meta.is_directory,
         split_before: member.meta.is_split_before,
         split_after: member.meta.is_split_after,
+        volume_index: 0,
     }
 }
 
@@ -1047,8 +1093,8 @@ fn read_options<'a>(
     options.max_member_output_bytes = read_limit(settings, "maxMemberOutputBytes")?;
     options.max_total_output_bytes = read_limit(settings, "maxTotalOutputBytes")?;
     options.max_reader_workspace_bytes = read_limit(settings, "maxReaderWorkspaceBytes")?;
-    options.rar50_dictionary_size_limit = read_limit(settings, "rar50DictionarySizeLimit")?;
-    options.rar50_buffered_decode_limit = read_limit(settings, "rar50BufferedDecodeLimit")?;
+    options.rar50_dictionary_size_limit = read_limit(settings, "maxRar50DictionaryBytes")?;
+    options.rar50_buffered_decode_limit = read_limit(settings, "maxRar50BufferedMemberBytes")?;
     options.allow_rar3_vm_programs = opt_bool(settings, "allowRar3VmPrograms")?;
     Ok(options)
 }

@@ -1166,12 +1166,11 @@ mod tests {
             b"a.txt",
             FHD_SPLIT_AFTER,
         ))])];
-        assert!(matches!(
-            extract_volumes_to(&incomplete, crate::ArchiveReadOptions::default(), |_| Ok(
-                Box::new(std::io::sink()) as Box<dyn Write>
-            ),),
-            Err(Error::InvalidHeader(_))
-        ));
+        let error = extract_volumes_to(&incomplete, crate::ArchiveReadOptions::default(), |_| {
+            Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+        })
+        .unwrap_err();
+        assert_eq!(error.root_cause(), &Error::MissingVolume);
     }
 
     #[test]

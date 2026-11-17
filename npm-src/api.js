@@ -1,6 +1,12 @@
-const FORMATS = Object.freeze([
+const ARCHIVE_VERSIONS = Object.freeze([
   "rar13", "rar14", "rar15", "rar20", "rar29",
   "rar30", "rar40", "rar50", "rar70",
+]);
+
+// Unknown keys are refused, so a misspelt or renamed setting can't be silently ignored.
+const WRITER_OPTIONS = Object.freeze([
+  "version", "level", "solid", "password", "encryptHeaders", "comment",
+  "recoveryPercent", "maxMemoryBytes", "volumeSize",
 ]);
 
 export function createApi(runtime) {
@@ -34,7 +40,7 @@ export function createApi(runtime) {
       }
       limits.legacyNameEncoding = encoding;
     }
-    for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "maxReaderWorkspaceBytes", "rar50DictionarySizeLimit", "rar50BufferedDecodeLimit"]) {
+    for (const key of ["maxHeaderCount", "maxHeaderBytes", "maxMemberOutputBytes", "maxTotalOutputBytes", "maxReaderWorkspaceBytes", "maxRar50DictionaryBytes", "maxRar50BufferedMemberBytes"]) {
       const value = options[key];
       if (value == null) continue;
       if (!(typeof value === "number" && Number.isSafeInteger(value) && value >= 0) &&
@@ -61,7 +67,9 @@ export function createApi(runtime) {
   class RarEntry {
     constructor(archive, metadata) {
       this._archive = archive;
-      if (metadata.modifiedAt !== undefined) metadata.modifiedAt = new Date(metadata.modifiedAt);
+      for (const key of ["mtime", "atime", "birthtime"]) {
+        if (metadata[key] !== undefined) metadata[key] = new Date(metadata[key]);
+      }
       Object.assign(this, metadata);
     }
 
@@ -73,7 +81,7 @@ export function createApi(runtime) {
       const operation = operationOptions(options);
       return this._archive._request("read", {
         index: this.index,
-        readOptions: readOptions(operation),
+        readOptions: this._archive._readOptions(operation),
         password: operation.password ?? this._archive._password,
       }, operation);
     }
@@ -91,11 +99,12 @@ export function createApi(runtime) {
         readOptions: readOptions(operation),
         password: operation.password,
       }, operation);
-      return new RarArchive(sources, operation.password, result, operation.legacyNameEncoding);
+      return new RarArchive(sources, operation.password, result, readOptions(operation));
     }
 
-    constructor(sources, password, metadata, legacyNameEncoding) {
-      this._legacyNameEncoding = legacyNameEncoding;
+    constructor(sources, password, metadata, defaults) {
+      this._defaults = defaults;
+      this._legacyNameEncoding = defaults.legacyNameEncoding;
       this._sources = sources;
       this._password = password;
       this._closed = false;
@@ -114,6 +123,11 @@ export function createApi(runtime) {
       }
     }
 
+    /** Options given to open() are defaults; a call's own fields override them one by one. */
+    _readOptions(operation) {
+      return { ...this._defaults, ...readOptions(operation) };
+    }
+
     _request(operation, payload, options) {
       assertOpen(this);
       return runtime.request(operation, { ...payload, sources: this._sources }, options);
@@ -130,6 +144,11 @@ export function createApi(runtime) {
 
     getAll(name) {
       return this.#matchingEntries(name, true);
+    }
+
+    /** Whether the archive holds an entry with this name, as Python's `name in archive`. */
+    has(name) {
+      return this.#matchingEntries(name, false).length > 0;
     }
 
     #matchingEntries(name, copy) {
@@ -163,7 +182,7 @@ export function createApi(runtime) {
       }
       return this._request("readMany", {
         indices,
-        readOptions: readOptions(operation),
+        readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
     }
@@ -172,14 +191,14 @@ export function createApi(runtime) {
       const operation = operationOptions(options);
       return this._request("readComment", {
         password: operation.password ?? this._password,
-        readOptions: readOptions(operation),
+        readOptions: this._readOptions(operation),
       }, operation);
     }
 
     async test(options) {
       const operation = operationOptions(options);
       await this._request("test", {
-        readOptions: readOptions(operation),
+        readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
     }
@@ -223,39 +242,71 @@ export function createApi(runtime) {
     if (options == null || typeof options !== "object") {
       throw new TypeError("writer options must be an object");
     }
-    const format = options.format ?? "rar50";
-    if (!FORMATS.includes(format)) throw new TypeError(`unsupported RAR format: ${format}`);
-    const level = options.level ?? 3;
-    if (!Number.isInteger(level) || level < 0 || level > 5) {
-      throw new TypeError("level must be an integer from 0 to 5");
+    for (const key of Object.keys(options)) {
+      if (!WRITER_OPTIONS.includes(key)) {
+        throw new TypeError(`unknown writer option ${JSON.stringify(key)}`
+          + (key === "format" ? "; it is now called version" : ""));
+      }
     }
+    const version = options.version ?? "rar50";
+    if (!ARCHIVE_VERSIONS.includes(version)) {
+      throw new TypeError(`unknown RAR version ${JSON.stringify(version)}; expected one of ${ARCHIVE_VERSIONS.join(", ")}`);
+    }
+    // A wrong type is a TypeError; a value the version can't write is refused here,
+    // before anything is added, as an INVALID_OPTION RarError.
+    const invalid = (message) => new RarError("INVALID_OPTION", message);
+    const modern = version === "rar50" || version === "rar70";
+    const level = options.level ?? 3;
+    if (!Number.isInteger(level)) throw new TypeError("level must be an integer");
+    if (level < 0 || level > 5) throw invalid("level must be from 0 to 5");
     for (const key of ["solid", "encryptHeaders"]) {
       if (options[key] !== undefined && typeof options[key] !== "boolean") {
         throw new TypeError(`${key} must be a boolean`);
       }
     }
-    if (options.recoveryPercent !== undefined &&
-        (!Number.isInteger(options.recoveryPercent) ||
-         options.recoveryPercent < 1 || options.recoveryPercent > 100)) {
-      throw new TypeError("recoveryPercent must be an integer from 1 to 100");
+    if (options.recoveryPercent !== undefined) {
+      if (!Number.isInteger(options.recoveryPercent)) {
+        throw new TypeError("recoveryPercent must be an integer");
+      }
+      if (!modern) throw invalid(`${version} cannot write a recovery record`);
+      if (options.recoveryPercent < 1 || options.recoveryPercent > 100) {
+        throw invalid("recoveryPercent must be from 1 to 100");
+      }
     }
-    return { ...options, format, level };
+    if (options.encryptHeaders) {
+      if (options.password == null) throw invalid("encryptHeaders needs a password");
+      if (!["rar30", "rar40", "rar50", "rar70"].includes(version)) {
+        throw invalid(`${version} cannot write header encryption`);
+      }
+    }
+    if (options.volumeSize !== undefined) {
+      if (!Number.isSafeInteger(options.volumeSize)) {
+        throw new TypeError("volumeSize must be a safe integer");
+      }
+      if (options.volumeSize <= 0) throw invalid("volumeSize must be more than 0");
+      if (options.comment != null) throw invalid(`${version} cannot write an archive comment in a volume set`);
+    }
+    if (options.maxMemoryBytes != null && !modern) {
+      throw invalid(`${version} cannot write to a memory limit; only rar50 and rar70 can`);
+    }
+    return { ...options, version, level };
   }
 
   function validateEntryOptions(options = {}) {
     if (options == null || typeof options !== "object") {
       throw new TypeError("entry options must be an object");
     }
-    if (options.modifiedAt !== undefined &&
-        (!(options.modifiedAt instanceof Date) || Number.isNaN(options.modifiedAt.valueOf()))) {
-      throw new TypeError("modifiedAt must be a valid Date");
+    // As fs.utimes takes it: a Date, or a number of Unix seconds.
+    const mtime = options.mtime instanceof Date ? options.mtime.valueOf() / 1000 : options.mtime;
+    if (mtime !== undefined && (typeof mtime !== "number" || !Number.isFinite(mtime))) {
+      throw new TypeError("mtime must be a valid Date or a number of Unix seconds");
     }
     if (options.mode !== undefined &&
         (!Number.isSafeInteger(options.mode) || options.mode < 0)) {
       throw new TypeError("mode must be a non-negative safe integer");
     }
     return {
-      modifiedAt: options.modifiedAt?.valueOf(),
+      mtime,
       mode: options.mode,
     };
   }
@@ -330,27 +381,27 @@ export function createApi(runtime) {
     }
 
     bytes(options) {
+      if (this._options.volumeSize !== undefined) {
+        return Promise.reject(new RarError("INVALID_OPTION",
+          "volumeSize is set, so use volumes() or writeTo()"));
+      }
       return this._build("build", {}, options);
     }
 
-    volumes(size, options) {
-      if (!Number.isSafeInteger(size) || size <= 0) {
-        return Promise.reject(new TypeError("volume size must be a positive safe integer"));
+    /** The parts of a volume set, in memory; needs `volumeSize`. */
+    volumes(options) {
+      if (this._options.volumeSize === undefined) {
+        return Promise.reject(new RarError("INVALID_OPTION",
+          "volumes() needs new RarWriter({ volumeSize })"));
       }
-      return this._build("buildVolumes", { size }, options);
+      return this._build("buildVolumes", {}, options);
     }
 
+    /** Writes the archive, or with `volumeSize` every part of the set, and returns the paths written. */
     writeTo(path, options) {
-      return this._build("writeTo", { path: runtime.prepareOutputPath(path) }, options);
-    }
-
-    writeVolumesTo(firstPath, size, options) {
-      if (!Number.isSafeInteger(size) || size <= 0) {
-        return Promise.reject(new TypeError("volume size must be a positive safe integer"));
-      }
-      return this._build("writeVolumesTo", {
-        path: runtime.prepareOutputPath(firstPath), size,
-      }, options);
+      const overwrite = options?.overwrite ?? false;
+      if (typeof overwrite !== "boolean") throw new TypeError("overwrite must be a boolean");
+      return this._build("writeTo", { path: runtime.prepareOutputPath(path), overwrite }, options);
     }
 
     close() {
@@ -360,8 +411,12 @@ export function createApi(runtime) {
     }
   }
 
+  /** With `output` (Node), the repaired archive is written there and `data` is undefined. */
   async function repair(input, options) {
     const operation = operationOptions(options);
+    const overwrite = operation.overwrite ?? false;
+    if (typeof overwrite !== "boolean") throw new TypeError("overwrite must be a boolean");
+    const output = operation.output == null ? undefined : runtime.prepareOutputPath(operation.output);
     const sources = await runtime.prepareArchiveSources(input);
     if (sources.length !== 1) {
       throw new RarError("UNSUPPORTED_FEATURE", "repair currently accepts one archive volume");
@@ -369,16 +424,9 @@ export function createApi(runtime) {
     return runtime.request("repair", {
       sources,
       password: operation.password,
+      output,
+      overwrite,
     }, operation);
-  }
-
-  async function repairDetailed(input, options) {
-    const operation = operationOptions(options);
-    const sources = await runtime.prepareArchiveSources(input);
-    if (sources.length !== 1) {
-      throw new RarError("UNSUPPORTED_FEATURE", "repair currently accepts one archive volume");
-    }
-    return runtime.request("repairDetailed", { sources, password: operation.password }, operation);
   }
 
   runtime.setErrorFactory((error) => {
@@ -391,8 +439,8 @@ export function createApi(runtime) {
     RarEntry,
     RarError,
     RarWriter,
-    repair, repairDetailed,
-    formats: FORMATS,
+    repair,
+    archiveVersions: ARCHIVE_VERSIONS,
     version: runtime.version,
   };
 }

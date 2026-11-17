@@ -623,8 +623,10 @@ impl<B: Budget> SplitWalk<'_, '_, '_, B> {
             return Ok(None);
         }
         loop {
+            let missing = self.feed.missing_next();
             let Some(volume) = self.feed.next_part()? else {
-                return Err(Error::InvalidHeader("RAR 5 split entry is incomplete"));
+                // The volumes given ran out while the member continues.
+                return Err(missing);
             };
             let Some(file) = volume.files().next() else {
                 continue;

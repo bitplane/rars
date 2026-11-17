@@ -10,12 +10,18 @@ export type NodePath = string | URL;
 export class RarArchive {
   static open(input: NodeRarInput | readonly NodeRarInput[], options?: ReadOptions): Promise<RarArchive>;
   readonly entries: readonly import("./base.js").RarEntry[];
-  readonly family: import("./base.js").RarFamily;
+  readonly family: import("./base.js").ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;
   readonly comment?: Uint8Array;
   get(name: RarName): import("./base.js").RarEntry | undefined;
   getAll(name: RarName): readonly import("./base.js").RarEntry[];
+  has(name: RarName): boolean;
+  /** One session and shared output budgets; request order and duplicates are retained. */
+  readMany(
+    members: Iterable<import("./base.js").RarEntry | RarName>,
+    options?: ReadOptions,
+  ): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
   test(options?: ReadOptions): Promise<void>;
   close(): void;
@@ -29,11 +35,21 @@ export class RarWriter {
   remove(name: RarName): this;
   rename(from: RarName, to: RarName): this;
   bytes(options?: OperationOptions): Promise<Uint8Array>;
-  volumes(size: number, options?: OperationOptions): Promise<readonly Uint8Array[]>;
-  writeTo(path: NodePath, options?: OperationOptions): Promise<void>;
-  writeVolumesTo(path: NodePath, size: number, options?: OperationOptions): Promise<readonly string[]>;
+  volumes(options?: OperationOptions): Promise<readonly Uint8Array[]>;
+  /**
+   * Writes the archive, or with `volumeSize` every part of the set, and returns the paths
+   * written. An existing file is refused unless `overwrite: true`; a set checks every part
+   * before writing any.
+   */
+  writeTo(path: NodePath, options?: OperationOptions & { overwrite?: boolean }): Promise<readonly string[]>;
   close(): void;
 }
 
-export function repair(input: NodeRarInput, options?: OperationOptions): Promise<Uint8Array>;
-export function repairDetailed(input: NodeRarInput, options?: OperationOptions): Promise<import("./base.js").RepairResult>;
+/**
+ * With `output`, the repaired archive is written there and `data` is undefined; an
+ * existing file is refused unless `overwrite: true`.
+ */
+export function repair(
+  input: NodeRarInput,
+  options?: OperationOptions & { output?: NodePath; overwrite?: boolean },
+): Promise<import("./base.js").RepairResult>;

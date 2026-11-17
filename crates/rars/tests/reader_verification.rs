@@ -621,10 +621,7 @@ fn split_callbacks_preserve_cancellation_errors_and_incomplete_volume_detection(
         Error::InvalidArgument("callback refused")
     );
     let error = test_volumes_with_options(&volumes[..2], ArchiveReadOptions::new()).unwrap_err();
-    assert!(matches!(
-        cause(&error),
-        Error::InvalidHeader("RAR 5 split entry is incomplete")
-    ));
+    assert!(matches!(cause(&error), Error::MissingVolume));
     let error = test_volumes_with_options(&volumes[1..], ArchiveReadOptions::new()).unwrap_err();
     assert!(matches!(
         cause(&error),

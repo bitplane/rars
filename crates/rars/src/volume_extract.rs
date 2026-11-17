@@ -112,6 +112,14 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
         }
     }
 
+    /// The error for a member that continues past the volumes there are.
+    pub(crate) fn missing_next(&self) -> crate::Error {
+        crate::Error::InVolume {
+            index: self.index,
+            source: Box::new(crate::Error::MissingVolume),
+        }
+    }
+
     /// A volume the set still needs; running out fails the same way wherever it happens.
     pub(crate) fn next_part(&mut self) -> crate::Result<Option<A>> {
         let index = self.index;
