@@ -77,7 +77,12 @@ mod error_detail_tests {
 }
 
 fn js_error(error: rars_rs::Error) -> JsValue {
-    let record = binding_error(error.kind().code(), &error.to_string());
+    // A volume still to come is not damage, so it gets its own code, as Python's MissingVolume.
+    let code = match error.root_cause() {
+        rars_rs::Error::MissingVolume => "MISSING_VOLUME",
+        _ => error.kind().code(),
+    };
+    let record = binding_error(code, &error.to_string());
     let details = js_sys::Object::new();
     let contexts = js_sys::Array::new();
     let mut cause = &error;

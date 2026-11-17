@@ -127,6 +127,10 @@ await check("volume sets are logical archives", async () => {
   await assert.rejects(new RarWriter().add("a", "a").volumes(), (error) => error.code === "INVALID_OPTION");
   const volumes = await writer.volumes();
   assert.ok(volumes.length > 1);
+  await assert.rejects((async () => {
+    const partial = await RarArchive.open(volumes.slice(0, -1));
+    await partial.entries[0].bytes();
+  })(), (error) => error instanceof RarError && error.code === "MISSING_VOLUME");
   const archive = await RarArchive.open(volumes);
   assert.deepEqual(archive.entries.map((entry) => entry.name), ["big.bin"]);
   assert.deepEqual(await archive.entries[0].bytes(), payload);
