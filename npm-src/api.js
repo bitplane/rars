@@ -67,7 +67,9 @@ export function createApi(runtime) {
   class RarEntry {
     constructor(archive, metadata) {
       this._archive = archive;
-      if (metadata.modifiedAt !== undefined) metadata.modifiedAt = new Date(metadata.modifiedAt);
+      for (const key of ["mtime", "atime", "birthtime"]) {
+        if (metadata[key] !== undefined) metadata[key] = new Date(metadata[key]);
+      }
       Object.assign(this, metadata);
     }
 
@@ -289,16 +291,17 @@ export function createApi(runtime) {
     if (options == null || typeof options !== "object") {
       throw new TypeError("entry options must be an object");
     }
-    if (options.modifiedAt !== undefined &&
-        (!(options.modifiedAt instanceof Date) || Number.isNaN(options.modifiedAt.valueOf()))) {
-      throw new TypeError("modifiedAt must be a valid Date");
+    // As fs.utimes takes it: a Date, or a number of Unix seconds.
+    const mtime = options.mtime instanceof Date ? options.mtime.valueOf() / 1000 : options.mtime;
+    if (mtime !== undefined && (typeof mtime !== "number" || !Number.isFinite(mtime))) {
+      throw new TypeError("mtime must be a valid Date or a number of Unix seconds");
     }
     if (options.mode !== undefined &&
         (!Number.isSafeInteger(options.mode) || options.mode < 0)) {
       throw new TypeError("mode must be a non-negative safe integer");
     }
     return {
-      modifiedAt: options.modifiedAt?.valueOf(),
+      mtime,
       mode: options.mode,
     };
   }

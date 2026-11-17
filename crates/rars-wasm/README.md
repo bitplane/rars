@@ -99,7 +99,7 @@ import { RarWriter } from "@bitplane/rars";
 const writer = new RarWriter({ version: "rar50", level: 5 });
 writer
   .add("hello.txt", "hello")
-  .add("data.bin", payload, { mode: 0o644, modifiedAt: new Date() });
+  .add("data.bin", payload, { mode: 0o644, mtime: new Date() });
 
 const bytes = await writer.bytes();
 

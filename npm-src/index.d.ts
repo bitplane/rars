@@ -71,7 +71,8 @@ export interface RarWriterOptions {
 }
 
 export interface RarEntryOptions {
-  modifiedAt?: Date;
+  /** A Date, or Unix seconds as `fs.utimes` takes them. */
+  mtime?: Date | number;
   mode?: number;
 }
 
@@ -98,7 +99,10 @@ export class RarEntry {
   readonly nameBytes: Uint8Array;
   readonly size: number;
   readonly compressedSize: number;
-  readonly modifiedAt?: Date;
+  /** Times named as `fs.Stats` names them; absent where the archive records none. */
+  readonly mtime?: Date;
+  readonly atime?: Date;
+  readonly birthtime?: Date;
   readonly crc32?: number;
   readonly isDirectory: boolean;
   readonly isEncrypted: boolean;

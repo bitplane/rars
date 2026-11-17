@@ -73,11 +73,13 @@ await check("metadata and immutable entry objects are friendly JavaScript", asyn
   const writer = new RarWriter({ version: "rar50" });
   writer.add("hello.txt", HELLO, {
     mode: 0o100644,
-    modifiedAt: new Date("2025-02-03T04:05:06Z"),
+    mtime: new Date("2025-02-03T04:05:06Z"),
   });
   const archive = await RarArchive.open(await writer.bytes());
   const [entry] = archive.entries;
   assert.equal(entry.name, "hello.txt");
+  assert.equal(entry.atime, undefined);
+  assert.equal(entry.birthtime, undefined);
   assert.equal(entry.size, HELLO.length);
   assert.equal(entry.isDirectory, false);
   assert.ok(entry.compressedSize > 0);
@@ -88,12 +90,14 @@ await check("metadata and immutable entry objects are friendly JavaScript", asyn
 
 await check("modification times read back as written in every family", async () => {
   // An even second: RAR 1.5-4.x store DOS times in 2-second steps.
-  const modifiedAt = new Date("2025-02-03T04:05:06Z");
+  const mtime = new Date("2025-02-03T04:05:06Z");
   for (const format of ["rar50", "rar29"]) {
     const writer = new RarWriter({ version: format });
-    writer.add("hello.txt", HELLO, { modifiedAt });
+    writer.add("hello.txt", HELLO, { mtime });
+    writer.add("seconds.txt", HELLO, { mtime: mtime.valueOf() / 1000 });
     const archive = await RarArchive.open(await writer.bytes());
-    assert.equal(archive.entries[0].modifiedAt.valueOf(), modifiedAt.valueOf(), format);
+    assert.equal(archive.entries[0].mtime.valueOf(), mtime.valueOf(), format);
+    assert.equal(archive.entries[1].mtime.valueOf(), mtime.valueOf(), format);
     archive.close();
     writer.close();
   }

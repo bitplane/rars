@@ -45,7 +45,9 @@ function metadata(archive, password, options) {
       nameBytes: info.nameBytes,
       size: info.size,
       compressedSize: info.packedSize,
-      modifiedAt: info.mtime === undefined ? undefined : info.mtime * 1000,
+      mtime: info.mtime === undefined ? undefined : info.mtime * 1000,
+      atime: info.atime === undefined ? undefined : info.atime * 1000,
+      birthtime: info.birthtime === undefined ? undefined : info.birthtime * 1000,
       crc32: info.crc,
       isDirectory: info.isDirectory,
       isEncrypted: info.isEncrypted,
@@ -96,7 +98,7 @@ async function build(wasm, payload, platform, volumes) {
           ? new TextEncoder().encode(entry.data)
           : await sourceBytes(entry.data, platform);
       const entryOptions = {
-        mtime: entry.options.modifiedAt === undefined ? undefined : entry.options.modifiedAt / 1000,
+        mtime: entry.options.mtime,
         mode: entry.options.mode,
       };
       if (typeof entry.name === "string") builder.addBytes(entry.name, data, entryOptions);

@@ -221,6 +221,8 @@ pub struct RarInfo {
     host_os: Option<f64>,
     file_attr: f64,
     mtime: Option<f64>,
+    atime: Option<f64>,
+    birthtime: Option<f64>,
     encrypted: bool,
     stored: bool,
     solid: bool,
@@ -279,6 +281,18 @@ impl RarInfo {
     #[wasm_bindgen(getter)]
     pub fn mtime(&self) -> Option<f64> {
         self.mtime
+    }
+
+    /// Access time in Unix seconds, where the archive records one.
+    #[wasm_bindgen(getter)]
+    pub fn atime(&self) -> Option<f64> {
+        self.atime
+    }
+
+    /// Creation time in Unix seconds, where the archive records one.
+    #[wasm_bindgen(getter)]
+    pub fn birthtime(&self) -> Option<f64> {
+        self.birthtime
     }
 
     /// Whether the member's data is encrypted.
@@ -579,12 +593,18 @@ fn info_from_member(member: rars_rs::ArchiveMember) -> RarInfo {
         rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
         _ => None,
     };
-    let mtime = member
-        .meta
-        .modification_time()
-        .map(|time| time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9);
+    // A malformed extended time record still leaves the main header's time.
+    let times = member.times().unwrap_or_else(|_| rars_rs::FileTimes {
+        modified: member.meta.modification_time(),
+        ..Default::default()
+    });
+    let seconds = |time: Option<rars_rs::Timestamp>| {
+        time.map(|time| time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9)
+    };
     RarInfo {
-        mtime,
+        mtime: seconds(times.modified),
+        atime: seconds(times.accessed),
+        birthtime: seconds(times.created),
         display_name: String::from_utf8_lossy(&member.meta.name).into_owned(),
         name: member.meta.name,
         size: member.meta.unpacked_size as f64,
