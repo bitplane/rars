@@ -42,21 +42,6 @@ fn entry<'a>(data: &'a [u8], password: Option<&'a [u8]>) -> FileEntry<'a> {
     }
 }
 
-fn fingerprint(volumes: &[Vec<u8>]) -> Vec<(usize, u32)> {
-    volumes
-        .iter()
-        .map(|volume| (volume.len(), crc32fast::hash(volume)))
-        .collect()
-}
-
-type Case<'a> = (
-    ArchiveVersion,
-    FeatureSet,
-    Option<&'a [u8]>,
-    &'a [u8],
-    &'static [(usize, u32)],
-);
-
 fn features(solid: bool, header_encryption: bool) -> FeatureSet {
     let mut features = FeatureSet::store_only();
     features.solid = solid;
@@ -64,100 +49,72 @@ fn features(solid: bool, header_encryption: bool) -> FeatureSet {
     features
 }
 
-// Lengths and CRCs of what the writer produced while it collected every volume.
+/// Lengths and CRCs of what the writer produced while it collected every
+/// volume, one line per case, in `tests/fixtures/golden`.
+///
+/// Every set carries a producer record naming the library version, so a version
+/// bump changes these. The release hook regenerates them with the RAR 5
+/// fixtures: `RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_compressed_volumes`.
 #[test]
 fn compressed_volumes_match_the_collecting_writer_byte_for_byte() {
-    type Golden = &'static [(usize, u32)];
     let data = data();
     let noise = noise();
     let plain = FeatureSet::store_only();
-    let rar29_family: Golden = &[(4000, 2211979389), (4000, 859169878), (1610, 950802394)];
+    type Case<'a> = (ArchiveVersion, FeatureSet, Option<&'a [u8]>, &'a [u8]);
     let cases: [Case; 9] = [
-        (
-            ArchiveVersion::Rar15,
-            plain,
-            None,
-            &data,
-            &[
-                (4000, 2890962626),
-                (4000, 3154893835),
-                (4000, 1831939250),
-                (4000, 2634338861),
-                (1528, 24330193),
-            ],
-        ),
-        (
-            ArchiveVersion::Rar20,
-            plain,
-            None,
-            &data,
-            &[
-                (4000, 916672814),
-                (4000, 954759445),
-                (4000, 1693362357),
-                (1691, 1194417463),
-            ],
-        ),
-        (ArchiveVersion::Rar29, plain, None, &data, rar29_family),
-        (ArchiveVersion::Rar30, plain, None, &data, rar29_family),
-        (ArchiveVersion::Rar40, plain, None, &data, rar29_family),
+        (ArchiveVersion::Rar15, plain, None, &data),
+        (ArchiveVersion::Rar20, plain, None, &data),
+        (ArchiveVersion::Rar29, plain, None, &data),
+        (ArchiveVersion::Rar30, plain, None, &data),
+        (ArchiveVersion::Rar40, plain, None, &data),
         // Coded through the solid encoder since sets took several members, as
         // a plain solid archive codes it.
-        (
-            ArchiveVersion::Rar40,
-            features(true, false),
-            None,
-            &data,
-            &[(4000, 3767647119), (4000, 1883229518), (706, 3369210247)],
-        ),
-        (
-            ArchiveVersion::Rar15,
-            plain,
-            Some(b"secret"),
-            &data,
-            &[
-                (4000, 3260565064),
-                (4000, 396586866),
-                (4000, 1262848883),
-                (4000, 1844390586),
-                (1528, 266564067),
-            ],
-        ),
-        (
-            ArchiveVersion::Rar20,
-            plain,
-            Some(b"secret"),
-            &data,
-            &[
-                (4000, 2139939348),
-                (4000, 3778798388),
-                (4000, 2116630113),
-                (1696, 3357619074),
-            ],
-        ),
-        (
-            ArchiveVersion::Rar40,
-            plain,
-            None,
-            &noise,
-            &[(4000, 3633366775), (4000, 3135306252), (1432, 3705095565)],
-        ),
+        (ArchiveVersion::Rar40, features(true, false), None, &data),
+        (ArchiveVersion::Rar15, plain, Some(b"secret"), &data),
+        (ArchiveVersion::Rar20, plain, Some(b"secret"), &data),
+        (ArchiveVersion::Rar40, plain, None, &noise),
     ];
-    for (target, features, password, input, golden) in cases {
+    let mut produced = String::new();
+    for (index, (target, features, password, input)) in cases.into_iter().enumerate() {
         let volumes = write_compressed_volumes(
             entry(input, password),
             WriterOptions::new(target, features),
             4000,
         )
         .unwrap();
-        assert_eq!(
-            fingerprint(&volumes),
-            golden,
-            "{target:?} solid={} password={}",
+        let fingerprint: Vec<String> = volumes
+            .iter()
+            .map(|volume| format!("{}:{}", volume.len(), crc32fast::hash(volume)))
+            .collect();
+        produced.push_str(&format!(
+            "{index} {target:?} solid={} encrypted={} {}\n",
             features.solid,
-            password.is_some()
+            password.is_some(),
+            fingerprint.join(" ")
+        ));
+    }
+
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/golden/legacy_compressed_volumes.txt");
+    if std::env::var_os("RARS_BLESS_GOLDEN").is_some() {
+        std::fs::write(&path, &produced).expect("write golden fixture");
+        return;
+    }
+    let expected = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        panic!(
+            "missing golden fixture {}: {error}\n\
+             regenerate with RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_compressed_volumes",
+            path.display()
+        )
+    });
+    for (expected, produced) in expected.lines().zip(produced.lines()) {
+        assert_eq!(
+            produced, expected,
+            "if this change is intentional, regenerate with \
+             RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_compressed_volumes"
         );
     }
+    assert_eq!(expected.lines().count(), produced.lines().count());
 }
 
 #[derive(Default)]

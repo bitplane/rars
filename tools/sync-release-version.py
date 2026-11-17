@@ -44,11 +44,21 @@ def main() -> None:
     )
 
     # Producer records contain the library version, including inside recovery
-    # parity. Refresh the byte fixtures once, after cargo-release has bumped
+    # parity and the legacy volume fingerprints. Refresh the byte fixtures once, after cargo-release has bumped
     # rars, so the version-only release commit still passes the golden tests.
     if os.environ.get("CRATE_NAME") == "rars" and os.environ.get("DRY_RUN") != "true":
         subprocess.run(
-            ["cargo", "test", "-p", "rars", "--test", "rar50_golden", "--locked"],
+            [
+                "cargo",
+                "test",
+                "-p",
+                "rars",
+                "--test",
+                "rar50_golden",
+                "--test",
+                "legacy_compressed_volumes",
+                "--locked",
+            ],
             cwd=root,
             env={**os.environ, "RARS_BLESS_GOLDEN": "1"},
             check=True,
