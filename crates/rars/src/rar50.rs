@@ -5047,16 +5047,31 @@ fn redirection_preservation_refuses_inconsistent_header_metadata() {
 mod open_key_tests {
     use super::*;
 
+    // One write per member, spliced together, so every member keeps its own salt.
     fn encrypted(password: &[u8], names: &[&str]) -> Vec<u8> {
-        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
-            .store(true)
-            .password(Some(password.to_vec()));
-        for name in names {
+        let single = |name: &str| {
+            let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+                .store(true)
+                .password(Some(password.to_vec()));
             builder
                 .add_bytes(name.as_bytes().to_vec(), b"payload".to_vec(), None, None)
                 .unwrap();
+            builder.to_bytes().unwrap()
+        };
+        let span = |bytes: &[u8]| {
+            let archive = Archive::parse(bytes).unwrap();
+            let file = archive.files().next().unwrap();
+            file.block.offset..file.block.data_range.end
+        };
+        let first = single(names[0]);
+        let end = span(&first).end;
+        let mut bytes = first[..end].to_vec();
+        for name in &names[1..] {
+            let part = single(name);
+            bytes.extend_from_slice(&part[span(&part)]);
         }
-        builder.to_bytes().unwrap()
+        bytes.extend_from_slice(&first[end..]);
+        bytes
     }
 
     #[cfg(all(

@@ -481,15 +481,41 @@ pub(crate) struct HeaderEncryptionKeys {
     pub(super) salt: [u8; 16],
 }
 
-pub(super) fn header_encryption_keys(password: &[u8]) -> Result<HeaderEncryptionKeys> {
+pub(super) fn header_encryption_keys<'p>(
+    write_keys: &mut WriteKeys<'p>,
+    password: &'p [u8],
+) -> Result<HeaderEncryptionKeys> {
     crate::crypto::require_encryption()?;
-    let mut salt = [0u8; 16];
-    crate::write_stream::fill_entropy(
-        &mut salt,
-        "RAR 5 writer could not generate encryption salt",
-    )?;
-    let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(Error::from)?;
+    let (salt, keys) = write_keys.for_password(password)?;
     Ok(HeaderEncryptionKeys { keys, salt })
+}
+
+/// One salt per password per write, as RAR does, so each password derives once.
+#[derive(Default)]
+pub(super) struct WriteKeys<'p> {
+    derived: Vec<(&'p [u8], [u8; 16], Rar50Keys)>,
+}
+
+impl<'p> WriteKeys<'p> {
+    pub(super) fn for_password(&mut self, password: &'p [u8]) -> Result<([u8; 16], Rar50Keys)> {
+        if let Some((_, salt, keys)) = self.derived.iter().find(|(known, ..)| *known == password) {
+            return Ok((*salt, keys.clone()));
+        }
+        let mut salt = [0u8; 16];
+        crate::write_stream::fill_entropy(
+            &mut salt,
+            "RAR 5 writer could not generate encryption salt",
+        )?;
+        let keys = Rar50Keys::derive(password, salt, WRITE_KDF_COUNT_LOG).map_err(Error::from)?;
+        self.derived.push((password, salt, keys.clone()));
+        Ok((salt, keys))
+    }
+}
+
+pub(super) fn fresh_iv() -> Result<[u8; 16]> {
+    let mut iv = [0u8; 16];
+    crate::write_stream::fill_entropy(&mut iv, "RAR 5 writer could not generate encryption IV")?;
+    Ok(iv)
 }
 
 /// Header encryption covers the whole archive, so every member, service and
@@ -632,7 +658,7 @@ mod prepared_header_tests {
     #[test]
     fn exact_images_match_existing_serialization_and_include_encryption_padding() {
         #[cfg(feature = "encryption")]
-        let keys = header_encryption_keys(b"secret").unwrap();
+        let keys = header_encryption_keys(&mut WriteKeys::default(), b"secret").unwrap();
         for len in [0, 1, 15, 16, 120, 127, 128, 16384] {
             let specific = vec![0x51; len];
             for encrypted in crate::test_features::encryption_cases() {
@@ -917,7 +943,7 @@ mod image_tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn encrypted_images_match_buffered_ciphertext_and_leave_trailing_data_plain() {
-        let keys = header_encryption_keys(b"secret").unwrap();
+        let keys = header_encryption_keys(&mut WriteKeys::default(), b"secret").unwrap();
         for size in [0, 1, 15, 16, 17, 127, 128, 16384] {
             let specific = vec![0x35; size];
             let data = b"unencrypted trailing payload";
