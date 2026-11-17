@@ -3034,6 +3034,145 @@ fn filter_stage_leaves_filters_it_cannot_hold_to_the_caller() {
     );
 }
 
+/// A solid run filters each member's bytes from the member's own offset, in
+/// records cut at the run's blocks and at what one record can describe.
+#[test]
+fn a_solid_run_filters_each_member_where_it_lies() {
+    let allowance = Allowance::default();
+    let mut state = 0x2545_f491u32;
+    let mut code = Vec::new();
+    while code.len() < 900 * 1024 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        code.extend_from_slice(&[0x48, 0x89, (state >> 16) as u8, 0xe5, 0x90, 0x90, 0x90]);
+        code.push(0xe8);
+        code.extend_from_slice(&(0x4000u32 + (state >> 28) * 0x400).to_le_bytes());
+    }
+    // The tail of one member, a whole second member, and the head of a third.
+    let segments = [
+        (0..300 * 1024, 1_000_000),
+        (300 * 1024..500 * 1024, 0),
+        (500 * 1024..900 * 1024, 0),
+    ];
+    let blocks = [
+        (64 * 1024, false),
+        (300 * 1024, true),
+        (500 * 1024, true),
+        (900 * 1024, false),
+    ];
+    let filters = [
+        crate::FilterSpec::range(crate::FilterKind::E8, 10_000..300 * 1024),
+        crate::FilterSpec::range(
+            crate::FilterKind::Delta { channels: 4 },
+            500 * 1024..900 * 1024,
+        ),
+        crate::FilterSpec::range(crate::FilterKind::E8E9, 300 * 1024..500 * 1024),
+    ];
+    let mut data = code.clone();
+    let records =
+        filter_streaming_blocks_in_place(&mut data, &blocks, &filters, &segments, &allowance)
+            .unwrap();
+
+    // Each filter's bytes are what the one-member transform makes of them at
+    // that member's offset, wherever the member sits in the run. Checked a
+    // record at a time, since a record is transformed on its own.
+    let mut expected = code.clone();
+    let mut covered = 0;
+    let mut block_start = 0;
+    for (block, &(block_end, _)) in records.iter().zip(&blocks) {
+        for record in block.iter() {
+            assert!(record.length <= MAX_FILTER_BLOCK_LENGTH);
+            let range = block_start + record.offset..block_start + record.offset + record.length;
+            assert!(range.end <= block_end, "a record leaves its block");
+            let (segment, file_offset) = segments
+                .iter()
+                .find(|(segment, _)| segment.start <= range.start && range.end <= segment.end)
+                .expect("a record lies in one member");
+            let filter = filters
+                .iter()
+                .find(|filter| {
+                    let within = filter.range.as_ref().unwrap();
+                    within.start <= range.start && range.end <= within.end
+                })
+                .expect("a record comes from one filter");
+            // The record's bytes placed that far into a file of their own,
+            // and filtered there in one piece.
+            let at = file_offset + (range.start - segment.start);
+            let mut placed = vec![0; at];
+            placed.extend_from_slice(&code[range.clone()]);
+            let within = crate::FilterSpec::range(filter.kind, at..placed.len());
+            let (alone, _) = filtered_lz_member(&placed, &[within]).unwrap();
+            expected[range.clone()].copy_from_slice(&alone[at..]);
+            covered += range.len();
+        }
+        block_start = block_end;
+    }
+    assert_eq!(covered, 300 * 1024 - 10_000 + 200 * 1024 + 400 * 1024);
+    assert!(data == expected);
+    assert!(data != code);
+    // The 400 KiB delta range is more than one record can describe.
+    assert!(records[3].len() >= 2);
+    // The first member's tail is far into its file: converted from the
+    // start of the run instead, its calls would come out differently.
+    let (from_zero, _) = filtered_lz_member(
+        &code[..64 * 1024],
+        &[crate::FilterSpec::range(
+            crate::FilterKind::E8,
+            10_000..64 * 1024,
+        )],
+    )
+    .unwrap();
+    assert!(data[10_000..64 * 1024] != from_zero[10_000..]);
+
+    // The run codes with those records and decodes back to the members.
+    let options = EncodeOptions::new(32).with_max_match_distance(1024 * 1024);
+    let history = b"what the window already holds";
+    let packed = streaming_blocks_with_records(
+        &data,
+        history,
+        &blocks,
+        Some(&records),
+        0,
+        options,
+        None,
+        &allowance,
+    )
+    .unwrap();
+    assert_eq!(packed.len(), blocks.len());
+    let plain =
+        streaming_blocks_with_allowance(&data, history, &blocks, 0, options, None, &allowance)
+            .unwrap();
+    assert!(packed
+        .iter()
+        .zip(plain.iter())
+        .any(|(with, without)| with != without));
+
+    // A filter may not straddle two members, and the record lists have to
+    // match the blocks.
+    let straddling = [crate::FilterSpec::range(
+        crate::FilterKind::E8,
+        200 * 1024..400 * 1024,
+    )];
+    assert!(filter_streaming_blocks_in_place(
+        &mut code.clone(),
+        &blocks,
+        &straddling,
+        &segments,
+        &allowance
+    )
+    .is_err());
+    assert!(streaming_blocks_with_records(
+        &data,
+        history,
+        &blocks,
+        Some(&records[..2]),
+        0,
+        options,
+        None,
+        &allowance
+    )
+    .is_err());
+}
+
 #[test]
 fn streaming_filter_records_reconstruct_buffered_output() {
     let cases = [
