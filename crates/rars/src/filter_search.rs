@@ -684,14 +684,7 @@ fn table_stride(window: &[u8], max_stride: usize) -> Option<usize> {
     if max_stride == 0 {
         return None;
     }
-    let mut hits = [0usize; MAX_TABLE_STRIDE + 1];
-    for index in max_stride..window.len() {
-        let byte = window[index];
-        for stride in 1..=max_stride {
-            let diff = (byte.wrapping_sub(window[index - stride]) as i8).unsigned_abs();
-            hits[stride] += usize::from(diff <= TABLE_STRIDE_NEAR);
-        }
-    }
+    let hits = stride_hits(window, max_stride);
     let total = window.len() - max_stride;
     let best = *hits[1..=max_stride]
         .iter()
@@ -701,6 +694,39 @@ fn table_stride(window: &[u8], max_stride: usize) -> Option<usize> {
         return None;
     }
     (1..=max_stride).find(|&stride| hits[stride] * 100 >= best * TABLE_STRIDE_TIE_PERCENT)
+}
+
+/// For each stride up to `max_stride`, how many bytes of `window` past the
+/// first `max_stride` land within [`TABLE_STRIDE_NEAR`] of the byte that far
+/// back.
+///
+/// One stride at a time over two slices the same length, counted a short run
+/// at a time in a byte that no run can overflow: a loop the compiler runs
+/// sixteen bytes to an instruction. Taking every stride at each byte in turn,
+/// as this did, was a quarter of the time spent writing a member with no
+/// table anywhere in it, and every member pays for the scan.
+fn stride_hits(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1] {
+    let mut hits = [0usize; MAX_TABLE_STRIDE + 1];
+    let Some(current) = window.get(max_stride..) else {
+        return hits;
+    };
+    for stride in 1..=max_stride {
+        let behind = &window[max_stride - stride..window.len() - stride];
+        hits[stride] = current
+            .chunks(128)
+            .zip(behind.chunks(128))
+            .map(|(current, behind)| {
+                let mut near = 0u8;
+                for (byte, behind) in current.iter().zip(behind) {
+                    // Within TABLE_STRIDE_NEAR either way, as one unsigned test.
+                    let apart = byte.wrapping_sub(*behind).wrapping_add(TABLE_STRIDE_NEAR);
+                    near += u8::from(apart <= 2 * TABLE_STRIDE_NEAR);
+                }
+                usize::from(near)
+            })
+            .sum();
+    }
+    hits
 }
 
 /// Where the member holds arrays of fixed-size records, each with the stride
@@ -2087,6 +2113,64 @@ mod tests {
             data.extend_from_slice(&(0x4455_6677_0000 | ((index * 7) & 0xffff)).to_le_bytes());
         }
         data
+    }
+
+    /// The scan counts a stride at a time, in runs. This is the count it
+    /// replaced, a byte at a time and every stride at each.
+    #[test]
+    fn the_stride_scan_counts_what_a_byte_at_a_time_count_does() {
+        fn byte_at_a_time(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1] {
+            let mut hits = [0usize; MAX_TABLE_STRIDE + 1];
+            for index in max_stride..window.len() {
+                for stride in 1..=max_stride {
+                    let diff =
+                        (window[index].wrapping_sub(window[index - stride]) as i8).unsigned_abs();
+                    hits[stride] += usize::from(diff <= TABLE_STRIDE_NEAR);
+                }
+            }
+            hits
+        }
+        let noise = incompressible(TABLE_SCAN_WINDOW);
+        let table = reloc_table(TABLE_SCAN_WINDOW / 24 + 1);
+        // Every difference there is, at stride one and across the wrap, so
+        // the edges of "near" are each counted on the right side.
+        let steps: Vec<u8> = (0..=255u8)
+            .flat_map(|step| [100, 100u8.wrapping_add(step), 250, 250u8.wrapping_add(step)])
+            .collect();
+        let flat = vec![7u8; 1000];
+        for window in [&noise[..], &table[..], &steps[..], &flat[..]] {
+            // Lengths either side of a run of 128, and windows shorter than
+            // the strides they are asked about.
+            for len in [
+                0,
+                1,
+                31,
+                32,
+                33,
+                127,
+                128,
+                129,
+                160,
+                161,
+                1000,
+                window.len(),
+            ] {
+                let window = &window[..len.min(window.len())];
+                for max_stride in [1, 2, 24, MAX_TABLE_STRIDE] {
+                    assert_eq!(
+                        stride_hits(window, max_stride),
+                        if window.len() >= max_stride {
+                            byte_at_a_time(window, max_stride)
+                        } else {
+                            [0; MAX_TABLE_STRIDE + 1]
+                        },
+                        "{} bytes at up to stride {max_stride}",
+                        window.len()
+                    );
+                }
+            }
+        }
+        assert_eq!(stride_hits(&flat, 3)[1..=3], [997; 3]);
     }
 
     #[test]

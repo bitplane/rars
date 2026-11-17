@@ -139,6 +139,12 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         self.head.allowance()
     }
 
+    /// How many positions back a link is kept.
+    #[cfg(all(test, feature = "write"))]
+    pub(crate) fn window(&self) -> usize {
+        self.mask + 1
+    }
+
     fn hash(&self, input: &[u8], pos: usize) -> usize {
         let value = if MIN_MATCH == 3 {
             u32::from(input[pos])
