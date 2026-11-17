@@ -27,21 +27,21 @@ def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
     assert builder.member_ids() == [0, 1]
     for edit in [lambda: builder.remove("one.txt"), lambda: builder.rename("one.txt", "new"),
                  lambda: builder.set_file_comment("one.txt", b"wrong"),
-                 lambda: builder.set_times("one.txt", modified_ns=0)]:
+                 lambda: builder.set_times("one.txt", mtime_ns=0)]:
         with pytest.raises(ValueError, match="ambiguous member name"):
             edit()
     # Both copies remain writable before resolving the ambiguity.
     assert rars.RarFile(builder.to_bytes()).namelist() == ["one.txt", "one.txt"]
     builder.rename(1, "second")
     builder.set_file_comment(1, b"changed")
-    builder.set_times(1, modified_ns=123_000_000_000)
+    builder.set_times(1, mtime_ns=123_000_000_000)
     for _ in range(2):
         output = rars.RarFile(builder.to_bytes())
         assert output.read("one.txt") == b"first"
         assert output.read("second") == b"second"
         assert output.getcomment("one.txt") == b"first comment"
         assert output.getcomment("second") == b"changed"
-        assert output.gettimes("second")["modified"] == 123_000_000_000
+        assert output.getinfo("second").mtime_ns == 123_000_000_000
     builder.remove(0)
     assert builder.member_ids() == [1]
     builder.rename(1, "one.txt")

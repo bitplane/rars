@@ -8,6 +8,10 @@ from test_rewrite_legacy import ROOT, DOS_TIME
 from test_rewrite_older import check_unrar
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 @pytest.mark.parametrize("fixture", ["README.RAR", "README_password=password.rar", "STOREPWD.RAR",
     "WITHDIR.RAR", "SOLID.RAR", "FCOMM.RAR", "COMMENT.RAR", "MULTIFIL.RAR"])
 def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
@@ -23,7 +27,7 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
         assert output.getinfo(after).is_dir() == source.getinfo(before).is_dir()
         assert output.getinfo(after).file_attr == source.getinfo(before).file_attr
         assert output.getinfo(after).is_encrypted == source.getinfo(before).is_encrypted
-        assert output.gettimes(after) == source.gettimes(before)
+        assert times(output.getinfo(after)) == times(source.getinfo(before))
         assert output.getcomment(after) == source.getcomment(before)
         if not source.getinfo(before).is_dir():
             assert output.read(after) == source.read(before)

@@ -43,14 +43,14 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
         assert archive.read(info) == payload
         assert archive.open(info).read() == payload
         assert archive.getcomment(info) == comment
-        assert archive.gettimes(info)["modified"] == timestamp * 1_000_000_000
+        assert archive.getinfo(info).mtime_ns == timestamp * 1_000_000_000
         destination = tmp_path / str(info.member_index)
         assert archive.extract(info, destination).read_bytes() == payload
         assert archive.extractall(destination, members=[info], overwrite=True)[0].read_bytes() == payload
     assert archive.getcomment("one.txt") == b"second comment"
-    assert archive.gettimes("one.txt")["modified"] == 20_000_000_000
+    assert archive.getinfo("one.txt").mtime_ns == 20_000_000_000
     other = rars.RarFile(data)
-    for operation in [other.read, other.getinfo, other.getcomment, other.gettimes, other.readlink]:
+    for operation in [other.read, other.getinfo, other.getcomment, other.readlink]:
         with pytest.raises(ValueError, match="different archive"):
             operation(first)
     with pytest.raises(ValueError, match="different archive"):

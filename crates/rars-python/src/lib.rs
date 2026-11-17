@@ -796,10 +796,14 @@ struct RarInfo {
     file_size: u64,
     #[pyo3(get)]
     compress_size: u64,
+    stored_time: Option<rars_rs::StoredTimestamp>,
+    /// Unix nanoseconds, the names `os.stat_result` uses; a creation time is `birthtime_ns`.
     #[pyo3(get)]
-    /// Whole-second calendar tuple: UTC for RAR5, stored wall-clock fields for
-    /// legacy DOS timestamps. None means no usable timestamp was recorded.
-    date_time: Option<(u16, u8, u8, u8, u8, u8)>,
+    mtime_ns: Option<i128>,
+    #[pyo3(get)]
+    atime_ns: Option<i128>,
+    #[pyo3(get)]
+    birthtime_ns: Option<i128>,
     /// Python reads it as `CRC`, the name `zipfile` and `rarfile` use.
     crc: Option<u32>,
     /// The stored host number, which RAR 5 numbers differently from RAR 1.5 to 4.x.
@@ -833,6 +837,32 @@ impl RarInfo {
     #[getter(CRC)]
     fn crc_upper(&self) -> Option<u32> {
         self.crc
+    }
+
+    /// Unix seconds, as `os.stat_result.st_mtime`.
+    #[getter]
+    fn mtime(&self) -> Option<f64> {
+        self.mtime_ns.map(|nanoseconds| nanoseconds as f64 / 1e9)
+    }
+
+    /// Whole-second local wall-clock fields, as `zipfile.ZipInfo.date_time`. RAR 1.3 to
+    /// 4.x store them so; a RAR 5 time is converted. None when no time was recorded.
+    #[getter]
+    fn date_time<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let fields = match self.stored_time {
+            None => return Ok(None),
+            Some(rars_rs::StoredTimestamp::UnixSeconds(seconds)) => {
+                let local = py.import("time")?.call_method1("localtime", (seconds,))?;
+                return Ok(Some(PyTuple::new(
+                    py,
+                    (0..6)
+                        .map(|index| local.get_item(index))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?));
+            }
+            Some(stored) => stored.calendar_fields(),
+        };
+        fields.map(|fields| fields.into_pyobject(py)).transpose()
     }
 
     #[getter]
@@ -1436,37 +1466,6 @@ impl RarFile {
             .ok_or_else(|| {
                 UnsupportedRarFeature::new_err("member is a kind of link rars cannot read")
             })
-    }
-
-    /// Exact Unix nanoseconds, absent kinds omitted; no `password` since headers were decrypted at open.
-    #[pyo3(signature = (member, *, options = None, cancellation = None))]
-    fn gettimes(
-        &self,
-        py: Python<'_>,
-        member: &Bound<'_, PyAny>,
-        options: Option<&ReadOptions>,
-        cancellation: Option<&CancellationToken>,
-    ) -> PyResult<HashMap<String, i128>> {
-        self.check_open()?;
-        let call_options = self.call_options(options, None, cancellation)?;
-        let options = call_options.as_ref();
-        check_read_options_cancellation(options)?;
-        let index = self.resolve_index(py, member)?;
-        let options = self.extraction_options(options, self.password.as_deref());
-        let (archive, index) = self.member_volume(py, index, options)?;
-        let member = archive
-            .members()
-            .nth(index)
-            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
-        let times = member.times().map_err(map_error)?;
-        Ok([
-            ("modified", times.modified),
-            ("created", times.created),
-            ("accessed", times.accessed),
-        ]
-        .into_iter()
-        .filter_map(|(name, time)| time.map(|time| (name.to_string(), time.unix_nanoseconds())))
-        .collect())
     }
 
     /// Metadata/settings the current rewrite implementation cannot preserve.
@@ -2688,32 +2687,32 @@ impl RarBuilder {
     fn add_directory(
         &mut self,
         arcname: &Bound<'_, PyAny>,
-        mtime: Option<i64>,
+        mtime: Option<UnixSeconds>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
             .add_directory(
                 new_member_name(arcname)?,
-                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mtime.map(|UnixSeconds(time)| time),
                 mode,
             )
             .map_err(map_builder_error)
     }
 
-    /// `mtime` is Unix seconds, in every format.
+    /// `mtime` is Unix seconds, an int or a float such as `os.stat_result.st_mtime`, in every format.
     #[pyo3(signature = (data, arcname, *, mtime = None, mode = None))]
     fn add_bytes(
         &mut self,
         data: &Bound<'_, PyAny>,
         arcname: &Bound<'_, PyAny>,
-        mtime: Option<i64>,
+        mtime: Option<UnixSeconds>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
             .add_bytes(
                 new_member_name(arcname)?,
                 py_required_bytes(data)?,
-                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mtime.map(|UnixSeconds(time)| time),
                 mode,
             )
             .map_err(map_builder_error)
@@ -2748,7 +2747,7 @@ impl RarBuilder {
         arcname: &Bound<'_, PyAny>,
         target: &Bound<'_, PyAny>,
         target_is_directory: bool,
-        mtime: Option<i64>,
+        mtime: Option<UnixSeconds>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
@@ -2756,21 +2755,21 @@ impl RarBuilder {
                 new_member_name(arcname)?,
                 new_member_name(target)?,
                 target_is_directory,
-                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mtime.map(|UnixSeconds(time)| time),
                 mode,
             )
             .map_err(map_builder_error)
     }
 
-    /// Sets times from exact Unix nanoseconds; one left `None` keeps what the
-    /// member has. RAR 1.3–4.x keep only `modified_ns`, in 2-second steps.
-    #[pyo3(signature = (member, *, modified_ns=None, created_ns=None, accessed_ns=None))]
+    /// Sets times from exact Unix nanoseconds, named as on `RarInfo`; one left
+    /// `None` keeps what the member has. RAR 1.3–4.x keep only `mtime_ns`, in 2-second steps.
+    #[pyo3(signature = (member, *, mtime_ns=None, atime_ns=None, birthtime_ns=None))]
     fn set_times(
         &mut self,
         member: &Bound<'_, PyAny>,
-        modified_ns: Option<i128>,
-        created_ns: Option<i128>,
-        accessed_ns: Option<i128>,
+        mtime_ns: Option<i128>,
+        atime_ns: Option<i128>,
+        birthtime_ns: Option<i128>,
     ) -> PyResult<()> {
         let time = |nanoseconds: Option<i128>| {
             nanoseconds
@@ -2781,9 +2780,9 @@ impl RarBuilder {
                 .transpose()
         };
         let times = rars_rs::FileTimes {
-            modified: time(modified_ns)?,
-            created: time(created_ns)?,
-            accessed: time(accessed_ns)?,
+            modified: time(mtime_ns)?,
+            created: time(birthtime_ns)?,
+            accessed: time(atime_ns)?,
         };
         let id = self.edit_member_id(member)?;
         self.inner
@@ -3661,6 +3660,33 @@ struct OutputMode {
 
 /// `True`, `False` or `"rename"`, as `extract` and `extractall` accept it.
 struct Overwrite(OverwritePolicy);
+
+/// Unix seconds as an int or a float, as `time.time()` and `os.stat_result.st_mtime` give them.
+struct UnixSeconds(rars_rs::Timestamp);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for UnixSeconds {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if value.is_instance_of::<pyo3::types::PyInt>() {
+            return Ok(Self(rars_rs::Timestamp::from_unix_seconds(
+                value.extract()?,
+            )));
+        }
+        let seconds = value.extract::<f64>()?;
+        if !seconds.is_finite() {
+            return Err(PyValueError::new_err(
+                "mtime must be a finite number of seconds",
+            ));
+        }
+        let whole = seconds.floor();
+        let nanoseconds = ((seconds - whole) * 1e9).round().min(999_999_999.0) as u32;
+        Ok(Self(
+            rars_rs::Timestamp::new(whole as i64, nanoseconds)
+                .ok_or_else(|| PyValueError::new_err("time is out of range"))?,
+        ))
+    }
+}
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
     type Error = PyErr;
@@ -4709,10 +4735,14 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
         _ => None,
     };
-    let date_time = member
-        .meta
-        .stored_modification_time()
-        .and_then(rars_rs::StoredTimestamp::calendar_fields);
+    let stored_time = member.meta.stored_modification_time();
+    // A malformed extended time record still leaves the main header's time.
+    let times = member.times().unwrap_or_else(|_| rars_rs::FileTimes {
+        modified: member.meta.modification_time(),
+        ..Default::default()
+    });
+    let nanoseconds =
+        |time: Option<rars_rs::Timestamp>| time.map(rars_rs::Timestamp::unix_nanoseconds);
     let attr_source = member.meta.attr_source();
     RarInfo {
         member_index: 0,
@@ -4721,7 +4751,10 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         orig_filename_bytes: member.meta.name.into(),
         file_size: member.meta.unpacked_size,
         compress_size: member.meta.packed_size,
-        date_time,
+        stored_time,
+        mtime_ns: nanoseconds(times.modified),
+        atime_ns: nanoseconds(times.accessed),
+        birthtime_ns: nanoseconds(times.created),
         crc,
         host_os: member.meta.host_os,
         attr_source,

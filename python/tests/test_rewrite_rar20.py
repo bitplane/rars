@@ -10,6 +10,10 @@ import rars
 from test_rewrite_legacy import ROOT, file_metadata, headers, source_bytes, with_extended_times
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 @pytest.mark.parametrize("fixture", [
     "rar202/comment_nopsw.rar", "rar202/comment_psw.rar",
     "rar250/SOLID.RAR", "rar250/AUDIO.RAR", "rar250/BIGLZ.RAR",
@@ -30,7 +34,7 @@ def test_vintage_rar20_preserves_metadata_comments_and_payloads(tmp_path, fixtur
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert output.read(after) == source.read(before)
         assert output.getcomment(after) == source.getcomment(before)
-        assert output.gettimes(after) == source.gettimes(before)
+        assert times(output.getinfo(after)) == times(source.getinfo(before))
         assert output.getinfo(after).file_attr == source.getinfo(before).file_attr
         assert output.getinfo(after).is_encrypted == source.getinfo(before).is_encrypted
     for before, after in zip(file_metadata(path.read_bytes()), file_metadata(data), strict=True):

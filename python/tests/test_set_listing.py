@@ -7,6 +7,10 @@ import pytest
 import rars
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
 
 MEMBERS = {
@@ -147,7 +151,7 @@ def test_a_later_member_reads_only_as_far_as_it_ends(tmp_path):
 def test_metadata_of_a_later_member_comes_from_its_own_volume(tmp_path):
     paths = write_set(tmp_path)
     with rars.RarFile(paths[0]) as archive:
-        assert archive.gettimes("tail.bin") == archive.gettimes("head.txt")
+        assert times(archive.getinfo("tail.bin")) == times(archive.getinfo("head.txt"))
         assert archive.getcomment("tail.bin") is None
 
 

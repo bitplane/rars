@@ -8,6 +8,10 @@ import rars
 from test_rewrite_legacy import DOS_TIME
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 @pytest.mark.parametrize("solid", [False, True])
 @pytest.mark.parametrize("preserve", [False, True])
 def test_batch_link_metadata_leaves_unrelated_corrupt_payload_for_writing(tmp_path, solid, preserve):
@@ -61,7 +65,7 @@ def test_legacy_directories_survive_edits_without_breaking_solid_data(options, m
     assert output.namelist() == ["first", "renamed", "second"]
     assert output.getinfo("renamed").is_dir()
     assert output.getinfo("renamed").file_attr == archive.getinfo("empty").file_attr
-    assert output.gettimes("renamed") == archive.gettimes("empty")
+    assert times(output.getinfo("renamed")) == times(archive.getinfo("empty"))
     assert output.read("first") == b"first payload " * 200
     assert output.read("second") == b"first payload " * 200 + b"second"
     assert output.rewrite_preservation_issues() == []
@@ -85,7 +89,7 @@ def test_native_legacy_links_keep_target_bytes_through_edits(target, options):
     assert output.family == "rar15_40"
     assert output.readlink(b"renamed-\xfe") == target
     assert output.getinfo(b"renamed-\xfe").file_attr == archive.getinfo(b"link-\xff").file_attr
-    assert output.gettimes(b"renamed-\xfe") == archive.gettimes(b"link-\xff")
+    assert times(output.getinfo(b"renamed-\xfe")) == times(archive.getinfo(b"link-\xff"))
     assert output.read("first") == b"first" * 200
     assert output.read("last") == b"last" * 200
     assert output.rewrite_preservation_issues() == []
@@ -145,7 +149,7 @@ def test_reference_legacy_directory_headers_retain_metadata():
         assert after.is_dir()
         assert after.filename == before.filename
         assert after.file_attr == before.file_attr
-        assert output.gettimes(after) == source.gettimes(before)
+        assert times(output.getinfo(after)) == times(source.getinfo(before))
 
 
 def test_legacy_directory_payload_is_rejected_before_output(tmp_path):

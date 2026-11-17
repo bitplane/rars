@@ -10,7 +10,7 @@ MTIME_NS = 1_700_000_000_123_456_700
 def test_extractall_restores_rar5_times_with_sub_second_precision(tmp_path):
     builder = rars.RarBuilder()
     builder.add_bytes(b"payload", "file.txt")
-    builder.set_times("file.txt", modified_ns=MTIME_NS)
+    builder.set_times("file.txt", mtime_ns=MTIME_NS)
     archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path)
@@ -27,8 +27,8 @@ def test_extractall_restores_file_and_directory_times(tmp_path, format):
 
     archive.extractall(tmp_path)
 
-    assert os.stat(tmp_path / "dir").st_mtime_ns == archive.gettimes("dir")["modified"]
-    assert os.stat(tmp_path / "dir/file.txt").st_mtime_ns == archive.gettimes("dir/file.txt")["modified"]
+    assert os.stat(tmp_path / "dir").st_mtime_ns == archive.getinfo("dir").mtime_ns
+    assert os.stat(tmp_path / "dir/file.txt").st_mtime_ns == archive.getinfo("dir/file.txt").mtime_ns
 
 
 def test_restore_times_false_keeps_written_times(tmp_path):
@@ -68,7 +68,7 @@ def test_volume_sets_restore_times(tmp_path, format):
     with rars.RarFile(paths[0]) as archive:
         archive.extractall(tmp_path / "found")
         archive.extractall(tmp_path / "given", volumes=paths[1:])
-        expected = archive.gettimes("large.bin")["modified"]
+        expected = archive.getinfo("large.bin").mtime_ns
 
     assert os.stat(tmp_path / "found/large.bin").st_mtime_ns == expected
     assert os.stat(tmp_path / "given/large.bin").st_mtime_ns == expected

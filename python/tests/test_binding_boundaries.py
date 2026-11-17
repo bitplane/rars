@@ -6,6 +6,10 @@ from pathlib import Path
 import pytest
 import rars
 
+
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
 ROOT = Path(__file__).resolve().parents[2]
 STORED = ROOT / "crates/rars/tests/fixtures/rar50/stored.rar"
 
@@ -227,7 +231,7 @@ def test_input_open_and_read_errors_are_oserrors(tmp_path, source):
         rars.RarFile(path)
 
 
-@pytest.mark.parametrize("method", ["getinfo", "read", "extract", "getcomment", "readlink", "gettimes"])
+@pytest.mark.parametrize("method", ["getinfo", "read", "extract", "getcomment", "readlink"])
 def test_missing_members_raise_keyerror(tmp_path, method):
     archive = rars.RarFile(STORED)
     args = ("missing", tmp_path) if method == "extract" else ("missing",)
@@ -313,7 +317,7 @@ def test_a_legacy_time_past_2106_converts_to_rar5():
     archive = rars.RarFile(builder.to_bytes())
     assert archive.getinfo("future.txt").date_time == (2107, 12, 31, 23, 59, 58)
     converted = rars.RarFile(rars.RarBuilder.from_archive(archive, preserve=False).to_bytes())
-    assert converted.gettimes("future.txt") == archive.gettimes("future.txt")
+    assert times(converted.getinfo("future.txt")) == times(archive.getinfo("future.txt"))
     retained = rars.RarFile(rars.RarBuilder.from_archive(archive).to_bytes())
     assert retained.getinfo("future.txt").date_time == archive.getinfo("future.txt").date_time
 
@@ -458,7 +462,7 @@ def test_recovery_progress_reports_its_phase_and_percentage():
     assert all(event.percentage is None or 0 <= event.percentage <= 100 for event in events)
 
 
-@pytest.mark.parametrize("method", ["getinfo", "read", "open", "extract", "getcomment", "readlink", "gettimes"])
+@pytest.mark.parametrize("method", ["getinfo", "read", "open", "extract", "getcomment", "readlink"])
 def test_member_conversion_errors_are_typeerrors(method):
     archive = rars.RarFile(STORED)
     with pytest.raises(TypeError):

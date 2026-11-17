@@ -8,6 +8,10 @@ from test_rewrite_legacy import DOS_TIME, file_metadata, headers, without_end_bl
 from test_rewrite_older import check_unrar
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 def versioned_file(version, name, password=None):
     builder = rars.RarBuilder(format={15: "rar15", 20: "rar20", 26: "rar20", 29: "rar29"}[version], password=password)
     builder.add_bytes(name.encode() * 100, name, mtime=DOS_TIME)
@@ -58,6 +62,6 @@ def test_rar15_dos_directory_without_later_directory_marker(tmp_path):
     data = editor.to_bytes()
     output = rars.RarFile(data)
     assert output.getinfo("renamed").is_dir()
-    assert output.gettimes("renamed") == source.gettimes("directory")
+    assert times(output.getinfo("renamed")) == times(source.getinfo("directory"))
     assert output.read("last") == b"last" * 100
     check_unrar(tmp_path, data)

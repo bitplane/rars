@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 import rars
 
+
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
 ROOT = Path(__file__).resolve().parents[2]
 MTIME = 1_710_000_000
 # Stored form, for hand-built extended-time records.
@@ -241,7 +245,7 @@ def test_reference_rar420_extended_times_survive_native_rewrite(tmp_path):
     output = rars.RarFile(output_bytes)
     assert output.family == "rar15_40"
     for name in source.namelist():
-        assert output.gettimes(name) == source.gettimes(name)
+        assert times(output.getinfo(name)) == times(source.getinfo(name))
         assert output.read(name) == source.read(name)
     if shutil.which("unrar"):
         rewritten = tmp_path / "rewritten.rar"
@@ -348,4 +352,4 @@ def test_reference_legacy_encryption_is_preserved(fixture):
     for name in source.namelist():
         assert output.getinfo(name).is_encrypted == source.getinfo(name).is_encrypted
         assert output.read(name) == source.read(name)
-        assert output.gettimes(name) == source.gettimes(name)
+        assert times(output.getinfo(name)) == times(source.getinfo(name))

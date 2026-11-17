@@ -2,6 +2,10 @@ import pytest
 import rars
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 def linked_archive():
     builder = rars.RarBuilder(format="rar50", store=True)
     builder.add_bytes(b"payload", "file", mtime=1_700_000_000)
@@ -20,11 +24,10 @@ def member_calls(archive, tmp_path):
         "extractall": ("file", lambda m: archive.extractall(tmp_path, members=[m], overwrite=True)[0].read_bytes(), b"payload"),
         "getcomment": ("file", lambda m: archive.getcomment(m), b"note"),
         "readlink": ("link", lambda m: archive.readlink(m), b"file"),
-        "gettimes": ("file", lambda m: archive.gettimes(m)["modified"], 1_700_000_000 * 10**9),
     }
 
 
-METHODS = ["getinfo", "read", "open", "read_many", "extract", "extractall", "getcomment", "readlink", "gettimes"]
+METHODS = ["getinfo", "read", "open", "read_many", "extract", "extractall", "getcomment", "readlink"]
 
 
 @pytest.mark.parametrize("method", METHODS)
@@ -48,7 +51,7 @@ def test_no_member_method_selects_by_position(tmp_path, method):
         call(0)
 
 
-@pytest.mark.parametrize("method", ["getcomment", "readlink", "gettimes"])
+@pytest.mark.parametrize("method", ["getcomment", "readlink"])
 def test_metadata_reads_honour_cancellation(method):
     archive = linked_archive()
     token = rars.CancellationToken()
@@ -98,7 +101,7 @@ def test_header_encrypted_links_and_times_read_with_a_per_call_password():
     assert archive.readlink("link", password="right") == b"target"
     assert archive.readlink("link") == b"target"
     plain = rars.RarFile(legacy_link(False))
-    assert archive.gettimes("link", options=rars.ReadOptions()) == plain.gettimes("link")
+    assert times(archive.getinfo("link")) == times(plain.getinfo("link"))
 
 
 @pytest.mark.parametrize("call", [

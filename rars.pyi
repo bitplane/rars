@@ -225,7 +225,16 @@ class RarInfo:
     @property
     def compress_size(self) -> int: ...
     @property
-    def date_time(self) -> tuple[int, int, int, int, int, int] | None: ...
+    def date_time(self) -> tuple[int, int, int, int, int, int] | None:
+        """Whole-second local wall-clock fields, as zipfile.ZipInfo.date_time."""
+    @property
+    def mtime(self) -> float | None: ...
+    @property
+    def mtime_ns(self) -> int | None: ...
+    @property
+    def atime_ns(self) -> int | None: ...
+    @property
+    def birthtime_ns(self) -> int | None: ...
     @property
     def CRC(self) -> int | None: ...
     @property
@@ -363,13 +372,6 @@ class RarFile:
         options: ReadOptions | None = None,
         cancellation: CancellationToken | None = None,
     ) -> bytes: ...
-    def gettimes(
-        self,
-        member: _Member,
-        *,
-        options: ReadOptions | None = None,
-        cancellation: CancellationToken | None = None,
-    ) -> dict[Literal["modified", "created", "accessed"], int]: ...
     def rewrite_preservation_issues(self) -> list[str]: ...
     def volume_paths(self) -> list[Path]: ...
     @property
@@ -431,7 +433,7 @@ class RarBuilder:
         self,
         arcname: _NewName,
         *,
-        mtime: int | None = None,
+        mtime: float | None = None,
         mode: int | None = None,
     ) -> None: ...
     def add_bytes(
@@ -439,7 +441,7 @@ class RarBuilder:
         data: Buffer,
         arcname: _NewName,
         *,
-        mtime: int | None = None,
+        mtime: float | None = None,
         mode: int | None = None,
     ) -> None: ...
     def member_ids(self) -> list[int]: ...
@@ -451,16 +453,16 @@ class RarBuilder:
         target: _NewName,
         *,
         target_is_directory: bool = False,
-        mtime: int | None = None,
+        mtime: float | None = None,
         mode: int | None = None,
     ) -> None: ...
     def set_times(
         self,
         member: int | _Member,
         *,
-        modified_ns: int | None = None,
-        created_ns: int | None = None,
-        accessed_ns: int | None = None,
+        mtime_ns: int | None = None,
+        atime_ns: int | None = None,
+        birthtime_ns: int | None = None,
     ) -> None: ...
     def set_file_comment(
         self,
