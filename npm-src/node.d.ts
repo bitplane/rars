@@ -29,9 +29,9 @@ export class RarWriter {
   remove(name: RarName): this;
   rename(from: RarName, to: RarName): this;
   bytes(options?: OperationOptions): Promise<Uint8Array>;
-  volumes(size: number, options?: OperationOptions): Promise<readonly Uint8Array[]>;
-  writeTo(path: NodePath, options?: OperationOptions): Promise<void>;
-  writeVolumesTo(path: NodePath, size: number, options?: OperationOptions): Promise<readonly string[]>;
+  volumes(options?: OperationOptions): Promise<readonly Uint8Array[]>;
+  /** Writes the archive, or with `volumeSize` every part of the set, and returns the paths written. */
+  writeTo(path: NodePath, options?: OperationOptions): Promise<readonly string[]>;
   close(): void;
 }
 

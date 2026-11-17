@@ -107,9 +107,11 @@ await check("passwords, comments and structured errors work", async () => {
 
 await check("volume sets are logical archives", async () => {
   const payload = new Uint8Array(300000).fill(7);
-  const writer = new RarWriter({ version: "rar50", level: 0 });
+  const writer = new RarWriter({ version: "rar50", level: 0, volumeSize: 64 * 1024 });
   writer.add("big.bin", payload);
-  const volumes = await writer.volumes(64 * 1024);
+  await assert.rejects(writer.bytes(), (error) => error.code === "INVALID_OPTION" && /volumes\(\)/.test(error.message));
+  await assert.rejects(new RarWriter().add("a", "a").volumes(), (error) => error.code === "INVALID_OPTION");
+  const volumes = await writer.volumes();
   assert.ok(volumes.length > 1);
   const archive = await RarArchive.open(volumes);
   assert.deepEqual(archive.entries.map((entry) => entry.name), ["big.bin"]);
@@ -165,13 +167,13 @@ await check("Node path input and atomic file output work", async () => {
     const output = path.join(directory, "output.rar");
     await writeFile(source, HELLO);
     const writer = new RarWriter().addFile("source.txt", source);
-    await writer.writeTo(output);
+    assert.deepEqual(await writer.writeTo(output), [output]);
     const archive = await RarArchive.open(output);
     assert.deepEqual(await archive.entries[0].bytes(), new Uint8Array(await readFile(source)));
 
-    const split = new RarWriter({ version: "rar50", level: 0 })
+    const split = new RarWriter({ version: "rar50", level: 0, volumeSize: 64 * 1024 })
       .add("large.bin", new Uint8Array(180000).fill(9));
-    const paths = await split.writeVolumesTo(path.join(directory, "split.rar"), 64 * 1024);
+    const paths = await split.writeTo(path.join(directory, "split.rar"));
     assert.ok(paths.length > 1);
     const volumeArchive = await RarArchive.open(paths[0]);
     assert.equal((await volumeArchive.entries[0].bytes()).length, 180000);
@@ -246,10 +248,10 @@ await check("RAR5 decoder and volume budgets reach WASM", async () => {
   assert.deepEqual(await filtered.entries[0].bytes({ maxRar50BufferedMemberBytes: 0 }), expected);
   const payload = new Uint8Array(180000).fill(9);
   for (const format of ["rar14", "rar29", "rar50", "rar70"]) {
-    const writer = new RarWriter({ version: format, level: 0 }).add("a.bin", payload);
+    const writer = new RarWriter({ version: format, level: 0, volumeSize: 64 * 1024 }).add("a.bin", payload);
     const modern = format === "rar50" || format === "rar70";
     if (modern) writer.add("b.txt", SECOND);
-    const parts = await writer.volumes(64 * 1024);
+    const parts = await writer.volumes();
     const volumes = await RarArchive.open(parts);
     await assert.rejects(volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length - (modern ? 0 : 1) }), limited);
     await assert.rejects(volumes.test({ maxMemberOutputBytes: payload.length - 1 }), limited);
@@ -275,8 +277,8 @@ await check("legacy filename views preserve bytes and Unicode names", async () =
     (error) => error.code === "INVALID_OPTION");
   await assert.rejects(RarArchive.open(bytes, { legacyNameEncoding: "auto" }),
     (error) => error.code === "INVALID_OPTION");
-  const parts = await new RarWriter({ version: "rar29", level: 0 })
-    .add(raw, new Uint8Array(180000).fill(9)).volumes(64000);
+  const parts = await new RarWriter({ version: "rar29", level: 0, volumeSize: 64000 })
+    .add(raw, new Uint8Array(180000).fill(9)).volumes();
   const archive = await RarArchive.open(parts, { legacyNameEncoding: "cp850" });
   assert.equal(archive.entries[0].name, "café.txt");
   assert.equal((await archive.get("café.txt").bytes()).length, 180000);
@@ -298,7 +300,8 @@ await check("aggregate writer memory policy crosses the worker boundary", async 
         return true;
       });
     }
-    const volumes = await writer.volumes(2048);
+    const volumes = await new RarWriter({ version: format, level: 0, maxMemoryBytes: 16n << 20n, volumeSize: 2048 })
+      .add("member", LARGE).volumes();
     assert.ok(volumes.length > 1);
   }
   for (const format of ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"]) {
@@ -316,7 +319,9 @@ await check("bounded WASM encryption and recovery retain readable output", async
     const archive = await RarArchive.open(bytes, { password: "secret" });
     assert.deepEqual(await archive.get("member").bytes(), LARGE);
     archive.close();
-    const volumes = await writer.volumes(2048);
+    const volumes = await new RarWriter({ version: "rar50", level: 0, password: "secret",
+      encryptHeaders, recoveryPercent: 10, maxMemoryBytes: 32 * 1024 * 1024, volumeSize: 2048 })
+      .add("member", LARGE).volumes();
     assert.ok(volumes.length > 1);
     const set = await RarArchive.open(volumes, { password: "secret" });
     assert.deepEqual(await set.get("member").bytes(), LARGE);

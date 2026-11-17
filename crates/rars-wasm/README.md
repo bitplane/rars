@@ -102,13 +102,17 @@ writer
   .add("data.bin", payload, { mode: 0o644, modifiedAt: new Date() });
 
 const bytes = await writer.bytes();
-const parts = await writer.volumes(5 * 1024 * 1024);
+
+const split = new RarWriter({ volumeSize: 5 * 1024 * 1024 }).add("big.bin", payload);
+const parts = await split.volumes();
 ```
 
 `level` runs from 0 (stored) to 5. Other options are `solid`, `password`,
-`encryptHeaders`, `comment` and `recoveryPercent`. Node additionally provides
-`addFile()`, `writeTo()` and `writeVolumesTo()`.
-For legacy formats, `writeVolumesTo()` keeps the first path and names later
+`encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
+`volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
+additionally provides `addFile()` and `writeTo(path)`, which writes the archive,
+or every part of a set, and returns the paths written.
+For legacy formats, `writeTo()` keeps the first path of a set and names later
 volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
 same directory. Sets exceeding 901 volumes or containing overlapping output
 paths are rejected before any file is written.

@@ -6,7 +6,7 @@ const ARCHIVE_VERSIONS = Object.freeze([
 // Unknown keys are refused, so a misspelt or renamed setting can't be silently ignored.
 const WRITER_OPTIONS = Object.freeze([
   "version", "level", "solid", "password", "encryptHeaders", "comment",
-  "recoveryPercent", "maxMemoryBytes",
+  "recoveryPercent", "maxMemoryBytes", "volumeSize",
 ]);
 
 export function createApi(runtime) {
@@ -259,6 +259,10 @@ export function createApi(runtime) {
          options.recoveryPercent < 1 || options.recoveryPercent > 100)) {
       throw new TypeError("recoveryPercent must be an integer from 1 to 100");
     }
+    if (options.volumeSize !== undefined &&
+        (!Number.isSafeInteger(options.volumeSize) || options.volumeSize <= 0)) {
+      throw new TypeError("volumeSize must be a positive safe integer");
+    }
     return { ...options, version, level };
   }
 
@@ -350,27 +354,25 @@ export function createApi(runtime) {
     }
 
     bytes(options) {
+      if (this._options.volumeSize !== undefined) {
+        return Promise.reject(new RarError("INVALID_OPTION",
+          "volumeSize is set, so use volumes() or writeTo()"));
+      }
       return this._build("build", {}, options);
     }
 
-    volumes(size, options) {
-      if (!Number.isSafeInteger(size) || size <= 0) {
-        return Promise.reject(new TypeError("volume size must be a positive safe integer"));
+    /** The parts of a volume set, in memory; needs `volumeSize`. */
+    volumes(options) {
+      if (this._options.volumeSize === undefined) {
+        return Promise.reject(new RarError("INVALID_OPTION",
+          "volumes() needs new RarWriter({ volumeSize })"));
       }
-      return this._build("buildVolumes", { size }, options);
+      return this._build("buildVolumes", {}, options);
     }
 
+    /** Writes the archive, or with `volumeSize` every part of the set, and returns the paths written. */
     writeTo(path, options) {
       return this._build("writeTo", { path: runtime.prepareOutputPath(path) }, options);
-    }
-
-    writeVolumesTo(firstPath, size, options) {
-      if (!Number.isSafeInteger(size) || size <= 0) {
-        return Promise.reject(new TypeError("volume size must be a positive safe integer"));
-      }
-      return this._build("writeVolumesTo", {
-        path: runtime.prepareOutputPath(firstPath), size,
-      }, options);
     }
 
     close() {

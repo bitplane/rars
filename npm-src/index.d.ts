@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readMany" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "writeVolumesTo" | "repair" | "repairDetailed";
+  operation: "open" | "read" | "readMany" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "repair" | "repairDetailed";
   phase: string;
   completed: number;
   total?: number;
@@ -65,6 +65,8 @@ export interface RarWriterOptions {
   recoveryPercent?: number;
   /** Hard RAR5/7 managed writer capacity; caller inputs and runtime overhead are excluded. */
   maxMemoryBytes?: number | bigint;
+  /** Split into volumes of at most this many bytes; write them with `volumes()` or `writeTo()`. */
+  volumeSize?: number;
 }
 
 export interface RarEntryOptions {
@@ -129,7 +131,7 @@ export class RarWriter {
   remove(name: RarName): this;
   rename(from: RarName, to: RarName): this;
   bytes(options?: OperationOptions): Promise<Uint8Array>;
-  volumes(size: number, options?: OperationOptions): Promise<readonly Uint8Array[]>;
+  volumes(options?: OperationOptions): Promise<readonly Uint8Array[]>;
   close(): void;
 }
 

@@ -70,8 +70,8 @@ try {
 
   async function writeVolumes(directory, firstName, total, format = "rar29") {
     await mkdir(directory, { recursive: true });
-    return new RarWriter({ version: format, level: 0 }).add("file.txt", "data")
-      .writeVolumesTo(path.join(directory, firstName), total);
+    return new RarWriter({ version: format, level: 0, volumeSize: total }).add("file.txt", "data")
+      .writeTo(path.join(directory, firstName));
   }
 
   for (const firstName of ["archive", "archive.rar"]) {
@@ -129,8 +129,8 @@ try {
     assert.deepEqual(actual, [1, 2, 3].map((index) => path.join(directory, `archive.part0${index}.rar`)));
     for (const [index, file] of actual.entries()) assert.deepEqual(await readFile(file), Buffer.of(index));
   }
-  await assert.rejects(new RarWriter({ version: "rar29", level: 0 }).add("file.txt", "data")
-    .writeVolumesTo("", 1), (error) => error.code === "INVALID_OPTION" && /needs a file name/.test(error.message));
+  await assert.rejects(new RarWriter({ version: "rar29", level: 0, volumeSize: 1 }).add("file.txt", "data")
+    .writeTo(""), (error) => error.code === "INVALID_OPTION" && /needs a file name/.test(error.message));
   console.log("npm production Node volume naming, output and preservation checks passed");
 } finally {
   await rm(temporary, { recursive: true, force: true });

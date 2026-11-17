@@ -86,7 +86,7 @@ async function build(wasm, payload, platform, volumes) {
     comment: options.comment,
     recoveryPercent: options.recoveryPercent,
     maxMemoryBytes: options.maxMemoryBytes,
-    volumeSize: volumes ? payload.size : undefined,
+    volumeSize: options.volumeSize,
   });
   try {
     for (const entry of payload.entries) {
@@ -153,12 +153,14 @@ export function startWorker(port, wasm, platform) {
       } else if (operation === "buildVolumes") {
         result = await build(wasm, payload, platform, true);
       } else if (operation === "writeTo") {
-        const bytes = await build(wasm, payload, platform, false);
-        await platform.writeAtomic(payload.path, bytes);
-        result = undefined;
-      } else if (operation === "writeVolumesTo") {
-        const parts = await build(wasm, payload, platform, true);
-        result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version);
+        if (payload.writerOptions.volumeSize === undefined) {
+          const bytes = await build(wasm, payload, platform, false);
+          await platform.writeAtomic(payload.path, bytes);
+          result = [payload.path];
+        } else {
+          const parts = await build(wasm, payload, platform, true);
+          result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version);
+        }
       } else {
         throw new Error(`unknown worker operation: ${operation}`);
       }
