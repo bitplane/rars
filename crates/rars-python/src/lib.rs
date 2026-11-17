@@ -1068,19 +1068,19 @@ impl RarFile {
         Ok(self.listing(py)?.infos.clone())
     }
 
-    fn getinfo(&self, py: Python<'_>, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
+    fn getinfo(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
         self.check_open()?;
-        let index = self.resolve_index(py, name)?;
+        let index = self.resolve_index(py, member)?;
         Ok(self.info_at(py, index)?.clone())
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
-    #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read(
         &self,
         py: Python<'_>,
-        name: &Bound<'_, PyAny>,
+        member: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         progress: Option<&Bound<'_, PyAny>>,
@@ -1091,7 +1091,7 @@ impl RarFile {
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(py, name)?;
+        let index = self.resolve_index(py, member)?;
         let data = self.read_indices(py, &[index], password, options, volumes)?;
         match data.into_iter().next().flatten() {
             Some(data) => Ok(data),
@@ -1099,12 +1099,12 @@ impl RarFile {
         }
     }
 
-    #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn open(
         &self,
         py: Python<'_>,
-        name: &Bound<'_, PyAny>,
+        member: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         progress: Option<&Bound<'_, PyAny>>,
@@ -1113,7 +1113,7 @@ impl RarFile {
     ) -> PyResult<Py<PyAny>> {
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
-        let data = self.read(py, name, password, options, None, None, volumes)?;
+        let data = self.read(py, member, password, options, None, None, volumes)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -2732,8 +2732,8 @@ impl RarBuilder {
         Ok(())
     }
 
-    fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
-        let id = self.edit_member_id(old)?;
+    fn rename(&mut self, member: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = self.edit_member_id(member)?;
         self.inner
             .rename_by_id(id, new_member_name(new)?)
             .map_err(map_builder_error)

@@ -126,3 +126,19 @@ def test_a_rarinfo_still_selects_an_existing_member_to_edit():
     builder.rename(archive.getinfo("file"), "renamed")
     builder.remove(archive.getinfo("link"))
     assert rars.RarFile(builder.to_bytes()).namelist() == ["renamed"]
+
+
+def test_every_member_argument_is_called_member(tmp_path):
+    archive = linked_archive()
+    assert archive.getinfo(member="file").filename == "file"
+    assert archive.read(member="file") == b"payload"
+    assert archive.open(member="file").read() == b"payload"
+    assert archive.member_comment(member="file") == b"note"
+    assert archive.readlink(member="link") == b"file"
+    assert archive.extract(member="file", path=tmp_path).read_bytes() == b"payload"
+    builder = rars.RarBuilder()
+    builder.add_bytes(b"x", "a")
+    builder.rename(member="a", new="b")
+    builder.set_member_comment(member="b", comment=b"c")
+    builder.set_times(member="b", mtime_ns=0)
+    builder.remove(member="b")
