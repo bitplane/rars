@@ -7,10 +7,13 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readMany" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
+  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "checkPassword" | "extract" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
   /** Python's ProgressPhase names, plus "repairing". */
-  phase: "reading" | "testing" | "compressing" | "repairing";
-  /** Bytes; the work runs in one step, so `completed` reaches `total` only on the last event. */
+  phase: "reading" | "extracting" | "testing" | "compressing" | "protecting" | "writing" | "repairing";
+  /**
+   * Bytes. Writing, testing and reading from one archive report as the engine goes;
+   * reading selected entries of a volume set and repairing report only start and end.
+   */
   completed: number;
   /** Absent while not known yet. */
   total?: number;
@@ -76,6 +79,8 @@ export interface RarWriterOptions {
 export interface RarEntryOptions {
   /** A Date, or Unix seconds as `fs.utimes` takes them. */
   mtime?: Date | number;
+  /** A comment attached to this member. */
+  comment?: string | Uint8Array;
   mode?: number;
 }
 
@@ -116,6 +121,10 @@ export class RarEntry {
   /** The volume the entry starts in, counting the first as 0. */
   readonly volumeIndex: number;
   bytes(options?: ReadOptions): Promise<Uint8Array>;
+  /** The comment attached to this entry, or undefined. */
+  readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
+  /** Node only: extracts this entry under `directory`, as `archive.extractAll()` does, and returns the path written. */
+  extract(directory: string | URL, options?: ReadOptions & { overwrite?: boolean | "rename"; flatten?: boolean; restoreTimes?: boolean }): Promise<string>;
 }
 
 export class RarArchive {
@@ -124,6 +133,14 @@ export class RarArchive {
   readonly family: ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;
+  /** Whether the (first) archive opened is one volume of a set. */
+  readonly isVolume: boolean;
+  /** Its place in the set, counting the first as 0; undefined when its headers don't record it. */
+  readonly volumeIndex?: number;
+  /** Whether it starts its set; undefined when its headers can't tell. */
+  readonly isFirstVolume?: boolean;
+  /** How the set names its volume files. */
+  readonly volumeNaming: "part" | "old";
   readonly comment?: Uint8Array;
   get(name: RarName): RarEntry | undefined;
   getAll(name: RarName): readonly RarEntry[];
@@ -146,6 +163,26 @@ export class RarWriter {
   close(): void;
 }
 
+export interface PasswordCheck<Archive = RarArchive> {
+  /** The first candidate proved correct, if any. */
+  correct?: string | Uint8Array;
+  /** Candidates the archive couldn't prove right or wrong without decoding data. */
+  undetermined: (string | Uint8Array)[];
+  needsPassword: boolean;
+  /** Opened with `correct`, or without a password when the headers aren't encrypted. */
+  archive?: Archive;
+}
+
+/** Tries candidates in order against one volume, stopping at the first proved correct. */
+export function checkPassword(
+  input: RarInput,
+  candidates: Iterable<string | Uint8Array>,
+  options?: ReadOptions,
+): Promise<PasswordCheck>;
 export function repair(input: RarInput, options?: OperationOptions): Promise<RepairResult>;
+/** Whether the input starts with a RAR signature. */
+export function isRarFile(input: RarInput): Promise<boolean>;
+/** Whether a RAR archive starts in the input, at its start or behind a self-extractor stub. */
+export function isRarFileSfx(input: RarInput): Promise<boolean>;
 export const version: string;
 export const archiveVersions: readonly ArchiveVersion[];

@@ -13,6 +13,16 @@ export class RarArchive {
   readonly family: import("./base.js").ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;
+  /** Whether the (first) archive opened is one volume of a set. */
+  readonly isVolume: boolean;
+  /** Its place in the set, counting the first as 0; undefined when its headers don't record it. */
+  readonly volumeIndex?: number;
+  /** Whether it starts its set; undefined when its headers can't tell. */
+  readonly isFirstVolume?: boolean;
+  /** How the set names its volume files. */
+  readonly volumeNaming: "part" | "old";
+  /** The files opened, when opened from paths: a first volume's path brings the later ones found beside it. */
+  readonly volumePaths?: readonly string[];
   readonly comment?: Uint8Array;
   get(name: RarName): import("./base.js").RarEntry | undefined;
   getAll(name: RarName): readonly import("./base.js").RarEntry[];
@@ -24,6 +34,18 @@ export class RarArchive {
   ): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
   test(options?: ReadOptions): Promise<void>;
+  /**
+   * Extracts entries under `directory` in one pass and returns the files written. Each is
+   * written only once verified. `overwrite` is false (refuse an existing file), true, or
+   * "rename" (write beside it as name(N).ext); `flatten` drops stored directories;
+   * `restoreTimes` (default true) sets modification times. Links are skipped.
+   */
+  extractAll(directory: NodePath, options?: ReadOptions & {
+    members?: Iterable<import("./base.js").RarEntry | RarName>;
+    overwrite?: boolean | "rename";
+    flatten?: boolean;
+    restoreTimes?: boolean;
+  }): Promise<readonly string[]>;
   close(): void;
 }
 
@@ -49,6 +71,16 @@ export class RarWriter {
  * With `output`, the repaired archive is written there and `data` is undefined; an
  * existing file is refused unless `overwrite: true`.
  */
+/** Tries candidates in order against one volume, stopping at the first proved correct. */
+export function checkPassword(
+  input: NodeRarInput,
+  candidates: Iterable<string | Uint8Array>,
+  options?: ReadOptions,
+): Promise<import("./base.js").PasswordCheck<RarArchive>>;
+/** Whether the input starts with a RAR signature; an unreadable path is not RAR. */
+export function isRarFile(input: NodeRarInput): Promise<boolean>;
+/** Whether a RAR archive starts in the input, at its start or behind a self-extractor stub. */
+export function isRarFileSfx(input: NodeRarInput): Promise<boolean>;
 export function repair(
   input: NodeRarInput,
   options?: OperationOptions & { output?: NodePath; overwrite?: boolean },

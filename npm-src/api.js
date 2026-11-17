@@ -85,6 +85,27 @@ export function createApi(runtime) {
         password: operation.password ?? this._archive._password,
       }, operation);
     }
+
+    /** Extracts this entry under `directory` (Node) and returns the path written. */
+    async extract(directory, options) {
+      if (this.isDirectory) {
+        throw new RarError("ENTRY_IS_DIRECTORY", `cannot extract directory entry as a file: ${this.name}`);
+      }
+      const [written] = await this._archive.extractAll(directory, { ...options, members: [this] });
+      if (written === undefined) throw new RarError("ENTRY_NOT_FOUND", `${this.name} has no file data`);
+      return written;
+    }
+
+    /** The comment attached to this entry, or undefined; Python's member_comment(). */
+    async readComment(options) {
+      assertOpen(this._archive);
+      const operation = operationOptions(options);
+      return this._archive._request("readMemberComment", {
+        index: this.index,
+        readOptions: this._archive._readOptions(operation),
+        password: operation.password ?? this._archive._password,
+      }, operation);
+    }
   }
 
   class RarArchive {
@@ -99,19 +120,27 @@ export function createApi(runtime) {
         readOptions: readOptions(operation),
         password: operation.password,
       }, operation);
-      return new RarArchive(sources, operation.password, result, readOptions(operation));
+      // A path to a set's first volume comes back with the later volumes found beside it.
+      return new RarArchive(result.sources ?? sources, operation.password, result, readOptions(operation));
     }
 
     constructor(sources, password, metadata, defaults) {
       this._defaults = defaults;
       this._legacyNameEncoding = defaults.legacyNameEncoding;
       this._sources = sources;
+      if (sources.every((source) => source?.kind === "path")) {
+        this.volumePaths = Object.freeze(sources.map((source) => source.path));
+      }
       this._password = password;
       this._closed = false;
       this.family = metadata.family;
       this.sfxOffset = metadata.sfxOffset;
       this.comment = metadata.comment;
       this.needsPassword = metadata.needsPassword;
+      this.isVolume = metadata.isVolume;
+      this.volumeIndex = metadata.volumeIndex;
+      this.isFirstVolume = metadata.isFirstVolume;
+      this.volumeNaming = metadata.volumeNaming;
       this.entries = Object.freeze(metadata.entries.map(
         (entry) => Object.freeze(new RarEntry(this, entry)),
       ));
@@ -182,6 +211,41 @@ export function createApi(runtime) {
       }
       return this._request("readMany", {
         indices,
+        readOptions: this._readOptions(operation),
+        password: operation.password ?? this._password,
+      }, operation);
+    }
+
+    /**
+     * Extracts entries under `directory` (Node) in one pass and returns the files written.
+     * `members` selects some; `overwrite` is false (refuse), true or "rename" (name(N).ext);
+     * `flatten` drops stored directories; `restoreTimes` (default true) sets modification times.
+     */
+    async extractAll(directory, options) {
+      assertOpen(this);
+      const operation = operationOptions(options);
+      const overwrite = operation.overwrite ?? false;
+      if (overwrite !== true && overwrite !== false && overwrite !== "rename") {
+        throw new TypeError('overwrite must be true, false or "rename"');
+      }
+      let indices;
+      if (operation.members !== undefined) {
+        indices = [];
+        for (const member of operation.members) {
+          const entry = member instanceof RarEntry ? member : this.get(member);
+          if (!entry) throw new RarError("ENTRY_NOT_FOUND", "no such archive entry");
+          if (entry._archive !== this) {
+            throw new RarError("INVALID_OPTION", "entry belongs to a different archive");
+          }
+          indices.push(entry.index);
+        }
+      }
+      return this._request("extract", {
+        directory: runtime.prepareOutputPath(directory),
+        indices,
+        overwrite,
+        flatten: operation.flatten ?? false,
+        restoreTimes: operation.restoreTimes ?? true,
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
@@ -305,9 +369,14 @@ export function createApi(runtime) {
         (!Number.isSafeInteger(options.mode) || options.mode < 0)) {
       throw new TypeError("mode must be a non-negative safe integer");
     }
+    if (options.comment !== undefined && typeof options.comment !== "string"
+        && !(options.comment instanceof Uint8Array)) {
+      throw new TypeError("comment must be a string or Uint8Array");
+    }
     return {
       mtime,
       mode: options.mode,
+      comment: options.comment,
     };
   }
 
@@ -411,6 +480,52 @@ export function createApi(runtime) {
     }
   }
 
+  /**
+   * Tries `candidates` in order against one volume and stops at the first proved
+   * correct, as Python's check_password(). `archive` is opened with it, or without one
+   * when the headers aren't encrypted; it is undefined only when they are and no
+   * candidate opened them.
+   */
+  async function checkPassword(input, candidates, options) {
+    const operation = operationOptions(options);
+    const list = Array.from(candidates);
+    for (const candidate of list) {
+      if (typeof candidate !== "string" && !(candidate instanceof Uint8Array)) {
+        throw new TypeError("each candidate must be a string or Uint8Array");
+      }
+    }
+    const [source] = await runtime.prepareArchiveSources(input);
+    const found = await runtime.request("checkPassword", {
+      sources: [source], candidates: list, readOptions: readOptions(operation),
+    }, operation);
+    const correct = found.correct === undefined ? undefined : list[found.correct];
+    const archive = correct !== undefined || !found.headersEncrypted
+      ? await RarArchive.open(input, { ...operation, password: correct })
+      : undefined;
+    return {
+      correct,
+      undetermined: found.undetermined.map((index) => list[index]),
+      needsPassword: found.needsPassword,
+      archive,
+    };
+  }
+
+  async function probe(input, sfx) {
+    if (Array.isArray(input)) throw new TypeError("expected one archive source");
+    const [source] = await runtime.prepareArchiveSources(input);
+    return runtime.request("probe", { sources: [source], sfx }, {});
+  }
+
+  /** Whether the source starts with a RAR signature; an unreadable source is not RAR. */
+  function isRarFile(input) {
+    return probe(input, false);
+  }
+
+  /** Whether a RAR archive starts in the source, behind a self-extractor stub or not. */
+  function isRarFileSfx(input) {
+    return probe(input, true);
+  }
+
   /** With `output` (Node), the repaired archive is written there and `data` is undefined. */
   async function repair(input, options) {
     const operation = operationOptions(options);
@@ -439,7 +554,7 @@ export function createApi(runtime) {
     RarEntry,
     RarError,
     RarWriter,
-    repair,
+    repair, isRarFile, isRarFileSfx, checkPassword,
     archiveVersions: ARCHIVE_VERSIONS,
     version: runtime.version,
   };

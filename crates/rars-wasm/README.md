@@ -30,10 +30,14 @@ the exact header bytes.
 `get(name)` selects the last matching entry; `getAll(name)` returns every match
 in archive order, and `has(name)` says whether there is one. Each returned entry
 reads its own payload by index. In a volume set, `entry.volumeIndex` is the
-volume the entry starts in, counting the first as 0.
+volume the entry starts in, counting the first as 0. The archive says where it
+sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
+`volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
+`entry.readComment()` returns the comment attached to an entry, or undefined.
 
-Node also accepts paths and file URLs. Passing the first path of a conventional
-volume set discovers its siblings automatically.
+Node also accepts paths and file URLs. Opening the first volume of a set by path
+finds the later volumes beside it, by the names RAR gives them, and stops at the
+first that isn't there; `archive.volumePaths` lists the files it opened.
 
 For legacy byte names, pass `legacyNameEncoding: "cp850"` to `open()`.
 Supported encodings are `cp437`, `cp850`, `cp852`, `cp866`, `windows-1251`,
@@ -93,6 +97,17 @@ objects and returned bytes are outside the quota. Capacity replacement overlap
 counts; this is not a process RAM limit. Refusals retain the resource error code
 and byte details.
 
+`isRarFile(input)` says whether the input starts with a RAR signature, and
+`isRarFileSfx(input)` whether an archive starts in it, behind a self-extractor
+stub or not. Only the bytes those need are read, and a path that can't be read
+is not RAR.
+
+`checkPassword(input, candidates)` tries passwords in order against one volume and
+stops at the first proved correct. It returns `{ correct, undetermined,
+needsPassword, archive }`: `undetermined` holds candidates a RAR 4 archive can't
+prove without decoding data, and `archive` is opened with the correct one, or
+without a password when the headers aren't encrypted.
+
 ## Write
 
 ```js
@@ -109,7 +124,8 @@ const split = new RarWriter({ volumeSize: 5 * 1024 * 1024 }).add("big.bin", payl
 const parts = await split.volumes();
 ```
 
-`level` runs from 0 (stored) to 5. Other options are `solid`, `password`,
+`add()` takes `mode`, `mtime` and a `comment` for the member. `level` runs
+from 0 (stored) to 5. Other writer options are `solid`, `password`,
 `encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
 `volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
 additionally provides `addFile()` and `writeTo(path)`, which writes the archive,
@@ -121,7 +137,11 @@ volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
 same directory. Sets exceeding 901 volumes or containing overlapping output
 paths are rejected before any file is written.
 
-Long operations accept an `AbortSignal` and progress callback:
+Long operations accept an `AbortSignal` and a progress callback, called with the
+phase (`reading`, `testing`, `compressing`, `protecting`, `writing` or
+`repairing`) and bytes `completed` of `total`, which is absent until known.
+Writing, testing and reading from one archive report as the engine goes; reading
+selected entries of a volume set, and repairing, report only start and end:
 
 ```js
 const bytes = await writer.bytes({
@@ -156,6 +176,20 @@ versions with `INVALID_OPTION`, as it does any setting the version can't write.
 Caller inputs, returned caller-owned bytes, JavaScript
 runtime objects, allocator overhead, stacks and OS memory are excluded. This is
 not a process-memory ceiling and does not bound reading or rewrite staging.
+
+## Extract (Node)
+
+```js
+const written = await archive.extractAll("out", { overwrite: "rename" });
+const one = await archive.get("docs/readme.txt").extract("out");
+```
+
+`extractAll()` decodes in one pass and writes each file only once it has been
+verified, under paths the core checks stay inside the directory. An existing
+file is refused unless `overwrite` is `true`, or kept with the new one written
+beside it as `name(N).ext` under `"rename"`. `members` selects entries,
+`flatten: true` drops stored directories, and `restoreTimes` (on by default)
+sets modification times. Links are skipped. It returns the files written.
 
 ## Repair
 

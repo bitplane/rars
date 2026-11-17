@@ -89,7 +89,11 @@ export function createClient(spawnWorker) {
       const task = queue.shift();
       active = task;
       try {
-        ensureWorker().post({ id: task.id, operation: task.operation, payload: task.payload });
+        // The engine reports bytes only to a caller that asked for progress.
+        ensureWorker().post({
+          id: task.id, operation: task.operation, payload: task.payload,
+          progress: typeof task.onProgress === "function",
+        });
       } catch (error) {
         if (active !== task) continue;
         stopWorker();

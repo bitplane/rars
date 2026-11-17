@@ -5,31 +5,14 @@ const os = require("node:os");
 const wasm = require("./wasm/rars_wasm.js");
 const { startWorker } = require("./worker-engine.cjs");
 
-function volumePath(firstPath, index, total, format) {
-  const parsed = path.parse(firstPath);
-  if (format === "rar50" || format === "rar70") {
-    const stem = parsed.name.replace(/\.part\d+$/i, "");
-    const width = Math.max(2, String(total).length);
-    // Keep the first name's ".rar" as written, as RAR does: A.RAR, A.part01.RAR.
-    const suffix = /^\.rar$/i.test(parsed.ext) ? parsed.ext : ".rar";
-    return path.join(parsed.dir, `${stem}.part${String(index + 1).padStart(width, "0")}${suffix}`);
-  }
-  if (index === 0) return firstPath;
-  // RAR follows the case of the first extension: A.RAR, A.R00; a.rar, a.r00.
-  // RAR 4 rolls .r99 on to .s00, and so on up to .z99.
-  const number = index - 1;
-  const letter = String.fromCharCode((parsed.ext.startsWith(".R") ? 82 : 114) + Math.floor(number / 100));
-  return path.join(parsed.dir, `${parsed.name}.${letter}${String(number % 100).padStart(2, "0")}`);
-}
-
 function volumePaths(firstPath, total, format) {
   if (!path.parse(firstPath).base) {
     throw new TypeError("volume output needs a file name");
   }
-  if (format !== "rar50" && format !== "rar70" && total > 901) {
-    throw new RangeError("old-style volume names run out after .z99");
-  }
-  const paths = Array.from({ length: total }, (_, index) => volumePath(firstPath, index, total, format));
+  // The core names them, as the CLI and Python do.
+  const directory = path.dirname(firstPath);
+  const paths = wasm.volumeNames(path.basename(firstPath), total, format)
+    .map((name) => path.join(directory, name));
   // Volume discovery is case insensitive, and these names must also remain
   // distinct on case-insensitive filesystems (e.g. archive.R00 vs archive.r00).
   if (new Set(paths.map((file) => path.resolve(file).toLowerCase())).size !== paths.length) {
@@ -83,13 +66,90 @@ async function writeAtomic(target, bytes, overwrite) {
   }
 }
 
+// Writes verified entries under `directory`, as Python's extractall does: an existing file
+// is refused unless overwrite is true, or kept with the new one beside it as name(N).ext
+// under "rename". Directory times are set last, after their contents are written.
+function extractor(directory, { overwrite, restoreTimes }) {
+  const root = path.resolve(directory);
+  const written = [];
+  const directories = [];
+  const fsSync = require("node:fs");
+  function setTime(file, mtime) {
+    if (restoreTimes && mtime !== undefined) fsSync.utimesSync(file, mtime, mtime);
+  }
+  function publish(temporary, target) {
+    if (overwrite === true) {
+      fsSync.renameSync(temporary, target);
+      return target;
+    }
+    const parsed = path.parse(target);
+    for (let number = 0; ; number++) {
+      const candidate = number === 0 ? target
+        : path.join(parsed.dir, `${parsed.name}(${number})${parsed.ext}`);
+      try {
+        fsSync.linkSync(temporary, candidate);
+        fsSync.unlinkSync(temporary);
+        return candidate;
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        if (overwrite !== "rename") throw alreadyExists(candidate);
+      }
+    }
+  }
+  return {
+    deliver(entry, bytes) {
+      const target = path.join(root, ...entry.path.split("/"));
+      const relative = path.relative(root, target);
+      if (relative.startsWith("..") || path.isAbsolute(relative)) {
+        throw Object.assign(new Error(`unsafe archive path: ${entry.path}`), { code: "UNSAFE_ENTRY_NAME" });
+      }
+      if (entry.isDirectory) {
+        fsSync.mkdirSync(target, { recursive: true });
+        directories.push([target, entry.mtime]);
+        return;
+      }
+      fsSync.mkdirSync(path.dirname(target), { recursive: true });
+      const temporary = `${target}.rars-${process.pid}-${Date.now()}.tmp`;
+      try {
+        fsSync.writeFileSync(temporary, bytes, { flag: "wx" });
+        setTime(temporary, entry.mtime);
+        written.push(publish(temporary, target));
+      } catch (error) {
+        try { fsSync.unlinkSync(temporary); } catch {}
+        throw error;
+      }
+    },
+    finish() {
+      for (const [target, mtime] of directories.reverse()) setTime(target, mtime);
+      return written;
+    },
+  };
+}
+
 startWorker({
   onMessage(callback) { parentPort.on("message", callback); },
   post(message, transfers = []) { parentPort.postMessage(message, transfers); },
 }, wasm, {
   readFile: async (file) => new Uint8Array(await fs.readFile(file)),
+  async isFile(file) {
+    return fs.stat(file).then((stats) => stats.isFile(), () => false);
+  },
+  baseName: (file) => path.basename(file),
+  sibling: (file, name) => path.join(path.dirname(file), name),
+  async readPrefix(file, limit) {
+    const handle = await fs.open(file, "r");
+    try {
+      const buffer = new Uint8Array(limit);
+      const { bytesRead } = await handle.read(buffer, 0, limit, 0);
+      return buffer.subarray(0, bytesRead);
+    } finally {
+      await handle.close();
+    }
+  },
   writeAtomic,
   refuseExisting,
+  extractor,
+  posix: process.platform !== "win32",
   async writeVolumes(firstPath, parts, format, overwrite) {
     // Validate the whole set before publishing any volume.
     const paths = volumePaths(firstPath, parts.length, format);

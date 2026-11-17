@@ -6,7 +6,7 @@ import "./test-npm-client.mjs";
 import "./test-npm-node.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import assert from "node:assert/strict";
@@ -15,7 +15,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const require = createRequire(import.meta.url);
 const commonjs = require(path.join(here, "..", "npm"));
 const esm = await import(pathToFileURL(path.join(here, "..", "npm", "node", "index.js")));
-const { RarArchive, RarWriter, RarError, repair, version, archiveVersions } = esm;
+const { RarArchive, RarWriter, RarError, repair, isRarFile, isRarFileSfx, checkPassword, version, archiveVersions } = esm;
 
 let passed = 0;
 async function check(name, body) {
@@ -134,6 +134,17 @@ await check("volume sets are logical archives", async () => {
   const archive = await RarArchive.open(volumes);
   assert.deepEqual(archive.entries.map((entry) => entry.name), ["big.bin"]);
   assert.equal(archive.entries[0].volumeIndex, 0);
+  assert.equal(archive.isVolume, true);
+  assert.equal(archive.volumeIndex, 0);
+  assert.equal(archive.isFirstVolume, true);
+  assert.equal(archive.volumeNaming, "part");
+  const second = await RarArchive.open(volumes[1]);
+  assert.equal(second.volumeIndex, 1);
+  assert.equal(second.isFirstVolume, false);
+  second.close();
+  const plain = await RarArchive.open(await new RarWriter().add("a", "a").bytes());
+  assert.deepEqual([plain.isVolume, plain.volumeIndex, plain.isFirstVolume], [false, 0, true]);
+  plain.close();
   assert.ok(archive.has("big.bin"));
   assert.ok(!archive.has("missing"));
   assert.deepEqual(await archive.entries[0].bytes(), payload);
@@ -167,17 +178,131 @@ await check("repair restores damaged bytes", async () => {
   }
 });
 
-await check("progress names its phase and leaves the total out until known", async () => {
+await check("checkPassword finds the right candidate and opens the archive", async () => {
+  for (const encryptHeaders of [false, true]) {
+    const bytes = await new RarWriter({ password: "right", encryptHeaders }).add("a.txt", HELLO).bytes();
+    const found = await checkPassword(bytes, ["wrong", text.encode("also wrong"), "right", "later"]);
+    assert.equal(found.correct, "right");
+    assert.equal(found.needsPassword, true);
+    assert.deepEqual(await found.archive.get("a.txt").bytes(), HELLO);
+    const none = await checkPassword(bytes, ["wrong"]);
+    assert.equal(none.correct, undefined);
+    assert.equal(none.archive === undefined, encryptHeaders);
+  }
+  const plain = await checkPassword(await new RarWriter().add("a.txt", "a").bytes(), ["unused"]);
+  assert.equal(plain.needsPassword, false);
+  assert.equal(plain.correct, undefined);
+  assert.deepEqual(plain.archive.entries.map((entry) => entry.name), ["a.txt"]);
+  await assert.rejects(checkPassword(new Uint8Array(1), [1]), TypeError);
+});
+
+await check("Node extracts entries once verified, refusing to overwrite by default", async () => {
+  const mtime = new Date("2024-05-06T07:08:10Z");
+  const bytes = await new RarWriter({ level: 0 })
+    .add("top.txt", HELLO, { mtime })
+    .add("nested/deep/inner.txt", SECOND, { mtime })
+    .add("nested/other.txt", "other").bytes();
+  const archive = await RarArchive.open(bytes);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-extract-"));
+  try {
+    const out = path.join(directory, "out");
+    const written = await archive.extractAll(out);
+    assert.deepEqual(written, ["top.txt", "nested/deep/inner.txt", "nested/other.txt"]
+      .map((name) => path.join(out, ...name.split("/"))));
+    assert.deepEqual(new Uint8Array(await readFile(path.join(out, "top.txt"))), HELLO);
+    assert.equal(await readFile(path.join(out, "nested", "deep", "inner.txt"), "utf8"), decode(SECOND));
+    assert.equal((await stat(path.join(out, "top.txt"))).mtime.valueOf(), mtime.valueOf());
+    const existing = (error) => error instanceof RarError && error.code === "IO"
+      && error.details.systemCode === "EEXIST";
+    await writeFile(path.join(out, "top.txt"), "precious");
+    await assert.rejects(archive.extractAll(out), existing);
+    assert.equal(await readFile(path.join(out, "top.txt"), "utf8"), "precious");
+    const renamed = await archive.extractAll(out, { overwrite: "rename", members: ["top.txt"] });
+    assert.deepEqual(renamed, [path.join(out, "top(1).txt")]);
+    assert.deepEqual(await archive.extractAll(out, { overwrite: true, members: ["top.txt"] }),
+      [path.join(out, "top.txt")]);
+    assert.deepEqual(new Uint8Array(await readFile(path.join(out, "top.txt"))), HELLO);
+    const flat = path.join(directory, "flat");
+    assert.deepEqual(await archive.get("nested/deep/inner.txt").extract(flat, { flatten: true }),
+      path.join(flat, "inner.txt"));
+    // A member that fails verification is never written.
+    const damaged = Uint8Array.from(bytes);
+    const at = Buffer.from(bytes).indexOf(Buffer.from(SECOND));
+    assert.ok(at > 0);
+    damaged[at + 2] ^= 0xff;
+    const broken = path.join(directory, "broken");
+    await assert.rejects((await RarArchive.open(damaged)).extractAll(broken));
+    assert.equal(await stat(path.join(broken, "nested", "deep", "inner.txt")).catch(() => undefined), undefined);
+    // Entries before it verified and were written.
+    assert.deepEqual(new Uint8Array(await readFile(path.join(broken, "top.txt"))), HELLO);
+  } finally {
+    archive.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+await check("member comments round-trip", async () => {
+  for (const format of ["rar15", "rar29", "rar50"]) {
+    const bytes = await new RarWriter({ version: format, level: 0 })
+      .add("noted.txt", HELLO, { comment: "a note" })
+      .add("raw.txt", HELLO, { comment: text.encode("raw note") })
+      .add("plain.txt", HELLO).bytes();
+    const archive = await RarArchive.open(bytes);
+    assert.equal(decode(await archive.get("noted.txt").readComment()), "a note", format);
+    assert.equal(decode(await archive.get("raw.txt").readComment()), "raw note", format);
+    assert.equal(await archive.get("plain.txt").readComment(), undefined, format);
+    archive.close();
+  }
+  assert.throws(() => new RarWriter().add("a", "a", { comment: 1 }), TypeError);
+});
+
+await check("isRarFile and isRarFileSfx answer for bytes, Blobs and paths", async () => {
+  const bytes = await new RarWriter().add("a.txt", "a").bytes();
+  const sfx = new Uint8Array(4096 + bytes.length);
+  sfx.set(text.encode("MZ"));
+  sfx.set(bytes, 4096);
+  assert.equal(await isRarFile(bytes), true);
+  assert.equal(await isRarFile(new Blob([bytes])), true);
+  assert.equal(await isRarFile(text.encode("PK\x03\x04 not a rar")), false);
+  assert.equal(await isRarFile(sfx), false);
+  assert.equal(await isRarFileSfx(sfx), true);
+  assert.equal(await isRarFileSfx(text.encode("no archive here")), false);
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-probe-"));
+  try {
+    const file = path.join(directory, "a.rar");
+    await writeFile(file, bytes);
+    assert.equal(await isRarFile(file), true);
+    // An unreadable source is not RAR, as Python's is_rarfile has it.
+    assert.equal(await isRarFile(path.join(directory, "missing.rar")), false);
+    assert.equal(await isRarFile(directory), false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+await check("progress reports the engine's stages in bytes", async () => {
   const events = [];
-  const bytes = await new RarWriter().add("hello.txt", HELLO).bytes({ onProgress: (event) => events.push(event) });
-  assert.deepEqual(events.map((event) => event.phase), ["compressing", "compressing"]);
+  const bytes = await new RarWriter({ recoveryPercent: 5 }).add("hello.txt", LARGE)
+    .bytes({ onProgress: (event) => events.push(event) });
   assert.equal(events[0].total, undefined);
+  assert.ok(events.length > 2);
+  const phases = new Set(events.map((event) => event.phase));
+  assert.ok(phases.has("compressing") && phases.has("protecting"), [...phases].join());
+  for (const phase of phases) assert.ok(["compressing", "protecting", "writing"].includes(phase), phase);
   assert.equal(events.at(-1).completed, bytes.length);
   assert.equal(events.at(-1).total, bytes.length);
-  const read = [];
   const archive = await RarArchive.open(bytes);
-  await archive.entries[0].bytes({ onProgress: (event) => read.push(event.phase) });
-  assert.deepEqual(read, ["reading", "reading"]);
+  for (const [run, phase] of [
+    [(onProgress) => archive.entries[0].bytes({ onProgress }), "reading"],
+    [(onProgress) => archive.readMany([archive.entries[0]], { onProgress }), "reading"],
+    [(onProgress) => archive.test({ onProgress }), "testing"],
+  ]) {
+    const seen = [];
+    await run((event) => seen.push(event));
+    assert.ok(seen.every((event) => event.phase === phase), phase);
+    // The engine's events count the member's decoded bytes.
+    assert.ok(seen.some((event) => event.total === LARGE.length && event.completed === LARGE.length), phase);
+  }
 });
 
 await check("codec work leaves the Node event loop responsive", async () => {
@@ -235,6 +360,20 @@ await check("Node path input and atomic file output work", async () => {
     assert.deepEqual(await split.writeTo(path.join(directory, "split.rar"), { overwrite: true }), paths);
     const volumeArchive = await RarArchive.open(paths[0]);
     assert.equal((await volumeArchive.entries[0].bytes()).length, 180000);
+    // The later volumes are found by the names the core gives them.
+    assert.deepEqual(volumeArchive.volumePaths, paths);
+    const [extracted] = await volumeArchive.extractAll(path.join(directory, "from-set"));
+    assert.equal((await readFile(extracted)).length, 180000);
+    const later = await RarArchive.open(paths[1]);
+    assert.deepEqual(later.volumePaths, [paths[1]]);
+    later.close();
+    const legacy = await new RarWriter({ version: "rar29", level: 0, volumeSize: 64 * 1024 })
+      .add("large.bin", new Uint8Array(180000).fill(9)).writeTo(path.join(directory, "old.rar"));
+    assert.deepEqual(legacy.map((file) => path.basename(file)), ["old.rar", "old.r00", "old.r01"]);
+    const legacyArchive = await RarArchive.open(legacy[0]);
+    assert.deepEqual(legacyArchive.volumePaths, legacy);
+    assert.equal((await legacyArchive.entries[0].bytes()).length, 180000);
+    assert.equal(await isRarFile(paths[0]), true);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
