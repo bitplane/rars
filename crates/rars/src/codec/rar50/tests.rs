@@ -6149,3 +6149,109 @@ fn filter_stage_frees_a_place_in_a_full_queue_once_a_filter_is_applied() {
         .hold::<std::convert::Infallible>(pending(FilterType::E8, MAX_STREAMED_FILTERS * 16, 8))
         .unwrap();
 }
+
+/// Pricing a member's blocks on other threads while the collector runs ahead
+/// must give the bytes the sequential walk gives, on every path that walks
+/// blocks: a whole member with and without history, a filtered member, and a
+/// streaming job's blocks.
+#[cfg(feature = "parallel")]
+#[test]
+fn pipelined_optimal_parse_matches_the_sequential_walk() {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let words = [
+        "archive ",
+        "volume ",
+        "member ",
+        "header ",
+        "block ",
+        "filter ",
+        "window ",
+        "the ",
+        "a ",
+        "of ",
+        "and ",
+        "match ",
+        "length ",
+        "distance ",
+        "\n",
+    ];
+    let mut text = |len: usize| {
+        let mut out = Vec::with_capacity(len + 16);
+        while out.len() < len {
+            out.extend_from_slice(words[(next() % words.len() as u64) as usize].as_bytes());
+        }
+        out.truncate(len);
+        out
+    };
+    // Text, then a run the splitter keeps as one block larger than a batch
+    // may hold, then more text.
+    let mut data = text(160 * 1024);
+    data.resize(data.len() + 700 * 1024, 0);
+    data.extend(text(64 * 1024));
+    let history = text(64 * 1024);
+    let options = EncodeOptions::new(8)
+        .with_optimal_parse(true)
+        .with_parse_passes(2)
+        .with_nice_match_length(64)
+        .with_max_match_distance(4 * 1024 * 1024);
+    let filters = [
+        crate::FilterSpec::range(crate::FilterKind::E8, 0..100 * 1024),
+        crate::FilterSpec::range(
+            crate::FilterKind::Delta { channels: 2 },
+            100 * 1024..200 * 1024,
+        ),
+    ];
+    let mut blocks = Vec::new();
+    let mut end = 0;
+    for size in [64 * 1024, 64 * 1024, 32 * 1024, 700 * 1024] {
+        end += size;
+        blocks.push((end, false));
+    }
+    blocks.push((data.len(), true));
+
+    let encode_all = || {
+        (
+            encode_lz_member_with_options(&data, 0, options).unwrap(),
+            encode_lz_member_with_history_and_options(&data, &history, 0, options).unwrap(),
+            encode_owned_member(
+                &data,
+                0,
+                options,
+                Some(&filters),
+                None,
+                &Allowance::default(),
+            )
+            .unwrap()
+            .into_vec(),
+            encode_lz_streaming_blocks(&data, &history, &blocks, 0, options, None).unwrap(),
+        )
+    };
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
+    let sequential = pool.install(|| {
+        let _one = crate::parallel::ThreadCap::set(Some(1));
+        assert!(!crate::parallel::may_nest());
+        encode_all()
+    });
+    let pipelined = pool.install(|| {
+        assert!(crate::parallel::may_nest());
+        encode_all()
+    });
+    assert!(pipelined.0 == sequential.0, "whole member");
+    assert!(pipelined.1 == sequential.1, "whole member after history");
+    assert!(pipelined.2 == sequential.2, "filtered member");
+    assert!(pipelined.3 == sequential.3, "streaming blocks");
+
+    let decoded = Unpack50Decoder::new()
+        .decode_member(&pipelined.0, 0, data.len(), false, DecodeMode::Lz)
+        .unwrap();
+    assert!(decoded == data);
+}
