@@ -120,9 +120,9 @@ struct ProgressEvent {
     entry_index: Option<usize>,
     #[pyo3(get)]
     total_entries: Option<usize>,
-    /// The volume being read, counting the first as 1; None outside a volume set.
+    /// The volume being read, counting the first as 0; None outside a volume set.
     #[pyo3(get)]
-    volume_number: Option<usize>,
+    volume_index: Option<usize>,
     finished: bool,
     /// A set whose last volume hasn't been read yet has no total until it is.
     total_known: bool,
@@ -431,7 +431,7 @@ impl rars_rs::WriteProgress for PythonProgress {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
-                volume_number: None,
+                volume_index: None,
                 finished: false,
                 total_known: true,
             });
@@ -583,7 +583,7 @@ impl ReadProgress {
             state.next_index = index + 1;
             state.see(&member.meta, chosen(index));
         }
-        state.volume = first.is_volume().then_some(1);
+        state.volume = first.is_volume().then_some(0);
         state.total_known = state.listed || alone || volume_end(first) == VolumeEnd::Last;
         self.report(state, false);
     }
@@ -693,7 +693,7 @@ impl ReadProgress {
             entry_name: state.entry_name.clone(),
             entry_index: state.started.checked_sub(1),
             total_entries: state.total_known.then_some(state.seen_entries),
-            volume_number: state.volume,
+            volume_index: state.volume,
             finished,
             total_known: state.total_known,
         };
@@ -887,10 +887,10 @@ impl RarInfo {
         self.is_directory
     }
 
-    /// The volume the member starts in, counting the first as 1 like `RarFile.volume_number`.
+    /// The volume the member starts in, counting the first as 0, so it indexes `volume_paths()`.
     #[getter]
-    fn volume_number(&self) -> usize {
-        self.volume + 1
+    fn volume_index(&self) -> usize {
+        self.volume
     }
 
     /// The same member of the same opened archive, however many times it was looked up.
@@ -1522,9 +1522,10 @@ impl RarFile {
         self.archive.is_volume()
     }
 
+    /// This volume's place in its set, counting the first as 0; None when the headers don't record it.
     #[getter]
-    fn volume_number(&self) -> Option<u64> {
-        self.archive.volume_number()
+    fn volume_index(&self) -> Option<u64> {
+        self.archive.volume_number().map(|number| number - 1)
     }
 
     #[getter]
@@ -3346,12 +3347,12 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BadPassword", py.get_type::<BadPassword>())?;
     m.add("PasswordRequired", py.get_type::<PasswordRequired>())?;
     let missing_volume = py.get_type::<MissingVolume>();
-    missing_volume.setattr("volume_number", py.None())?;
+    missing_volume.setattr("volume_index", py.None())?;
     missing_volume.setattr("path", py.None())?;
     m.add("MissingVolume", missing_volume)?;
     let checksum_error = py.get_type::<ChecksumError>();
     checksum_error.setattr("member", py.None())?;
-    checksum_error.setattr("volume_number", py.None())?;
+    checksum_error.setattr("volume_index", py.None())?;
     m.add("ChecksumError", checksum_error)?;
     m.add(
         "UnsupportedRarFeature",
@@ -4516,7 +4517,9 @@ fn set_fault(
             continue;
         };
         match error {
-            rars_rs::Error::InVolume { number, .. } => fault.volume_number = Some(*number),
+            rars_rs::Error::InVolume { number, .. } => {
+                fault.volume_index = number.checked_sub(1);
+            }
             rars_rs::Error::AtEntry { name, .. } if fault.member.is_none() => {
                 fault.member = Some(String::from_utf8_lossy(name).into_owned());
             }
@@ -4530,7 +4533,7 @@ fn set_fault(
 #[derive(Default)]
 struct SetFault {
     /// The innermost volume, where the fault is rather than where reading began.
-    volume_number: Option<usize>,
+    volume_index: Option<usize>,
     /// The outermost member, which is the one the caller asked for.
     member: Option<String>,
 }
@@ -4966,8 +4969,8 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
             with_attribute(
                 py,
                 MissingVolume::new_err(message),
-                "volume_number",
-                fault.volume_number,
+                "volume_index",
+                fault.volume_index,
             )
         });
     }
@@ -4977,7 +4980,7 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
     {
         return Python::attach(|py| {
             let error = with_attribute(py, ChecksumError::new_err(message), "member", fault.member);
-            with_attribute(py, error, "volume_number", fault.volume_number)
+            with_attribute(py, error, "volume_index", fault.volume_index)
         });
     }
     use rars_rs::ErrorKind;
@@ -5278,7 +5281,7 @@ mod tests {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
-                volume_number: None,
+                volume_index: None,
                 finished: false,
                 total_known: true,
             };

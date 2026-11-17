@@ -103,8 +103,8 @@ def test_every_member_has_its_whole_sizes_and_crc(tmp_path):
     for name, data in MEMBERS.items():
         assert infos[name].file_size == infos[name].compress_size == len(data)
         assert infos[name].CRC == zlib.crc32(data)
-    assert infos["head.txt"].volume_number == 1
-    assert infos["after.bin"].volume_number > 1
+    assert infos["head.txt"].volume_index == 0
+    assert infos["after.bin"].volume_index > 0
 
 
 def test_members_starting_in_later_volumes_can_be_selected(tmp_path):
@@ -138,7 +138,7 @@ def test_a_later_member_reads_only_as_far_as_it_ends(tmp_path):
             for info in rars.RarFile(path, first_volume_only=True).infolist()
         )
     )
-    assert after.volume_number - 1 < ends < len(paths) - 1
+    assert after.volume_index < ends < len(paths) - 1
 
     def volumes():
         yield from paths[1 : ends + 1]
@@ -183,7 +183,7 @@ def test_a_missing_middle_volume_is_named_by_the_listing(tmp_path):
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(rars.MissingVolume, match=paths[2].name) as raised:
             archive.namelist()
-        assert raised.value.volume_number == 3
+        assert raised.value.volume_index == 2
         assert raised.value.path == paths[2]
         with pytest.raises(rars.MissingVolume):
             archive.read("tail.bin")

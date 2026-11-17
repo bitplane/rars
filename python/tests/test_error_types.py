@@ -67,7 +67,7 @@ def test_a_removed_volume_is_a_missing_volume(tmp_path, format):
             archive.testrar()
     assert isinstance(raised.value, rars.Error)
     assert not isinstance(raised.value, rars.BadRarFile)
-    assert raised.value.volume_number == 3
+    assert raised.value.volume_index == 2
     assert raised.value.path == paths[2]
 
 
@@ -76,7 +76,7 @@ def test_volumes_ending_early_is_a_missing_volume_without_a_path(tmp_path):
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(rars.MissingVolume) as raised:
             archive.extractall(tmp_path / "out", volumes=paths[1:2])
-    assert raised.value.volume_number == 3
+    assert raised.value.volume_index == 2
     assert raised.value.path is None
 
 
@@ -94,7 +94,7 @@ def test_a_corrupt_rar5_volume_is_a_checksum_error_naming_member_and_volume(tmp_
             archive.testrar()
     assert isinstance(raised.value, rars.BadRarFile)
     assert raised.value.member == "large.bin"
-    assert raised.value.volume_number == 2
+    assert raised.value.volume_index == 1
 
 
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
@@ -164,8 +164,8 @@ def test_a_corrupt_member_wholly_in_a_later_volume_names_that_volume(tmp_path, f
     paths = builder.write(tmp_path / "set.part1.rar")
     with rars.RarFile(paths[0]) as archive:
         info = next(info for info in archive.infolist()
-                    if info.volume_number > 1 and not info.is_split_before and not info.is_split_after)
-    volume = paths[info.volume_number - 1]
+                    if info.volume_index > 0 and not info.is_split_before and not info.is_split_after)
+    volume = paths[info.volume_index]
     data = bytearray(volume.read_bytes())
     data[data.find(payloads[int(info.filename[1:])][100:140])] ^= 0xFF
     volume.write_bytes(bytes(data))
@@ -173,4 +173,6 @@ def test_a_corrupt_member_wholly_in_a_later_volume_names_that_volume(tmp_path, f
         with pytest.raises(rars.ChecksumError) as raised:
             archive.testrar()
     assert raised.value.member == info.filename
-    assert raised.value.volume_number == info.volume_number
+    assert raised.value.volume_index == info.volume_index
+    # Messages are for people, so they count as the part names do.
+    assert f"in volume {info.volume_index + 1}" in str(raised.value)

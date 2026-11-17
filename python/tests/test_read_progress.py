@@ -23,7 +23,7 @@ def test_extractall_reports_bytes_written_against_a_known_total(tmp_path):
     assert {event.phase for event in events} == {"extracting"}
     assert events[-1].completed == events[-1].total == len(PAYLOAD) + 5
     assert events[-1].percentage == 100.0
-    assert events[-1].volume_number is None
+    assert events[-1].volume_index is None
     assert all(a.completed <= b.completed for a, b in zip(events, events[1:]))
 
 
@@ -45,18 +45,18 @@ def test_a_set_from_a_generator_claims_no_total_before_its_last_volume(tmp_path)
             yield path
 
     def record(event):
-        events.append((event.volume_number, event.total, event.percentage, event.completed))
+        events.append((event.volume_index, event.total, event.percentage, event.completed))
 
     with rars.RarFile(paths[0]) as archive:
         archive.testrar(progress=record, volumes=later_volumes())
 
-    before_last = [event for event in events if event[0] < len(paths)]
+    before_last = [event for event in events if event[0] < len(paths) - 1]
     assert before_last
     assert all(total is None and percentage is None for _, total, percentage, _ in before_last)
     volumes = [volume for volume, *_ in events]
     assert volumes == sorted(volumes)
-    assert volumes[0] == 1
-    assert events[-1] == (len(paths), len(PAYLOAD) + 5, 100.0, len(PAYLOAD) + 5)
+    assert volumes[0] == 0
+    assert events[-1] == (len(paths) - 1, len(PAYLOAD) + 5, 100.0, len(PAYLOAD) + 5)
 
 
 class Stop(Exception):
