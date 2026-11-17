@@ -94,7 +94,7 @@ def test_passwords_and_policies_after_the_main_arguments_are_keyword_only(tmp_pa
         lambda: archive.extractall(tmp_path, None, "secret"),
         lambda: archive.testrar("secret"),
         lambda: archive.read_comment("secret"),
-        lambda: archive.getcomment("file.txt", "secret"),
+        lambda: archive.member_comment("file.txt", "secret"),
         lambda: rars.repair(data, "secret"),
         lambda: rars.RarBuilder.from_archive(data, "secret"),
     ):
@@ -231,7 +231,7 @@ def test_input_open_and_read_errors_are_oserrors(tmp_path, source):
         rars.RarFile(path)
 
 
-@pytest.mark.parametrize("method", ["getinfo", "read", "extract", "getcomment", "readlink"])
+@pytest.mark.parametrize("method", ["getinfo", "read", "extract", "member_comment", "readlink"])
 def test_missing_members_raise_keyerror(tmp_path, method):
     archive = rars.RarFile(STORED)
     args = ("missing", tmp_path) if method == "extract" else ("missing",)
@@ -368,11 +368,11 @@ def test_selected_extraction_creates_only_selected_redirections(tmp_path):
 def test_explicit_none_password_and_comment_arguments_remain_optional():
     builder = rars.RarBuilder(store=True, password=None, comment=None)
     builder.add_bytes(b"payload", "file.txt")
-    builder.set_file_comment("file.txt", b"comment")
-    builder.set_file_comment("file.txt", None)
+    builder.set_member_comment("file.txt", b"comment")
+    builder.set_member_comment("file.txt", None)
     archive = rars.RarFile(builder.to_bytes(), password=None)
     assert archive.comment is None
-    assert archive.getcomment("file.txt", password=None) is None
+    assert archive.member_comment("file.txt", password=None) is None
     assert archive.read("file.txt", password=None) == b"payload"
 
 
@@ -462,17 +462,17 @@ def test_recovery_progress_reports_its_phase_and_percentage():
     assert all(event.percentage is None or 0 <= event.percentage <= 100 for event in events)
 
 
-@pytest.mark.parametrize("method", ["getinfo", "read", "open", "extract", "getcomment", "readlink"])
+@pytest.mark.parametrize("method", ["getinfo", "read", "open", "extract", "member_comment", "readlink"])
 def test_member_conversion_errors_are_typeerrors(method):
     archive = rars.RarFile(STORED)
     with pytest.raises(TypeError):
         getattr(archive, method)(object())
 
 
-@pytest.mark.parametrize("method", ["read", "extract", "extractall", "testrar", "read_comment", "getcomment"])
+@pytest.mark.parametrize("method", ["read", "extract", "extractall", "testrar", "read_comment", "member_comment"])
 def test_per_call_password_conversion_errors_are_typeerrors(tmp_path, method):
     archive = rars.RarFile(STORED)
-    args = (archive.namelist()[0],) if method in {"read", "extract", "getcomment"} else ()
+    args = (archive.namelist()[0],) if method in {"read", "extract", "member_comment"} else ()
     kwargs = {"password": object()}
     if method == "extract":
         kwargs["path"] = tmp_path
@@ -488,7 +488,7 @@ def test_per_call_password_conversion_errors_are_typeerrors(tmp_path, method):
     ("rename", ["file.txt", object()]),
     ("add_unix_symlink", [object(), "target"]),
     ("add_unix_symlink", ["link", object()]),
-    ("set_file_comment", ["file.txt", object()]),
+    ("set_member_comment", ["file.txt", object()]),
 ])
 def test_builder_argument_conversion_errors_are_typeerrors(method, args):
     builder = rars.RarBuilder(store=True)

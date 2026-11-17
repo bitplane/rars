@@ -132,12 +132,12 @@ def test_preflight_detects_volume_settings(tmp_path):
 def test_file_comments_survive_edits_and_distinguish_empty_from_absent():
     builder = rars.RarBuilder(comment=b"archive comment")
     builder.add_directory("directory")
-    builder.set_file_comment("directory", b"directory comment")
+    builder.set_member_comment("directory", b"directory comment")
     for name in ["rename", "empty", "absent", "remove"]:
         builder.add_bytes(b"payload", name)
-    builder.set_file_comment("rename", b"legacy bytes\xff")
-    builder.set_file_comment("empty", b"")
-    builder.set_file_comment("remove", b"discard")
+    builder.set_member_comment("rename", b"legacy bytes\xff")
+    builder.set_member_comment("empty", b"")
+    builder.set_member_comment("remove", b"discard")
     source = rars.RarFile(builder.to_bytes())
     assert source.rewrite_preservation_issues() == []
     rewritten = rars.RarBuilder.from_archive(source)
@@ -146,46 +146,46 @@ def test_file_comments_survive_edits_and_distinguish_empty_from_absent():
     rewritten.add_bytes(b"new", "new")
     output = rars.RarFile(rewritten.to_bytes())
     assert output.comment == b"archive comment"
-    assert output.getcomment("directory") == b"directory comment"
-    assert output.getcomment("renamed") == b"legacy bytes\xff"
-    assert output.getcomment("empty") == b""
-    assert output.getcomment("absent") is None
-    assert output.getcomment("new") is None
+    assert output.member_comment("directory") == b"directory comment"
+    assert output.member_comment("renamed") == b"legacy bytes\xff"
+    assert output.member_comment("empty") == b""
+    assert output.member_comment("absent") is None
+    assert output.member_comment("new") is None
     assert output.read("renamed") == b"payload"
     with pytest.raises(KeyError):
-        output.getcomment("remove")
-    rewritten.set_file_comment("renamed")
-    assert rars.RarFile(rewritten.to_bytes()).getcomment("renamed") is None
+        output.member_comment("remove")
+    rewritten.set_member_comment("renamed")
+    assert rars.RarFile(rewritten.to_bytes()).member_comment("renamed") is None
 
 
 @pytest.mark.parametrize("format", ["rar14", "rar15", "rar20", "rar29"])
 def test_conversion_retains_legacy_file_comments(format):
     builder = rars.RarBuilder(format=format)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"comment\xff")
+    builder.set_member_comment("file", b"comment\xff")
     source = rars.RarFile(builder.to_bytes())
-    assert source.getcomment("file") == b"comment\xff"
+    assert source.member_comment("file") == b"comment\xff"
     rewritten = rars.RarBuilder.from_archive(source, preserve=False)
     output = rars.RarFile(rewritten.to_bytes())
-    assert output.getcomment("file") == b"comment\xff"
+    assert output.member_comment("file") == b"comment\xff"
     assert output.read("file") == b"payload"
 
 
 def test_conversion_decodes_encrypted_file_comments():
     builder = rars.RarBuilder(password="secret")
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"private comment")
+    builder.set_member_comment("file", b"private comment")
     source = rars.RarFile(builder.to_bytes(), password="secret")
-    assert source.getcomment("file") == b"private comment"
+    assert source.member_comment("file") == b"private comment"
     output = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
-    assert output.getcomment("file") == b"private comment"
+    assert output.member_comment("file") == b"private comment"
     assert output.read("file") == b"payload"
 
 
 def test_invalid_file_comment_fails_before_destination_is_touched(tmp_path):
     builder = rars.RarBuilder(store=True)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"comment")
+    builder.set_member_comment("file", b"comment")
     data = bytearray(builder.to_bytes())
     _, _, body_end = next(named_headers(data, 3, b"CMT"))
     data[body_end] ^= 1
@@ -261,10 +261,10 @@ def test_unknown_main_metadata_stays_readable_but_fails_preservation(tmp_path, d
 def test_rewrite_preserves_mixed_data_and_comment_encryption():
     plain = rars.RarBuilder(store=True)
     plain.add_bytes(b"public", "plain")
-    plain.set_file_comment("plain", b"public comment")
+    plain.set_member_comment("plain", b"public comment")
     secret = rars.RarBuilder(store=True, password="secret")
     secret.add_bytes(b"private", "encrypted")
-    secret.set_file_comment("encrypted", b"private comment")
+    secret.set_member_comment("encrypted", b"private comment")
     a, b = plain.to_bytes(), secret.to_bytes()
     # Join member blocks under the first non-solid main header.
     member_at, _, _ = next(named_headers(b, 2, b"encrypted"))
@@ -275,12 +275,12 @@ def test_rewrite_preserves_mixed_data_and_comment_encryption():
     output = rars.RarFile(rewritten)
     assert not output.getinfo("plain").is_encrypted
     assert output.getinfo("encrypted").is_encrypted
-    assert output.getcomment("plain") == b"public comment"
+    assert output.member_comment("plain") == b"public comment"
     with pytest.raises(rars.PasswordRequired):
-        output.getcomment("encrypted")
+        output.member_comment("encrypted")
     unlocked = rars.RarFile(rewritten, password="secret")
     assert unlocked.read("encrypted") == b"private"
-    assert unlocked.getcomment("encrypted") == b"private comment"
+    assert unlocked.member_comment("encrypted") == b"private comment"
 
 
 @pytest.mark.parametrize("options", [

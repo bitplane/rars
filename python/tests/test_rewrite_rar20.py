@@ -33,7 +33,7 @@ def test_vintage_rar20_preserves_metadata_comments_and_payloads(tmp_path, fixtur
     assert bool(next(headers(data))[2] & 8) == bool(next(headers(path.read_bytes()))[2] & 8)
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert output.read(after) == source.read(before)
-        assert output.getcomment(after) == source.getcomment(before)
+        assert output.member_comment(after) == source.member_comment(before)
         assert times(output.getinfo(after)) == times(source.getinfo(before))
         assert output.getinfo(after).file_attr == source.getinfo(before).file_attr
         assert output.getinfo(after).is_encrypted == source.getinfo(before).is_encrypted

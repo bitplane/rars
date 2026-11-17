@@ -20,27 +20,27 @@ def test_rewrite_duplicate_names_use_stable_ids(tmp_path, preserve):
     source = rars.RarBuilder(store=True)
     source.add_bytes(b"first", "one.txt", mtime=10)
     source.add_bytes(b"second", "two.txt", mtime=20)
-    source.set_file_comment("one.txt", b"first comment")
-    source.set_file_comment("two.txt", b"second comment")
+    source.set_member_comment("one.txt", b"first comment")
+    source.set_member_comment("two.txt", b"second comment")
     archive = rars.RarFile(_rewrite_name(source.to_bytes(), b"two.txt", b"one.txt"))
     builder = rars.RarBuilder.from_archive(archive, preserve=preserve, staging_dir=tmp_path)
     assert builder.member_ids() == [0, 1]
     for edit in [lambda: builder.remove("one.txt"), lambda: builder.rename("one.txt", "new"),
-                 lambda: builder.set_file_comment("one.txt", b"wrong"),
+                 lambda: builder.set_member_comment("one.txt", b"wrong"),
                  lambda: builder.set_times("one.txt", mtime_ns=0)]:
         with pytest.raises(ValueError, match="ambiguous member name"):
             edit()
     # Both copies remain writable before resolving the ambiguity.
     assert rars.RarFile(builder.to_bytes()).namelist() == ["one.txt", "one.txt"]
     builder.rename(1, "second")
-    builder.set_file_comment(1, b"changed")
+    builder.set_member_comment(1, b"changed")
     builder.set_times(1, mtime_ns=123_000_000_000)
     for _ in range(2):
         output = rars.RarFile(builder.to_bytes())
         assert output.read("one.txt") == b"first"
         assert output.read("second") == b"second"
-        assert output.getcomment("one.txt") == b"first comment"
-        assert output.getcomment("second") == b"changed"
+        assert output.member_comment("one.txt") == b"first comment"
+        assert output.member_comment("second") == b"changed"
         assert output.getinfo("second").mtime_ns == 123_000_000_000
     builder.remove(0)
     assert builder.member_ids() == [1]
@@ -233,7 +233,7 @@ def test_rewrite_readonly_flag_matches_unrar(tmp_path):
 def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
     builder = rars.RarBuilder(store=True)
     builder.add_unix_symlink("link", "../missing", mtime=123, mode=0o750)
-    builder.set_file_comment("link", b"link comment")
+    builder.set_member_comment("link", b"link comment")
     builder.add_unix_symlink("directory-link", "missing-dir", target_is_directory=True)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes())
@@ -245,7 +245,7 @@ def test_rewrite_preserves_unix_symlinks_through_edits(tmp_path):
     output = rars.RarFile(destination)
     assert output.readlink("renamed") == b"../missing"
     assert output.readlink("directory-link") == b"missing-dir"
-    assert output.getcomment("renamed") == b"link comment"
+    assert output.member_comment("renamed") == b"link comment"
     assert output.read("file") == b"payload"
     assert output.rewrite_preservation_issues() == []
     assert not (tmp_path / "missing-dir").exists()

@@ -1403,9 +1403,9 @@ impl RarFile {
         self.first.infos.iter().any(|info| info.is_encrypted)
     }
 
-    /// Returns the decoded comment attached to a member, or None if absent.
+    /// Returns the comment attached to a member, or None if absent.
     #[pyo3(signature = (member, *, password = None, options = None, cancellation = None))]
-    fn getcomment(
+    fn member_comment(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
@@ -2792,7 +2792,7 @@ impl RarBuilder {
 
     /// Sets or removes the comment attached to a queued member.
     #[pyo3(signature = (member, comment = None))]
-    fn set_file_comment(
+    fn set_member_comment(
         &mut self,
         member: &Bound<'_, PyAny>,
         comment: Option<&Bound<'_, PyAny>>,

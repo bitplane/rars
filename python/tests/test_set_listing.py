@@ -152,7 +152,7 @@ def test_metadata_of_a_later_member_comes_from_its_own_volume(tmp_path):
     paths = write_set(tmp_path)
     with rars.RarFile(paths[0]) as archive:
         assert times(archive.getinfo("tail.bin")) == times(archive.getinfo("head.txt"))
-        assert archive.getcomment("tail.bin") is None
+        assert archive.member_comment("tail.bin") is None
 
 
 def test_a_rarinfo_from_the_first_volume_still_selects_its_member(tmp_path):

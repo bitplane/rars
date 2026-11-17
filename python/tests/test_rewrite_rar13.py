@@ -28,7 +28,7 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
         assert output.getinfo(after).file_attr == source.getinfo(before).file_attr
         assert output.getinfo(after).is_encrypted == source.getinfo(before).is_encrypted
         assert times(output.getinfo(after)) == times(source.getinfo(before))
-        assert output.getcomment(after) == source.getcomment(before)
+        assert output.member_comment(after) == source.member_comment(before)
         if not source.getinfo(before).is_dir():
             assert output.read(after) == source.read(before)
     check_unrar(tmp_path, data)

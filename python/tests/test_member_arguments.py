@@ -9,7 +9,7 @@ def times(info):
 def linked_archive():
     builder = rars.RarBuilder(format="rar50", store=True)
     builder.add_bytes(b"payload", "file", mtime=1_700_000_000)
-    builder.set_file_comment("file", b"note")
+    builder.set_member_comment("file", b"note")
     builder.add_unix_symlink("link", "file")
     return rars.RarFile(builder.to_bytes())
 
@@ -22,12 +22,12 @@ def member_calls(archive, tmp_path):
         "read_many": ("file", lambda m: archive.read_many([m]), [b"payload"]),
         "extract": ("file", lambda m: archive.extract(m, tmp_path, overwrite=True).read_bytes(), b"payload"),
         "extractall": ("file", lambda m: archive.extractall(tmp_path, members=[m], overwrite=True)[0].read_bytes(), b"payload"),
-        "getcomment": ("file", lambda m: archive.getcomment(m), b"note"),
+        "member_comment": ("file", lambda m: archive.member_comment(m), b"note"),
         "readlink": ("link", lambda m: archive.readlink(m), b"file"),
     }
 
 
-METHODS = ["getinfo", "read", "open", "read_many", "extract", "extractall", "getcomment", "readlink"]
+METHODS = ["getinfo", "read", "open", "read_many", "extract", "extractall", "member_comment", "readlink"]
 
 
 @pytest.mark.parametrize("method", METHODS)
@@ -51,7 +51,7 @@ def test_no_member_method_selects_by_position(tmp_path, method):
         call(0)
 
 
-@pytest.mark.parametrize("method", ["getcomment", "readlink"])
+@pytest.mark.parametrize("method", ["member_comment", "readlink"])
 def test_metadata_reads_honour_cancellation(method):
     archive = linked_archive()
     token = rars.CancellationToken()
@@ -66,12 +66,12 @@ def test_metadata_reads_honour_cancellation(method):
 def test_member_comments_honour_output_limits(format):
     builder = rars.RarBuilder(format=format)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"note")
+    builder.set_member_comment("file", b"note")
     archive = rars.RarFile(builder.to_bytes())
     for field in ["max_member_output_bytes", "max_total_output_bytes"]:
-        assert archive.getcomment("file", options=rars.ReadOptions(**{field: 4})) == b"note"
+        assert archive.member_comment("file", options=rars.ReadOptions(**{field: 4})) == b"note"
         with pytest.raises(rars.LimitExceeded):
-            archive.getcomment("file", options=rars.ReadOptions(**{field: 3}))
+            archive.member_comment("file", options=rars.ReadOptions(**{field: 3}))
 
 
 def legacy_link(encrypt_headers):

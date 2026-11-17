@@ -74,7 +74,7 @@ def test_limits_apply_to_comments_read_from_the_source(format, where):
     builder = rars.RarBuilder(format=format, comment=b"long comment" if where == "archive" else None)
     builder.add_bytes(b"x", "x")
     if where == "member":
-        builder.set_file_comment("x", b"long comment")
+        builder.set_member_comment("x", b"long comment")
     tight = rars.ReadOptions(max_member_output_bytes=4)
     with pytest.raises(rars.LimitExceeded):
         rars.RarBuilder.from_archive(builder.to_bytes(), options=tight)

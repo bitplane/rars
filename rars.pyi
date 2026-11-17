@@ -356,7 +356,7 @@ class RarFile:
     ) -> bytes | None: ...
     @property
     def needs_password(self) -> bool: ...
-    def getcomment(
+    def member_comment(
         self,
         member: _Member,
         *,
@@ -464,7 +464,7 @@ class RarBuilder:
         atime_ns: int | None = None,
         birthtime_ns: int | None = None,
     ) -> None: ...
-    def set_file_comment(
+    def set_member_comment(
         self,
         member: int | _Member,
         comment: str | bytes | None = None,

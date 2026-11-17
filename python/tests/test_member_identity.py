@@ -12,8 +12,8 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     builder.add_directory("prefix")
     builder.add_bytes(b"first", "one.txt", mtime=10)
     builder.add_bytes(b"second", "two.txt", mtime=20)
-    builder.set_file_comment("one.txt", b"first comment")
-    builder.set_file_comment("two.txt", b"second comment")
+    builder.set_member_comment("one.txt", b"first comment")
+    builder.set_member_comment("two.txt", b"second comment")
     data = _rewrite_name(builder.to_bytes(), b"two.txt", b"one.txt")
     archive = rars.RarFile(data)
     first, second = archive.infolist()[1:]
@@ -42,15 +42,15 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     ]:
         assert archive.read(info) == payload
         assert archive.open(info).read() == payload
-        assert archive.getcomment(info) == comment
+        assert archive.member_comment(info) == comment
         assert archive.getinfo(info).mtime_ns == timestamp * 1_000_000_000
         destination = tmp_path / str(info.member_index)
         assert archive.extract(info, destination).read_bytes() == payload
         assert archive.extractall(destination, members=[info], overwrite=True)[0].read_bytes() == payload
-    assert archive.getcomment("one.txt") == b"second comment"
+    assert archive.member_comment("one.txt") == b"second comment"
     assert archive.getinfo("one.txt").mtime_ns == 20_000_000_000
     other = rars.RarFile(data)
-    for operation in [other.read, other.getinfo, other.getcomment, other.readlink]:
+    for operation in [other.read, other.getinfo, other.member_comment, other.readlink]:
         with pytest.raises(ValueError, match="different archive"):
             operation(first)
     with pytest.raises(ValueError, match="different archive"):

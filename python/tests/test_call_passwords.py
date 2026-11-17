@@ -82,9 +82,9 @@ def test_a_wrong_password_on_rar4_header_encryption_raises_at_open(name):
     lambda archive, tmp_path: archive.extractall(tmp_path, pwd="right"),
     lambda archive, tmp_path: archive.testrar(pwd="right"),
     lambda archive, tmp_path: archive.read_comment(pwd="right"),
-    lambda archive, tmp_path: archive.getcomment("file", pwd="right"),
+    lambda archive, tmp_path: archive.member_comment("file", pwd="right"),
     lambda archive, tmp_path: archive.readlink("file", pwd="right"),
-], ids=["read", "read_many", "open", "extract", "extractall", "testrar", "read_comment", "getcomment", "readlink"])
+], ids=["read", "read_many", "open", "extract", "extractall", "testrar", "read_comment", "member_comment", "readlink"])
 def test_the_per_call_password_keyword_is_password(tmp_path, call):
     archive = rars.RarFile(encrypted("rar50"))
     with pytest.raises(TypeError, match="pwd"):

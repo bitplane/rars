@@ -34,23 +34,23 @@ def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password, f
     builder = rars.RarBuilder(format=format, comment=b"archive", password=password)
     for name in ["file", "empty", "absent", "remove"]:
         builder.add_bytes(name.encode(), name)
-    builder.set_file_comment("file", b"comment\xff")
-    builder.set_file_comment("empty", b"")
-    builder.set_file_comment("remove", b"discard")
+    builder.set_member_comment("file", b"comment\xff")
+    builder.set_member_comment("empty", b"")
+    builder.set_member_comment("remove", b"discard")
     source = rars.RarFile(builder.to_bytes(), password=password)
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     editor.remove("remove")
     output = rars.RarFile(editor.to_bytes(), password=password)
     assert output.comment == b"archive"
-    assert output.getcomment("renamed") == b"comment\xff"
-    assert output.getcomment("empty") == b""
-    assert output.getcomment("absent") is None
+    assert output.member_comment("renamed") == b"comment\xff"
+    assert output.member_comment("empty") == b""
+    assert output.member_comment("absent") is None
     assert output.read("renamed") == b"file"
-    editor.set_file_comment("renamed", b"changed")
-    assert rars.RarFile(editor.to_bytes(), password=password).getcomment("renamed") == b"changed"
-    editor.set_file_comment("renamed", None)
-    assert rars.RarFile(editor.to_bytes(), password=password).getcomment("renamed") is None
+    editor.set_member_comment("renamed", b"changed")
+    assert rars.RarFile(editor.to_bytes(), password=password).member_comment("renamed") == b"changed"
+    editor.set_member_comment("renamed", None)
+    assert rars.RarFile(editor.to_bytes(), password=password).member_comment("renamed") is None
 
 
 def old_comment_archive():
@@ -98,7 +98,7 @@ def test_bad_archive_comments_leave_destination_untouched(tmp_path, damage):
 def test_corrupt_file_comment_fails_before_destination_write(tmp_path):
     builder = rars.RarBuilder(format="rar29", store=True)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"comment")
+    builder.set_member_comment("file", b"comment")
     data = bytearray(builder.to_bytes())
     offset, _, _, _ = next(h for h in headers(data) if h[1] == 0x74)
     name_size = struct.unpack_from("<H", data, offset + 26)[0]
