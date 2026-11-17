@@ -151,7 +151,7 @@ def test_selected_extraction_keeps_empty_files_and_completed_prefixes(tmp_path, 
 
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("from_path", [False, True])
-def test_parsing_limits_are_per_call_and_do_not_become_payload_defaults(tmp_path, format, from_path):
+def test_open_options_are_defaults_that_a_calls_options_replace(tmp_path, format, from_path):
     builder = rars.RarBuilder(format=format, store=True)
     builder.add_bytes(b"payload", "file")
     data = builder.to_bytes()
@@ -170,7 +170,19 @@ def test_parsing_limits_are_per_call_and_do_not_become_payload_defaults(tmp_path
         open_archive(None, cancellation=token)
     options = rars.ReadOptions(max_header_count=100, max_header_bytes=10000, max_member_output_bytes=0)
     assert options.max_header_count == 100
-    assert open_archive(options).read("file") == b"payload"
+    archive = open_archive(options)
+    with pytest.raises(MemoryError):
+        archive.read("file")
+    with pytest.raises(MemoryError):
+        archive.extractall(tmp_path / "out")
+    with pytest.raises(MemoryError):
+        archive.testrar()
+    assert archive.read("file", options=rars.ReadOptions()) == b"payload"
+    # Opening's cancellation is not a default.
+    token = rars.CancellationToken()
+    archive = open_archive(None, cancellation=token)
+    token.cancel()
+    assert archive.read("file") == b"payload"
     with pytest.raises(AttributeError):
         options.max_header_bytes = 100
 

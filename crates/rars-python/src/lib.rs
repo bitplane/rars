@@ -233,7 +233,7 @@ impl WriterResources {
     }
 }
 
-/// Per-call parsing, decoding and extraction policies.
+/// Parsing, decoding and extraction policies, given to `RarFile` as defaults or to one call.
 #[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone, Default)]
 struct ReadOptions {
@@ -935,6 +935,9 @@ impl RarFile {
     /// A path or seekable file object is read on demand from its start, so it must stay
     /// open and unchanged while the archive is, and its position is left wherever reading
     /// ended; a stream that can't seek is read whole from where it is.
+    ///
+    /// `options` cover opening and are the defaults for every later call; a call's own
+    /// `options` replace them whole. `cancellation` covers opening alone.
     #[new]
     #[pyo3(signature = (source, mode = "r", *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
@@ -1008,7 +1011,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, name)?;
@@ -1031,7 +1034,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         let data = self.read(py, name, password, options, None, None, volumes)?;
         let io = py.import("io")?;
@@ -1053,7 +1056,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let indices = members
@@ -1084,7 +1087,7 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
     ) -> PyResult<PathBuf> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let Overwrite(overwrite) = overwrite;
@@ -1175,7 +1178,7 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
     ) -> PyResult<Vec<PathBuf>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let mode = OutputMode {
@@ -1246,7 +1249,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "testing");
@@ -1299,7 +1302,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         py.detach(|| {
@@ -1324,7 +1327,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1346,7 +1349,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<u8>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1378,7 +1381,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<HashMap<String, i128>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1501,6 +1504,17 @@ impl RarFile {
 }
 
 impl RarFile {
+    /// A call's own `options` replace the ones the archive was opened with, whole.
+    fn call_options(
+        &self,
+        options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Option<ReadOptions>> {
+        let defaults = self.options.as_ref().map(ReadOptions::policies);
+        ReadOptions::for_call(options.or(defaults.as_ref()), progress, cancellation)
+    }
+
     fn with_set(mut self, first_volume_only: bool, volumes: Option<Py<PyTuple>>) -> Self {
         self.first_volume_only = first_volume_only;
         self.volumes = volumes;
