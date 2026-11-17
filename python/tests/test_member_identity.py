@@ -27,7 +27,7 @@ def test_duplicate_member_objects_keep_payload_and_metadata_identity(tmp_path, f
     with pytest.raises(rars.LimitExceeded):
         archive.read_many([second, first], options=rars.ReadOptions(max_total_output_bytes=10))
     assert archive.read_many([]) == []
-    with pytest.raises(KeyError):
+    with pytest.raises(IsADirectoryError):
         archive.read_many([archive.infolist()[0]])
     with pytest.raises(KeyError):
         archive.read_many([first, "missing"])

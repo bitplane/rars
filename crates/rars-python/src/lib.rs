@@ -1,4 +1,6 @@
-use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError};
+use pyo3::exceptions::{
+    PyIsADirectoryError, PyKeyError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError,
+};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
@@ -990,13 +992,7 @@ impl RarFile {
 
     fn getinfo(&self, py: Python<'_>, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
         let index = self.resolve_index(py, name)?;
-        // A first-volume member never waits for later volumes; its split sizes are whole once the set is listed.
-        let listing = match self.whole.get() {
-            Some(whole) => whole,
-            None if index < self.first.infos.len() => &self.first,
-            None => self.listing(py)?,
-        };
-        Ok(listing.infos[index].clone())
+        Ok(self.info_at(py, index)?.clone())
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
@@ -1017,10 +1013,10 @@ impl RarFile {
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, name)?;
         let data = self.read_indices(py, &[index], password, options, volumes)?;
-        data.into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
+        match data.into_iter().next().flatten() {
+            Some(data) => Ok(data),
+            None => Err(no_payload(self.info_at(py, index)?)),
+        }
     }
 
     #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
@@ -1066,7 +1062,11 @@ impl RarFile {
             .collect::<PyResult<Vec<_>>>()?;
         self.read_indices(py, &indices, password, options, volumes)?
             .into_iter()
-            .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
+            .zip(&indices)
+            .map(|(bytes, &index)| match bytes {
+                Some(bytes) => Ok(bytes),
+                None => Err(no_payload(self.info_at(py, index)?)),
+            })
             .collect()
     }
 
@@ -1367,10 +1367,18 @@ impl RarFile {
                 .map_err(map_error)?
                 .expect("legacy symlink predicate checked above"));
         }
+        if !member.meta.is_redirection {
+            return Err(PyValueError::new_err(format!(
+                "{} is not a link",
+                String::from_utf8_lossy(&member.meta.name)
+            )));
+        }
         member
             .supported_redirection()
             .map(|link| link.target_name.clone())
-            .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
+            .ok_or_else(|| {
+                UnsupportedRarFeature::new_err("member is a kind of link rars cannot read")
+            })
     }
 
     /// Exact Unix nanoseconds, absent kinds omitted; no `password` since headers were decrypted at open.
@@ -1505,6 +1513,16 @@ impl RarFile {
 }
 
 impl RarFile {
+    /// A first-volume member never waits for later volumes; its split sizes are whole once the set is listed.
+    fn info_at(&self, py: Python<'_>, index: usize) -> PyResult<&RarInfo> {
+        let listing = match self.whole.get() {
+            Some(whole) => whole,
+            None if index < self.first.infos.len() => &self.first,
+            None => self.listing(py)?,
+        };
+        Ok(&listing.infos[index])
+    }
+
     /// A call's own `options` replace the ones the archive was opened with, whole.
     fn call_options(
         &self,
@@ -4564,6 +4582,20 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         is_directory: member.meta.is_directory,
         is_redirection: member.meta.is_redirection,
         volume: 0,
+    }
+}
+
+/// Why `read` has nothing to return for a member that exists.
+fn no_payload(info: &RarInfo) -> PyErr {
+    if info.is_directory {
+        PyIsADirectoryError::new_err(format!("{} is a directory", info.filename))
+    } else if info.is_redirection {
+        PyValueError::new_err(format!(
+            "{} is a link; readlink() reads its target",
+            info.filename
+        ))
+    } else {
+        PyValueError::new_err(format!("{} has no data to read", info.filename))
     }
 }
 

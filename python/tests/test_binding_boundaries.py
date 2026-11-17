@@ -287,8 +287,22 @@ def test_cancelled_volume_publication_preserves_old_destination(tmp_path):
 
 def test_readlink_refuses_regular_members():
     archive = rars.RarFile(STORED)
-    with pytest.raises(rars.UnsupportedRarFeature, match="not a supported redirection"):
+    with pytest.raises(ValueError, match="is not a link"):
         archive.readlink(archive.namelist()[0])
+
+
+def test_reading_a_directory_or_link_says_which_it_is():
+    builder = rars.RarBuilder(store=True)
+    builder.add_directory("d")
+    builder.add_unix_symlink("l", "d")
+    archive = rars.RarFile(builder.to_bytes())
+    for read in (archive.read, archive.open, lambda name: archive.read_many([name])):
+        with pytest.raises(IsADirectoryError, match="d is a directory"):
+            read("d")
+        with pytest.raises(ValueError, match="readlink"):
+            read("l")
+    with pytest.raises(ValueError, match="d is not a link"):
+        archive.readlink("d")
 
 
 def test_a_legacy_time_past_2106_converts_to_rar5():
@@ -387,7 +401,7 @@ def test_conversion_refuses_unknown_redirection_kind():
     assert changed
     archive = rars.RarFile(bytes(data))
     assert archive.namelist() == ["link"]
-    with pytest.raises(rars.UnsupportedRarFeature, match="not a supported redirection"):
+    with pytest.raises(rars.UnsupportedRarFeature, match="kind of link rars cannot read"):
         archive.readlink("link")
     with pytest.raises(rars.UnsupportedRarFeature, match="special entry"):
         rars.RarBuilder.from_archive(archive, preserve=False)
