@@ -114,7 +114,7 @@ async function openArchive(wasm, sources, password, platform, options) {
     : wasm.RarFile.openVolumes(volumes, password, options);
 }
 
-async function build(wasm, payload, platform, volumes) {
+async function build(wasm, payload, platform, volumes, report) {
   const options = payload.writerOptions;
   const builder = new wasm.RarBuilder({
     format: options.version,
@@ -143,7 +143,7 @@ async function build(wasm, payload, platform, volumes) {
       if (typeof entry.name === "string") builder.addBytes(entry.name, data, entryOptions);
       else builder.addBytesRaw(entry.name, data, entryOptions);
     }
-    return volumes ? builder.toVolumes() : builder.toBytes();
+    return volumes ? builder.toVolumes(report) : builder.toBytes(report);
   } finally {
     builder.free();
   }
@@ -170,6 +170,10 @@ function producedBytes(result) {
 export function startWorker(port, wasm, platform) {
   port.onMessage(async (message) => {
     const { id, operation, payload } = message;
+    // The engine calls this while it works, a mebibyte or a stage at a time.
+    const report = message.progress
+      ? (phase, completed, total) => port.post({ id, progress: { operation, phase, completed, total } })
+      : undefined;
     try {
       const phase = PHASES[operation];
       // The engine reports nothing while it runs, so the total is unknown until it ends.
@@ -186,9 +190,9 @@ export function startWorker(port, wasm, platform) {
             case "open":
               result = { ...metadata(archive, payload.password, payload.readOptions), sources: payload.sources };
               break;
-            case "read": result = archive.readAt(payload.index, payload.password, payload.readOptions); break;
-            case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions); break;
-            case "test": archive.test(payload.password, payload.readOptions); break;
+            case "read": result = archive.readAt(payload.index, payload.password, payload.readOptions, report); break;
+            case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions, report); break;
+            case "test": archive.test(payload.password, payload.readOptions, report); break;
             case "readComment": result = archive.readComment(payload.password, payload.readOptions); break;
             case "readMemberComment": result = archive.readMemberComment(payload.index, payload.password, payload.readOptions); break;
           }
@@ -236,16 +240,16 @@ export function startWorker(port, wasm, platform) {
           result.data = undefined;
         }
       } else if (operation === "build") {
-        result = await build(wasm, payload, platform, false);
+        result = await build(wasm, payload, platform, false, report);
       } else if (operation === "buildVolumes") {
-        result = await build(wasm, payload, platform, true);
+        result = await build(wasm, payload, platform, true, report);
       } else if (operation === "writeTo") {
         if (payload.writerOptions.volumeSize === undefined) {
-          const bytes = await build(wasm, payload, platform, false);
+          const bytes = await build(wasm, payload, platform, false, report);
           await platform.writeAtomic(payload.path, bytes, payload.overwrite);
           result = [payload.path];
         } else {
-          const parts = await build(wasm, payload, platform, true);
+          const parts = await build(wasm, payload, platform, true, report);
           result = await platform.writeVolumes(payload.path, parts, payload.writerOptions.version, payload.overwrite);
         }
       } else {

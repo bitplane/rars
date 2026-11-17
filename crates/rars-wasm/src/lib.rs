@@ -8,6 +8,8 @@
 use rars_rs::{ArchiveVersion, Builder};
 use wasm_bindgen::prelude::*;
 
+mod progress;
+
 /// The `rars` version this module was built from, so a page can report which
 /// encoder wrote an archive.
 #[wasm_bindgen(js_name = version)]
@@ -588,8 +590,22 @@ impl RarFile {
         index: usize,
         password: Option<Password>,
         settings: JsValue,
+        progress: Option<js_sys::Function>,
     ) -> Result<Vec<u8>, JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
+        if progress.is_some() && self.archives.len() == 1 {
+            let options = read_options(password.as_deref(), &settings)?;
+            let data = progress::watching(progress, || {
+                read_counted(&self.archives[0], &[index], options)
+            })
+            .map_err(js_error)?;
+            return data.into_iter().next().flatten().ok_or_else(|| {
+                binding_error(
+                    "ENTRY_NOT_FOUND",
+                    &format!("no such archive entry index: {index}"),
+                )
+            });
+        }
         let found = if self.archives.len() == 1 {
             self.archives[0]
                 .read_member_at_with_options(index, read_options(password.as_deref(), &settings)?)
@@ -615,11 +631,16 @@ impl RarFile {
         indices: Vec<u32>,
         password: Option<Password>,
         settings: JsValue,
+        progress: Option<js_sys::Function>,
     ) -> Result<js_sys::Array, JsValue> {
         let indices: Vec<usize> = indices.into_iter().map(|index| index as usize).collect();
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         let options = read_options(password.as_deref(), &settings)?;
-        let data = if self.archives.len() == 1 {
+        let data = if progress.is_some() && self.archives.len() == 1 {
+            progress::watching(progress, || {
+                read_counted(&self.archives[0], &indices, options)
+            })
+        } else if self.archives.len() == 1 {
             self.archives[0].read_members_at_with_options(&indices, options)
         } else {
             rars_rs::read_volume_members_at_with_options(&self.archives, &indices, options)
@@ -640,8 +661,18 @@ impl RarFile {
 
     /// Decode every member and discard the bytes, throwing on the first
     /// checksum failure or wrong password.
-    pub fn test(&self, password: Option<Password>, settings: JsValue) -> Result<(), JsValue> {
+    pub fn test(
+        &self,
+        password: Option<Password>,
+        settings: JsValue,
+        progress: Option<js_sys::Function>,
+    ) -> Result<(), JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
+        if progress.is_some() {
+            let options = read_options(password.as_deref(), &settings)?;
+            return progress::watching(progress, || test_counted(&self.archives, options))
+                .map_err(js_error);
+        }
         if self.archives.len() == 1 {
             return self.archives[0]
                 .test_with_options(read_options(password.as_deref(), &settings)?)
@@ -754,6 +785,116 @@ impl RarFile {
     pub fn family(&self) -> String {
         family_name(self.archives[0].family()).to_string()
     }
+}
+
+/// Tests the archive or set a member at a time, counting each as it is verified.
+fn test_counted(
+    archives: &[rars_rs::Archive],
+    options: rars_rs::ArchiveReadOptions<'_>,
+) -> rars_rs::Result<()> {
+    // The callback names regular entries and directories in archive order, skipping
+    // redirections, a member at a time; each counts as it is verified.
+    let members: Vec<rars_rs::ArchiveMember> = if archives.len() == 1 {
+        archives[0].members().collect()
+    } else {
+        rars_rs::volume_members(archives)?
+    };
+    let mut sizes = members
+        .iter()
+        .filter(|member| !member.meta.is_redirection)
+        .map(|member| (!member.meta.is_directory).then_some(member.meta.unpacked_size))
+        .collect::<Vec<_>>()
+        .into_iter();
+    let total = members
+        .iter()
+        .filter(|member| !member.meta.is_redirection && !member.meta.is_directory)
+        .map(|member| member.meta.unpacked_size)
+        .sum();
+    let count = progress::ReadCount::new("testing", total);
+    let mut previous = 0;
+    let mut tested = |_: &rars_rs::ExtractedEntryMeta| {
+        count.add(std::mem::take(&mut previous));
+        previous = sizes.next().flatten().unwrap_or(0);
+        Ok(())
+    };
+    if archives.len() == 1 {
+        archives[0].test_with_options_and_callback(options, &mut tested)?;
+    } else {
+        rars_rs::test_volumes_with_options_and_callback(archives, options, &mut tested)?;
+    }
+    count.finish();
+    Ok(())
+}
+
+/// Selected members decoded in one pass, counted as they decode. Unselected solid
+/// predecessors decode into a sink and aren't counted.
+fn read_counted(
+    archive: &rars_rs::Archive,
+    indices: &[usize],
+    options: rars_rs::ArchiveReadOptions<'_>,
+) -> rars_rs::Result<Vec<Option<Vec<u8>>>> {
+    use std::cell::RefCell;
+    use std::collections::{HashMap, HashSet};
+    use std::rc::Rc;
+    struct Shared(Rc<RefCell<Vec<u8>>>);
+    impl std::io::Write for Shared {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let selected: HashSet<usize> = indices.iter().copied().collect();
+    let readable =
+        |member: &rars_rs::ArchiveMember| !member.meta.is_directory && !member.meta.is_redirection;
+    let members: Vec<_> = archive.members().collect();
+    let total = members
+        .iter()
+        .enumerate()
+        .filter(|(index, member)| selected.contains(index) && readable(member))
+        .map(|(_, member)| member.meta.unpacked_size)
+        .sum();
+    let last = members
+        .iter()
+        .enumerate()
+        .filter(|(index, member)| selected.contains(index) && readable(member))
+        .map(|(index, _)| index)
+        .next_back();
+    let count = progress::ReadCount::new("reading", total);
+    let mut buffers: HashMap<usize, Rc<RefCell<Vec<u8>>>> = HashMap::new();
+    if let Some(last) = last {
+        let solid = archive.is_solid();
+        let mut current = 0;
+        archive.extract_with_control(options, |member| {
+            let index = current;
+            current += 1;
+            if index > last {
+                return Ok(rars_rs::ExtractionDecision::Stop);
+            }
+            if !readable(member) {
+                return Ok(rars_rs::ExtractionDecision::Skip);
+            }
+            if selected.contains(&index) {
+                let buffer = Rc::new(RefCell::new(Vec::new()));
+                buffers.insert(index, Rc::clone(&buffer));
+                return Ok(rars_rs::ExtractionDecision::Extract(
+                    count.counted(Box::new(Shared(buffer))),
+                ));
+            }
+            Ok(if solid {
+                rars_rs::ExtractionDecision::Extract(Box::new(std::io::sink()))
+            } else {
+                rars_rs::ExtractionDecision::Skip
+            })
+        })?;
+    }
+    count.finish();
+    Ok(indices
+        .iter()
+        .map(|index| buffers.get(index).map(|buffer| buffer.borrow().clone()))
+        .collect())
 }
 
 fn info_with_encoding(
@@ -987,32 +1128,52 @@ impl RarBuilder {
     /// seconds of work with no yielding. Call it from a worker if the page has
     /// to stay responsive.
     #[wasm_bindgen(js_name = toBytes)]
-    pub fn to_bytes(&self) -> Result<js_sys::Uint8Array, JsValue> {
+    pub fn to_bytes(
+        &self,
+        progress: Option<js_sys::Function>,
+    ) -> Result<js_sys::Uint8Array, JsValue> {
+        progress::watching(progress, || self.to_bytes_reporting())
+    }
+
+    /// Encode the archive as a volume set, one `Uint8Array` per volume.
+    /// Requires `volumeSize`.
+    #[wasm_bindgen(js_name = toVolumes, unchecked_return_type = "Uint8Array[]")]
+    pub fn to_volumes(&self, progress: Option<js_sys::Function>) -> Result<js_sys::Array, JsValue> {
+        progress::watching(progress, || self.to_volumes_reporting())
+    }
+}
+
+impl RarBuilder {
+    fn reporter() -> Option<&'static dyn rars_rs::WriteProgress> {
+        progress::active().then_some(&progress::WriteReporter as &dyn rars_rs::WriteProgress)
+    }
+
+    fn to_bytes_reporting(&self) -> Result<js_sys::Uint8Array, JsValue> {
         if self.resources.max_memory_bytes().is_none()
             && self.inner.format().family() != rars_rs::ArchiveFamily::Rar50Plus
         {
-            let bytes = self.inner.to_bytes().map_err(js_error)?;
+            let bytes = self
+                .inner
+                .to_bytes_with_progress(Self::reporter())
+                .map_err(js_error)?;
             return Ok(js_sys::Uint8Array::from(bytes.as_slice()));
         }
         let output = self
             .inner
-            .to_output(&self.resources, None)
+            .to_output(&self.resources, Self::reporter())
             .map_err(js_error)?;
         output
             .copy_with(|bytes| js_sys::Uint8Array::from(bytes))
             .map_err(js_error)
     }
 
-    /// Encode the archive as a volume set, one `Uint8Array` per volume.
-    /// Requires `volumeSize`.
-    #[wasm_bindgen(js_name = toVolumes, unchecked_return_type = "Uint8Array[]")]
-    pub fn to_volumes(&self) -> Result<js_sys::Array, JsValue> {
+    fn to_volumes_reporting(&self) -> Result<js_sys::Array, JsValue> {
         if self.resources.max_memory_bytes().is_none()
             && self.inner.format().family() != rars_rs::ArchiveFamily::Rar50Plus
         {
             return Ok(self
                 .inner
-                .build_volumes(None)
+                .build_volumes(Self::reporter())
                 .map_err(js_error)?
                 .iter()
                 .map(|volume| js_sys::Uint8Array::from(volume.as_slice()))
@@ -1020,7 +1181,7 @@ impl RarBuilder {
         }
         let volumes = self
             .inner
-            .to_volume_output(&self.resources, None)
+            .to_volume_output(&self.resources, Self::reporter())
             .map_err(js_error)?;
         volumes
             .copy_with(|volumes| {

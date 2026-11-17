@@ -137,7 +137,11 @@ volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
 same directory. Sets exceeding 901 volumes or containing overlapping output
 paths are rejected before any file is written.
 
-Long operations accept an `AbortSignal` and progress callback:
+Long operations accept an `AbortSignal` and a progress callback, called with the
+phase (`reading`, `testing`, `compressing`, `protecting`, `writing` or
+`repairing`) and bytes `completed` of `total`, which is absent until known.
+Writing, testing and reading from one archive report as the engine goes; reading
+selected entries of a volume set, and repairing, report only start and end:
 
 ```js
 const bytes = await writer.bytes({

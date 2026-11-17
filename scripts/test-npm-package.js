@@ -235,17 +235,29 @@ await check("isRarFile and isRarFileSfx answer for bytes, Blobs and paths", asyn
   }
 });
 
-await check("progress names its phase and leaves the total out until known", async () => {
+await check("progress reports the engine's stages in bytes", async () => {
   const events = [];
-  const bytes = await new RarWriter().add("hello.txt", HELLO).bytes({ onProgress: (event) => events.push(event) });
-  assert.deepEqual(events.map((event) => event.phase), ["compressing", "compressing"]);
+  const bytes = await new RarWriter({ recoveryPercent: 5 }).add("hello.txt", LARGE)
+    .bytes({ onProgress: (event) => events.push(event) });
   assert.equal(events[0].total, undefined);
+  assert.ok(events.length > 2);
+  const phases = new Set(events.map((event) => event.phase));
+  assert.ok(phases.has("compressing") && phases.has("protecting"), [...phases].join());
+  for (const phase of phases) assert.ok(["compressing", "protecting", "writing"].includes(phase), phase);
   assert.equal(events.at(-1).completed, bytes.length);
   assert.equal(events.at(-1).total, bytes.length);
-  const read = [];
   const archive = await RarArchive.open(bytes);
-  await archive.entries[0].bytes({ onProgress: (event) => read.push(event.phase) });
-  assert.deepEqual(read, ["reading", "reading"]);
+  for (const [run, phase] of [
+    [(onProgress) => archive.entries[0].bytes({ onProgress }), "reading"],
+    [(onProgress) => archive.readMany([archive.entries[0]], { onProgress }), "reading"],
+    [(onProgress) => archive.test({ onProgress }), "testing"],
+  ]) {
+    const seen = [];
+    await run((event) => seen.push(event));
+    assert.ok(seen.every((event) => event.phase === phase), phase);
+    // The engine's events count the member's decoded bytes.
+    assert.ok(seen.some((event) => event.total === LARGE.length && event.completed === LARGE.length), phase);
+  }
 });
 
 await check("codec work leaves the Node event loop responsive", async () => {
