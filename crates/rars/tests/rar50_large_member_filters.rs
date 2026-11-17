@@ -13,9 +13,11 @@ use rars::{
 };
 
 const MIB: u64 = 1024 * 1024;
-const MEMBER: usize = 8 << 20;
-/// Below the 8 MiB member's whole-member charge, above one run's.
-const LIMIT: u64 = 180 * MIB;
+const MEMBER: usize = 2 << 20;
+/// Below the 2 MiB member's whole-member charge (173.1 MiB at a 128 KiB
+/// dictionary) and above one 1 MiB run's filter search (169.1 MiB), so the
+/// member is coded run by run and each run still searches.
+const LIMIT: u64 = 171 * MIB;
 
 /// The same few instructions before each call to one of eight targets. Once
 /// the E8 filter makes the addresses absolute, the member is eight records.
@@ -51,7 +53,7 @@ fn write(data: &[u8], policy: FilterPolicy, resources: &WriterResources) -> Vec<
     rar50::write_streaming_archive_with_progress(
         &entries,
         WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
-            .with_compression_level(3)
+            .with_compression_level(2)
             .with_dictionary_size(128 * 1024),
         ArchiveExtras::default().with_filter_policy(policy),
         resources,
