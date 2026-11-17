@@ -566,6 +566,7 @@ impl FileHeader {
             | Error::WriterPreparationLimitExceeded { .. }
             | Error::Rar50ScratchLimitExceeded { .. }
             | Error::RewriteStagingLimitExceeded { .. }
+            | Error::UnrewritableEntry { .. }
             | Error::Rar50FilterMemoryLimitExceeded { .. }
             | Error::UnsupportedFamilyFeature { .. }
             | Error::UnsupportedCompression { .. }

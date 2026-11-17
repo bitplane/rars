@@ -1782,56 +1782,25 @@ impl RarFile {
     }
 
     /// A set's later volumes are read here, as their headers describe the set's members.
-    fn rewrite_source(
+    /// The rest of the set a rewrite reads, after this first volume.
+    fn rewrite_volumes(
         &self,
         py: Python<'_>,
         volumes: Option<&Bound<'_, PyAny>>,
         password: Option<&[u8]>,
-    ) -> PyResult<(Vec<rars_rs::Archive>, Vec<SourceMember>)> {
+    ) -> PyResult<Vec<rars_rs::Archive>> {
         let options = self.extraction_options(self.options.as_ref(), password);
-        let later = if !self.archive.is_volume() {
-            Vec::new()
+        if !self.archive.is_volume() {
+            Ok(Vec::new())
         } else if self.first_volume_only {
-            return Err(PyValueError::new_err(
+            Err(PyValueError::new_err(
                 "a RarFile opened with first_volume_only=True cannot rewrite its volume set; open it without first_volume_only",
-            ));
+            ))
         } else {
             self.extract_set(py, volumes, options, |volumes| {
                 volumes_to_last(&self.archive, volumes).collect()
-            })?
-        };
-        // Releases the GIL, which a file-object source takes from inside its lock.
-        let members = py
-            .detach(|| {
-                let mut read = std::iter::once(&self.archive)
-                    .chain(&later)
-                    .map(|volume| {
-                        Ok((
-                            volume.member_comments_with_options(options)?,
-                            volume.legacy_symlink_targets_with_options(options)?,
-                            volume.member_comment_encryption(),
-                        ))
-                    })
-                    .collect::<rars_rs::Result<Vec<_>>>()?;
-                Ok::<_, rars_rs::Error>(
-                    self.archive
-                        .volume_set_members(&later)?
-                        .into_iter()
-                        .map(|set_member| {
-                            let (comments, links, encrypted) = &mut read[set_member.volume_index];
-                            let index = set_member.index_in_volume;
-                            SourceMember {
-                                member: set_member.member,
-                                comment: comments[index].take(),
-                                legacy_link: links[index].take(),
-                                comment_encrypted: encrypted[index],
-                            }
-                        })
-                        .collect(),
-                )
             })
-            .map_err(map_error)?;
-        Ok((later, members))
+        }
     }
 
     /// Only a set's first volume knows where the set starts, and bytes alone can't find the rest.
@@ -2204,14 +2173,6 @@ impl PythonVolumes {
     }
 }
 
-/// A source member with the metadata read from its volume besides the payload.
-struct SourceMember {
-    member: rars_rs::ArchiveMember,
-    comment: Option<Vec<u8>>,
-    legacy_link: Option<Vec<u8>>,
-    comment_encrypted: bool,
-}
-
 /// Original identity follows edits; verified payload sources belong to one write.
 #[derive(Debug, Clone)]
 struct RewriteInput {
@@ -2219,15 +2180,11 @@ struct RewriteInput {
     later_volumes: Vec<rars_rs::Archive>,
     password: Option<Vec<u8>>,
     options: Option<ReadOptions>,
-    members: HashMap<usize, RewriteMember>,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    /// Payloads still to stage, by builder id.
+    members: HashMap<usize, rars_rs::RewritePayload>,
     directory: Option<PathBuf>,
     max_staged_bytes: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RewriteMember {
-    index: usize,
-    size: u64,
 }
 
 impl RewriteInput {
@@ -2238,26 +2195,19 @@ impl RewriteInput {
         progress: Option<Arc<PythonProgress>>,
         consume: impl FnOnce(&rars_rs::Builder) -> rars_rs::Result<T>,
     ) -> rars_rs::Result<T> {
-        let mut members: Vec<_> = self.members.iter().collect();
-        members.sort_unstable_by_key(|(_, member)| member.index);
+        let payloads: Vec<_> = self.members.values().copied().collect();
         let limit = match self.max_staged_bytes {
             Some(limit) => limit,
-            None => members.iter().try_fold(0u64, |sum, (_, member)| {
-                sum.checked_add(member.size)
-                    .ok_or(rars_rs::Error::RewriteStagingLimitExceeded {
-                        limit: u64::MAX,
-                        required: u64::MAX,
-                    })
-            })?,
+            None => rars_rs::rewrite_payload_bytes(&payloads)?,
         };
-        let indices: Vec<_> = members.iter().map(|(_, member)| member.index).collect();
         let mut options = python_read_options(self.options.as_ref(), self.password.as_deref());
+        options.legacy_name_encoding = options.legacy_name_encoding.or(self.encoding);
         if let Some(progress) = &progress {
             options = options.with_cancellation(&progress.read_cancellation);
         }
-        self.archive.with_rewrite_sources_from_volumes(
+        self.archive.with_rewrite_payloads(
             &self.later_volumes,
-            &indices,
+            &payloads,
             options,
             &rars_rs::RewriteStaging {
                 directory: self.directory.as_deref().unwrap_or(directory).to_path_buf(),
@@ -2266,12 +2216,8 @@ impl RewriteInput {
             progress
                 .clone()
                 .map(|progress| progress as Arc<dyn rars_rs::WriteProgress>),
-            |sources| {
-                for ((id, _), source) in members.into_iter().zip(sources) {
-                    builder.set_source_by_id(*id, source)?;
-                }
-                consume(builder)
-            },
+            builder,
+            consume,
         )
     }
 }
@@ -2512,200 +2458,34 @@ impl RarBuilder {
                 )));
             }
         }
-        let (later_volumes, members) = archive.rewrite_source(py, volumes, password.as_deref())?;
-        let inner = if preserve {
-            archive
-                .archive
-                .preserving_builder(password.as_deref())
-                .map_err(map_error)?
-        } else {
-            rars_rs::Builder::new(rars_rs::ArchiveVersion::Rar50).compression_level(Some(3))
-        };
-        let format = inner.format();
-        let legacy_preservation = preserve && format.family() != rars_rs::ArchiveFamily::Rar50Plus;
-        let mut builder = Self {
-            inner: inner
-                .comment(archive.read_comment(py, None, archive.options.as_ref(), None)?)
-                .allow_duplicate_names(true),
-            format,
+        let later_volumes = archive.rewrite_volumes(py, volumes, password.as_deref())?;
+        let options = archive.extraction_options(archive.options.as_ref(), password.as_deref());
+        // Releases the GIL, which a file-object source takes from inside its lock.
+        let (inner, payloads) = py
+            .detach(|| {
+                archive
+                    .archive
+                    .rewrite_builder(&later_volumes, options, preserve)
+            })
+            .map_err(map_builder_error)?;
+        Ok(Self {
+            format: inner.format(),
+            inner,
             resources: rars_rs::WriterResources::default(),
             rewrite: Some(RewriteInput {
                 archive: archive.archive.clone(),
-                later_volumes: later_volumes.clone(),
-                password: password.clone(),
+                later_volumes,
+                password,
                 options: archive.options.as_ref().map(ReadOptions::policies),
-                members: HashMap::new(),
+                encoding: archive.encoding,
+                members: payloads
+                    .into_iter()
+                    .map(|payload| (payload.id, payload))
+                    .collect(),
                 directory: staging_dir.map(|path| py_path_buf(py, path)).transpose()?,
                 max_staged_bytes,
             }),
-        };
-        for (
-            member_index,
-            SourceMember {
-                member,
-                comment,
-                legacy_link,
-                comment_encrypted,
-            },
-        ) in members.into_iter().enumerate()
-        {
-            let legacy_unicode_name = if legacy_preservation {
-                match &member.detail {
-                    rars_rs::ArchiveMemberDetail::Rar15To40 { unicode_name, .. } => {
-                        unicode_name.clone()
-                    }
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            // Within one family the stored times copy exactly; across families
-            // they go through Unix time.
-            let (copied_times, converted_times) = if member.meta.family == format.family() {
-                (Some(member.clone()), None)
-            } else {
-                (None, Some(member.times().map_err(map_error)?))
-            };
-            let converted_name = (!legacy_preservation
-                && member.meta.family != rars_rs::ArchiveFamily::Rar50Plus)
-                .then(|| member.decoded_name(archive.encoding).map(Cow::into_owned))
-                .transpose()
-                .map_err(map_error)?;
-            let link = member.supported_redirection().cloned();
-            let retained_link = link.as_ref().map(|_| member.clone());
-            let info = member.meta;
-            // A builder mode is Unix metadata, not generic archive attributes.
-            // Reuse extraction's host rules: e.g. legacy host 1 is DOS, but
-            // RAR5 host 1 is Unix. DOS 0x20 must not become Unix mode 0040.
-            let attr_source = info.attr_source();
-            let output_name = match converted_name {
-                Some(name) if attr_source == rars_rs::AttrSource::Unix => {
-                    rars_rs::builder::validate_entry_name(name.clone())
-                        .map_err(map_builder_error)?;
-                    rars_rs::filename::encode_rar50(&name).into_owned()
-                }
-                Some(name) => name,
-                None => info.name.clone(),
-            };
-            let unix_type = info.file_attr & 0o170000;
-            let unsupported_type = attr_source == rars_rs::AttrSource::Unix
-                && !matches!(unix_type, 0 | 0o100000)
-                && !(info.is_directory && unix_type == 0o040000);
-            let reparse_point =
-                attr_source == rars_rs::AttrSource::Dos && info.file_attr & 0x400 != 0;
-            if link.is_none()
-                && legacy_link.is_none()
-                && (info.is_redirection
-                    || unsupported_type
-                    || reparse_point
-                    || (info.is_directory && info.unpacked_size != 0))
-            {
-                return Err(UnsupportedRarFeature::new_err(format!(
-                    "cannot rewrite special entry {:?}: its type or contents cannot be preserved",
-                    String::from_utf8_lossy(&info.name)
-                )));
-            }
-            let mode =
-                (attr_source == rars_rs::AttrSource::Unix).then_some(if legacy_preservation {
-                    info.file_attr as u32
-                } else {
-                    (info.file_attr & 0o7777) as u32
-                });
-            if let Some(member) = retained_link {
-                builder
-                    .inner
-                    .add_archive_redirection(&member)
-                    .map_err(map_builder_error)?;
-            } else if let Some(target) = legacy_link {
-                builder
-                    .inner
-                    .add_unix_symlink(
-                        output_name.clone(),
-                        if legacy_preservation {
-                            target
-                        } else {
-                            rars_rs::filename::encode_rar50(&target).into_owned()
-                        },
-                        false,
-                        None,
-                        mode,
-                    )
-                    .map_err(map_builder_error)?;
-            } else if info.is_directory {
-                builder
-                    .inner
-                    .add_directory(output_name.clone(), None, mode)
-                    .map_err(map_builder_error)?;
-            } else {
-                // The per-write builder replaces this placeholder after a single
-                // verified traversal. Never decode individual members on reopen.
-                let source = rars_rs::EntrySource::from_opener(info.unpacked_size, || {
-                    Err(rars_rs::Error::InvalidArgument(
-                        "rewrite payload was not staged",
-                    ))
-                });
-                builder
-                    .inner
-                    .add_source(output_name.clone(), source, None, mode)
-                    .map_err(map_builder_error)?;
-                builder.rewrite.as_mut().unwrap().members.insert(
-                    builder.inner.member_ids().last().unwrap(),
-                    RewriteMember {
-                        index: member_index,
-                        size: info.unpacked_size,
-                    },
-                );
-            }
-            let id = builder.inner.member_ids().last().unwrap();
-            builder
-                .inner
-                .set_file_comment_by_id(id, comment)
-                .map_err(map_builder_error)?;
-            if let Some(source) = &copied_times {
-                builder
-                    .inner
-                    .copy_times_by_id(id, source)
-                    .map_err(map_builder_error)?;
-            }
-            if let Some(times) = converted_times {
-                builder
-                    .inner
-                    .set_times_by_id(id, times)
-                    .map_err(map_builder_error)?;
-            }
-            if preserve {
-                builder
-                    .inner
-                    .set_entry_encryption_by_id(
-                        id,
-                        if info.is_encrypted {
-                            password.clone()
-                        } else {
-                            None
-                        },
-                        if comment_encrypted {
-                            password.clone()
-                        } else {
-                            None
-                        },
-                    )
-                    .map_err(map_builder_error)?;
-            }
-            if let Some(raw) = legacy_unicode_name {
-                builder
-                    .inner
-                    .set_legacy_unicode_name_by_id(id, raw)
-                    .map_err(map_builder_error)?;
-            }
-            if attr_source == rars_rs::AttrSource::Dos {
-                builder
-                    .inner
-                    .set_dos_attributes_by_id(id, info.file_attr)
-                    .map_err(map_builder_error)?;
-            }
-        }
-        builder.inner = builder.inner.allow_duplicate_names(false);
-        Ok(builder)
+        })
     }
 
     #[pyo3(signature = (path, arcname = None))]

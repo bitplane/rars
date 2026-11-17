@@ -161,6 +161,11 @@ pub enum Error {
         required: u64,
     },
     /// Retained rewrite payload bytes, excluding decoder and writer workspace.
+    /// A member a rewrite cannot carry over: a special file, or a link or
+    /// directory whose type or contents the writer cannot reproduce.
+    UnrewritableEntry {
+        name: Vec<u8>,
+    },
     RewriteStagingLimitExceeded {
         limit: u64,
         required: u64,
@@ -302,6 +307,11 @@ impl std::fmt::Display for Error {
                 "RAR 5 filtered member requires buffered decoding of {required} bytes, above the configured limit of {limit} bytes"
             ),
             Self::Rar50ScratchLimitExceeded { limit, required } => write!(f, "RAR 5 scratch limit {limit} bytes exceeded (requires {required})"),
+            Self::UnrewritableEntry { name } => write!(
+                f,
+                "cannot rewrite special entry {:?}: its type or contents cannot be preserved",
+                String::from_utf8_lossy(name)
+            ),
             Self::RewriteStagingLimitExceeded { limit, required } => write!(f, "rewrite staging limit {limit} bytes exceeded (requires {required})"),
             Self::Rar50FilterMemoryLimitExceeded { limit, required } => write!(f, "RAR 5 filter workspace limit {limit} bytes exceeded (requires {required})"),
             Self::WriterSpoolLimitExceeded { limit, required, used } => write!(f,
@@ -474,7 +484,8 @@ impl Error {
             | Self::UnsupportedFamilyFeature { .. }
             | Self::UnsupportedCompression { .. }
             | Self::UnsupportedEncryption { .. }
-            | Self::UnsupportedWriterOption { .. } => ErrorKind::UnsupportedFeature,
+            | Self::UnsupportedWriterOption { .. }
+            | Self::UnrewritableEntry { .. } => ErrorKind::UnsupportedFeature,
             Self::NeedPassword => ErrorKind::PasswordRequired,
             Self::WrongPasswordOrCorruptData
             | Self::Rar50Crypto(crate::crypto::rar50::Error::BadPassword) => ErrorKind::BadPassword,

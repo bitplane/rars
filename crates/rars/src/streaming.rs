@@ -1011,6 +1011,26 @@ impl Spool {
     }
 }
 
+/// Bare WebAssembly's spool is already memory: its bytes become the source.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+impl Spool {
+    pub(crate) fn into_source(mut self) -> EntrySource {
+        let mut bytes = Vec::with_capacity(usize::try_from(self.len).unwrap_or(0));
+        let read = self
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| self.read_to_end(&mut bytes));
+        match read {
+            Ok(_) => EntrySource::from_bytes(bytes),
+            Err(error) => {
+                let message = error.to_string();
+                EntrySource::from_opener(self.len, move || {
+                    Err(std::io::Error::other(message.clone()).into())
+                })
+            }
+        }
+    }
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 struct SpoolReader {
     file: std::fs::File,
