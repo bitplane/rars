@@ -327,7 +327,7 @@ def test_rewrite_can_replace_its_source_after_reading(tmp_path):
     destination.write_bytes(archive_bytes(solid=True))
     builder = rars.RarBuilder.from_archive(destination)
     builder.rename("file", "renamed")
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     output = rars.RarFile(destination)
     assert output.read("renamed") == b"payload" * 40
     assert output.namelist() == ["empty", "renamed"]
@@ -366,6 +366,6 @@ def test_corrupt_lazy_payload_preserves_existing_destination(tmp_path):
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.BadRarFile):
-        builder.write(destination)
+        builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]

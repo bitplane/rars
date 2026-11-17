@@ -17,11 +17,11 @@ def test_legacy_encoding_callback_exception_preserves_destination(tmp_path, form
             raise failure
 
     with pytest.raises(RuntimeError) as caught:
-        builder.write(destination, progress=stop)
+        builder.write(destination, progress=stop, overwrite=True)
     assert caught.value is failure
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("file") == payload
 
 

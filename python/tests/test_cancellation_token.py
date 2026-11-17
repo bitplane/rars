@@ -25,7 +25,7 @@ def test_pre_cancelled_token_refuses_without_callback_or_publication(tmp_path, f
         if method == "to_bytes":
             builder.to_bytes(cancellation=token)
         else:
-            getattr(builder, method)(destination, cancellation=token)
+            getattr(builder, method)(destination, overwrite=True, cancellation=token)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
 
@@ -50,7 +50,8 @@ def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
             assert resume.wait(10), "test did not release callback"
 
     with ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(builder.write, destination, progress=report, cancellation=token)
+        future = pool.submit(builder.write, destination, overwrite=True, progress=report,
+                             cancellation=token)
         try:
             assert reached.wait(10), "writer did not reach requested phase"
             token.cancel()
@@ -61,9 +62,9 @@ def test_another_python_thread_can_cancel_a_write(tmp_path, phase):
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
     with pytest.raises(rars.Cancelled):
-        builder.write(destination, cancellation=token)
+        builder.write(destination, cancellation=token, overwrite=True)
     fresh = rars.CancellationToken()
-    builder.write(destination, cancellation=fresh)
+    builder.write(destination, cancellation=fresh, overwrite=True)
     assert not fresh.is_cancelled()
     assert rars.RarFile(destination).read("file") == payload
 

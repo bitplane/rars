@@ -100,5 +100,5 @@ def test_embedded_file_comments_with_encrypted_headers_fail_before_writing(tmp_p
     path = tmp_path / "existing.rar"
     path.write_bytes(b"keep")
     with pytest.raises((ValueError, rars.UnsupportedRarFeature), match="embedded legacy file comments"):
-        builder.write(path)
+        builder.write(path, overwrite=True)
     assert path.read_bytes() == b"keep"

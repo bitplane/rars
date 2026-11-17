@@ -26,7 +26,7 @@ def test_writer_memory_failure_preserves_destination(tmp_path):
         with pytest.raises(rars.LimitExceeded):
             builder.to_bytes()
         with pytest.raises(rars.LimitExceeded):
-            builder.write(destination)
+            builder.write(destination, overwrite=True)
         assert destination.read_bytes() == b"original"
         assert list(tmp_path.iterdir()) == [destination]
 

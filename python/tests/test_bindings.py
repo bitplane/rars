@@ -273,3 +273,29 @@ def test_file_attr_kind_reads_the_host_number_for_its_family(format):
     assert infos["unix"].file_attr_kind == rars.AttributeKind.UNIX
     assert infos["unix"].host_os == (3 if format == "rar29" else 1)
     assert infos["dos"].file_attr_kind == rars.AttributeKind.DOS
+
+
+def test_writers_refuse_an_existing_file_unless_told_to_overwrite(tmp_path):
+    builder = rars.RarBuilder(store=True)
+    builder.add_bytes(b"payload", "file")
+    path = tmp_path / "archive.rar"
+    path.write_bytes(b"precious")
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        builder.write(path)
+    assert path.read_bytes() == b"precious"
+    builder.write(path, overwrite=True)
+    assert rars.RarFile(path).read("file") == b"payload"
+    with pytest.raises(FileExistsError):
+        rars.repair(path.read_bytes(), output=path)
+
+    volumes = rars.RarBuilder(store=True, volume_size=4096)
+    volumes.add_bytes(os.urandom(20_000), "big")
+    first = tmp_path / "set.part1.rar"
+    paths = volumes.write_volumes(first)
+    paths[-1].write_bytes(b"precious")
+    for part in paths[:-1]:
+        part.unlink()
+    with pytest.raises(FileExistsError, match=paths[-1].name):
+        volumes.write_volumes(first)
+    assert [path.name for path in tmp_path.iterdir() if path.name.startswith("set.")] == [paths[-1].name]
+    assert volumes.write_volumes(first, overwrite=True) == paths

@@ -124,7 +124,7 @@ def test_rewrite_retains_hard_links_and_updates_internal_targets(tmp_path, fixtu
     destination.write_bytes(b"existing archive")
     rewritten.remove("renamed")
     with pytest.raises(ValueError, match="targets must precede"):
-        rewritten.write(destination)
+        rewritten.write(destination, overwrite=True)
     assert destination.read_bytes() == b"existing archive"
 
 

@@ -2834,16 +2834,19 @@ impl RarBuilder {
             .map_err(map_error)
     }
 
-    #[pyo3(signature = (path, *, progress = None, cancellation = None))]
+    /// An existing file at `path` is refused unless `overwrite=True`, which replaces it once the archive is written.
+    #[pyo3(signature = (path, *, overwrite = false, progress = None, cancellation = None))]
     fn write(
         &self,
         py: Python<'_>,
         path: &Bound<'_, PyAny>,
+        overwrite: bool,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<()> {
         let path = py_path_buf(py, path)?;
         self.refuse_volume_mismatch(false)?;
+        refuse_existing(&path, overwrite)?;
         let directory = output_directory(&path);
         self.detached(
             py,
@@ -2860,11 +2863,13 @@ impl RarBuilder {
         )
     }
 
-    #[pyo3(signature = (first_path, *, progress = None, cancellation = None))]
+    /// Refuses before writing any part if one exists, unless `overwrite=True`.
+    #[pyo3(signature = (first_path, *, overwrite = false, progress = None, cancellation = None))]
     fn write_volumes(
         &self,
         py: Python<'_>,
         first_path: &Bound<'_, PyAny>,
+        overwrite: bool,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<PathBuf>> {
@@ -2907,11 +2912,26 @@ impl RarBuilder {
                     }
                 })
                 .collect::<PyResult<Vec<_>>>()?;
+            for path in &paths {
+                refuse_existing(path, overwrite)?;
+            }
             for (index, path) in paths.iter().enumerate() {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return Err(map_error(rars_rs::Error::Cancelled));
                 }
-                fs::write(path, parts.part(index)).map_err(map_io_error)?;
+                let mut file = fs::OpenOptions::new();
+                file.write(true);
+                if overwrite {
+                    file.create(true).truncate(true);
+                } else {
+                    file.create_new(true);
+                }
+                file.open(path)
+                    .and_then(|mut file| file.write_all(parts.part(index)))
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::AlreadyExists => exists_error(path),
+                        _ => map_io_error(error),
+                    })?;
             }
             Ok(paths)
         })
@@ -2989,6 +3009,24 @@ impl RarBuilder {
         }
         result.map_err(map_error)
     }
+}
+
+/// What a writer raises for an existing file without `overwrite=True`, as extraction does.
+fn exists_error(path: &Path) -> PyErr {
+    PyOSError::new_err((
+        libc::EEXIST,
+        format!(
+            "{} already exists; pass overwrite=True to replace it",
+            path.display()
+        ),
+    ))
+}
+
+fn refuse_existing(path: &Path, overwrite: bool) -> PyResult<()> {
+    if !overwrite && fs::symlink_metadata(path).is_ok() {
+        return Err(exists_error(path));
+    }
+    Ok(())
 }
 
 fn output_directory(path: &Path) -> &Path {
@@ -3204,15 +3242,18 @@ fn check_password(
     })
 }
 
-/// With `output=`, the repaired archive replaces that file only once the repair
-/// succeeds and `data` is None; otherwise `data` holds it.
+/// With `output=`, the repaired archive is written there once the repair
+/// succeeds and `data` is None; otherwise `data` holds it. An existing
+/// `output` is refused unless `overwrite=True`.
 #[pyfunction]
-#[pyo3(signature = (source, *, password = None, output = None, options = None, cancellation = None))]
+#[pyo3(signature = (source, *, password = None, output = None, overwrite = false, options = None, cancellation = None))]
+#[allow(clippy::too_many_arguments)] // Python keyword arguments.
 fn repair(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
     output: Option<&Bound<'_, PyAny>>,
+    overwrite: bool,
     options: Option<&ReadOptions>,
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<RepairResult> {
@@ -3220,6 +3261,9 @@ fn repair(
     let call_options = ReadOptions::for_call(options, None, cancellation)?;
     let options = call_options.as_ref();
     let output = output.map(|output| py_path_buf(py, output)).transpose()?;
+    if let Some(output) = &output {
+        refuse_existing(output, overwrite)?;
+    }
     let password = py_password(password)?;
     let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
     py.detach(|| {

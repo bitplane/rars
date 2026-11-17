@@ -159,7 +159,7 @@ def test_removing_last_legacy_member_keeps_existing_destination(tmp_path):
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(ValueError, match="no entries"):
-        builder.write(destination)
+        builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
 
 
@@ -168,7 +168,7 @@ def test_native_legacy_rewrite_can_replace_its_source(tmp_path):
     path.write_bytes(source_bytes(solid=True))
     builder = rars.RarBuilder.from_archive(path)
     builder.rename(b"raw-\xff", b"renamed-\xff")
-    builder.write(path)
+    builder.write(path, overwrite=True)
     output = rars.RarFile(path)
     assert output.read(b"renamed-\xff") == b"payload" * 50
     assert output.read("second") == b"second"
@@ -334,7 +334,7 @@ def test_legacy_password_failure_keeps_destination(tmp_path, password, header_en
     destination.write_bytes(b"keep")
     with pytest.raises((rars.PasswordRequired, rars.BadPassword, rars.BadRarFile)):
         source = rars.RarFile(data, password=password)
-        rars.RarBuilder.from_archive(source).write(destination)
+        rars.RarBuilder.from_archive(source).write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
 

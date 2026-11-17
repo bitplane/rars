@@ -50,11 +50,11 @@ def test_limit_is_lazy_per_write_and_counts_only_retained_payloads(tmp_path):
         rars.RarFile(source_archive()), max_staged_bytes=14,
     )
     with pytest.raises(rars.LimitExceeded, match="rewrite staging limit"):
-        builder.write(destination)
+        builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
     builder.remove("first")
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("second") == b"second payload"
     assert list(tmp_path.iterdir()) == [destination]
 
@@ -81,12 +81,12 @@ def test_default_directory_and_cleanup_after_writer_callback_failure(tmp_path, m
         if method == "to_bytes":
             builder.to_bytes(progress=stop)
         else:
-            builder.write(destination, progress=stop)
+            builder.write(destination, progress=stop, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(cwd.iterdir()) == []
     assert list(output_dir.iterdir()) == [destination]
     # A failed write must not poison or retain that session's sources.
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("first") == b"first payload"
     assert list(output_dir.iterdir()) == [destination]
 
@@ -177,12 +177,12 @@ def test_staging_callback_cancels_and_preserves_destination(tmp_path, format, wh
             raise failure
 
     with pytest.raises(RuntimeError) as caught:
-        builder.write(destination, progress=stop)
+        builder.write(destination, progress=stop, overwrite=True)
     assert caught.value is failure
     assert seen
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("file") == b"payload" * 20000
     assert list(tmp_path.iterdir()) == [destination]
 

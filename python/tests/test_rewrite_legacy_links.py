@@ -31,12 +31,12 @@ def test_batch_link_metadata_leaves_unrelated_corrupt_payload_for_writing(tmp_pa
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.BadRarFile):
-        editor.write(destination)
+        editor.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
     editor.remove("file")
     editor.rename("link2", "renamed")
-    editor.write(destination)
+    editor.write(destination, overwrite=True)
     output = rars.RarFile(destination)
     assert output.readlink("renamed") == b"../second-target"
     # readlink exposes wire bytes; explicit RAR5 conversion uses its Unix mapping.

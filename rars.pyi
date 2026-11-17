@@ -477,6 +477,7 @@ class RarBuilder:
         self,
         path: _StrPath,
         *,
+        overwrite: bool = False,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
     ) -> None: ...
@@ -484,6 +485,7 @@ class RarBuilder:
         self,
         first_path: _StrPath,
         *,
+        overwrite: bool = False,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
     ) -> list[Path]: ...
@@ -535,6 +537,7 @@ def repair(
     *,
     password: _Password | None = None,
     output: _StrPath | None = None,
+    overwrite: bool = False,
     options: ReadOptions | None = None,
     cancellation: CancellationToken | None = None,
 ) -> RepairResult: ...

@@ -35,16 +35,16 @@ def test_repair_token_is_reusable_and_path_publication_cleans_up(tmp_path, forma
     repaired = rars.repair(source, cancellation=token).data
     assert repaired == rars.repair(original, cancellation=token).data == rars.repair(original).data
     rars.RarFile(repaired).testrar()
-    written = rars.repair(source, output=output, cancellation=token)
+    written = rars.repair(source, output=output, cancellation=token, overwrite=True)
     assert written.data is None
     assert output.read_bytes() == repaired
     assert not token.is_cancelled()
     assert sorted(p.name for p in tmp_path.iterdir()) == ["input.rar", "output.rar"]
     token.cancel()
     with pytest.raises(rars.Cancelled):
-        rars.repair(source, output=output, cancellation=token)
+        rars.repair(source, output=output, cancellation=token, overwrite=True)
     assert output.read_bytes() == repaired
-    rars.repair(source, output=source)
+    rars.repair(source, output=source, overwrite=True)
     assert source.read_bytes() == repaired
 
 
