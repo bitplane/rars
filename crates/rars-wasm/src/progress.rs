@@ -82,18 +82,23 @@ impl rars_rs::WriteProgress for WriteReporter {
 /// Reports a mebibyte at a time, so a decoder's writes don't each call into JavaScript.
 const BATCH: u64 = 1 << 20;
 
-/// Decoded bytes counted toward one call's total.
+/// Decoded bytes counted toward one call's total, which is unknown while a
+/// set's later volumes are still arriving.
 #[derive(Clone)]
 pub(crate) struct ReadCount {
     phase: &'static str,
-    total: u64,
+    total: Option<u64>,
     completed: Rc<Cell<u64>>,
     reported: Rc<Cell<u64>>,
 }
 
 impl ReadCount {
     pub(crate) fn new(phase: &'static str, total: u64) -> Self {
-        report(phase, 0, Some(total));
+        Self::with_total(phase, Some(total))
+    }
+
+    pub(crate) fn with_total(phase: &'static str, total: Option<u64>) -> Self {
+        report(phase, 0, total);
         Self {
             phase,
             total,
@@ -110,16 +115,18 @@ impl ReadCount {
     }
 
     pub(crate) fn add(&self, bytes: u64) {
-        let completed = (self.completed.get() + bytes).min(self.total);
+        let completed = self.completed.get() + bytes;
+        let completed = self.total.map_or(completed, |total| completed.min(total));
         self.completed.set(completed);
         if completed - self.reported.get() >= BATCH {
             self.reported.set(completed);
-            report(self.phase, completed, Some(self.total));
+            report(self.phase, completed, self.total);
         }
     }
 
     pub(crate) fn finish(&self) {
-        report(self.phase, self.total, Some(self.total));
+        let completed = self.total.unwrap_or(self.completed.get());
+        report(self.phase, completed, Some(completed));
     }
 }
 

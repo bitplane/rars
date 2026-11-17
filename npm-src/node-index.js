@@ -1,4 +1,4 @@
-import { Worker } from "node:worker_threads";
+import { MessageChannel, Worker } from "node:worker_threads";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { createApi } from "./api.js";
@@ -7,7 +7,7 @@ import { createClient } from "./client.js";
 function spawnWorker() {
   const worker = new Worker(new URL("./worker.cjs", import.meta.url), { name: "rars" });
   return {
-    post(message) { worker.ref(); worker.postMessage(message); },
+    post(message, transfer = []) { worker.ref(); worker.postMessage(message, transfer); },
     onMessage(callback) {
       worker.on("message", (message) => {
         // The callback can start and ref the next queued operation.
@@ -54,6 +54,44 @@ const runtime = Object.assign(createClient(spawnWorker), {
   },
   prepareFile(path) { return { kind: "file", path: pathValue(path) }; },
   prepareOutputPath: pathValue,
+  /**
+   * A channel the worker pulls a set's later volumes through, from `volumes`, an
+   * iterable or async iterable of paths and bytes. The worker blocks on `flag` until
+   * a reply is posted; `failure` keeps what the iterator threw, to raise in its place.
+   */
+  volumeFeed(volumes) {
+    const iterator = volumes?.[Symbol.asyncIterator]?.call(volumes) ?? volumes?.[Symbol.iterator]?.call(volumes);
+    if (iterator === undefined || typeof volumes === "string") {
+      throw new TypeError("volumes must be an iterable or async iterable of paths or bytes");
+    }
+    const { port1, port2 } = new MessageChannel();
+    const flag = new Int32Array(new SharedArrayBuffer(4));
+    const feed = {
+      channel: { port: port2, flag },
+      transfer: [port2],
+      failure: undefined,
+      close() {
+        port1.close();
+        Promise.resolve().then(() => iterator.return?.()).catch(() => {});
+      },
+    };
+    port1.on("message", async () => {
+      let reply;
+      try {
+        const { value, done } = await iterator.next();
+        if (done) reply = { done: true };
+        else if (typeof value === "string" || value instanceof URL) reply = { path: pathValue(value) };
+        else reply = { bytes: new Uint8Array(await binaryBlob(value).arrayBuffer()) };
+      } catch (error) {
+        feed.failure = error;
+        reply = { error: true };
+      }
+      port1.postMessage(reply);
+      Atomics.store(flag, 0, 1);
+      Atomics.notify(flag, 0);
+    });
+    return feed;
+  },
 });
 
 export const {

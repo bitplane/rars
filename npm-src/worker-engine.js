@@ -224,14 +224,17 @@ export function startWorker(port, wasm, platform) {
               break;
             case "read": result = archive.readAt(payload.index, payload.password, payload.readOptions, report); break;
             case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions, report); break;
-            case "test": archive.test(payload.password, payload.readOptions, report); break;
+            case "test":
+              archive.test(payload.password, payload.readOptions, report, platform.nextVolume?.(payload.volumeFeed));
+              break;
             case "readComment": result = archive.readComment(payload.password, payload.readOptions); break;
             case "readMemberComment": result = archive.readMemberComment(payload.index, payload.password, payload.readOptions); break;
             case "readLink": result = archive.readLink(payload.index, payload.password, payload.readOptions); break;
             case "extract": {
               const output = platform.extractor(payload.directory, payload);
               archive.extractEach(payload.indices, payload.password, payload.readOptions,
-                payload.flatten, platform.posix, output.deliver, output.readLink, report);
+                payload.flatten, platform.posix, output.deliver, output.readLink,
+                platform.nextVolume?.(payload.volumeFeed), report);
               result = output.finish();
               break;
             }
