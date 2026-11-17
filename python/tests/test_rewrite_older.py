@@ -9,6 +9,10 @@ import rars
 from test_rewrite_legacy import ROOT, DOS_TIME, headers, file_metadata
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 def check_unrar(tmp_path, data, password="password"):
     if shutil.which("unrar"):
         path = tmp_path / "rewritten.rar"
@@ -26,10 +30,10 @@ def test_vintage_rar15_preservation(tmp_path, fixture):
     editor.rename(source.namelist()[0], "renamed")
     data = editor.to_bytes()
     output = rars.RarFile(data, password="password")
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert source.read(before) == output.read(after)
-        assert source.gettimes(before) == output.gettimes(after)
+        assert times(source.getinfo(before)) == times(output.getinfo(after))
         assert source.getinfo(before).file_attr == output.getinfo(after).file_attr
         assert source.getinfo(before).is_encrypted == output.getinfo(after).is_encrypted
     assert all(meta[3] == 15 for meta in file_metadata(data))
@@ -40,7 +44,7 @@ def test_vintage_rar15_preservation(tmp_path, fixture):
 @pytest.mark.parametrize("solid", [False, True])
 @pytest.mark.parametrize("password", [None, "password"])
 def test_older_formats_keep_version_and_solid_directory_state(tmp_path, version, solid, password):
-    builder = rars.RarBuilder(format="rar15" if version == 15 else "rar20", solid=solid, password=password)
+    builder = rars.RarBuilder(version="rar15" if version == 15 else "rar20", solid=solid, password=password)
     builder.add_bytes(b"first " * 300, b"raw-\xff", mtime=DOS_TIME)
     builder.add_directory("empty", mtime=DOS_TIME)
     builder.add_bytes(b"first " * 300 + b"end", "last", mtime=DOS_TIME)
@@ -58,7 +62,7 @@ def test_older_formats_keep_version_and_solid_directory_state(tmp_path, version,
     assert output.read("renamed") == b"first " * 300
     assert output.read("last") == b"first " * 300 + b"end"
     assert output.getinfo("empty").is_dir()
-    assert output.gettimes("empty") == source.gettimes("empty")
+    assert times(output.getinfo("empty")) == times(source.getinfo("empty"))
     assert all(meta[3] == version for meta in file_metadata(data))
     check_unrar(tmp_path, data)
     editor.remove("renamed")

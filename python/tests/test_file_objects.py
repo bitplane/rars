@@ -7,7 +7,7 @@ import rars
 
 
 def archive_bytes(format="rar50"):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_bytes(b"payload" * 1000, "file")
     builder.add_bytes(b"other", "dir/other")
     return builder.to_bytes()
@@ -42,9 +42,9 @@ class Stream(io.RawIOBase):
 
 
 def volume_set(tmp_path, format="rar50"):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(bytes(range(256)) * 80, "large.bin")
-    return [Path(path) for path in builder.write_volumes(tmp_path / "set.part01.rar")]
+    return [Path(path) for path in builder.write(tmp_path / "set.part01.rar")]
 
 
 @pytest.mark.parametrize("format", ["rar29", "rar50"])
@@ -106,7 +106,7 @@ def test_bytes_naming_a_file_say_to_pass_a_path(tmp_path):
 
 
 def damaged_archive():
-    builder = rars.RarBuilder(format="rar50", store=True, recovery_percent=10)
+    builder = rars.RarBuilder(version="rar50", level=0, recovery_percent=10)
     builder.add_bytes(b"recoverable payload " * 1000, "file")
     data = bytearray(builder.to_bytes())
     data[len(data) // 3] ^= 0xFF

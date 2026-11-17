@@ -9,7 +9,7 @@ PAYLOAD = random.Random(31).randbytes(30_000)
 
 
 def write_set(tmp_path, format):
-    builder = rars.RarBuilder(format=format, volume_size=8192)
+    builder = rars.RarBuilder(version=format, volume_size=8192)
     if format == "rar50":
         builder.add_bytes(b"head", "head.txt")
         builder.add_directory("dir")
@@ -18,7 +18,7 @@ def write_set(tmp_path, format):
         builder.add_bytes(b"tail", "tail.txt")
     first = "set.part01.rar" if format == "rar50" else "set.rar"
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / first)
+    paths = builder.write(tmp_path / "made" / first)
     assert len(paths) > 2
     return paths
 

@@ -8,7 +8,7 @@ PAYLOAD = random.Random(5).randbytes(300_000)
 
 
 def single_archive():
-    builder = rars.RarBuilder(format="rar50", level=3)
+    builder = rars.RarBuilder(version="rar50", level=3)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     builder.add_directory("empty")
@@ -23,16 +23,16 @@ def test_extractall_reports_bytes_written_against_a_known_total(tmp_path):
     assert {event.phase for event in events} == {"extracting"}
     assert events[-1].completed == events[-1].total == len(PAYLOAD) + 5
     assert events[-1].percentage == 100.0
-    assert events[-1].volume is None
+    assert events[-1].volume_index is None
     assert all(a.completed <= b.completed for a, b in zip(events, events[1:]))
 
 
 def write_set(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=64 * 1024)
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=64 * 1024)
     builder.add_bytes(PAYLOAD, "large.bin")
     builder.add_bytes(b"small", "small.txt")
     tmp_path.mkdir(exist_ok=True)
-    return builder.write_volumes(tmp_path / "set.part01.rar")
+    return builder.write(tmp_path / "set.part01.rar")
 
 
 def test_a_set_from_a_generator_claims_no_total_before_its_last_volume(tmp_path):
@@ -45,18 +45,18 @@ def test_a_set_from_a_generator_claims_no_total_before_its_last_volume(tmp_path)
             yield path
 
     def record(event):
-        events.append((event.volume, event.total, event.percentage, event.completed))
+        events.append((event.volume_index, event.total, event.percentage, event.completed))
 
     with rars.RarFile(paths[0]) as archive:
         archive.testrar(progress=record, volumes=later_volumes())
 
-    before_last = [event for event in events if event[0] < len(paths)]
+    before_last = [event for event in events if event[0] < len(paths) - 1]
     assert before_last
-    assert all(total == 0 and percentage is None for _, total, percentage, _ in before_last)
+    assert all(total is None and percentage is None for _, total, percentage, _ in before_last)
     volumes = [volume for volume, *_ in events]
     assert volumes == sorted(volumes)
-    assert volumes[0] == 1
-    assert events[-1] == (len(paths), len(PAYLOAD) + 5, 100.0, len(PAYLOAD) + 5)
+    assert volumes[0] == 0
+    assert events[-1] == (len(paths) - 1, len(PAYLOAD) + 5, 100.0, len(PAYLOAD) + 5)
 
 
 class Stop(Exception):
@@ -186,4 +186,4 @@ def test_a_set_with_a_volume_still_missing_falls_back_to_an_unknown_total(tmp_pa
             archive.testrar(progress=events.append)
 
     assert events
-    assert all(event.total == 0 and event.percentage is None for event in events)
+    assert all(event.total is None and event.percentage is None for event in events)

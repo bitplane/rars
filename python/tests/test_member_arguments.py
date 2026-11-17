@@ -2,10 +2,14 @@ import pytest
 import rars
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 def linked_archive():
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(version="rar50", level=0)
     builder.add_bytes(b"payload", "file", mtime=1_700_000_000)
-    builder.set_file_comment("file", b"note")
+    builder.set_member_comment("file", b"note")
     builder.add_unix_symlink("link", "file")
     return rars.RarFile(builder.to_bytes())
 
@@ -18,13 +22,12 @@ def member_calls(archive, tmp_path):
         "read_many": ("file", lambda m: archive.read_many([m]), [b"payload"]),
         "extract": ("file", lambda m: archive.extract(m, tmp_path, overwrite=True).read_bytes(), b"payload"),
         "extractall": ("file", lambda m: archive.extractall(tmp_path, members=[m], overwrite=True)[0].read_bytes(), b"payload"),
-        "getcomment": ("file", lambda m: archive.getcomment(m), b"note"),
+        "member_comment": ("file", lambda m: archive.member_comment(m), b"note"),
         "readlink": ("link", lambda m: archive.readlink(m), b"file"),
-        "gettimes": ("file", lambda m: archive.gettimes(m)["modified"], 1_700_000_000 * 10**9),
     }
 
 
-METHODS = ["getinfo", "read", "open", "read_many", "extract", "extractall", "getcomment", "readlink", "gettimes"]
+METHODS = ["getinfo", "read", "open", "read_many", "extract", "extractall", "member_comment", "readlink"]
 
 
 @pytest.mark.parametrize("method", METHODS)
@@ -48,31 +51,31 @@ def test_no_member_method_selects_by_position(tmp_path, method):
         call(0)
 
 
-@pytest.mark.parametrize("method", ["getcomment", "readlink", "gettimes"])
+@pytest.mark.parametrize("method", ["member_comment", "readlink"])
 def test_metadata_reads_honour_cancellation(method):
     archive = linked_archive()
     token = rars.CancellationToken()
     token.cancel()
     member = "link" if method == "readlink" else "file"
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         getattr(archive, method)(member, cancellation=token)
     assert getattr(archive, method)(member, options=rars.ReadOptions())
 
 
 @pytest.mark.parametrize("format", ["rar15", "rar20", "rar29", "rar50"])
 def test_member_comments_honour_output_limits(format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"note")
+    builder.set_member_comment("file", b"note")
     archive = rars.RarFile(builder.to_bytes())
     for field in ["max_member_output_bytes", "max_total_output_bytes"]:
-        assert archive.getcomment("file", options=rars.ReadOptions(**{field: 4})) == b"note"
-        with pytest.raises(MemoryError):
-            archive.getcomment("file", options=rars.ReadOptions(**{field: 3}))
+        assert archive.member_comment("file", options=rars.ReadOptions(**{field: 4})) == b"note"
+        with pytest.raises(rars.LimitExceeded):
+            archive.member_comment("file", options=rars.ReadOptions(**{field: 3}))
 
 
 def legacy_link(encrypt_headers):
-    builder = rars.RarBuilder(format="rar40", password="right", encrypt_headers=encrypt_headers)
+    builder = rars.RarBuilder(version="rar40", password="right", encrypt_headers=encrypt_headers)
     builder.add_bytes(b"target", "link", mtime=1_700_000_000, mode=0o120777)
     return builder.to_bytes()
 
@@ -80,7 +83,7 @@ def legacy_link(encrypt_headers):
 def test_legacy_link_targets_honour_output_limits():
     archive = rars.RarFile(legacy_link(False), password="right")
     assert archive.readlink("link", options=rars.ReadOptions(max_member_output_bytes=6)) == b"target"
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.readlink("link", options=rars.ReadOptions(max_member_output_bytes=5))
 
 
@@ -98,7 +101,7 @@ def test_header_encrypted_links_and_times_read_with_a_per_call_password():
     assert archive.readlink("link", password="right") == b"target"
     assert archive.readlink("link") == b"target"
     plain = rars.RarFile(legacy_link(False))
-    assert archive.gettimes("link", options=rars.ReadOptions()) == plain.gettimes("link")
+    assert times(archive.getinfo("link")) == times(plain.getinfo("link"))
 
 
 @pytest.mark.parametrize("call", [
@@ -123,3 +126,19 @@ def test_a_rarinfo_still_selects_an_existing_member_to_edit():
     builder.rename(archive.getinfo("file"), "renamed")
     builder.remove(archive.getinfo("link"))
     assert rars.RarFile(builder.to_bytes()).namelist() == ["renamed"]
+
+
+def test_every_member_argument_is_called_member(tmp_path):
+    archive = linked_archive()
+    assert archive.getinfo(member="file").filename == "file"
+    assert archive.read(member="file") == b"payload"
+    assert archive.open(member="file").read() == b"payload"
+    assert archive.member_comment(member="file") == b"note"
+    assert archive.readlink(member="link") == b"file"
+    assert archive.extract(member="file", path=tmp_path).read_bytes() == b"payload"
+    builder = rars.RarBuilder()
+    builder.add_bytes(b"x", "a")
+    builder.rename(member="a", new="b")
+    builder.set_member_comment(member="b", comment=b"c")
+    builder.set_times(member="b", mtime_ns=0)
+    builder.remove(member="b")

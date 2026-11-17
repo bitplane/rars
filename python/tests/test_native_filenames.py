@@ -38,7 +38,7 @@ def test_native_filename_round_trip(tmp_path, format, raw_names, request):
     root.mkdir()
     for name in names:
         (root / os.fsdecode(name)).write_bytes(name)
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add(root)
     archive = rars.RarFile(builder.to_bytes())
     # Lookups continue to use exact archive identity, including RAR5 mapping.
@@ -52,7 +52,7 @@ def test_native_filename_round_trip(tmp_path, format, raw_names, request):
 
 @pytest.fixture
 def legacy_byte_archive():
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", b"legacy-\xff")
     return rars.RarFile(builder.to_bytes())
 

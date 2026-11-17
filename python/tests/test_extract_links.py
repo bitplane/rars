@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(os.name == "nt", reason="symlinks need privilege
 
 
 def archive(links, format="rar50", target=True):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     if target:
         builder.add_bytes(b"target", "c/target.txt")
     for name, link_target in links:
@@ -86,7 +86,7 @@ def test_symlinks_that_stay_inside_are_created(tmp_path, format):
 @pytest.mark.parametrize("format", ["rar50", "rar29"])
 @pytest.mark.parametrize("target", ["../../outside", "/etc/passwd"])
 def test_symlinks_that_leave_are_skipped_with_a_warning(tmp_path, format, target):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add_unix_symlink("a/escape", target)
     builder.add_bytes(b"after", "after.txt")
     rar = rars.RarFile(builder.to_bytes())

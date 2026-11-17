@@ -9,7 +9,7 @@ import rars
 
 
 def archive_of(**members):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     for name, payload in members.items():
         builder.add_bytes(payload, name)
     return rars.RarFile(builder.to_bytes())
@@ -95,7 +95,7 @@ def staging_left(out):
 @pytest.mark.parametrize("members", [None, ["good.txt", "bad.txt"]])
 @pytest.mark.parametrize("old", [None, b"old contents"])
 def test_a_member_that_fails_its_checksum_leaves_its_destination_alone(tmp_path, members, old):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"good payload", "good.txt")
     builder.add_bytes(b"bad payload", "bad.txt")
     archive = corrupt_last(builder)
@@ -114,11 +114,11 @@ def test_a_member_that_fails_its_checksum_leaves_its_destination_alone(tmp_path,
 
 
 def write_set(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=4096)
+    builder = rars.RarBuilder(level=0, volume_size=4096)
     builder.add_bytes(b"small payload", "small.txt")
     builder.add_bytes(bytes(range(256)) * 80, "large.bin")
     (tmp_path / "made").mkdir()
-    return builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    return builder.write(tmp_path / "made" / "set.part01.rar")
 
 
 @pytest.mark.parametrize("old", [None, b"old contents"])
@@ -154,7 +154,7 @@ def test_no_staging_remains_after_success_cancellation_or_a_raising_volumes_iter
             token.cancel()
             yield from paths[1:]
 
-        with pytest.raises(InterruptedError):
+        with pytest.raises(rars.Cancelled):
             archive.extractall(tmp_path / "cancelled", volumes=cancelling(),
                                cancellation=token)
 
@@ -187,7 +187,7 @@ except FileNotFoundError:
 def test_staging_streams_to_disk_instead_of_buffering_a_member(tmp_path):
     def peak(size):
         archive = tmp_path / f"{size}.rar"
-        builder = rars.RarBuilder(store=True)
+        builder = rars.RarBuilder(level=0)
         builder.add_bytes(os.urandom(size), "member.bin")
         builder.write(archive)
         out = tmp_path / f"out-{size}"

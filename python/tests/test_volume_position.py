@@ -9,9 +9,9 @@ FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
 
 
 def write_set(tmp_path, format, first):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(random.Random(22).randbytes(40_000), "large.bin")
-    paths = builder.write_volumes(tmp_path / first)
+    paths = builder.write(tmp_path / first)
     assert len(paths) > 3
     return paths
 
@@ -20,7 +20,7 @@ def numbers_of(paths):
     numbers = []
     for path in paths:
         with rars.RarFile(path, first_volume_only=True) as archive:
-            numbers.append(archive.volume_number)
+            numbers.append(archive.volume_index)
     return numbers
 
 
@@ -32,14 +32,14 @@ def test_each_volume_of_a_built_set_knows_its_place(tmp_path, format, first, nam
     places = []
     for path in paths:
         with rars.RarFile(path, first_volume_only=True) as archive:
-            places.append((archive.volume_number, archive.is_first_volume, archive.volume_naming))
-    expected = [(number, number == 1, naming) for number in range(1, len(paths) + 1)]
+            places.append((archive.volume_index, archive.is_first_volume, archive.volume_naming))
+    expected = [(index, index == 0, naming) for index in range(len(paths))]
     assert places == expected
 
 
 def test_winrar_5_volumes_know_their_numbers():
     paths = [FIXTURES / f"rar50/multivol.part{n}.rar" for n in (1, 2, 3)]
-    assert numbers_of(paths) == [1, 2, 3]
+    assert numbers_of(paths) == [0, 1, 2]
 
 
 # WinRAR 3.00 records no number in its end blocks, so only the first volume knows its place.
@@ -52,12 +52,12 @@ def test_winrar_5_volumes_know_their_numbers():
 )
 def test_a_winrar_3_00_set_numbers_only_its_first_volume(names):
     paths = [FIXTURES / "rar15_40/rar300" / name for name in names]
-    assert numbers_of(paths) == [1] + [None] * (len(names) - 1)
+    assert numbers_of(paths) == [0] + [None] * (len(names) - 1)
 
 
 def test_a_built_rar2_set_numbers_only_its_first_volume(tmp_path):
     paths = write_set(tmp_path, "rar20", "set.rar")
-    assert numbers_of(paths) == [1] + [None] * (len(paths) - 1)
+    assert numbers_of(paths) == [0] + [None] * (len(paths) - 1)
 
 
 def test_a_rar_1_54_set_records_no_numbers():
@@ -71,7 +71,7 @@ def test_a_rar_1_54_set_records_no_numbers():
 def test_a_single_archive_is_volume_one_of_one(name):
     with rars.RarFile(FIXTURES / name) as archive:
         assert archive.is_volume is False
-        assert archive.volume_number == 1
+        assert archive.volume_index == 0
         assert archive.is_first_volume is True
 
 
@@ -80,7 +80,7 @@ def test_a_rar_1_3_volume_records_no_number():
     for path in paths:
         with rars.RarFile(path, first_volume_only=True) as archive:
             assert archive.is_volume is True
-            assert archive.volume_number is None
+            assert archive.volume_index is None
 
 
 def firsts_of(paths):
@@ -137,5 +137,5 @@ def test_a_middle_volume_lists_the_member_it_continues(tmp_path, format, first):
         [member] = archive.infolist()
         assert member.filename == "large.bin"
         assert member.is_split_before and member.is_split_after
-        assert archive.volume_number == 3
+        assert archive.volume_index == 2
         assert archive.is_first_volume is False

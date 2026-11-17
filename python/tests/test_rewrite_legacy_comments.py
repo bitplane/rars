@@ -13,10 +13,10 @@ from test_rewrite_legacy import ROOT, headers, service_headers
 @pytest.mark.parametrize("comment", [b"", b"archive comment\xff"])
 @pytest.mark.parametrize("password", [None, "secret"])
 def test_native_archive_comments_survive_rewrites(format, comment, password):
-    builder = rars.RarBuilder(format=format, comment=comment, password=password)
+    builder = rars.RarBuilder(version=format, comment=comment, password=password)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes(), password=password)
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     data = editor.to_bytes()
@@ -24,37 +24,37 @@ def test_native_archive_comments_survive_rewrites(format, comment, password):
     assert output.family == "rar15_40"
     assert output.comment == comment
     assert output.read("renamed") == b"payload"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert rars.RarFile(rars.RarBuilder.from_archive(output).to_bytes(), password=password).comment == comment
 
 
 @pytest.mark.parametrize("password", [None, "secret"])
 @pytest.mark.parametrize("format", ["rar20", "rar29"])
 def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password, format):
-    builder = rars.RarBuilder(format=format, comment=b"archive", password=password)
+    builder = rars.RarBuilder(version=format, comment=b"archive", password=password)
     for name in ["file", "empty", "absent", "remove"]:
         builder.add_bytes(name.encode(), name)
-    builder.set_file_comment("file", b"comment\xff")
-    builder.set_file_comment("empty", b"")
-    builder.set_file_comment("remove", b"discard")
+    builder.set_member_comment("file", b"comment\xff")
+    builder.set_member_comment("empty", b"")
+    builder.set_member_comment("remove", b"discard")
     source = rars.RarFile(builder.to_bytes(), password=password)
     editor = rars.RarBuilder.from_archive(source)
     editor.rename("file", "renamed")
     editor.remove("remove")
     output = rars.RarFile(editor.to_bytes(), password=password)
     assert output.comment == b"archive"
-    assert output.getcomment("renamed") == b"comment\xff"
-    assert output.getcomment("empty") == b""
-    assert output.getcomment("absent") is None
+    assert output.member_comment("renamed") == b"comment\xff"
+    assert output.member_comment("empty") == b""
+    assert output.member_comment("absent") is None
     assert output.read("renamed") == b"file"
-    editor.set_file_comment("renamed", b"changed")
-    assert rars.RarFile(editor.to_bytes(), password=password).getcomment("renamed") == b"changed"
-    editor.set_file_comment("renamed", None)
-    assert rars.RarFile(editor.to_bytes(), password=password).getcomment("renamed") is None
+    editor.set_member_comment("renamed", b"changed")
+    assert rars.RarFile(editor.to_bytes(), password=password).member_comment("renamed") == b"changed"
+    editor.set_member_comment("renamed", None)
+    assert rars.RarFile(editor.to_bytes(), password=password).member_comment("renamed") is None
 
 
 def old_comment_archive():
-    builder = rars.RarBuilder(format="rar29", store=True, comment=b"comment")
+    builder = rars.RarBuilder(version="rar29", level=0, comment=b"comment")
     builder.add_bytes(b"payload", "file")
     return builder.to_bytes()
 
@@ -96,9 +96,9 @@ def test_bad_archive_comments_leave_destination_untouched(tmp_path, damage):
 
 
 def test_corrupt_file_comment_fails_before_destination_write(tmp_path):
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"comment")
+    builder.set_member_comment("file", b"comment")
     data = bytearray(builder.to_bytes())
     offset, _, _, _ = next(h for h in headers(data) if h[1] == 0x74)
     name_size = struct.unpack_from("<H", data, offset + 26)[0]
@@ -134,7 +134,7 @@ def test_reference_rar300_comment_survives_native_rewrite(tmp_path):
 
 @pytest.mark.parametrize("damage", ["duplicate", "after_file", "unknown_flags"])
 def test_unsupported_cmt_service_layout_is_rejected(damage):
-    builder = rars.RarBuilder(format="rar30", comment=b"comment")
+    builder = rars.RarBuilder(version="rar30", comment=b"comment")
     builder.add_bytes(b"payload", "file")
     data = bytearray(builder.to_bytes())
     offset, _, flags, size = next(service_headers(data, b"CMT"))

@@ -43,7 +43,7 @@ def archive_bytes(**options):
 
 def test_preservation_default_accepts_supported_rar5_metadata():
     source = rars.RarFile(archive_bytes(comment=b"comment"))
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source)
     rewritten.rename("file", "renamed")
     output = rars.RarFile(rewritten.to_bytes())
@@ -55,7 +55,7 @@ def test_preservation_default_accepts_supported_rar5_metadata():
 
 @pytest.mark.parametrize("damage", ["unknown", "incomplete"])
 def test_skipped_extra_metadata_cannot_pass_preservation_preflight(damage):
-    data = bytearray(archive_bytes(store=True))
+    data = bytearray(archive_bytes(level=0))
     for crc_at, body_at, body_end in _headers(data):
         _, cursor = _read_vint(data, body_at)
         kind, cursor = _read_vint(data, cursor)
@@ -73,27 +73,24 @@ def test_skipped_extra_metadata_cannot_pass_preservation_preflight(damage):
         break
     source = rars.RarFile(bytes(data))
     assert source.read("file") == b"payload" * 40
-    assert any("metadata" in issue for issue in source.rewrite_preservation_issues())
     with pytest.raises(rars.UnsupportedRarFeature, match="metadata"):
         rars.RarBuilder.from_archive(source)
 
 
 @pytest.mark.parametrize("suffix", [b"trailing metadata", None])
 def test_trailing_bytes_or_missing_end_cannot_pass_preflight(suffix):
-    data = archive_bytes(store=True)
+    data = archive_bytes(level=0)
     data = data + suffix if suffix is not None else data[:_headers(data)[-1][0]]
     source = rars.RarFile(data)
     assert source.read("file") == b"payload" * 40
-    assert source.rewrite_preservation_issues()
     with pytest.raises(rars.UnsupportedRarFeature):
         rars.RarBuilder.from_archive(source)
 
 
 def test_legacy_trailing_data_is_rejected():
-    builder = rars.RarBuilder(format="rar13", store=True)
+    builder = rars.RarBuilder(version="rar13", level=0)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes() + b"extra")
-    assert any("trailing bytes" in issue for issue in source.rewrite_preservation_issues())
     with pytest.raises(rars.UnsupportedRarFeature, match="trailing bytes"):
         rars.RarBuilder.from_archive(source)
 
@@ -101,11 +98,10 @@ def test_legacy_trailing_data_is_rejected():
 def test_preflight_checks_on_disk_requirements_not_creator_version():
     # The RAR7 writer may emit fully RAR5-compatible headers. Its creating
     # release cannot be inferred from these bytes and is not a preservation promise.
-    compatible = rars.RarFile(archive_bytes(format="rar70"))
-    assert compatible.rewrite_preservation_issues() == []
+    compatible = rars.RarFile(archive_bytes(version="rar70"))
+    rars.RarBuilder.from_archive(compatible)
     fixture = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/rar50/algorithm_version_2_stored.rar"
     future = rars.RarFile(fixture)
-    assert any("source format" in issue for issue in future.rewrite_preservation_issues())
     with pytest.raises(rars.UnsupportedRarFeature, match="source format"):
         rars.RarBuilder.from_archive(future)
 
@@ -114,17 +110,16 @@ def test_preflight_accepts_supported_fractional_mtime():
     fixture = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/rar15_40/rar420/ext_time_rar420.rar"
     converted = rars.RarBuilder.from_archive(fixture, preserve=False).to_bytes()
     source = rars.RarFile(converted)
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     assert rars.RarBuilder.from_archive(source).to_bytes() == converted
 
 
 def test_preflight_detects_volume_settings(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=512)
+    builder = rars.RarBuilder(level=0, volume_size=512)
     builder.add_bytes(b"payload" * 400, "file")
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
     assert len(paths) > 1
     source = rars.RarFile(paths[0])
-    assert any("volume" in issue for issue in source.rewrite_preservation_issues())
     with pytest.raises(rars.UnsupportedRarFeature, match="volume"):
         rars.RarBuilder.from_archive(source)
 
@@ -132,60 +127,60 @@ def test_preflight_detects_volume_settings(tmp_path):
 def test_file_comments_survive_edits_and_distinguish_empty_from_absent():
     builder = rars.RarBuilder(comment=b"archive comment")
     builder.add_directory("directory")
-    builder.set_file_comment("directory", b"directory comment")
+    builder.set_member_comment("directory", b"directory comment")
     for name in ["rename", "empty", "absent", "remove"]:
         builder.add_bytes(b"payload", name)
-    builder.set_file_comment("rename", b"legacy bytes\xff")
-    builder.set_file_comment("empty", b"")
-    builder.set_file_comment("remove", b"discard")
+    builder.set_member_comment("rename", b"legacy bytes\xff")
+    builder.set_member_comment("empty", b"")
+    builder.set_member_comment("remove", b"discard")
     source = rars.RarFile(builder.to_bytes())
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source)
     rewritten.rename("rename", "renamed")
     rewritten.remove("remove")
     rewritten.add_bytes(b"new", "new")
     output = rars.RarFile(rewritten.to_bytes())
     assert output.comment == b"archive comment"
-    assert output.getcomment("directory") == b"directory comment"
-    assert output.getcomment("renamed") == b"legacy bytes\xff"
-    assert output.getcomment("empty") == b""
-    assert output.getcomment("absent") is None
-    assert output.getcomment("new") is None
+    assert output.member_comment("directory") == b"directory comment"
+    assert output.member_comment("renamed") == b"legacy bytes\xff"
+    assert output.member_comment("empty") == b""
+    assert output.member_comment("absent") is None
+    assert output.member_comment("new") is None
     assert output.read("renamed") == b"payload"
     with pytest.raises(KeyError):
-        output.getcomment("remove")
-    rewritten.set_file_comment("renamed")
-    assert rars.RarFile(rewritten.to_bytes()).getcomment("renamed") is None
+        output.member_comment("remove")
+    rewritten.set_member_comment("renamed")
+    assert rars.RarFile(rewritten.to_bytes()).member_comment("renamed") is None
 
 
 @pytest.mark.parametrize("format", ["rar14", "rar15", "rar20", "rar29"])
 def test_conversion_retains_legacy_file_comments(format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"comment\xff")
+    builder.set_member_comment("file", b"comment\xff")
     source = rars.RarFile(builder.to_bytes())
-    assert source.getcomment("file") == b"comment\xff"
+    assert source.member_comment("file") == b"comment\xff"
     rewritten = rars.RarBuilder.from_archive(source, preserve=False)
     output = rars.RarFile(rewritten.to_bytes())
-    assert output.getcomment("file") == b"comment\xff"
+    assert output.member_comment("file") == b"comment\xff"
     assert output.read("file") == b"payload"
 
 
 def test_conversion_decodes_encrypted_file_comments():
     builder = rars.RarBuilder(password="secret")
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"private comment")
+    builder.set_member_comment("file", b"private comment")
     source = rars.RarFile(builder.to_bytes(), password="secret")
-    assert source.getcomment("file") == b"private comment"
+    assert source.member_comment("file") == b"private comment"
     output = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
-    assert output.getcomment("file") == b"private comment"
+    assert output.member_comment("file") == b"private comment"
     assert output.read("file") == b"payload"
 
 
 def test_invalid_file_comment_fails_before_destination_is_touched(tmp_path):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file")
-    builder.set_file_comment("file", b"comment")
+    builder.set_member_comment("file", b"comment")
     data = bytearray(builder.to_bytes())
     _, _, body_end = next(named_headers(data, 3, b"CMT"))
     data[body_end] ^= 1
@@ -206,7 +201,7 @@ def test_invalid_file_comment_fails_before_destination_is_touched(tmp_path):
 ])
 def test_preservation_retains_solid_and_encryption_settings(options):
     source = rars.RarFile(archive_bytes(**options), password=options.get("password"))
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source)
     rewritten.rename("file", "renamed")
     data = rewritten.to_bytes()
@@ -259,28 +254,28 @@ def test_unknown_main_metadata_stays_readable_but_fails_preservation(tmp_path, d
 
 
 def test_rewrite_preserves_mixed_data_and_comment_encryption():
-    plain = rars.RarBuilder(store=True)
+    plain = rars.RarBuilder(level=0)
     plain.add_bytes(b"public", "plain")
-    plain.set_file_comment("plain", b"public comment")
-    secret = rars.RarBuilder(store=True, password="secret")
+    plain.set_member_comment("plain", b"public comment")
+    secret = rars.RarBuilder(level=0, password="secret")
     secret.add_bytes(b"private", "encrypted")
-    secret.set_file_comment("encrypted", b"private comment")
+    secret.set_member_comment("encrypted", b"private comment")
     a, b = plain.to_bytes(), secret.to_bytes()
     # Join member blocks under the first non-solid main header.
     member_at, _, _ = next(named_headers(b, 2, b"encrypted"))
     combined = a[:_headers(a)[-1][0]] + b[member_at:]
     source = rars.RarFile(combined, password="secret")
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source).to_bytes()
     output = rars.RarFile(rewritten)
     assert not output.getinfo("plain").is_encrypted
     assert output.getinfo("encrypted").is_encrypted
-    assert output.getcomment("plain") == b"public comment"
+    assert output.member_comment("plain") == b"public comment"
     with pytest.raises(rars.PasswordRequired):
-        output.getcomment("encrypted")
+        output.member_comment("encrypted")
     unlocked = rars.RarFile(rewritten, password="secret")
     assert unlocked.read("encrypted") == b"private"
-    assert unlocked.getcomment("encrypted") == b"private comment"
+    assert unlocked.member_comment("encrypted") == b"private comment"
 
 
 @pytest.mark.parametrize("options", [
@@ -301,7 +296,7 @@ def test_empty_archives_retain_settings_and_comments(options, remove_last):
     output = rars.RarFile(data, password=options.get("password"))
     assert output.namelist() == []
     assert output.comment == b"retained"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     # Empty output must itself remain editable with the same settings.
     again = rars.RarBuilder.from_archive(output).to_bytes()
     assert rars.RarFile(again, password=options.get("password")).comment == b"retained"
@@ -327,14 +322,14 @@ def test_rewrite_can_replace_its_source_after_reading(tmp_path):
     destination.write_bytes(archive_bytes(solid=True))
     builder = rars.RarBuilder.from_archive(destination)
     builder.rename("file", "renamed")
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     output = rars.RarFile(destination)
     assert output.read("renamed") == b"payload" * 40
     assert output.namelist() == ["empty", "renamed"]
 
 
 def test_legacy_default_rejection_explains_explicit_conversion(tmp_path):
-    builder = rars.RarBuilder(format="rar13", store=True)
+    builder = rars.RarBuilder(version="rar13", level=0)
     builder.add_bytes(b"payload", "file")
     source = rars.RarFile(builder.to_bytes() + b"extra")
     destination = tmp_path / "existing.rar"
@@ -347,7 +342,7 @@ def test_legacy_default_rejection_explains_explicit_conversion(tmp_path):
 
 
 def test_corrupt_lazy_payload_preserves_existing_destination(tmp_path):
-    data = bytearray(archive_bytes(store=True))
+    data = bytearray(archive_bytes(level=0))
     for _, body_at, body_end in _headers(data):
         _, cursor = _read_vint(data, body_at)
         kind, cursor = _read_vint(data, cursor)
@@ -366,6 +361,6 @@ def test_corrupt_lazy_payload_preserves_existing_destination(tmp_path):
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(rars.BadRarFile):
-        builder.write(destination)
+        builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]

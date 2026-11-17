@@ -4,22 +4,27 @@ import pytest
 import rars
 
 
-@pytest.mark.parametrize("times", [
-    dict(modified=0, created=123, accessed=4_294_967_295_999_999_999),
-    dict(modified=-11_644_473_600_000_000_000, created=1_728_229_934_970_955_161_500, accessed=100),
-    dict(created=0, accessed=123_456_789),
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
+@pytest.mark.parametrize("given", [
+    dict(mtime_ns=0, birthtime_ns=123, atime_ns=4_294_967_295_999_999_999),
+    dict(mtime_ns=-11_644_473_600_000_000_000, birthtime_ns=1_728_229_934_970_955_161_500, atime_ns=100),
+    dict(birthtime_ns=0, atime_ns=123_456_789),
 ])
-def test_rewrite_preserves_all_file_times_without_narrowing(times):
+def test_rewrite_preserves_all_file_times_without_narrowing(given):
     builder = rars.RarBuilder()
     builder.add_bytes(b"payload", "file")
-    builder.set_times("file", **{kind + "_ns": value for kind, value in times.items()})
+    builder.set_times("file", **given)
+    expected = (given.get("mtime_ns"), given.get("birthtime_ns"), given.get("atime_ns"))
     source = rars.RarFile(builder.to_bytes())
-    assert source.gettimes("file") == times
-    assert source.rewrite_preservation_issues() == []
+    assert times(source.getinfo("file")) == expected
+    rars.RarBuilder.from_archive(source)
     rewritten = rars.RarBuilder.from_archive(source, preserve=True)
     rewritten.rename("file", "renamed")
     output = rars.RarFile(rewritten.to_bytes())
-    assert output.gettimes("renamed") == times
+    assert times(output.getinfo("renamed")) == expected
     assert output.read("renamed") == b"payload"
 
 
@@ -27,12 +32,12 @@ def test_legacy_extended_times_survive_conversion():
     source = rars.RarFile(Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/rar15_40/rar420/ext_time_rar420.rar")
     output = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
     for name in source.namelist():
-        assert output.gettimes(name) == source.gettimes(name)
+        assert times(output.getinfo(name)) == times(source.getinfo(name))
 
 
 def test_unrepresentable_mixed_precision_leaves_queued_times_unchanged():
     builder = rars.RarBuilder()
     builder.add_bytes(b"payload", "file", mtime=123)
     with pytest.raises(ValueError, match="100-nanosecond"):
-        builder.set_times("file", modified_ns=-100, created_ns=1)
-    assert rars.RarFile(builder.to_bytes()).gettimes("file") == {"modified": 123_000_000_000}
+        builder.set_times("file", mtime_ns=-100, birthtime_ns=1)
+    assert times(rars.RarFile(builder.to_bytes()).getinfo("file")) == (123_000_000_000, None, None)

@@ -4,7 +4,7 @@ import rars
 
 def source_archive(format="rar50", solid=False):
     builder = rars.RarBuilder(
-        format=format, solid=solid, store=not solid or format in ("rar50", "rar70")
+        version=format, solid=solid, level=0 if not solid or format in ("rar50", "rar70") else 3
     )
     builder.add_directory("empty", mtime=1_700_000_000)
     builder.add_bytes(b"first payload", "first", mtime=1_700_000_002)
@@ -49,12 +49,12 @@ def test_limit_is_lazy_per_write_and_counts_only_retained_payloads(tmp_path):
     builder = rars.RarBuilder.from_archive(
         rars.RarFile(source_archive()), max_staged_bytes=14,
     )
-    with pytest.raises(MemoryError, match="rewrite staging limit"):
-        builder.write(destination)
+    with pytest.raises(rars.LimitExceeded, match="rewrite staging limit"):
+        builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
     builder.remove("first")
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("second") == b"second payload"
     assert list(tmp_path.iterdir()) == [destination]
 
@@ -72,7 +72,7 @@ def test_default_directory_and_cleanup_after_writer_callback_failure(tmp_path, m
     expected = cwd if method == "to_bytes" else output_dir
 
     def stop(event):
-        if event.phase != "compression" or not list(expected.glob(".rars-spool-*")):
+        if event.phase != "compressing" or not list(expected.glob(".rars-spool-*")):
             return
         # Abort while the writer owns staged payloads, before publication.
         raise RuntimeError("stop after staging")
@@ -81,12 +81,12 @@ def test_default_directory_and_cleanup_after_writer_callback_failure(tmp_path, m
         if method == "to_bytes":
             builder.to_bytes(progress=stop)
         else:
-            builder.write(destination, progress=stop)
+            builder.write(destination, progress=stop, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(cwd.iterdir()) == []
     assert list(output_dir.iterdir()) == [destination]
     # A failed write must not poison or retain that session's sources.
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("first") == b"first payload"
     assert list(output_dir.iterdir()) == [destination]
 
@@ -111,7 +111,7 @@ def test_no_retained_payloads_need_no_staging_directory(tmp_path):
         rars.RarFile(source_archive()),
         staging_dir=tmp_path / "missing", max_staged_bytes=0,
     )
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         builder.to_bytes()
     builder.remove("first")
     builder.remove("second")
@@ -149,14 +149,14 @@ def test_staging_progress_counts_decoded_dependencies_during_compression(tmp_pat
     assert [event.completed for event in staging] == sorted(event.completed for event in staging)
     names = {event.entry_name for event in staging if event.entry_name is not None}
     assert names == ({b"first", b"second"} if solid else {b"second"})
-    assert any(event.phase == "compression" for event in events)
+    assert any(event.phase == "compressing" for event in events)
     assert list(tmp_path.iterdir()) == []
 
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40", "rar50", "rar70"])
 @pytest.mark.parametrize("when", ["start", "bytes"])
 def test_staging_callback_cancels_and_preserves_destination(tmp_path, format, when):
-    original = rars.RarBuilder(format=format, store=True)
+    original = rars.RarBuilder(version=format, level=0)
     original.add_bytes(b"payload" * 20000, "file")
     builder = rars.RarBuilder.from_archive(rars.RarFile(original.to_bytes()))
     destination = tmp_path / "archive.rar"
@@ -177,12 +177,12 @@ def test_staging_callback_cancels_and_preserves_destination(tmp_path, format, wh
             raise failure
 
     with pytest.raises(RuntimeError) as caught:
-        builder.write(destination, progress=stop)
+        builder.write(destination, progress=stop, overwrite=True)
     assert caught.value is failure
     assert seen
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
-    builder.write(destination)
+    builder.write(destination, overwrite=True)
     assert rars.RarFile(destination).read("file") == b"payload" * 20000
     assert list(tmp_path.iterdir()) == [destination]
 

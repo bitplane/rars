@@ -8,6 +8,10 @@ from pathlib import Path
 import pytest
 import rars
 
+
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
 ROOT = Path(__file__).resolve().parents[2]
 MTIME = 1_710_000_000
 # Stored form, for hand-built extended-time records.
@@ -56,14 +60,14 @@ def file_metadata(data):
 
 
 def source_bytes(format="rar40", **options):
-    builder = rars.RarBuilder(format=format, **options)
+    builder = rars.RarBuilder(version=format, **options)
     builder.add_bytes(b"payload" * 50, b"raw-\xff", mtime=MTIME, mode=0o100640)
     builder.add_bytes(b"second", "second")
     return builder.to_bytes()
 
 
 @pytest.mark.parametrize("format", ["rar20", "rar29", "rar30", "rar40"])
-@pytest.mark.parametrize("options", [{"store": True}, {}, {"solid": True}])
+@pytest.mark.parametrize("options", [{"level": 0}, {}, {"solid": True}])
 @pytest.mark.parametrize("on_disk", [False, True])
 def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_path, format, options, on_disk):
     original = source_bytes(format, **options)
@@ -79,7 +83,7 @@ def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_
     output = rars.RarFile(data)
     assert output.family == "rar15_40"
     assert output.read(b"renamed-\xfe") == b"payload" * 50
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     expected = file_metadata(original)[0]
     assert file_metadata(data) == [(b"renamed-\xfe", *expected[1:])]
     assert bool(next(headers(data))[2] & 8) == options.get("solid", False)
@@ -93,7 +97,7 @@ def test_native_legacy_preservation_keeps_names_times_attributes_and_format(tmp_
     ("comment", "file comments"),
 ])
 def test_unsupported_legacy_metadata_is_rejected_before_destination_write(tmp_path, damage, message):
-    data = bytearray(source_bytes(store=True))
+    data = bytearray(source_bytes(level=0))
     if damage == "trailing":
         data += b"extra"
     elif damage == "partial_header":
@@ -118,7 +122,7 @@ def test_unsupported_legacy_metadata_is_rejected_before_destination_write(tmp_pa
 
 @pytest.mark.skipif(not shutil.which("unrar"), reason="requires unrar")
 def test_unrar_extracts_native_legacy_rewrite(tmp_path):
-    source = rars.RarBuilder(format="rar40", solid=True)
+    source = rars.RarBuilder(version="rar40", solid=True)
     source.add_bytes(b"first" * 100, "first", mtime=MTIME)
     source.add_bytes(b"second" * 100, "second", mtime=MTIME)
     builder = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
@@ -159,7 +163,7 @@ def test_removing_last_legacy_member_keeps_existing_destination(tmp_path):
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     with pytest.raises(ValueError, match="no entries"):
-        builder.write(destination)
+        builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
 
 
@@ -168,7 +172,7 @@ def test_native_legacy_rewrite_can_replace_its_source(tmp_path):
     path.write_bytes(source_bytes(solid=True))
     builder = rars.RarBuilder.from_archive(path)
     builder.rename(b"raw-\xff", b"renamed-\xff")
-    builder.write(path)
+    builder.write(path, overwrite=True)
     output = rars.RarFile(path)
     assert output.read(b"renamed-\xff") == b"payload" * 50
     assert output.read("second") == b"second"
@@ -205,7 +209,7 @@ def test_native_extended_times_retain_all_four_slots_and_precision(width, solid)
             raw += struct.pack("<I", DOS_TIME + index)
         raw += b"\x01" * width
     source = rars.RarFile(with_extended_times(source_bytes(solid=solid), raw))
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     builder = rars.RarBuilder.from_archive(source)
     builder.rename(b"raw-\xff", "renamed")
     builder.remove("second")
@@ -241,7 +245,7 @@ def test_reference_rar420_extended_times_survive_native_rewrite(tmp_path):
     output = rars.RarFile(output_bytes)
     assert output.family == "rar15_40"
     for name in source.namelist():
-        assert output.gettimes(name) == source.gettimes(name)
+        assert times(output.getinfo(name)) == times(source.getinfo(name))
         assert output.read(name) == source.read(name)
     if shutil.which("unrar"):
         rewritten = tmp_path / "rewritten.rar"
@@ -261,7 +265,7 @@ def test_reference_rar420_extended_times_survive_native_rewrite(tmp_path):
 def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
     original = source_bytes(password="secret", encrypt_headers=header_encryption, solid=solid)
     source = rars.RarFile(original, password="secret")
-    assert source.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(source)
     builder = rars.RarBuilder.from_archive(source)
     builder.rename(b"raw-\xff", "renamed")
     output_bytes = builder.to_bytes()
@@ -269,7 +273,7 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
         with pytest.raises(rars.PasswordRequired):
             rars.RarFile(output_bytes)
     output = rars.RarFile(output_bytes, password="secret")
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     for name in output.namelist():
         assert output.getinfo(name).is_encrypted
     assert output.read("renamed") == b"payload" * 50
@@ -284,9 +288,9 @@ def test_legacy_encryption_survives_edits(tmp_path, header_encryption, solid):
 @pytest.mark.parametrize("format", ["rar20", "rar40"])
 @pytest.mark.parametrize("encrypted_first", [False, True])
 def test_mixed_legacy_encryption_keeps_plaintext_members_plain(tmp_path, format, encrypted_first):
-    plain = rars.RarBuilder(format=format, store=True)
+    plain = rars.RarBuilder(version=format, level=0)
     plain.add_bytes(b"public", "plain")
-    encrypted = rars.RarBuilder(format=format, password="secret")
+    encrypted = rars.RarBuilder(version=format, password="secret")
     encrypted.add_bytes(b"private", "encrypted")
     first, second = (encrypted, plain) if encrypted_first else (plain, encrypted)
     second_bytes = second.to_bytes()
@@ -334,7 +338,7 @@ def test_legacy_password_failure_keeps_destination(tmp_path, password, header_en
     destination.write_bytes(b"keep")
     with pytest.raises((rars.PasswordRequired, rars.BadPassword, rars.BadRarFile)):
         source = rars.RarFile(data, password=password)
-        rars.RarBuilder.from_archive(source).write(destination)
+        rars.RarBuilder.from_archive(source).write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
 
@@ -348,4 +352,4 @@ def test_reference_legacy_encryption_is_preserved(fixture):
     for name in source.namelist():
         assert output.getinfo(name).is_encrypted == source.getinfo(name).is_encrypted
         assert output.read(name) == source.read(name)
-        assert output.gettimes(name) == source.gettimes(name)
+        assert times(output.getinfo(name)) == times(source.getinfo(name))

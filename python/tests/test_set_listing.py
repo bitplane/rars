@@ -7,6 +7,10 @@ import pytest
 import rars
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 FIXTURES = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures"
 
 MEMBERS = {
@@ -19,20 +23,20 @@ LATER = ["after.bin", "tail.bin"]
 
 
 def write_set(tmp_path, **options):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=4096, **options)
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=4096, **options)
     for name, data in MEMBERS.items():
         builder.add_bytes(data, name)
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     assert len(paths) > 3
     return paths
 
 
 def write_legacy_set(tmp_path, format, first, **options):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096, **options)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096, **options)
     builder.add_bytes(MEMBERS["large.bin"], "large.bin")
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / first)
+    paths = builder.write(tmp_path / "made" / first)
     assert len(paths) > 3
     return paths
 
@@ -99,8 +103,8 @@ def test_every_member_has_its_whole_sizes_and_crc(tmp_path):
     for name, data in MEMBERS.items():
         assert infos[name].file_size == infos[name].compress_size == len(data)
         assert infos[name].CRC == zlib.crc32(data)
-    assert infos["head.txt"].volume == 0
-    assert infos["after.bin"].volume > 0
+    assert infos["head.txt"].volume_index == 0
+    assert infos["after.bin"].volume_index > 0
 
 
 def test_members_starting_in_later_volumes_can_be_selected(tmp_path):
@@ -134,7 +138,7 @@ def test_a_later_member_reads_only_as_far_as_it_ends(tmp_path):
             for info in rars.RarFile(path, first_volume_only=True).infolist()
         )
     )
-    assert after.volume < ends < len(paths) - 1
+    assert after.volume_index < ends < len(paths) - 1
 
     def volumes():
         yield from paths[1 : ends + 1]
@@ -147,8 +151,8 @@ def test_a_later_member_reads_only_as_far_as_it_ends(tmp_path):
 def test_metadata_of_a_later_member_comes_from_its_own_volume(tmp_path):
     paths = write_set(tmp_path)
     with rars.RarFile(paths[0]) as archive:
-        assert archive.gettimes("tail.bin") == archive.gettimes("head.txt")
-        assert archive.getcomment("tail.bin") is None
+        assert times(archive.getinfo("tail.bin")) == times(archive.getinfo("head.txt"))
+        assert archive.member_comment("tail.bin") is None
 
 
 def test_a_rarinfo_from_the_first_volume_still_selects_its_member(tmp_path):
@@ -179,7 +183,7 @@ def test_a_missing_middle_volume_is_named_by_the_listing(tmp_path):
     with rars.RarFile(paths[0]) as archive:
         with pytest.raises(rars.MissingVolume, match=paths[2].name) as raised:
             archive.namelist()
-        assert raised.value.volume_number == 3
+        assert raised.value.volume_index == 2
         assert raised.value.path == paths[2]
         with pytest.raises(rars.MissingVolume):
             archive.read("tail.bin")
@@ -250,11 +254,11 @@ def read_bytes_so_far():
 
 @pytest.mark.skipif(not Path("/proc/self/io").exists(), reason="needs Linux read counters")
 def test_listing_a_large_set_reads_headers_only(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=1 << 20)
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=1 << 20)
     for index in range(4):
         builder.add_bytes(random.Random(index).randbytes(3 << 20), f"{index}.bin")
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "big.part01.rar")
+    paths = builder.write(tmp_path / "made" / "big.part01.rar")
     with rars.RarFile(paths[0]) as archive:
         start = read_bytes_so_far()
         assert len(archive.namelist()) == 4

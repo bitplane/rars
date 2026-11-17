@@ -8,7 +8,7 @@ from test_rewrite_legacy_comment_encryption import encrypted_comment_source
 @pytest.mark.parametrize("format", FORMATS)
 @pytest.mark.parametrize("comment", [None, b"", b"archive comment\xff"])
 def test_comment_policies_keep_defaults_and_reset_budgets(format, comment):
-    builder = rars.RarBuilder(format=format, comment=comment)
+    builder = rars.RarBuilder(version=format, comment=comment)
     builder.add_bytes(b"payload", "file")
     archive = rars.RarFile(builder.to_bytes())
     assert archive.comment == comment
@@ -19,11 +19,11 @@ def test_comment_policies_keep_defaults_and_reset_budgets(format, comment):
         assert archive.read_comment(options=options) == comment
     if size:
         for field in ["max_member_output_bytes", "max_total_output_bytes"]:
-            with pytest.raises(MemoryError):
+            with pytest.raises(rars.LimitExceeded):
                 archive.read_comment(options=rars.ReadOptions(**{field: size - 1}))
     token = rars.CancellationToken()
     token.cancel()
-    with pytest.raises(InterruptedError):
+    with pytest.raises(rars.Cancelled):
         archive.read_comment(cancellation=token)
     assert archive.comment == comment
     assert archive.read_comment() == comment
@@ -34,7 +34,7 @@ def test_comment_policies_keep_defaults_and_reset_budgets(format, comment):
 def test_comment_password_override_is_per_call_and_limits_precede_decryption(password):
     archive = rars.RarFile(encrypted_comment_source(), password=password)
     expected = b"secret archive comment"
-    with pytest.raises(MemoryError):
+    with pytest.raises(rars.LimitExceeded):
         archive.read_comment(options=rars.ReadOptions(max_member_output_bytes=0))
     options = rars.ReadOptions(max_total_output_bytes=len(expected))
     assert archive.read_comment(password=b"password", options=options) == expected

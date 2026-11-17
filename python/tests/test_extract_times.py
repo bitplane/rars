@@ -10,7 +10,7 @@ MTIME_NS = 1_700_000_000_123_456_700
 def test_extractall_restores_rar5_times_with_sub_second_precision(tmp_path):
     builder = rars.RarBuilder()
     builder.add_bytes(b"payload", "file.txt")
-    builder.set_times("file.txt", modified_ns=MTIME_NS)
+    builder.set_times("file.txt", mtime_ns=MTIME_NS)
     archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path)
@@ -20,15 +20,15 @@ def test_extractall_restores_rar5_times_with_sub_second_precision(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar13", "rar15", "rar20", "rar29", "rar40", "rar50"])
 def test_extractall_restores_file_and_directory_times(tmp_path, format):
-    builder = rars.RarBuilder(format=format)
+    builder = rars.RarBuilder(version=format)
     builder.add_directory("dir", mtime=1_600_000_000)
     builder.add_bytes(b"payload", "dir/file.txt", mtime=1_650_000_000)
     archive = rars.RarFile(builder.to_bytes())
 
     archive.extractall(tmp_path)
 
-    assert os.stat(tmp_path / "dir").st_mtime_ns == archive.gettimes("dir")["modified"]
-    assert os.stat(tmp_path / "dir/file.txt").st_mtime_ns == archive.gettimes("dir/file.txt")["modified"]
+    assert os.stat(tmp_path / "dir").st_mtime_ns == archive.getinfo("dir").mtime_ns
+    assert os.stat(tmp_path / "dir/file.txt").st_mtime_ns == archive.getinfo("dir/file.txt").mtime_ns
 
 
 def test_restore_times_false_keeps_written_times(tmp_path):
@@ -59,16 +59,16 @@ def test_extract_and_selected_members_restore_times(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar50", "rar29"])
 def test_volume_sets_restore_times(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=4096)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=4096)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     assert len(paths) > 2
 
     with rars.RarFile(paths[0]) as archive:
         archive.extractall(tmp_path / "found")
         archive.extractall(tmp_path / "given", volumes=paths[1:])
-        expected = archive.gettimes("large.bin")["modified"]
+        expected = archive.getinfo("large.bin").mtime_ns
 
     assert os.stat(tmp_path / "found/large.bin").st_mtime_ns == expected
     assert os.stat(tmp_path / "given/large.bin").st_mtime_ns == expected
@@ -76,7 +76,7 @@ def test_volume_sets_restore_times(tmp_path, format):
 
 @pytest.mark.parametrize("members", [None, ["good.txt", "bad.txt"]])
 def test_failed_extraction_restores_completed_outputs_only(tmp_path, members):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"good payload", "good.txt", mtime=1_600_000_000)
     builder.add_bytes(b"spacer", "spacer.txt", mtime=1_600_000_000)
     builder.add_bytes(b"bad payload", "bad.txt", mtime=1_600_000_000)
@@ -92,18 +92,18 @@ def test_failed_extraction_restores_completed_outputs_only(tmp_path, members):
 
 
 def test_cancelled_volume_set_restores_completed_outputs_and_drops_the_rest(tmp_path):
-    builder = rars.RarBuilder(store=True, volume_size=4096)
+    builder = rars.RarBuilder(level=0, volume_size=4096)
     builder.add_bytes(b"small", "small.txt", mtime=1_600_000_000)
     builder.add_bytes(bytes(20_000), "large.bin", mtime=1_600_000_000)
     (tmp_path / "made").mkdir()
-    paths = builder.write_volumes(tmp_path / "made" / "set.part01.rar")
+    paths = builder.write(tmp_path / "made" / "set.part01.rar")
     token = rars.CancellationToken()
 
     def volumes():
         token.cancel()
         yield from paths[1:]
 
-    with rars.RarFile(paths[0]) as archive, pytest.raises(InterruptedError):
+    with rars.RarFile(paths[0]) as archive, pytest.raises(rars.Cancelled):
         archive.extractall(tmp_path / "out", volumes=volumes(), cancellation=token)
 
     assert os.stat(tmp_path / "out/small.txt").st_mtime == 1_600_000_000

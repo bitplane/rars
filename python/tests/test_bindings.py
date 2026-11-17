@@ -23,7 +23,7 @@ def test_rarfile_lists_and_reads_fixture():
 
 
 def test_extractall_rejects_existing_without_overwrite(tmp_path):
-    builder = rars.RarBuilder(store=True)
+    builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "hello.txt")
     archive = rars.RarFile(builder.to_bytes())
 
@@ -35,7 +35,7 @@ def test_extractall_rejects_existing_without_overwrite(tmp_path):
 
 
 def test_builder_creates_archive_and_rewrite_model():
-    builder = rars.RarBuilder(format="rar50", store=True)
+    builder = rars.RarBuilder(version="rar50", level=0)
     builder.add_bytes(b"one", "one.txt")
     builder.add_bytes(b"two", "two.txt")
 
@@ -55,7 +55,7 @@ def test_from_archive_explicit_conversion_contract(encrypted):
     # Explicit conversion retains the old settings, including removing encryption.
     password = "rewrite secret" if encrypted else None
     builder = rars.RarBuilder(
-        format="rar29", store=True, password=password, comment=b"keep this comment"
+        version="rar29", level=0, password=password, comment=b"keep this comment"
     )
     members = [("second.txt", b"second payload"), ("first.txt", b"first payload")]
     for name, data in members:
@@ -78,7 +78,7 @@ def test_from_archive_explicit_conversion_contract(encrypted):
 @pytest.mark.parametrize("format", ["rar14", "rar15", "rar29", "rar50", "rar70"])
 @pytest.mark.parametrize("mode", [None, 0, 0o640, 0o755, 0o6750])
 def test_from_archive_interprets_permissions_using_source_host(format, mode):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
     source = rars.RarFile(builder.to_bytes())
     output = rars.RarFile(rars.RarBuilder.from_archive(source, preserve=False).to_bytes())
@@ -87,9 +87,11 @@ def test_from_archive_interprets_permissions_using_source_host(format, mode):
     # RAR 1.4/1.5 writers deliberately emit DOS metadata even for Unix input.
     if mode is None or format in ("rar14", "rar15"):
         assert info.host_os == 0
+        assert info.file_attr_kind == rars.AttributeKind.DOS
         assert info.file_attr == 0x20
     else:
         assert info.host_os == 1
+        assert info.file_attr_kind == rars.AttributeKind.UNIX
         assert info.file_attr == 0o100000 | mode
     assert output.read("file.txt") == b"permissions payload"
 
@@ -101,7 +103,7 @@ def test_from_archive_permissions_match_reference_extraction(tmp_path, format, m
     control = tmp_path / "control"
     control.write_bytes(b"control")
     expected_mode = control.stat().st_mode & 0o777 if mode is None else mode
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add_bytes(b"permissions payload", "file.txt", mode=mode)
     source = rars.RarFile(builder.to_bytes())
     archive_path = tmp_path / "rewritten.rar"
@@ -122,7 +124,7 @@ def test_from_archive_permissions_match_reference_extraction(tmp_path, format, m
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 @pytest.mark.parametrize("mtime", [None, 0, 1_700_000_002, 0xFFFFFFFF])
 def test_from_archive_retains_rar5_modification_time(format, mtime):
-    source = rars.RarBuilder(format=format, store=True)
+    source = rars.RarBuilder(version=format, level=0)
     source.add_bytes(b"timestamp payload", "file.txt", mtime=mtime, mode=0o640)
     rewritten = rars.RarBuilder.from_archive(rars.RarFile(source.to_bytes()))
     rewritten.rename("file.txt", "renamed.txt")
@@ -153,7 +155,7 @@ def test_from_archive_retains_fixture_htime_with_reference_extractor(tmp_path):
 
 
 def test_builder_reports_compression_progress():
-    builder = rars.RarBuilder(format="rar70", level=3, solid=True)
+    builder = rars.RarBuilder(version="rar70", level=3, solid=True)
     builder.add_bytes(b"progress payload " * 8192, "payload.txt")
     events = []
 
@@ -161,7 +163,7 @@ def test_builder_reports_compression_progress():
 
     assert data
     assert events
-    compression = [event for event in events if event.phase == "compression"]
+    compression = [event for event in events if event.phase == "compressing"]
     assert compression
     assert compression[-1].completed == compression[-1].total
     assert compression[-1].percentage == 100.0
@@ -169,7 +171,7 @@ def test_builder_reports_compression_progress():
 
 
 def test_builder_progress_exception_cancels_and_is_reraised():
-    builder = rars.RarBuilder(format="rar50", level=3)
+    builder = rars.RarBuilder(version="rar50", level=3)
     builder.add_bytes(b"cancel me " * 8192, "payload.txt")
 
     class StopCompression(Exception):
@@ -183,9 +185,9 @@ def test_builder_progress_exception_cancels_and_is_reraised():
 
 
 def test_builder_writes_and_extracts_volumes(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=512)
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=512)
     builder.add_bytes(b"0123456789" * 200, "large.txt")
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
 
     assert len(paths) > 1
     out_dir = tmp_path / "out"
@@ -199,9 +201,9 @@ def test_builder_writes_volumes_from_added_paths(tmp_path):
     source = tmp_path / "large.txt"
     source.write_bytes(b"0123456789" * 200)
 
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=512)
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=512)
     builder.add(source)
-    paths = builder.write_volumes(tmp_path / "archive.part01.rar")
+    paths = builder.write(tmp_path / "archive.part01.rar")
 
     assert len(paths) > 1
     out_dir = tmp_path / "out"
@@ -221,7 +223,7 @@ def test_password_errors_are_typed():
 
 def test_repair_reports_repaired_data(tmp_path):
     payload = bytes((index * 7 + (index >> 5)) & 0xFF for index in range(200_000))
-    builder = rars.RarBuilder(format="rar50", store=True, recovery_percent=10)
+    builder = rars.RarBuilder(version="rar50", level=0, recovery_percent=10)
     builder.add_bytes(payload, "payload.bin")
     archive_path = tmp_path / "recovery.rar"
     builder.write(archive_path)
@@ -250,7 +252,7 @@ def test_repair_reports_repaired_data(tmp_path):
 )
 def test_builder_writes_every_supported_feature_combination(tmp_path, kwargs):
     archive_path = tmp_path / "archive.rar"
-    builder = rars.RarBuilder(format="rar50", **kwargs)
+    builder = rars.RarBuilder(version="rar50", **kwargs)
     builder.add_bytes(b"streamed payload\n" * 500, "a.txt")
     builder.add_bytes(b"second payload\n" * 500, "b.txt")
     builder.write(archive_path)
@@ -260,3 +262,40 @@ def test_builder_writes_every_supported_feature_combination(tmp_path, kwargs):
     archive.testrar()
     assert sorted(info.filename for info in archive.infolist()) == ["a.txt", "b.txt"]
     assert archive.read("a.txt") == b"streamed payload\n" * 500
+
+
+@pytest.mark.parametrize("format", ["rar29", "rar50"])
+def test_file_attr_kind_reads_the_host_number_for_its_family(format):
+    builder = rars.RarBuilder(version=format, level=0)
+    builder.add_bytes(b"x", "unix", mode=0o644)
+    builder.add_bytes(b"x", "dos")
+    infos = {info.filename: info for info in rars.RarFile(builder.to_bytes())}
+    assert infos["unix"].file_attr_kind == rars.AttributeKind.UNIX
+    assert infos["unix"].host_os == (3 if format == "rar29" else 1)
+    assert infos["dos"].file_attr_kind == rars.AttributeKind.DOS
+
+
+def test_writers_refuse_an_existing_file_unless_told_to_overwrite(tmp_path):
+    builder = rars.RarBuilder(level=0)
+    builder.add_bytes(b"payload", "file")
+    path = tmp_path / "archive.rar"
+    path.write_bytes(b"precious")
+    with pytest.raises(FileExistsError, match="overwrite=True"):
+        builder.write(path)
+    assert path.read_bytes() == b"precious"
+    builder.write(path, overwrite=True)
+    assert rars.RarFile(path).read("file") == b"payload"
+    with pytest.raises(FileExistsError):
+        rars.repair(path.read_bytes(), output=path)
+
+    volumes = rars.RarBuilder(level=0, volume_size=4096)
+    volumes.add_bytes(os.urandom(20_000), "big")
+    first = tmp_path / "set.part1.rar"
+    paths = volumes.write(first)
+    paths[-1].write_bytes(b"precious")
+    for part in paths[:-1]:
+        part.unlink()
+    with pytest.raises(FileExistsError, match=paths[-1].name):
+        volumes.write(first)
+    assert [path.name for path in tmp_path.iterdir() if path.name.startswith("set.")] == [paths[-1].name]
+    assert volumes.write(first, overwrite=True) == paths

@@ -3,7 +3,7 @@ from collections.abc import Callable, Iterable, Iterator
 from enum import Enum
 from pathlib import Path
 from types import TracebackType
-from typing import IO, Final, Literal, Protocol, final
+from typing import IO, Literal, Protocol, final
 
 from typing_extensions import Buffer, Self, TypeAlias
 
@@ -17,6 +17,7 @@ __all__ = [
     "ArchiveVersion",
     "ArchiveFamily",
     "VolumeNaming",
+    "AttributeKind",
     "ProgressPhase",
     "WriterResources",
     "RepairReport",
@@ -35,16 +36,9 @@ __all__ = [
     "UnsupportedRarFeature",
     "NotRarFile",
     "UnsafeArchivePath",
+    "LimitExceeded",
     "UnsafeLinkWarning",
-    "RAR13",
-    "RAR14",
-    "RAR15",
-    "RAR20",
-    "RAR29",
-    "RAR30",
-    "RAR40",
-    "RAR50",
-    "RAR70",
+    "Cancelled",
 ]
 
 class _BinaryReader(Protocol):
@@ -82,43 +76,50 @@ class VolumeNaming(str, Enum):
     PART = "part"
     OLD = "old"
 
+class AttributeKind(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    DOS = "dos"
+    UNIX = "unix"
+    UNKNOWN = "unknown"
+
 class ProgressPhase(str, Enum):
     def __new__(cls, value: str) -> Self: ...
     READING = "reading"
     EXTRACTING = "extracting"
     TESTING = "testing"
     STAGING = "staging"
-    COMPRESSION = "compression"
-    RECOVERY = "recovery"
+    COMPRESSING = "compressing"
+    PROTECTING = "protecting"
+    """Adding a recovery record."""
     WRITING = "writing"
 
-RAR13: Final = ArchiveVersion.RAR13
-RAR14: Final = ArchiveVersion.RAR14
-RAR15: Final = ArchiveVersion.RAR15
-RAR20: Final = ArchiveVersion.RAR20
-RAR29: Final = ArchiveVersion.RAR29
-RAR30: Final = ArchiveVersion.RAR30
-RAR40: Final = ArchiveVersion.RAR40
-RAR50: Final = ArchiveVersion.RAR50
-RAR70: Final = ArchiveVersion.RAR70
 
 class Error(Exception): ...
-class BadRarFile(Error): ...
-class BadPassword(BadRarFile): ...
-class PasswordRequired(BadRarFile): ...
 
-class MissingVolume(BadRarFile):
-    volume_number: int | None
+class BadRarFile(Error):
+    """The archive is damaged or malformed."""
+
+class BadPassword(Error): ...
+class PasswordRequired(Error): ...
+
+class MissingVolume(Error):
+    volume_index: int | None
     path: Path | None
 
 class ChecksumError(BadRarFile):
     member: str | None
-    volume_number: int | None
+    volume_index: int | None
 
 class UnsupportedRarFeature(Error): ...
 class NotRarFile(Error): ...
 class UnsafeArchivePath(Error): ...
+
+class LimitExceeded(Error):
+    """A configured limit refused the archive or the write."""
 class UnsafeLinkWarning(UserWarning): ...
+
+class Cancelled(Exception):
+    """A CancellationToken or progress callback stopped the call. Not a rars.Error."""
 
 @final
 class ProgressEvent:
@@ -127,7 +128,8 @@ class ProgressEvent:
     @property
     def completed(self) -> int: ...
     @property
-    def total(self) -> int: ...
+    def total(self) -> int | None:
+        """Bytes this phase will handle, or None while that isn't known yet."""
     @property
     def pass_number(self) -> int: ...
     @property
@@ -137,7 +139,7 @@ class ProgressEvent:
     @property
     def total_entries(self) -> int | None: ...
     @property
-    def volume(self) -> int | None: ...
+    def volume_index(self) -> int | None: ...
     @property
     def percentage(self) -> float | None: ...
 
@@ -155,8 +157,8 @@ class ReadOptions:
         max_member_output_bytes: int | None = None,
         max_total_output_bytes: int | None = None,
         max_reader_workspace_bytes: int | None = None,
-        rar50_dictionary_size_limit: int | None = None,
-        rar50_buffered_decode_limit: int | None = None,
+        max_rar50_dictionary_bytes: int | None = None,
+        max_rar50_buffered_member_bytes: int | None = None,
         max_header_count: int | None = None,
         max_header_bytes: int | None = None,
         legacy_name_encoding: str | None = None,
@@ -170,9 +172,9 @@ class ReadOptions:
     @property
     def max_reader_workspace_bytes(self) -> int | None: ...
     @property
-    def rar50_dictionary_size_limit(self) -> int | None: ...
+    def max_rar50_dictionary_bytes(self) -> int | None: ...
     @property
-    def rar50_buffered_decode_limit(self) -> int | None: ...
+    def max_rar50_buffered_member_bytes(self) -> int | None: ...
     @property
     def max_header_count(self) -> int | None: ...
     @property
@@ -189,10 +191,10 @@ class WriterResources:
     def __new__(
         cls,
         *,
-        max_memory: int | None = None,
+        max_memory_bytes: int | None = None,
     ) -> Self: ...
     @property
-    def max_memory(self) -> int | None: ...
+    def max_memory_bytes(self) -> int | None: ...
 
 @final
 class RarInfo:
@@ -207,11 +209,23 @@ class RarInfo:
     @property
     def compress_size(self) -> int: ...
     @property
-    def date_time(self) -> tuple[int, int, int, int, int, int] | None: ...
+    def date_time(self) -> tuple[int, int, int, int, int, int] | None:
+        """Whole-second local wall-clock fields, as zipfile.ZipInfo.date_time."""
+    @property
+    def mtime(self) -> float | None: ...
+    @property
+    def mtime_ns(self) -> int | None: ...
+    @property
+    def atime_ns(self) -> int | None: ...
+    @property
+    def birthtime_ns(self) -> int | None: ...
     @property
     def CRC(self) -> int | None: ...
     @property
-    def host_os(self) -> int | None: ...
+    def host_os(self) -> int | None:
+        """The stored host number. RAR 5 numbers hosts differently from RAR 1.5 to 4.x; use file_attr_kind."""
+    @property
+    def file_attr_kind(self) -> AttributeKind: ...
     @property
     def is_encrypted(self) -> bool: ...
     @property
@@ -225,15 +239,16 @@ class RarInfo:
     @property
     def file_attr(self) -> int: ...
     @property
-    def volume(self) -> int: ...
+    def volume_index(self) -> int: ...
     def is_dir(self) -> bool: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
 
 @final
 class RarFile:
     def __new__(
         cls,
         source: _Source,
-        mode: Literal["r"] = "r",
         *,
         password: _Password | None = None,
         options: ReadOptions | None = None,
@@ -243,10 +258,10 @@ class RarFile:
     ) -> Self: ...
     def namelist(self) -> list[str]: ...
     def infolist(self) -> list[RarInfo]: ...
-    def getinfo(self, name: _Member) -> RarInfo: ...
+    def getinfo(self, member: _Member) -> RarInfo: ...
     def read(
         self,
-        name: _Member,
+        member: _Member,
         *,
         password: _Password | None = None,
         options: ReadOptions | None = None,
@@ -256,7 +271,7 @@ class RarFile:
     ) -> bytes: ...
     def open(
         self,
-        name: _Member,
+        member: _Member,
         *,
         password: _Password | None = None,
         options: ReadOptions | None = None,
@@ -324,7 +339,7 @@ class RarFile:
     ) -> bytes | None: ...
     @property
     def needs_password(self) -> bool: ...
-    def getcomment(
+    def member_comment(
         self,
         member: _Member,
         *,
@@ -340,14 +355,6 @@ class RarFile:
         options: ReadOptions | None = None,
         cancellation: CancellationToken | None = None,
     ) -> bytes: ...
-    def gettimes(
-        self,
-        member: _Member,
-        *,
-        options: ReadOptions | None = None,
-        cancellation: CancellationToken | None = None,
-    ) -> dict[Literal["modified", "created", "accessed"], int]: ...
-    def rewrite_preservation_issues(self) -> list[str]: ...
     def volume_paths(self) -> list[Path]: ...
     @property
     def sfx_offset(self) -> int: ...
@@ -356,11 +363,16 @@ class RarFile:
     @property
     def is_volume(self) -> bool: ...
     @property
-    def volume_number(self) -> int | None: ...
+    def volume_index(self) -> int | None: ...
     @property
     def is_first_volume(self) -> bool | None: ...
     @property
     def volume_naming(self) -> VolumeNaming: ...
+    def close(self) -> None: ...
+    @property
+    def closed(self) -> bool: ...
+    @property
+    def first_volume_only(self) -> bool: ...
     def __enter__(self) -> Self: ...
     def __exit__(
         self,
@@ -369,15 +381,16 @@ class RarFile:
         tb: TracebackType | None,
     ) -> Literal[False]: ...
     def __iter__(self) -> Iterator[RarInfo]: ...
+    def __len__(self) -> int: ...
+    def __contains__(self, member: object, /) -> bool: ...
 
 @final
 class RarBuilder:
     def __new__(
         cls,
-        format: ArchiveVersion | str = "rar50",
+        version: ArchiveVersion | str = "rar50",
         *,
         level: int = 3,
-        store: bool = False,
         solid: bool = False,
         password: _Password | None = None,
         encrypt_headers: bool = False,
@@ -403,7 +416,7 @@ class RarBuilder:
         self,
         arcname: _NewName,
         *,
-        mtime: int | None = None,
+        mtime: float | None = None,
         mode: int | None = None,
     ) -> None: ...
     def add_bytes(
@@ -411,30 +424,30 @@ class RarBuilder:
         data: Buffer,
         arcname: _NewName,
         *,
-        mtime: int | None = None,
+        mtime: float | None = None,
         mode: int | None = None,
     ) -> None: ...
     def member_ids(self) -> list[int]: ...
     def remove(self, member: int | _Member) -> None: ...
-    def rename(self, old: int | _Member, new: _NewName) -> None: ...
+    def rename(self, member: int | _Member, new: _NewName) -> None: ...
     def add_unix_symlink(
         self,
         arcname: _NewName,
         target: _NewName,
         *,
         target_is_directory: bool = False,
-        mtime: int | None = None,
+        mtime: float | None = None,
         mode: int | None = None,
     ) -> None: ...
     def set_times(
         self,
         member: int | _Member,
         *,
-        modified_ns: int | None = None,
-        created_ns: int | None = None,
-        accessed_ns: int | None = None,
+        mtime_ns: int | None = None,
+        atime_ns: int | None = None,
+        birthtime_ns: int | None = None,
     ) -> None: ...
-    def set_file_comment(
+    def set_member_comment(
         self,
         member: int | _Member,
         comment: str | bytes | None = None,
@@ -449,13 +462,7 @@ class RarBuilder:
         self,
         path: _StrPath,
         *,
-        progress: _Progress | None = None,
-        cancellation: CancellationToken | None = None,
-    ) -> None: ...
-    def write_volumes(
-        self,
-        first_path: _StrPath,
-        *,
+        overwrite: bool = False,
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
     ) -> list[Path]: ...
@@ -507,6 +514,7 @@ def repair(
     *,
     password: _Password | None = None,
     output: _StrPath | None = None,
+    overwrite: bool = False,
     options: ReadOptions | None = None,
     cancellation: CancellationToken | None = None,
 ) -> RepairResult: ...

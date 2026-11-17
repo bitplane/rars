@@ -8,6 +8,10 @@ from test_rewrite_legacy import ROOT, DOS_TIME
 from test_rewrite_older import check_unrar
 
 
+def times(info):
+    return info.mtime_ns, info.birthtime_ns, info.atime_ns
+
+
 @pytest.mark.parametrize("fixture", ["README.RAR", "README_password=password.rar", "STOREPWD.RAR",
     "WITHDIR.RAR", "SOLID.RAR", "FCOMM.RAR", "COMMENT.RAR", "MULTIFIL.RAR"])
 def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
@@ -17,14 +21,14 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
     data = editor.to_bytes()
     output = rars.RarFile(data, password="password")
     assert output.family == source.family == "rar13"
-    assert output.rewrite_preservation_issues() == []
+    rars.RarBuilder.from_archive(output)
     assert output.comment == source.comment
     for before, after in zip(source.namelist(), output.namelist(), strict=True):
         assert output.getinfo(after).is_dir() == source.getinfo(before).is_dir()
         assert output.getinfo(after).file_attr == source.getinfo(before).file_attr
         assert output.getinfo(after).is_encrypted == source.getinfo(before).is_encrypted
-        assert output.gettimes(after) == source.gettimes(before)
-        assert output.getcomment(after) == source.getcomment(before)
+        assert times(output.getinfo(after)) == times(source.getinfo(before))
+        assert output.member_comment(after) == source.member_comment(before)
         if not source.getinfo(before).is_dir():
             assert output.read(after) == source.read(before)
     check_unrar(tmp_path, data)
@@ -32,7 +36,7 @@ def test_vintage_rar13_metadata_payloads_and_comments(tmp_path, fixture):
 
 @pytest.mark.parametrize("solid", [False, True])
 def test_rar13_directories_between_solid_members_and_after_removal(tmp_path, solid):
-    builder = rars.RarBuilder(format="rar13", solid=solid, password="password")
+    builder = rars.RarBuilder(version="rar13", solid=solid, password="password")
     builder.add_bytes(b"data " * 500, b"raw-\xff", mtime=DOS_TIME)
     builder.add_directory("empty", mtime=DOS_TIME)
     builder.add_bytes(b"data " * 500 + b"end", "last", mtime=DOS_TIME)
@@ -48,7 +52,7 @@ def test_rar13_directories_between_solid_members_and_after_removal(tmp_path, sol
 
 @pytest.mark.parametrize("damage", ["main_flags", "file_flags", "extra", "version"])
 def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
-    builder = rars.RarBuilder(format="rar13", store=True)
+    builder = rars.RarBuilder(version="rar13", level=0)
     builder.add_bytes(b"data", "file")
     data = bytearray(builder.to_bytes())
     offset = struct.unpack_from("<H", data, 4)[0]
@@ -71,9 +75,9 @@ def test_rar13_unknown_metadata_preserves_destination(tmp_path, damage):
 
 
 def test_rar13_mixed_encryption_keeps_plain_members_plain(tmp_path):
-    plain = rars.RarBuilder(format="rar13", store=True)
+    plain = rars.RarBuilder(version="rar13", level=0)
     plain.add_bytes(b"public", "plain")
-    encrypted = rars.RarBuilder(format="rar13", password="password")
+    encrypted = rars.RarBuilder(version="rar13", password="password")
     encrypted.add_bytes(b"private", "secret")
     data = encrypted.to_bytes()
     source = rars.RarFile(plain.to_bytes() + data[struct.unpack_from("<H", data, 4)[0]:], password="password")

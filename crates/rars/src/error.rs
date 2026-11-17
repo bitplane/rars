@@ -213,7 +213,7 @@ pub enum Error {
     Io(IoError),
     NeedPassword,
     WrongPasswordOrCorruptData,
-    /// Archive writing was cancelled by a token or progress callback.
+    /// The operation was cancelled by a token or progress callback.
     Cancelled,
     CrcMismatch {
         expected: u16,
@@ -342,7 +342,7 @@ impl std::fmt::Display for Error {
             Self::WrongPasswordOrCorruptData => {
                 write!(f, "wrong password or corrupt encrypted data")
             }
-            Self::Cancelled => f.write_str("archive writing was cancelled"),
+            Self::Cancelled => f.write_str("operation cancelled"),
             Self::CrcMismatch { expected, actual } => {
                 write!(
                     f,
@@ -415,6 +415,28 @@ impl Error {
             error = source;
         }
         error
+    }
+
+    /// Names the volume a member failed in, counting the first as 0, unless
+    /// the error names a volume already or no member.
+    pub(crate) fn in_member_volume(self, index: usize) -> Self {
+        let mut error = &self;
+        loop {
+            match error {
+                Self::InVolume { .. } => return self,
+                Self::AtArchiveOffset { source, .. } | Self::AtEntry { source, .. } => {
+                    error = source
+                }
+                _ => break,
+            }
+        }
+        if self.entry_context().is_none() {
+            return self;
+        }
+        Self::InVolume {
+            number: index + 1,
+            source: Box::new(self),
+        }
     }
 
     /// The outermost member context, if this error identifies a member.

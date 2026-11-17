@@ -1,7 +1,4 @@
-use pyo3::exceptions::{
-    PyInterruptedError, PyKeyError, PyMemoryError, PyNotImplementedError, PyOSError, PyTypeError,
-    PyValueError,
-};
+use pyo3::exceptions::{PyIsADirectoryError, PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
@@ -27,15 +24,19 @@ use std::sync::{Arc, Mutex, OnceLock};
 mod scratch;
 
 create_exception!(rars, Error, pyo3::exceptions::PyException);
+// `BadRarFile` is damage; a password or a volume still to come is not.
 create_exception!(rars, BadRarFile, Error);
-create_exception!(rars, BadPassword, BadRarFile);
-create_exception!(rars, PasswordRequired, BadRarFile);
-create_exception!(rars, MissingVolume, BadRarFile);
+create_exception!(rars, BadPassword, Error);
+create_exception!(rars, PasswordRequired, Error);
+create_exception!(rars, MissingVolume, Error);
 create_exception!(rars, ChecksumError, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
+create_exception!(rars, LimitExceeded, Error);
 create_exception!(rars, UnsafeLinkWarning, pyo3::exceptions::PyUserWarning);
+// Outside `Error`, so a loop that skips bad archives doesn't swallow a cancel.
+create_exception!(rars, Cancelled, pyo3::exceptions::PyException);
 
 /// `str` subclasses, so each member still compares, hashes and formats as its
 /// value did when these were plain strings. Python 3.10 has no `StrEnum`.
@@ -67,17 +68,23 @@ class VolumeNaming(str, enum.Enum):
     OLD = 'old'
 
 
+class AttributeKind(str, enum.Enum):
+    DOS = 'dos'
+    UNIX = 'unix'
+    UNKNOWN = 'unknown'
+
+
 class ProgressPhase(str, enum.Enum):
     READING = 'reading'
     EXTRACTING = 'extracting'
     TESTING = 'testing'
     STAGING = 'staging'
-    COMPRESSION = 'compression'
-    RECOVERY = 'recovery'
+    COMPRESSING = 'compressing'
+    PROTECTING = 'protecting'
     WRITING = 'writing'
 
 
-ENUMS = (ArchiveVersion, ArchiveFamily, VolumeNaming, ProgressPhase)
+ENUMS = (ArchiveVersion, ArchiveFamily, VolumeNaming, AttributeKind, ProgressPhase)
 for cls in ENUMS:
     cls.__str__ = str.__str__
     cls.__format__ = str.__format__
@@ -87,6 +94,7 @@ for cls in ENUMS:
 static ARCHIVE_FAMILY: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static VOLUME_NAMING: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static PROGRESS_PHASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static ATTRIBUTE_KIND: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 fn enum_member<'py>(
     py: Python<'py>,
@@ -103,7 +111,6 @@ struct ProgressEvent {
     phase: String,
     #[pyo3(get)]
     completed: u64,
-    #[pyo3(get)]
     total: u64,
     #[pyo3(get)]
     pass_number: usize,
@@ -113,11 +120,11 @@ struct ProgressEvent {
     entry_index: Option<usize>,
     #[pyo3(get)]
     total_entries: Option<usize>,
-    /// The volume being read, counting the first as 1; None outside a volume set.
+    /// The volume being read, counting the first as 0; None outside a volume set.
     #[pyo3(get)]
-    volume: Option<usize>,
+    volume_index: Option<usize>,
     finished: bool,
-    /// A set whose last volume hasn't been read yet has no total; `total` is 0 until it does.
+    /// A set whose last volume hasn't been read yet has no total until it is.
     total_known: bool,
 }
 
@@ -167,15 +174,19 @@ impl ProgressEvent {
         enum_member(py, &PROGRESS_PHASE, "ProgressPhase", &self.phase)
     }
 
+    /// Bytes the phase will handle, or None while that isn't known yet.
+    #[getter]
+    fn total(&self) -> Option<u64> {
+        let unknown =
+            !self.total_known || (self.phase == "writing" && self.total == 0 && !self.finished);
+        (!unknown).then_some(self.total)
+    }
+
     #[getter]
     fn percentage(&self) -> Option<f64> {
-        if !self.total_known || (self.phase == "writing" && self.total == 0 && !self.finished) {
-            return None;
-        }
-        if self.total == 0 {
-            Some(100.0)
-        } else {
-            Some(self.completed as f64 * 100.0 / self.total as f64)
+        match self.total()? {
+            0 => Some(100.0),
+            total => Some(self.completed as f64 * 100.0 / total as f64),
         }
     }
 }
@@ -209,31 +220,31 @@ impl CancellationToken {
 #[derive(Debug, Clone, Default)]
 struct WriterResources {
     /// Hard ceiling on the RAR 5 writer's managed allocations; exceeding it
-    /// raises `MemoryError`. Legacy formats refuse it.
+    /// raises `LimitExceeded`. `RarBuilder` refuses it for older versions.
     #[pyo3(get)]
-    max_memory: Option<u64>,
+    max_memory_bytes: Option<u64>,
 }
 
 #[pymethods]
 impl WriterResources {
     #[new]
-    #[pyo3(signature = (*, max_memory = None))]
-    fn new(max_memory: Option<u64>) -> Self {
-        Self { max_memory }
+    #[pyo3(signature = (*, max_memory_bytes = None))]
+    fn new(max_memory_bytes: Option<u64>) -> Self {
+        Self { max_memory_bytes }
     }
 }
 
 impl WriterResources {
     fn core(&self) -> rars_rs::WriterResources {
         let resources = rars_rs::WriterResources::default();
-        match self.max_memory {
+        match self.max_memory_bytes {
             Some(limit) => resources.with_max_memory_bytes(limit),
             None => resources,
         }
     }
 }
 
-/// Per-call parsing, decoding and extraction policies.
+/// Parsing, decoding and extraction policies, given to `RarFile` as defaults or to one call.
 #[pyclass(frozen, module = "rars")]
 #[derive(Debug, Clone, Default)]
 struct ReadOptions {
@@ -252,9 +263,10 @@ struct ReadOptions {
     #[pyo3(get)]
     max_header_bytes: Option<u64>,
     #[pyo3(get)]
-    rar50_dictionary_size_limit: Option<u64>,
+    max_rar50_dictionary_bytes: Option<u64>,
+    /// The largest RAR 5 member decoded whole in memory; larger ones stream.
     #[pyo3(get)]
-    rar50_buffered_decode_limit: Option<u64>,
+    max_rar50_buffered_member_bytes: Option<u64>,
     #[pyo3(get)]
     allow_rar3_vm_programs: bool,
     /// Caps members decoded side by side and a large RAR 5 member's block decoders; 0 or 1 keeps the call on the calling thread.
@@ -269,13 +281,13 @@ struct ReadOptions {
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
+    #[pyo3(signature = (*, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, max_rar50_dictionary_bytes=None, max_rar50_buffered_member_bytes=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
     fn new(
         max_member_output_bytes: Option<u64>,
         max_total_output_bytes: Option<u64>,
         max_reader_workspace_bytes: Option<u64>,
-        rar50_dictionary_size_limit: Option<u64>,
-        rar50_buffered_decode_limit: Option<u64>,
+        max_rar50_dictionary_bytes: Option<u64>,
+        max_rar50_buffered_member_bytes: Option<u64>,
         max_header_count: Option<u64>,
         max_header_bytes: Option<u64>,
         legacy_name_encoding: Option<String>,
@@ -294,8 +306,8 @@ impl ReadOptions {
             max_member_output_bytes,
             max_total_output_bytes,
             max_reader_workspace_bytes,
-            rar50_dictionary_size_limit,
-            rar50_buffered_decode_limit,
+            max_rar50_dictionary_bytes,
+            max_rar50_buffered_member_bytes,
             max_header_count,
             max_header_bytes,
             allow_rar3_vm_programs,
@@ -353,8 +365,8 @@ fn python_read_options<'a>(
         options.max_member_output_bytes = settings.max_member_output_bytes;
         options.max_total_output_bytes = settings.max_total_output_bytes;
         options.max_reader_workspace_bytes = settings.max_reader_workspace_bytes;
-        options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
-        options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
+        options.rar50_dictionary_size_limit = settings.max_rar50_dictionary_bytes;
+        options.rar50_buffered_decode_limit = settings.max_rar50_buffered_member_bytes;
         options.allow_rar3_vm_programs = settings.allow_rar3_vm_programs;
         options.threads = settings.threads;
     }
@@ -419,7 +431,7 @@ impl rars_rs::WriteProgress for PythonProgress {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
-                volume: None,
+                volume_index: None,
                 finished: false,
                 total_known: true,
             });
@@ -571,7 +583,7 @@ impl ReadProgress {
             state.next_index = index + 1;
             state.see(&member.meta, chosen(index));
         }
-        state.volume = first.is_volume().then_some(1);
+        state.volume = first.is_volume().then_some(0);
         state.total_known = state.listed || alone || volume_end(first) == VolumeEnd::Last;
         self.report(state, false);
     }
@@ -681,7 +693,7 @@ impl ReadProgress {
             entry_name: state.entry_name.clone(),
             entry_index: state.started.checked_sub(1),
             total_entries: state.total_known.then_some(state.seen_entries),
-            volume: state.volume,
+            volume_index: state.volume,
             finished,
             total_known: state.total_known,
         };
@@ -767,8 +779,8 @@ impl Drop for CountedWriter {
 fn progress_phase(operation: rars_rs::WriteOperation) -> &'static str {
     match operation {
         rars_rs::WriteOperation::Staging => "staging",
-        rars_rs::WriteOperation::Compression => "compression",
-        rars_rs::WriteOperation::Recovery => "recovery",
+        rars_rs::WriteOperation::Compression => "compressing",
+        rars_rs::WriteOperation::Recovery => "protecting",
         _ => "writing",
     }
 }
@@ -786,14 +798,20 @@ struct RarInfo {
     file_size: u64,
     #[pyo3(get)]
     compress_size: u64,
+    stored_time: Option<rars_rs::StoredTimestamp>,
+    /// Unix nanoseconds, the names `os.stat_result` uses; a creation time is `birthtime_ns`.
     #[pyo3(get)]
-    /// Whole-second calendar tuple: UTC for RAR5, stored wall-clock fields for
-    /// legacy DOS timestamps. None means no usable timestamp was recorded.
-    date_time: Option<(u16, u8, u8, u8, u8, u8)>,
+    mtime_ns: Option<i128>,
+    #[pyo3(get)]
+    atime_ns: Option<i128>,
+    #[pyo3(get)]
+    birthtime_ns: Option<i128>,
     /// Python reads it as `CRC`, the name `zipfile` and `rarfile` use.
     crc: Option<u32>,
+    /// The stored host number, which RAR 5 numbers differently from RAR 1.5 to 4.x.
     #[pyo3(get)]
     host_os: Option<u64>,
+    attr_source: rars_rs::AttrSource,
     #[pyo3(get)]
     is_encrypted: bool,
     #[pyo3(get)]
@@ -807,8 +825,7 @@ struct RarInfo {
     file_attr: u64,
     is_directory: bool,
     is_redirection: bool,
-    /// Counted from 0.
-    #[pyo3(get)]
+    /// The volume the member starts in, counting the first as 0; Python counts from 1.
     volume: usize,
 }
 
@@ -824,13 +841,76 @@ impl RarInfo {
         self.crc
     }
 
+    /// Unix seconds, as `os.stat_result.st_mtime`.
+    #[getter]
+    fn mtime(&self) -> Option<f64> {
+        self.mtime_ns.map(|nanoseconds| nanoseconds as f64 / 1e9)
+    }
+
+    /// Whole-second local wall-clock fields, as `zipfile.ZipInfo.date_time`. RAR 1.3 to
+    /// 4.x store them so; a RAR 5 time is converted. None when no time was recorded.
+    #[getter]
+    fn date_time<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyTuple>>> {
+        let fields = match self.stored_time {
+            None => return Ok(None),
+            Some(rars_rs::StoredTimestamp::UnixSeconds(seconds)) => {
+                let local = py.import("time")?.call_method1("localtime", (seconds,))?;
+                return Ok(Some(PyTuple::new(
+                    py,
+                    (0..6)
+                        .map(|index| local.get_item(index))
+                        .collect::<PyResult<Vec<_>>>()?,
+                )?));
+            }
+            Some(stored) => stored.calendar_fields(),
+        };
+        fields.map(|fields| fields.into_pyobject(py)).transpose()
+    }
+
     #[getter]
     fn family<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         family_member(py, self.family)
     }
 
+    /// What `file_attr` holds: DOS attribute bits, a Unix mode, or nothing meaningful.
+    #[getter]
+    fn file_attr_kind<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let value = match self.attr_source {
+            rars_rs::AttrSource::Dos => "dos",
+            rars_rs::AttrSource::Unix => "unix",
+            _ => "unknown",
+        };
+        enum_member(py, &ATTRIBUTE_KIND, "AttributeKind", value)
+    }
+
     fn is_dir(&self) -> bool {
         self.is_directory
+    }
+
+    /// The volume the member starts in, counting the first as 0, so it indexes `volume_paths()`.
+    #[getter]
+    fn volume_index(&self) -> usize {
+        self.volume
+    }
+
+    /// The same member of the same opened archive, however many times it was looked up.
+    fn __eq__(&self, other: &Self) -> bool {
+        self.member_index == other.member_index
+            && match (&self.archive_identity, &other.archive_identity) {
+                (Some(this), Some(that)) => Arc::ptr_eq(this, that),
+                _ => false,
+            }
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.archive_identity
+            .as_ref()
+            .map(Arc::as_ptr)
+            .hash(&mut hasher);
+        self.member_index.hash(&mut hasher);
+        hasher.finish()
     }
 
     fn __repr__(&self) -> String {
@@ -859,6 +939,7 @@ struct RarFile {
     first: SetListing,
     /// The whole set, listed the first time a call needs a member past the first volume.
     whole: OnceLock<SetListing>,
+    closed: AtomicBool,
 }
 
 struct SetListing {
@@ -935,13 +1016,15 @@ impl RarFile {
     /// A path or seekable file object is read on demand from its start, so it must stay
     /// open and unchanged while the archive is, and its position is left wherever reading
     /// ended; a stream that can't seek is read whole from where it is.
+    ///
+    /// `options` cover opening and are the defaults for every later call; a call's own
+    /// `options` replace them whole. `cancellation` covers opening alone.
     #[new]
-    #[pyo3(signature = (source, mode = "r", *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
+    #[pyo3(signature = (source, *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn new(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
-        mode: &str,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
@@ -950,11 +1033,6 @@ impl RarFile {
     ) -> PyResult<Self> {
         let call_options = ReadOptions::for_call(options, None, cancellation)?;
         let options = call_options.as_ref();
-        if mode != "r" {
-            return Err(PyNotImplementedError::new_err(
-                "RarFile currently opens archives for reading; use RarBuilder to create or rewrite archives",
-            ));
-        }
         let password = py_password(password)?;
         let volumes = stored_volumes(
             volumes,
@@ -972,6 +1050,7 @@ impl RarFile {
     }
 
     fn namelist(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.check_open()?;
         Ok(self
             .listing(py)?
             .infos
@@ -981,59 +1060,56 @@ impl RarFile {
     }
 
     fn infolist(&self, py: Python<'_>) -> PyResult<Vec<RarInfo>> {
+        self.check_open()?;
         Ok(self.listing(py)?.infos.clone())
     }
 
-    fn getinfo(&self, py: Python<'_>, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
-        let index = self.resolve_index(py, name)?;
-        // A first-volume member never waits for later volumes; its split sizes are whole once the set is listed.
-        let listing = match self.whole.get() {
-            Some(whole) => whole,
-            None if index < self.first.infos.len() => &self.first,
-            None => self.listing(py)?,
-        };
-        Ok(listing.infos[index].clone())
+    fn getinfo(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
+        self.check_open()?;
+        let index = self.resolve_index(py, member)?;
+        Ok(self.info_at(py, index)?.clone())
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
-    #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read(
         &self,
         py: Python<'_>,
-        name: &Bound<'_, PyAny>,
+        member: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
-        let index = self.resolve_index(py, name)?;
+        let index = self.resolve_index(py, member)?;
         let data = self.read_indices(py, &[index], password, options, volumes)?;
-        data.into_iter()
-            .next()
-            .flatten()
-            .ok_or_else(|| PyKeyError::new_err("member has no file payload"))
+        match data.into_iter().next().flatten() {
+            Some(data) => Ok(data),
+            None => Err(no_payload(self.info_at(py, index)?)),
+        }
     }
 
-    #[pyo3(signature = (name, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn open(
         &self,
         py: Python<'_>,
-        name: &Bound<'_, PyAny>,
+        member: &Bound<'_, PyAny>,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
-        let data = self.read(py, name, password, options, None, None, volumes)?;
+        let data = self.read(py, member, password, options, None, None, volumes)?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -1053,7 +1129,8 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let indices = members
@@ -1062,7 +1139,11 @@ impl RarFile {
             .collect::<PyResult<Vec<_>>>()?;
         self.read_indices(py, &indices, password, options, volumes)?
             .into_iter()
-            .map(|bytes| bytes.ok_or_else(|| PyKeyError::new_err("member has no file payload")))
+            .zip(&indices)
+            .map(|(bytes, &index)| match bytes {
+                Some(bytes) => Ok(bytes),
+                None => Err(no_payload(self.info_at(py, index)?)),
+            })
             .collect()
     }
 
@@ -1084,7 +1165,8 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
     ) -> PyResult<PathBuf> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let Overwrite(overwrite) = overwrite;
@@ -1175,7 +1257,8 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
     ) -> PyResult<Vec<PathBuf>> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let mode = OutputMode {
@@ -1246,7 +1329,8 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
-        let call_options = ReadOptions::for_call(options, progress, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "testing");
@@ -1299,7 +1383,8 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         py.detach(|| {
@@ -1314,9 +1399,9 @@ impl RarFile {
         self.first.infos.iter().any(|info| info.is_encrypted)
     }
 
-    /// Returns the decoded comment attached to a member, or None if absent.
+    /// Returns the comment attached to a member, or None if absent.
     #[pyo3(signature = (member, *, password = None, options = None, cancellation = None))]
-    fn getcomment(
+    fn member_comment(
         &self,
         py: Python<'_>,
         member: &Bound<'_, PyAny>,
@@ -1324,7 +1409,8 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1346,7 +1432,8 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<u8>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        self.check_open()?;
+        let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1363,50 +1450,23 @@ impl RarFile {
                 .map_err(map_error)?
                 .expect("legacy symlink predicate checked above"));
         }
+        if !member.meta.is_redirection {
+            return Err(PyValueError::new_err(format!(
+                "{} is not a link",
+                String::from_utf8_lossy(&member.meta.name)
+            )));
+        }
         member
             .supported_redirection()
             .map(|link| link.target_name.clone())
-            .ok_or_else(|| UnsupportedRarFeature::new_err("member is not a supported redirection"))
-    }
-
-    /// Exact Unix nanoseconds, absent kinds omitted; no `password` since headers were decrypted at open.
-    #[pyo3(signature = (member, *, options = None, cancellation = None))]
-    fn gettimes(
-        &self,
-        py: Python<'_>,
-        member: &Bound<'_, PyAny>,
-        options: Option<&ReadOptions>,
-        cancellation: Option<&CancellationToken>,
-    ) -> PyResult<HashMap<String, i128>> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
-        let options = call_options.as_ref();
-        check_read_options_cancellation(options)?;
-        let index = self.resolve_index(py, member)?;
-        let options = self.extraction_options(options, self.password.as_deref());
-        let (archive, index) = self.member_volume(py, index, options)?;
-        let member = archive
-            .members()
-            .nth(index)
-            .ok_or_else(|| PyKeyError::new_err("member not found"))?;
-        let times = member.times().map_err(map_error)?;
-        Ok([
-            ("modified", times.modified),
-            ("created", times.created),
-            ("accessed", times.accessed),
-        ]
-        .into_iter()
-        .filter_map(|(name, time)| time.map(|time| (name.to_string(), time.unix_nanoseconds())))
-        .collect())
-    }
-
-    /// Metadata/settings the current rewrite implementation cannot preserve.
-    /// This is a conservative metadata check, not a payload integrity test.
-    fn rewrite_preservation_issues(&self) -> Vec<String> {
-        self.archive.rewrite_preservation_issues()
+            .ok_or_else(|| {
+                UnsupportedRarFeature::new_err("member is a kind of link rars cannot read")
+            })
     }
 
     /// Stops at the first volume missing or unreadable rather than raising, so clean-up gets what is there.
     fn volume_paths(&self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
+        self.check_open()?;
         let Some(first_path) = &self.path else {
             return Err(PyValueError::new_err(
                 "an archive opened from bytes or a file object has no volume paths",
@@ -1462,9 +1522,10 @@ impl RarFile {
         self.archive.is_volume()
     }
 
+    /// This volume's place in its set, counting the first as 0; None when the headers don't record it.
     #[getter]
-    fn volume_number(&self) -> Option<u64> {
-        self.archive.volume_number()
+    fn volume_index(&self) -> Option<u64> {
+        self.archive.volume_number().map(|number| number - 1)
     }
 
     #[getter]
@@ -1491,16 +1552,85 @@ impl RarFile {
         _exc: Option<&Bound<'_, PyAny>>,
         _tb: Option<&Bound<'_, PyAny>>,
     ) -> bool {
+        self.close();
         false
     }
 
+    /// Later reads raise `ValueError`, as a closed file's do. Closing again does nothing.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+
+    /// Whether the archive was opened with `first_volume_only=True`.
+    #[getter]
+    fn first_volume_only(&self) -> bool {
+        self.first_volume_only
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let list = PyList::new(py, self.listing(py)?.infos.clone())?;
         Ok(list.call_method0("__iter__")?.unbind())
+    }
+
+    fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        self.check_open()?;
+        Ok(self.listing(py)?.infos.len())
+    }
+
+    /// Takes what `getinfo` takes; a `RarInfo` from another archive is not in this one.
+    fn __contains__(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.check_open()?;
+        if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
+            return Ok(info
+                .archive_identity
+                .as_ref()
+                .is_some_and(|identity| Arc::ptr_eq(identity, &self.identity)));
+        }
+        match self.resolve_index(py, member) {
+            Ok(_) => Ok(true),
+            Err(error) if error.is_instance_of::<PyKeyError>(py) => Ok(false),
+            // Two members decode to this name.
+            Err(error) if error.is_instance_of::<PyValueError>(py) => Ok(true),
+            Err(error) => Err(error),
+        }
     }
 }
 
 impl RarFile {
+    fn check_open(&self) -> PyResult<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(PyValueError::new_err("I/O operation on closed archive"));
+        }
+        Ok(())
+    }
+
+    /// A first-volume member never waits for later volumes; its split sizes are whole once the set is listed.
+    fn info_at(&self, py: Python<'_>, index: usize) -> PyResult<&RarInfo> {
+        let listing = match self.whole.get() {
+            Some(whole) => whole,
+            None if index < self.first.infos.len() => &self.first,
+            None => self.listing(py)?,
+        };
+        Ok(&listing.infos[index])
+    }
+
+    /// A call's own `options` replace the ones the archive was opened with, whole.
+    fn call_options(
+        &self,
+        options: Option<&ReadOptions>,
+        progress: Option<&Bound<'_, PyAny>>,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Option<ReadOptions>> {
+        let defaults = self.options.as_ref().map(ReadOptions::policies);
+        ReadOptions::for_call(options.or(defaults.as_ref()), progress, cancellation)
+    }
+
     fn with_set(mut self, first_volume_only: bool, volumes: Option<Py<PyTuple>>) -> Self {
         self.first_volume_only = first_volume_only;
         self.volumes = volumes;
@@ -2037,6 +2167,7 @@ impl RarFile {
             first_volume_only: false,
             first: SetListing::new(infos),
             whole: OnceLock::new(),
+            closed: AtomicBool::new(false),
         })
     }
 }
@@ -2200,14 +2331,13 @@ fn map_builder_error(error: rars_rs::Error) -> PyErr {
 
 #[pymethods]
 impl RarBuilder {
-    /// Everything after `format` is keyword-only, so later releases can add
-    /// and regroup settings without breaking callers.
+    /// Everything after `version` is keyword-only, so later releases can add
+    /// and regroup settings without breaking callers. `level=0` stores members uncompressed.
     #[new]
     #[pyo3(signature = (
-        format = "rar50",
+        version = "rar50",
         *,
         level = 3,
-        store = false,
         solid = false,
         password = None,
         encrypt_headers = false,
@@ -2218,9 +2348,8 @@ impl RarBuilder {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        format: &str,
-        level: u8,
-        store: bool,
+        version: &str,
+        level: i64,
         solid: bool,
         password: Option<&Bound<'_, PyAny>>,
         encrypt_headers: bool,
@@ -2229,15 +2358,71 @@ impl RarBuilder {
         volume_size: Option<usize>,
         resources: Option<&WriterResources>,
     ) -> PyResult<Self> {
-        let format = parse_version(format)?;
+        let format = parse_version(version)?;
+        let password = py_password(password)?;
+        let comment = py_optional_bytes(comment)?;
+        let level = u8::try_from(level)
+            .ok()
+            .filter(|&level| level <= 5)
+            .ok_or_else(|| PyValueError::new_err("level must be from 0 to 5"))?;
+        // What the version alone decides is refused here, before any member is added.
+        let shape = rars_rs::write_plan::PlanShape::new()
+            .compressed(level > 0)
+            .volumes(volume_size.is_some());
+        let refuse_unless = |option: rars_rs::write_plan::WriterOption| {
+            if rars_rs::write_plan::supports(format, option, shape) {
+                return Ok(());
+            }
+            let set = if shape.volumes {
+                " in a volume set"
+            } else {
+                ""
+            };
+            Err(PyValueError::new_err(format!(
+                "{} cannot write {}{set}",
+                format.as_str(),
+                option.name()
+            )))
+        };
+        if let Some(percent) = recovery_percent {
+            refuse_unless(rars_rs::write_plan::WriterOption::RecoveryRecord)?;
+            if !(1..=100).contains(&percent) {
+                return Err(PyValueError::new_err(
+                    "recovery_percent must be from 1 to 100",
+                ));
+            }
+        }
+        if encrypt_headers {
+            if password.is_none() {
+                return Err(PyValueError::new_err("encrypt_headers needs a password"));
+            }
+            refuse_unless(rars_rs::write_plan::WriterOption::Feature(
+                rars_rs::Feature::HeaderEncryption,
+            ))?;
+        }
+        if comment.is_some() {
+            refuse_unless(rars_rs::write_plan::WriterOption::ArchiveComment)?;
+        }
+        // Only the RAR 5 writer keeps its allocations to a quota.
+        if resources.is_some_and(|resources| resources.max_memory_bytes.is_some())
+            && format.family() != rars_rs::ArchiveFamily::Rar50Plus
+        {
+            return Err(PyValueError::new_err(format!(
+                "{} cannot write to a memory limit; only rar50 and rar70 can",
+                format.as_str()
+            )));
+        }
+        if volume_size == Some(0) {
+            return Err(PyValueError::new_err("volume_size must be more than 0"));
+        }
         Ok(Self {
             inner: rars_rs::Builder::new(format)
                 .compression_level(Some(level))
-                .store(store)
+                .store(level == 0)
                 .solid(solid)
-                .password(py_password(password)?)
+                .password(password)
                 .header_encryption(encrypt_headers)
-                .comment(py_optional_bytes(comment)?)
+                .comment(comment)
                 .recovery_percent(recovery_percent)
                 .volume_size(volume_size),
             format,
@@ -2286,6 +2471,7 @@ impl RarBuilder {
         max_staged_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
+            Ok(archive) if archive.closed() => return Err(archive.check_open().unwrap_err()),
             Ok(archive) => RarFile {
                 identity: archive.identity.clone(),
                 encoding: options.map_or(archive.encoding, |options| options.encoding),
@@ -2307,17 +2493,9 @@ impl RarBuilder {
                 first_volume_only: archive.first_volume_only,
                 first: SetListing::new(archive.first.infos.clone()),
                 whole: OnceLock::new(),
+                closed: AtomicBool::new(false),
             },
-            Err(_) => RarFile::new(
-                py,
-                source,
-                "r",
-                password,
-                options,
-                cancellation,
-                false,
-                None,
-            )?,
+            Err(_) => RarFile::new(py, source, password, options, cancellation, false, None)?,
         };
         let password = archive.password.clone();
         if preserve {
@@ -2550,32 +2728,32 @@ impl RarBuilder {
     fn add_directory(
         &mut self,
         arcname: &Bound<'_, PyAny>,
-        mtime: Option<i64>,
+        mtime: Option<UnixSeconds>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
             .add_directory(
                 new_member_name(arcname)?,
-                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mtime.map(|UnixSeconds(time)| time),
                 mode,
             )
             .map_err(map_builder_error)
     }
 
-    /// `mtime` is Unix seconds, in every format.
+    /// `mtime` is Unix seconds, an int or a float such as `os.stat_result.st_mtime`, in every format.
     #[pyo3(signature = (data, arcname, *, mtime = None, mode = None))]
     fn add_bytes(
         &mut self,
         data: &Bound<'_, PyAny>,
         arcname: &Bound<'_, PyAny>,
-        mtime: Option<i64>,
+        mtime: Option<UnixSeconds>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
             .add_bytes(
                 new_member_name(arcname)?,
                 py_required_bytes(data)?,
-                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mtime.map(|UnixSeconds(time)| time),
                 mode,
             )
             .map_err(map_builder_error)
@@ -2595,8 +2773,8 @@ impl RarBuilder {
         Ok(())
     }
 
-    fn rename(&mut self, old: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
-        let id = self.edit_member_id(old)?;
+    fn rename(&mut self, member: &Bound<'_, PyAny>, new: &Bound<'_, PyAny>) -> PyResult<()> {
+        let id = self.edit_member_id(member)?;
         self.inner
             .rename_by_id(id, new_member_name(new)?)
             .map_err(map_builder_error)
@@ -2610,7 +2788,7 @@ impl RarBuilder {
         arcname: &Bound<'_, PyAny>,
         target: &Bound<'_, PyAny>,
         target_is_directory: bool,
-        mtime: Option<i64>,
+        mtime: Option<UnixSeconds>,
         mode: Option<u32>,
     ) -> PyResult<()> {
         self.inner
@@ -2618,21 +2796,21 @@ impl RarBuilder {
                 new_member_name(arcname)?,
                 new_member_name(target)?,
                 target_is_directory,
-                mtime.map(rars_rs::Timestamp::from_unix_seconds),
+                mtime.map(|UnixSeconds(time)| time),
                 mode,
             )
             .map_err(map_builder_error)
     }
 
-    /// Sets times from exact Unix nanoseconds; one left `None` keeps what the
-    /// member has. RAR 1.3–4.x keep only `modified_ns`, in 2-second steps.
-    #[pyo3(signature = (member, *, modified_ns=None, created_ns=None, accessed_ns=None))]
+    /// Sets times from exact Unix nanoseconds, named as on `RarInfo`; one left
+    /// `None` keeps what the member has. RAR 1.3–4.x keep only `mtime_ns`, in 2-second steps.
+    #[pyo3(signature = (member, *, mtime_ns=None, atime_ns=None, birthtime_ns=None))]
     fn set_times(
         &mut self,
         member: &Bound<'_, PyAny>,
-        modified_ns: Option<i128>,
-        created_ns: Option<i128>,
-        accessed_ns: Option<i128>,
+        mtime_ns: Option<i128>,
+        atime_ns: Option<i128>,
+        birthtime_ns: Option<i128>,
     ) -> PyResult<()> {
         let time = |nanoseconds: Option<i128>| {
             nanoseconds
@@ -2643,9 +2821,9 @@ impl RarBuilder {
                 .transpose()
         };
         let times = rars_rs::FileTimes {
-            modified: time(modified_ns)?,
-            created: time(created_ns)?,
-            accessed: time(accessed_ns)?,
+            modified: time(mtime_ns)?,
+            created: time(birthtime_ns)?,
+            accessed: time(atime_ns)?,
         };
         let id = self.edit_member_id(member)?;
         self.inner
@@ -2655,7 +2833,7 @@ impl RarBuilder {
 
     /// Sets or removes the comment attached to a queued member.
     #[pyo3(signature = (member, comment = None))]
-    fn set_file_comment(
+    fn set_member_comment(
         &mut self,
         member: &Bound<'_, PyAny>,
         comment: Option<&Bound<'_, PyAny>>,
@@ -2673,7 +2851,11 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Py<PyBytes>> {
-        self.refuse_volume_mismatch(false)?;
+        if self.inner.splits_into_volumes() {
+            return Err(PyValueError::new_err(
+                "volume_size is set, so write the set to files with write()",
+            ));
+        }
         if self.resources.max_memory_bytes().is_none() {
             let bytes = self.detached(
                 py,
@@ -2696,16 +2878,24 @@ impl RarBuilder {
             .map_err(map_error)
     }
 
-    #[pyo3(signature = (path, *, progress = None, cancellation = None))]
+    /// Writes the archive to `path` and returns the files written: `path` alone, or with
+    /// `volume_size` set, every part of the set, named from `path`.
+    /// An existing file is refused unless `overwrite=True`; a set checks every part before
+    /// writing any.
+    #[pyo3(signature = (path, *, overwrite = false, progress = None, cancellation = None))]
     fn write(
         &self,
         py: Python<'_>,
         path: &Bound<'_, PyAny>,
+        overwrite: bool,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Vec<PathBuf>> {
         let path = py_path_buf(py, path)?;
-        self.refuse_volume_mismatch(false)?;
+        if self.inner.splits_into_volumes() {
+            return self.write_volumes(py, path, overwrite, progress, cancellation);
+        }
+        refuse_existing(&path, overwrite)?;
         let directory = output_directory(&path);
         self.detached(
             py,
@@ -2719,19 +2909,20 @@ impl RarBuilder {
                     progress,
                 )
             },
-        )
+        )?;
+        Ok(vec![path])
     }
+}
 
-    #[pyo3(signature = (first_path, *, progress = None, cancellation = None))]
+impl RarBuilder {
     fn write_volumes(
         &self,
         py: Python<'_>,
-        first_path: &Bound<'_, PyAny>,
+        first_path: PathBuf,
+        overwrite: bool,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<PathBuf>> {
-        let first_path = py_path_buf(py, first_path)?;
-        self.refuse_volume_mismatch(true)?;
         let parts = self.detached(
             py,
             progress,
@@ -2769,29 +2960,29 @@ impl RarBuilder {
                     }
                 })
                 .collect::<PyResult<Vec<_>>>()?;
+            for path in &paths {
+                refuse_existing(path, overwrite)?;
+            }
             for (index, path) in paths.iter().enumerate() {
                 if cancellation.is_some_and(CancellationToken::is_cancelled) {
                     return Err(map_error(rars_rs::Error::Cancelled));
                 }
-                fs::write(path, parts.part(index)).map_err(map_io_error)?;
+                let mut file = fs::OpenOptions::new();
+                file.write(true);
+                if overwrite {
+                    file.create(true).truncate(true);
+                } else {
+                    file.create_new(true);
+                }
+                file.open(path)
+                    .and_then(|mut file| file.write_all(parts.part(index)))
+                    .map_err(|error| match error.kind() {
+                        io::ErrorKind::AlreadyExists => exists_error(path),
+                        _ => map_io_error(error),
+                    })?;
             }
             Ok(paths)
         })
-    }
-}
-
-impl RarBuilder {
-    /// The core's refusal names its own methods; this names Python's.
-    fn refuse_volume_mismatch(&self, volumes: bool) -> PyResult<()> {
-        match (volumes, self.inner.splits_into_volumes()) {
-            (false, true) => Err(PyValueError::new_err(
-                "volume_size is set, so write the set with write_volumes()",
-            )),
-            (true, false) => Err(PyValueError::new_err(
-                "write_volumes() needs RarBuilder(volume_size=...)",
-            )),
-            _ => Ok(()),
-        }
     }
 
     fn edit_member_id(&self, member: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -2853,6 +3044,24 @@ impl RarBuilder {
     }
 }
 
+/// What a writer raises for an existing file without `overwrite=True`, as extraction does.
+fn exists_error(path: &Path) -> PyErr {
+    PyOSError::new_err((
+        libc::EEXIST,
+        format!(
+            "{} already exists; pass overwrite=True to replace it",
+            path.display()
+        ),
+    ))
+}
+
+fn refuse_existing(path: &Path, overwrite: bool) -> PyResult<()> {
+    if !overwrite && fs::symlink_metadata(path).is_ok() {
+        return Err(exists_error(path));
+    }
+    Ok(())
+}
+
 fn output_directory(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2861,7 +3070,7 @@ fn output_directory(path: &Path) -> &Path {
 
 fn check_python_cancellation(cancellation: Option<&CancellationToken>) -> PyResult<()> {
     if cancellation.is_some_and(CancellationToken::is_cancelled) {
-        return Err(PyInterruptedError::new_err("operation cancelled"));
+        return Err(Cancelled::new_err(rars_rs::Error::Cancelled.to_string()));
     }
     Ok(())
 }
@@ -3055,7 +3264,7 @@ fn check_password(
         .map(|archive| -> PyResult<Py<RarFile>> {
             let mut file = RarFile::parse(py, password, options, |_| Ok(archive))?;
             file.path = path;
-            Py::new(py, file.with_set(true, None))
+            Py::new(py, file)
         })
         .transpose()?;
     Ok(PasswordCheck {
@@ -3066,15 +3275,18 @@ fn check_password(
     })
 }
 
-/// With `output=`, the repaired archive replaces that file only once the repair
-/// succeeds and `data` is None; otherwise `data` holds it.
+/// With `output=`, the repaired archive is written there once the repair
+/// succeeds and `data` is None; otherwise `data` holds it. An existing
+/// `output` is refused unless `overwrite=True`.
 #[pyfunction]
-#[pyo3(signature = (source, *, password = None, output = None, options = None, cancellation = None))]
+#[pyo3(signature = (source, *, password = None, output = None, overwrite = false, options = None, cancellation = None))]
+#[allow(clippy::too_many_arguments)] // Python keyword arguments.
 fn repair(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     password: Option<&Bound<'_, PyAny>>,
     output: Option<&Bound<'_, PyAny>>,
+    overwrite: bool,
     options: Option<&ReadOptions>,
     cancellation: Option<&CancellationToken>,
 ) -> PyResult<RepairResult> {
@@ -3082,6 +3294,9 @@ fn repair(
     let call_options = ReadOptions::for_call(options, None, cancellation)?;
     let options = call_options.as_ref();
     let output = output.map(|output| py_path_buf(py, output)).transpose()?;
+    if let Some(output) = &output {
+        refuse_existing(output, overwrite)?;
+    }
     let password = py_password(password)?;
     let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
     py.detach(|| {
@@ -3132,12 +3347,12 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("BadPassword", py.get_type::<BadPassword>())?;
     m.add("PasswordRequired", py.get_type::<PasswordRequired>())?;
     let missing_volume = py.get_type::<MissingVolume>();
-    missing_volume.setattr("volume_number", py.None())?;
+    missing_volume.setattr("volume_index", py.None())?;
     missing_volume.setattr("path", py.None())?;
     m.add("MissingVolume", missing_volume)?;
     let checksum_error = py.get_type::<ChecksumError>();
     checksum_error.setattr("member", py.None())?;
-    checksum_error.setattr("volume_number", py.None())?;
+    checksum_error.setattr("volume_index", py.None())?;
     m.add("ChecksumError", checksum_error)?;
     m.add(
         "UnsupportedRarFeature",
@@ -3145,20 +3360,18 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?;
     m.add("NotRarFile", py.get_type::<NotRarFile>())?;
     m.add("UnsafeArchivePath", py.get_type::<UnsafeArchivePath>())?;
+    m.add("LimitExceeded", py.get_type::<LimitExceeded>())?;
     m.add("UnsafeLinkWarning", py.get_type::<UnsafeLinkWarning>())?;
+    m.add("Cancelled", py.get_type::<Cancelled>())?;
     let enums = PyModule::from_code(py, ENUMS, c"rars/_enums.py", c"rars._enums")?;
     for name in [
         "ArchiveVersion",
         "ArchiveFamily",
         "VolumeNaming",
+        "AttributeKind",
         "ProgressPhase",
     ] {
         m.add(name, enums.getattr(name)?)?;
-    }
-    // Kept as the module-level spellings of ArchiveVersion's members.
-    for member in enums.getattr("ArchiveVersion")?.try_iter()? {
-        let member = member?;
-        m.add(member.getattr("name")?.extract::<String>()?, member)?;
     }
     Ok(())
 }
@@ -3476,6 +3689,33 @@ struct OutputMode {
 
 /// `True`, `False` or `"rename"`, as `extract` and `extractall` accept it.
 struct Overwrite(OverwritePolicy);
+
+/// Unix seconds as an int or a float, as `time.time()` and `os.stat_result.st_mtime` give them.
+struct UnixSeconds(rars_rs::Timestamp);
+
+impl<'a, 'py> FromPyObject<'a, 'py> for UnixSeconds {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if value.is_instance_of::<pyo3::types::PyInt>() {
+            return Ok(Self(rars_rs::Timestamp::from_unix_seconds(
+                value.extract()?,
+            )));
+        }
+        let seconds = value.extract::<f64>()?;
+        if !seconds.is_finite() {
+            return Err(PyValueError::new_err(
+                "mtime must be a finite number of seconds",
+            ));
+        }
+        let whole = seconds.floor();
+        let nanoseconds = ((seconds - whole) * 1e9).round().min(999_999_999.0) as u32;
+        Ok(Self(
+            rars_rs::Timestamp::new(whole as i64, nanoseconds)
+                .ok_or_else(|| PyValueError::new_err("time is out of range"))?,
+        ))
+    }
+}
 
 impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
     type Error = PyErr;
@@ -4277,7 +4517,9 @@ fn set_fault(
             continue;
         };
         match error {
-            rars_rs::Error::InVolume { number, .. } => fault.volume_number = Some(*number),
+            rars_rs::Error::InVolume { number, .. } => {
+                fault.volume_index = number.checked_sub(1);
+            }
             rars_rs::Error::AtEntry { name, .. } if fault.member.is_none() => {
                 fault.member = Some(String::from_utf8_lossy(name).into_owned());
             }
@@ -4291,7 +4533,7 @@ fn set_fault(
 #[derive(Default)]
 struct SetFault {
     /// The innermost volume, where the fault is rather than where reading began.
-    volume_number: Option<usize>,
+    volume_index: Option<usize>,
     /// The outermost member, which is the one the caller asked for.
     member: Option<String>,
 }
@@ -4524,10 +4766,15 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         rars_rs::ArchiveMemberDetail::Rar50Plus { crc32, .. } => crc32,
         _ => None,
     };
-    let date_time = member
-        .meta
-        .stored_modification_time()
-        .and_then(rars_rs::StoredTimestamp::calendar_fields);
+    let stored_time = member.meta.stored_modification_time();
+    // A malformed extended time record still leaves the main header's time.
+    let times = member.times().unwrap_or_else(|_| rars_rs::FileTimes {
+        modified: member.meta.modification_time(),
+        ..Default::default()
+    });
+    let nanoseconds =
+        |time: Option<rars_rs::Timestamp>| time.map(rars_rs::Timestamp::unix_nanoseconds);
+    let attr_source = member.meta.attr_source();
     RarInfo {
         member_index: 0,
         archive_identity: None,
@@ -4535,9 +4782,13 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         orig_filename_bytes: member.meta.name.into(),
         file_size: member.meta.unpacked_size,
         compress_size: member.meta.packed_size,
-        date_time,
+        stored_time,
+        mtime_ns: nanoseconds(times.modified),
+        atime_ns: nanoseconds(times.accessed),
+        birthtime_ns: nanoseconds(times.created),
         crc,
         host_os: member.meta.host_os,
+        attr_source,
         is_encrypted: member.meta.is_encrypted,
         is_solid: solid,
         is_split_before: member.meta.is_split_before,
@@ -4547,6 +4798,20 @@ fn info_from_member_named(member: rars_rs::ArchiveMember, filename: String) -> R
         is_directory: member.meta.is_directory,
         is_redirection: member.meta.is_redirection,
         volume: 0,
+    }
+}
+
+/// Why `read` has nothing to return for a member that exists.
+fn no_payload(info: &RarInfo) -> PyErr {
+    if info.is_directory {
+        PyIsADirectoryError::new_err(format!("{} is a directory", info.filename))
+    } else if info.is_redirection {
+        PyValueError::new_err(format!(
+            "{} is a link; readlink() reads its target",
+            info.filename
+        ))
+    } else {
+        PyValueError::new_err(format!("{} has no data to read", info.filename))
     }
 }
 
@@ -4560,9 +4825,15 @@ fn family_member(py: Python<'_>, family: rars_rs::ArchiveFamily) -> PyResult<Bou
     enum_member(py, &ARCHIVE_FAMILY, "ArchiveFamily", value)
 }
 
+/// Exactly an `ArchiveVersion` value, so one version has one spelling.
 fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
     rars_rs::ArchiveVersion::from_name(value)
-        .ok_or_else(|| PyValueError::new_err(format!("unsupported RAR format: {value}")))
+        .filter(|version| version.as_str() == value)
+        .ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown RAR version {value:?}; expected an ArchiveVersion such as \"rar50\""
+            ))
+        })
 }
 
 /// The member's stored relative path, and where it goes under `out_dir`.
@@ -4698,8 +4969,8 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
             with_attribute(
                 py,
                 MissingVolume::new_err(message),
-                "volume_number",
-                fault.volume_number,
+                "volume_index",
+                fault.volume_index,
             )
         });
     }
@@ -4709,7 +4980,7 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
     {
         return Python::attach(|py| {
             let error = with_attribute(py, ChecksumError::new_err(message), "member", fault.member);
-            with_attribute(py, error, "volume_number", fault.volume_number)
+            with_attribute(py, error, "volume_index", fault.volume_index)
         });
     }
     use rars_rs::ErrorKind;
@@ -4724,8 +4995,8 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
         },
         ErrorKind::InvalidArgument | ErrorKind::DuplicateEntry => PyValueError::new_err(message),
         ErrorKind::EntryNotFound => PyKeyError::new_err(message),
-        ErrorKind::ResourceLimit => PyMemoryError::new_err(message),
-        ErrorKind::Cancelled => PyInterruptedError::new_err(message),
+        ErrorKind::ResourceLimit => LimitExceeded::new_err(message),
+        ErrorKind::Cancelled => Cancelled::new_err(message),
         ErrorKind::WriterFailure => pyo3::exceptions::PyRuntimeError::new_err(message),
         _ => BadRarFile::new_err(message),
     }
@@ -5010,7 +5281,7 @@ mod tests {
                 entry_name: None,
                 entry_index: None,
                 total_entries: None,
-                volume: None,
+                volume_index: None,
                 finished: false,
                 total_known: true,
             };
@@ -5132,7 +5403,7 @@ mod tests {
     }
 
     #[test]
-    fn reader_workspace_options_reach_the_decoder_and_raise_memory_error() {
+    fn reader_workspace_options_reach_the_decoder_and_raise_limit_exceeded() {
         Python::initialize();
         Python::attach(|py| {
             let kwargs = pyo3::types::PyDict::new(py);
@@ -5163,7 +5434,7 @@ mod tests {
                 .unwrap();
             let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
             let error = map_error(archive.test_with_options(options).unwrap_err());
-            assert!(error.is_instance_of::<PyMemoryError>(py));
+            assert!(error.is_instance_of::<LimitExceeded>(py));
         });
     }
 
@@ -5224,6 +5495,7 @@ mod tests {
                     volumes: None,
                     first_volume_only: false,
                     whole: OnceLock::new(),
+                    closed: AtomicBool::new(false),
                     archive,
                     path: None,
                     password: None,
@@ -5255,10 +5527,7 @@ mod tests {
                     )
                     .unwrap_err();
                 py.detach(|| worker.join().unwrap());
-                assert!(
-                    error.is_instance_of::<PyInterruptedError>(py),
-                    "{format}: {error}"
-                );
+                assert!(error.is_instance_of::<Cancelled>(py), "{format}: {error}");
                 assert_eq!(
                     file.read(py, name.as_any(), None, None, None, None, None)
                         .unwrap(),
@@ -5458,6 +5727,7 @@ mod tests {
                             first_volume_only: false,
                             first: SetListing::new(Vec::new()),
                             whole: OnceLock::new(),
+                            closed: AtomicBool::new(false),
                         },
                     )
                     .unwrap();
@@ -5538,11 +5808,9 @@ mod tests {
                         exception.is_instance_of::<UnsupportedRarFeature>(py)
                     }
                     rars_rs::ErrorKind::ResourceLimit => {
-                        exception.is_instance_of::<PyMemoryError>(py)
+                        exception.is_instance_of::<LimitExceeded>(py)
                     }
-                    rars_rs::ErrorKind::Cancelled => {
-                        exception.is_instance_of::<PyInterruptedError>(py)
-                    }
+                    rars_rs::ErrorKind::Cancelled => exception.is_instance_of::<Cancelled>(py),
                     rars_rs::ErrorKind::WriterFailure => {
                         exception.is_instance_of::<pyo3::exceptions::PyRuntimeError>(py)
                     }
@@ -5600,9 +5868,11 @@ mod tests {
     #[test]
     fn parses_python_version_names() {
         assert_eq!(
-            parse_version("rar5").unwrap(),
+            parse_version("rar50").unwrap(),
             rars_rs::ArchiveVersion::Rar50
         );
+        assert!(parse_version("rar5").is_err());
+        assert!(parse_version("RAR50").is_err());
         assert_eq!(
             parse_version("rar70").unwrap(),
             rars_rs::ArchiveVersion::Rar70

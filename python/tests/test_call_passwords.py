@@ -10,7 +10,7 @@ ENCRYPTED = Path(__file__).resolve().parents[2] / "crates/rars/tests/fixtures/ra
 
 
 def encrypted(format, compressed=True):
-    builder = rars.RarBuilder(format=format, store=not compressed, password="right")
+    builder = rars.RarBuilder(version=format, level=3 if compressed else 0, password="right")
     builder.add_bytes(PAYLOAD, "file")
     return builder.to_bytes()
 
@@ -56,9 +56,9 @@ def test_a_call_password_opens_an_archive_opened_without_one(tmp_path, format):
 
 
 def test_a_call_password_wins_in_later_volumes(tmp_path):
-    builder = rars.RarBuilder(format="rar50", store=True, volume_size=4096, password="right")
+    builder = rars.RarBuilder(version="rar50", level=0, volume_size=4096, password="right")
     builder.add_bytes(bytes(range(256)) * 64, "large.bin")
-    paths = builder.write_volumes(tmp_path / "set.part01.rar")
+    paths = builder.write(tmp_path / "set.part01.rar")
     archive = rars.RarFile(paths[0], password="right")
     with pytest.raises(rars.BadPassword):
         archive.read("large.bin", password="wrong")
@@ -82,9 +82,9 @@ def test_a_wrong_password_on_rar4_header_encryption_raises_at_open(name):
     lambda archive, tmp_path: archive.extractall(tmp_path, pwd="right"),
     lambda archive, tmp_path: archive.testrar(pwd="right"),
     lambda archive, tmp_path: archive.read_comment(pwd="right"),
-    lambda archive, tmp_path: archive.getcomment("file", pwd="right"),
+    lambda archive, tmp_path: archive.member_comment("file", pwd="right"),
     lambda archive, tmp_path: archive.readlink("file", pwd="right"),
-], ids=["read", "read_many", "open", "extract", "extractall", "testrar", "read_comment", "getcomment", "readlink"])
+], ids=["read", "read_many", "open", "extract", "extractall", "testrar", "read_comment", "member_comment", "readlink"])
 def test_the_per_call_password_keyword_is_password(tmp_path, call):
     archive = rars.RarFile(encrypted("rar50"))
     with pytest.raises(TypeError, match="pwd"):

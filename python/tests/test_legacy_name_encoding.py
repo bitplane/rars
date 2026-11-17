@@ -6,7 +6,7 @@ import rars
 
 @pytest.mark.parametrize("format", ["rar13", "rar14", "rar15", "rar20", "rar29", "rar30", "rar40"])
 def test_decoded_names_select_extract_and_preserve(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add_bytes(b"payload", b"caf\x82.txt")
     data = builder.to_bytes()
     options = rars.ReadOptions(legacy_name_encoding="cp850")
@@ -37,7 +37,7 @@ def test_decoded_names_select_extract_and_preserve(tmp_path, format):
     ("utf-8", "日本語".encode(), "日本語"),
 ])
 def test_shared_encoding_mappings(encoding, raw, expected):
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"x", raw)
     archive = rars.RarFile(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding=encoding))
     assert archive.namelist() == [expected]
@@ -46,7 +46,7 @@ def test_shared_encoding_mappings(encoding, raw, expected):
 def test_invalid_options_and_undefined_bytes_fail(tmp_path):
     with pytest.raises(ValueError, match="unsupported legacy"):
         rars.ReadOptions(legacy_name_encoding="auto")
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"x", b"bad-\x81")
     options = rars.ReadOptions(legacy_name_encoding="windows-1252")
     with pytest.raises(ValueError, match="undefined byte"):
@@ -59,7 +59,7 @@ def test_invalid_options_and_undefined_bytes_fail(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar50", "rar70"])
 def test_modern_unicode_is_not_reinterpreted(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True)
+    builder = rars.RarBuilder(version=format, level=0)
     builder.add_bytes(b"x", "café.txt")
     archive = rars.RarFile(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="cp850"))
     assert archive.namelist() == ["café.txt"]
@@ -69,7 +69,7 @@ def test_modern_unicode_is_not_reinterpreted(tmp_path, format):
 
 def test_legacy_unicode_and_decoded_collisions(tmp_path):
     from test_rewrite_legacy_unicode import replace_first_name, unicode_wire
-    builder = rars.RarBuilder(format="rar29", store=True)
+    builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"unicode", "first.txt")
     builder.add_bytes(b"legacy", b"caf\x82.txt")
     data = replace_first_name(builder.to_bytes(), unicode_wire("café.txt"))
@@ -96,10 +96,10 @@ def test_legacy_unicode_and_decoded_collisions(tmp_path):
 
 @pytest.mark.parametrize("format", ["rar14", "rar29", "rar40"])
 def test_volume_extraction_uses_name_policy(tmp_path, format):
-    builder = rars.RarBuilder(format=format, store=True, volume_size=1024)
+    builder = rars.RarBuilder(version=format, level=0, volume_size=1024)
     payload = b"volume" * 2000
     builder.add_bytes(payload, b"caf\x82.txt")
-    paths = builder.write_volumes(tmp_path / "parts.rar")
+    paths = builder.write(tmp_path / "parts.rar")
     out = tmp_path / "out"
     rars.RarFile(paths[0]).extractall(out, options=rars.ReadOptions(legacy_name_encoding="cp850"),
                                       volumes=paths[1:])
