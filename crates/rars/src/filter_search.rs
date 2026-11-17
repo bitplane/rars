@@ -363,12 +363,38 @@ fn screen_wins(filtered: usize, baseline: usize) -> bool {
 /// A window from the middle of the member, used to screen the filters that have
 /// nothing but a trial encode to go on.
 fn screen_sample(data: &[u8]) -> &[u8] {
-    if data.len() <= SCREEN_SAMPLE_LEN {
-        return data;
+    &data[screen_sample_range(data.len())]
+}
+
+/// Where [`screen_sample`] takes its window from, in a member this long.
+fn screen_sample_range(len: usize) -> Range<usize> {
+    if len <= SCREEN_SAMPLE_LEN {
+        return 0..len;
     }
-    let middle = (data.len() - SCREEN_SAMPLE_LEN) / 2;
+    let middle = (len - SCREEN_SAMPLE_LEN) / 2;
     let start = middle / SCREEN_SAMPLE_ALIGNMENT * SCREEN_SAMPLE_ALIGNMENT;
-    &data[start..start + SCREEN_SAMPLE_LEN]
+    start..start + SCREEN_SAMPLE_LEN
+}
+
+/// A sample of the member as `kind` would leave it, filtered where it lies.
+///
+/// The x86 filters turn a call's displacement into the address it reaches, and
+/// leave alone a call that reaches outside the file. Filtered on its own, a
+/// sample starts at address zero, so every call back past its first byte looks
+/// like one of those and stays as it was: half the calls in ordinary code. The
+/// screen then prices a filter doing half its work, and that is the price it
+/// turned regions down at. So the member is filtered up to the end of the
+/// sample, over the sample's range only, and the sample is read back out.
+fn filtered_sample<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    sample: Range<usize>,
+    kind: FilterKind,
+) -> Result<Buffer<u8, S::Memory>> {
+    let filters = [FilterSpec::range(kind, sample.clone())];
+    let mut filtered = search.filtered_bytes(&data[..sample.end], &filters)?;
+    filtered.discard_prefix(sample.start);
+    Ok(filtered)
 }
 
 /// What the screen made of one filter kind.
@@ -498,7 +524,9 @@ fn x86_screened_regions<S: OwnedSearch>(
     let mut kept = Buffer::new(search.allowance());
     let mut helped = false;
     for region in regions {
-        let sample = screen_sample(&data[region.clone()]);
+        let within = screen_sample_range(region.len());
+        let within = region.start + within.start..region.start + within.end;
+        let sample = &data[within.clone()];
         if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
             // Scanner padding makes this possible only when the entire
             // member is too short to provide a useful x86 sample.
@@ -510,22 +538,35 @@ fn x86_screened_regions<S: OwnedSearch>(
         // with no margin under it, and a sample encode is cheap enough to get
         // right.
         let baseline = search.encode_plain(sample, options, None)?;
-        let transformed = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8E9)])?;
-        let filtered = search.encode_plain(&transformed, options, None)?;
-        if filtered.len() > baseline.len() {
-            continue;
-        }
+        let transformed = filtered_sample(search, data, within.clone(), FilterKind::E8E9)?;
+        let pair = search.encode_plain(&transformed, options, None)?;
         // No margin here, unlike the detectorless filters: the scanner has
         // already ruled on where code is, so a small win on this sample is
         // evidence rather than noise.
-        helped |= filtered.len() < baseline.len();
-        kept.try_push((region.clone(), filtered.len()))?;
+        if pair.len() <= baseline.len() {
+            helped |= pair.len() < baseline.len();
+            kept.try_push((region.clone(), within, Some(pair.len())))?;
+            continue;
+        }
+        // The pair losing is not the calls losing. Where jumps are dense and
+        // short, as in unoptimised code, converting them costs more than the
+        // calls give back, and the region was turned down with the calls
+        // never priced: on one 4 MiB run of a debug build the pair came out
+        // 1.3% bigger than no filter and the calls alone 7.6% smaller. Only a
+        // region the pair fails pays for this second question.
+        let calls = filtered_sample(search, data, within.clone(), FilterKind::E8)?;
+        let calls = search.encode_plain(&calls, options, None)?;
+        if calls.len() < baseline.len() {
+            helped = true;
+            kept.try_push((region.clone(), within, None))?;
+        }
     }
     let rejected_a_region = kept.len() < regions.len();
     if !helped {
         return Ok(X86Screen {
             kept: Buffer::new(search.allowance()),
             rejected_a_region: false,
+            jumps_pay: false,
             jumps_cost_more: false,
         });
     }
@@ -534,20 +575,26 @@ fn x86_screened_regions<S: OwnedSearch>(
     // per region inside the loop above priced the jump opcodes on members that
     // then declined every filter, which is a sample encode each for an answer
     // nothing reads.
+    let mut jumps_pay = false;
     let mut jumps_cost_more = false;
-    for (region, e8e9) in kept.iter() {
-        let sample = screen_sample(&data[region.clone()]);
-        let e8_only = search.filtered_bytes(sample, &[FilterSpec::whole(FilterKind::E8)])?;
+    for (_, within, pair) in kept.iter() {
+        let Some(pair) = pair else {
+            jumps_cost_more = true;
+            continue;
+        };
+        jumps_pay = true;
+        let e8_only = filtered_sample(search, data, within.clone(), FilterKind::E8)?;
         let e8_only = search.encode_plain(&e8_only, options, None)?;
-        jumps_cost_more |= e8_only.len() < *e8e9;
+        jumps_cost_more |= e8_only.len() < *pair;
     }
 
     Ok(X86Screen {
         rejected_a_region,
         kept: Buffer::collect(
-            kept.into_iter().map(|(region, _)| region),
+            kept.into_iter().map(|(region, _, _)| region),
             search.allowance(),
         )?,
+        jumps_pay,
         jumps_cost_more,
     })
 }
@@ -559,6 +606,9 @@ struct X86Screen<B: Budget> {
     /// Whether any region came out bigger under the filter, which rules out
     /// filtering the member end to end.
     rejected_a_region: bool,
+    /// Whether any kept region did no worse with the jump opcodes converted
+    /// than with no filter. Where none did, the pair is not worth an encode.
+    jumps_pay: bool,
     /// Whether any kept region did better with the jump opcodes left alone,
     /// which is the only reason to price the E8-only filter separately. A tie
     /// does not count: it usually means the sample held no jump opcodes at all,
@@ -597,9 +647,12 @@ fn x86_finalists<B: Budget>(
     let (numerator, denominator) = X86_CODE_COVERAGE_RATIO;
     let sparse = covered * denominator < data.len() * numerator;
     let mut finalists = Buffer::new(&allowance);
-    for kind in [FilterKind::E8E9, FilterKind::E8]
-        .into_iter()
-        .take(if screen.jumps_cost_more { 2 } else { 1 })
+    for kind in [
+        screen.jumps_pay.then_some(FilterKind::E8E9),
+        screen.jumps_cost_more.then_some(FilterKind::E8),
+    ]
+    .into_iter()
+    .flatten()
     {
         if screen.rejected_a_region || sparse {
             finalists.try_push(Buffer::collect(
@@ -800,6 +853,56 @@ fn graft_owned<B: Budget>(
     )?)
 }
 
+/// The tables left once the code has had its say on the ones inside it.
+///
+/// The table scanner reads repetition at a stride, and code built from one
+/// instruction pattern repeats at the pattern's length. A run of calls sixteen
+/// bytes apart scans as a table of sixteen-byte records from end to end, and
+/// the delta filter does shrink it, so the table screen keeps it. Grafting then
+/// cut the whole run out of every x86 finalist, and the x86 filter, worth far
+/// more there, was never measured.
+///
+/// So a table that lies in code the x86 screen kept is priced both ways on
+/// its own sample, and goes to whichever filter leaves that smaller. A real
+/// table inside a code region, a jump table or the relocations the scanner
+/// swept up with the code around them, still wins: the x86 filter finds
+/// little in it to convert.
+fn tables_outside_code<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    tables: TableRegions<S::Memory>,
+    code: &X86Screen<S::Memory>,
+    options: S::Options,
+) -> Result<TableRegions<S::Memory>> {
+    let screen_options = search.screen_options(options);
+    let kind = if code.jumps_pay {
+        FilterKind::E8E9
+    } else {
+        FilterKind::E8
+    };
+    let mut kept = Buffer::new(search.allowance());
+    for (region, stride) in tables {
+        let within = screen_sample_range(region.len());
+        let within = region.start + within.start..region.start + within.end;
+        let in_code = code
+            .kept
+            .iter()
+            .any(|code| code.start < within.end && within.start < code.end);
+        if in_code {
+            let filters = [FilterSpec::whole(FilterKind::Delta { channels: stride })];
+            let as_table = search.filtered_bytes(&data[within.clone()], &filters)?;
+            let as_table = search.encode_plain(&as_table, screen_options, None)?;
+            let as_code = filtered_sample(search, data, within, kind)?;
+            let as_code = search.encode_plain(&as_code, screen_options, None)?;
+            if as_code.len() < as_table.len() {
+                continue;
+            }
+        }
+        kept.try_push((region, stride))?;
+    }
+    Ok(kept)
+}
+
 /// The filter specs worth measuring against the whole member, paired with the
 /// bytes for any the screen already measured.
 ///
@@ -816,7 +919,7 @@ fn finalists<S: OwnedSearch>(
     let mut finalists = Buffer::collect([(Buffer::new(allowance), screen.plain)], allowance)?;
 
     let table_regions = table_regions(data, search.max_delta_channels(), allowance)?;
-    let tables = table_screened_regions(search, data, &table_regions, options)?;
+    let mut tables = table_screened_regions(search, data, &table_regions, options)?;
 
     // The tables graft into every x86 finalist rather than competing against
     // them, so when the x86 screen kept anything they cost no encode of their
@@ -827,6 +930,7 @@ fn finalists<S: OwnedSearch>(
         let screen =
             x86_screened_regions(search, data, &x86_code_regions(data, allowance)?, options)?;
         if !screen.kept.is_empty() {
+            tables = tables_outside_code(search, data, tables, &screen, options)?;
             tables_carried = !tables.is_empty();
             for specs in x86_finalists(data, &screen)? {
                 finalists.try_push((graft_owned(specs, &tables, data.len())?, None))?;
@@ -1561,6 +1665,7 @@ mod tests {
             let screen = X86Screen {
                 rejected_a_region: true,
                 kept: Buffer::collect(std::iter::once(0..3), budget)?,
+                jumps_pay: true,
                 jumps_cost_more: true,
             };
             let finalists = super::x86_finalists(&[0; 100], &screen)?;
@@ -2260,6 +2365,165 @@ mod tests {
             "the table filter is worth a lot more than this: {} against {}",
             packed.len(),
             plain.len()
+        );
+    }
+
+    /// Code whose calls all reach back to a few functions at the start of the
+    /// member, the way the calls in the later part of a binary reach the
+    /// earlier part.
+    fn calls_back_to_the_start(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491u32;
+        let mut data = Vec::with_capacity(len + 16);
+        while data.len() < len {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            // Bodies of several lengths, so the calls fall at no fixed stride
+            // and nothing here scans as a table.
+            const BODY: [u8; 13] = [
+                0x48, 0x89, 0x45, 0xf8, 0x8b, 0x45, 0xfc, 0x48, 0x83, 0xc0, 0x01, 0x66, 0x90,
+            ];
+            data.extend_from_slice(&BODY[..7 + 2 * ((state >> 20) as usize % 4)]);
+            let target = 0x40u32 + ((state >> 24) & 7) * 0x400;
+            let call_end = (data.len() + 5) as u32;
+            data.push(0xe8);
+            data.extend_from_slice(&target.wrapping_sub(call_end).to_le_bytes());
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// A sample filtered as if it began the file converts no call that reaches
+    /// back past its first byte, which here is every call there is. The screen
+    /// used to price that, see no difference, and decline the filter.
+    #[test]
+    fn the_x86_screen_filters_a_sample_where_it_lies_in_the_member() {
+        let data = calls_back_to_the_start(SCREEN_SAMPLE_LEN * 4);
+        let within = screen_sample_range(data.len());
+        assert!(
+            within.start > 0x2000,
+            "the sample has to lie past the targets"
+        );
+        let whole = [FilterSpec::whole(FilterKind::E8E9)];
+        let alone = FULL.filtered_bytes(&data[within.clone()], &whole).unwrap();
+        assert_eq!(alone, &data[within.clone()], "nothing converts on its own");
+
+        let search = UnlimitedSearch(&FULL, Allowance::default());
+        let placed = filtered_sample(&search, &data, within.clone(), FilterKind::E8E9).unwrap();
+        assert_eq!(placed.len(), within.len());
+        let in_member = FULL.filtered_bytes(&data, &whole).unwrap();
+        assert_eq!(&placed[..], &in_member[within.clone()]);
+        assert_ne!(&placed[..], &data[within]);
+
+        let plain = FULL.encode_plain(&data, options(), None).unwrap();
+        let (specs, packed) = choose_filter(&FULL, &data, options(), None).unwrap();
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)),
+            "the calls went unfiltered: {specs:?}"
+        );
+        assert!(
+            packed.len() * 10 < plain.len() * 9,
+            "the x86 filter is worth more than this: {} against {}",
+            packed.len(),
+            plain.len()
+        );
+    }
+
+    /// One instruction sequence over and over, sixteen bytes long: load an
+    /// argument, call one of a few dozen functions, test what came back. Only
+    /// the argument and the call's displacement change from one to the next.
+    fn calls_in_one_pattern(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491u32;
+        let mut step = || {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            state >> 16
+        };
+        let mut data = Vec::with_capacity(len + 16);
+        while data.len() < len {
+            data.push(0xbf);
+            data.extend_from_slice(&(step() % 4096).to_le_bytes());
+            let target = 0x0010_0000u32 + (step() % 64) * 0x1230;
+            let call_end = (data.len() + 5) as u32;
+            data.push(0xe8);
+            data.extend_from_slice(&target.wrapping_sub(call_end).to_le_bytes());
+            data.extend_from_slice(&[0x85, 0xc0, 0x75, 0x04, 0x0f, 0x1f]);
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// Calls a fixed sixteen bytes apart are code and scan as a table. The
+    /// delta filter the scanner offers does shrink them, which is how it gets
+    /// past its screen, and the x86 filter shrinks them further.
+    #[test]
+    fn code_that_scans_as_a_table_is_still_measured_as_code() {
+        let data = calls_in_one_pattern(SCREEN_SAMPLE_LEN * 4);
+        let tables = delta_table_regions(&data, FULL.max_delta_channels());
+        let tables = table_screened_regions(&FULL, &data, &tables, options()).unwrap();
+        assert!(
+            tables
+                .iter()
+                .any(|(range, stride)| *stride == 16 && range.len() * 2 > data.len()),
+            "the fixture no longer scans as a table: {:?}",
+            &tables[..]
+        );
+
+        let delta = [FilterSpec::whole(FilterKind::Delta { channels: 16 })];
+        let delta = FULL
+            .encode_filtered(&data, &delta, options(), None)
+            .unwrap();
+        let (specs, packed) = choose_filter(&FULL, &data, options(), None).unwrap();
+        assert!(
+            specs
+                .iter()
+                .all(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9))
+                && !specs.is_empty(),
+            "the code went to the table filter: {specs:?}"
+        );
+        assert!(
+            packed.len() * 10 < delta.len() * 9,
+            "the x86 filter is worth more than this: {} against {} under delta",
+            packed.len(),
+            delta.len()
+        );
+    }
+
+    /// A relocation table in the middle of code stays a table: the x86 filter
+    /// finds nothing in it, and the code around it is no reason to give it up.
+    #[test]
+    fn a_table_inside_code_is_still_a_table() {
+        let mut data = calls_to_fixed_addresses(SCREEN_SAMPLE_LEN * 2);
+        let table_start = data.len();
+        data.extend_from_slice(&reloc_table(20_000));
+        let table_end = data.len();
+        data.extend_from_slice(&calls_to_fixed_addresses(SCREEN_SAMPLE_LEN * 2));
+
+        let search = UnlimitedSearch(&FULL, Allowance::default());
+        let tables = delta_table_regions(&data, FULL.max_delta_channels());
+        let tables = table_screened_regions(&FULL, &data, &tables, options()).unwrap();
+        assert!(!tables.is_empty());
+        // The scanner's own regions may stop at the table. Code that covers
+        // the member is the case where the table has to defend itself.
+        let code = X86Screen {
+            kept: Buffer::collect(std::iter::once(0..data.len()), &Allowance::default()).unwrap(),
+            rejected_a_region: false,
+            jumps_pay: true,
+            jumps_cost_more: false,
+        };
+        let expected = tables.to_vec();
+        let kept = tables_outside_code(&search, &data, tables, &code, options()).unwrap();
+        assert_eq!(&kept[..], &expected[..]);
+
+        let (specs, _) = choose_filter(&FULL, &data, options(), None).unwrap();
+        assert!(
+            specs.iter().any(|spec| {
+                matches!(spec.kind, FilterKind::Delta { channels: 24 })
+                    && spec
+                        .range
+                        .as_ref()
+                        .is_some_and(|range| range.start < table_end && table_start < range.end)
+            }),
+            "the table lost its filter: {specs:?}"
         );
     }
 

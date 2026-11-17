@@ -586,6 +586,7 @@ mod dictionary_encoding_tests {
 
         let search = Rar50OwnedSearch {
             algorithm_version: 0,
+            file_offset: 0,
             allowance: Allowance::limited(0),
         };
         let filter = FilterSpec::whole(FilterKind::Delta { channels: 1 });
@@ -632,6 +633,9 @@ const SCREENED_KINDS: [FilterKind; 5] = [
 
 struct Rar50OwnedSearch<B: Budget> {
     algorithm_version: u8,
+    /// Where the data searched starts in its member. The x86 filters convert
+    /// by file position, so a run has to be measured at its own.
+    file_offset: usize,
     allowance: B,
 }
 impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
@@ -653,6 +657,14 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         options.with_optimal_parse(false)
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, B>> {
+        if self.file_offset != 0 {
+            return Ok(crate::codec::rar50::filtered_run_bytes(
+                data,
+                filters,
+                self.file_offset,
+                &self.allowance,
+            )?);
+        }
         Ok(crate::codec::rar50::filtered_owned_member(
             data,
             filters,
@@ -681,6 +693,19 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         options: EncodeOptions,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Buffer<u8, B>> {
+        if self.file_offset != 0 {
+            return Ok(crate::codec::rar50::encode_filtered_run(
+                data,
+                filters,
+                &[],
+                self.file_offset,
+                true,
+                self.algorithm_version,
+                options,
+                progress,
+                &self.allowance,
+            )?);
+        }
         Ok(crate::codec::rar50::encode_owned_member(
             data,
             self.algorithm_version,
@@ -698,9 +723,22 @@ fn choose_owned_filter<B: Budget>(
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
     allowance: &B,
 ) -> Result<crate::filter_search::FilterChoice<B>> {
+    choose_filter_at(data, 0, algorithm_version, options, progress, allowance)
+}
+
+/// The search over `data`, which starts `file_offset` bytes into its member.
+fn choose_filter_at<B: Budget>(
+    data: &[u8],
+    file_offset: usize,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    allowance: &B,
+) -> Result<crate::filter_search::FilterChoice<B>> {
     crate::filter_search::choose_owned(
         &Rar50OwnedSearch {
             algorithm_version,
+            file_offset,
             allowance: allowance.clone(),
         },
         data,
@@ -710,7 +748,10 @@ fn choose_owned_filter<B: Budget>(
 }
 /// The filters for one run of a member too large to search whole, ranged over
 /// the run. The run is searched on its own, without the history it is later
-/// coded against, so the choice never waits on the runs before it.
+/// coded against, so the choice never waits on the runs before it. It is
+/// filtered where it lies in the member all the same: an x86 filter measured
+/// as if the run began the file leaves alone every call that reaches back
+/// past the run's start.
 ///
 /// The decoder converts x86 and ARM addresses from a 32-bit file offset, and
 /// the encoder refuses one past that, so a run reaching beyond 4 GiB stays
@@ -730,8 +771,9 @@ pub(super) fn run_filters_with_allowance<B: Budget>(
         return Ok(Buffer::new(allowance));
     }
     let mut progress = |_| !cancelled();
-    choose_owned_filter(
+    choose_filter_at(
         data,
+        file_offset,
         algorithm_version,
         run_search_options(options),
         Some(&mut progress),
@@ -1002,6 +1044,52 @@ mod allowance_tests {
         assert!(allowance.used() >= packed.len() as u64);
         drop(packed);
         assert_eq!(allowance.used(), 0);
+    }
+
+    /// A run deep in a member, whose calls all reach back before the run
+    /// began. Searched as if it started the file none of them converts, and
+    /// the x86 filter measures as no filter at all.
+    #[test]
+    fn a_run_is_searched_at_its_own_file_offset() {
+        const FILE_OFFSET: usize = 8 * 1048576;
+        let mut state = 0x2545_f491u32;
+        let mut data = Vec::new();
+        while data.len() < 512 * 1024 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.extend_from_slice(&[0x48, 0x89, (state >> 16) as u8, (state >> 8) as u8]);
+            data.extend_from_slice(&[0x8b, 0x45, (state >> 20) as u8 & 0xfc]);
+            let target = 0x0010_0000u32 + ((state >> 24) & 7) * 0x400;
+            let call_end = (FILE_OFFSET + data.len() + 5) as u32;
+            data.push(0xe8);
+            data.extend_from_slice(&target.wrapping_sub(call_end).to_le_bytes());
+        }
+        let options = EncodeOptions::new(32).with_max_match_distance(1048576);
+        let filters = |file_offset| {
+            run_filters_with_allowance(
+                &data,
+                file_offset,
+                0,
+                options,
+                &|| false,
+                &Allowance::default(),
+            )
+            .unwrap()
+        };
+        let placed = filters(FILE_OFFSET);
+        assert!(
+            placed
+                .iter()
+                .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)),
+            "the run's calls went unfiltered: {:?}",
+            &placed[..]
+        );
+        // The same bytes at the start of a file hold calls to before it.
+        assert!(
+            !filters(0)
+                .iter()
+                .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)),
+            "calls to before the file began were converted"
+        );
     }
 
     #[test]
