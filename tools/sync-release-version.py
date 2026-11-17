@@ -28,12 +28,6 @@ def main() -> None:
         rf"\g<1>{version}\g<2>",
         "[project] version",
     )
-    replace_once(
-        root / ".github/workflows/release.yml",
-        r'^(\s*default: "v)[^"]+("\s*)$',
-        rf"\g<1>{version}\g<2>",
-        "release workflow default ref",
-    )
     # The independent reader consumer has its own lockfile, which cargo-release
     # does not touch. CI checks it with --locked.
     replace_once(
@@ -44,8 +38,9 @@ def main() -> None:
     )
 
     # Producer records contain the library version, including inside recovery
-    # parity and the legacy volume fingerprints. Refresh the byte fixtures once, after cargo-release has bumped
-    # rars, so the version-only release commit still passes the golden tests.
+    # parity and the legacy volume fingerprints. Refresh the byte fixtures once,
+    # after cargo-release has bumped rars, so the version-only release commit
+    # still passes the golden tests.
     if os.environ.get("CRATE_NAME") == "rars" and os.environ.get("DRY_RUN") != "true":
         subprocess.run(
             [

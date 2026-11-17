@@ -1,16 +1,25 @@
 name: Release
 
+# A release is a merged pull request that changes the version (`just release`
+# opens one). The first job works out whether this push did that and the version
+# is not tagged yet; if not, everything else is skipped. The tag is pushed only
+# once the test gate passes, and publishing waits for the release environment's
+# approval.
+#
+# workflow_dispatch re-runs publishing for a version that is already tagged,
+# when a registry failed part way through.
 on:
   push:
-    tags:
-      - "v*.*.*"
-      - "v*.*.*-*"
+    branches:
+      - master
+    paths:
+      - "crates/*/Cargo.toml"
+      - "pyproject.toml"
   workflow_dispatch:
     inputs:
       ref:
-        description: "Tag or ref to publish"
+        description: "Existing release tag to publish, e.g. v0.13.0"
         required: true
-        default: "v0.13.0"
       publish:
         description: "Release path to run"
         required: true
@@ -24,29 +33,33 @@ on:
 # Default deny; each job re-grants only what it needs.
 permissions: {}
 
-# Releases must never be cancelled mid-flight.
+# Releases must never be cancelled mid-flight. Each push gets its own group, so
+# a later push to master cannot replace a release waiting for approval; two
+# pushes racing to tag one version are settled by the tag push itself.
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
   cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
   BIN_NAME: rars
-  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.ref_name }}
+  RELEASE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
 
 jobs:
   # ----------------------------------------------------------------------
-  # 1. Verify the tag matches every publishable package version. Refuse to
-  #    publish v0.1.0-alpha.1 if any crate still declares a different
-  #    package version.
+  # 1. Decide whether this is a release, and check every publishable package
+  #    declares the version being released. A push releases when it changed
+  #    the version and that version has no tag; a dispatch republishes the
+  #    tag it names.
   # ----------------------------------------------------------------------
   verify-tag:
-    name: Verify tag matches workspace package versions
+    name: Decide the release and check package versions
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,11 +69,38 @@ jobs:
 
       - id: check
         name: Check versions
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
         run: |
           set -euo pipefail
-          TAG="${RELEASE_REF##*/}"            # v0.1.0-alpha.1
-          TAG_VERSION="${TAG#v}"              # 0.1.0-alpha.1
-          echo "tag = $TAG_VERSION"
+          package_version() {
+            sed -n 's/^version = "\(.*\)"$/\1/p' | head -1
+          }
+          if [ "$EVENT" = workflow_dispatch ]; then
+            TAG="${RELEASE_REF##*/}"            # v0.1.0-alpha.1
+            TAG_VERSION="${TAG#v}"              # 0.1.0-alpha.1
+            git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null \
+              || { echo "::error::$TAG is not a tag"; exit 1; }
+          else
+            TAG_VERSION="$(package_version < crates/rars/Cargo.toml)"
+            PREVIOUS=""
+            if git fetch -q --depth=1 origin "$BEFORE" 2>/dev/null; then
+              PREVIOUS="$(git show FETCH_HEAD:crates/rars/Cargo.toml | package_version)"
+            fi
+            if [ "$PREVIOUS" = "$TAG_VERSION" ]; then
+              echo "Version $TAG_VERSION is unchanged; not a release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/v$TAG_VERSION" >/dev/null; then
+              echo "v$TAG_VERSION is already tagged; not releasing it again."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "Releasing $TAG_VERSION (was ${PREVIOUS:-unknown})."
+          fi
+          echo "version = $TAG_VERSION"
 
           cargo metadata --locked --no-deps --format-version 1 > metadata.json
           python3 - <<'PY' "$TAG_VERSION"
@@ -98,6 +138,7 @@ jobs:
               raise SystemExit(1)
           PY
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "release=true" >> "$GITHUB_OUTPUT"
 
   # ----------------------------------------------------------------------
   # 2. Re-run the suite as a release gate. Nothing else runs unless this is
@@ -106,6 +147,7 @@ jobs:
   test:
     name: Test gate
     needs: verify-tag
+    if: needs.verify-tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -176,6 +218,33 @@ jobs:
       # RARS_REQUIRE_EXTERNAL_DECODERS is set inside the script, so a missing
       # decoder fails the gate rather than skipping the matrix.
       - run: ./scripts/release-gate.sh
+
+  # ----------------------------------------------------------------------
+  # 2b. Tag the merge commit, now that the gate has passed on it. A tag that
+  #     already exists fails the push, so of two runs racing for one version
+  #     only one goes on to publish.
+  # ----------------------------------------------------------------------
+  tag:
+    name: Tag the release
+    needs: [verify-tag, test]
+    if: github.event_name == 'push' && needs.verify-tag.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Push the tag
+        env:
+          VERSION: ${{ needs.verify-tag.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "v$VERSION" -m "v$VERSION" "$GITHUB_SHA"
+          git push origin "refs/tags/v$VERSION"
 
   # ----------------------------------------------------------------------
   # 3. Build release binaries for the supported targets.
@@ -441,10 +510,11 @@ jobs:
   # ----------------------------------------------------------------------
   publish:
     name: Publish to crates.io, PyPI and npm
-    needs: [verify-tag, test, build-python-wheels, build-python-sdist, build-npm]
+    needs: [verify-tag, test, tag, build-python-wheels, build-python-sdist, build-npm]
     if: >-
       always()
       && needs.verify-tag.result == 'success'
+      && needs.verify-tag.outputs.release == 'true'
       && needs.test.result == 'success'
       && !contains(needs.*.result, 'failure')
       && !contains(needs.*.result, 'cancelled')
@@ -595,7 +665,7 @@ jobs:
       - name: Publish release assets
         uses: softprops/action-gh-release@v3
         with:
-          tag_name: ${{ github.ref_name }}
+          tag_name: v${{ needs.verify-tag.outputs.version }}
           name: ${{ env.BIN_NAME }} ${{ needs.verify-tag.outputs.version }}
           generate_release_notes: true
           prerelease: ${{ contains(needs.verify-tag.outputs.version, '-') }}
