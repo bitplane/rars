@@ -224,22 +224,22 @@ struct WriterResources {
     /// Hard ceiling on the RAR 5 writer's managed allocations; exceeding it
     /// raises `LimitExceeded`. Legacy formats refuse it.
     #[pyo3(get)]
-    max_memory: Option<u64>,
+    max_memory_bytes: Option<u64>,
 }
 
 #[pymethods]
 impl WriterResources {
     #[new]
-    #[pyo3(signature = (*, max_memory = None))]
-    fn new(max_memory: Option<u64>) -> Self {
-        Self { max_memory }
+    #[pyo3(signature = (*, max_memory_bytes = None))]
+    fn new(max_memory_bytes: Option<u64>) -> Self {
+        Self { max_memory_bytes }
     }
 }
 
 impl WriterResources {
     fn core(&self) -> rars_rs::WriterResources {
         let resources = rars_rs::WriterResources::default();
-        match self.max_memory {
+        match self.max_memory_bytes {
             Some(limit) => resources.with_max_memory_bytes(limit),
             None => resources,
         }
@@ -265,9 +265,10 @@ struct ReadOptions {
     #[pyo3(get)]
     max_header_bytes: Option<u64>,
     #[pyo3(get)]
-    rar50_dictionary_size_limit: Option<u64>,
+    max_rar50_dictionary_bytes: Option<u64>,
+    /// The largest RAR 5 member decoded whole in memory; larger ones stream.
     #[pyo3(get)]
-    rar50_buffered_decode_limit: Option<u64>,
+    max_rar50_buffered_member_bytes: Option<u64>,
     #[pyo3(get)]
     allow_rar3_vm_programs: bool,
     /// Caps members decoded side by side and a large RAR 5 member's block decoders; 0 or 1 keeps the call on the calling thread.
@@ -282,13 +283,13 @@ struct ReadOptions {
 impl ReadOptions {
     #[new]
     #[allow(clippy::too_many_arguments)] // Python keyword-only policy fields.
-    #[pyo3(signature = (*, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, rar50_dictionary_size_limit=None, rar50_buffered_decode_limit=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
+    #[pyo3(signature = (*, max_member_output_bytes=None, max_total_output_bytes=None, max_reader_workspace_bytes=None, max_rar50_dictionary_bytes=None, max_rar50_buffered_member_bytes=None, max_header_count=None, max_header_bytes=None, legacy_name_encoding=None, allow_rar3_vm_programs=false, threads=None))]
     fn new(
         max_member_output_bytes: Option<u64>,
         max_total_output_bytes: Option<u64>,
         max_reader_workspace_bytes: Option<u64>,
-        rar50_dictionary_size_limit: Option<u64>,
-        rar50_buffered_decode_limit: Option<u64>,
+        max_rar50_dictionary_bytes: Option<u64>,
+        max_rar50_buffered_member_bytes: Option<u64>,
         max_header_count: Option<u64>,
         max_header_bytes: Option<u64>,
         legacy_name_encoding: Option<String>,
@@ -307,8 +308,8 @@ impl ReadOptions {
             max_member_output_bytes,
             max_total_output_bytes,
             max_reader_workspace_bytes,
-            rar50_dictionary_size_limit,
-            rar50_buffered_decode_limit,
+            max_rar50_dictionary_bytes,
+            max_rar50_buffered_member_bytes,
             max_header_count,
             max_header_bytes,
             allow_rar3_vm_programs,
@@ -366,8 +367,8 @@ fn python_read_options<'a>(
         options.max_member_output_bytes = settings.max_member_output_bytes;
         options.max_total_output_bytes = settings.max_total_output_bytes;
         options.max_reader_workspace_bytes = settings.max_reader_workspace_bytes;
-        options.rar50_dictionary_size_limit = settings.rar50_dictionary_size_limit;
-        options.rar50_buffered_decode_limit = settings.rar50_buffered_decode_limit;
+        options.rar50_dictionary_size_limit = settings.max_rar50_dictionary_bytes;
+        options.rar50_buffered_decode_limit = settings.max_rar50_buffered_member_bytes;
         options.allow_rar3_vm_programs = settings.allow_rar3_vm_programs;
         options.threads = settings.threads;
     }

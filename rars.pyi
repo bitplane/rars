@@ -157,8 +157,8 @@ class ReadOptions:
         max_member_output_bytes: int | None = None,
         max_total_output_bytes: int | None = None,
         max_reader_workspace_bytes: int | None = None,
-        rar50_dictionary_size_limit: int | None = None,
-        rar50_buffered_decode_limit: int | None = None,
+        max_rar50_dictionary_bytes: int | None = None,
+        max_rar50_buffered_member_bytes: int | None = None,
         max_header_count: int | None = None,
         max_header_bytes: int | None = None,
         legacy_name_encoding: str | None = None,
@@ -172,9 +172,9 @@ class ReadOptions:
     @property
     def max_reader_workspace_bytes(self) -> int | None: ...
     @property
-    def rar50_dictionary_size_limit(self) -> int | None: ...
+    def max_rar50_dictionary_bytes(self) -> int | None: ...
     @property
-    def rar50_buffered_decode_limit(self) -> int | None: ...
+    def max_rar50_buffered_member_bytes(self) -> int | None: ...
     @property
     def max_header_count(self) -> int | None: ...
     @property
@@ -191,10 +191,10 @@ class WriterResources:
     def __new__(
         cls,
         *,
-        max_memory: int | None = None,
+        max_memory_bytes: int | None = None,
     ) -> Self: ...
     @property
-    def max_memory(self) -> int | None: ...
+    def max_memory_bytes(self) -> int | None: ...
 
 @final
 class RarInfo:

@@ -109,8 +109,8 @@ def test_passwords_and_policies_after_the_main_arguments_are_keyword_only(tmp_pa
 
 
 def test_writer_resources_keep_their_settings():
-    assert rars.WriterResources().max_memory is None
-    assert rars.WriterResources(max_memory=1 << 20).max_memory == 1 << 20
+    assert rars.WriterResources().max_memory_bytes is None
+    assert rars.WriterResources(max_memory_bytes=1 << 20).max_memory_bytes == 1 << 20
     with pytest.raises(TypeError):
         rars.WriterResources(1 << 20)
 

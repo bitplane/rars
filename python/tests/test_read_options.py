@@ -106,7 +106,7 @@ def test_thread_cap_extracts_and_tests_the_same_bytes(tmp_path, threads):
     for name, payload in payloads.items():
         builder.add_bytes(payload, name)
     archive = rars.RarFile(builder.to_bytes())
-    options = rars.ReadOptions(threads=threads, rar50_buffered_decode_limit=0)
+    options = rars.ReadOptions(threads=threads, max_rar50_buffered_member_bytes=0)
     assert options.threads == threads
     archive.extractall(tmp_path, options=options)
     archive.testrar(options=options)
@@ -122,12 +122,12 @@ def test_rar5_dictionary_policy_and_streaming_decode_option(format):
     payload = b"repeated text\n" * 1000
     builder.add_bytes(payload, "file")
     archive = rars.RarFile(builder.to_bytes())
-    refused = rars.ReadOptions(rar50_dictionary_size_limit=0)
+    refused = rars.ReadOptions(max_rar50_dictionary_bytes=0)
     with pytest.raises(rars.LimitExceeded):
         archive.read("file", options=refused)
     with pytest.raises(rars.LimitExceeded):
         archive.testrar(options=refused)
-    streaming = rars.ReadOptions(rar50_buffered_decode_limit=0)
+    streaming = rars.ReadOptions(max_rar50_buffered_member_bytes=0)
     assert archive.read("file", options=streaming) == payload
     archive.testrar(options=streaming)
 
