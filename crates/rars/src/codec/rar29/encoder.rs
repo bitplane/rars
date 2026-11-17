@@ -2027,8 +2027,12 @@ impl<'a> LzParser<'a> {
     fn new(data: &'a [u8], start: usize, options: EncodeOptions, block_size: usize) -> Self {
         let reach = options.max_match_distance.min(MAX_HISTORY);
         let batch_bytes = Self::batch_bytes(block_size);
-        // Reach plus a batch, so filling a batch only overwrites links nothing in it can reach.
-        let mut finder = Rar29MatchFinder::for_reach(reach.saturating_add(batch_bytes), reach);
+        // Reach plus a batch, so filling a batch only overwrites links nothing
+        // in it can reach, and no more than the data, which then overwrites
+        // none. A batch is megabytes at any thread count: clearing links for
+        // one was most of the time spent on a member of a few kilobytes.
+        let window = reach.saturating_add(batch_bytes).min(data.len());
+        let mut finder = Rar29MatchFinder::for_reach(window, reach);
         for history_pos in 0..start {
             finder.insert(data, history_pos);
         }

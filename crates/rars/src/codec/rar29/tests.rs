@@ -4669,6 +4669,48 @@ fn members_parsed_in_segments_code_to_the_serial_parse_bytes() {
     assert_eq!(packed_fingerprint(&continued), (73_398, 3_211_860_258));
 }
 
+/// A parser keeps links for a reach and a batch, and a batch is megabytes at
+/// any thread count. A member of a few kilobytes used to have all of them
+/// cleared for it, which took longer than compressing it.
+#[test]
+fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
+    let input = mixed_member(5000);
+    let options = EncodeOptions::new(8).with_max_match_distance(4 * 1024 * 1024);
+    let block_size = 64 * 1024;
+    let batch = super::LzParser::batch_bytes(block_size);
+    assert!(batch > 16 * input.len());
+
+    let mut parser = super::LzParser::new(&input, 0, options, block_size);
+    assert_eq!(parser.finder.window(), input.len().next_power_of_two());
+    let tokens = parser.parse_blocks(&[input.len()]);
+
+    // The links it would have kept are the same links: nothing in a member
+    // this short is far enough back to be overwritten either way.
+    let mut roomy = super::LzParser::new(&input, 0, options, block_size);
+    roomy.finder = super::Rar29MatchFinder::for_reach(
+        options.max_match_distance + batch,
+        options.max_match_distance,
+    );
+    assert!(roomy.finder.window() > 16 * parser.finder.window());
+    assert_eq!(
+        format!("{:?}", roomy.parse_blocks(&[input.len()])),
+        format!("{tokens:?}")
+    );
+    assert!(tokens[0]
+        .iter()
+        .any(|token| matches!(token, super::EncodeToken::Match { .. })));
+
+    // A member longer than a reach and a batch still gets both.
+    let long = vec![0u8; 3 * 64 * 1024];
+    let near = EncodeOptions::new(8).with_max_match_distance(64 * 1024);
+    let batch = super::LzParser::batch_bytes(4096);
+    let parser = super::LzParser::new(&long, 0, near, 4096);
+    assert_eq!(
+        parser.finder.window(),
+        (64 * 1024 + batch).min(long.len()).next_power_of_two()
+    );
+}
+
 fn phrase_member(len: usize) -> Vec<u8> {
     let phrases = [
         &b"the model predicts each byte from the bytes before it, "[..],
