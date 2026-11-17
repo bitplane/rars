@@ -114,6 +114,7 @@ async function build(wasm, payload, platform, volumes) {
       const entryOptions = {
         mtime: entry.options.mtime,
         mode: entry.options.mode,
+        comment: entry.options.comment,
       };
       if (typeof entry.name === "string") builder.addBytes(entry.name, data, entryOptions);
       else builder.addBytesRaw(entry.name, data, entryOptions);
@@ -127,6 +128,7 @@ async function build(wasm, payload, platform, volumes) {
 // The phase names Python's ProgressPhase uses, plus repairing, which Python reports none for.
 const PHASES = {
   open: "reading", read: "reading", readMany: "reading", readComment: "reading",
+  readMemberComment: "reading",
   test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
   repair: "repairing", probe: "reading",
 };
@@ -150,7 +152,7 @@ export function startWorker(port, wasm, platform) {
       port.post({ id, progress: { operation, phase, completed: 0 } });
       let result;
       if (operation === "open" || operation === "read" || operation === "readMany"
-          || operation === "test" || operation === "readComment") {
+          || operation === "test" || operation === "readComment" || operation === "readMemberComment") {
         const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
         try {
           switch (operation) {
@@ -159,6 +161,7 @@ export function startWorker(port, wasm, platform) {
             case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions); break;
             case "test": archive.test(payload.password, payload.readOptions); break;
             case "readComment": result = archive.readComment(payload.password, payload.readOptions); break;
+            case "readMemberComment": result = archive.readMemberComment(payload.index, payload.password, payload.readOptions); break;
           }
         } finally {
           archive.free();

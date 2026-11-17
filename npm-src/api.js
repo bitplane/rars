@@ -85,6 +85,17 @@ export function createApi(runtime) {
         password: operation.password ?? this._archive._password,
       }, operation);
     }
+
+    /** The comment attached to this entry, or undefined; Python's member_comment(). */
+    async readComment(options) {
+      assertOpen(this._archive);
+      const operation = operationOptions(options);
+      return this._archive._request("readMemberComment", {
+        index: this.index,
+        readOptions: this._archive._readOptions(operation),
+        password: operation.password ?? this._archive._password,
+      }, operation);
+    }
   }
 
   class RarArchive {
@@ -309,9 +320,14 @@ export function createApi(runtime) {
         (!Number.isSafeInteger(options.mode) || options.mode < 0)) {
       throw new TypeError("mode must be a non-negative safe integer");
     }
+    if (options.comment !== undefined && typeof options.comment !== "string"
+        && !(options.comment instanceof Uint8Array)) {
+      throw new TypeError("comment must be a string or Uint8Array");
+    }
     return {
       mtime,
       mode: options.mode,
+      comment: options.comment,
     };
   }
 

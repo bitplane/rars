@@ -178,6 +178,21 @@ await check("repair restores damaged bytes", async () => {
   }
 });
 
+await check("member comments round-trip", async () => {
+  for (const format of ["rar15", "rar29", "rar50"]) {
+    const bytes = await new RarWriter({ version: format, level: 0 })
+      .add("noted.txt", HELLO, { comment: "a note" })
+      .add("raw.txt", HELLO, { comment: text.encode("raw note") })
+      .add("plain.txt", HELLO).bytes();
+    const archive = await RarArchive.open(bytes);
+    assert.equal(decode(await archive.get("noted.txt").readComment()), "a note", format);
+    assert.equal(decode(await archive.get("raw.txt").readComment()), "raw note", format);
+    assert.equal(await archive.get("plain.txt").readComment(), undefined, format);
+    archive.close();
+  }
+  assert.throws(() => new RarWriter().add("a", "a", { comment: 1 }), TypeError);
+});
+
 await check("isRarFile and isRarFileSfx answer for bytes, Blobs and paths", async () => {
   const bytes = await new RarWriter().add("a.txt", "a").bytes();
   const sfx = new Uint8Array(4096 + bytes.length);

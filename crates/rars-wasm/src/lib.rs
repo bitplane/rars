@@ -370,6 +370,8 @@ pub struct RarFile {
     archives: Vec<rars_rs::Archive>,
     password: Option<Vec<u8>>,
     infos: Vec<RarInfo>,
+    /// Each member's first part: its volume, and its index within that volume.
+    places: Vec<(usize, usize)>,
 }
 
 #[wasm_bindgen]
@@ -395,10 +397,12 @@ impl RarFile {
             .map(|member| info_with_encoding(member, options.legacy_name_encoding))
             .collect::<rars_rs::Result<Vec<_>>>()
             .map_err(js_error)?;
+        let places = (0..infos.len()).map(|index| (0, index)).collect();
         Ok(Self {
             archives: vec![archive],
             password,
             infos,
+            places,
         })
     }
 
@@ -425,16 +429,21 @@ impl RarFile {
             );
         }
         // A member starts in the volume holding its first part.
-        let starts = archives.iter().enumerate().flat_map(|(index, archive)| {
-            archive
-                .members()
-                .filter(|member| !member.meta.is_split_before)
-                .map(move |_| index)
-        });
+        let places: Vec<(usize, usize)> = archives
+            .iter()
+            .enumerate()
+            .flat_map(|(volume, archive)| {
+                archive
+                    .members()
+                    .enumerate()
+                    .filter(|(_, member)| !member.meta.is_split_before)
+                    .map(move |(index, _)| (volume, index))
+            })
+            .collect();
         let infos = rars_rs::volume_members(&archives)
             .map_err(js_error)?
             .into_iter()
-            .zip(starts)
+            .zip(places.iter().map(|&(volume, _)| volume))
             .map(|(member, volume_index)| {
                 info_with_encoding(member, options.legacy_name_encoding).map(|info| RarInfo {
                     volume_index,
@@ -447,6 +456,7 @@ impl RarFile {
             archives,
             password,
             infos,
+            places,
         })
     }
 
@@ -592,6 +602,29 @@ impl RarFile {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         self.archives[0]
             .comment_with_options(read_options(password.as_deref(), &settings)?)
+            .map_err(js_error)
+    }
+
+    /// The comment attached to the member at `index`, or `undefined` when it has none.
+    #[wasm_bindgen(js_name = readMemberComment)]
+    pub fn read_member_comment(
+        &self,
+        index: usize,
+        password: Option<Password>,
+        settings: JsValue,
+    ) -> Result<Option<Vec<u8>>, JsValue> {
+        let &(volume, index_in_volume) = self.places.get(index).ok_or_else(|| {
+            binding_error(
+                "ENTRY_NOT_FOUND",
+                &format!("no such archive entry index: {index}"),
+            )
+        })?;
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        self.archives[volume]
+            .member_comment_at_with_options(
+                index_in_volume,
+                read_options(password.as_deref(), &settings)?,
+            )
             .map_err(js_error)
     }
 
@@ -741,6 +774,33 @@ extern "C" {
     pub type Password;
 }
 
+impl RarBuilder {
+    /// Queues one member with its `mtime`, `mode` and `comment` options.
+    fn add_entry(
+        &mut self,
+        name: Vec<u8>,
+        data: Vec<u8>,
+        options: &JsValue,
+    ) -> Result<(), JsValue> {
+        let comment = opt_bytes(options, "comment")?;
+        self.inner
+            .add_bytes(
+                name,
+                data,
+                opt_timestamp(options, "mtime")?,
+                opt_number(options, "mode")?.map(|n| n as u32),
+            )
+            .map_err(js_error)?;
+        if comment.is_some() {
+            let id = self.inner.member_ids().last().expect("member just added");
+            self.inner
+                .set_file_comment_by_id(id, comment)
+                .map_err(js_error)?;
+        }
+        Ok(())
+    }
+}
+
 /// Assembles an archive from members added one at a time.
 #[wasm_bindgen]
 pub struct RarBuilder {
@@ -798,14 +858,7 @@ impl RarBuilder {
             Some(options) => options.into(),
             None => JsValue::UNDEFINED,
         };
-        self.inner
-            .add_bytes(
-                name.as_bytes().to_vec(),
-                data,
-                opt_timestamp(&options, "mtime")?,
-                opt_number(&options, "mode")?.map(|n| n as u32),
-            )
-            .map_err(js_error)
+        self.add_entry(name.as_bytes().to_vec(), data, &options)
     }
 
     /// Queue `data` under an exact byte name. Internal worker-facing variant.
@@ -820,14 +873,7 @@ impl RarBuilder {
             Some(options) => options.into(),
             None => JsValue::UNDEFINED,
         };
-        self.inner
-            .add_bytes(
-                name,
-                data,
-                opt_timestamp(&options, "mtime")?,
-                opt_number(&options, "mode")?.map(|n| n as u32),
-            )
-            .map_err(js_error)
+        self.add_entry(name, data, &options)
     }
 
     /// Drop the member called `name`.
@@ -1163,8 +1209,10 @@ mod host_tests {
                 .unwrap();
         }
         let archive = rars_rs::ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let infos: Vec<_> = archive.members().map(super::info_from_member).collect();
         let file = super::RarFile {
-            infos: archive.members().map(super::info_from_member).collect(),
+            places: (0..infos.len()).map(|index| (0, index)).collect(),
+            infos,
             archives: vec![archive],
             password: None,
         };

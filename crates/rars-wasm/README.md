@@ -33,6 +33,7 @@ reads its own payload by index. In a volume set, `entry.volumeIndex` is the
 volume the entry starts in, counting the first as 0. The archive says where it
 sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
 `volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
+`entry.readComment()` returns the comment attached to an entry, or undefined.
 
 Node also accepts paths and file URLs. Passing the first path of a conventional
 volume set discovers its siblings automatically.
@@ -116,7 +117,8 @@ const split = new RarWriter({ volumeSize: 5 * 1024 * 1024 }).add("big.bin", payl
 const parts = await split.volumes();
 ```
 
-`level` runs from 0 (stored) to 5. Other options are `solid`, `password`,
+`add()` takes `mode`, `mtime` and a `comment` for the member. `level` runs
+from 0 (stored) to 5. Other writer options are `solid`, `password`,
 `encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
 `volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
 additionally provides `addFile()` and `writeTo(path)`, which writes the archive,

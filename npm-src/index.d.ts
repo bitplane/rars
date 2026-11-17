@@ -7,7 +7,7 @@ export type RarData = string | RarInput;
 export type RarName = string | Uint8Array;
 
 export interface RarProgress {
-  operation: "open" | "read" | "readMany" | "readComment" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
+  operation: "open" | "read" | "readMany" | "readComment" | "readMemberComment" | "test" | "build" | "buildVolumes" | "writeTo" | "repair";
   /** Python's ProgressPhase names, plus "repairing". */
   phase: "reading" | "testing" | "compressing" | "repairing";
   /** Bytes; the work runs in one step, so `completed` reaches `total` only on the last event. */
@@ -76,6 +76,8 @@ export interface RarWriterOptions {
 export interface RarEntryOptions {
   /** A Date, or Unix seconds as `fs.utimes` takes them. */
   mtime?: Date | number;
+  /** A comment attached to this member. */
+  comment?: string | Uint8Array;
   mode?: number;
 }
 
@@ -116,6 +118,8 @@ export class RarEntry {
   /** The volume the entry starts in, counting the first as 0. */
   readonly volumeIndex: number;
   bytes(options?: ReadOptions): Promise<Uint8Array>;
+  /** The comment attached to this entry, or undefined. */
+  readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
 }
 
 export class RarArchive {
