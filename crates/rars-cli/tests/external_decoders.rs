@@ -85,6 +85,29 @@ fn mixed_payload(len: usize) -> Vec<u8> {
     out
 }
 
+/// A few instructions before each call to one of eight targets, at no fixed
+/// stride: data the x86 filters shrink, so the writer chooses them.
+fn code_payload(len: usize, seed: u64) -> Vec<u8> {
+    const FILLER: [u8; 13] = [
+        0x48, 0x89, 0x8b, 0xc3, 0x83, 0x0f, 0x85, 0x31, 0xff, 0x74, 0x41, 0x66, 0x90,
+    ];
+    const TARGETS: [u32; 8] = [
+        0x1000, 0x2340, 0x8800, 0x10000, 0x23456, 0x40000, 0x7f000, 0x12_3456,
+    ];
+    let mut noise = Noise(seed);
+    let mut out = Vec::with_capacity(len);
+    while out.len() + 18 <= len {
+        let step = noise.next();
+        out.extend_from_slice(&FILLER[..7 + 2 * ((step >> 40) as usize % 4)]);
+        let target = TARGETS[(step >> 33) as usize % TARGETS.len()];
+        let at = out.len();
+        out.push(0xe8);
+        out.extend_from_slice(&target.wrapping_sub(at as u32 + 5).to_le_bytes());
+    }
+    out.resize(len, 0x90);
+    out
+}
+
 /// Which files a cell compresses. Cells that do not need the expensive payload
 /// do not pay for it.
 #[derive(Clone, Copy, PartialEq)]
@@ -97,6 +120,13 @@ enum Inputs {
     /// One member, large enough to split. The legacy volume writers take a
     /// single input file and refuse more.
     Single,
+    /// Code in several members, one of them longer than a run.
+    ///
+    /// For solid RAR 5, which filters each run of each member from the
+    /// member's own offset. Our reader agrees with our writer about where that
+    /// is whichever of them is wrong, so this is the cell that asks someone
+    /// else.
+    Code,
     /// One member big enough to span several LZ blocks.
     ///
     /// Every other payload here fits in one block, which is what let a member
@@ -121,6 +151,12 @@ impl Inputs {
                     ("noise.bin", Noise(0x9E37_79B9_7F4A_7C15).bytes(16_384)),
                 ]
             }
+            Inputs::Code => vec![
+                ("first.bin", code_payload(200 * 1024, 1)),
+                ("notes.txt", b"between the code ".repeat(2048)),
+                ("large.bin", code_payload(1280 * 1024, 2)),
+                ("last.bin", code_payload(96 * 1024, 3)),
+            ],
             Inputs::PpmdStress => vec![("mixed.bin", mixed_payload(320 * 1024))],
             Inputs::Single => vec![("one.bin", mixed_payload(192 * 1024))],
             Inputs::MultiBlock => vec![("wide.bin", mixed_payload(512 * 1024))],
@@ -492,6 +528,15 @@ const CELLS: &[Cell] = &[
         name: "arm-filter",
         flags: &["--level", "5", "--arm-filter"],
         inputs: Inputs::Standard,
+        formats: MODERN,
+        judge: Judge::Everything,
+    },
+    // A 128 KiB dictionary makes a run 1 MiB, so the large member is cut and
+    // its second run starts mid-member.
+    Cell {
+        name: "solid-code",
+        flags: &["--level", "3", "--solid", "--dict-size", "128k"],
+        inputs: Inputs::Code,
         formats: MODERN,
         judge: Judge::Everything,
     },

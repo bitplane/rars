@@ -763,9 +763,43 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     blocks: &[(usize, bool)],
     algorithm_version: u8,
     options: EncodeOptions,
+    block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<Buffer<u8, B>, B>> {
+    streaming_blocks_with_records(
+        data,
+        history,
+        blocks,
+        None,
+        algorithm_version,
+        options,
+        block_done,
+        allowance,
+    )
+}
+
+/// [`streaming_blocks_with_allowance`] over bytes already filtered in place by
+/// [`filter_streaming_blocks_in_place`], whose records these are, one list to
+/// a block. `history` is the window the decoder will hold, so it is filtered
+/// wherever the runs before were.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streaming_blocks_with_records<B: Budget>(
+    data: &[u8],
+    history: &[u8],
+    blocks: &[(usize, bool)],
+    records: Option<&[Buffer<EncodeFilter, B>]>,
+    algorithm_version: u8,
+    options: EncodeOptions,
     mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
+    if records.is_some_and(|records| records.len() != blocks.len()) {
+        return Err(Error::InvalidData(
+            "RAR 5 streaming blocks and filter records differ in number",
+        ));
+    }
+    let records_of =
+        |index: usize| -> &[EncodeFilter] { records.map_or(NO_RECORDS, |records| &records[index]) };
     let mut previous = 0;
     for &(end, _) in blocks {
         if end <= previous || end > data.len() {
@@ -803,7 +837,7 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
             0..end,
             MemberSearch::Fresh,
             algorithm_version,
-            &[],
+            records_of(0),
             options,
             is_last,
             None,
@@ -822,11 +856,14 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
         let mut block_start = at;
         pipelined_optimal_blocks(
             &combined,
-            blocks[first..].iter().map(|&(end, is_last)| {
-                let block = block_start..start + end;
-                block_start = block.end;
-                (block, NO_RECORDS, is_last)
-            }),
+            blocks[first..]
+                .iter()
+                .enumerate()
+                .map(|(index, &(end, is_last))| {
+                    let block = block_start..start + end;
+                    block_start = block.end;
+                    (block, records_of(first + index), is_last)
+                }),
             OptimalCollector::with_allowance(&combined, at, options, allowance)?,
             algorithm_version,
             options,
@@ -850,14 +887,14 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
             &combined, at, options, allowance,
         )?)
     };
-    for &(end, is_last) in &blocks[first..] {
+    for (index, &(end, is_last)) in blocks[first..].iter().enumerate() {
         let end = start + end;
         output.push_admitted(encode_lz_block_with_allowance(
             &combined,
             at..end,
             search.borrow(),
             algorithm_version,
-            &[],
+            records_of(first + index),
             options,
             is_last,
             None,
@@ -1143,6 +1180,68 @@ fn filter_blocks_in_place<B: Budget>(
 struct NormalizedFilterSpec {
     kind: Rar50Filter,
     range: Range<usize>,
+}
+
+/// Transforms a run of streaming blocks in place and returns each block's
+/// filter records, for [`streaming_blocks_with_records`].
+///
+/// A solid run can hold the ends and starts of several members. `segments`
+/// says where each member's bytes lie in `data` and how far into the member
+/// they start, since a filter converts by position in its own file and not in
+/// the stream. `filters` are ranged over `data`, each inside one segment.
+///
+/// A record covers bytes of one block and no more than a record can describe,
+/// so a filter is cut at both, as [`filter_blocks_in_place`] cuts it.
+pub(crate) fn filter_streaming_blocks_in_place<B: Budget>(
+    data: &mut [u8],
+    blocks: &[(usize, bool)],
+    filters: &[crate::FilterSpec],
+    segments: &[(Range<usize>, usize)],
+    allowance: &B,
+) -> Result<Buffer<Buffer<EncodeFilter, B>, B>> {
+    let mut filters = normalized_filter_specs(data.len(), filters, allowance)?;
+    filters.sort_unstable_by_key(|filter| filter.range.start);
+    let mut placed = Buffer::with_capacity(filters.len(), allowance)?;
+    for filter in filters.iter() {
+        let Some((segment, file_offset)) = segments.iter().find(|(segment, _)| {
+            segment.start <= filter.range.start && filter.range.end <= segment.end
+        }) else {
+            return Err(Error::InvalidData(
+                "RAR 5 solid filter does not lie in one member",
+            ));
+        };
+        placed.push_admitted(file_offset + (filter.range.start - segment.start));
+    }
+    let mut records = Buffer::with_capacity(blocks.len(), allowance)?;
+    let mut block_start = 0usize;
+    for &(block_end, _) in blocks {
+        let mut block_records = Buffer::new(allowance);
+        for (filter, &file_offset) in filters.iter().zip(placed.iter()) {
+            let mut start = filter.range.start.max(block_start);
+            let end = filter.range.end.min(block_end);
+            while start < end {
+                let piece_end = (start + MAX_FILTER_BLOCK_LENGTH).min(end);
+                let (filter_type, channels) = encode_filter_data(
+                    filter.kind,
+                    &mut data[start..piece_end],
+                    file_offset + (start - filter.range.start),
+                    allowance,
+                )?;
+                block_records
+                    .push(EncodeFilter {
+                        offset: start - block_start,
+                        length: piece_end - start,
+                        filter_type,
+                        channels,
+                    })
+                    .map_err(Into::into)?;
+                start = piece_end;
+            }
+        }
+        records.push_admitted(block_records);
+        block_start = block_end;
+    }
+    Ok(records)
 }
 
 fn normalized_filter_specs<B: Budget>(

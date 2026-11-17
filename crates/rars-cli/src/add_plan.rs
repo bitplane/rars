@@ -158,25 +158,25 @@ pub(crate) fn reject_coding_without_compression(
 
 /// Refuses the filter requests a solid archive cannot honour.
 ///
-/// RAR 5 and RAR 7 code solid members as one chain and skip the filter search
-/// entirely, so neither a named filter nor `--auto-filter` reaches them; both
-/// used to be taken and dropped. RAR 2.9 takes either, search included: its
-/// chain measures each candidate against the history so far, which is the only
-/// place a filter can be measured once one exists.
+/// RAR 5 and RAR 7 code solid members as one chain, which chooses filters for
+/// each run of each member and has nowhere to put one named for the whole
+/// archive. A named filter used to be taken and dropped. The search runs
+/// either way, so `--auto-filter` only says what happens already. RAR 2.9
+/// takes a named filter too: its chain measures each candidate against the
+/// history so far.
 pub(crate) fn reject_filter_with_solid(
     target: ArchiveVersion,
     filters: &AskedFilters,
-    auto_filter: bool,
     solid: bool,
 ) -> Result<(), CliError> {
     if !solid || target.family() != rars::ArchiveFamily::Rar50Plus {
         return Ok(());
     }
-    if filters.count() == 0 && !auto_filter {
+    if filters.count() == 0 {
         return Ok(());
     }
     Err(CliError::usage(format!(
-        "{} cannot be used with --solid; solid members share one dictionary",
+        "{} cannot be used with --solid; a solid archive chooses its own filters",
         flag_for(WriterOption::Filter, filters),
     )))
 }
@@ -381,17 +381,11 @@ mod tests {
             delta: true,
             ..Default::default()
         };
-        assert!(reject_filter_with_solid(ArchiveVersion::Rar50, &delta, false, false).is_ok());
-        assert!(reject_filter_with_solid(ArchiveVersion::Rar29, &delta, false, true).is_ok());
-        assert!(reject_filter_with_solid(ArchiveVersion::Rar50, &none, false, true).is_ok());
+        assert!(reject_filter_with_solid(ArchiveVersion::Rar50, &delta, false).is_ok());
+        assert!(reject_filter_with_solid(ArchiveVersion::Rar29, &delta, true).is_ok());
+        assert!(reject_filter_with_solid(ArchiveVersion::Rar50, &none, true).is_ok());
         assert!(
-            reject_filter_with_solid(ArchiveVersion::Rar50, &none, true, true)
-                .unwrap_err()
-                .to_string()
-                .starts_with("--auto-filter")
-        );
-        assert!(
-            reject_filter_with_solid(ArchiveVersion::Rar70, &delta, false, true)
+            reject_filter_with_solid(ArchiveVersion::Rar70, &delta, true)
                 .unwrap_err()
                 .to_string()
                 .starts_with("--delta-filter")

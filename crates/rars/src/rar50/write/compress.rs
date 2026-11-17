@@ -24,7 +24,10 @@ use super::filter_policy::{
 use super::FilterPolicy;
 #[cfg(test)]
 use crate::codec::rar50::EncodeOptions;
-use crate::codec::rar50::{streaming_blocks_with_allowance, BlockSplitter};
+use crate::codec::rar50::{
+    filter_streaming_blocks_in_place, streaming_blocks_with_allowance,
+    streaming_blocks_with_records, BlockSplitter, EncodeFilter,
+};
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::Crc32;
 use crate::rar50::blake2sp;
@@ -228,6 +231,13 @@ struct BlockJob<B: Budget> {
     /// Filters ranged over `data`. A run with any is coded as one filtered
     /// stream, cut where its filter records fit rather than at `blocks`.
     filters: Records<crate::FilterSpec>,
+    /// In a solid run, where each member's bytes lie in `data` and how far
+    /// into the member they start. A solid run can hold several members, and
+    /// a filter converts by position in its own.
+    segments: Records<(std::ops::Range<usize>, usize)>,
+    /// In a solid run that was filtered, each block's filter records. `data`
+    /// already holds the filtered bytes, and the blocks stay as they were.
+    records: Option<Buffer<Buffer<EncodeFilter, B>, B>>,
 }
 
 impl<B: Budget> BlockJob<B> {
@@ -260,6 +270,8 @@ struct MemberStream<B: Budget> {
     packed: Spool,
     /// A chunk read to decide a block boundary and not used by that block.
     pushback: Buffer<u8, B>,
+    /// How much of the member has gone into jobs so far.
+    placed: usize,
     crc: Crc32,
     hash: blake2sp::Hasher,
 }
@@ -290,6 +302,7 @@ impl<B: Budget> MemberStream<B> {
             remaining: size,
             packed: Spool::create_parked(resources)?,
             pushback: Buffer::new(allowance),
+            placed: 0,
             crc: Crc32::new(),
             hash: blake2sp::Hasher::new(),
         })
@@ -359,11 +372,14 @@ pub(super) fn compress_members_with_context(
                 resources,
             )?
         }
-        ExecutionPlan::Blocks { workspace } => compress_streaming_members(
+        ExecutionPlan::Blocks {
+            workspace,
+            run_filters,
+        } => compress_streaming_members(
             sources,
             &mut integrity,
             plan,
-            false,
+            run_filters,
             workspace,
             resources,
             advance,
@@ -447,7 +463,7 @@ fn compress_streaming_members(
             sources,
             integrity,
             plan,
-            false,
+            run_filters,
             batch_capacity,
             required,
             resources,
@@ -926,6 +942,8 @@ where
                     blocks: Records::new(0, resources)?,
                     offset: offsets[member],
                     filters: Records::new(0, resources)?,
+                    segments: Records::new(0, resources)?,
+                    records: None,
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
                     job.append(
@@ -956,7 +974,8 @@ where
                         explicit_run_filter(job, spec)?;
                     }
                 } else {
-                    choose_run_filters(&mut jobs, plan, required, resources, advance)?;
+                    let concurrent = jobs.len();
+                    choose_run_filters(&mut jobs, concurrent, plan, required, resources, advance)?;
                 }
                 for job in jobs.iter_mut() {
                     let (member, _, _) = job.blocks[0];
@@ -1008,8 +1027,7 @@ fn compress_solid_chain<B: Budget + Send + Sync>(
     sources: &[EntrySource],
     integrity: &mut [(u64, u32, [u8; 32])],
     plan: &CompressPlan,
-    // Shares the independent path's signature; a solid chain never filters.
-    _filter_runs: bool,
+    filter_runs: bool,
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
@@ -1055,10 +1073,19 @@ where
             }
             let mut job = BlockJob {
                 data: Buffer::new(allowance),
-                history: Buffer::copied(&history, allowance)?,
+                // A filtered run's history is the window the decoder will
+                // hold, which is not known until the runs before it have
+                // chosen their filters.
+                history: if filter_runs {
+                    Buffer::new(allowance)
+                } else {
+                    Buffer::copied(&history, allowance)?
+                },
                 blocks: Records::new(0, resources)?,
                 offset: 0,
                 filters: Records::new(0, resources)?,
+                segments: Records::new(0, resources)?,
+                records: None,
             };
             while job.data.len() < run_size(plan) {
                 while next < streams.len() && !streams[next].has_more() {
@@ -1067,17 +1094,59 @@ where
                 let Some(stream) = streams.get_mut(next) else {
                     break;
                 };
+                let start = job.data.len();
                 job.append(
                     read_block(stream, plan.block_size, advance)
                         .map_err(|error| error_context(stream.member, error))?,
                 )?;
                 job.blocks
                     .push_growing((stream.member, job.data.len(), !stream.has_more()))?;
+                if filter_runs {
+                    let block = job.data.len() - start;
+                    match job.segments.last_mut() {
+                        Some((segment, _)) if stream.placed != 0 && segment.end == start => {
+                            segment.end += block;
+                        }
+                        _ => job
+                            .segments
+                            .push_growing((start..start + block, stream.placed))?,
+                    }
+                    stream.placed += block;
+                }
             }
             // The outer loop found a stream with data, so this job contains
             // at least that stream's next block.
-            history.remember(&job.data, plan.encode_options.max_match_distance)?;
+            if !filter_runs {
+                history.remember(&job.data, plan.encode_options.max_match_distance)?;
+            }
             jobs.push(job)?;
+        }
+
+        if filter_runs && !jobs.is_empty() {
+            // A solid run can hold many members, each searched on its own.
+            // The wave reserved workspace for `wave_capacity` jobs whether or
+            // not it filled that many, so that many searches fit at once.
+            choose_run_filters(&mut jobs, wave_capacity, plan, required, resources, advance)?;
+            for job in jobs.iter_mut() {
+                job.history = Buffer::copied(&history, allowance)?;
+                if !job.filters.is_empty() {
+                    let boundaries = Records::collect(
+                        job.blocks.iter().map(|&(_, end, last)| Ok((end, last))),
+                        resources,
+                    )?;
+                    job.records = Some(filter_streaming_blocks_in_place(
+                        &mut job.data,
+                        &boundaries,
+                        &job.filters,
+                        &job.segments,
+                        allowance,
+                    )?);
+                    // The filters are in the bytes now. Left here they would
+                    // send the run down the one-member filtered path.
+                    job.filters = Records::new(0, resources)?;
+                }
+                history.remember(&job.data, plan.encode_options.max_match_distance)?;
+            }
         }
 
         if jobs.is_empty() {
@@ -1197,13 +1266,15 @@ fn explicit_run_filter<B: Budget>(job: &mut BlockJob<B>, spec: &crate::FilterSpe
 }
 
 /// Chooses each run's filters, in parallel and against the same admission as
-/// the wave that will code them: at most one search per job at a time.
+/// the wave that will code them: at most `concurrent` searches at a time,
+/// which is as many as the wave has workspace reserved for.
 ///
 /// A run is searched in pieces of [`FILTER_SEARCH_BYTES`], so one search fits
 /// the budget whatever the dictionary, and the pieces' ranges are offset into
 /// the run.
 fn choose_run_filters<B: Budget + Send + Sync>(
     jobs: &mut Records<BlockJob<B>>,
+    concurrent: usize,
     plan: &CompressPlan,
     required: u64,
     resources: &WriterResources,
@@ -1212,21 +1283,31 @@ fn choose_run_filters<B: Budget + Send + Sync>(
 where
     B::Charge: Send,
 {
+    // A piece is a stretch of one member: the bytes to search and how far
+    // into the member they start. A solid run holds a segment per member; any
+    // other run is all one member's.
     let mut pieces = Records::new(0, resources)?;
     for (index, job) in jobs.iter().enumerate() {
-        let mut start = 0;
-        while start < job.data.len() {
-            let end = (start + FILTER_SEARCH_BYTES).min(job.data.len());
-            pieces.push_growing((index, start..end))?;
-            start = end;
+        let whole = [(0..job.data.len(), job.offset)];
+        let segments = if job.segments.is_empty() {
+            &whole[..]
+        } else {
+            &job.segments[..]
+        };
+        for (segment, file_offset) in segments {
+            let mut start = segment.start;
+            while start < segment.end {
+                let end = (start + FILTER_SEARCH_BYTES).min(segment.end);
+                pieces.push_growing((index, start..end, file_offset + (start - segment.start)))?;
+                start = end;
+            }
         }
     }
     let mut chosen = Records::new(pieces.len(), resources)?;
-    for batch in pieces.chunks(jobs.len().max(1)) {
+    for batch in pieces.chunks(concurrent.max(1)) {
         let searches = Records::collect(
-            batch.iter().map(|(index, range)| {
-                let job = &jobs[*index];
-                Ok((&job.data[range.clone()], job.offset + range.start))
+            batch.iter().map(|(index, range, file_offset)| {
+                Ok((&jobs[*index].data[range.clone()], *file_offset))
             }),
             resources,
         )?;
@@ -1265,7 +1346,7 @@ where
             chosen.push(specs)?;
         }
     }
-    for ((index, range), specs) in pieces.iter().zip(chosen) {
+    for ((index, range, _), specs) in pieces.iter().zip(chosen) {
         let filters = &mut jobs[*index].filters;
         for spec in specs {
             let span = spec.range.map_or(range.clone(), |r| {
@@ -1364,15 +1445,35 @@ fn encode_block_job<B: Budget, C: Budget>(
         return Ok(output);
     }
     let mut block_done = |bytes: usize| progress.advance(bytes as u64);
-    let packed = streaming_blocks_with_allowance(
-        &job.data,
-        &job.history,
-        &boundaries,
-        plan.algorithm_version,
-        plan.encode_options,
-        Some(&mut block_done),
-        allowance,
-    )?;
+    let packed = match &job.records {
+        Some(records) => {
+            // The records were made under the job's own budget and the
+            // encoder charges this worker's, so they cross over as a copy.
+            let records = Buffer::try_collect(
+                records.iter().map(|block| Buffer::copied(block, allowance)),
+                allowance,
+            )?;
+            streaming_blocks_with_records(
+                &job.data,
+                &job.history,
+                &boundaries,
+                Some(&records),
+                plan.algorithm_version,
+                plan.encode_options,
+                Some(&mut block_done),
+                allowance,
+            )?
+        }
+        None => streaming_blocks_with_allowance(
+            &job.data,
+            &job.history,
+            &boundaries,
+            plan.algorithm_version,
+            plan.encode_options,
+            Some(&mut block_done),
+            allowance,
+        )?,
+    };
     for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
         output.push((member, packed, last))?;
     }

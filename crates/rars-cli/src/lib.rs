@@ -1529,7 +1529,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     // differently, so the format check would name a flag it had not looked at.
     add_plan::reject_multiple_filters(&asked_filters)?;
     add_plan::reject_unsupported_filter(target, &asked_filters)?;
-    add_plan::reject_filter_with_solid(target, &asked_filters, auto_filter, solid)?;
+    add_plan::reject_filter_with_solid(target, &asked_filters, solid)?;
     if store {
         add_plan::reject_coding_without_compression(&asked_filters, auto_filter, ppmd)?;
     }
@@ -1565,15 +1565,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             solid,
             header_encryption,
             recovery_percent,
-            rar50_filter_policy(
-                auto_filter,
-                no_filter,
-                solid,
-                store,
-                delta_filter,
-                e8_filter,
-                arm_filter,
-            ),
+            rar50_filter_policy(no_filter, store, delta_filter, e8_filter, arm_filter),
             quick_open,
             archive_comment.as_deref(),
             file_comment.as_deref(),
@@ -2292,13 +2284,11 @@ impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
 
 /// Archive-level options for a streaming write.
 /// RAR 5 looks for a data filter by default, because it usually pays and the
-/// cost is compression time rather than memory. Solid archives share one
-/// dictionary across members and so cannot carry per-member filters, and
-/// stored members are not compressed at all, so neither takes one.
+/// cost is compression time rather than memory. That holds for solid archives
+/// too, which choose filters run by run. Stored members are not compressed at
+/// all, so they take none.
 fn rar50_filter_policy(
-    auto_filter: bool,
     no_filter: bool,
-    solid: bool,
     store: bool,
     delta_filter: Option<usize>,
     e8_filter: Option<bool>,
@@ -2318,7 +2308,7 @@ fn rar50_filter_policy(
     if arm_filter {
         return FilterPolicy::explicit(FilterKind::Arm);
     }
-    if no_filter || store || (solid && !auto_filter) {
+    if no_filter || store {
         return FilterPolicy::None;
     }
     FilterPolicy::Auto
@@ -3002,12 +2992,16 @@ mod tests {
         }
         use rars::rar50::FilterPolicy;
         assert!(matches!(
-            super::rar50_filter_policy(false, false, true, false, None, None, false),
+            super::rar50_filter_policy(false, false, None, None, false),
+            FilterPolicy::Auto
+        ));
+        assert!(matches!(
+            super::rar50_filter_policy(true, false, None, None, false),
             FilterPolicy::None
         ));
         assert!(matches!(
-            super::rar50_filter_policy(true, false, true, false, None, None, false),
-            FilterPolicy::Auto
+            super::rar50_filter_policy(false, true, None, None, false),
+            FilterPolicy::None
         ));
     }
 

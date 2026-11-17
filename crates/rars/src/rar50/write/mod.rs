@@ -242,7 +242,11 @@ pub fn write_streaming_volumes_with_progress(
     // This used to be a single check over all three, which reported a string
     // naming every option it covered whichever one the caller had set. Quick
     // open rides on the feature set, so `validate_plan` catches that one.
-    validate_plan(options, shape)?;
+    validate_plan(
+        options,
+        shape,
+        matches!(extras.filter_policy, FilterPolicy::Explicit(_)),
+    )?;
     if extras.locked {
         return Err(Error::InvalidArgument(
             "archive lock flag is not supported in volume output",
@@ -421,6 +425,7 @@ pub(crate) fn write_streaming_archive_reporting(
         PlanShape::new()
             .compressed(true)
             .filtered(extras.filter_policy != FilterPolicy::None),
+        matches!(extras.filter_policy, FilterPolicy::Explicit(_)),
     )?;
     if let Some(percent) = recovery_percent {
         validate_recovery_percent(percent)?;
@@ -874,7 +879,7 @@ impl<'a> Rar50Writer<'a> {
 /// member the builder accepts. Each built a set of allowed features and compared
 /// it with the request, and several built it by assigning a flag to itself,
 /// which accepted the flag whatever it said.
-fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
+fn validate_plan(options: WriterOptions, shape: PlanShape, explicit_filter: bool) -> Result<()> {
     if options.target.family() != crate::version::ArchiveFamily::Rar50Plus {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -890,11 +895,12 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
             because: Some("with header encryption"),
         });
     }
-    // Solid members share one dictionary and are coded as one chain, so the
-    // filter search never runs for them. Relations between two requests cannot
-    // be expressed in the capability table, which is why this lives here rather
-    // than in `supports`.
-    if shape.filtered && options.features.solid {
+    // Solid members share one dictionary and are coded as one chain. The chain
+    // chooses filters for each run of each member, where the member lies, and
+    // has nowhere to put a filter named for the whole archive. Relations
+    // between two requests cannot be expressed in the capability table, which
+    // is why this lives here rather than in `supports`.
+    if explicit_filter && options.features.solid {
         return Err(Error::UnsupportedWriterOption {
             target: options.target,
             option: WriterOption::Filter,
@@ -1125,6 +1131,15 @@ mod tests {
                 ..
             }
         ));
+
+        // A solid chain chooses its own filters, so the automatic policy is
+        // no request it has to refuse.
+        let options = super::WriterOptions::new(crate::ArchiveVersion::Rar50, features);
+        let shape = crate::write_plan::PlanShape::new()
+            .compressed(true)
+            .filtered(true);
+        assert!(super::validate_plan(options, shape, false).is_ok());
+        assert!(super::validate_plan(options, shape, true).is_err());
     }
 
     fn simple_entry(data: &[u8]) -> super::ArchiveEntry {
@@ -1469,6 +1484,7 @@ mod tests {
         let error = super::validate_plan(
             options,
             crate::write_plan::PlanShape::new().compressed(true),
+            false,
         )
         .unwrap_err();
         assert!(matches!(

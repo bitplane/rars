@@ -1563,7 +1563,7 @@ impl Builder {
     /// this out for itself, an archive built from bytes came out unfiltered and
     /// larger than the same archive built from files.
     fn rar50_filter_policy(&self) -> rar50::FilterPolicy {
-        if self.solid || self.store {
+        if self.store {
             rar50::FilterPolicy::None
         } else {
             rar50::FilterPolicy::Auto

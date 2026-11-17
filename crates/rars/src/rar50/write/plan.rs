@@ -48,7 +48,12 @@ pub(super) struct MemberPlan {
 
 pub(super) enum ExecutionPlan {
     Stored,
-    Blocks { workspace: u64 },
+    /// `run_filters` when the members share one solid window and each run's
+    /// filter search fits the budget beside it.
+    Blocks {
+        workspace: u64,
+        run_filters: bool,
+    },
     IndependentMembers(Records<MemberPlan>),
 }
 
@@ -83,8 +88,20 @@ impl ExecutionPlan {
             } else {
                 sizes.max().unwrap_or(0)
             };
+            let workspace = streaming_workspace(settings, true, largest);
+            // A solid chain cannot search a member whole: its members code
+            // against each other. It searches each run on its own instead, as
+            // a member too large to search whole does, when that fits.
+            let search = whole_member_workspace(largest.min(search_piece(settings)), settings);
+            let run_filters =
+                settings.solid && settings.filter_policy == FilterPolicy::Auto && search <= limit;
             return Ok(Self::Blocks {
-                workspace: streaming_workspace(settings, true, largest),
+                workspace: if run_filters {
+                    workspace.max(search)
+                } else {
+                    workspace
+                },
+                run_filters,
             });
         }
         Ok(Self::IndependentMembers(Records::collect(
@@ -318,12 +335,58 @@ mod tests {
         for (solid, expected) in [(false, charge(member)), (true, charge(2 * member))] {
             settings.solid = solid;
             let plan = ExecutionPlan::new(&settings, [member, member].into_iter(), u64::MAX);
-            assert!(matches!(plan, ExecutionPlan::Blocks { workspace } if workspace == expected));
+            assert!(
+                matches!(plan, ExecutionPlan::Blocks { workspace, .. } if workspace == expected)
+            );
             assert!(expected < full);
         }
         settings.solid = false;
         let large = ExecutionPlan::new(&settings, [16 * 1024 * 1024].into_iter(), u64::MAX);
-        assert!(matches!(large, ExecutionPlan::Blocks { workspace } if workspace == full));
+        assert!(matches!(large, ExecutionPlan::Blocks { workspace, .. } if workspace == full));
+    }
+
+    #[test]
+    fn a_solid_chain_searches_each_run_when_the_search_fits() {
+        let mut settings = settings();
+        settings.solid = true;
+        let sizes = || [3 * 1024 * 1024u64, 5 * 1024 * 1024].into_iter();
+        let streaming = streaming_workspace(&settings, true, 8 * 1024 * 1024);
+        let search = whole_member_workspace(search_piece(&settings), &settings);
+        assert!(search > streaming);
+
+        // The search is charged beside the chain, and decides nothing about
+        // the output when it does not fit.
+        let roomy = ExecutionPlan::new(&settings, sizes(), search);
+        assert!(matches!(
+            roomy,
+            ExecutionPlan::Blocks { workspace, run_filters: true } if workspace == search
+        ));
+        let tight = ExecutionPlan::new(&settings, sizes(), search - 1);
+        assert!(matches!(
+            tight,
+            ExecutionPlan::Blocks { workspace, run_filters: false } if workspace == streaming
+        ));
+
+        // Only the automatic policy searches. A chain has nowhere to put a
+        // filter named for the whole archive, and none was asked for here.
+        settings.filter_policy = FilterPolicy::None;
+        let unfiltered = ExecutionPlan::new(&settings, sizes(), u64::MAX);
+        assert!(matches!(
+            unfiltered,
+            ExecutionPlan::Blocks { workspace, run_filters: false } if workspace == streaming
+        ));
+
+        // Members that do not share a window are planned one by one, and
+        // never as a chain.
+        settings.solid = false;
+        let apart = ExecutionPlan::new(&settings, sizes(), u64::MAX);
+        assert!(matches!(
+            apart,
+            ExecutionPlan::Blocks {
+                run_filters: false,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -338,7 +401,7 @@ mod tests {
         settings.method = 1;
         settings.solid = true;
         let solid = ExecutionPlan::new(&settings, [16, u64::MAX].into_iter(), u64::MAX);
-        assert!(matches!(solid, ExecutionPlan::Blocks { workspace } if workspace > 0));
+        assert!(matches!(solid, ExecutionPlan::Blocks { workspace, .. } if workspace > 0));
     }
 
     #[test]
