@@ -141,6 +141,22 @@ volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
 same directory. Sets exceeding 901 volumes or containing overlapping output
 paths are rejected before any file is written.
 
+`RarWriter.fromArchive(archive)` starts a writer holding every member of an
+open archive, or of its whole volume set, with names, times, attributes,
+comments and links carried over, to edit with `add()`, `remove()` and
+`rename()` and write again:
+
+```js
+const writer = await RarWriter.fromArchive(await RarArchive.open("old.rar"));
+const bytes = await writer.remove("draft.txt").add("final.txt", text).bytes();
+```
+
+By default it keeps the source's format, settings and encryption, and refuses
+an archive whose settings it can't keep; `{ preserve: false }` writes RAR 5 at
+level 3 instead. Members' data is decoded and verified, in memory, when the
+archive is written, so the source must still be readable then;
+`maxStagedBytes` caps how much is held at once.
+
 Long operations accept an `AbortSignal` and a progress callback, called with the
 phase (`reading`, `testing`, `compressing`, `protecting`, `writing` or
 `repairing`) and bytes `completed` of `total`, which is absent until known.

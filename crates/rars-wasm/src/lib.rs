@@ -1316,6 +1316,17 @@ impl RarBuilder {
 pub struct RarBuilder {
     inner: Builder,
     resources: rars_rs::WriterResources,
+    rewrite: Option<Rewrite>,
+}
+
+/// An archive being written again: where its members' payloads come from.
+struct Rewrite {
+    archives: Vec<rars_rs::Archive>,
+    password: Option<Vec<u8>>,
+    settings: JsValue,
+    /// Payloads still to stage, by builder member id.
+    payloads: std::collections::HashMap<usize, rars_rs::RewritePayload>,
+    max_staged_bytes: Option<u64>,
 }
 
 #[wasm_bindgen]
@@ -1341,6 +1352,7 @@ impl RarBuilder {
         }
         Ok(Self {
             resources,
+            rewrite: None,
             inner: Builder::new(format)
                 .compression_level(Some(compression))
                 .store(opt_bool(&options, "store")?)
@@ -1425,6 +1437,91 @@ impl RarBuilder {
         self.finish_entry(&options)
     }
 
+    /// A builder holding every member of `archive`, which may be a volume set,
+    /// ready to edit and write again. `preserve` keeps the source's format,
+    /// settings and encryption, and refuses an archive whose settings can't be
+    /// kept; otherwise it writes RAR 5 at level 3. Payloads are decoded and
+    /// verified when the archive is written, held in memory, up to
+    /// `maxStagedBytes` when given.
+    #[wasm_bindgen(js_name = fromArchive)]
+    pub fn from_archive(
+        archive: &RarFile,
+        preserve: bool,
+        password: Option<Password>,
+        settings: JsValue,
+        max_staged_bytes: Option<f64>,
+    ) -> Result<RarBuilder, JsValue> {
+        let password = password_bytes(password)?.or_else(|| archive.password.clone());
+        let options = read_options(password.as_deref(), &settings)?;
+        let (first, later) = archive
+            .archives
+            .split_first()
+            .expect("a file has a first volume");
+        if preserve {
+            let issues = first.rewrite_preservation_issues();
+            if !issues.is_empty() {
+                let way_through = if first.is_volume() {
+                    "use preserve: false to rewrite the volume set as one RAR5 archive"
+                } else {
+                    "use preserve: false for explicit RAR5 conversion"
+                };
+                return Err(binding_error(
+                    "UNSUPPORTED_FEATURE",
+                    &format!(
+                        "cannot preserve archive: {}; {way_through} (archive settings may be lost)",
+                        issues.join("; ")
+                    ),
+                ));
+            }
+        }
+        let (inner, payloads) = first
+            .rewrite_builder(later, options, preserve)
+            .map_err(js_error)?;
+        Ok(Self {
+            inner,
+            resources: rars_rs::WriterResources::default(),
+            rewrite: Some(Rewrite {
+                archives: archive.archives.clone(),
+                password,
+                settings,
+                payloads: payloads
+                    .into_iter()
+                    .map(|payload| (payload.id, payload))
+                    .collect(),
+                max_staged_bytes: max_staged_bytes.map(|limit| limit as u64),
+            }),
+        })
+    }
+
+    /// Each queued member's id, in the order they will be written. Ids stay
+    /// with a member through renames.
+    #[wasm_bindgen(js_name = memberIds)]
+    pub fn member_ids(&self) -> Vec<u32> {
+        self.inner.member_ids().map(|id| id as u32).collect()
+    }
+
+    /// The queued member names as stored, in the order they will be written.
+    #[wasm_bindgen(js_name = rawNames, unchecked_return_type = "Uint8Array[]")]
+    pub fn raw_names(&self) -> js_sys::Array {
+        self.inner.names().map(js_sys::Uint8Array::from).collect()
+    }
+
+    /// Drop the member with id `id`.
+    #[wasm_bindgen(js_name = removeId)]
+    pub fn remove_id(&mut self, id: u32) -> Result<(), JsValue> {
+        self.inner.remove_by_id(id as usize).map_err(js_error)?;
+        if let Some(rewrite) = &mut self.rewrite {
+            rewrite.payloads.remove(&(id as usize));
+        }
+        Ok(())
+    }
+
+    /// Rename the member with id `id` to the exact bytes `name`.
+    #[wasm_bindgen(js_name = renameId)]
+    pub fn rename_id(&mut self, id: u32, name: Vec<u8>) -> Result<(), JsValue> {
+        self.inner.rename_by_id(id as usize, name).map_err(js_error)
+    }
+
     /// Drop the member called `name`.
     pub fn remove(&mut self, name: &str) -> Result<(), JsValue> {
         self.inner.remove(name.as_bytes()).map_err(js_error)
@@ -1462,14 +1559,18 @@ impl RarBuilder {
         &self,
         progress: Option<js_sys::Function>,
     ) -> Result<js_sys::Uint8Array, JsValue> {
-        progress::watching(progress, || self.to_bytes_reporting())
+        progress::watching(progress, || {
+            self.with_payloads(|builder| self.to_bytes_reporting(builder))
+        })
     }
 
     /// Encode the archive as a volume set, one `Uint8Array` per volume.
     /// Requires `volumeSize`.
     #[wasm_bindgen(js_name = toVolumes, unchecked_return_type = "Uint8Array[]")]
     pub fn to_volumes(&self, progress: Option<js_sys::Function>) -> Result<js_sys::Array, JsValue> {
-        progress::watching(progress, || self.to_volumes_reporting())
+        progress::watching(progress, || {
+            self.with_payloads(|builder| self.to_volumes_reporting(builder))
+        })
     }
 }
 
@@ -1478,18 +1579,62 @@ impl RarBuilder {
         progress::active().then_some(&progress::WriteReporter as &dyn rars_rs::WriteProgress)
     }
 
-    fn to_bytes_reporting(&self) -> Result<js_sys::Uint8Array, JsValue> {
+    /// Runs `write` on the builder, with a rewrite's payloads staged into a copy of it.
+    fn with_payloads<T>(
+        &self,
+        write: impl FnOnce(&Builder) -> Result<T, JsValue>,
+    ) -> Result<T, JsValue> {
+        let Some(rewrite) = &self.rewrite else {
+            return write(&self.inner);
+        };
+        let payloads: Vec<_> = rewrite.payloads.values().copied().collect();
+        let limit = match rewrite.max_staged_bytes {
+            Some(limit) => limit,
+            None => rars_rs::rewrite_payload_bytes(&payloads).map_err(js_error)?,
+        };
+        let options = read_options(rewrite.password.as_deref(), &rewrite.settings)?;
+        let mut builder = self.inner.clone();
+        let raised = std::cell::RefCell::new(None);
+        let (first, later) = rewrite
+            .archives
+            .split_first()
+            .expect("a set has a first volume");
+        let staged = first.with_rewrite_payloads(
+            later,
+            &payloads,
+            options,
+            &rars_rs::RewriteStaging {
+                directory: std::path::PathBuf::new(),
+                max_staged_bytes: limit,
+            },
+            progress::active().then(|| {
+                std::sync::Arc::new(progress::WriteReporter)
+                    as std::sync::Arc<dyn rars_rs::WriteProgress>
+            }),
+            &mut builder,
+            |builder| {
+                write(builder).map_err(|error| {
+                    *raised.borrow_mut() = Some(error);
+                    rars_rs::Error::WriterFailure("rewrite output failed")
+                })
+            },
+        );
+        if let Some(error) = raised.into_inner() {
+            return Err(error);
+        }
+        staged.map_err(js_error)
+    }
+
+    fn to_bytes_reporting(&self, builder: &Builder) -> Result<js_sys::Uint8Array, JsValue> {
         if self.resources.max_memory_bytes().is_none()
-            && self.inner.format().family() != rars_rs::ArchiveFamily::Rar50Plus
+            && builder.format().family() != rars_rs::ArchiveFamily::Rar50Plus
         {
-            let bytes = self
-                .inner
+            let bytes = builder
                 .to_bytes_with_progress(Self::reporter())
                 .map_err(js_error)?;
             return Ok(js_sys::Uint8Array::from(bytes.as_slice()));
         }
-        let output = self
-            .inner
+        let output = builder
             .to_output(&self.resources, Self::reporter())
             .map_err(js_error)?;
         output
@@ -1497,20 +1642,18 @@ impl RarBuilder {
             .map_err(js_error)
     }
 
-    fn to_volumes_reporting(&self) -> Result<js_sys::Array, JsValue> {
+    fn to_volumes_reporting(&self, builder: &Builder) -> Result<js_sys::Array, JsValue> {
         if self.resources.max_memory_bytes().is_none()
-            && self.inner.format().family() != rars_rs::ArchiveFamily::Rar50Plus
+            && builder.format().family() != rars_rs::ArchiveFamily::Rar50Plus
         {
-            return Ok(self
-                .inner
+            return Ok(builder
                 .build_volumes(Self::reporter())
                 .map_err(js_error)?
                 .iter()
                 .map(|volume| js_sys::Uint8Array::from(volume.as_slice()))
                 .collect());
         }
-        let volumes = self
-            .inner
+        let volumes = builder
             .to_volume_output(&self.resources, Self::reporter())
             .map_err(js_error)?;
         volumes

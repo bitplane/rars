@@ -52,6 +52,12 @@ export class RarArchive {
 
 export class RarWriter {
   constructor(options?: RarWriterOptions);
+  /**
+   * Every member of `archive`, a volume set included, to edit and write again. `preserve`
+   * (default true) keeps the source's format, settings and encryption; `false` writes RAR 5
+   * at level 3. Data is decoded and verified when written, `maxStagedBytes` at most at once.
+   */
+  static fromArchive(archive: RarArchive, options?: ReadOptions & { preserve?: boolean; maxStagedBytes?: number }): Promise<RarWriter>;
   readonly names: readonly RarName[];
   add(name: RarName, data: RarData, options?: RarEntryOptions): this;
   addFile(name: RarName, path: NodePath, options?: RarEntryOptions): this;

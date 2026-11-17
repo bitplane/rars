@@ -417,6 +417,43 @@ export function createApi(runtime) {
       this._closed = false;
     }
 
+    /**
+     * A writer holding every member of `archive`, a volume set included, to edit and write
+     * again, as Python's RarBuilder.from_archive(). `preserve` (default true) keeps the
+     * source's format, settings and encryption, and refuses one whose settings can't be
+     * kept; `preserve: false` writes RAR 5 at level 3. Members' data is decoded and
+     * verified when the archive is written, so the source must still be readable then;
+     * `maxStagedBytes` caps the decoded data held at once.
+     */
+    static async fromArchive(archive, options) {
+      if (!(archive instanceof RarArchive)) throw new TypeError("archive must be a RarArchive");
+      assertOpen(archive);
+      const operation = operationOptions(options);
+      const preserve = options?.preserve ?? true;
+      if (typeof preserve !== "boolean") throw new TypeError("preserve must be a boolean");
+      const maxStagedBytes = options?.maxStagedBytes;
+      if (maxStagedBytes !== undefined && !(Number.isSafeInteger(maxStagedBytes) && maxStagedBytes >= 0)) {
+        throw new RangeError("maxStagedBytes must be a non-negative safe integer");
+      }
+      const rewrite = {
+        sources: archive._sources,
+        password: operation.password ?? archive._password,
+        readOptions: archive._readOptions(operation),
+        preserve,
+        maxStagedBytes,
+      };
+      const plan = await runtime.request("rewritePlan", { rewrite }, operation);
+      const writer = new RarWriter();
+      writer._rewrite = rewrite;
+      const utf8 = new TextDecoder("utf-8", { fatal: true });
+      writer._entries = plan.names.map((stored, index) => {
+        let name;
+        try { name = utf8.decode(stored); } catch { name = Uint8Array.from(stored); }
+        return { name, kind: "archived", id: plan.ids[index], stored };
+      });
+      return writer;
+    }
+
     add(name, data, options) {
       assertOpen(this);
       return this.#queue({
@@ -497,6 +534,7 @@ export function createApi(runtime) {
       return runtime.request(operation, {
         writerOptions: this._options,
         entries: this._entries.slice(),
+        rewrite: this._rewrite,
         ...extra,
       }, operationOptions(options));
     }
@@ -529,6 +567,7 @@ export function createApi(runtime) {
       if (this._closed) return;
       this._closed = true;
       this._entries = [];
+      this._rewrite = undefined;
     }
   }
 

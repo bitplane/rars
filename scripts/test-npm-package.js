@@ -196,6 +196,42 @@ await check("checkPassword finds the right candidate and opens the archive", asy
   await assert.rejects(checkPassword(new Uint8Array(1), [1]), TypeError);
 });
 
+await check("RarWriter.fromArchive carries members over, and edits before writing", async () => {
+  const source = await new RarWriter({ level: 3, comment: "set comment" })
+    .add("keep.txt", HELLO, { mtime: new Date("2020-01-02T03:04:05Z"), comment: "member comment" })
+    .add("drop.txt", "gone")
+    .addDirectory("dir")
+    .addSymlink("dir/link", "../keep.txt")
+    .bytes();
+  const archive = await RarArchive.open(source);
+  const writer = await RarWriter.fromArchive(archive);
+  assert.deepEqual(writer.names, ["keep.txt", "drop.txt", "dir", "dir/link"]);
+  const bytes = await writer.remove("drop.txt").rename("keep.txt", "kept.txt").add("new.txt", "new").bytes();
+  const result = await RarArchive.open(bytes);
+  assert.deepEqual(result.entries.map((entry) => entry.name), ["kept.txt", "dir", "dir/link", "new.txt"]);
+  assert.deepEqual(await result.get("kept.txt").bytes(), HELLO);
+  assert.equal(result.get("kept.txt").mtime.toISOString(), "2020-01-02T03:04:05.000Z");
+  assert.equal(new TextDecoder().decode(await result.readComment()), "set comment");
+  assert.equal(new TextDecoder().decode(await result.get("kept.txt").readComment()), "member comment");
+  assert.equal(new TextDecoder().decode(await result.get("dir/link").readLink()), "../keep.txt");
+  // An encrypted source is written encrypted again with the same password.
+  const secret = await new RarWriter({ password: "pw" }).add("s.txt", HELLO).bytes();
+  const again = await (await RarWriter.fromArchive(await RarArchive.open(secret, { password: "pw" }))).bytes();
+  await assert.rejects((await RarArchive.open(again)).get("s.txt").bytes());
+  assert.deepEqual(await (await RarArchive.open(again, { password: "pw" })).get("s.txt").bytes(), HELLO);
+  // A volume set is read whole, a member split across volumes included, and written as one archive.
+  const big = new Uint8Array(200 * 1024).map((_, index) => (index * 7919) % 251);
+  const parts = await new RarWriter({ level: 0, volumeSize: 64 * 1024 }).add("big.bin", big).add("small.txt", HELLO).volumes();
+  assert.ok(parts.length > 2);
+  const joined = await (await RarWriter.fromArchive(await RarArchive.open(parts), { preserve: false })).bytes();
+  const whole = await RarArchive.open(joined);
+  assert.deepEqual(whole.entries.map((entry) => entry.name), ["big.bin", "small.txt"]);
+  assert.deepEqual(await whole.get("big.bin").bytes(), big);
+  // Too small a staging limit refuses the write.
+  const capped = await RarWriter.fromArchive(archive, { maxStagedBytes: 1 });
+  await assert.rejects(capped.bytes(), (error) => error.code === "RESOURCE_LIMIT");
+});
+
 await check("Node extraction writes links, and skips one that could leave the directory", async () => {
   const bytes = await new RarWriter({ level: 0 })
     .add("data/file.txt", HELLO)

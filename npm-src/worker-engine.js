@@ -115,9 +115,23 @@ async function openArchive(wasm, sources, password, platform, options) {
     : wasm.RarFile.openVolumes(volumes, password, options);
 }
 
+// The builder that writes `rewrite`'s archive again, from its sources.
+async function rewriteBuilder(wasm, rewrite, platform) {
+  const archive = await openArchive(wasm, rewrite.sources, rewrite.password, platform, rewrite.readOptions);
+  try {
+    return wasm.RarBuilder.fromArchive(archive, rewrite.preserve, rewrite.password,
+      rewrite.readOptions, rewrite.maxStagedBytes);
+  } finally {
+    archive.free();
+  }
+}
+
+const sameBytes = (left, right) =>
+  left.length === right.length && left.every((value, index) => value === right[index]);
+
 async function build(wasm, payload, platform, volumes, report) {
   const options = payload.writerOptions;
-  const builder = new wasm.RarBuilder({
+  const builder = payload.rewrite ? await rewriteBuilder(wasm, payload.rewrite, platform) : new wasm.RarBuilder({
     format: options.version,
     compression: options.level,
     store: options.level === 0,
@@ -131,7 +145,18 @@ async function build(wasm, payload, platform, volumes, report) {
   });
   try {
     const bytes = (value) => typeof value === "string" ? new TextEncoder().encode(value) : value;
+    if (payload.rewrite) {
+      // The archive's own members keep their ids through the writer's edits.
+      const kept = new Map(payload.entries.filter((entry) => entry.kind === "archived")
+        .map((entry) => [entry.id, entry]));
+      for (const id of builder.memberIds()) {
+        const entry = kept.get(id);
+        if (entry === undefined) builder.removeId(id);
+        else if (!sameBytes(bytes(entry.name), entry.stored)) builder.renameId(id, bytes(entry.name));
+      }
+    }
     for (const entry of payload.entries) {
+      if (entry.kind === "archived") continue;
       const entryOptions = { ...entry.options };
       if (entry.kind === "directory") {
         builder.addDirectory(bytes(entry.name), entryOptions);
@@ -160,7 +185,7 @@ const PHASES = {
   open: "reading", read: "reading", readMany: "reading", readComment: "reading",
   readMemberComment: "reading", readLink: "reading", extract: "extracting",
   test: "testing", build: "compressing", buildVolumes: "compressing", writeTo: "compressing",
-  repair: "repairing", probe: "reading", checkPassword: "testing",
+  repair: "repairing", probe: "reading", checkPassword: "testing", rewritePlan: "reading",
 };
 
 // Bytes the call produced, where its result is bytes.
@@ -253,6 +278,13 @@ export function startWorker(port, wasm, platform) {
         if (payload.output !== undefined) {
           await platform.writeAtomic(payload.output, result.data, payload.overwrite);
           result.data = undefined;
+        }
+      } else if (operation === "rewritePlan") {
+        const builder = await rewriteBuilder(wasm, payload.rewrite, platform);
+        try {
+          result = { names: builder.rawNames(), ids: Array.from(builder.memberIds()) };
+        } finally {
+          builder.free();
         }
       } else if (operation === "build") {
         result = await build(wasm, payload, platform, false, report);
