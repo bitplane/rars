@@ -1,6 +1,4 @@
-use pyo3::exceptions::{
-    PyIsADirectoryError, PyKeyError, PyNotImplementedError, PyOSError, PyTypeError, PyValueError,
-};
+use pyo3::exceptions::{PyIsADirectoryError, PyKeyError, PyOSError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
@@ -1022,12 +1020,11 @@ impl RarFile {
     /// `options` cover opening and are the defaults for every later call; a call's own
     /// `options` replace them whole. `cancellation` covers opening alone.
     #[new]
-    #[pyo3(signature = (source, mode = "r", *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
+    #[pyo3(signature = (source, *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn new(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
-        mode: &str,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
@@ -1036,11 +1033,6 @@ impl RarFile {
     ) -> PyResult<Self> {
         let call_options = ReadOptions::for_call(options, None, cancellation)?;
         let options = call_options.as_ref();
-        if mode != "r" {
-            return Err(PyNotImplementedError::new_err(
-                "RarFile currently opens archives for reading; use RarBuilder to create or rewrite archives",
-            ));
-        }
         let password = py_password(password)?;
         let volumes = stored_volumes(
             volumes,
@@ -2502,16 +2494,7 @@ impl RarBuilder {
                 whole: OnceLock::new(),
                 closed: AtomicBool::new(false),
             },
-            Err(_) => RarFile::new(
-                py,
-                source,
-                "r",
-                password,
-                options,
-                cancellation,
-                false,
-                None,
-            )?,
+            Err(_) => RarFile::new(py, source, password, options, cancellation, false, None)?,
         };
         let password = archive.password.clone();
         if preserve {

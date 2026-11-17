@@ -249,7 +249,6 @@ class RarFile:
     def __new__(
         cls,
         source: _Source,
-        mode: Literal["r"] = "r",
         *,
         password: _Password | None = None,
         options: ReadOptions | None = None,
