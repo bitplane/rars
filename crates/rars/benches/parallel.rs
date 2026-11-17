@@ -189,21 +189,35 @@ fn bench_parallel_encrypted_open(_: &mut Criterion) {}
 
 #[cfg(feature = "encryption")]
 fn bench_parallel_encrypted_open(c: &mut Criterion) {
-    // Each member gets its own salt, so opening derives one key per member.
-    let mut builder = Builder::new(ArchiveVersion::Rar50)
-        .store(true)
-        .password(Some(b"password".to_vec()));
-    for index in 0..200 {
+    // A write shares one salt across its members, so splice 200 one-member
+    // writes together to make opening derive one key per member.
+    let single = |index: u32| {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .store(true)
+            .password(Some(b"password".to_vec()));
         builder
             .add_bytes(
                 format!("file-{index:03}.bin").into_bytes(),
-                payload(4096, index as u32),
+                payload(4096, index),
                 None,
                 None,
             )
             .unwrap();
+        builder.to_bytes().unwrap()
+    };
+    let span = |bytes: &[u8]| {
+        let archive = Archive::parse(bytes).unwrap();
+        let file = archive.files().next().unwrap();
+        file.block.offset..file.block.data_range.end
+    };
+    let first = single(0);
+    let end = span(&first).end;
+    let mut archive_bytes = first[..end].to_vec();
+    for index in 1..200 {
+        let part = single(index);
+        archive_bytes.extend_from_slice(&part[span(&part)]);
     }
-    let archive_bytes = builder.to_bytes().unwrap();
+    archive_bytes.extend_from_slice(&first[end..]);
     let options = ArchiveReadOptions::with_password(b"password");
 
     let mut group = c.benchmark_group("parallel_rar50_encrypted_open");

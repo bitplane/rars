@@ -1435,6 +1435,115 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "encryption")]
+    fn write_encrypted(header_encryption: bool, volume_size: Option<usize>) -> Vec<Vec<u8>> {
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .store(true)
+            .password(Some(b"password".to_vec()))
+            .header_encryption(header_encryption)
+            .volume_size(volume_size);
+        for name in ["a", "b", "c", "d", "e", "f"] {
+            builder
+                .add_bytes(
+                    name.as_bytes().to_vec(),
+                    name.repeat(300).into_bytes(),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        match volume_size {
+            Some(_) => builder.build_volumes(None).unwrap(),
+            None => vec![builder
+                .comment(Some(b"comment".to_vec()))
+                .archive_comment_password(Some(b"password".to_vec()))
+                .to_bytes()
+                .unwrap()],
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    fn encrypted_writes() -> [(&'static str, bool, Option<usize>); 4] {
+        [
+            ("plain headers", false, None),
+            ("encrypted headers", true, None),
+            ("split", false, Some(1024)),
+            ("split with encrypted headers", true, Some(1024)),
+        ]
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn one_password_derives_one_key_per_write() {
+        let derivations = || crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get);
+        for (case, header_encryption, volume_size) in encrypted_writes() {
+            let before = derivations();
+            write_encrypted(header_encryption, volume_size);
+            assert_eq!(derivations() - before, 1, "{case}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn members_share_the_archive_salt_and_draw_fresh_ivs() {
+        for (case, header_encryption, volume_size) in encrypted_writes() {
+            let parts = write_encrypted(header_encryption, volume_size);
+            assert_eq!(parts.len() > 1, volume_size.is_some(), "{case}");
+            let volumes = parts
+                .iter()
+                .map(|part| super::super::Archive::parse_with_password(part, Some(b"password")))
+                .collect::<crate::Result<Vec<_>>>()
+                .unwrap();
+            let mut records = std::collections::BTreeMap::new();
+            for volume in &volumes {
+                for file in volume.files().chain(volume.services()) {
+                    if let Some(encryption) = &file.encryption {
+                        records.insert(file.name.clone(), (encryption.salt, encryption.iv));
+                    }
+                }
+            }
+            // Six members, plus the encrypted comment where the write can carry one.
+            let blocks = 6 + usize::from(volume_size.is_none());
+            assert_eq!(records.len(), blocks, "{case}");
+            let salts = records.values().map(|(salt, _)| *salt);
+            let ivs = records.values().map(|(_, iv)| *iv);
+            assert_eq!(
+                salts.collect::<std::collections::BTreeSet<_>>().len(),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                ivs.collect::<std::collections::BTreeSet<_>>().len(),
+                blocks,
+                "{case}"
+            );
+            if header_encryption {
+                // The archive encryption header's salt follows its CRC and its one-byte size,
+                // type, flags, version, encryption flags and KDF count fields.
+                let (salt, _) = records.values().next().unwrap();
+                for part in &parts {
+                    assert_eq!(&part[18..34], salt, "{case}");
+                }
+            }
+
+            let mut extracted = 0;
+            super::super::extract_volumes_to(
+                &volumes,
+                crate::ArchiveReadOptions::with_password(b"password"),
+                |_| {
+                    extracted += 1;
+                    Ok(Box::new(std::io::sink()))
+                },
+            )
+            .unwrap();
+            assert_eq!(extracted, 6, "{case}");
+            assert!(
+                super::super::Archive::parse_with_password(&parts[0], Some(b"wrong")).is_err(),
+                "{case}"
+            );
+        }
+    }
+
     #[test]
     #[cfg(feature = "encryption")]
     fn header_encryption_rejects_conflicting_member_password_before_output() {
