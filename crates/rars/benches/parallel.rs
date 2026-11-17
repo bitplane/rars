@@ -184,6 +184,46 @@ fn bench_parallel_extraction(c: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(not(feature = "encryption"))]
+fn bench_parallel_encrypted_open(_: &mut Criterion) {}
+
+#[cfg(feature = "encryption")]
+fn bench_parallel_encrypted_open(c: &mut Criterion) {
+    // Each member gets its own salt, so opening derives one key per member.
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .password(Some(b"password".to_vec()));
+    for index in 0..200 {
+        builder
+            .add_bytes(
+                format!("file-{index:03}.bin").into_bytes(),
+                payload(4096, index as u32),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let archive_bytes = builder.to_bytes().unwrap();
+    let options = ArchiveReadOptions::with_password(b"password");
+
+    let mut group = c.benchmark_group("parallel_rar50_encrypted_open");
+    for threads in thread_counts() {
+        let pool = thread_pool(threads);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(thread_label(threads)),
+            &threads,
+            |b, _| {
+                b.iter(|| {
+                    pool.install(|| {
+                        black_box(Archive::parse_with_options(&archive_bytes, options).unwrap())
+                    })
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
 fn bench_setup(c: &mut Criterion) {
     let fixture = ArchiveFixture::new(MEMBER_COUNT, MEMBER_SIZE);
     c.bench_function("rar50_input_copy_and_entry_setup", |b| {
@@ -241,6 +281,6 @@ fn bench_candidate_pricing(c: &mut Criterion) {
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_parallel_compression, bench_parallel_extraction, bench_candidate_pricing, bench_setup
+    targets = bench_parallel_compression, bench_parallel_extraction, bench_parallel_encrypted_open, bench_candidate_pricing, bench_setup
 );
 criterion_main!(benches);

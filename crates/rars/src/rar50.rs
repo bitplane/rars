@@ -1953,6 +1953,69 @@ fn attach_service_crypto(
     attach_file_crypto(service, password, key_cache)
 }
 
+/// Checks the first key before fanning out, so a wrong password costs one derivation.
+fn attach_crypto(
+    blocks: &mut [Block],
+    headers: &[(usize, usize)],
+    options: crate::ArchiveReadOptions<'_>,
+    key_cache: &KeyCache,
+) -> Result<()> {
+    let password = options.password;
+    let mut warmed = false;
+    for &(index, offset) in headers {
+        let attached = match &mut blocks[index] {
+            Block::File(file) => {
+                attach_file_crypto(file, password, key_cache).map(|()| file.crypto.is_some())
+            }
+            Block::Service(service) => attach_service_crypto(service, password, key_cache)
+                .map(|()| service.crypto.is_some()),
+            _ => continue,
+        }
+        .map_err(|error| error.at_archive_offset(offset))?;
+        if !warmed && attached {
+            warmed = true;
+            #[cfg(feature = "encryption")]
+            derive_pending_keys(blocks, options, key_cache)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "encryption")]
+fn derive_pending_keys(
+    blocks: &[Block],
+    options: crate::ArchiveReadOptions<'_>,
+    key_cache: &KeyCache,
+) -> Result<()> {
+    let Some(password) = options.password else {
+        return Ok(());
+    };
+    let mut salts: Vec<_> = blocks
+        .iter()
+        .filter_map(|block| match block {
+            Block::File(file) => Some(file),
+            Block::Service(service) if service.name != b"QO" => Some(service),
+            _ => None,
+        })
+        .filter(|header| header.encrypted && header.crypto.is_none())
+        .filter_map(|header| header.encryption.as_ref())
+        .filter(|encryption| encryption.version == 0)
+        .map(|encryption| (encryption.salt, encryption.kdf_count))
+        .collect();
+    salts.sort_unstable();
+    salts.dedup();
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
+    // No may_nest: opening never runs inside a fan-out item that can block.
+    for window in salts.chunks_mut(crate::parallel::default_window()) {
+        options.check_cancelled()?;
+        // Failures stay in the cache for the in-order attach to report.
+        crate::parallel::for_each_mut(window, |_, &mut (salt, kdf_count)| {
+            let _ = key_cache.rar50(password, salt, kdf_count);
+        });
+    }
+    Ok(())
+}
+
 #[cfg(feature = "encryption")]
 pub(crate) fn map_rar50_crypto_error(error: crate::crypto::rar50::Error) -> Error {
     match error {
@@ -2043,57 +2106,64 @@ where
     pos = first.next_offset;
 
     let mut blocks = Vec::new();
-    while pos < archive_len {
-        let parsed = if let Some(keys) = &header_keys {
-            read_encrypted_block(pos, keys, &mut budget).map_err(|error| at_offset(error, pos))?
-        } else {
-            read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?
-        };
-        let next = parsed.next_offset;
-        match parsed.block.header_type {
-            HEAD_FILE => {
-                let mut file =
-                    parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
-                attach_file_crypto(&mut file, password, key_cache)
-                    .map_err(|error| at_offset(error, pos))?;
-                blocks.push(Block::File(file));
+    // Keys attach after the walk so distinct salts can derive side by side; a
+    // header error found later still loses to an earlier member's key error.
+    let mut crypto_headers = Vec::new();
+    let walked = (|| {
+        while pos < archive_len {
+            let parsed = if let Some(keys) = &header_keys {
+                read_encrypted_block(pos, keys, &mut budget)
+                    .map_err(|error| at_offset(error, pos))?
+            } else {
+                read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?
+            };
+            let next = parsed.next_offset;
+            match parsed.block.header_type {
+                HEAD_FILE => {
+                    let file =
+                        parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
+                    crypto_headers.push((blocks.len(), pos));
+                    blocks.push(Block::File(file));
+                }
+                HEAD_SERVICE => {
+                    let service =
+                        parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
+                    crypto_headers.push((blocks.len(), pos));
+                    blocks.push(Block::Service(service));
+                }
+                HEAD_CRYPT => {
+                    return Err(Error::UnsupportedFeature {
+                        version: crate::version::ArchiveVersion::Rar50,
+                        feature: "RAR 5 encrypted headers",
+                    });
+                }
+                HEAD_END => {
+                    main.rewrite_metadata_complete &= next == archive_len;
+                    // A block with no room for the vint reads as no flags rather
+                    // than as a broken archive. Hand-built and truncated archives
+                    // do turn up with an empty end block, and the field only says
+                    // whether to look for another volume.
+                    let flags = read_vint_at(
+                        &parsed.header,
+                        parsed.type_specific_range.start,
+                        parsed.type_specific_range.end,
+                    )
+                    .map(|(flags, _)| flags)
+                    .unwrap_or(0);
+                    blocks.push(Block::End(EndHeader {
+                        block: parsed.block,
+                        flags,
+                    }));
+                    break;
+                }
+                _ => blocks.push(Block::Unknown(parsed.block)),
             }
-            HEAD_SERVICE => {
-                let mut service =
-                    parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
-                attach_service_crypto(&mut service, password, key_cache)
-                    .map_err(|error| at_offset(error, pos))?;
-                blocks.push(Block::Service(service));
-            }
-            HEAD_CRYPT => {
-                return Err(Error::UnsupportedFeature {
-                    version: crate::version::ArchiveVersion::Rar50,
-                    feature: "RAR 5 encrypted headers",
-                });
-            }
-            HEAD_END => {
-                main.rewrite_metadata_complete &= next == archive_len;
-                // A block with no room for the vint reads as no flags rather
-                // than as a broken archive. Hand-built and truncated archives
-                // do turn up with an empty end block, and the field only says
-                // whether to look for another volume.
-                let flags = read_vint_at(
-                    &parsed.header,
-                    parsed.type_specific_range.start,
-                    parsed.type_specific_range.end,
-                )
-                .map(|(flags, _)| flags)
-                .unwrap_or(0);
-                blocks.push(Block::End(EndHeader {
-                    block: parsed.block,
-                    flags,
-                }));
-                break;
-            }
-            _ => blocks.push(Block::Unknown(parsed.block)),
+            pos = next;
         }
-        pos = next;
-    }
+        Ok(())
+    })();
+    attach_crypto(&mut blocks, &crypto_headers, options, key_cache)?;
+    walked?;
 
     main.rewrite_metadata_complete &= matches!(blocks.last(), Some(Block::End(_)));
     Ok((main, blocks))
@@ -4969,6 +5039,123 @@ fn redirection_preservation_refuses_inconsistent_header_metadata() {
                 Err(Error::InvalidArgument("unsupported redirection metadata"))
             );
             assert!(output.is_empty());
+        }
+    }
+}
+
+#[cfg(all(test, feature = "encryption", feature = "write"))]
+mod open_key_tests {
+    use super::*;
+
+    fn encrypted(password: &[u8], names: &[&str]) -> Vec<u8> {
+        let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50)
+            .store(true)
+            .password(Some(password.to_vec()));
+        for name in names {
+            builder
+                .add_bytes(name.as_bytes().to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+        }
+        builder.to_bytes().unwrap()
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    mod pool {
+        use super::*;
+
+        fn derivations() -> usize {
+            crate::crypto::rar50::DERIVATIONS.with(std::cell::Cell::get)
+        }
+
+        fn derivations_opening(bytes: &[u8]) -> usize {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            let before: usize = pool.broadcast(|_| derivations()).into_iter().sum();
+            let archive = pool
+                .install(|| {
+                    Archive::parse_with_options(
+                        bytes,
+                        crate::ArchiveReadOptions::with_password(b"password"),
+                    )
+                })
+                .unwrap();
+            assert!(archive.files().all(|file| file.crypto.is_some()));
+            pool.broadcast(|_| derivations()).into_iter().sum::<usize>() - before
+        }
+
+        #[test]
+        fn opening_derives_each_distinct_salt_once() {
+            let names = ["a", "b", "c", "d", "e", "f", "g", "h"];
+            assert_eq!(derivations_opening(&encrypted(b"password", &names)), 8);
+
+            let single = encrypted(b"password", &["a"]);
+            let archive = Archive::parse(&single).unwrap();
+            let file = archive.files().next().unwrap();
+            let member = &single[file.block.offset..file.block.data_range.end];
+            let mut shared = single[..file.block.data_range.end].to_vec();
+            shared.extend_from_slice(member);
+            shared.extend_from_slice(member);
+            shared.extend_from_slice(&single[file.block.data_range.end..]);
+            assert_eq!(derivations_opening(&shared), 1);
+        }
+
+        #[test]
+        fn opening_leaves_all_but_the_first_key_to_the_pool() {
+            if rayon::current_num_threads() < 2 {
+                return;
+            }
+            // Four salts after the first fill two whole windows, so none runs alone on the caller.
+            let bytes = encrypted(b"password", &["a", "b", "c", "d", "e"]);
+            let on_caller = std::thread::spawn(move || {
+                let before = derivations();
+                Archive::parse_with_options(
+                    &bytes,
+                    crate::ArchiveReadOptions::with_password(b"password").with_threads(2),
+                )
+                .unwrap();
+                derivations() - before
+            })
+            .join()
+            .unwrap();
+            assert_eq!(on_caller, 1);
+        }
+    }
+
+    #[test]
+    fn a_wrong_password_reports_the_first_failing_member_in_archive_order() {
+        let right_bytes = encrypted(b"password", &["a"]);
+        let right = Archive::parse(&right_bytes).unwrap();
+        let wrong_bytes = encrypted(b"other", &["b", "c", "d", "e"]);
+        let wrong = Archive::parse(&wrong_bytes).unwrap();
+        let span = |file: &FileHeader| file.block.offset..file.block.data_range.end;
+        let first = right.files().next().unwrap();
+        let mut bytes = right_bytes[..span(first).end].to_vec();
+        let first_wrong = bytes.len();
+        for file in wrong.files() {
+            bytes.extend_from_slice(&wrong_bytes[span(file)]);
+        }
+        let end = wrong.blocks.last().unwrap();
+        let Block::End(end) = end else {
+            panic!("expected end block")
+        };
+        bytes.extend_from_slice(&wrong_bytes[end.block.offset..]);
+
+        let error = Archive::parse_with_options(
+            &bytes,
+            crate::ArchiveReadOptions::with_password(b"password"),
+        )
+        .unwrap_err();
+        match error {
+            Error::AtArchiveOffset { offset, source } => {
+                assert_eq!(offset, first_wrong);
+                assert!(matches!(*source, Error::WrongPasswordOrCorruptData));
+            }
+            other => panic!("unexpected error {other:?}"),
         }
     }
 }
