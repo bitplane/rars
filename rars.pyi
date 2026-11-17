@@ -197,9 +197,12 @@ class WriterResources:
         cls,
         *,
         max_memory_bytes: int | None = None,
+        max_workspace_bytes: int | None = None,
     ) -> Self: ...
     @property
     def max_memory_bytes(self) -> int | None: ...
+    @property
+    def max_workspace_bytes(self) -> int | None: ...
 
 @final
 class RarInfo:
