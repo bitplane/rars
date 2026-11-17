@@ -79,3 +79,22 @@ def test_relative_path_survives_working_directory_change(tmp_path, monkeypatch, 
     assert (elsewhere / "out" / "member").read_bytes() == b"payload"
     rewritten = rars.RarFile(rewrite.to_bytes())
     assert rewritten.read("member") == b"payload"
+
+
+def test_a_closed_archive_refuses_reads_like_a_closed_file(tmp_path):
+    builder = rars.RarBuilder(store=True)
+    builder.add_bytes(b"payload", "file")
+    path = tmp_path / "archive.rar"
+    builder.write(path)
+    with rars.RarFile(path) as archive:
+        assert not archive.closed
+        assert archive.namelist() == ["file"]
+    assert archive.closed
+    for call in (archive.namelist, archive.infolist, archive.testrar, lambda: archive.read("file"),
+                 lambda: archive.extractall(tmp_path / "out"), lambda: "file" in archive,
+                 lambda: len(archive), lambda: list(archive), lambda: archive.comment,
+                 lambda: rars.RarBuilder.from_archive(archive)):
+        with pytest.raises(ValueError, match="closed archive"):
+            call()
+    archive.close()
+    assert archive.family == rars.ArchiveFamily.RAR50_PLUS

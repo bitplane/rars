@@ -907,6 +907,7 @@ struct RarFile {
     first: SetListing,
     /// The whole set, listed the first time a call needs a member past the first volume.
     whole: OnceLock<SetListing>,
+    closed: AtomicBool,
 }
 
 struct SetListing {
@@ -1023,6 +1024,7 @@ impl RarFile {
     }
 
     fn namelist(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        self.check_open()?;
         Ok(self
             .listing(py)?
             .infos
@@ -1032,10 +1034,12 @@ impl RarFile {
     }
 
     fn infolist(&self, py: Python<'_>) -> PyResult<Vec<RarInfo>> {
+        self.check_open()?;
         Ok(self.listing(py)?.infos.clone())
     }
 
     fn getinfo(&self, py: Python<'_>, name: &Bound<'_, PyAny>) -> PyResult<RarInfo> {
+        self.check_open()?;
         let index = self.resolve_index(py, name)?;
         Ok(self.info_at(py, index)?.clone())
     }
@@ -1053,6 +1057,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
+        self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1098,6 +1103,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
+        self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1133,6 +1139,7 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
     ) -> PyResult<PathBuf> {
+        self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1224,6 +1231,7 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
     ) -> PyResult<Vec<PathBuf>> {
+        self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1295,6 +1303,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
+        self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
@@ -1348,6 +1357,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
+        self.check_open()?;
         let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
@@ -1373,6 +1383,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
+        self.check_open()?;
         let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1395,6 +1406,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<u8>> {
+        self.check_open()?;
         let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1435,6 +1447,7 @@ impl RarFile {
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<HashMap<String, i128>> {
+        self.check_open()?;
         let call_options = self.call_options(options, None, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1458,12 +1471,14 @@ impl RarFile {
 
     /// Metadata/settings the current rewrite implementation cannot preserve.
     /// This is a conservative metadata check, not a payload integrity test.
-    fn rewrite_preservation_issues(&self) -> Vec<String> {
-        self.archive.rewrite_preservation_issues()
+    fn rewrite_preservation_issues(&self) -> PyResult<Vec<String>> {
+        self.check_open()?;
+        Ok(self.archive.rewrite_preservation_issues())
     }
 
     /// Stops at the first volume missing or unreadable rather than raising, so clean-up gets what is there.
     fn volume_paths(&self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
+        self.check_open()?;
         let Some(first_path) = &self.path else {
             return Err(PyValueError::new_err(
                 "an archive opened from bytes or a file object has no volume paths",
@@ -1548,20 +1563,34 @@ impl RarFile {
         _exc: Option<&Bound<'_, PyAny>>,
         _tb: Option<&Bound<'_, PyAny>>,
     ) -> bool {
+        self.close();
         false
     }
 
+    /// Later reads raise `ValueError`, as a closed file's do. Closing again does nothing.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Relaxed);
+    }
+
+    #[getter]
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Relaxed)
+    }
+
     fn __iter__(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        self.check_open()?;
         let list = PyList::new(py, self.listing(py)?.infos.clone())?;
         Ok(list.call_method0("__iter__")?.unbind())
     }
 
     fn __len__(&self, py: Python<'_>) -> PyResult<usize> {
+        self.check_open()?;
         Ok(self.listing(py)?.infos.len())
     }
 
     /// Takes what `getinfo` takes; a `RarInfo` from another archive is not in this one.
     fn __contains__(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<bool> {
+        self.check_open()?;
         if let Ok(info) = member.extract::<PyRef<'_, RarInfo>>() {
             return Ok(info
                 .archive_identity
@@ -1579,6 +1608,13 @@ impl RarFile {
 }
 
 impl RarFile {
+    fn check_open(&self) -> PyResult<()> {
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(PyValueError::new_err("I/O operation on closed archive"));
+        }
+        Ok(())
+    }
+
     /// A first-volume member never waits for later volumes; its split sizes are whole once the set is listed.
     fn info_at(&self, py: Python<'_>, index: usize) -> PyResult<&RarInfo> {
         let listing = match self.whole.get() {
@@ -2136,6 +2172,7 @@ impl RarFile {
             first_volume_only: false,
             first: SetListing::new(infos),
             whole: OnceLock::new(),
+            closed: AtomicBool::new(false),
         })
     }
 }
@@ -2385,6 +2422,7 @@ impl RarBuilder {
         max_staged_bytes: Option<u64>,
     ) -> PyResult<Self> {
         let archive = match source.extract::<PyRef<'_, RarFile>>() {
+            Ok(archive) if archive.closed() => return Err(archive.check_open().unwrap_err()),
             Ok(archive) => RarFile {
                 identity: archive.identity.clone(),
                 encoding: options.map_or(archive.encoding, |options| options.encoding),
@@ -2406,6 +2444,7 @@ impl RarBuilder {
                 first_volume_only: archive.first_volume_only,
                 first: SetListing::new(archive.first.infos.clone()),
                 whole: OnceLock::new(),
+                closed: AtomicBool::new(false),
             },
             Err(_) => RarFile::new(
                 py,
@@ -5342,6 +5381,7 @@ mod tests {
                     volumes: None,
                     first_volume_only: false,
                     whole: OnceLock::new(),
+                    closed: AtomicBool::new(false),
                     archive,
                     path: None,
                     password: None,
@@ -5573,6 +5613,7 @@ mod tests {
                             first_volume_only: false,
                             first: SetListing::new(Vec::new()),
                             whole: OnceLock::new(),
+                            closed: AtomicBool::new(false),
                         },
                     )
                     .unwrap();
