@@ -3283,8 +3283,11 @@ fn write_encrypted_header(out: &mut dyn Write, header: &[u8], key: &HeaderKey) -
     }
 }
 
-/// Larger sizes need the FHD_LARGE high halves.
+/// Larger sizes need the FHD_LARGE high halves; 2.9-format members take them sooner.
 const MAX_SHORT_SIZE: u64 = u32::MAX as u64;
+
+/// RAR 3.0 onwards gives a 2.9-format member past this the high size fields, zero until 4 GiB.
+const RAR29_LARGE_FROM: u64 = 1 << 31;
 
 /// The format spec gives RAR 2.0 members past this UNP_VER 26; RAR 2.9 members keep 29.
 const MAX_RAR20_SIZE: u64 = i32::MAX as u64;
@@ -3335,7 +3338,12 @@ struct FileRecord<'a> {
 
 fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
-    let large = record.packed_size > MAX_SHORT_SIZE || record.unpacked_size > MAX_SHORT_SIZE;
+    let large = record.packed_size > MAX_SHORT_SIZE
+        || record.unpacked_size > MAX_SHORT_SIZE
+        || (matches!(
+            record.target,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        ) && record.unpacked_size > RAR29_LARGE_FROM);
     if large && record.target == ArchiveVersion::Rar15 {
         return Err(RAR15_LARGE_MEMBER);
     }
@@ -4192,6 +4200,15 @@ mod tests {
     }
 
     fn file_header_of_size(target: ArchiveVersion, size: u64, comment: Option<&[u8]>) -> Vec<u8> {
+        file_header_of_sizes(target, size, size, comment)
+    }
+
+    fn file_header_of_sizes(
+        target: ArchiveVersion,
+        unpacked: u64,
+        packed: u64,
+        comment: Option<&[u8]>,
+    ) -> Vec<u8> {
         let extra = super::encode_file_comment(comment).unwrap();
         let mut header = Vec::new();
         super::write_file_header(
@@ -4199,9 +4216,9 @@ mod tests {
             &super::FileRecord {
                 head_type: super::FILE_HEAD,
                 name: b"big.bin",
-                unpacked_size: size,
+                unpacked_size: unpacked,
                 file_crc: 0x1234_5678,
-                packed_size: size,
+                packed_size: packed,
                 file_time: 0,
                 file_attr: 0x20,
                 host_os: 0,
@@ -4218,12 +4235,32 @@ mod tests {
     }
 
     #[test]
-    fn members_up_to_4_gib_keep_the_short_header() {
-        let header = file_header_of_size(ArchiveVersion::Rar40, u64::from(u32::MAX), None);
-        assert_eq!(u16::from_le_bytes([header[3], header[4]]) & 0x0100, 0);
-        assert_eq!(header.len(), 32 + b"big.bin".len());
-        assert_eq!(header[7..11], [0xff; 4]);
-        assert_eq!(header[11..15], [0xff; 4]);
+    fn rar29_members_past_2_gib_carry_the_large_size_fields() {
+        let large = |header: &[u8]| u16::from_le_bytes([header[3], header[4]]) & 0x0100 != 0;
+        let two_gib = 1u64 << 31;
+        for target in [
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
+            let header = file_header_of_size(target, two_gib, None);
+            assert!(!large(&header), "{target} at 2 GiB");
+            assert_eq!(header.len(), 32 + b"big.bin".len());
+
+            for size in [two_gib + 1, 3 << 30, u64::from(u32::MAX)] {
+                let header = file_header_of_size(target, size, None);
+                assert!(large(&header), "{target} at {size}");
+                assert_eq!(header.len(), 40 + b"big.bin".len());
+                assert_eq!(header[7..11], (size as u32).to_le_bytes());
+                assert_eq!(header[32..40], [0; 8]);
+            }
+
+            // Compressed or stored and padded past 4 GiB, a member's header is one length.
+            let size = u64::from(u32::MAX) - 7;
+            let compressed = file_header_of_sizes(target, size, 1000, None);
+            let stored = file_header_of_sizes(target, size, size.next_multiple_of(16), None);
+            assert_eq!(compressed.len(), stored.len(), "{target}");
+        }
     }
 
     #[test]
@@ -4298,6 +4335,30 @@ mod tests {
             assert_eq!((member.pack_size, member.unp_size), (size, size));
             assert_eq!(member.file_crc, 0x1234_5678);
         }
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn a_member_between_2_and_4_gib_can_be_rewritten() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let size = 3u64 << 30;
+        let dir = crate::scratch::case("rars-rar15-40-2-to-4-gib-rewrite");
+        let path = dir.join("big.rar");
+        let mut file = std::fs::File::create(&path).unwrap();
+        let mut head = super::RAR15_SIGNATURE.to_vec();
+        super::write_main_header(&mut head, 0);
+        head.extend_from_slice(&file_header_of_size(ArchiveVersion::Rar40, size, None));
+        file.write_all(&head).unwrap();
+        // Sparse: the payload is never written, only skipped over.
+        file.seek(SeekFrom::Current(size as i64)).unwrap();
+        file.write_all(&super::end_block(super::ENDARC_FLAGS))
+            .unwrap();
+        drop(file);
+
+        let archive = crate::rar15_40::Archive::parse_path(&path).unwrap();
+        assert_eq!(archive.files().next().unwrap().unp_size, size);
+        assert_eq!(archive.rewrite_preservation_issues(), Vec::<String>::new());
     }
 
     use super::{

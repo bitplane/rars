@@ -1246,8 +1246,10 @@ impl Archive {
             }
             // Only native times, salt and embedded comments are retained. Check
             // the declared length too: the reader tolerates unflagged extras.
+            // RAR 3.0 onwards flags the high size fields on any member past 2 GiB.
             if file.block.flags
                 & !(LONG_BLOCK
+                    | FHD_LARGE
                     | FHD_SOLID
                     | FHD_DIRECTORY_MASK
                     | FHD_EXTTIME
@@ -1262,6 +1264,11 @@ impl Archive {
                         + file.ext_time.len()
                         + file.file_comment.len()
                         + if file.salt.is_some() { 8 } else { 0 }
+                        + if file.block.flags & FHD_LARGE != 0 {
+                            8
+                        } else {
+                            0
+                        }
             {
                 issues.push(format!("{label}: legacy file flags or extra metadata"));
             }
