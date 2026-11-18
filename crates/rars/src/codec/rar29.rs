@@ -25,7 +25,7 @@ use super::filters::DeltaErrorMessages;
 #[cfg(all(test, feature = "write"))]
 use super::filters::MAX_DELTA_CHANNELS;
 use super::packed_window::DRAINED;
-use super::ppmd::{PpmdByteReader, PpmdState};
+use super::ppmd7::{Ppmd7, PpmdByteReader};
 use super::rarvm;
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
@@ -233,7 +233,7 @@ pub(crate) struct Reader29State<B: Budget> {
     pending_match: Option<(usize, usize, bool)>,
     in_lz_block: bool,
     block_mode: BlockMode,
-    ppmd: PpmdState<B>,
+    ppmd: Ppmd7<B>,
     ppmd_esc: u8,
     filters: Buffer<VmFilter<B>, B>,
     programs: Buffer<VmProgram<B>, B>,
@@ -321,7 +321,7 @@ impl<B: Budget> Reader29State<B> {
             pending_match: None,
             in_lz_block: false,
             block_mode: BlockMode::Lz,
-            ppmd: PpmdState::with_allowance(allowance),
+            ppmd: Ppmd7::with_allowance(allowance),
             ppmd_esc: 2,
             filters: Buffer::new(allowance),
             programs: Buffer::new(allowance),
