@@ -3571,7 +3571,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_writer_creates_rar29_old_style_comments() {
+    fn direct_writer_creates_rar29_comments() {
         let archive_features = FeatureSet::store_only();
         let bytes = rar15_40::write_compressed_archive_with_comment(
             &[rar15_40::FileEntry {
@@ -3589,7 +3589,7 @@ mod tests {
         .unwrap();
         let archive = ArchiveReader::read(&bytes).unwrap();
         let raw = archive.as_rar15_40().unwrap();
-        assert!(raw.main.has_archive_comment());
+        assert!(!raw.main.has_archive_comment());
         assert_eq!(
             raw.archive_comment().unwrap().as_deref(),
             Some(b"facade rar29 archive note".as_slice())

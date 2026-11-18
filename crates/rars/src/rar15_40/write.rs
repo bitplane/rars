@@ -25,7 +25,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 
 mod volumes;
-pub use volumes::{write_stored_volumes_to, write_volumes_to};
+pub use volumes::{write_stored_volumes_to, write_volumes_to, write_volumes_with_comment_to};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -662,7 +662,7 @@ fn write_archive_to(
         &coding,
         archive_comment,
         header_key.as_ref(),
-        archive_comment_password,
+        archive_comment_password.or(header_comment_password(options.target, header_password)),
         resources,
         &work,
         output,
@@ -704,22 +704,20 @@ fn write_members_to(
     let mut head = Vec::new();
     write_main_header(&mut head, main_flags);
     output.write_all(&head)?;
-    if !uses_old_style_archive_comment(options.target) {
-        write_producer(output, options.target, header_key, progress.reporter())?;
-    }
-    write_archive_comment(
-        output,
+    let comment = encode_archive_comment(
         archive_comment,
         options,
         header_key,
         archive_comment_password,
         &mut data_keys,
     )?;
-    // Old-style comments must immediately follow the main header. Readers look
-    // there directly when MHD_COMMENT is set, rather than scanning subblocks.
-    if uses_old_style_archive_comment(options.target) {
-        write_producer(output, options.target, header_key, progress.reporter())?;
-    }
+    write_lead(
+        output,
+        options.target,
+        &comment,
+        header_key,
+        progress.reporter(),
+    )?;
 
     // Solid members share one encoder, so they are coded in order. Independent
     // ones are coded a window at a time and written as each window lands.
@@ -2100,12 +2098,13 @@ pub fn write_stored_volumes(
     options: WriterOptions,
     volume_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    write_stored_volumes_with_progress(entry, options, volume_size, None)
+    write_stored_volumes_with_progress(entry, options, None, volume_size, None)
 }
 
 pub(crate) fn write_stored_volumes_with_progress(
     entry: StoredEntry<'_>,
     options: WriterOptions,
+    archive_comment: Option<&[u8]>,
     volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
@@ -2114,6 +2113,7 @@ pub(crate) fn write_stored_volumes_with_progress(
         &[Member::from_stored(&entry)],
         options,
         &MemberCoding::Stored,
+        archive_comment,
         volume_size,
         &mut sink,
         &WriterResources::default(),
@@ -2139,8 +2139,27 @@ pub fn write_compressed_volumes_with_progress(
     volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
+    write_compressed_volumes_with_comment_and_progress(entry, options, None, volume_size, progress)
+}
+
+pub(crate) fn write_compressed_volumes_with_comment_and_progress(
+    entry: FileEntry<'_>,
+    options: WriterOptions,
+    archive_comment: Option<&[u8]>,
+    volume_size: usize,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<Vec<Vec<u8>>> {
     let mut sink = crate::volume_sink::CollectedVolumes::new();
-    write_compressed_volumes_to(entry, options, volume_size, &mut sink, progress)?;
+    volumes::split_members(
+        &[Member::from_file(&entry)],
+        options,
+        &MemberCoding::Compressed,
+        archive_comment,
+        volume_size,
+        &mut sink,
+        &WriterResources::default(),
+        progress,
+    )?;
     Ok(sink.take())
 }
 
@@ -2156,6 +2175,7 @@ pub fn write_compressed_volumes_to(
         &[Member::from_file(&entry)],
         options,
         &MemberCoding::Compressed,
+        None,
         volume_size,
         sink,
         &WriterResources::default(),
@@ -3143,31 +3163,59 @@ fn write_producer(
 }
 
 fn uses_old_style_archive_comment(target: ArchiveVersion) -> bool {
-    matches!(
-        target,
-        ArchiveVersion::Rar15 | ArchiveVersion::Rar20 | ArchiveVersion::Rar29
-    )
+    matches!(target, ArchiveVersion::Rar15 | ArchiveVersion::Rar20)
 }
 
-fn write_archive_comment(
+/// RAR 2.9-format builds encrypt the comment whenever headers are encrypted.
+fn header_comment_password(
+    target: ArchiveVersion,
+    header_password: Option<&[u8]>,
+) -> Option<&[u8]> {
+    header_password.filter(|_| target == ArchiveVersion::Rar29)
+}
+
+/// RAR 2.9-format builds put CMT before anything else, as old-style comments must be.
+fn write_lead(
     out: &mut dyn Write,
+    target: ArchiveVersion,
+    comment: &[u8],
+    header_key: Option<&HeaderKey>,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<()> {
+    if uses_old_style_archive_comment(target) || target == ArchiveVersion::Rar29 {
+        out.write_all(comment)?;
+        write_producer(out, target, header_key, progress)
+    } else {
+        write_producer(out, target, header_key, progress)?;
+        out.write_all(comment)?;
+        Ok(())
+    }
+}
+
+fn encode_archive_comment(
     comment: Option<&[u8]>,
     options: WriterOptions,
     header_key: Option<&HeaderKey>,
     password: Option<&[u8]>,
     data_keys: &mut DataKeys,
-) -> Result<()> {
+) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
     let Some(comment) = comment else {
-        return Ok(());
+        return Ok(out);
     };
     if uses_old_style_archive_comment(options.target) {
-        let mut block = Vec::new();
-        write_comment_header(&mut block, Some(comment))?;
-        out.write_all(&block)?;
-        return Ok(());
+        write_comment_header(&mut out, Some(comment))?;
+        return Ok(out);
     }
     let mut packed = unpack29_encode_literals(comment)?;
-    let salt = encrypt_packed_data_for_writer(&mut packed, options.target, password, data_keys)?;
+    // RAR gives a 2.9 comment a data salt apart from the members' one.
+    let mut own_keys = DataKeys::default();
+    let keys = if options.target == ArchiveVersion::Rar29 {
+        &mut own_keys
+    } else {
+        data_keys
+    };
+    let salt = encrypt_packed_data_for_writer(&mut packed, options.target, password, keys)?;
     let metadata = options.archive_comment_metadata;
     let mut header = Vec::new();
     write_file_header(
@@ -3194,12 +3242,12 @@ fn write_archive_comment(
         },
     )?;
     if let Some(key) = header_key {
-        write_encrypted_header(out, &header, key)?;
+        write_encrypted_header(&mut out, &header, key)?;
     } else {
-        out.write_all(&header)?;
+        out.extend_from_slice(&header);
     }
-    out.write_all(&packed)?;
-    Ok(())
+    out.extend_from_slice(&packed);
+    Ok(out)
 }
 
 /// Closes a header-encrypted archive or volume with an end-of-archive block in a
@@ -3562,6 +3610,7 @@ mod tests {
                 &members,
                 super::WriterOptions::new(self.target, features),
                 &coding,
+                None,
                 volume_size,
                 &mut sink,
                 &crate::WriterResources::default(),

@@ -54,7 +54,7 @@ def test_embedded_file_comments_follow_edits_and_keep_empty_distinct(password, f
 
 
 def old_comment_archive():
-    builder = rars.RarBuilder(version="rar29", level=0, comment=b"comment")
+    builder = rars.RarBuilder(version="rar20", level=0, comment=b"comment")
     builder.add_bytes(b"payload", "file")
     return builder.to_bytes()
 

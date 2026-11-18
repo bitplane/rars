@@ -2210,7 +2210,7 @@ fn writes_rar20_old_style_comments_that_reader_decodes() {
 }
 
 #[test]
-fn writes_rar29_old_style_comments_that_reader_decodes() {
+fn writes_rar29_comments_that_reader_decodes() {
     let archive_features = FeatureSet::store_only();
     let stored = [StoredEntry {
         name: b"rar29-commented.txt",
@@ -2228,7 +2228,7 @@ fn writes_rar29_old_style_comments_that_reader_decodes() {
     )
     .unwrap();
     let archive = Archive::parse(&archive_bytes).unwrap();
-    assert!(archive.main.has_archive_comment());
+    assert!(!archive.main.has_archive_comment());
     assert_eq!(
         archive.archive_comment().unwrap().as_deref(),
         Some(b"rar29 archive note\r\n".as_slice())
@@ -8470,6 +8470,77 @@ fn reference_tool_accepts_rar29_header_encrypted_archives_and_volumes() {
             "the reference tool rejected {label}\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn reference_tool_accepts_rar29_header_encrypted_comments() {
+    let comment = b"rar29 encrypted archive note\r\n";
+    let mut state = 0x9e37_79b9u32;
+    let data: Vec<u8> = (0..6000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let mut features = FeatureSet::store_only();
+    features.header_encryption = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar29, features);
+    let entry = FileEntry {
+        name: b"member.bin",
+        data: &data,
+        file_time: 0x5a21_0000,
+        file_attr: 0x20,
+        host_os: 3,
+        password: Some(b"secret"),
+        file_comment: None,
+    };
+    let mut cases = vec![(
+        "rar29-hp-comment-single".to_owned(),
+        vec![write_compressed_archive_with_comment(&[entry], options, Some(comment)).unwrap()],
+    )];
+    for (name, coding) in [
+        ("stored", rars::MemberCoding::Stored),
+        ("compressed", rars::MemberCoding::Compressed),
+    ] {
+        let source = rars::rar15_40::StreamingEntry::new(
+            b"member.bin".to_vec(),
+            rars::EntrySource::from_bytes(data.clone()),
+        )
+        .with_password(b"secret".to_vec());
+        let mut sink = rars::rar15_40::CollectedVolumes::new();
+        rars::rar15_40::write_volumes_with_comment_to(
+            &[source],
+            options,
+            coding,
+            Some(comment),
+            2048,
+            &mut sink,
+            &rars::WriterResources::default(),
+            None,
+        )
+        .unwrap();
+        let volumes = sink.take();
+        assert!(volumes.len() > 1, "{name}");
+        cases.push((format!("rar29-hp-comment-volumes-{name}"), volumes));
+    }
+    for (label, volumes) in cases {
+        let parts: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+        let Some(output) = local_reference_test_volumes(&label, &parts, Some("secret")) else {
+            continue;
+        };
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "the reference tool rejected {label}\nstdout:\n{stdout}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            stdout.contains("rar29 encrypted archive note"),
+            "{label}: {stdout}"
         );
     }
 }

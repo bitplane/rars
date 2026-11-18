@@ -12,9 +12,14 @@ member extraction passed, but RAR 3.93 reported a corrupt comment. That layout
 was rejected. The final probe checks comment export explicitly, in addition to
 file tests and extraction hashes.
 
+The `rar29` writer has since moved its archive comment to a `CMT` new-subblock,
+as every RAR build that writes 2.9-format members does. The producer still
+follows the comment, so the framing below holds for either comment form.
+
 Preserving rewrites recognize and replace the producer using the existing
 bounded, CRC-checked schema validation. The marker requires at least `rar29`,
-not `rar30`; a RAR 3 comment or encrypted headers still requires `rar30`.
+not `rar30`. A `CMT` comment or encrypted headers rewrite as `rar30`, which
+`rar29` output also reads as.
 Otherwise identical RAR 2.9/3/4 archives cannot reveal the original target
 selection. Rewriting uses the lowest supported format implied by their records.
 The subsequent [RAR 2.0 backfit](../rar20/README.md) uses unpacker version 20
@@ -55,7 +60,7 @@ with its final character missing in both variants. UnRAR has no `cw` command,
 so its comment check inspects the text displayed by `t` instead.
 
 Negative controls flip a stored member byte and require CRC-error exit 3 from
-RAR/WinRAR. Reference update checks require the old-style comment and all
+RAR/WinRAR. Reference update checks require the archive comment and all
 member contents to survive adding a member. Raw framing checks validate header
 CRCs, producer payload CRCs, exact framing and one producer in every volume.
 

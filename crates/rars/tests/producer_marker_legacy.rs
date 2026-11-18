@@ -2,16 +2,23 @@
 
 #[path = "support/volume_size.rs"]
 mod volume_size;
-use rars::rar15_40::{Archive, Block, NewSubKind};
+use rars::rar15_40::{Archive, Block, NewSubHeader, NewSubKind};
 use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 const DATA: &[u8] = concat!("rars/", env!("CARGO_PKG_VERSION"), "\nmarker-schema=1\n").as_bytes();
 
 fn marker(archive: &Archive) {
-    let index = usize::from(matches!(archive.blocks.first(), Some(Block::Comment(_))));
+    let index = usize::from(matches!(
+        archive.blocks.first(),
+        Some(Block::Comment(_))
+            | Some(Block::NewSub(NewSubHeader {
+                kind: NewSubKind::ArchiveComment,
+                ..
+            }))
+    ));
     assert!(
         matches!(&archive.blocks[index], Block::NewSub(sub) if sub.file.name == b"RARS"),
-        "producer must follow any old-style comment and precede files"
+        "producer must follow any leading comment and precede files"
     );
     check_marker(archive, index);
 }
@@ -132,9 +139,12 @@ fn legacy_producer_preserves_members_comments_and_format_requirement() {
                             parsed.new_subs().next().unwrap().file.unp_ver,
                             expected_unp_ver
                         );
-                        assert!(!parsed
-                            .new_subs()
-                            .any(|sub| sub.kind == NewSubKind::ArchiveComment));
+                        assert_eq!(
+                            parsed
+                                .new_subs()
+                                .any(|sub| sub.kind == NewSubKind::ArchiveComment),
+                            version == ArchiveVersion::Rar29 && comment.is_some()
+                        );
                     }
                 }
             }
