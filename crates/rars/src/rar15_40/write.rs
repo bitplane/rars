@@ -4670,6 +4670,78 @@ mod tests {
     }
 
     #[test]
+    fn a_member_over_4_gib_streams_into_a_set_but_is_refused_in_memory() {
+        use crate::atomic64::AtomicU64;
+        use std::sync::atomic::Ordering;
+
+        const SIZE: u64 = (4 << 30) + 4099;
+        struct Pattern(u64);
+        impl std::io::Read for Pattern {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = (SIZE - self.0).min(buffer.len() as u64) as usize;
+                for (offset, byte) in buffer[..count].iter_mut().enumerate() {
+                    let at = self.0 + offset as u64;
+                    *byte = (at ^ (at >> 13)) as u8;
+                }
+                self.0 += count as u64;
+                Ok(count)
+            }
+        }
+        impl std::io::Seek for Pattern {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0 = match from {
+                    std::io::SeekFrom::Start(at) => at,
+                    std::io::SeekFrom::End(delta) => SIZE.saturating_add_signed(delta),
+                    std::io::SeekFrom::Current(delta) => self.0.saturating_add_signed(delta),
+                }
+                .min(SIZE);
+                Ok(self.0)
+            }
+        }
+        struct CancelPast(AtomicU64);
+        impl crate::WriteProgress for CancelPast {
+            fn report(&self, event: crate::WriteProgressEvent<'_>) {
+                if let crate::WriteProgressEvent::Advanced {
+                    completed_bytes, ..
+                } = event
+                {
+                    self.0.fetch_max(completed_bytes, Ordering::Relaxed);
+                }
+            }
+
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::Relaxed) > 1024 * 1024
+            }
+        }
+        let members = [super::StreamingEntry::new(
+            b"big.bin".to_vec(),
+            crate::EntrySource::from_opener(SIZE, || Ok(Box::new(Pattern(0)))),
+        )];
+        // A small window keeps the segment coded before cancellation small.
+        let mut options = rar40();
+        options.dictionary_size = Some(64 * 1024);
+        let set = |stream_above| {
+            volume_set(
+                &members,
+                options,
+                crate::MemberCoding::Compressed,
+                64 << 20,
+                stream_above,
+                Some(&CancelPast(AtomicU64::new(0))),
+            )
+        };
+
+        assert!(matches!(set(256 * 1024), Err(crate::Error::Cancelled)));
+        let Err(crate::Error::AtEntry { source, .. }) = set(u64::MAX) else {
+            panic!("a member over 4 GiB was coded in memory");
+        };
+        assert!(
+            matches!(*source, crate::Error::InvalidArgument(_)),
+            "{source}"
+        );
+    }
+
+    #[test]
     fn solid_members_stream_into_a_set_on_the_chain() {
         let large = binary_member(1024 * 1024 + 4321);
         let noise = noise(1024 * 1024 + 7);

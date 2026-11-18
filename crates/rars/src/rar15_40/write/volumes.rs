@@ -134,8 +134,12 @@ pub(super) fn split_members_above(
         let len = member.unpacked_size().map_err(|error| {
             crate::write_stream::member_error(error, member.name, "reading source")
         })?;
-        // Compressed set members still keep to 32-bit sizes, streamed or not.
-        let validate = if compresses {
+        // A member coded in memory keeps to 32-bit sizes; one that streams holds neither copy.
+        let in_memory = compresses
+            && !streams_member(member, options, coding, stream_above).map_err(|error| {
+                crate::write_stream::member_error(error, member.name, "preparing volume member")
+            })?;
+        let validate = if in_memory {
             validate_volume_member
         } else {
             validate_member
