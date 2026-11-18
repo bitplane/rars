@@ -25,8 +25,7 @@ use super::FilterPolicy;
 #[cfg(test)]
 use crate::codec::rar50::EncodeOptions;
 use crate::codec::rar50::{
-    filter_streaming_blocks_in_place, streaming_blocks_with_allowance,
-    streaming_blocks_with_records, BlockSplitter, EncodeFilter,
+    filter_streaming_blocks_in_place, streaming_blocks_in_window, BlockSplitter, EncodeFilter,
 };
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::Crc32;
@@ -1445,36 +1444,47 @@ fn encode_block_job<B: Budget, C: Budget>(
         return Ok(output);
     }
     let mut block_done = |bytes: usize| progress.advance(bytes as u64);
-    let packed = match &job.records {
-        Some(records) => {
-            // The records were made under the job's own budget and the
-            // encoder charges this worker's, so they cross over as a copy.
-            let records = Buffer::try_collect(
-                records.iter().map(|block| Buffer::copied(block, allowance)),
-                allowance,
-            )?;
-            streaming_blocks_with_records(
-                &job.data,
-                &job.history,
-                &boundaries,
-                Some(&records),
-                plan.algorithm_version,
-                plan.encode_options,
-                Some(&mut block_done),
-                allowance,
-            )?
-        }
-        None => streaming_blocks_with_allowance(
-            &job.data,
-            &job.history,
-            &boundaries,
-            plan.algorithm_version,
-            plan.encode_options,
-            Some(&mut block_done),
+    // The records were made under the job's own budget and the encoder charges
+    // this worker's, so they cross over as a copy.
+    let records = match &job.records {
+        Some(records) => Some(Buffer::try_collect(
+            records.iter().map(|block| Buffer::copied(block, allowance)),
             allowance,
-        )?,
+        )?),
+        None => None,
     };
-    for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
+    let BlockJob {
+        data,
+        history,
+        blocks,
+        ..
+    } = job;
+    // The encoder parses history and run as one window. Grow the history into
+    // it and let the run go, rather than have the encoder copy both into a
+    // third buffer for the whole encode.
+    let start = history.len();
+    let window = if start == 0 {
+        data
+    } else {
+        let mut window = history;
+        window
+            .extend_from_slice(&data)
+            .map_err(Into::<crate::codec::Error>::into)?;
+        drop(data);
+        window
+    };
+    let packed = streaming_blocks_in_window(
+        &window,
+        start,
+        &boundaries,
+        records.as_deref(),
+        plan.algorithm_version,
+        plan.encode_options,
+        Some(&mut block_done),
+        allowance,
+    )?;
+    drop(window);
+    for ((member, _, last), packed) in blocks.into_iter().zip(packed) {
         output.push((member, packed, last))?;
     }
     Ok(output)

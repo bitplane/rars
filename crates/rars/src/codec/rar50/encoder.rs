@@ -757,6 +757,7 @@ pub(crate) fn encode_lz_streaming_blocks(
     .map(|outputs| outputs.into_iter().map(Buffer::into_vec).collect())
 }
 
+#[cfg(test)]
 pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     data: &[u8],
     history: &[u8],
@@ -778,6 +779,7 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
     )
 }
 
+#[cfg(test)]
 /// [`streaming_blocks_with_allowance`] over bytes already filtered in place by
 /// [`filter_streaming_blocks_in_place`], whose records these are, one list to
 /// a block. `history` is the window the decoder will hold, so it is filtered
@@ -790,29 +792,78 @@ pub(crate) fn streaming_blocks_with_records<B: Budget>(
     records: Option<&[Buffer<EncodeFilter, B>]>,
     algorithm_version: u8,
     options: EncodeOptions,
-    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    block_done: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
+    // Refuse bad ranges before the window is allocated, as a caller's budget
+    // would otherwise report the allocation instead.
+    check_streaming_blocks(data.len(), blocks, records)?;
+    let (combined, start) = member_window_with_allowance(data, history, options, allowance)?;
+    streaming_blocks_in_window(
+        &combined,
+        start,
+        blocks,
+        records,
+        algorithm_version,
+        options,
+        block_done,
+        allowance,
+    )
+}
+
+fn check_streaming_blocks<B: Budget>(
+    len: usize,
+    blocks: &[(usize, bool)],
+    records: Option<&[Buffer<EncodeFilter, B>]>,
+) -> Result<()> {
     if records.is_some_and(|records| records.len() != blocks.len()) {
         return Err(Error::InvalidData(
             "RAR 5 streaming blocks and filter records differ in number",
         ));
     }
-    let records_of =
-        |index: usize| -> &[EncodeFilter] { records.map_or(NO_RECORDS, |records| &records[index]) };
     let mut previous = 0;
     for &(end, _) in blocks {
-        if end <= previous || end > data.len() {
+        if end <= previous || end > len {
             return Err(Error::InvalidData("RAR 5 streaming block range is invalid"));
         }
         previous = end;
     }
-    if previous != data.len() {
+    if previous != len {
         return Err(Error::InvalidData(
             "RAR 5 streaming blocks do not cover input",
         ));
     }
-    let (combined, start) = member_window_with_allowance(data, history, options, allowance)?;
+    Ok(())
+}
+
+/// [`streaming_blocks_with_records`] over one window that already holds the
+/// history and then the run, so a caller that owns both in one buffer is not
+/// copied into a third. The run starts at `start`; block ends are offsets into
+/// the run, as there. History further back than the match distance is ignored,
+/// as it is when the window is built from separate parts.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streaming_blocks_in_window<B: Budget>(
+    window: &[u8],
+    start: usize,
+    blocks: &[(usize, bool)],
+    records: Option<&[Buffer<EncodeFilter, B>]>,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<Buffer<u8, B>, B>> {
+    if start > window.len() {
+        return Err(Error::InvalidData(
+            "RAR 5 streaming run starts past its window",
+        ));
+    }
+    let skip = start.saturating_sub(options.max_match_distance);
+    let combined = &window[skip..];
+    let start = start - skip;
+    let data = &combined[start..];
+    check_streaming_blocks(data.len(), blocks, records)?;
+    let records_of =
+        |index: usize| -> &[EncodeFilter] { records.map_or(NO_RECORDS, |records| &records[index]) };
 
     let mut at = start;
     let mut output = Buffer::with_capacity(blocks.len(), allowance)?;
@@ -855,7 +906,7 @@ pub(crate) fn streaming_blocks_with_records<B: Budget>(
     if pipelines::<B>(options) {
         let mut block_start = at;
         pipelined_optimal_blocks(
-            &combined,
+            combined,
             blocks[first..]
                 .iter()
                 .enumerate()
@@ -864,7 +915,7 @@ pub(crate) fn streaming_blocks_with_records<B: Budget>(
                     block_start = block.end;
                     (block, records_of(first + index), is_last)
                 }),
-            OptimalCollector::with_allowance(&combined, at, options, allowance)?,
+            OptimalCollector::with_allowance(combined, at, options, allowance)?,
             algorithm_version,
             options,
             &mut |block, packed| {
@@ -880,17 +931,17 @@ pub(crate) fn streaming_blocks_with_records<B: Budget>(
     }
     let mut search = if options.optimal_parse {
         SharedMemberSearch::Optimal(OptimalCollector::with_allowance(
-            &combined, at, options, allowance,
+            combined, at, options, allowance,
         )?)
     } else {
         SharedMemberSearch::Lazy(member_finder_with_allowance(
-            &combined, at, options, allowance,
+            combined, at, options, allowance,
         )?)
     };
     for (index, &(end, is_last)) in blocks[first..].iter().enumerate() {
         let end = start + end;
         output.push_admitted(encode_lz_block_with_allowance(
-            &combined,
+            combined,
             at..end,
             search.borrow(),
             algorithm_version,

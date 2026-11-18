@@ -19,9 +19,8 @@ pub use encoder::{
 #[cfg(feature = "write")]
 pub(crate) use encoder::{
     encode_filtered_run, encode_owned_member, filter_streaming_blocks_in_place,
-    filtered_owned_member, filtered_run_bytes, streaming_blocks_with_allowance,
-    streaming_blocks_with_records, BlockSplitter, EncodeFilter, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS,
-    MAX_LZ_BLOCK_SIZE,
+    filtered_owned_member, filtered_run_bytes, streaming_blocks_in_window, BlockSplitter,
+    EncodeFilter, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS, MAX_LZ_BLOCK_SIZE,
 };
 #[cfg(all(test, feature = "write"))]
 pub(crate) use encoder::{
