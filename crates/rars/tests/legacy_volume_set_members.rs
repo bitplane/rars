@@ -209,7 +209,7 @@ fn compressed_sets_can_be_solid_encrypted_or_both() {
             (true, false, Some(&b"secret"[..])),
             (false, true, Some(&b"secret"[..])),
         ] {
-            if header_encryption && target != ArchiveVersion::Rar40 {
+            if header_encryption && target == ArchiveVersion::Rar20 {
                 continue;
             }
             let mut features = FeatureSet::store_only();

@@ -6792,8 +6792,8 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
     ),
     (
         &["--format", "rar15", "--encrypt-headers", "--password", "pw"],
-        "error: --encrypt-headers is not supported by --format rar15; use --format rar30, \
-         --format rar40, --format rar50 or --format rar70",
+        "error: --encrypt-headers is not supported by --format rar15; use --format rar29, \
+         --format rar30, --format rar40, --format rar50 or --format rar70",
     ),
     (
         &["--format", "rar50", "--rgb-filter", "3"],

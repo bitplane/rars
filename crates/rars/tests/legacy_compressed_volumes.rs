@@ -197,7 +197,11 @@ fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {
 fn encrypted_compressed_volumes_extract_to_the_source() {
     let data = data();
     for (header_encryption, solid) in [(false, false), (true, false), (true, true)] {
-        for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
+        for target in [
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
             let mut sink = CollectedVolumes::new();
             write_compressed_volumes_to(
                 entry(&data, Some(b"secret")),

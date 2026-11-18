@@ -2226,6 +2226,15 @@ fn validate_plan(
     let _ = dictionary_flags_for_options(options)?;
     if has_archive_comment {
         crate::write_plan::validate_option(options.target, WriterOption::ArchiveComment, shape)?;
+        // An old-style comment is never encrypted, so it would sit in plain
+        // text among encrypted headers.
+        if options.features.header_encryption && uses_old_style_archive_comment(options.target) {
+            return Err(Error::UnsupportedWriterOption {
+                target: options.target,
+                option: WriterOption::ArchiveComment,
+                because: Some("with header encryption"),
+            });
+        }
     }
     if has_file_comment {
         crate::write_plan::validate_option(options.target, WriterOption::FileComment, shape)?;
@@ -3478,9 +3487,6 @@ mod tests {
             ] {
                 for store in [true, false] {
                     for header_encryption in [false, true] {
-                        if header_encryption && target == crate::ArchiveVersion::Rar29 {
-                            continue;
-                        }
                         for volume_size in [None, Some(4096)] {
                             cases.push(Self {
                                 target,

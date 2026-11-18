@@ -483,7 +483,7 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "--encrypt-headers is not supported by --format rar15; \
-             use --format rar30, --format rar40, --format rar50 or --format rar70"
+             use --format rar29, --format rar30, --format rar40, --format rar50 or --format rar70"
         );
         // rar13 exists in the library but --format does not accept it, so it is
         // never suggested.
