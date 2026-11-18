@@ -13,6 +13,9 @@ const MAX_MATCH_CANDIDATES: usize = 256;
 
 type Rar20MatchFinder = match_finder::MatchFinder<3>;
 
+/// Takes packed bytes and how far into the member they reach; a break stops the coding.
+pub(crate) type PackedOut<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>;
+
 pub fn unpack20_encode_literals(input: &[u8]) -> Result<Vec<u8>> {
     unpack20_encode_literals_with_options(input, EncodeOptions::default())
 }
@@ -49,7 +52,7 @@ pub(crate) fn unpack20_encode_streamed(
     len: usize,
     options: EncodeOptions,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
+    out: PackedOut<'_>,
 ) -> Result<ControlFlow<()>> {
     let try_audio = options.try_audio;
     encode_streamed(
@@ -174,7 +177,7 @@ impl Unpack20Encoder {
         input: &mut dyn Read,
         len: usize,
         progress: &mut dyn FnMut(usize) -> bool,
-        out: &mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
+        out: PackedOut<'_>,
     ) -> Result<ControlFlow<()>> {
         if len == 0 {
             return Ok(ControlFlow::Continue(()));
@@ -333,7 +336,7 @@ fn encode_streamed(
     options: EncodeOptions,
     try_audio: bool,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
+    out: PackedOut<'_>,
     block_size: usize,
 ) -> Result<(ControlFlow<()>, Vec<u8>)> {
     let options = options.constrained();
