@@ -70,9 +70,35 @@ mod threaded {
     #[cfg(any(test, feature = "write"))]
     impl FanOut {
         fn start() -> Self {
+            #[cfg(test)]
+            assert!(
+                !PRIVATE_POOL.get(),
+                "a private pool ignores windows elsewhere, so it must not open one"
+            );
             FANNED_OUT.fetch_add(1, Ordering::SeqCst);
             Self
         }
+    }
+
+    // Unit tests share one process, and with it FANNED_OUT: a window one test
+    // opens turns nesting off in every other test's pool, though its items can
+    // only block threads of the pool they run in. A test that needs nesting on
+    // runs in a private pool, whose workers count only their own windows, and
+    // they open none.
+    #[cfg(test)]
+    thread_local! {
+        static PRIVATE_POOL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A pool for one test, where other tests' windows do not turn nesting off.
+    #[cfg(test)]
+    #[cfg_attr(not(feature = "write"), allow(dead_code))]
+    pub(crate) fn private_pool(threads: usize) -> rayon::ThreadPool {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .start_handler(|_| PRIVATE_POOL.set(true))
+            .build()
+            .unwrap()
     }
 
     #[cfg(any(test, feature = "write"))]
@@ -188,6 +214,10 @@ mod threaded {
     /// Whether work inside an item may fan out: not while blocking siblings wait in the pool.
     #[cfg(feature = "write")]
     pub(crate) fn may_nest() -> bool {
+        #[cfg(test)]
+        if PRIVATE_POOL.get() {
+            return threads() > 1;
+        }
         threads() > 1 && FANNED_OUT.load(Ordering::SeqCst) == 0
     }
 
