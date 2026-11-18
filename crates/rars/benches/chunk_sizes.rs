@@ -5,7 +5,7 @@ use rars::codec::rar29::{
 use rars::codec::rar50::{
     DecodeMode, EncodeOptions as Rar50EncodeOptions, Unpack50Decoder, Unpack50Encoder,
 };
-use std::hint::black_box;
+use std::{cell::OnceCell, hint::black_box};
 
 const CHUNK_SIZES: &[usize] = &[1024, 4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024];
 
@@ -66,6 +66,15 @@ fn decode_rar50(input: &[u8], output_size: usize) -> Vec<u8> {
         .expect("RAR 5.0 decompression should succeed")
 }
 
+// Checked when the case first runs rather than while the groups are set up,
+// so a filtered run of another case skips the extra encode and decode.
+fn check_optimal_round_trip(options: Rar50EncodeOptions, data: &[u8]) {
+    let packed = Unpack50Encoder::with_options(options)
+        .encode_member(data, 0)
+        .unwrap();
+    assert_eq!(decode_rar50(&packed, data.len()), data);
+}
+
 fn bench_compression(c: &mut Criterion) {
     let mut group = c.benchmark_group("compression_by_chunk_size");
 
@@ -100,27 +109,28 @@ fn bench_decompression(c: &mut Criterion) {
         let data = payload(size);
         group.throughput(Throughput::Bytes(size as u64));
 
-        let rar29_packed = encode_rar29(&data);
-        let rar29_decoded = decode_rar29(&rar29_packed, data.len());
-        assert_eq!(rar29_decoded, data);
-        group.bench_with_input(
-            BenchmarkId::new("rar29_lz", chunk_label(size)),
-            &rar29_packed,
-            |b, packed| {
-                b.iter(|| black_box(decode_rar29(black_box(packed), size)));
-            },
-        );
+        // Packed and round-trip checked when the case first runs, so a
+        // filtered run of another case (nextest runs each in its own process)
+        // skips the encoding.
+        let rar29_packed = OnceCell::new();
+        group.bench_function(BenchmarkId::new("rar29_lz", chunk_label(size)), |b| {
+            let packed = rar29_packed.get_or_init(|| {
+                let packed = encode_rar29(&data);
+                assert_eq!(decode_rar29(&packed, data.len()), data);
+                packed
+            });
+            b.iter(|| black_box(decode_rar29(black_box(packed), size)));
+        });
 
-        let rar50_packed = encode_rar50(&data);
-        let rar50_decoded = decode_rar50(&rar50_packed, data.len());
-        assert_eq!(rar50_decoded, data);
-        group.bench_with_input(
-            BenchmarkId::new("rar50_lz", chunk_label(size)),
-            &rar50_packed,
-            |b, packed| {
-                b.iter(|| black_box(decode_rar50(black_box(packed), size)));
-            },
-        );
+        let rar50_packed = OnceCell::new();
+        group.bench_function(BenchmarkId::new("rar50_lz", chunk_label(size)), |b| {
+            let packed = rar50_packed.get_or_init(|| {
+                let packed = encode_rar50(&data);
+                assert_eq!(decode_rar50(&packed, data.len()), data);
+                packed
+            });
+            b.iter(|| black_box(decode_rar50(black_box(packed), size)));
+        });
     }
 
     group.finish();
@@ -165,12 +175,10 @@ fn bench_optimal_compression(c: &mut Criterion) {
         ("two_symbol_noise", noise),
     ] {
         let options = Rar50EncodeOptions::new(128).with_optimal_parse(true);
-        let packed = Unpack50Encoder::with_options(options)
-            .encode_member(&data, 0)
-            .unwrap();
-        assert_eq!(decode_rar50(&packed, data.len()), data);
+        let checked = OnceCell::new();
         group.throughput(Throughput::Bytes(data.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), &data, |b, data| {
+            checked.get_or_init(|| check_optimal_round_trip(options, data));
             b.iter(|| {
                 black_box(
                     Unpack50Encoder::with_options(options)
@@ -208,12 +216,10 @@ fn bench_optimal_setup(c: &mut Criterion) {
         ("literal_heavy_64KiB", noise(64 * 1024)),
     ] {
         let options = Rar50EncodeOptions::new(128).with_optimal_parse(true);
-        let packed = Unpack50Encoder::with_options(options)
-            .encode_member(&data, 0)
-            .unwrap();
-        assert_eq!(decode_rar50(&packed, data.len()), data);
+        let checked = OnceCell::new();
         group.throughput(Throughput::Bytes(data.len() as u64));
         group.bench_with_input(BenchmarkId::from_parameter(name), &data, |b, data| {
+            checked.get_or_init(|| check_optimal_round_trip(options, data));
             b.iter(|| {
                 black_box(
                     Unpack50Encoder::with_options(options)
