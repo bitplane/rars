@@ -1139,11 +1139,11 @@ fn encode_ppmd_streamed(
     input: &mut dyn Read,
     len: usize,
     escapes: Option<usize>,
-    model: Option<PpmdDecoder>,
+    model: Option<PpmdModel>,
     mut history: Option<&mut Vec<u8>>,
     progress: &mut dyn FnMut(usize) -> bool,
     out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
-) -> Result<(ControlFlow<()>, Option<PpmdDecoder>)> {
+) -> Result<(ControlFlow<()>, Option<PpmdModel>)> {
     if !progress(0) {
         return Err(Error::Cancelled);
     }
