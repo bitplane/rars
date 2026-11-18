@@ -5599,6 +5599,7 @@ fn rar15_writer_rejects_header_encryption_by_name() {
             rars::PlanShape::new(),
         ),
         vec![
+            ArchiveVersion::Rar29,
             ArchiveVersion::Rar30,
             ArchiveVersion::Rar40,
             ArchiveVersion::Rar50,
@@ -8361,17 +8362,116 @@ fn a_member_larger_than_the_budget_is_written_anyway() {
 /// Tests an archive with a locally installed reference tool, returning `None`
 /// when there is not one.
 fn local_reference_test(label: &str, archive: &[u8]) -> Option<std::process::Output> {
+    local_reference_test_volumes(label, &[archive], None)
+}
+
+fn local_reference_test_volumes(
+    label: &str,
+    volumes: &[&[u8]],
+    password: Option<&str>,
+) -> Option<std::process::Output> {
     let dir = scratch::case(&format!("rars-{label}"));
-    let path = dir.join("archive.rar");
-    std::fs::write(&path, archive).unwrap();
-    let mut result = None;
-    for tool in ["unrar", "rar"] {
-        if let Ok(output) = Command::new(tool).arg("t").arg(&path).output() {
-            result = Some(output);
-            break;
-        }
+    for (index, volume) in volumes.iter().enumerate() {
+        let name = match index {
+            0 => "archive.rar".to_owned(),
+            n => format!("archive.r{:02}", n - 1),
+        };
+        std::fs::write(dir.join(name), volume).unwrap();
     }
-    result
+    let path = dir.join("archive.rar");
+    ["unrar", "rar"].into_iter().find_map(|tool| {
+        let mut command = Command::new(tool);
+        command.arg("t");
+        if let Some(password) = password {
+            command.arg(format!("-p{password}"));
+        }
+        command.arg(&path).output().ok()
+    })
+}
+
+#[test]
+fn reference_tool_accepts_rar29_header_encrypted_archives_and_volumes() {
+    let text = b"rar29 header encrypted text that compresses well\n".repeat(200);
+    let mut state = 0x9e37_79b9u32;
+    let noise: Vec<u8> = (0..6000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let members: Vec<(&[u8], Vec<u8>)> = vec![(b"text.txt", text), (b"noise.bin", noise)];
+    let entries: Vec<_> = file_entries(&members)
+        .into_iter()
+        .map(|entry| FileEntry {
+            password: Some(b"secret"),
+            ..entry
+        })
+        .collect();
+    let stored: Vec<_> = entries
+        .iter()
+        .map(|entry| StoredEntry {
+            name: entry.name,
+            data: entry.data,
+            file_time: entry.file_time,
+            file_attr: entry.file_attr,
+            host_os: entry.host_os,
+            password: entry.password,
+            file_comment: None,
+        })
+        .collect();
+    let options = |solid| {
+        let mut features = FeatureSet::store_only();
+        features.header_encryption = true;
+        features.solid = solid;
+        WriterOptions::new(ArchiveVersion::Rar29, features)
+    };
+
+    let cases = [
+        (
+            "rar29-encrypted-headers-stored",
+            vec![write_stored_archive(&stored, options(false)).unwrap()],
+        ),
+        (
+            "rar29-encrypted-headers-compressed",
+            vec![write_compressed_archive(&entries, options(false)).unwrap()],
+        ),
+        (
+            "rar29-encrypted-headers-solid",
+            vec![write_compressed_archive(&entries, options(true)).unwrap()],
+        ),
+        (
+            "rar29-encrypted-headers-volumes",
+            write_compressed_volumes(entries[1], options(false), 2048).unwrap(),
+        ),
+        (
+            "rar29-encrypted-headers-stored-volumes",
+            write_stored_volumes(stored[1], options(false), 2048).unwrap(),
+        ),
+    ];
+    for (label, volumes) in cases {
+        let parsed: Vec<_> = volumes
+            .iter()
+            .map(|volume| Archive::parse_with_password(volume, Some(b"secret")).unwrap())
+            .collect();
+        assert!(parsed[0].main.has_encrypted_headers(), "{label}");
+        if label.ends_with("volumes") {
+            assert!(volumes.len() > 1, "{label}");
+        } else {
+            assert_eq!(parsed[0].files().count(), members.len(), "{label}");
+        }
+        let parts: Vec<&[u8]> = volumes.iter().map(Vec::as_slice).collect();
+        let Some(output) = local_reference_test_volumes(label, &parts, Some("secret")) else {
+            continue;
+        };
+        assert!(
+            output.status.success(),
+            "the reference tool rejected {label}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 fn solid_options(target: ArchiveVersion) -> WriterOptions {

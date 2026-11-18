@@ -143,7 +143,8 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         WriterOption::Feature(Feature::Solid) => shape.compressed,
         WriterOption::Feature(Feature::HeaderEncryption) => matches!(
             target,
-            ArchiveVersion::Rar30
+            ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
                 | ArchiveVersion::Rar50
                 | ArchiveVersion::Rar70

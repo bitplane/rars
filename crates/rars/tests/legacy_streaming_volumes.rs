@@ -134,7 +134,11 @@ fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {
 #[test]
 fn encrypted_streamed_volumes_extract_to_the_source() {
     for header_encryption in [false, true] {
-        for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
+        for target in [
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar30,
+            ArchiveVersion::Rar40,
+        ] {
             let mut features = FeatureSet::store_only();
             features.header_encryption = header_encryption;
             let entry = entry(EntrySource::from_bytes(data()), Some(b"secret"));

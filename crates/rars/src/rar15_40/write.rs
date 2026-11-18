@@ -3478,9 +3478,6 @@ mod tests {
             ] {
                 for store in [true, false] {
                     for header_encryption in [false, true] {
-                        if header_encryption && target == crate::ArchiveVersion::Rar29 {
-                            continue;
-                        }
                         for volume_size in [None, Some(4096)] {
                             cases.push(Self {
                                 target,
