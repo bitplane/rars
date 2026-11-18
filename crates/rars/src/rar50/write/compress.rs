@@ -283,9 +283,15 @@ const SHARED_WINDOW_LIMIT: usize = u32::MAX as usize / 6;
 /// what its own window held and what later runs' histories hold. It joins
 /// only when it has history: at its member's start, its own parse searches a
 /// tree.
+///
+/// In a solid `chain`, the wave's runs are consecutive runs of one stream
+/// that crosses members, so they group as one. A filtered run there already
+/// holds its filtered bytes and carries its blocks' records, and joins on the
+/// same terms.
 fn share_member_windows<B: Budget + Send + Sync>(
     jobs: &mut [BlockJob<B>],
     plan: &CompressPlan,
+    chain: bool,
     allowance: &B,
 ) -> Result<()>
 where
@@ -298,19 +304,25 @@ where
     let dictionary = options.max_match_distance;
     let own_window = |job: &BlockJob<B>| job.history.len().min(dictionary) + job.data.len();
     let shareable = |job: &BlockJob<B>| {
-        (job.filters.is_empty() || !job.history.is_empty())
-            && job.records.is_none()
+        let plain = job.filters.is_empty() && job.records.is_none();
+        (plain || !job.history.is_empty())
             && crate::codec::rar50::packed_index_fits(own_window(job), options)
+    };
+    let next_to = |before: &BlockJob<B>, after: &BlockJob<B>| {
+        chain || before.offset + before.data.len() == after.offset
     };
     let mut members: Vec<usize> = jobs.iter().map(|job| job.blocks[0].0).collect();
     members.sort_unstable();
     members.dedup();
+    if chain {
+        members.truncate(1);
+    }
     let mut groups: Vec<(Vec<usize>, usize)> = Vec::new();
     for member in members {
         // Jobs are taken from a member in order, so its runs here are
-        // consecutive in the list's order.
+        // consecutive in the list's order; a chain's are all one stream.
         let runs: Vec<usize> = (0..jobs.len())
-            .filter(|&index| jobs[index].blocks[0].0 == member)
+            .filter(|&index| chain || jobs[index].blocks[0].0 == member)
             .collect();
         let mut group: Vec<usize> = Vec::new();
         let mut window_len = 0usize;
@@ -319,7 +331,7 @@ where
                 match group.last() {
                     None => own_window(&jobs[index]) <= SHARED_WINDOW_LIMIT,
                     Some(&last) => {
-                        jobs[last].offset + jobs[last].data.len() == jobs[index].offset
+                        next_to(&jobs[last], &jobs[index])
                             && window_len + jobs[index].data.len() <= SHARED_WINDOW_LIMIT
                     }
                 }
@@ -1223,7 +1235,7 @@ where
             }
 
             if resources.execution.is_none() {
-                share_member_windows(&mut jobs, plan, allowance)?;
+                share_member_windows(&mut jobs, plan, false, allowance)?;
             }
             compress_wave(
                 jobs,
@@ -1378,6 +1390,9 @@ where
 
         if jobs.is_empty() {
             break;
+        }
+        if resources.execution.is_none() {
+            share_member_windows(&mut jobs, plan, true, allowance)?;
         }
         compress_wave(
             jobs,
@@ -1729,7 +1744,12 @@ fn encode_shared_block_job<B: Budget>(
     progress: &dyn CompressionProgress,
     allowance: &B,
 ) -> Result<PackedBlocks<B>> {
-    let BlockJob { blocks, shared, .. } = job;
+    let BlockJob {
+        blocks,
+        shared,
+        records: solid_records,
+        ..
+    } = job;
     let SharedRun {
         window,
         start,
@@ -1740,7 +1760,7 @@ fn encode_shared_block_job<B: Budget>(
     let mut block_done = |bytes: usize| progress.advance(bytes as u64);
     let (cuts, records) = match &filtered {
         Some((cuts, records)) => (&cuts[..], Some(&records[..])),
-        None => (&boundaries[..], None),
+        None => (&boundaries[..], solid_records.as_deref()),
     };
     let packed = streaming_blocks_with_finder(
         &window[..end],

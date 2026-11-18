@@ -82,7 +82,12 @@ fn code(size: usize) -> Vec<u8> {
     data
 }
 
-fn write(members: Vec<(&'static str, Vec<u8>)>, policy: FilterPolicy, threads: usize) -> Vec<u8> {
+fn write(
+    members: Vec<(&'static str, Vec<u8>)>,
+    policy: FilterPolicy,
+    solid: bool,
+    threads: usize,
+) -> Vec<u8> {
     let entries: Vec<_> = members
         .into_iter()
         .map(|(name, data)| ArchiveEntry::new(name, EntrySource::from_bytes(data)))
@@ -91,11 +96,13 @@ fn write(members: Vec<(&'static str, Vec<u8>)>, policy: FilterPolicy, threads: u
         .num_threads(threads)
         .build()
         .unwrap();
+    let mut features = FeatureSet::store_only();
+    features.solid = solid;
     let mut bytes = Vec::new();
     pool.install(|| {
         rar50::write_streaming_archive_with_progress(
             &entries,
-            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            WriterOptions::new(ArchiveVersion::Rar50, features)
                 .with_compression_level(2)
                 .with_dictionary_size(1024 * 1024),
             ArchiveExtras::default().with_filter_policy(policy),
@@ -110,7 +117,35 @@ fn write(members: Vec<(&'static str, Vec<u8>)>, policy: FilterPolicy, threads: u
 
 #[test]
 fn runs_sharing_a_window_write_the_archive_one_run_at_a_time_would() {
-    same_archive_shared_or_alone(members, FilterPolicy::None, 4);
+    same_archive_shared_or_alone(members, FilterPolicy::None, false, 4);
+}
+
+#[test]
+fn solid_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would() {
+    // A solid chain is one stream through every member, so a wave of four
+    // holds four consecutive runs of it, the second crossing from the first
+    // member into the second.
+    let chain = || {
+        vec![
+            ("first.txt", text(1536 * KIB, 1)),
+            ("second.txt", text(1536 * KIB + 3, 2)),
+        ]
+    };
+    same_archive_shared_or_alone(chain, FilterPolicy::None, true, 4);
+}
+
+#[test]
+fn filtered_solid_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would() {
+    // Automatic filters give a solid run its blocks' records, with its bytes
+    // already filtered. The first run, filtered at the chain's start, keeps
+    // its own window; the second, filtered, and the third, plain text, share.
+    let mixed = || {
+        vec![
+            ("code.bin", code(2048 * KIB)),
+            ("notes.txt", text(64 * KIB + 3, 3)),
+        ]
+    };
+    same_archive_shared_or_alone(mixed, FilterPolicy::Auto, true, 3);
 }
 
 #[test]
@@ -125,11 +160,13 @@ fn filtered_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would() {
     let whole = same_archive_shared_or_alone(
         member,
         FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8)),
+        false,
         3,
     );
     let part = same_archive_shared_or_alone(
         member,
         FilterPolicy::Explicit(FilterSpec::range(FilterKind::E8, 1536 * KIB..3072 * KIB)),
+        false,
         3,
     );
     assert!(whole.len() < part.len(), "the filters were not applied");
@@ -140,10 +177,11 @@ fn filtered_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would() {
 fn same_archive_shared_or_alone(
     members: impl Fn() -> Vec<(&'static str, Vec<u8>)>,
     policy: FilterPolicy,
+    solid: bool,
     threads: usize,
 ) -> Vec<u8> {
-    let alone = write(members(), policy.clone(), 1);
-    let shared = write(members(), policy.clone(), threads);
+    let alone = write(members(), policy.clone(), solid, 1);
+    let shared = write(members(), policy.clone(), solid, threads);
     assert!(alone == shared, "{policy:?}: sharing changed the archive");
 
     let archive = ArchiveReader::read(&shared).unwrap();
