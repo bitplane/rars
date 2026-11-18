@@ -731,7 +731,7 @@ fn write_members_to(
                 None => false,
             };
             if let (true, Sink::Seekable(output, _)) = (streams, &mut *sink) {
-                let method = stream_member(
+                let method = stream_member_in_place(
                     output,
                     member,
                     options,
@@ -827,7 +827,7 @@ fn write_members_to(
                         progress.reporter(),
                     ),
                     None => match sink {
-                        Sink::Seekable(output, _) => stream_member(
+                        Sink::Seekable(output, _) => stream_member_in_place(
                             output,
                             member,
                             options,
@@ -1914,14 +1914,116 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     lz.saturating_add(search.max(ppmd)).saturating_add(chain)
 }
 
-/// The attempt stops short of the member's size, so a stored fallback overwrites all of it.
+/// Where a streamed member's packed bytes go: one archive, or the fragments of a volume set.
+trait StreamedOut {
+    /// Puts out what stands before the payload, with sizes still to be patched.
+    fn begin(&mut self, salt: Option<[u8; 8]>, sizes: HeaderPayload) -> Result<()>;
+    /// False stores the member instead; `coded` is how far into it the packed bytes reach with `block`.
+    fn goes_on(&mut self, packed: u64, block: u64, coded: u64, unpacked: u64) -> bool;
+    fn write_packed(&mut self, bytes: &[u8]) -> Result<()>;
+    /// Back to the start of the payload; the stored copy is longer than the attempt, so it covers it.
+    fn restart(&mut self) -> Result<()>;
+    /// Patches the header now the payload's sizes and CRC are known.
+    fn finish(&mut self, sizes: HeaderPayload) -> Result<()>;
+}
+
+/// A member in a single archive, its header written ahead and patched in place.
+struct InPlace<'o, 'm> {
+    output: &'o mut dyn SeekWrite,
+    member: &'m Member<'m>,
+    options: WriterOptions,
+    header_key: Option<&'m HeaderKey>,
+    continues: bool,
+    salt: Option<[u8; 8]>,
+    header_at: u64,
+    header_len: u64,
+}
+
+impl InPlace<'_, '_> {
+    fn write_header(&mut self, sizes: HeaderPayload) -> Result<u64> {
+        let continuation = self.continues && sizes.method != 0x30;
+        let header = member_header(self.member, self.options, continuation, self.salt, sizes)?;
+        let from = self.output.stream_position()?;
+        match self.header_key {
+            Some(key) => write_encrypted_header(self.output, &header, key)?,
+            None => self.output.write_all(&header)?,
+        }
+        Ok(self.output.stream_position()? - from)
+    }
+}
+
+impl StreamedOut for InPlace<'_, '_> {
+    fn begin(&mut self, salt: Option<[u8; 8]>, sizes: HeaderPayload) -> Result<()> {
+        self.salt = salt;
+        self.header_at = self.output.stream_position()?;
+        self.header_len = self.write_header(sizes)?;
+        Ok(())
+    }
+
+    fn goes_on(&mut self, packed: u64, block: u64, _coded: u64, unpacked: u64) -> bool {
+        packed + block < unpacked
+    }
+
+    fn write_packed(&mut self, bytes: &[u8]) -> Result<()> {
+        Ok(self.output.write_all(bytes)?)
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        self.output
+            .seek(SeekFrom::Start(self.header_at + self.header_len))?;
+        Ok(())
+    }
+
+    fn finish(&mut self, sizes: HeaderPayload) -> Result<()> {
+        let end = self.output.stream_position()?;
+        self.output.seek(SeekFrom::Start(self.header_at))?;
+        if self.write_header(sizes)? != self.header_len {
+            return Err(Error::InvalidArgument(
+                "legacy file header changed length when patched",
+            ));
+        }
+        self.output.seek(SeekFrom::Start(end))?;
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn stream_member(
+fn stream_member_in_place(
     output: &mut dyn SeekWrite,
     member: &Member<'_>,
     options: WriterOptions,
     coding: &MemberCoding,
     header_key: Option<&HeaderKey>,
+    data_keys: &mut DataKeys,
+    solid: Option<SolidLink<'_>>,
+    resources: &WriterResources,
+    progress: &WorkTracker<'_>,
+) -> Result<u8> {
+    progress.check()?;
+    let unpacked_size = member.unpacked_size()?;
+    validate_member(member.name, options.target, unpacked_size)?;
+    let mut out = InPlace {
+        output,
+        member,
+        options,
+        header_key,
+        continues: solid.as_ref().is_some_and(|link| link.continues),
+        salt: None,
+        header_at: 0,
+        header_len: 0,
+    };
+    stream_member(
+        &mut out, member, options, coding, data_keys, solid, resources, progress,
+    )
+}
+
+/// Codes a member into `out` as it reads, storing it instead if the attempt doesn't pay.
+#[allow(clippy::too_many_arguments)]
+fn stream_member(
+    out: &mut dyn StreamedOut,
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
     data_keys: &mut DataKeys,
     mut solid: Option<SolidLink<'_>>,
     resources: &WriterResources,
@@ -1929,7 +2031,6 @@ fn stream_member(
 ) -> Result<u8> {
     progress.check()?;
     let unpacked_size = member.unpacked_size()?;
-    validate_member(member.name, options.target, unpacked_size)?;
     let len = usize::try_from(unpacked_size)
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
     let encode_options = rar29_encode_options_for_options(options)?;
@@ -1938,28 +2039,14 @@ fn stream_member(
             progress.is_cancelled()
         })?;
     let engine = streamed_engine(member, len, options, coding, encode_options, progress)?;
-    let method = compression_method_for_level(options);
     let cipher = volumes::CipherPlan::new(options.target, member.password, data_keys)?;
-    let salt = cipher.salt();
-    let header_at = output.stream_position()?;
     let mut sizes = HeaderPayload {
-        method,
+        method: compression_method_for_level(options),
         unpacked_size,
         file_crc: 0,
         packed_size: 0,
     };
-    let continues = solid.as_ref().is_some_and(|link| link.continues);
-    let write_header = |output: &mut dyn SeekWrite, sizes: HeaderPayload| -> Result<u64> {
-        let continuation = continues && sizes.method != 0x30;
-        let header = member_header(member, options, continuation, salt, sizes)?;
-        let from = output.stream_position()?;
-        match header_key {
-            Some(key) => write_encrypted_header(output, &header, key)?,
-            None => output.write_all(&header)?,
-        }
-        Ok(output.stream_position()? - from)
-    };
-    let header_len = write_header(output, sizes)?;
+    out.begin(cipher.salt(), sizes)?;
     let mut sealed = Sealed::new(cipher.start()?);
 
     let mut crc = Crc32::new();
@@ -1978,12 +2065,16 @@ fn stream_member(
         last = last.max(position);
         progress.advance(delta as u64)
     };
-    let mut write = |block: &[u8]| {
-        if sizes.packed_size + block.len() as u64 >= unpacked_size {
+    let mut write = |block: &[u8], coded: usize| -> crate::codec::Result<ControlFlow<()>> {
+        let size = block.len() as u64;
+        if !out.goes_on(sizes.packed_size, size, coded as u64, unpacked_size) {
             return Ok(ControlFlow::Break(()));
         }
-        sealed.write(output, block)?;
-        sizes.packed_size += block.len() as u64;
+        sealed.write(out, block).map_err(|error| match error {
+            Error::Cancelled => crate::codec::Error::Cancelled,
+            error => crate::codec::Error::Io(Box::new(error)),
+        })?;
+        sizes.packed_size += size;
         Ok(ControlFlow::Continue(()))
     };
     let mut choose = |segment: &[u8]| -> crate::codec::Result<Vec<FilterSpec>> {
@@ -2027,7 +2118,7 @@ fn stream_member(
             unpacked_size,
             "entry source size changed while compressing",
         )?;
-        sealed.finish(output)?;
+        sealed.finish(out)?;
         sizes.file_crc = crc.finish();
         sizes.packed_size = cipher.packed_len(sizes.packed_size)?;
     } else {
@@ -2035,7 +2126,7 @@ fn stream_member(
         if let Some(link) = solid {
             *link.encoder = Some(SolidEncoder::for_target(options)?);
         }
-        output.seek(SeekFrom::Start(header_at + header_len))?;
+        out.restart()?;
         let mut crc = Crc32::new();
         let mut source = member.bytes.open()?;
         let mut sealed = Sealed::new(cipher.start()?);
@@ -2049,7 +2140,7 @@ fn stream_member(
             }
             progress.check()?;
             crc.update(&chunk[..read]);
-            sealed.write(output, &chunk[..read])?;
+            sealed.write(out, &chunk[..read])?;
             copied += read as u64;
         }
         crate::write_stream::check_source_length(
@@ -2058,7 +2149,7 @@ fn stream_member(
             unpacked_size,
             "entry source size changed while writing",
         )?;
-        sealed.finish(output)?;
+        sealed.finish(out)?;
         progress.advance(unpacked_size.saturating_sub(last as u64));
         sizes = HeaderPayload {
             method: 0x30,
@@ -2067,14 +2158,7 @@ fn stream_member(
             packed_size: cipher.packed_len(unpacked_size)?,
         };
     }
-    let end = output.stream_position()?;
-    output.seek(SeekFrom::Start(header_at))?;
-    if write_header(output, sizes)? != header_len {
-        return Err(Error::InvalidArgument(
-            "legacy file header changed length when patched",
-        ));
-    }
-    output.seek(SeekFrom::Start(end))?;
+    out.finish(sizes)?;
     Ok(sizes.method)
 }
 
@@ -2098,25 +2182,24 @@ impl Sealed {
         }
     }
 
-    fn write(&mut self, output: &mut dyn SeekWrite, bytes: &[u8]) -> std::io::Result<()> {
+    fn write(&mut self, output: &mut dyn StreamedOut, bytes: &[u8]) -> Result<()> {
         let Some(cipher) = &mut self.cipher else {
-            output.write_all(bytes)?;
-            return Ok(());
+            return output.write_packed(bytes);
         };
         self.pending.extend_from_slice(bytes);
         let whole = self.pending.len() & !15;
         cipher.encrypt(&mut self.pending[..whole]);
-        output.write_all(&self.pending[..whole])?;
+        output.write_packed(&self.pending[..whole])?;
         self.pending.drain(..whole);
         Ok(())
     }
 
-    fn finish(mut self, output: &mut dyn SeekWrite) -> std::io::Result<()> {
+    fn finish(mut self, output: &mut dyn StreamedOut) -> Result<()> {
         if let Some(cipher) = &mut self.cipher {
             if !self.pending.is_empty() {
                 self.pending.resize(16, 0);
                 cipher.encrypt(&mut self.pending);
-                output.write_all(&self.pending)?;
+                output.write_packed(&self.pending)?;
             }
         }
         Ok(())
@@ -2278,7 +2361,7 @@ pub(crate) fn write_compressed_volumes_with_comment_and_progress(
     Ok(sink.take())
 }
 
-/// Writes each volume to `sink` as it fills; only the member and its packed form are held.
+/// Writes each volume to `sink` as it fills; a large RAR 2.9-4.x member's packed form is not held.
 pub fn write_compressed_volumes_to(
     entry: FileEntry<'_>,
     options: WriterOptions,
@@ -4277,6 +4360,10 @@ mod tests {
 
     #[cfg(feature = "encryption")]
     fn extracted(archive: &[u8], password: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+        extracted_set(&[archive.to_vec()], password)
+    }
+
+    fn extracted_set(volumes: &[Vec<u8>], password: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
         use std::cell::RefCell;
         use std::rc::Rc;
 
@@ -4291,10 +4378,13 @@ mod tests {
             }
         }
 
-        let parsed = crate::rar15_40::Archive::parse_with_password(archive, password).unwrap();
+        let parsed: Vec<_> = volumes
+            .iter()
+            .map(|volume| crate::rar15_40::Archive::parse_with_password(volume, password).unwrap())
+            .collect();
         let mut out = Vec::new();
         crate::rar15_40::extract_volumes_to(
-            std::slice::from_ref(&parsed),
+            &parsed,
             match password {
                 Some(password) => crate::ArchiveReadOptions::with_password(password),
                 None => crate::ArchiveReadOptions::default(),
@@ -4449,6 +4539,289 @@ mod tests {
             (b"after.wav".to_vec(), audio[audio.len() - 80000..].to_vec()),
         ];
         assert_eq!(extracted(&archive, Some(b"password")), expected);
+    }
+
+    fn counted_entries(
+        members: &[(&str, &[u8])],
+    ) -> (
+        Vec<super::StreamingEntry>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let opens = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = members
+            .iter()
+            .map(|(name, data)| {
+                let data = data.to_vec();
+                let opens = opens.clone();
+                super::StreamingEntry::new(
+                    name.as_bytes().to_vec(),
+                    crate::EntrySource::from_opener(data.len() as u64, move || {
+                        opens.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        Ok(Box::new(std::io::Cursor::new(data.clone())))
+                    }),
+                )
+            })
+            .collect();
+        (entries, opens)
+    }
+
+    fn volume_set(
+        entries: &[super::StreamingEntry],
+        options: super::WriterOptions,
+        coding: crate::MemberCoding,
+        volume_size: usize,
+        stream_above: u64,
+        progress: Option<&dyn crate::WriteProgress>,
+    ) -> crate::Result<Vec<Vec<u8>>> {
+        let members: Vec<_> = entries.iter().map(super::Member::from_streaming).collect();
+        let mut sink = crate::volume_sink::CollectedVolumes::new();
+        super::volumes::split_members_above(
+            &members,
+            options,
+            &coding,
+            None,
+            volume_size,
+            &mut sink,
+            &crate::WriterResources::default(),
+            progress,
+            stream_above,
+        )?;
+        Ok(sink.take())
+    }
+
+    #[test]
+    fn a_streamed_member_splits_into_the_volumes_the_in_memory_writer_does() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let (members, opens) = counted_entries(&[
+            ("small.txt", b"small and below the threshold\n"),
+            ("large.bin", &large),
+        ]);
+        let coding = || crate::MemberCoding::Compressed;
+
+        let streamed = volume_set(&members, rar40(), coding(), 100_000, 256 * 1024, None).unwrap();
+
+        assert!(
+            opens.load(std::sync::atomic::Ordering::Relaxed) > 2,
+            "the large member was not streamed"
+        );
+        let whole = volume_set(&members, rar40(), coding(), 100_000, u64::MAX, None).unwrap();
+        assert!(streamed.len() > 2);
+        assert_eq!(streamed, whole);
+    }
+
+    #[test]
+    fn an_incompressible_member_in_a_set_is_stored_with_nothing_left_over() {
+        let noise = noise(1024 * 1024 + 7);
+        let large = binary_member(512 * 1024);
+        let coding = || crate::MemberCoding::Compressed;
+        // A stored lead leaves the noise most of a volume, or a few bytes, to start in.
+        for lead_len in [100, 99_800] {
+            let lead = super::tests::noise(lead_len);
+            let contents = [
+                ("lead.bin", &lead[..]),
+                ("noise.bin", &noise[..]),
+                ("large.bin", &large[..]),
+            ];
+            let (members, opens) = counted_entries(&contents);
+
+            let streamed =
+                volume_set(&members, rar40(), coding(), 100_000, 256 * 1024, None).unwrap();
+
+            assert!(
+                opens.load(std::sync::atomic::Ordering::Relaxed) > 4,
+                "the large members were not streamed"
+            );
+            let whole = volume_set(&members, rar40(), coding(), 100_000, u64::MAX, None).unwrap();
+            assert_eq!(streamed, whole, "a {lead_len} byte lead");
+            let expected: Vec<_> = contents
+                .iter()
+                .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+                .collect();
+            assert_eq!(extracted_set(&streamed, None), expected);
+        }
+    }
+
+    #[test]
+    fn a_ppmd_member_starting_at_a_volume_end_waits_to_be_judged() {
+        let lead = noise(99_800);
+        let text = word_text(1024 * 1024);
+        let contents = [("lead.bin", &lead[..]), ("text.txt", &text[..])];
+        let (members, _) = counted_entries(&contents);
+
+        let set = volume_set(
+            &members,
+            rar40(),
+            crate::MemberCoding::Compressed,
+            100_000,
+            256 * 1024,
+            None,
+        )
+        .unwrap();
+
+        let first = crate::rar15_40::Archive::parse(&set[0]).unwrap();
+        let start = first.files().nth(1).unwrap();
+        assert!(start.pack_size < 34, "{} bytes", start.pack_size);
+        assert_eq!(start.method, 0x33);
+        let expected: Vec<_> = contents
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect();
+        assert_eq!(extracted_set(&set, None), expected);
+    }
+
+    #[test]
+    fn solid_members_stream_into_a_set_on_the_chain() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(1024 * 1024 + 7);
+        let mut options = rar40();
+        options.features.solid = true;
+        let (members, opens) = counted_entries(&[
+            ("before.bin", &large[1000..41000]),
+            ("large.bin", &large),
+            ("after.bin", &large[large.len() - 40000..]),
+            ("noise.bin", &noise),
+            ("last.bin", &large[5000..45000]),
+        ]);
+        let coding = || crate::MemberCoding::Compressed;
+
+        let streamed = volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
+
+        assert!(
+            opens.load(std::sync::atomic::Ordering::Relaxed) > 5,
+            "the large members were not streamed"
+        );
+        let whole = volume_set(&members, options, coding(), 100_000, u64::MAX, None).unwrap();
+        assert_eq!(streamed, whole);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn password_protected_members_stream_into_a_set() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(1024 * 1024 + 7);
+        let contents = [
+            ("small.txt", &b"small and below the threshold\n"[..]),
+            ("large.bin", &large[..]),
+            ("noise.bin", &noise[..]),
+        ];
+        let (members, opens) = counted_entries(&contents);
+        let members: Vec<_> = members
+            .into_iter()
+            .map(|entry| entry.with_password(b"password".to_vec()))
+            .collect();
+        let sizes = |volumes: &[Vec<u8>]| {
+            volumes
+                .iter()
+                .flat_map(|volume| {
+                    crate::rar15_40::Archive::parse_with_password(volume, Some(b"password"))
+                        .unwrap()
+                        .files()
+                        .map(|file| (file.method, file.pack_size))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected: Vec<_> = contents
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect();
+
+        for (header_encryption, solid) in [(false, false), (true, false), (true, true)] {
+            let mut options = rar40();
+            options.features.header_encryption = header_encryption;
+            options.features.solid = solid;
+            let coding = || crate::MemberCoding::Compressed;
+            let case = format!("-hp {header_encryption}, solid {solid}");
+
+            let streamed =
+                volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
+
+            let whole = volume_set(&members, options, coding(), 100_000, u64::MAX, None).unwrap();
+            assert_eq!(sizes(&streamed), sizes(&whole), "{case}");
+            assert_eq!(
+                streamed.iter().map(Vec::len).collect::<Vec<_>>(),
+                whole.iter().map(Vec::len).collect::<Vec<_>>(),
+                "{case}"
+            );
+            assert_eq!(
+                extracted_set(&streamed, Some(b"password")),
+                expected,
+                "{case}"
+            );
+        }
+        assert!(
+            opens.load(std::sync::atomic::Ordering::Relaxed) > 12,
+            "the large members were not streamed"
+        );
+    }
+
+    #[test]
+    fn a_member_streaming_into_a_set_reports_progress_and_can_be_cancelled() {
+        use crate::atomic64::AtomicU64;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct CancelPast {
+            limit: u64,
+            done: AtomicU64,
+            volumes: AtomicUsize,
+        }
+        impl crate::WriteProgress for CancelPast {
+            fn report(&self, event: crate::WriteProgressEvent<'_>) {
+                match event {
+                    crate::WriteProgressEvent::Advanced {
+                        completed_bytes, ..
+                    } => {
+                        self.done.fetch_max(completed_bytes, Ordering::Relaxed);
+                    }
+                    crate::WriteProgressEvent::VolumeFinished { .. } => {
+                        self.volumes.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+
+            fn is_cancelled(&self) -> bool {
+                self.done.load(Ordering::Relaxed) > self.limit
+            }
+        }
+
+        let large = binary_member(2 * 1024 * 1024);
+        let members = entries(&[("large.bin", &large)]);
+        let coding = || crate::MemberCoding::Compressed;
+
+        let finished = CancelPast {
+            limit: u64::MAX,
+            ..CancelPast::default()
+        };
+        let set = volume_set(
+            &members,
+            rar40(),
+            coding(),
+            100_000,
+            256 * 1024,
+            Some(&finished),
+        )
+        .unwrap();
+        assert_eq!(finished.done.load(Ordering::Relaxed), large.len() as u64);
+        assert_eq!(finished.volumes.load(Ordering::Relaxed), set.len());
+
+        let cancelled = CancelPast {
+            limit: 512 * 1024,
+            ..CancelPast::default()
+        };
+        assert!(matches!(
+            volume_set(
+                &members,
+                rar40(),
+                coding(),
+                100_000,
+                256 * 1024,
+                Some(&cancelled)
+            ),
+            Err(crate::Error::Cancelled)
+        ));
+        assert!(cancelled.done.load(Ordering::Relaxed) < large.len() as u64);
     }
 
     #[test]

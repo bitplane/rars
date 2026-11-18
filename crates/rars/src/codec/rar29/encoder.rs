@@ -1000,6 +1000,9 @@ fn encode_member_blocks(
     Ok(out)
 }
 
+/// Takes packed bytes as they are coded, with how far into the member they code through.
+pub(crate) type PackedOut<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>;
+
 /// Ranges are the segment's own, so a chooser needs no member to measure against.
 pub(crate) type SegmentFilters<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<crate::FilterSpec>>;
 
@@ -1011,7 +1014,7 @@ pub(crate) fn unpack29_encode_literals_streamed(
     options: EncodeOptions,
     filters: Option<SegmentFilters<'_>>,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    out: PackedOut<'_>,
 ) -> Result<ControlFlow<()>> {
     Unpack29Encoder::with_options(options).encode_lz_streamed(input, len, filters, progress, out)
 }
@@ -1030,7 +1033,7 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
     len: usize,
     escapes: Option<usize>,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    out: PackedOut<'_>,
 ) -> Result<ControlFlow<()>> {
     encode_ppmd_streamed(input, len, escapes, None, None, progress, out).map(|(flow, _)| flow)
 }
@@ -1043,7 +1046,7 @@ impl Unpack29Encoder {
         len: usize,
         filters: Option<SegmentFilters<'_>>,
         progress: &mut dyn FnMut(usize) -> bool,
-        out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+        out: PackedOut<'_>,
     ) -> Result<ControlFlow<()>> {
         let mut options = self.options;
         let mut levels = self.levels;
@@ -1066,7 +1069,7 @@ impl Unpack29Encoder {
                 &mut levels,
                 Some(progress),
             )?;
-            let flow = out(&packed)?;
+            let flow = out(&packed, len)?;
             if flow.is_continue() {
                 self.levels = levels;
                 self.remember(&data);
@@ -1093,7 +1096,7 @@ impl Unpack29Encoder {
                     true => block_filter_records(records, base, end, window, &mut programs)?,
                     false => Vec::new(),
                 };
-                out(&code_block(tokens, &records, end < len, &mut levels)?)
+                out(&code_block(tokens, &records, end < len, &mut levels)?, end)
             },
         )?;
         if flow.is_continue() {
@@ -1113,7 +1116,7 @@ impl Unpack29Encoder {
         len: usize,
         escapes: Option<usize>,
         progress: &mut dyn FnMut(usize) -> bool,
-        out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+        out: PackedOut<'_>,
     ) -> Result<ControlFlow<()>> {
         // Taken rather than copied: after a break the caller starts a new chain.
         let mut history = std::mem::take(&mut self.history);
@@ -1142,7 +1145,7 @@ fn encode_ppmd_streamed(
     model: Option<PpmdModel>,
     mut history: Option<&mut Vec<u8>>,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    out: PackedOut<'_>,
 ) -> Result<(ControlFlow<()>, Option<PpmdModel>)> {
     if !progress(0) {
         return Err(Error::Cancelled);
@@ -1160,7 +1163,7 @@ fn encode_ppmd_streamed(
             ],
         ),
     };
-    if out(&head)?.is_break() {
+    if out(&head, 0)?.is_break() {
         return Ok((ControlFlow::Break(()), None));
     }
     let reach = escapes.map_or(0, |distance| len.min(distance).min(MAX_HISTORY));
@@ -1207,12 +1210,12 @@ fn encode_ppmd_streamed(
             }
             pos = end;
         }
-        if out(&encoder.take_output())?.is_break() {
+        if out(&encoder.take_output(), pos)?.is_break() {
             return Ok((ControlFlow::Break(()), None));
         }
     }
     let (packed, model) = encoder.finish_keeping_model()?;
-    let flow = out(&packed)?;
+    let flow = out(&packed, len)?;
     if !progress(len) {
         return Err(Error::Cancelled);
     }

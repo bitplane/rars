@@ -4829,7 +4829,7 @@ fn a_member_read_in_segments_codes_to_the_in_memory_bytes() {
         options,
         None,
         &mut |_| true,
-        &mut |block| {
+        &mut |block, _| {
             blocks += 1;
             streamed.extend_from_slice(block);
             Ok(std::ops::ControlFlow::Continue(()))
@@ -4853,7 +4853,7 @@ fn a_streamed_member_stops_at_the_block_its_sink_refuses() {
         options,
         None,
         &mut |_| true,
-        &mut |_| {
+        &mut |_, _| {
             blocks += 1;
             Ok(if blocks == 3 {
                 std::ops::ControlFlow::Break(())
@@ -4882,7 +4882,7 @@ fn a_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes() {
             text.len(),
             escapes,
             &mut |_| true,
-            &mut |bytes| {
+            &mut |bytes, _| {
                 writes += 1;
                 streamed.extend_from_slice(bytes);
                 Ok(std::ops::ControlFlow::Continue(()))
@@ -4939,7 +4939,7 @@ fn a_member_filtered_a_segment_at_a_time_codes_to_the_in_memory_bytes() {
             Ok(vec![FilterSpec::whole(kind)])
         }),
         &mut |_| true,
-        &mut |block| {
+        &mut |block, _| {
             streamed.extend_from_slice(block);
             Ok(std::ops::ControlFlow::Continue(()))
         },

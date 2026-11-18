@@ -80,6 +80,31 @@ pub fn write_volumes_with_comment_to(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn split_members(
     members: &[Member<'_>],
+    options: WriterOptions,
+    coding: &MemberCoding,
+    archive_comment: Option<&[u8]>,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
+    split_members_above(
+        members,
+        options,
+        coding,
+        archive_comment,
+        volume_size,
+        sink,
+        resources,
+        progress,
+        STREAM_MEMBERS_ABOVE,
+    )
+}
+
+/// Members larger than `stream_above` are coded into the volumes as they are read.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn split_members_above(
+    members: &[Member<'_>],
     mut options: WriterOptions,
     coding: &MemberCoding,
     archive_comment: Option<&[u8]>,
@@ -87,6 +112,7 @@ pub(super) fn split_members(
     sink: &mut dyn VolumeSink,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
+    stream_above: u64,
 ) -> Result<()> {
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
@@ -108,7 +134,7 @@ pub(super) fn split_members(
         let len = member.unpacked_size().map_err(|error| {
             crate::write_stream::member_error(error, member.name, "reading source")
         })?;
-        // A compressed member is coded whole in memory, so it keeps to 32-bit sizes.
+        // Compressed set members still keep to 32-bit sizes, streamed or not.
         let validate = if compresses {
             validate_volume_member
         } else {
@@ -189,8 +215,61 @@ pub(super) fn split_members(
     } else {
         boundary_reserves(members, options.target)?
     };
+    let mut open_packer = |name: &[u8]| -> Result<VolumePacker<'_>> {
+        if let Some(password) = header_password {
+            let key = HeaderKey::derive(password).map_err(|error| {
+                crate::write_stream::member_error(error, name, "encrypting volume member")
+            })?;
+            let _ = header_key.set(key);
+        }
+        let comment = encode_archive_comment(
+            archive_comment,
+            options,
+            header_key.get(),
+            header_comment_password(options.target, header_password),
+            &mut DataKeys::default(),
+        )?;
+        VolumePacker::new(
+            sink.take().expect("the packer opens once"),
+            volume_size as u64,
+            options.target,
+            if solid { MHD_SOLID } else { 0 },
+            comment,
+            header_key.get(),
+            progress,
+        )
+    };
     for (member, &reserve) in members.iter().zip(&reserves) {
         let name = member.name;
+        let streams = compresses
+            && streams_member(member, options, coding, stream_above).map_err(|error| {
+                crate::write_stream::member_error(error, name, "preparing volume member")
+            })?;
+        if streams {
+            let packer = match &mut packer {
+                Some(packer) => packer,
+                None => packer.insert(open_packer(name)?),
+            };
+            let method = stream_member_into(
+                packer,
+                member,
+                options,
+                coding,
+                &mut data_keys,
+                solid.then_some(SolidLink {
+                    encoder: &mut solid_encoder,
+                    continues: solid_run_has_member,
+                }),
+                resources,
+                &work,
+            )
+            .map_err(|error| {
+                crate::write_stream::member_error(error, name, "compressing volume member")
+            })?;
+            // A streamed member is never empty, so only storing it ends the run.
+            solid_run_has_member = method != 0x30;
+            continue;
+        }
         let encoded = if compresses && !member.is_directory {
             Some(
                 encode_member(
@@ -256,48 +335,30 @@ pub(super) fn split_members(
                 crate::write_stream::member_error(error, name, "encrypting volume member")
             })?;
         let volume_member = VolumeMember {
-            name,
-            target: options.target,
-            unpacked_size,
-            file_time: member.file_time,
-            file_attr: member.file_attr,
-            host_os: member.host_os,
-            method,
-            dictionary_flags: if member.is_directory && options.target != ArchiveVersion::Rar15 {
-                FHD_DIRECTORY_MASK
-            } else {
-                dictionary_flags_for_options(options)?
+            head: FragmentHead {
+                name,
+                target: options.target,
+                unpacked_size,
+                file_time: member.file_time,
+                file_attr: member.file_attr,
+                host_os: member.host_os,
+                method,
+                dictionary_flags: if member.is_directory && options.target != ArchiveVersion::Rar15
+                {
+                    FHD_DIRECTORY_MASK
+                } else {
+                    dictionary_flags_for_options(options)?
+                },
+                file_flags: writer_file_flags(member.password, None, solid_continuation)
+                    | if cipher.salt().is_some() { FHD_SALT } else { 0 },
+                salt: cipher.salt(),
             },
-            file_flags: writer_file_flags(member.password, None, solid_continuation)
-                | if cipher.salt().is_some() { FHD_SALT } else { 0 },
-            salt: cipher.salt(),
             packed_len,
             final_crc,
             payload,
         };
         if packer.is_none() {
-            if let Some(password) = header_password {
-                let key = HeaderKey::derive(password).map_err(|error| {
-                    crate::write_stream::member_error(error, name, "encrypting volume member")
-                })?;
-                let _ = header_key.set(key);
-            }
-            let comment = encode_archive_comment(
-                archive_comment,
-                options,
-                header_key.get(),
-                header_comment_password(options.target, header_password),
-                &mut DataKeys::default(),
-            )?;
-            let mut opened = VolumePacker::new(
-                sink.take().expect("the packer opens once"),
-                volume_size as u64,
-                options.target,
-                if solid { MHD_SOLID } else { 0 },
-                comment,
-                header_key.get(),
-                progress,
-            )?;
+            let mut opened = open_packer(name)?;
             if members.len() == 1 {
                 opened.expect_only(&volume_member)?;
             }
@@ -368,8 +429,8 @@ fn header_len_bound(member: &Member<'_>, target: ArchiveVersion) -> Result<u64> 
     Ok(header.len() as u64)
 }
 
-/// Header fields and two readers over one member's packed bytes.
-struct VolumeMember<'a> {
+/// What every fragment header of a member says, apart from the fragment's size and CRC.
+struct FragmentHead<'a> {
     name: &'a [u8],
     target: ArchiveVersion,
     unpacked_size: u64,
@@ -380,13 +441,9 @@ struct VolumeMember<'a> {
     dictionary_flags: u16,
     file_flags: u16,
     salt: Option<[u8; 8]>,
-    packed_len: u64,
-    /// Known when packing worked it out; otherwise found while copying the payload.
-    final_crc: Option<u32>,
-    payload: PackedStream<'a>,
 }
 
-impl VolumeMember<'_> {
+impl FragmentHead<'_> {
     fn header(
         &self,
         split_before: bool,
@@ -431,6 +488,24 @@ impl VolumeMember<'_> {
             None => Ok(header),
         }
     }
+}
+
+/// A member's header fields and a reader over its packed bytes.
+struct VolumeMember<'a> {
+    head: FragmentHead<'a>,
+    packed_len: u64,
+    /// Known when packing worked it out; otherwise found while copying the payload.
+    final_crc: Option<u32>,
+    payload: PackedStream<'a>,
+}
+
+/// A fragment just written behind its placeholder header.
+struct Fragment {
+    header_len: u64,
+    continued: bool,
+    split_after: bool,
+    len: u64,
+    crc: u32,
 }
 
 /// Packs members into volumes; end blocks wait for the close, when it is known whether more follow.
@@ -489,9 +564,11 @@ impl<'a> VolumePacker<'a> {
 
     /// Works out the set's size up front when `member` is the only one.
     fn expect_only(&mut self, member: &VolumeMember<'_>) -> Result<()> {
-        let header_len = self.header_len(member).map_err(|error| {
-            crate::write_stream::member_error(error, member.name, "writing volume member")
-        })?;
+        let header_len = self
+            .header_len(&member.head, member.packed_len)
+            .map_err(|error| {
+                crate::write_stream::member_error(error, member.head.name, "writing volume member")
+            })?;
         let overhead = self.head(0)?.len() as u64 + header_len + self.tail_len;
         if let Some(payload) = self.volume_size.checked_sub(overhead).filter(|&p| p > 0) {
             let total = member.packed_len.div_ceil(payload);
@@ -501,22 +578,29 @@ impl<'a> VolumePacker<'a> {
         Ok(())
     }
 
+    /// Payload room left in the open volume once `ahead` more bytes are in it.
+    fn room_after(&self, ahead: u64) -> u64 {
+        let used = self.open.as_ref().map_or(0, |volume| volume.used);
+        self.volume_size
+            .saturating_sub(used + self.tail_len + ahead)
+    }
+
     /// Header length depends only on the member, not on the fragment.
-    fn header_len(&self, member: &VolumeMember<'_>) -> Result<u64> {
-        let probe = member.packed_len.min(self.volume_size);
-        Ok(member.header(false, true, probe, 0, self.header_key)?.len() as u64)
+    fn header_len(&self, head: &FragmentHead<'_>, packed_len: u64) -> Result<u64> {
+        let probe = packed_len.min(self.volume_size);
+        Ok(head.header(false, true, probe, 0, self.header_key)?.len() as u64)
     }
 
     /// `reserve` is the room to leave after the member's last byte, or it goes on into the next volume.
     fn write_member(&mut self, mut member: VolumeMember<'_>, reserve: u64) -> Result<()> {
-        let name = member.name;
+        let name = member.head.name;
         self.write_fragments(&mut member, reserve).map_err(|error| {
             crate::write_stream::member_error(error, name, "writing volume member")
         })
     }
 
     fn write_fragments(&mut self, member: &mut VolumeMember<'_>, reserve: u64) -> Result<()> {
-        let header_len = self.header_len(member)?;
+        let header_len = self.header_len(&member.head, member.packed_len)?;
         let mut start = 0;
         // A fragment can be empty, so `start` alone doesn't say whether one came before.
         let mut continued = false;
@@ -570,25 +654,17 @@ impl<'a> VolumePacker<'a> {
                 (false, Some(crc)) => crc,
                 (false, None) => member.payload.unpacked_crc(),
             };
-            let header = member.header(continued, split_after, len, file_crc, self.header_key)?;
-            if header.len() as u64 != header_len {
-                return Err(Error::WriterFailure(
-                    "legacy file header changed length when patched",
-                ));
-            }
-            let volume = self.open.as_mut().expect("volume started");
-            let back = i64::try_from(header_len + len)
-                .map_err(|_| Error::InvalidArgument("legacy volume fragment is too long"))?;
-            volume.out.seek(SeekFrom::Current(-back))?;
-            volume.out.write_all(&header)?;
-            volume
-                .out
-                .seek(SeekFrom::Current(back - header_len as i64))?;
-            volume.crc = crc32_combine(volume.crc, crc32(&header), header_len);
-            volume.crc = crc32_combine(volume.crc, fragment_crc, len);
-            volume.used += header_len + len;
-            volume.fragments += 1;
-            volume.ends_member = !split_after;
+            self.close_fragment(
+                &member.head,
+                Fragment {
+                    header_len,
+                    continued,
+                    split_after,
+                    len,
+                    crc: fragment_crc,
+                },
+                file_crc,
+            )?;
             start += len;
             continued = true;
             if !split_after {
@@ -596,6 +672,42 @@ impl<'a> VolumePacker<'a> {
             }
             self.close_volume(true)?;
         }
+    }
+
+    /// Patches the header of the fragment just written behind it and counts it into the volume.
+    fn close_fragment(
+        &mut self,
+        head: &FragmentHead<'_>,
+        fragment: Fragment,
+        file_crc: u32,
+    ) -> Result<()> {
+        let Fragment {
+            header_len,
+            continued,
+            split_after,
+            len,
+            crc,
+        } = fragment;
+        let header = head.header(continued, split_after, len, file_crc, self.header_key)?;
+        if header.len() as u64 != header_len {
+            return Err(Error::WriterFailure(
+                "legacy file header changed length when patched",
+            ));
+        }
+        let volume = self.open.as_mut().expect("volume started");
+        let back = i64::try_from(header_len + len)
+            .map_err(|_| Error::InvalidArgument("legacy volume fragment is too long"))?;
+        volume.out.seek(SeekFrom::Current(-back))?;
+        volume.out.write_all(&header)?;
+        volume
+            .out
+            .seek(SeekFrom::Current(back - header_len as i64))?;
+        volume.crc = crc32_combine(volume.crc, crc32(&header), header_len);
+        volume.crc = crc32_combine(volume.crc, crc, len);
+        volume.used += header_len + len;
+        volume.fragments += 1;
+        volume.ends_member = !split_after;
+        Ok(())
     }
 
     fn finish(mut self) -> Result<()> {
@@ -689,6 +801,212 @@ impl<'a> VolumePacker<'a> {
             None => {}
         }
         Ok(out)
+    }
+}
+
+/// Room kept past a streamed block for cipher bytes held from the last one and the final padding.
+const SEAL_MARGIN: u64 = 32;
+
+/// Codes a member into the set as it reads; volumes are handed on as they fill.
+#[allow(clippy::too_many_arguments)]
+fn stream_member_into(
+    packer: &mut VolumePacker<'_>,
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    data_keys: &mut DataKeys,
+    solid: Option<SolidLink<'_>>,
+    resources: &WriterResources,
+    progress: &WorkTracker<'_>,
+) -> Result<u8> {
+    let mut out = StreamedFragments {
+        head: FragmentHead {
+            name: member.name,
+            target: options.target,
+            unpacked_size: member.unpacked_size()?,
+            file_time: member.file_time,
+            file_attr: member.file_attr,
+            host_os: member.host_os,
+            method: 0x30,
+            dictionary_flags: dictionary_flags_for_options(options)?,
+            file_flags: 0,
+            salt: None,
+        },
+        packer,
+        password: member.password,
+        continues: solid.as_ref().is_some_and(|link| link.continues),
+        header_len: 0,
+        continued: false,
+        len: 0,
+        crc: Crc32::new(),
+        first_at: None,
+        committed: false,
+        held: Vec::new(),
+    };
+    stream_member(
+        &mut out, member, options, coding, data_keys, solid, resources, progress,
+    )
+}
+
+/// Rewinding for a stored copy only works in the open volume, so a member commits when its first one fills.
+struct StreamedFragments<'p, 'a, 'm> {
+    packer: &'p mut VolumePacker<'a>,
+    head: FragmentHead<'m>,
+    password: Option<&'m [u8]>,
+    continues: bool,
+    header_len: u64,
+    /// The open fragment follows one in an earlier volume.
+    continued: bool,
+    len: u64,
+    crc: Crc32,
+    /// Where the payload starts, while the member is still in its first volume.
+    first_at: Option<u64>,
+    committed: bool,
+    /// Opening bytes that did not fit before anything was coded to judge the member by.
+    held: Vec<u8>,
+}
+
+impl StreamedFragments<'_, '_, '_> {
+    fn set_method(&mut self, method: u8) {
+        self.head.method = method;
+        let continuation = self.continues && method != 0x30;
+        self.head.file_flags = writer_file_flags(self.password, None, continuation)
+            | if self.head.salt.is_some() {
+                FHD_SALT
+            } else {
+                0
+            };
+    }
+
+    fn room(&self) -> u64 {
+        self.packer.room_after(self.header_len + self.len)
+    }
+
+    /// Writes a placeholder header where payload fits after it, in a fresh volume if this one is full.
+    fn open_fragment(&mut self) -> Result<()> {
+        loop {
+            crate::write_progress::check_cancelled(Some(self.packer.progress))?;
+            if self.packer.open.is_none() {
+                self.packer.start_volume()?;
+            }
+            if self.packer.room_after(self.header_len) > 0 {
+                break;
+            }
+            if self.packer.open.as_ref().expect("volume started").fragments == 0 {
+                return Err(Error::InvalidArgument(
+                    "volume size is too small to hold the volume headers",
+                ));
+            }
+            self.packer.close_volume(true)?;
+        }
+        let volume = self.packer.open.as_mut().expect("volume started");
+        volume.out.write_all(&vec![0; self.header_len as usize])?;
+        if !self.continued {
+            self.first_at = Some(volume.used + self.header_len);
+        }
+        self.len = 0;
+        self.crc = Crc32::new();
+        Ok(())
+    }
+
+    fn fragment(&self, split_after: bool) -> Fragment {
+        Fragment {
+            header_len: self.header_len,
+            continued: self.continued,
+            split_after,
+            len: self.len,
+            crc: self.crc.finish(),
+        }
+    }
+}
+
+impl StreamedOut for StreamedFragments<'_, '_, '_> {
+    fn begin(&mut self, salt: Option<[u8; 8]>, sizes: HeaderPayload) -> Result<()> {
+        self.head.salt = salt;
+        self.set_method(sizes.method);
+        self.header_len = self.packer.header_len(&self.head, sizes.unpacked_size)?;
+        self.open_fragment()
+    }
+
+    fn goes_on(&mut self, packed: u64, block: u64, coded: u64, unpacked: u64) -> bool {
+        if self.committed {
+            return true;
+        }
+        if packed + block >= unpacked {
+            return false;
+        }
+        // A PPMd member's opening bytes code nothing yet, so they wait in `held` for evidence.
+        if coded == 0 || self.held.len() as u64 + block + SEAL_MARGIN <= self.room() {
+            return true;
+        }
+        self.committed = packed + block < coded;
+        self.committed
+    }
+
+    fn write_packed(&mut self, bytes: &[u8]) -> Result<()> {
+        if !self.committed && (!self.held.is_empty() || self.room() < bytes.len() as u64) {
+            self.held.extend_from_slice(bytes);
+            return Ok(());
+        }
+        let held = std::mem::take(&mut self.held);
+        self.write_through(&held)?;
+        self.write_through(bytes)
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        let at = self.first_at.ok_or(Error::WriterFailure(
+            "streamed volume member restarted after its first volume closed",
+        ))?;
+        let volume = self.packer.open.as_mut().expect("fragment open");
+        volume.out.seek(SeekFrom::Start(at))?;
+        self.len = 0;
+        self.crc = Crc32::new();
+        self.held.clear();
+        self.committed = true;
+        self.set_method(0x30);
+        Ok(())
+    }
+
+    fn finish(&mut self, sizes: HeaderPayload) -> Result<()> {
+        // A member that ends uncommitted has packed smaller than it is, so it keeps what it holds.
+        self.committed = true;
+        let held = std::mem::take(&mut self.held);
+        self.write_through(&held)?;
+        self.set_method(sizes.method);
+        let fragment = self.fragment(false);
+        self.packer
+            .close_fragment(&self.head, fragment, sizes.file_crc)
+    }
+}
+
+impl StreamedFragments<'_, '_, '_> {
+    /// Writes committed bytes, closing each volume as it fills.
+    fn write_through(&mut self, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            let room = self.room();
+            if room == 0 {
+                if !self.committed {
+                    return Err(Error::WriterFailure(
+                        "streamed volume member split before it committed",
+                    ));
+                }
+                let fragment = self.fragment(true);
+                let crc = fragment.crc;
+                self.packer.close_fragment(&self.head, fragment, crc)?;
+                self.packer.close_volume(true)?;
+                self.continued = true;
+                self.first_at = None;
+                self.open_fragment()?;
+                continue;
+            }
+            let take = room.min(bytes.len() as u64) as usize;
+            let volume = self.packer.open.as_mut().expect("fragment open");
+            volume.out.write_all(&bytes[..take])?;
+            self.crc.update(&bytes[..take]);
+            self.len += take as u64;
+            bytes = &bytes[take..];
+        }
+        Ok(())
     }
 }
 
