@@ -276,6 +276,7 @@ fn a_model_the_budget_refuses_cannot_be_continued() {
     ));
 }
 
+#[cfg(feature = "write")]
 fn golden_cases() -> Vec<(Vec<u8>, usize, usize)> {
     vec![
         (text(40_000, 1), 2, 1),
@@ -289,6 +290,7 @@ fn golden_cases() -> Vec<(Vec<u8>, usize, usize)> {
 
 // Codes `data` with escapes, matches and repeats mixed in, then a second
 // block continuing the model.
+#[cfg(feature = "write")]
 macro_rules! code_with_commands {
     ($encoder:ty, $data:expr, $order:expr, $mb:expr) => {{
         let data: &[u8] = $data;
@@ -320,6 +322,7 @@ macro_rules! code_with_commands {
 // simulated suballocator apart and matched these bytes independently. They
 // pin restarts, glueing and every escape command, which a round trip through
 // one model could not: its encoder and decoder would agree on any mistake.
+#[cfg(feature = "write")]
 const GOLDEN: [(usize, u32); 6] = [
     (5730, 0xf72d8d8e),
     (5180, 0x1b264cd6),
@@ -329,6 +332,7 @@ const GOLDEN: [(usize, u32); 6] = [
     (334130, 0x802daf1d),
 ];
 
+#[cfg(feature = "write")]
 #[test]
 fn the_writer_codes_exactly_what_the_previous_model_did() {
     for ((data, order, mb), (len, crc)) in golden_cases().into_iter().zip(GOLDEN) {
