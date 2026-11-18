@@ -18,8 +18,8 @@ follows the comment, so the framing below holds for either comment form.
 
 Preserving rewrites recognize and replace the producer using the existing
 bounded, CRC-checked schema validation. The marker requires at least `rar29`,
-not `rar30`. A `CMT` comment or encrypted headers rewrite as `rar30`, which
-`rar29` output also reads as.
+not `rar30`. A `CMT` comment and encrypted headers also rewrite as `rar29`;
+only a comment encrypted without the headers needs `rar30`.
 Otherwise identical RAR 2.9/3/4 archives cannot reveal the original target
 selection. Rewriting uses the lowest supported format implied by their records.
 The subsequent [RAR 2.0 backfit](../rar20/README.md) uses unpacker version 20

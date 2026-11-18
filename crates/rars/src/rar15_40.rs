@@ -1106,31 +1106,37 @@ impl Archive {
     /// The highest format requirement present in this container, not its creator release.
     #[cfg(feature = "write")]
     pub(crate) fn preservation_version(&self) -> ArchiveVersion {
+        let comment = self
+            .new_subs()
+            .find(|sub| sub.kind == NewSubKind::ArchiveComment);
+        let has_encrypted_headers = self.main.has_encrypted_headers();
+        // Only Rar30/Rar40 take a comment password; Rar29 encrypts a comment only with the headers.
+        if !has_encrypted_headers && comment.is_some_and(|sub| sub.file.is_encrypted()) {
+            return ArchiveVersion::Rar30;
+        }
         // Producer records declare their own minimum unpacker version.
-        if self.main.has_encrypted_headers()
-            || self
-                .new_subs()
-                .any(|sub| sub.kind == NewSubKind::ArchiveComment)
-        {
-            ArchiveVersion::Rar30
+        let producer_version = self
+            .new_subs()
+            .filter(|sub| sub.file.name == crate::producer::NAME)
+            .map(|sub| sub.file.unp_ver)
+            .max()
+            .unwrap_or(15);
+        let floor = if has_encrypted_headers || comment.is_some() {
+            29
         } else {
-            let producer_version = self
-                .new_subs()
-                .filter(|sub| sub.file.name == crate::producer::NAME)
-                .map(|sub| sub.file.unp_ver)
-                .max()
-                .unwrap_or(15);
-            match self
-                .files()
-                .map(|file| file.unp_ver)
-                .max()
-                .unwrap_or(15)
-                .max(producer_version)
-            {
-                29.. => ArchiveVersion::Rar29,
-                20..=28 => ArchiveVersion::Rar20,
-                _ => ArchiveVersion::Rar15,
-            }
+            15
+        };
+        match self
+            .files()
+            .map(|file| file.unp_ver)
+            .max()
+            .unwrap_or(15)
+            .max(producer_version)
+            .max(floor)
+        {
+            29.. => ArchiveVersion::Rar29,
+            20..=28 => ArchiveVersion::Rar20,
+            _ => ArchiveVersion::Rar15,
         }
     }
 

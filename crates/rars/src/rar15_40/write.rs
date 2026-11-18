@@ -2218,14 +2218,10 @@ fn validate_plan(
     has_file_comment: bool,
 ) -> Result<()> {
     if options.archive_comment_metadata.is_some()
-        && (!has_archive_comment
-            || !matches!(
-                options.target,
-                ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-            ))
+        && (!has_archive_comment || uses_old_style_archive_comment(options.target))
     {
         return Err(Error::InvalidArgument(
-            "retained archive comment metadata requires a RAR3/4 archive comment",
+            "retained archive comment metadata requires a CMT archive comment",
         ));
     }
     if options.target.family() != crate::version::ArchiveFamily::Rar15To40 {
@@ -4141,14 +4137,14 @@ mod tests {
         assert_eq!(
             super::validate_plan(options, shape, false, false).unwrap_err(),
             crate::Error::InvalidArgument(
-                "retained archive comment metadata requires a RAR3/4 archive comment"
+                "retained archive comment metadata requires a CMT archive comment"
             )
         );
         options.target = crate::ArchiveVersion::Rar20;
         assert_eq!(
             super::validate_plan(options, shape, true, false).unwrap_err(),
             crate::Error::InvalidArgument(
-                "retained archive comment metadata requires a RAR3/4 archive comment"
+                "retained archive comment metadata requires a CMT archive comment"
             )
         );
         options.target = crate::ArchiveVersion::Rar30;
