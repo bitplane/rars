@@ -39,8 +39,11 @@ const LENGTH_COUNT: usize = 28;
 const LEVEL_COUNT: usize = 20;
 const TABLE_COUNT: usize = MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT + LENGTH_COUNT;
 const MAX_HISTORY: usize = 4 * 1024 * 1024;
-// Matches up to this long are copied byte by byte (see `copy_match`).
+// Matches up to this long are copied without a call to `memcpy` (see
+// `copy_match`).
 const SHORT_MATCH: usize = 64;
+// Matches at least this far back are copied in blocks of this width.
+const COPY_WIDTH: usize = 16;
 const STREAM_CHUNK: usize = 1024 * 1024;
 // The most history a streamed member holds: the window, up to a quarter
 // window not yet trimmed, and the chunk being decoded.
@@ -1222,11 +1225,31 @@ impl<B: Budget> Reader29State<B> {
                 let start = (self.current_pos() - offset)
                     .checked_sub(self.base_offset)
                     .ok_or(out_of_range)?;
-                if now <= SHORT_MATCH {
+                let at = self.output.len();
+                if offset >= COPY_WIDTH
+                    && now <= SHORT_MATCH
+                    && self.output.capacity() - at >= now.next_multiple_of(COPY_WIDTH)
+                {
+                    // Fixed-width copies into spare capacity, cut back to the
+                    // match: cheaper than a loop or a variable-length memcpy.
+                    // Each reads bytes at least `COPY_WIDTH` back, already
+                    // in place.
+                    let mut from = start;
+                    while self.output.len() < at + now {
+                        let bytes: [u8; COPY_WIDTH] = self.output[from..from + COPY_WIDTH]
+                            .try_into()
+                            .expect("fixed-width slice");
+                        self.output.extend_from_slice(&bytes).map_err(Into::into)?;
+                        from += COPY_WIDTH;
+                    }
+                    self.output.truncate(at + now);
+                } else if offset == 1 {
+                    let byte = self.output[start];
+                    self.output.resize(at + now, byte)?;
+                } else if now <= SHORT_MATCH {
                     // Most matches are a few bytes: room once, then a plain
                     // loop, which also repeats an overlapping run correctly.
                     // A call to `memmove` per match cost more than the copy.
-                    let at = self.output.len();
                     self.output.resize(at + now, 0)?;
                     for i in 0..now {
                         self.output[at + i] = self.output[start + i];
@@ -1380,6 +1403,8 @@ impl<B: Budget> Huffman<B> {
     }
     /// Decodes from a 15-bit peek, with the results of reading bit by bit;
     /// see the RAR 5 decoder's `HuffmanState::decode`.
+    // Always inlined: it runs once per symbol, and as a call it cost 7%.
+    #[inline(always)]
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
         let (peek, available) = bits.peek15();
         let (symbol, len) = self.state.decode_peeked_checked(
@@ -1493,12 +1518,14 @@ impl<B: Budget> BitReader<B> {
         self.read_bits(1).map(|value| value as u8)
     }
 
+    #[inline]
     fn read_bits(&mut self, count: u8) -> Result<u32> {
         let value = self.peek_bits(count)?;
         self.bit_pos += count as usize;
         Ok(value)
     }
 
+    #[inline]
     fn peek_bits(&self, count: u8) -> Result<u32> {
         if count > 24 {
             return Err(Error::InvalidData("RAR 2.9 bit read is too wide"));
@@ -1506,10 +1533,14 @@ impl<B: Budget> BitReader<B> {
         if count == 0 {
             return Ok(0);
         }
-        // The at most four bytes the bits span, read at once and shifted
-        // into place.
         let byte_pos = self.bit_pos / 8;
         let bit_offset = self.bit_pos % 8;
+        // At most 24 bits from a bit offset below 8 lie in one 32-bit word.
+        if let Some(bytes) = self.word_at(byte_pos) {
+            return Ok((u32::from_be_bytes(bytes) << bit_offset) >> (32 - u32::from(count)));
+        }
+        // Near the end of the input: the at most four bytes the bits span,
+        // read at once and shifted into place.
         let needed = (bit_offset + usize::from(count)).div_ceil(8);
         let bytes = self
             .input
@@ -1522,10 +1553,26 @@ impl<B: Budget> BitReader<B> {
 
     /// The next 15 bits, most significant first, with zeros past the end of
     /// the input, and how many of them are real (at most 15).
-    #[inline]
+    #[inline(always)]
     fn peek15(&self) -> (u32, usize) {
         let byte_pos = self.bit_pos / 8;
         let bit_offset = self.bit_pos % 8;
+        if let Some(bytes) = self.word_at(byte_pos) {
+            return ((u32::from_be_bytes(bytes) << bit_offset) >> 17, 15);
+        }
+        self.peek15_near_end(byte_pos, bit_offset)
+    }
+
+    #[inline(always)]
+    fn word_at(&self, byte_pos: usize) -> Option<[u8; 4]> {
+        self.input
+            .get(byte_pos..)
+            .and_then(|rest| rest.first_chunk::<4>())
+            .copied()
+    }
+
+    #[cold]
+    fn peek15_near_end(&self, byte_pos: usize, bit_offset: usize) -> (u32, usize) {
         let rest = self.input.get(byte_pos..).unwrap_or_default();
         let word = match rest {
             [a, b, c, ..] => u32::from_be_bytes([0, *a, *b, *c]),

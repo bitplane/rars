@@ -2,7 +2,8 @@ use super::*;
 
 #[test]
 fn padded_peek_matches_individual_bits_at_every_byte_boundary() {
-    for size in 0..=4 {
+    // Past four bytes, peeks start taking the whole-word path.
+    for size in 0..=6 {
         for pattern in 0..=255u8 {
             let input: Vec<_> = (0..size)
                 .map(|i| pattern.rotate_left(i as u32 * 3))
@@ -47,8 +48,8 @@ fn short_and_long_codes_require_real_bits_and_consume_exact_lengths() {
 
 #[test]
 fn wide_peeks_match_bitwise_reads_for_every_width_and_offset() {
-    for size in 0..=4 {
-        let input = [0xa5, 0x3c, 0x96, 0x7e][..size].to_vec();
+    for size in 0..=6 {
+        let input = [0xa5, 0x3c, 0x96, 0x7e, 0x0f, 0xf1][..size].to_vec();
         let mut bits = BitReader::from_bytes_with_allowance(&input, &Allowance::default()).unwrap();
         for position in 0..=size * 8 + 8 {
             bits.bit_pos = position;
