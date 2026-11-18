@@ -26,14 +26,22 @@ fn split_zero_fill_keeps_its_decision_across_chunks_and_checkpoints() {
 #[test]
 fn short_long_and_split_matches_agree_with_bytewise_copying() {
     let seed: Vec<_> = (0..256).map(|i| (i % 23) as u8).collect();
-    for length in [0, 1, 64, 65, 200] {
-        for offset in [1, 3, 256] {
+    for length in [0, 1, 15, 16, 17, 63, 64, 65, 200] {
+        for offset in [1, 3, 15, 16, 17, 256] {
             let mut expected = seed.clone();
             for _ in 0..length {
                 expected.push(expected[expected.len() - offset]);
             }
-            for chunk in [1, 63, 64, 65, 200] {
+            // Without spare room past the match, wide copies must not be used.
+            for (chunk, tight) in [1, 63, 64, 65, 200]
+                .into_iter()
+                .flat_map(|chunk| [(chunk, false), (chunk, true)])
+            {
                 let mut decoder = Reader29State::with_allowance(&Allowance::default());
+                if tight {
+                    decoder.output =
+                        Buffer::with_capacity(seed.len() + length, &Allowance::default()).unwrap();
+                }
                 decoder.output.extend_from_slice(&seed).unwrap();
                 let end = seed.len() + length;
                 decoder
@@ -47,7 +55,7 @@ fn short_long_and_split_matches_agree_with_bytewise_copying() {
                 assert_eq!(
                     &decoder.output[..],
                     expected,
-                    "length={length} offset={offset} chunk={chunk}"
+                    "length={length} offset={offset} chunk={chunk} tight={tight}"
                 );
             }
         }
