@@ -6371,10 +6371,9 @@ fn pipelined_optimal_parse_matches_the_sequential_walk() {
             encode_lz_streaming_blocks(&data, &history, &blocks, 0, options, None).unwrap(),
         )
     };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(4)
-        .build()
-        .unwrap();
+    // Private, so another test's window cannot quietly turn the pipelined
+    // run into a second sequential one.
+    let pool = crate::parallel::private_pool(4);
     let sequential = pool.install(|| {
         let _one = crate::parallel::ThreadCap::set(Some(1));
         assert!(!crate::parallel::may_nest());
