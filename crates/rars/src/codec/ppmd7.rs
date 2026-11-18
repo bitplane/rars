@@ -8,7 +8,7 @@
 // The model is consistent whatever the input: input only chooses symbols.
 // So pool indexing never fails on corrupt data, and a failing index is a bug.
 
-use super::workspace::{Budget, Buffer};
+use super::workspace::Budget;
 use super::{Error, Result};
 
 const MAX_FREQ: u32 = 124;
@@ -20,6 +20,8 @@ const NUM_INDEXES: usize = 38;
 const MAX_ORDER: usize = 64;
 const TOP: u32 = 1 << 24;
 const BOT: u32 = 1 << 15;
+// The budget is charged for the pool in steps of this many bytes.
+const CHARGE_STEP: u64 = 64 * 1024;
 const EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
 const INIT_BIN_ESC: [u16; 8] = [
     0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051,
@@ -96,8 +98,17 @@ impl RangeDecoder {
 
 #[derive(Debug)]
 pub(crate) struct Ppmd7<B: Budget> {
-    // The whole model, charged at its declared size when a block resets it.
-    mem: Buffer<u8, B>,
+    // The pool, reserved at its declared size. Untouched pages cost nothing,
+    // so the budget is charged only for what the model has reached.
+    mem: Vec<u8>,
+    charge: B::Charge,
+    charged: u64,
+    // The furthest each region has reached since the pool was allocated. Its
+    // pages stay touched across restarts, so these never move back.
+    text_peak: u32,
+    lo_peak: u32,
+    units_floor: u32,
+    hi_floor: u32,
     size: u32,
     align: u32,
     text: u32,
@@ -174,7 +185,13 @@ impl<B: Budget> Ppmd7<B> {
             }
         }
         Self {
-            mem: Buffer::new(allowance),
+            mem: Vec::new(),
+            charge: allowance.charge(),
+            charged: 0,
+            text_peak: 0,
+            lo_peak: 0,
+            units_floor: 0,
+            hi_floor: 0,
             size: 0,
             align: 0,
             text: 0,
@@ -222,7 +239,9 @@ impl<B: Budget> Ppmd7<B> {
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
         // Only the text, the units in use and the contexts carry data.
-        let mut mem = Buffer::filled(self.mem.len(), 0u8, &self.mem.allowance())?;
+        let mut charge = B::allowance(&self.charge).charge();
+        B::resize(&mut charge, self.charged)?;
+        let mut mem = vec![0u8; self.mem.len()];
         for range in [
             0..self.text as usize,
             self.units_start as usize..self.lo_unit as usize,
@@ -232,6 +251,7 @@ impl<B: Budget> Ppmd7<B> {
         }
         Ok(Self {
             mem,
+            charge,
             rc: self.rc.clone(),
             read_control: self.read_control.clone(),
             ..*self
@@ -263,18 +283,25 @@ impl<B: Budget> Ppmd7<B> {
                 return Err(Error::InvalidData("RAR PPMd order is invalid"));
             }
             let size = (u32::from(max_mb.unwrap_or(0)) + 1) << 20;
+            // Until the new model is charged there is none to continue.
+            self.allocated = false;
             if self.size != size || self.mem.is_empty() {
+                self.mem = Vec::new();
+                B::resize(&mut self.charge, 0)?;
+                self.charged = 0;
                 self.align = 4u32.wrapping_sub(size) & 3;
-                // Release the old pool before charging the new one. Until
-                // that succeeds there is no model to continue.
-                self.allocated = false;
-                let allowance = self.mem.allowance();
-                self.mem = Buffer::new(&allowance);
-                self.mem = Buffer::filled((self.align + size) as usize, 0u8, &allowance)?;
+                self.mem = vec![0u8; (self.align + size) as usize];
                 self.size = size;
             }
             self.max_order = max_order;
             self.restart_model();
+            if self.charged == 0 {
+                self.text_peak = self.text;
+                self.lo_peak = self.lo_unit;
+                self.units_floor = self.units_start;
+                self.hi_floor = self.hi_unit;
+            }
+            self.charge_reached()?;
             self.allocated = true;
         } else if !self.allocated {
             return Err(Error::InvalidData("RAR PPMd block reuses missing model"));
@@ -375,6 +402,38 @@ impl<B: Budget> Ppmd7<B> {
     #[inline(always)]
     fn u2i(&self, nu: u32) -> usize {
         usize::from(self.units2indx[nu as usize - 1])
+    }
+
+    // Charge the budget for the parts of the pool the model has reached.
+    // Called whenever a region passes its furthest point so far.
+    #[cold]
+    fn charge_reached(&mut self) -> Result<()> {
+        self.text_peak = self.text_peak.max(self.text);
+        self.lo_peak = self.lo_peak.max(self.lo_unit);
+        self.units_floor = self.units_floor.min(self.units_start);
+        self.hi_floor = self.hi_floor.min(self.hi_unit);
+        let end = self.align + self.size;
+        let reached = u64::from(self.text_peak - self.align)
+            + u64::from(self.lo_peak - self.units_floor)
+            + u64::from(end - self.hi_floor);
+        let reached = reached
+            .next_multiple_of(CHARGE_STEP)
+            .min(self.mem.len() as u64);
+        if reached > self.charged {
+            B::resize(&mut self.charge, reached)?;
+            self.charged = reached;
+        }
+        Ok(())
+    }
+
+    // New contexts take units from the top of the pool, downwards.
+    #[inline(always)]
+    fn take_context_unit(&mut self) -> Result<u32> {
+        self.hi_unit -= UNIT_SIZE;
+        if self.hi_unit < self.hi_floor {
+            self.charge_reached()?;
+        }
+        Ok(self.hi_unit)
     }
 
     #[inline(always)]
@@ -501,12 +560,14 @@ impl<B: Budget> Ppmd7<B> {
             if i == NUM_INDEXES {
                 let bytes = UNIT_SIZE * self.i2u(indx);
                 self.glue_count -= 1;
-                return Ok(if self.units_start - self.text > bytes {
-                    self.units_start -= bytes;
-                    Some(self.units_start)
-                } else {
-                    None
-                });
+                if self.units_start - self.text <= bytes {
+                    return Ok(None);
+                }
+                self.units_start -= bytes;
+                if self.units_start < self.units_floor {
+                    self.charge_reached()?;
+                }
+                return Ok(Some(self.units_start));
             }
             if self.free_list[i] != 0 {
                 break;
@@ -526,6 +587,9 @@ impl<B: Budget> Ppmd7<B> {
         if self.hi_unit - self.lo_unit >= bytes {
             let at = self.lo_unit;
             self.lo_unit += bytes;
+            if self.lo_unit > self.lo_peak {
+                self.charge_reached()?;
+            }
             return Ok(Some(at));
         }
         self.alloc_units_rare(indx)
@@ -641,8 +705,7 @@ impl<B: Budget> Ppmd7<B> {
         };
         loop {
             let c1 = if self.hi_unit != self.lo_unit {
-                self.hi_unit -= UNIT_SIZE;
-                self.hi_unit
+                self.take_context_unit()?
             } else if self.free_list[0] != 0 {
                 self.remove_node(0)
             } else {
@@ -712,6 +775,9 @@ impl<B: Budget> Ppmd7<B> {
 
         self.set_u8(self.text, fs_symbol);
         self.text += 1;
+        if self.text > self.text_peak {
+            self.charge_reached()?;
+        }
         if self.text >= self.units_start {
             #[cfg(test)]
             {

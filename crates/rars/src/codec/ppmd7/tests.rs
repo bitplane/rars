@@ -144,14 +144,17 @@ fn decodes_what_the_writer_encodes_through_restarts_and_glue() {
 fn a_copy_decodes_on_exactly_as_the_original() {
     let data = noise(200_000, 7, 40);
     let (first, input, symbols) = encode(&data, 64, 1);
-    let mut model = Ppmd7::with_allowance(&Allowance::default());
+    let budget = Allowance::limited(u64::MAX);
+    let mut model = Ppmd7::with_allowance(&budget);
     let mut input = Bytes { input: &input };
     let mut escape = ESCAPE;
     model.decode_init(first, &mut input, &mut escape).unwrap();
     let half = symbols.len() / 2;
     assert_eq!(decode_all(&mut model, &mut input, half), symbols[..half]);
     assert!(model.glues > 0);
+    let charged = budget.used();
     let mut copy = model.try_clone().unwrap();
+    assert_eq!(budget.used(), 2 * charged);
     let mut copy_input = Bytes { input: input.input };
     let rest = symbols.len() - half;
     assert_eq!(
@@ -162,24 +165,45 @@ fn a_copy_decodes_on_exactly_as_the_original() {
 }
 
 #[test]
-fn the_declared_model_size_is_charged_when_a_block_resets_it() {
-    let (first, input, _) = encode(b"abracadabra", 6, 3);
-    let declared = 3 << 20;
-    let budget = Allowance::limited(declared - 1);
+fn the_pool_is_charged_only_as_far_as_the_model_reaches() {
+    // A short stream in a 25 MiB model touches a sliver of the pool.
+    let (first, input, symbols) = encode(b"abracadabra, abracadabra", 6, 25);
+    let budget = Allowance::limited(1 << 20);
     let mut model = Ppmd7::with_allowance(&budget);
+    let mut bytes = Bytes { input: &input };
     let mut escape = ESCAPE;
-    assert!(matches!(
-        model.decode_init(first, &mut Bytes { input: &input }, &mut escape),
-        Err(Error::WorkspaceLimitExceeded(_))
-    ));
-    let budget = Allowance::limited(declared);
-    let mut model = Ppmd7::with_allowance(&budget);
-    model
-        .decode_init(first, &mut Bytes { input: &input }, &mut escape)
-        .unwrap();
-    assert_eq!(budget.used(), declared);
+    model.decode_init(first, &mut bytes, &mut escape).unwrap();
+    assert_eq!(decode_all(&mut model, &mut bytes, symbols.len()), symbols);
+    assert_eq!(budget.used(), CHARGE_STEP);
     drop(model);
     assert_eq!(budget.used(), 0);
+
+    // A stream that fills a 1 MiB pool many times over needs all of it, and
+    // no more, however often the model restarts.
+    let (first, input, symbols) = encode(&noise(300_000, 4, 40), 64, 1);
+    for (limit, completes) in [(1 << 20, true), (1 << 19, false)] {
+        let budget = Allowance::limited(limit);
+        let mut model = Ppmd7::with_allowance(&budget);
+        let mut bytes = Bytes { input: &input };
+        model.decode_init(first, &mut bytes, &mut escape).unwrap();
+        let outcome = (0..symbols.len()).try_for_each(|_| {
+            model.decode_symbol(&mut bytes)?;
+            // The charge never lags behind what the model has reached.
+            let reach = u64::from(model.text - model.align)
+                + u64::from(model.lo_unit - model.units_start)
+                + u64::from(model.align + model.size - model.hi_unit);
+            assert!(budget.used() >= reach.min(model.mem.len() as u64));
+            Ok(())
+        });
+        if completes {
+            outcome.unwrap();
+            assert!(model.restarts > 1);
+            assert_eq!(budget.used(), 1 << 20);
+        } else {
+            assert!(matches!(outcome, Err(Error::WorkspaceLimitExceeded(_))));
+            assert!(budget.used() <= limit);
+        }
+    }
 }
 
 #[test]
@@ -216,17 +240,28 @@ fn headers_must_name_an_order_and_a_model() {
 }
 
 #[test]
-fn a_refused_model_cannot_be_continued() {
-    let (first, input, symbols) = encode(b"abracadabra", 6, 1);
-    let budget = Allowance::limited(2 << 20);
+fn contexts_are_charged_as_they_reach_down_the_pool() {
+    let (first, input, _) = encode(b"abracadabra", 6, 1);
+    let budget = Allowance::limited(u64::MAX);
     let mut model = Ppmd7::with_allowance(&budget);
     let mut escape = ESCAPE;
-    let mut bytes = Bytes { input: &input };
-    model.decode_init(first, &mut bytes, &mut escape).unwrap();
-    assert_eq!(decode_all(&mut model, &mut bytes, 3), symbols[..3]);
+    model
+        .decode_init(first, &mut Bytes { input: &input }, &mut escape)
+        .unwrap();
+    assert_eq!(budget.used(), CHARGE_STEP);
+    let units = (CHARGE_STEP / u64::from(UNIT_SIZE)) as usize;
+    for _ in 0..units {
+        model.take_context_unit().unwrap();
+    }
+    assert_eq!(budget.used(), 2 * CHARGE_STEP);
+}
 
-    // A reset that declares more than the budget allows loses the old model.
-    let (first, input, _) = encode(b"abracadabra", 6, 3);
+#[test]
+fn a_model_the_budget_refuses_cannot_be_continued() {
+    let (first, input, _) = encode(b"abracadabra", 6, 1);
+    let budget = Allowance::limited(CHARGE_STEP - 1);
+    let mut model = Ppmd7::with_allowance(&budget);
+    let mut escape = ESCAPE;
     assert!(matches!(
         model.decode_init(first, &mut Bytes { input: &input }, &mut escape),
         Err(Error::WorkspaceLimitExceeded(_))
