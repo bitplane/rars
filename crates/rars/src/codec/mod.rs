@@ -8,7 +8,7 @@ mod huffman;
 #[cfg(any(test, feature = "write"))]
 mod match_finder;
 #[cfg(feature = "write")]
-mod packed_chain;
+pub(crate) mod packed_chain;
 pub(crate) mod packed_window;
 mod ppmd;
 pub mod rar13;

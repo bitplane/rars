@@ -849,7 +849,7 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
     records: Option<&[Buffer<EncodeFilter, B>]>,
     algorithm_version: u8,
     options: EncodeOptions,
-    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    block_done: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
     if start > window.len() {
@@ -858,8 +858,68 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
         ));
     }
     let skip = start.saturating_sub(options.max_match_distance);
-    let combined = &window[skip..];
-    let start = start - skip;
+    streaming_blocks_from(
+        &window[skip..],
+        start - skip,
+        None,
+        blocks,
+        records,
+        algorithm_version,
+        options,
+        block_done,
+        allowance,
+    )
+}
+
+/// [`streaming_blocks_in_window`] for a run whose window is one job's part of
+/// a group's, with a finder handed out by the group's shared index.
+///
+/// `window` must end where the run does and start where the group's window
+/// does, and the finder must stand at the run's start, or after its first
+/// block when the run starts the member; nothing is trimmed. The match finder
+/// then collects what the job's own would, which is what keeps the output
+/// unchanged (#276).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streaming_blocks_with_finder<B: Budget>(
+    window: &[u8],
+    start: usize,
+    finder: crate::codec::packed_chain::PackedMatchFinder<B>,
+    blocks: &[(usize, bool)],
+    algorithm_version: u8,
+    options: EncodeOptions,
+    block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<Buffer<u8, B>, B>> {
+    if start > window.len() || !options.optimal_parse {
+        return Err(Error::InvalidData(
+            "RAR 5 shared finder needs an optimal parse within its window",
+        ));
+    }
+    streaming_blocks_from(
+        window,
+        start,
+        Some(finder),
+        blocks,
+        None,
+        algorithm_version,
+        options,
+        block_done,
+        allowance,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn streaming_blocks_from<B: Budget>(
+    combined: &[u8],
+    start: usize,
+    mut finder: Option<crate::codec::packed_chain::PackedMatchFinder<B>>,
+    blocks: &[(usize, bool)],
+    records: Option<&[Buffer<EncodeFilter, B>]>,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<Buffer<u8, B>, B>> {
     let data = &combined[start..];
     check_streaming_blocks(data.len(), blocks, records)?;
     let records_of =
@@ -915,7 +975,7 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
                     block_start = block.end;
                     (block, records_of(first + index), is_last)
                 }),
-            OptimalCollector::with_allowance(combined, at, options, allowance)?,
+            collector_at(combined, at, finder.take(), options, allowance)?,
             algorithm_version,
             options,
             &mut |block, packed| {
@@ -930,8 +990,12 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
         return Ok(output);
     }
     let mut search = if options.optimal_parse {
-        SharedMemberSearch::Optimal(OptimalCollector::with_allowance(
-            combined, at, options, allowance,
+        SharedMemberSearch::Optimal(collector_at(
+            combined,
+            at,
+            finder.take(),
+            options,
+            allowance,
         )?)
     } else {
         SharedMemberSearch::Lazy(member_finder_with_allowance(
@@ -1696,6 +1760,35 @@ enum MemberSearch<'a, B: Budget = Allowance> {
     Optimal(&'a mut OptimalCollector<B>),
 }
 
+/// Whether the optimal parse searches a window this long, past its first
+/// position, through a packed index rather than chains or a tree. Block jobs
+/// that share an index must be ones whose own window would have used one.
+pub(crate) fn packed_index_fits(window: usize, options: EncodeOptions) -> bool {
+    window >= 1024 * 1024
+        && window <= options.max_match_distance.saturating_mul(2)
+        && window <= u32::MAX as usize / 6
+}
+
+/// The collector a run's blocks share from `at`: over a finder handed out by a
+/// shared index when there is one, built for the window otherwise.
+fn collector_at<B: Budget>(
+    combined: &[u8],
+    at: usize,
+    finder: Option<crate::codec::packed_chain::PackedMatchFinder<B>>,
+    options: EncodeOptions,
+    allowance: &B,
+) -> Result<OptimalCollector<B>> {
+    match finder {
+        Some(finder) => {
+            debug_assert_eq!(finder.position(), at.min(combined.len().saturating_sub(3)));
+            Ok(OptimalCollector {
+                finder: CollectorFinder::Packed(finder),
+            })
+        }
+        None => OptimalCollector::with_allowance(combined, at, options, allowance),
+    }
+}
+
 enum SharedMemberSearch<B: Budget> {
     Lazy(Rar50MatchFinder<B>),
     Optimal(OptimalCollector<B>),
@@ -1834,11 +1927,7 @@ impl<B: Budget> OptimalCollector<B> {
         options: EncodeOptions,
         allowance: &B,
     ) -> Result<Self> {
-        if start != 0
-            && combined.len() >= 1024 * 1024
-            && combined.len() <= options.max_match_distance.saturating_mul(2)
-            && combined.len() <= u32::MAX as usize / 6
-        {
+        if start != 0 && packed_index_fits(combined.len(), options) {
             // Captured bounded jobs can store each complete hash chain as a
             // contiguous byte stream. Static input limits select the backend;
             // available memory never changes its candidate quality.

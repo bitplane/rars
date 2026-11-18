@@ -22,10 +22,12 @@ use super::filter_policy::{
     candidates_with_allowance, compression_info, should_store_compressed_payload,
 };
 use super::FilterPolicy;
+use crate::codec::packed_chain::{PackedMatchFinder, SharedPackedIndex};
 #[cfg(test)]
 use crate::codec::rar50::EncodeOptions;
 use crate::codec::rar50::{
-    filter_streaming_blocks_in_place, streaming_blocks_in_window, BlockSplitter, EncodeFilter,
+    filter_streaming_blocks_in_place, streaming_blocks_in_window, streaming_blocks_with_finder,
+    BlockSplitter, EncodeFilter,
 };
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::Crc32;
@@ -237,6 +239,147 @@ struct BlockJob<B: Budget> {
     /// In a solid run that was filtered, each block's filter records. `data`
     /// already holds the filtered bytes, and the blocks stay as they were.
     records: Option<Buffer<Buffer<EncodeFilter, B>, B>>,
+    /// The run's part of a window and index it shares with other runs of its
+    /// member in the wave. `data` and `history` are empty when this is set.
+    shared: Option<SharedRun<B>>,
+}
+
+/// A run's part of its group's window, and a finder over the group's index
+/// standing where the run's own would.
+struct SharedRun<B: Budget> {
+    window: std::sync::Arc<Buffer<u8, B>>,
+    /// Where the run starts and ends in `window`.
+    start: usize,
+    end: usize,
+    finder: PackedMatchFinder<B>,
+}
+
+/// The most a shared window holds. A packed index keeps positions in 32 bits
+/// with room for its records, as a job's own does (`packed_index_fits`), and
+/// a shared one refuses a window past 1 GiB.
+const SHARED_WINDOW_LIMIT: usize = u32::MAX as usize / 6;
+
+/// Gives each member's consecutive unfiltered runs in a wave one window and
+/// one packed index between them, where they each held a window and built an
+/// index over it (#276). Neighbouring runs' windows overlap, so a group of
+/// sixteen holds seventeen runs' bytes rather than thirty-two, and indexes
+/// them once.
+///
+/// The output does not change. A run joins only when its own window would
+/// have used a packed index; its window is the group's cut off where the run
+/// ends, so positions past it stay out of reach; and its finder stands where
+/// the run's own would. The chains then hold extra positions only from before
+/// the run's own window, which its distance floor stops at, and its distance
+/// limit works out the same: a run whose own window starts at the member's
+/// start is in a group whose window does too, and any other carries a whole
+/// dictionary of history.
+fn share_member_windows<B: Budget>(
+    jobs: &mut [BlockJob<B>],
+    plan: &CompressPlan,
+    allowance: &B,
+) -> Result<()> {
+    let options = plan.encode_options;
+    if !options.optimal_parse {
+        return Ok(());
+    }
+    let dictionary = options.max_match_distance;
+    let own_window = |job: &BlockJob<B>| job.history.len().min(dictionary) + job.data.len();
+    let shareable = |job: &BlockJob<B>| {
+        job.filters.is_empty()
+            && job.records.is_none()
+            && crate::codec::rar50::packed_index_fits(own_window(job), options)
+    };
+    let mut members: Vec<usize> = jobs.iter().map(|job| job.blocks[0].0).collect();
+    members.sort_unstable();
+    members.dedup();
+    for member in members {
+        // Jobs are taken from a member in order, so its runs here are
+        // consecutive in the list's order.
+        let runs: Vec<usize> = (0..jobs.len())
+            .filter(|&index| jobs[index].blocks[0].0 == member)
+            .collect();
+        let mut group: Vec<usize> = Vec::new();
+        let mut window_len = 0usize;
+        for index in runs.into_iter().chain(std::iter::once(usize::MAX)) {
+            let joins = index != usize::MAX && shareable(&jobs[index]) && {
+                match group.last() {
+                    None => own_window(&jobs[index]) <= SHARED_WINDOW_LIMIT,
+                    Some(&last) => {
+                        jobs[last].offset + jobs[last].data.len() == jobs[index].offset
+                            && window_len + jobs[index].data.len() <= SHARED_WINDOW_LIMIT
+                    }
+                }
+            };
+            if joins {
+                window_len += if group.is_empty() {
+                    own_window(&jobs[index])
+                } else {
+                    jobs[index].data.len()
+                };
+                group.push(index);
+                continue;
+            }
+            if group.len() > 1 {
+                share_group(jobs, &group, window_len, dictionary, allowance)?;
+            }
+            group.clear();
+            window_len = 0;
+            if index != usize::MAX && shareable(&jobs[index]) {
+                window_len = own_window(&jobs[index]);
+                group.push(index);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn share_group<B: Budget>(
+    jobs: &mut [BlockJob<B>],
+    group: &[usize],
+    window_len: usize,
+    dictionary: usize,
+    allowance: &B,
+) -> Result<()> {
+    let first = &jobs[group[0]];
+    let history = &first.history[first.history.len().saturating_sub(dictionary)..];
+    let mut window = Buffer::with_capacity(window_len, allowance)?;
+    window
+        .extend_from_slice(history)
+        .map_err(Into::<crate::codec::Error>::into)?;
+    let mut bounds = Vec::with_capacity(group.len());
+    let mut at = Vec::with_capacity(group.len());
+    for &index in group {
+        let job = &mut jobs[index];
+        let start = window.len();
+        debug_assert!(
+            job.history[job.history.len().saturating_sub(dictionary)..]
+                == window[start.saturating_sub(dictionary.min(job.history.len()))..start],
+            "a grouped run's history is the window before it"
+        );
+        window
+            .extend_from_slice(&job.data)
+            .map_err(Into::<crate::codec::Error>::into)?;
+        let end = window.len();
+        // Where the run's own collector would start: at the run, or past its
+        // first block when the run starts the member and that block is
+        // searched on its own; never past where the run's window can insert.
+        let first_block = if start == 0 { job.blocks[0].1 } else { 0 };
+        at.push((start + first_block).min(end.saturating_sub(3)));
+        bounds.push((start, end));
+        job.data = Buffer::new(allowance);
+        job.history = Buffer::new(allowance);
+    }
+    let finders = SharedPackedIndex::finders_over(&window, &at, allowance)?;
+    let window = std::sync::Arc::new(window);
+    for ((&job, (start, end)), finder) in group.iter().zip(bounds).zip(finders) {
+        jobs[job].shared = Some(SharedRun {
+            window: std::sync::Arc::clone(&window),
+            start,
+            end,
+            finder,
+        });
+    }
+    Ok(())
 }
 
 impl<B: Budget> BlockJob<B> {
@@ -943,6 +1086,7 @@ where
                     filters: Records::new(0, resources)?,
                     segments: Records::new(0, resources)?,
                     records: None,
+                    shared: None,
                 };
                 while stream.has_more() && job.data.len() < run_size(plan) {
                     job.append(
@@ -998,6 +1142,9 @@ where
                 }
             }
 
+            if resources.execution.is_none() {
+                share_member_windows(&mut jobs, plan, allowance)?;
+            }
             compress_wave(
                 jobs,
                 plan,
@@ -1085,6 +1232,7 @@ where
                 filters: Records::new(0, resources)?,
                 segments: Records::new(0, resources)?,
                 records: None,
+                shared: None,
             };
             while job.data.len() < run_size(plan) {
                 while next < streams.len() && !streams[next].has_more() {
@@ -1385,6 +1533,9 @@ where
     let jobs = prepare_block_jobs::<B, B>(jobs, resources)?;
     let packed_runs = run_jobs(jobs, resources, advance, |job, progress| {
         let allowance = job.0.data.allowance();
+        if job.0.shared.is_some() {
+            return encode_shared_block_job(job, plan, progress, &allowance);
+        }
         encode_block_job(job, plan, progress, &allowance)
     })?;
     append_packed_runs(packed_runs, plan, streams, advance, error_context)
@@ -1478,6 +1629,39 @@ fn encode_block_job<B: Budget, C: Budget>(
         start,
         &boundaries,
         records.as_deref(),
+        plan.algorithm_version,
+        plan.encode_options,
+        Some(&mut block_done),
+        allowance,
+    )?;
+    drop(window);
+    for ((member, _, last), packed) in blocks.into_iter().zip(packed) {
+        output.push((member, packed, last))?;
+    }
+    Ok(output)
+}
+
+/// A run that shares its member's window and index with the other runs of
+/// the wave, coded by the same block walk as one with its own.
+fn encode_shared_block_job<B: Budget>(
+    (job, boundaries, mut output): PreparedBlockJob<B, B>,
+    plan: &CompressPlan,
+    progress: &dyn CompressionProgress,
+    allowance: &B,
+) -> Result<PackedBlocks<B>> {
+    let BlockJob { blocks, shared, .. } = job;
+    let SharedRun {
+        window,
+        start,
+        end,
+        finder,
+    } = shared.expect("dispatched as a shared run");
+    let mut block_done = |bytes: usize| progress.advance(bytes as u64);
+    let packed = streaming_blocks_with_finder(
+        &window[..end],
+        start,
+        finder,
+        &boundaries,
         plan.algorithm_version,
         plan.encode_options,
         Some(&mut block_done),

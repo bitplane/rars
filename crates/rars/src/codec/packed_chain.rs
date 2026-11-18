@@ -339,55 +339,173 @@ pub(crate) struct PackedMatchFinder<B: Budget = Allowance> {
 #[derive(Debug)]
 pub(crate) struct SharedPackedIndex<B: Budget = Allowance> {
     packed: Buffer<u8, B>,
-    /// Where each bucket's records start, before any position is inserted.
-    starts: Buffer<u32, B>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "block jobs share an index in the next step of #276"
-    )
-)]
 impl<B: Budget> SharedPackedIndex<B> {
+    /// Builds the index over `window` and hands out finders standing at each
+    /// of `positions`, ascending, as if every position before it had been
+    /// inserted.
+    ///
+    /// Building is the cost a group's jobs used to pay in parallel, one index
+    /// each, so it is split by bucket range across the pool: every part scans
+    /// the whole window and writes only its own buckets' records, which lie
+    /// together in the stream. A bucket's records depend only on its own
+    /// positions in order, so the stream is the one a single pass writes. The
+    /// write cursors just before a position are where insertion would have
+    /// left each bucket, so each part copies its range of them into every
+    /// finder it passes.
+    ///
     /// A finder chooses its walk by the length of the input it is given, which
     /// for a shared index is shorter than the window the stream was built
     /// over. So the window must stay where every record is one unit or two.
-    pub(crate) fn with_allowance(window: &[u8], allowance: &B) -> Result<std::sync::Arc<Self>> {
+    pub(crate) fn finders_over(
+        window: &[u8],
+        positions: &[usize],
+        allowance: &B,
+    ) -> Result<Buffer<PackedMatchFinder<B>, B>> {
         if window.len() > PAIRED_INPUT_LIMIT {
             return Err(Error::InvalidData(
                 "shared packed window exceeds the paired walk's reach",
             ));
         }
-        let (packed, starts) = build(window, allowance)?;
-        Ok(std::sync::Arc::new(Self { packed, starts }))
-    }
-
-    /// Finders standing at each of `positions`, ascending, as if every
-    /// position of the window before it had been inserted. One pass over the
-    /// window serves them all.
-    pub(crate) fn finders(
-        self: &std::sync::Arc<Self>,
-        window: &[u8],
-        positions: &[usize],
-        allowance: &B,
-    ) -> Result<Buffer<PackedMatchFinder<B>, B>> {
         debug_assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
         let insertable = window.len().saturating_sub(3);
-        let mut cursor = Buffer::copied(&self.starts, allowance)?;
-        let mut finders = Buffer::with_capacity(positions.len(), allowance)?;
-        let mut pos = 0;
-        for &target in positions {
-            let target = target.min(insertable);
-            while pos < target {
-                let bucket = hash(window, pos);
-                cursor[bucket] = past_record(&self.packed, cursor[bucket] as usize) as u32;
-                pos += 1;
+        let targets = Buffer::collect(
+            positions.iter().map(|&position| position.min(insertable)),
+            allowance,
+        )?;
+        let span = BUCKETS.div_ceil(crate::parallel::threads().clamp(1, 64));
+        let ranges = || {
+            (0..BUCKETS)
+                .step_by(span)
+                .map(move |start| start..(start + span).min(BUCKETS))
+        };
+        let delta_at = |head: &mut [u32], index: usize, pos: usize| {
+            let previous = std::mem::replace(&mut head[index], pos as u32);
+            if previous == NO_LINK {
+                0
+            } else {
+                pos as u32 - previous
             }
+        };
+
+        // Each bucket's stream length, a part of the buckets at a time.
+        struct Count<B: Budget> {
+            buckets: std::ops::Range<usize>,
+            lengths: Buffer<u32, B>,
+            head: Buffer<u32, B>,
+            overflowed: bool,
+        }
+        let mut counts = Vec::new();
+        for buckets in ranges() {
+            counts.push(Count {
+                lengths: Buffer::filled(buckets.len(), 0u32, allowance)?,
+                head: Buffer::filled(buckets.len(), NO_LINK, allowance)?,
+                buckets,
+                overflowed: false,
+            });
+        }
+        crate::parallel::for_each_mut(&mut counts, |_, count| {
+            for pos in 0..insertable {
+                let bucket = hash(window, pos);
+                if !count.buckets.contains(&bucket) {
+                    continue;
+                }
+                let index = bucket - count.buckets.start;
+                let length = encoded_length(delta_at(&mut count.head, index, pos)) as u32;
+                match count.lengths[index].checked_add(length) {
+                    Some(total) => count.lengths[index] = total,
+                    None => count.overflowed = true,
+                }
+            }
+        });
+        if counts.iter().any(|count| count.overflowed) {
+            return Err(Error::InvalidData(
+                "packed finder bucket exceeds u32 offsets",
+            ));
+        }
+        let mut starts = Buffer::filled(BUCKETS + 1, 0u32, allowance)?;
+        let mut total = 0u32;
+        for count in &counts {
+            for (index, &length) in count.lengths.iter().enumerate() {
+                starts[count.buckets.start + index] = total;
+                total = total.checked_add(length).ok_or(Error::InvalidData(
+                    "packed finder storage exceeds u32 offsets",
+                ))?;
+            }
+        }
+        starts[BUCKETS] = total;
+        drop(counts);
+
+        // The records, and each finder's cursors, a part of the buckets at a
+        // time. A part owns its buckets' stretch of the stream and of every
+        // finder's cursor array.
+        let mut packed = Buffer::filled(total as usize, 0u8, allowance)?;
+        let mut cursors = Vec::with_capacity(targets.len());
+        for _ in 0..targets.len() {
+            cursors.push(Buffer::filled(BUCKETS, 0u32, allowance)?);
+        }
+        struct Fill<'a, B: Budget> {
+            buckets: std::ops::Range<usize>,
+            base: usize,
+            packed: &'a mut [u8],
+            cursors: Vec<&'a mut [u32]>,
+            write: Buffer<u32, B>,
+            head: Buffer<u32, B>,
+        }
+        let mut fills = Vec::new();
+        let mut rest: &mut [u8] = &mut packed;
+        let mut chunks: Vec<std::slice::ChunksMut<'_, u32>> = cursors
+            .iter_mut()
+            .map(|cursor| cursor.chunks_mut(span))
+            .collect();
+        for buckets in ranges() {
+            let base = starts[buckets.start] as usize;
+            let (mine, after) = rest.split_at_mut(starts[buckets.end] as usize - base);
+            rest = after;
+            fills.push(Fill {
+                write: Buffer::copied(&starts[buckets.clone()], allowance)?,
+                head: Buffer::filled(buckets.len(), NO_LINK, allowance)?,
+                cursors: chunks
+                    .iter_mut()
+                    .map(|chunk| chunk.next().expect("one chunk per part"))
+                    .collect(),
+                buckets,
+                base,
+                packed: mine,
+            });
+        }
+        drop(chunks);
+        crate::parallel::for_each_mut(&mut fills, |_, fill| {
+            let mut next = 0;
+            for pos in 0..insertable {
+                while next < targets.len() && targets[next] == pos {
+                    fill.cursors[next].copy_from_slice(&fill.write);
+                    next += 1;
+                }
+                let bucket = hash(window, pos);
+                if !fill.buckets.contains(&bucket) {
+                    continue;
+                }
+                let index = bucket - fill.buckets.start;
+                let delta = delta_at(&mut fill.head, index, pos);
+                let length = encoded_length(delta);
+                let start = fill.write[index] as usize - fill.base;
+                encode(&mut fill.packed[start..start + length], delta);
+                fill.write[index] += length as u32;
+            }
+            for cursor in &mut fill.cursors[next..] {
+                cursor.copy_from_slice(&fill.write);
+            }
+        });
+        drop(fills);
+
+        let index = std::sync::Arc::new(Self { packed });
+        let mut finders = Buffer::with_capacity(targets.len(), allowance)?;
+        for (cursor, &target) in cursors.into_iter().zip(targets.iter()) {
             finders.push_admitted(PackedMatchFinder {
-                cursor: Buffer::copied(&cursor, allowance)?,
-                packed: Stream::Shared(std::sync::Arc::clone(self)),
+                cursor,
+                packed: Stream::Shared(std::sync::Arc::clone(&index)),
                 next_position: target,
             });
         }
@@ -474,6 +592,11 @@ impl<B: Budget> PackedMatchFinder<B> {
             packed: Stream::Own(packed),
             next_position: 0,
         })
+    }
+
+    /// The next position this finder will insert.
+    pub(crate) fn position(&self) -> usize {
+        self.next_position
     }
 
     pub(crate) fn allowance(&self) -> B {
@@ -977,14 +1100,12 @@ mod tests {
         let group_start = runs[0].start.saturating_sub(dictionary);
         let group = &member[group_start..runs.last().unwrap().end];
         let mut shared_finders = if shared {
-            let index = SharedPackedIndex::with_allowance(group, &allowance).unwrap();
             let at: Vec<usize> = runs
                 .iter()
                 .map(|run| blocks_of(run).first().map_or(run.end, |b| b.start) - group_start)
                 .collect();
             Some(
-                index
-                    .finders(group, &at, &allowance)
+                SharedPackedIndex::finders_over(group, &at, &allowance)
                     .unwrap()
                     .into_vec()
                     .into_iter(),
