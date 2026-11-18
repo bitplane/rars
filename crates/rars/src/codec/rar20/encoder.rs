@@ -41,15 +41,15 @@ pub(crate) fn unpack20_encode_auto_with_options_and_progress(
 }
 
 /// [`unpack20_encode_auto_with_options_and_progress`], reading the member as
-/// it is coded and handing `out` the packed bytes a block at a time, so
-/// neither the member nor its packed form is held whole. A break from `out`
-/// stops the coding.
+/// it is coded and handing `out` the packed bytes a block at a time, with how
+/// far into the member they reach, so neither the member nor its packed form
+/// is held whole. A break from `out` stops the coding.
 pub(crate) fn unpack20_encode_streamed(
     input: &mut dyn Read,
     len: usize,
     options: EncodeOptions,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    out: &mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
     let try_audio = options.try_audio;
     encode_streamed(
@@ -174,7 +174,7 @@ impl Unpack20Encoder {
         input: &mut dyn Read,
         len: usize,
         progress: &mut dyn FnMut(usize) -> bool,
-        out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+        out: &mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
     ) -> Result<ControlFlow<()>> {
         if len == 0 {
             return Ok(ControlFlow::Continue(()));
@@ -333,7 +333,7 @@ fn encode_streamed(
     options: EncodeOptions,
     try_audio: bool,
     progress: &mut dyn FnMut(usize) -> bool,
-    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    out: &mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
     block_size: usize,
 ) -> Result<(ControlFlow<()>, Vec<u8>)> {
     let options = options.constrained();
@@ -350,13 +350,13 @@ fn encode_streamed(
         coder.code_block(&window, behind, end < len, base, Some(&mut *progress))?;
         // The last byte may still take bits from the next block.
         let whole = coder.bits.take_whole_bytes();
-        if !whole.is_empty() && out(&whole)?.is_break() {
+        if !whole.is_empty() && out(&whole, end)?.is_break() {
             return Ok((ControlFlow::Break(()), Vec::new()));
         }
         base = end;
     }
     let tail = coder.bits.finish();
-    if !tail.is_empty() && out(&tail)?.is_break() {
+    if !tail.is_empty() && out(&tail, len)?.is_break() {
         return Ok((ControlFlow::Break(()), Vec::new()));
     }
     window.drain(..window.len().saturating_sub(reach));
@@ -483,7 +483,9 @@ impl BlockCoder {
 }
 
 /// One block's LZ coding, its tables chosen by up to three parses: a greedy
-/// one, then re-parses priced by the tables the one before implied.
+/// one, then re-parses priced by the tables the one before implied. Only the
+/// first advances progress, so each byte of the member is counted once; the
+/// re-parses report the block's end, already reached, to stay cancellable.
 #[allow(clippy::too_many_arguments)]
 fn code_lz_block(
     window: &[u8],
@@ -533,6 +535,8 @@ fn code_lz_block(
     } else {
         None
     };
+    let span = window.len() - start;
+    let mut poll = progress.map(|report| move |_: usize| report(span));
     let mut best_table = table_lengths;
     for _ in 0..refinements {
         let cost_model = CostModel::new(&best_table);
@@ -543,7 +547,8 @@ fn code_lz_block(
             Some(&cost_model),
             matches.as_ref(),
             state,
-            again(&mut progress),
+            poll.as_mut()
+                .map(|poll| poll as &mut dyn FnMut(usize) -> bool),
         )?;
         let next_table = table_lengths_for_tokens(&next_tokens, None, more)?;
         let mut next = BitWriter::default();

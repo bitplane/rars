@@ -129,7 +129,7 @@ fn streamed(
         options,
         try_audio,
         &mut |_| true,
-        &mut |bytes| {
+        &mut |bytes, _| {
             out.extend_from_slice(bytes);
             chunks += 1;
             Ok(ControlFlow::Continue(()))
@@ -196,17 +196,22 @@ fn a_streamed_chain_moves_on_only_when_every_byte_is_taken() {
     let before = chain.history.clone();
     let mut taken = 0;
     let flow = chain
-        .encode_member_streamed(&mut &data[..], data.len(), &mut |_| true, &mut |bytes| {
-            taken += bytes.len();
-            Ok(ControlFlow::Break(()))
-        })
+        .encode_member_streamed(
+            &mut &data[..],
+            data.len(),
+            &mut |_| true,
+            &mut |bytes, _| {
+                taken += bytes.len();
+                Ok(ControlFlow::Break(()))
+            },
+        )
         .unwrap();
     assert!(flow.is_break());
     assert!(taken > 0);
     assert_eq!(chain.history, before);
 
     let flow = chain
-        .encode_member_streamed(&mut &data[..], data.len(), &mut |_| true, &mut |_| {
+        .encode_member_streamed(&mut &data[..], data.len(), &mut |_| true, &mut |_, _| {
             Ok(ControlFlow::Continue(()))
         })
         .unwrap();
@@ -232,7 +237,7 @@ fn streaming_reports_progress_through_the_member_and_can_be_cancelled() {
             furthest = furthest.max(at);
             true
         },
-        &mut |bytes| {
+        &mut |bytes, _| {
             out.extend_from_slice(bytes);
             Ok(ControlFlow::Continue(()))
         },
@@ -250,7 +255,7 @@ fn streaming_reports_progress_through_the_member_and_can_be_cancelled() {
         EncodeOptions::default(),
         false,
         &mut |at| at < 2 * BLOCK,
-        &mut |_| Ok(ControlFlow::Continue(())),
+        &mut |_, _| Ok(ControlFlow::Continue(())),
         BLOCK,
     );
     assert!(matches!(cancelled, Err(Error::Cancelled)));
@@ -309,4 +314,25 @@ fn a_block_parse_starts_from_the_offsets_the_reader_carries() {
         state.old_offsets,
     );
     assert!(opens_with_old_offset(&optimal), "{:?}", &optimal[..2]);
+}
+
+#[test]
+fn every_byte_of_a_member_is_counted_once_whatever_the_level() {
+    let data = [text(50_000, 13), noise(20_000, 14), text(30_000, 15)].concat();
+    for options in levels() {
+        // As the writer counts it: progress since the last report, from zero
+        // again if a report goes back.
+        let (mut last, mut counted) = (0usize, 0usize);
+        let mut advance = |position: usize| {
+            if position < last {
+                last = 0;
+            }
+            counted += position - last;
+            last = position;
+            true
+        };
+        encode_member_in_blocks(&data, &[], None, options, true, Some(&mut advance), BLOCK)
+            .unwrap();
+        assert_eq!(counted, data.len(), "{options:?}");
+    }
 }

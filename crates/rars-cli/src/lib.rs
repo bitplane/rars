@@ -2097,13 +2097,16 @@ fn write_plain_rar50_streaming(
     Ok(())
 }
 
-/// Warns before a volume set that will not fit comfortably in memory.
-///
-/// The legacy codecs pack a member as a unit, so it is held however the parts are written.
+/// RAR 1.3 to 2.0 hold each member whole to pack it; RAR 2.9 to 4.x stream any member big enough to matter.
 fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersion) {
     const WARN_THRESHOLD: u64 = 256 * 1024 * 1024;
 
-    if target.family() == rars::version::ArchiveFamily::Rar50Plus {
+    if target.family() == rars::version::ArchiveFamily::Rar50Plus
+        || matches!(
+            target,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        )
+    {
         return;
     }
     let Ok(inputs) = collect_inputs(input_paths) else {
@@ -2739,7 +2742,11 @@ mod tests {
                 std::slice::from_ref(&path),
                 super::ArchiveVersion::Rar14,
             );
-            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar40);
+            super::warn_if_buffered_write_is_large(
+                std::slice::from_ref(&path),
+                super::ArchiveVersion::Rar40,
+            );
+            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar20);
             return;
         }
         let root = crate::scratch::case("buffered-volume-warning");
@@ -2773,9 +2780,10 @@ mod tests {
             if expected_warnings != 0 {
                 assert!(stderr.contains("--format rar14 builds a volume set in memory"));
                 assert!(stderr.contains(
-                    "--format rar40 compresses each member in memory, so this write holds \
+                    "--format rar20 compresses each member in memory, so this write holds \
                      the largest, its packed form and the encoder's working memory"
                 ));
+                assert!(!stderr.contains("--format rar40"), "{stderr}");
                 assert_eq!(
                     stderr.matches("--format rar50 splits as it goes").count(),
                     2
