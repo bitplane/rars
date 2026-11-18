@@ -25,7 +25,7 @@ use super::filters::DeltaErrorMessages;
 #[cfg(all(test, feature = "write"))]
 use super::filters::MAX_DELTA_CHANNELS;
 use super::packed_window::DRAINED;
-use super::ppmd7::{Ppmd7, PpmdByteReader};
+use super::ppmd::{Ppmd7, PpmdByteReader};
 use super::rarvm;
 use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};

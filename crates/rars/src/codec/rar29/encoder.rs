@@ -1,5 +1,5 @@
 //! RAR29 LZ and PPMd encoding, filter preparation and table emission.
-use super::super::ppmd::{PpmdDecoder, PpmdEncoder};
+use super::super::ppmd::{PpmdEncoder, PpmdModel};
 use super::super::{
     filters::{self, FilterOp},
     huffman, match_finder,
@@ -447,9 +447,9 @@ fn encode_ppmd_block_with_model(
     lz_escapes: bool,
     initial_filters: &[Vec<u8>],
     max_match_distance: usize,
-    model: Option<PpmdDecoder>,
+    model: Option<PpmdModel>,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<(Vec<u8>, PpmdDecoder)> {
+) -> Result<(Vec<u8>, PpmdModel)> {
     if progress.as_mut().is_some_and(|report| !report(0)) {
         return Err(Error::Cancelled);
     }
@@ -675,7 +675,7 @@ pub struct Unpack29Encoder {
     /// one. A reader keeps it across every block that does not ask for a reset,
     /// LZ blocks included, so a member can go PPMd against everything the chain
     /// has read even when the member before it went LZ.
-    ppmd: Option<PpmdDecoder>,
+    ppmd: Option<PpmdModel>,
 }
 
 impl Default for Unpack29Encoder {
@@ -847,7 +847,7 @@ impl Unpack29Encoder {
         &self,
         input: &[u8],
         progress: &mut dyn FnMut(usize) -> bool,
-    ) -> Result<(Vec<u8>, PpmdDecoder)> {
+    ) -> Result<(Vec<u8>, PpmdModel)> {
         encode_ppmd_block_with_model(
             input,
             true,
