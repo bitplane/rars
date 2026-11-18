@@ -776,8 +776,8 @@ impl<B: Budget> StateArena<B> {
     fn coalesce(&mut self) -> Result<()> {
         self.read_control.check_codec()?;
         let mut bitmap = Buffer::filled(
-            self.states.len().div_ceil(16),
-            0u8,
+            self.states.len().div_ceil(128),
+            0u64,
             &self.states.allowance(),
         )?;
         let mut poller = self.read_control.poller();
@@ -785,7 +785,7 @@ impl<B: Budget> StateArena<B> {
             for &at in list {
                 for pair in at as usize / 2..(at as usize + Self::block_len(class)) / 2 {
                     poller.check_codec(pair)?;
-                    bitmap[pair / 8] |= 1 << (pair % 8);
+                    bitmap[pair / 64] |= 1 << (pair % 64);
                 }
             }
         }
@@ -824,21 +824,23 @@ impl<B: Budget> StateArena<B> {
         Ok(())
     }
 
+    // Visit the free runs of a bitmap with one bit per pair of slots, as
+    // the largest blocks that tile each run from its start.
     fn visit_free_blocks(
-        bitmap: &[u8],
+        bitmap: &[u64],
         slots: usize,
         control: Option<&crate::read_control::ReadControl>,
         mut visit: impl FnMut(u32, usize),
     ) -> Result<()> {
         let mut poller = control.map(crate::read_control::ReadControl::poller);
-        let mut start = 0;
-        for pair in 0..=slots / 2 {
-            if let Some(poller) = &mut poller {
-                poller.check_codec(pair)?;
+        let pairs = slots / 2;
+        let mut pair = 0;
+        loop {
+            let start = Self::next_pair(bitmap, pair, pairs, true, &mut poller)?;
+            if start == pairs {
+                return Ok(());
             }
-            if pair < slots / 2 && bitmap[pair / 8] & (1 << (pair % 8)) != 0 {
-                continue;
-            }
+            pair = Self::next_pair(bitmap, start, pairs, false, &mut poller)?;
             let mut at = start * 2;
             let end = pair * 2;
             while at < end {
@@ -847,9 +849,31 @@ impl<B: Budget> StateArena<B> {
                 visit(at as u32, class);
                 at += Self::block_len(class);
             }
-            start = pair + 1;
         }
-        Ok(())
+    }
+
+    // The first pair from `from` whose bit is `free`, or `pairs` if none
+    // is. Whole words of the other value are skipped at once. No bit at or
+    // past `pairs` is set, so a used pair is never found beyond it.
+    fn next_pair(
+        bitmap: &[u64],
+        mut from: usize,
+        pairs: usize,
+        free: bool,
+        poller: &mut Option<crate::read_control::Poller>,
+    ) -> Result<usize> {
+        let flip = if free { 0 } else { u64::MAX };
+        while from < pairs {
+            if let Some(poller) = poller {
+                poller.check_codec(from)?;
+            }
+            let bits = (bitmap[from / 64] ^ flip) >> (from % 64);
+            if bits != 0 {
+                return Ok(from + bits.trailing_zeros() as usize);
+            }
+            from = (from / 64 + 1) * 64;
+        }
+        Ok(pairs)
     }
 }
 
