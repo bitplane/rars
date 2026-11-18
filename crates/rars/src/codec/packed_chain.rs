@@ -328,6 +328,28 @@ pub(crate) struct PackedMatchFinder<B: Budget = Allowance> {
     next_position: usize,
 }
 
+/// Calls `visit` with each position in `positions` whose `owner` is `part`,
+/// in order. Most positions belong to other parts, so they are compared 64 at
+/// a time into a mask, which compiles to vector compares, and only the set
+/// bits are visited.
+fn each_owned(
+    owner: &[u8],
+    positions: std::ops::Range<usize>,
+    part: u8,
+    mut visit: impl FnMut(usize),
+) {
+    let from = positions.start;
+    for (index, block) in owner[positions].chunks(64).enumerate() {
+        let mut mask = block.iter().enumerate().fold(0u64, |mask, (bit, &of)| {
+            mask | (u64::from(of == part) << bit)
+        });
+        while mask != 0 {
+            visit(from + index * 64 + mask.trailing_zeros() as usize);
+            mask &= mask - 1;
+        }
+    }
+}
+
 /// One set of packed chains over a window several finders search, each from
 /// its own position. A bucket's chain here holds every position a finder
 /// built over a later, shorter window would hold, newest first, plus older
@@ -347,13 +369,19 @@ impl<B: Budget> SharedPackedIndex<B> {
     /// inserted.
     ///
     /// Building is the cost a group's jobs used to pay in parallel, one index
-    /// each, so it is split by bucket range across the pool: every part scans
+    /// each, so it is split by bucket range across the pool: every part walks
     /// the whole window and writes only its own buckets' records, which lie
     /// together in the stream. A bucket's records depend only on its own
     /// positions in order, so the stream is the one a single pass writes. The
     /// write cursors just before a position are where insertion would have
     /// left each bucket, so each part copies its range of them into every
     /// finder it passes.
+    ///
+    /// Each position is hashed once, up front and in parallel, into the
+    /// number of the part that owns its bucket. A part then passes over
+    /// other parts' positions with a byte comparison; hashing them in every
+    /// part made the build cost the window once per thread, which at 32
+    /// threads lost more than sharing saved.
     ///
     /// A finder chooses its walk by the length of the input it is given, which
     /// for a shared index is shorter than the window the stream was built
@@ -380,6 +408,20 @@ impl<B: Budget> SharedPackedIndex<B> {
                 .step_by(span)
                 .map(move |start| start..(start + span).min(BUCKETS))
         };
+        const STRIPE: usize = 1 << 20;
+        let mut owner = Buffer::filled(insertable, 0u8, allowance)?;
+        let mut stripes: Vec<(usize, &mut [u8])> = owner
+            .chunks_mut(STRIPE)
+            .enumerate()
+            .map(|(index, stripe)| (index * STRIPE, stripe))
+            .collect();
+        crate::parallel::for_each_mut(&mut stripes, |_, (from, stripe)| {
+            for (pos, part) in (*from..).zip(stripe.iter_mut()) {
+                *part = (hash(window, pos) / span) as u8;
+            }
+        });
+        drop(stripes);
+        let owner = &owner[..];
         let delta_at = |head: &mut [u32], index: usize, pos: usize| {
             let previous = std::mem::replace(&mut head[index], pos as u32);
             if previous == NO_LINK {
@@ -406,18 +448,15 @@ impl<B: Budget> SharedPackedIndex<B> {
             });
         }
         crate::parallel::for_each_mut(&mut counts, |_, count| {
-            for pos in 0..insertable {
-                let bucket = hash(window, pos);
-                if !count.buckets.contains(&bucket) {
-                    continue;
-                }
-                let index = bucket - count.buckets.start;
+            let part = (count.buckets.start / span) as u8;
+            each_owned(owner, 0..insertable, part, |pos| {
+                let index = hash(window, pos) - count.buckets.start;
                 let length = encoded_length(delta_at(&mut count.head, index, pos)) as u32;
                 match count.lengths[index].checked_add(length) {
                     Some(total) => count.lengths[index] = total,
                     None => count.overflowed = true,
                 }
-            }
+            });
         });
         if counts.iter().any(|count| count.overflowed) {
             return Err(Error::InvalidData(
@@ -477,26 +516,24 @@ impl<B: Budget> SharedPackedIndex<B> {
         }
         drop(chunks);
         crate::parallel::for_each_mut(&mut fills, |_, fill| {
-            let mut next = 0;
-            for pos in 0..insertable {
-                while next < targets.len() && targets[next] == pos {
-                    fill.cursors[next].copy_from_slice(&fill.write);
-                    next += 1;
-                }
-                let bucket = hash(window, pos);
-                if !fill.buckets.contains(&bucket) {
-                    continue;
-                }
-                let index = bucket - fill.buckets.start;
-                let delta = delta_at(&mut fill.head, index, pos);
-                let length = encoded_length(delta);
-                let start = fill.write[index] as usize - fill.base;
-                encode(&mut fill.packed[start..start + length], delta);
-                fill.write[index] += length as u32;
+            let part = (fill.buckets.start / span) as u8;
+            let insert = |fill: &mut Fill<'_, B>, positions: std::ops::Range<usize>| {
+                each_owned(owner, positions, part, |pos| {
+                    let index = hash(window, pos) - fill.buckets.start;
+                    let delta = delta_at(&mut fill.head, index, pos);
+                    let length = encoded_length(delta);
+                    let start = fill.write[index] as usize - fill.base;
+                    encode(&mut fill.packed[start..start + length], delta);
+                    fill.write[index] += length as u32;
+                });
+            };
+            let mut from = 0;
+            for (next, &target) in targets.iter().enumerate() {
+                insert(fill, from..target);
+                fill.cursors[next].copy_from_slice(&fill.write);
+                from = target;
             }
-            for cursor in &mut fill.cursors[next..] {
-                cursor.copy_from_slice(&fill.write);
-            }
+            insert(fill, from..insertable);
         });
         drop(fills);
 
