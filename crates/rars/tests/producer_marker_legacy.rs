@@ -172,13 +172,18 @@ fn each_legacy_volume_has_a_producer() {
 #[test]
 fn encrypted_legacy_headers_leave_only_producer_payload_public() {
     for version in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        let mut builder = Builder::new(version)
-            .store(true)
-            .password(Some(b"secret".to_vec()))
-            .header_encryption(true);
-        builder
-            .add_bytes(b"private-name".to_vec(), (0..49).collect(), None, None)
-            .unwrap();
+        let builder_of = |data: Vec<u8>| {
+            let mut builder = Builder::new(version)
+                .store(true)
+                .password(Some(b"secret".to_vec()))
+                .header_encryption(true);
+            builder
+                .add_bytes(b"private-name".to_vec(), data, None, None)
+                .unwrap();
+            builder
+        };
+        let builder = builder_of((0..49).collect());
+        let probe = builder_of(vec![0]);
         let bytes = builder.to_bytes().unwrap();
         assert!(bytes.windows(DATA.len()).any(|part| part == DATA));
         assert!(!bytes
@@ -189,9 +194,11 @@ fn encrypted_legacy_headers_leave_only_producer_payload_public() {
         assert!(rars::Archive::Rar15To40(raw)
             .preserving_builder(Some(b"secret"))
             .is_ok());
-        for (index, volume) in volume_size::sized_for_payload(16, |size| {
-            builder.clone().volume_size(Some(size)).build_volumes(None)
-        })
+        for (index, volume) in volume_size::sized_for_payload_probed(
+            16,
+            |size| probe.clone().volume_size(Some(size)).build_volumes(None),
+            |size| builder.clone().volume_size(Some(size)).build_volumes(None),
+        )
         .unwrap()
         .iter()
         .enumerate()

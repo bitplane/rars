@@ -6742,8 +6742,12 @@ fn rar5_explicit_filters_combine_with_the_rest_of_the_writer() {
         ("file-comment", vec!["--file-comment", "note"]),
     ] {
         let archive = dir.join(format!("{name}.rar"));
+        // The fastest level still applies the filter, and what is under test
+        // is whether the writer takes the combination at all. The default
+        // level's match search on this run-heavy payload was nearly all of
+        // the test's time.
         let output = rars()
-            .args(["a", "--format", "rar50", "--e8-filter"])
+            .args(["a", "--format", "rar50", "--e8-filter", "--level", "1"])
             .args(&extra)
             .arg(&archive)
             .arg(&source)

@@ -4937,9 +4937,18 @@ fn solid_compressed_volume_sets_keep_the_solid_main_flag() {
             password: encrypted_headers.then_some(b"password".as_slice()),
             file_comment: None,
         };
-        let parts = volume_size::sized_for_payload(24, |volume_size| {
-            write_compressed_volumes(entry, WriterOptions::new(target, features), volume_size)
-        })
+        let options = WriterOptions::new(target, features);
+        let parts = volume_size::sized_for_payload_probed(
+            24,
+            |volume_size| {
+                let probe = FileEntry {
+                    data: &entry.data[..1],
+                    ..entry
+                };
+                write_compressed_volumes(probe, options, volume_size)
+            },
+            |volume_size| write_compressed_volumes(entry, options, volume_size),
+        )
         .unwrap();
         assert!(parts.len() > 1, "{target:?}");
         let archives: Vec<_> = parts
@@ -5367,9 +5376,17 @@ fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
         password: Some(b"password"),
         file_comment: None,
     };
-    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_stored_volumes(stored, options, volume_size)
-    })
+    let stored_parts = volume_size::sized_for_payload_probed(
+        24,
+        |volume_size| {
+            let probe = StoredEntry {
+                data: &stored.data[..1],
+                ..stored
+            };
+            write_stored_volumes(probe, options, volume_size)
+        },
+        |volume_size| write_stored_volumes(stored, options, volume_size),
+    )
     .unwrap();
     assert!(matches!(
         Archive::parse(&stored_parts[0]),
@@ -5398,9 +5415,17 @@ fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
         password: Some(b"password"),
         file_comment: None,
     };
-    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_compressed_volumes(compressed, options, volume_size)
-    })
+    let compressed_parts = volume_size::sized_for_payload_probed(
+        24,
+        |volume_size| {
+            let probe = FileEntry {
+                data: &compressed.data[..1],
+                ..compressed
+            };
+            write_compressed_volumes(probe, options, volume_size)
+        },
+        |volume_size| write_compressed_volumes(compressed, options, volume_size),
+    )
     .unwrap();
     assert!(matches!(
         Archive::parse(&compressed_parts[0]),

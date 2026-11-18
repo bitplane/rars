@@ -68,6 +68,13 @@ fn write(data: &[u8], policy: FilterPolicy, resources: &WriterResources) -> Vec<
 fn runs_of_a_large_member_choose_their_own_filters() {
     let root = scratch::case("rar50-large-member-filters");
     let data = code(MEMBER);
+    // The plain archive is only the yardstick, and it packs to the same bytes
+    // with or without the ledger, so one serves both.
+    let plain = write(
+        &data,
+        FilterPolicy::None,
+        &WriterResources::new(LIMIT).with_temp_dir(&root),
+    );
     for ledger in [None, Some(4 * 1024 * MIB)] {
         let resources = WriterResources::new(LIMIT).with_temp_dir(&root);
         let resources = match ledger {
@@ -75,7 +82,6 @@ fn runs_of_a_large_member_choose_their_own_filters() {
             None => resources,
         };
         let filtered = write(&data, FilterPolicy::Auto, &resources);
-        let plain = write(&data, FilterPolicy::None, &resources);
 
         let archive = ArchiveReader::read(&filtered).unwrap();
         archive.test(None).unwrap();

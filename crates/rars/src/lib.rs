@@ -3919,22 +3919,28 @@ mod tests {
     fn direct_writer_creates_rar30_header_encrypted_compressed_volumes() {
         let mut features = FeatureSet::store_only();
         features.header_encryption = true;
-        let parts =
-            crate::volume_test_support::sized_for_payload(8, |volume_size| {
-                rar15_40::write_compressed_volumes(
-            rar15_40::FileEntry {
-                name: b"split-rar30-header-secret.txt",
-                data: b"facade rar30 header encrypted split facade rar30 header encrypted split\n",
-                file_time: 0,
-                file_attr: 0x20,
-                host_os: 3,
-                password: Some(b"password"),
-                file_comment: None,
+        let entry = rar15_40::FileEntry {
+            name: b"split-rar30-header-secret.txt",
+            data: b"facade rar30 header encrypted split facade rar30 header encrypted split\n",
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: Some(b"password"),
+            file_comment: None,
+        };
+        let options = rar15_options_with_features(ArchiveVersion::Rar30, features);
+        let parts = crate::volume_test_support::sized_for_payload_probed(
+            8,
+            |volume_size| {
+                let probe = rar15_40::FileEntry {
+                    data: &entry.data[..1],
+                    ..entry
+                };
+                rar15_40::write_compressed_volumes(probe, options, volume_size)
             },
-            rar15_options_with_features(ArchiveVersion::Rar30, features),
-            volume_size)
-            })
-            .unwrap();
+            |volume_size| rar15_40::write_compressed_volumes(entry, options, volume_size),
+        )
+        .unwrap();
         assert!(matches!(
             rar15_40::Archive::parse(&parts[0]),
             Err(Error::NeedPassword)

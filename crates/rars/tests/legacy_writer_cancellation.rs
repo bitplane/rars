@@ -117,12 +117,16 @@ impl WriteProgress for Stop {
     }
 }
 
+/// The payload is just over the 64 KiB a stored member is copied in, so a
+/// stored write still reports progress, and can be cancelled, with part of
+/// the member done. Anything larger only gives the compressors more to do
+/// before the same cancellation points.
 fn builder(format: ArchiveVersion, store: bool) -> Builder {
     let mut builder = Builder::new(format).store(store);
     builder
         .add_bytes(
             b"payload".to_vec(),
-            b"legacy cancellation\n".repeat(8000),
+            b"legacy cancellation\n".repeat(3300),
             None,
             None,
         )
