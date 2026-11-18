@@ -25,7 +25,6 @@ pub(crate) use encoder::{
 #[cfg(all(test, feature = "write"))]
 pub(crate) use encoder::{
     encode_lz_member_with_options_and_progress, encode_lz_reader_to, filtered_lz_member,
-    streaming_blocks_with_allowance,
 };
 
 use super::filters::{self, DeltaErrorMessages};

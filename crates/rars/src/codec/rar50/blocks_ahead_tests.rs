@@ -1,7 +1,8 @@
+use super::super::encoder::streaming_blocks_with_allowance;
 use super::super::{
-    encode_compressed_block, encode_table_lengths_with_bit_count, streaming_blocks_with_allowance,
-    Allowance, EncodeOptions, TableLengths, Unpack50Encoder, ALIGN_TABLE_SIZE,
-    DISTANCE_TABLE_SIZE_50, LENGTH_TABLE_SIZE, MAIN_TABLE_SIZE,
+    encode_compressed_block, encode_table_lengths_with_bit_count, Allowance, EncodeOptions,
+    TableLengths, Unpack50Encoder, ALIGN_TABLE_SIZE, DISTANCE_TABLE_SIZE_50, LENGTH_TABLE_SIZE,
+    MAIN_TABLE_SIZE,
 };
 use super::*;
 use crate::read_control::ReadControl;
