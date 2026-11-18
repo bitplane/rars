@@ -1,11 +1,86 @@
 // Generate and verify fixtures outside timed work. Fresh decoders include table
 // construction, so tiny members expose lookup setup costs. The audio fixture
 // must actually select an audio block rather than silently measuring LZ.
+// Fixtures are built when their case first runs rather than while the groups
+// are set up, so a filtered run (nextest runs each case in its own process)
+// builds only the one it measures.
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use rars::codec::rar20::{
     unpack20_encode_auto_with_options, EncodeOptions, Unpack20, Unpack20Encoder,
 };
-use std::{hint::black_box, time::Duration};
+use std::{cell::OnceCell, hint::black_box, time::Duration};
+
+fn decode_size(kind: &str) -> usize {
+    match kind {
+        "tiny" => 128,
+        "one" => 1,
+        "audio" | "audio_noise" => 32768,
+        _ => 256 * 1024,
+    }
+}
+
+// Generates, packs and round-trip checks one decode fixture.
+fn decode_fixture(kind: &str) -> Vec<u8> {
+    let size = decode_size(kind);
+    let mut random = 0x1234_5678u32;
+    let mut next = || {
+        random ^= random << 13;
+        random ^= random >> 17;
+        random ^= random << 5;
+        random as u8
+    };
+    let data: Vec<u8> = match kind {
+        "period3" | "period64" => {
+            let n = if kind == "period3" { 3 } else { 64 };
+            let pattern: Vec<_> = (0..n).map(|_| next()).collect();
+            pattern.into_iter().cycle().take(size).collect()
+        }
+        "audio" => (0..8192i16)
+            .flat_map(|sample| {
+                let l = sample.wrapping_mul(3).wrapping_add(200);
+                let r = sample.wrapping_mul(3).wrapping_sub(200);
+                [l.to_le_bytes(), r.to_le_bytes()].concat()
+            })
+            .collect(),
+        "audio_noise" => (0..8192)
+            .flat_map(|sample| {
+                let wave = ((sample % 512) as i16 - 256) * 32;
+                let l = wave + i16::from(next() & 31) - 16;
+                let r = wave + i16::from(next() & 31) - 216;
+                [l.to_le_bytes(), r.to_le_bytes()].concat()
+            })
+            .collect(),
+        "short" => (0..size / 4)
+            .flat_map(|_| {
+                let x = next();
+                [x, x, x, x ^ 0x80]
+            })
+            .collect(),
+        _ => (0..size).map(|_| next()).collect(),
+    };
+    let mut options =
+        EncodeOptions::new(if kind == "literals" { 0 } else { 16 }).with_try_audio(false);
+    if kind == "short" {
+        options = options.with_max_match_distance(1);
+    }
+    let packed = if kind.starts_with("audio") {
+        let p = unpack20_encode_auto_with_options(&data, options.with_try_audio(true)).unwrap();
+        assert_ne!(p[0] & 0x80, 0);
+        p
+    } else {
+        Unpack20Encoder::with_options(options)
+            .encode_member(&data)
+            .unwrap()
+    };
+    assert_eq!(Unpack20::new().decode_member(&packed, size).unwrap(), data);
+    eprintln!(
+        "fixture {kind}: {} decoded bytes, {} packed bytes, crc32 {:08x}",
+        data.len(),
+        packed.len(),
+        rars::crc32::crc32(&packed)
+    );
+    packed
+}
 
 fn decode(c: &mut Criterion) {
     let mut group = c.benchmark_group("rar20_decode");
@@ -20,75 +95,15 @@ fn decode(c: &mut Criterion) {
         "audio",
         "audio_noise",
     ] {
-        let size = match kind {
-            "tiny" => 128,
-            "one" => 1,
-            "audio" | "audio_noise" => 32768,
-            _ => 256 * 1024,
-        };
-        let mut random = 0x1234_5678u32;
-        let mut next = || {
-            random ^= random << 13;
-            random ^= random >> 17;
-            random ^= random << 5;
-            random as u8
-        };
-        let data: Vec<u8> = match kind {
-            "period3" | "period64" => {
-                let n = if kind == "period3" { 3 } else { 64 };
-                let pattern: Vec<_> = (0..n).map(|_| next()).collect();
-                pattern.into_iter().cycle().take(size).collect()
-            }
-            "audio" => (0..8192i16)
-                .flat_map(|sample| {
-                    let l = sample.wrapping_mul(3).wrapping_add(200);
-                    let r = sample.wrapping_mul(3).wrapping_sub(200);
-                    [l.to_le_bytes(), r.to_le_bytes()].concat()
-                })
-                .collect(),
-            "audio_noise" => (0..8192)
-                .flat_map(|sample| {
-                    let wave = ((sample % 512) as i16 - 256) * 32;
-                    let l = wave + i16::from(next() & 31) - 16;
-                    let r = wave + i16::from(next() & 31) - 216;
-                    [l.to_le_bytes(), r.to_le_bytes()].concat()
-                })
-                .collect(),
-            "short" => (0..size / 4)
-                .flat_map(|_| {
-                    let x = next();
-                    [x, x, x, x ^ 0x80]
-                })
-                .collect(),
-            _ => (0..size).map(|_| next()).collect(),
-        };
-        let mut options =
-            EncodeOptions::new(if kind == "literals" { 0 } else { 16 }).with_try_audio(false);
-        if kind == "short" {
-            options = options.with_max_match_distance(1);
-        }
-        let packed = if kind.starts_with("audio") {
-            let p = unpack20_encode_auto_with_options(&data, options.with_try_audio(true)).unwrap();
-            assert_ne!(p[0] & 0x80, 0);
-            p
-        } else {
-            Unpack20Encoder::with_options(options)
-                .encode_member(&data)
-                .unwrap()
-        };
-        assert_eq!(Unpack20::new().decode_member(&packed, size).unwrap(), data);
-        eprintln!(
-            "fixture {kind}: {} decoded bytes, {} packed bytes, crc32 {:08x}",
-            data.len(),
-            packed.len(),
-            rars::crc32::crc32(&packed)
-        );
+        let size = decode_size(kind);
+        let packed = OnceCell::new();
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_function(kind, |b| {
+            let packed = packed.get_or_init(|| decode_fixture(kind));
             b.iter(|| {
                 black_box(
                     Unpack20::new()
-                        .decode_member(black_box(&packed), size)
+                        .decode_member(black_box(packed), size)
                         .unwrap(),
                 )
             });
@@ -96,6 +111,8 @@ fn decode(c: &mut Criterion) {
     }
     group.finish();
 }
+
+const WINDOW: usize = 1024 * 1024;
 
 // Seed a fresh decoder rather than cloning it: cloning changes Vec capacity
 // and would turn every case into a checkpoint-restoration measurement.
@@ -107,52 +124,63 @@ fn seeded_solid_decoder(mut seed: &[u8]) -> Unpack20 {
     decoder
 }
 
+// The window-filling seed member and the packed continuation, both checked.
+fn solid_fixture(size: usize, members: usize) -> (Vec<u8>, Vec<u8>) {
+    let mut encoder = Unpack20Encoder::with_options(EncodeOptions::new(16).with_try_audio(false));
+    let prefix = vec![b'A'; WINDOW];
+    let data = vec![b'A'; size];
+    let seed = encoder.encode_member(&prefix).unwrap();
+    let packed = encoder.encode_member(&data).unwrap();
+    assert_eq!(
+        Unpack20::new().decode_member(&seed, WINDOW).unwrap(),
+        prefix
+    );
+    eprintln!(
+        "solid fixture: {members} members of {size} bytes; seed crc32 {:08x}, member {} packed bytes, crc32 {:08x}",
+        rars::crc32::crc32(&seed), packed.len(), rars::crc32::crc32(&packed)
+    );
+    (seed, packed)
+}
+
+// The same packed continuation is reused only after verifying the entire
+// sequence, including its offset/table state and checkpoints.
+fn verify_solid_sequence(mode: &str, seed: &[u8], packed: &[u8], size: usize, members: usize) {
+    let data = vec![b'A'; size];
+    let mut decoder = seeded_solid_decoder(seed);
+    for _ in 0..members {
+        if mode == "streaming" {
+            let mut output = Vec::new();
+            decoder
+                .decode_member_from_reader(&mut &packed[..], size, &mut output)
+                .unwrap();
+            assert_eq!(output, data);
+        } else {
+            assert_eq!(decoder.decode_member(packed, size).unwrap(), data);
+        }
+        if mode == "restore" {
+            decoder = decoder.clone();
+        } else if mode == "checkpoint" {
+            black_box(decoder.clone());
+        }
+    }
+}
+
 fn solid_history(c: &mut Criterion) {
-    const WINDOW: usize = 1024 * 1024;
     let mut group = c.benchmark_group("rar20_solid_history");
     for size in [1024, 4093, 16384, 65537, WINDOW] {
-        let mut encoder =
-            Unpack20Encoder::with_options(EncodeOptions::new(16).with_try_audio(false));
-        let prefix = vec![b'A'; WINDOW];
-        let data = vec![b'A'; size];
-        let seed = encoder.encode_member(&prefix).unwrap();
-        let packed = encoder.encode_member(&data).unwrap();
         let members = (2 * WINDOW).div_ceil(size);
-        assert_eq!(
-            Unpack20::new().decode_member(&seed, WINDOW).unwrap(),
-            prefix
-        );
-        eprintln!(
-            "solid fixture: {members} members of {size} bytes; seed crc32 {:08x}, member {} packed bytes, crc32 {:08x}",
-            rars::crc32::crc32(&seed), packed.len(), rars::crc32::crc32(&packed)
-        );
+        let fixture = OnceCell::new();
         group.throughput(Throughput::Bytes((members * size) as u64));
         for mode in ["owned", "streaming", "checkpoint", "restore"] {
             if size != 1024 && matches!(mode, "checkpoint" | "restore") {
                 continue;
             }
-            // The same packed continuation is reused only after verifying the
-            // entire sequence, including its offset/table state and checkpoints.
-            let mut decoder = seeded_solid_decoder(&seed);
-            for _ in 0..members {
-                if mode == "streaming" {
-                    let mut output = Vec::new();
-                    decoder
-                        .decode_member_from_reader(&mut packed.as_slice(), size, &mut output)
-                        .unwrap();
-                    assert_eq!(output, data);
-                } else {
-                    assert_eq!(decoder.decode_member(&packed, size).unwrap(), data);
-                }
-                if mode == "restore" {
-                    decoder = decoder.clone();
-                } else if mode == "checkpoint" {
-                    black_box(decoder.clone());
-                }
-            }
+            let verified = OnceCell::new();
             group.bench_function(format!("{mode}/{size}"), |b| {
+                let (seed, packed) = fixture.get_or_init(|| solid_fixture(size, members));
+                verified.get_or_init(|| verify_solid_sequence(mode, seed, packed, size, members));
                 b.iter_batched(
-                    || seeded_solid_decoder(&seed),
+                    || seeded_solid_decoder(seed),
                     |mut decoder| {
                         for _ in 0..members {
                             if mode == "streaming" {
@@ -164,7 +192,7 @@ fn solid_history(c: &mut Criterion) {
                                     )
                                     .unwrap();
                             } else {
-                                black_box(decoder.decode_member(&packed, size).unwrap());
+                                black_box(decoder.decode_member(packed, size).unwrap());
                             }
                             if mode == "restore" {
                                 decoder = decoder.clone();

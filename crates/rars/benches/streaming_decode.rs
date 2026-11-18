@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rars::rar50::{ArchiveEntry, FilterPolicy, Rar50Writer, WriterOptions};
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, EntrySource, FeatureSet};
-use std::{hint::black_box, sync::Arc, time::Duration};
+use std::{cell::OnceCell, hint::black_box, sync::Arc, time::Duration};
 
 const MEMBER_SIZE: usize = 2 * 1024 * 1024;
 
@@ -60,6 +60,16 @@ fn fixture(name: &str, data: Vec<u8>) -> Archive {
     archive
 }
 
+fn payload(name: &str) -> Vec<u8> {
+    match name {
+        "period_3" => periodic_payload(3),
+        "period_64" => periodic_payload(64),
+        "period_4096" => periodic_payload(4096),
+        "mixed_text" => mixed_payload(),
+        _ => unreachable!("unknown streaming benchmark payload {name}"),
+    }
+}
+
 fn decode(c: &mut Criterion, streaming: bool) {
     let mut group = c.benchmark_group(if streaming {
         "rar50_streaming_decode"
@@ -72,18 +82,19 @@ fn decode(c: &mut Criterion, streaming: bool) {
         ArchiveReadOptions::new()
     };
     group.throughput(Throughput::Bytes(MEMBER_SIZE as u64));
-    for (name, data) in [
-        ("period_3", periodic_payload(3)),
-        ("period_64", periodic_payload(64)),
-        ("period_4096", periodic_payload(4096)),
-        ("mixed_text", mixed_payload()),
-    ] {
-        // Archive generation, parsing and byte-for-byte validation are untimed.
+    for name in ["period_3", "period_64", "period_4096", "mixed_text"] {
+        // Archive generation, parsing and byte-for-byte validation are untimed,
+        // and wait until the case runs: a filtered run (nextest runs each case
+        // in its own process) builds only the archive it measures.
         // An explicit zero buffering limit selects the production streaming
         // reader on this bounded member instead of its <=512 MiB buffered path.
-        let archive = fixture(name, data);
-        archive.test_with_options(options).unwrap();
-        group.bench_with_input(BenchmarkId::from_parameter(name), &archive, |b, archive| {
+        let archive = OnceCell::new();
+        group.bench_function(BenchmarkId::from_parameter(name), |b| {
+            let archive = archive.get_or_init(|| {
+                let archive = fixture(name, payload(name));
+                archive.test_with_options(options).unwrap();
+                archive
+            });
             b.iter(|| {
                 black_box(archive)
                     .test_with_options(options)
