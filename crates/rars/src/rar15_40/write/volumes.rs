@@ -693,7 +693,7 @@ impl<'a> VolumePacker<'a> {
 }
 
 /// Fixed once so both reads of the source produce the same ciphertext.
-struct CipherPlan<'a> {
+pub(super) struct CipherPlan<'a> {
     target: ArchiveVersion,
     password: Option<&'a [u8]>,
     #[cfg(feature = "encryption")]
@@ -701,7 +701,7 @@ struct CipherPlan<'a> {
 }
 
 impl<'a> CipherPlan<'a> {
-    fn new(
+    pub(super) fn new(
         target: ArchiveVersion,
         password: Option<&'a [u8]>,
         data_keys: &mut DataKeys,
@@ -734,7 +734,7 @@ impl<'a> CipherPlan<'a> {
         }
     }
 
-    fn salt(&self) -> Option<[u8; 8]> {
+    pub(super) fn salt(&self) -> Option<[u8; 8]> {
         #[cfg(feature = "encryption")]
         {
             self.rar30.as_ref().map(|(salt, _)| *salt)
@@ -748,7 +748,7 @@ impl<'a> CipherPlan<'a> {
         self.password.is_some() && self.target != ArchiveVersion::Rar15
     }
 
-    fn packed_len(&self, unpacked: u64) -> Result<u64> {
+    pub(super) fn packed_len(&self, unpacked: u64) -> Result<u64> {
         if self.pads() {
             unpacked
                 .checked_add(15)
@@ -759,7 +759,7 @@ impl<'a> CipherPlan<'a> {
         }
     }
 
-    fn start(&self) -> Result<Option<Cipher>> {
+    pub(super) fn start(&self) -> Result<Option<Cipher>> {
         let Some(password) = self.password else {
             return Ok(None);
         };
@@ -781,7 +781,7 @@ impl<'a> CipherPlan<'a> {
     }
 }
 
-enum Cipher {
+pub(super) enum Cipher {
     #[cfg(feature = "encryption")]
     Rar15(Rar15Cipher),
     #[cfg(feature = "encryption")]
@@ -791,7 +791,7 @@ enum Cipher {
 }
 
 impl Cipher {
-    fn encrypt(&mut self, data: &mut [u8]) {
+    pub(super) fn encrypt(&mut self, data: &mut [u8]) {
         match self {
             #[cfg(feature = "encryption")]
             Self::Rar15(cipher) => cipher.crypt_in_place(data),
