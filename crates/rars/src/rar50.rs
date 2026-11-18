@@ -1574,12 +1574,18 @@ fn parse_file_extra_area(
                 // RAR 5 file versioning: the record carries a flags vint
                 // (no flags are defined) then the version-number vint.
                 // Adopt the record by appending ";N" to the member name;
-                // the newest version has no record at all. Service blocks
+                // the newest version has no record at all. Version 0 is
+                // "no version" and gets no suffix either. Service blocks
                 // never carry versions, so those names must stay untouched.
-                let (_, flags_len) = read_vint_at(input, data.start, data.end)?;
-                let (version, _version_len) =
-                    read_vint_at(input, data.start + flags_len, data.end)?;
-                if !is_service {
+                // Reference readers do not fail an archive over a record
+                // they cannot read, so a short record counts as version 0.
+                let flags_len = read_vint_at(input, data.start, data.end)
+                    .map(|(_, len)| len)
+                    .unwrap_or_default();
+                let version = read_vint_at(input, data.start + flags_len, data.end)
+                    .map(|(version, _)| version)
+                    .unwrap_or_default();
+                if !is_service && version != 0 {
                     file.name
                         .extend_from_slice(format!(";{version}").as_bytes());
                 }
@@ -3042,6 +3048,19 @@ mod tests {
             parse(FHEXTRA_VERSION as u8, &[0, 1], true, b"CMT", None).name,
             b"CMT"
         );
+        // A version of 0 reads as "no version" and gets no suffix.
+        {
+            let file = parse(FHEXTRA_VERSION as u8, &[0, 0], false, b"f.txt", None);
+            assert_eq!(file.name, b"f.txt");
+            assert!(!file.rewrite_metadata_complete);
+        }
+        // A version record too short to parse (empty, or flags without the
+        // version number) reads as version 0 instead of failing to open.
+        for payload in [vec![], vec![0]] {
+            let file = parse(FHEXTRA_VERSION as u8, &payload, false, b"f.txt", None);
+            assert_eq!(file.name, b"f.txt");
+            assert!(!file.rewrite_metadata_complete);
+        }
         // A version needing more than one vint byte exercises the flags
         // offset arithmetic before the version number.
         {
