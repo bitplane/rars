@@ -48,8 +48,8 @@ fn text(size: usize, seed: u64) -> Vec<u8> {
 
 /// With a 1 MiB dictionary a run is 1 MiB and its window up to 2 MiB, which
 /// the optimal parse searches through a packed index. Two members two runs
-/// long, the second of one cut short. A wave of four alternates them, so
-/// each member's runs share though they are not next to each other in it.
+/// long, the second of one cut short. A wave of four takes the first
+/// member's runs and then the second's, and each member's two share.
 fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("first.txt", text(2048 * KIB, 1)),

@@ -10,8 +10,10 @@
 //! then holds filtered bytes, so its runs pick filters in one parallel pass and
 //! take their histories from the filtered runs before them in a second.
 //!
-//! Non-solid members each carry their own history and are interleaved so that
-//! several small members keep every core busy. Solid members share one history
+//! Non-solid members each carry their own history. A wave takes a member's
+//! runs in order until it runs out and then moves to the next, so several
+//! small members keep every core busy, and a large member's runs in a wave
+//! share one window between them. Solid members share one history
 //! chain that runs across member boundaries, so their blocks are produced by a
 //! single walk through the members in order — the walk is just reading, which
 //! is cheap, so waves of blocks still compress in parallel.
@@ -1060,9 +1062,16 @@ fn compress_fallback_members(
     )
 }
 
-/// Members with independent dictionaries, interleaved so a batch of small
-/// members can still saturate the machine. With `filter_runs`, each run chooses
-/// its own filters.
+/// Members with independent dictionaries. A wave takes each member's runs in
+/// order until it runs out, then the next member's, so a batch of small
+/// members still saturates the machine and a large member's runs in a wave
+/// are consecutive, which is what lets them share a window and an index.
+/// Taking one run from each member in turn left every run of a member in a
+/// wave of its own whenever there were as many members as threads.
+///
+/// A run is coded from its own bytes and its member's history, so which
+/// runs share a wave never changes the archive. With `filter_runs`, each run
+/// chooses its own filters.
 #[allow(clippy::too_many_arguments)]
 fn compress_independent_members<B: Budget + Send + Sync>(
     sources: &[EntrySource],
@@ -1117,11 +1126,10 @@ where
             let mut jobs = Records::new(wave_capacity, resources)?;
             let mut misses = 0usize;
             while jobs.len() < wave_capacity && misses < streams.len() {
-                let stream_count = streams.len();
                 let member = cursor;
                 let stream = &mut streams[member];
-                cursor = (cursor + 1) % stream_count;
                 if !stream.has_more() {
+                    cursor = (cursor + 1) % streams.len();
                     misses += 1;
                     continue;
                 }
