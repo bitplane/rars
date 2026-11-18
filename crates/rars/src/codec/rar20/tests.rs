@@ -61,8 +61,10 @@ fn reader_decoding_stays_in_a_workspace_that_does_not_grow_with_the_member() {
         .iter()
         .map(|&byte| EncodeToken::Literal(byte))
         .collect();
-    let tables = super::table_lengths_for_tokens(&tokens, None).unwrap();
-    let packed = super::encode_member_with_tables(&tokens, &[], None, &tables).unwrap();
+    let tables = super::table_lengths_for_tokens(&tokens, None, false).unwrap();
+    let mut bits = BitWriter::default();
+    super::write_lz_block(&mut bits, &tokens, true, None, &tables, false).unwrap();
+    let packed = bits.finish();
     assert!(packed.len() > data.len() * 9 / 10);
     let budget = super::Allowance::limited(3 << 20);
     let mut state = super::Reader20State::with_allowance(&budget);
@@ -146,9 +148,18 @@ fn encode_tokens(
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
 ) -> Vec<EncodeToken> {
-    let (combined, start) = super::combined_input(input, history, options);
-    encode_tokens_with_progress(&combined, start, options, cost_model, None, None)
-        .expect("encoding without cancellation cannot be cancelled")
+    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
+    let combined = [history, input].concat();
+    encode_tokens_with_progress(
+        &combined,
+        history.len(),
+        options,
+        cost_model,
+        None,
+        super::LzState::default(),
+        None,
+    )
+    .expect("encoding without cancellation cannot be cancelled")
 }
 
 const AUTOREJ_PACKED: &[u8] = &[
@@ -867,7 +878,7 @@ fn optimal_parser_skips_an_out_of_format_fresh_match() {
     let prices = CostModel::new(&lengths);
 
     let matches = super::collect_match_lists(&input, start, end, options);
-    let tokens = super::encode_tokens_optimal(&input, start, end, &matches, &prices);
+    let tokens = super::encode_tokens_optimal(&input, start, end, &matches, &prices, [0; 4]);
     assert_eq!(tokens.len(), 5);
     assert!(tokens
         .iter()
@@ -882,7 +893,7 @@ fn optimal_parser_covers_a_long_repeat_with_full_length_matches() {
     let prices = CostModel::new(&lengths);
 
     let matches = super::collect_match_lists(&input, 0, input.len(), options);
-    let tokens = super::encode_tokens_optimal(&input, 0, input.len(), &matches, &prices);
+    let tokens = super::encode_tokens_optimal(&input, 0, input.len(), &matches, &prices, [0; 4]);
     let mut decoded = Vec::new();
     for token in &tokens {
         match *token {

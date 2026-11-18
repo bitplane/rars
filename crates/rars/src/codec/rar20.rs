@@ -1,7 +1,9 @@
 #[cfg(feature = "write")]
 mod encoder;
 #[cfg(feature = "write")]
-pub(crate) use encoder::unpack20_encode_auto_with_options_and_progress;
+pub(crate) use encoder::{
+    block_workspace, unpack20_encode_auto_with_options_and_progress, unpack20_encode_streamed,
+};
 #[cfg(feature = "write")]
 pub use encoder::{
     unpack20_encode_auto, unpack20_encode_auto_with_options, unpack20_encode_literals,
