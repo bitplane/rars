@@ -3443,6 +3443,11 @@ const MAX_SHORT_SIZE: u64 = u32::MAX as u64;
 /// RAR 3.0 onwards gives a 2.9-format member past this the high size fields, zero until 4 GiB.
 const RAR29_LARGE_FROM: u64 = 1 << 31;
 
+/// A short unpacked size of all ones reads as unknown to unrar, which then
+/// fails a compressed member of exactly that size on its checksum. RAR 2.0
+/// gives such a member the high size fields, zero, so the size reads as given.
+const RAR20_LARGE_FROM: u64 = u32::MAX as u64;
+
 /// The format spec gives RAR 2.0 members past this UNP_VER 26; RAR 2.9 members keep 29.
 const MAX_RAR20_SIZE: u64 = i32::MAX as u64;
 
@@ -3494,6 +3499,7 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
     let large = record.packed_size > MAX_SHORT_SIZE
         || record.unpacked_size > MAX_SHORT_SIZE
+        || (record.target == ArchiveVersion::Rar20 && record.unpacked_size >= RAR20_LARGE_FROM)
         || (matches!(
             record.target,
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
@@ -4746,6 +4752,17 @@ mod tests {
         }
         assert!(charge(ArchiveVersion::Rar15, 3) >= 12 * size);
         assert!(charge(ArchiveVersion::Rar29, 5) < 50 * size);
+    }
+
+    #[test]
+    fn a_rar20_member_of_all_ones_bytes_gives_its_size_in_full() {
+        let large = |header: &[u8]| u16::from_le_bytes([header[3], header[4]]) & 0x100 != 0;
+        let short = file_header_of_size(ArchiveVersion::Rar20, u64::from(u32::MAX) - 1, None);
+        assert!(!large(&short));
+        let header = file_header_of_size(ArchiveVersion::Rar20, u64::from(u32::MAX), None);
+        assert!(large(&header));
+        assert_eq!(header[7..11], [0xff; 4]);
+        assert_eq!(header[32..40], [0; 8]);
     }
 
     #[test]
