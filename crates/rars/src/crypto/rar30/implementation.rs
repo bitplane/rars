@@ -194,22 +194,31 @@ fn derive_key_iv_fast(raw: &[u8]) -> ([u8; 16], [u8; 16]) {
 mod tests {
     use super::*;
 
+    /// Key and IV for the longest password the reference tools keep, all of
+    /// it supplementary characters, salted with `longsalt`. Each derivation of
+    /// it takes most of a second, so the tests share the answer instead of
+    /// deriving it again to compare against.
+    const MAXIMUM_PASSWORD_KEY_IV: ([u8; 16], [u8; 16]) = (
+        [
+            0x73, 0xb0, 0xc0, 0x1f, 0x35, 0xff, 0x15, 0xca, 0xd9, 0xae, 0xbf, 0x9f, 0xca, 0xa6,
+            0x6e, 0xa8,
+        ],
+        [
+            0x44, 0xd9, 0x4e, 0x6c, 0xa0, 0xfe, 0xfe, 0x85, 0xc9, 0xfa, 0xe7, 0x4f, 0x19, 0x41,
+            0x43, 0xc0,
+        ],
+    );
+
     #[test]
     fn maximum_supplementary_unicode_password_fits_bounded_kdf_scratch() {
-        let password = "🙂".repeat(crate::crypto::MAX_PASSWORD_CHARS);
-        let longer = format!("{password}🙂");
-        let mut exact = *b"0123456789abcdef";
-        let mut clamped = exact;
-        let salt = Some(*b"longsalt");
-        Rar30Cipher::new(password.as_bytes(), salt)
-            .unwrap()
-            .encrypt_in_place(&mut exact)
-            .unwrap();
-        Rar30Cipher::new(longer.as_bytes(), salt)
-            .unwrap()
-            .encrypt_in_place(&mut clamped)
-            .unwrap();
-        assert_eq!(exact, clamped);
+        // One character over is clamped back to the longest password, so it
+        // has to fill the bounded scratch and come out with that password's
+        // key, which `kdf_keys_and_ivs_match_known_vectors` pins.
+        let longer = "🙂".repeat(crate::crypto::MAX_PASSWORD_CHARS + 1);
+        assert_eq!(
+            derive_key_iv(longer.as_bytes(), Some(*b"longsalt")).unwrap(),
+            MAXIMUM_PASSWORD_KEY_IV
+        );
     }
 
     fn raw_kdf_material(password: &[u8], salt: Option<[u8; 8]>) -> Vec<u8> {
@@ -362,14 +371,8 @@ mod tests {
             (
                 max.as_bytes(),
                 Some(*b"longsalt"),
-                [
-                    0x73, 0xb0, 0xc0, 0x1f, 0x35, 0xff, 0x15, 0xca, 0xd9, 0xae, 0xbf, 0x9f, 0xca,
-                    0xa6, 0x6e, 0xa8,
-                ],
-                [
-                    0x44, 0xd9, 0x4e, 0x6c, 0xa0, 0xfe, 0xfe, 0x85, 0xc9, 0xfa, 0xe7, 0x4f, 0x19,
-                    0x41, 0x43, 0xc0,
-                ],
+                MAXIMUM_PASSWORD_KEY_IV.0,
+                MAXIMUM_PASSWORD_KEY_IV.1,
             ),
         ];
         for (password, salt, key, iv) in cases {

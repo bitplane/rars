@@ -14,6 +14,29 @@ pub fn sized_for_payload<T, E: std::fmt::Display>(
     write(size)
 }
 
+/// `sized_for_payload` for a legacy member too long to search with.
+///
+/// The search ends by writing the member at the smallest size it accepts, cut
+/// into one-byte volumes, and with encrypted headers every volume pays for its
+/// own key derivations: in the slowest tests that one write was most of the
+/// run. Legacy volumes repeat the same headers around every slice and no
+/// header field grows with the member, so `probe`, writing the same member
+/// with one byte of data, has the same smallest size and far less to cut up.
+/// The full member is still asked about the size just below, which it refuses
+/// at its first volume, so its volumes cannot carry more than `payload`.
+pub fn sized_for_payload_probed<P, T, F: std::fmt::Display, E: std::fmt::Display>(
+    payload: usize,
+    probe: impl FnMut(usize) -> Result<P, F>,
+    mut write: impl FnMut(usize) -> Result<T, E>,
+) -> Result<T, E> {
+    let smallest = smallest_volume_size(probe);
+    assert!(
+        matches!(write(smallest - 1), Err(error) if error.to_string().contains("too small")),
+        "the full member fits a volume smaller than its one-byte probe needs"
+    );
+    write(smallest + payload - 1)
+}
+
 /// The smallest volume size `write` does not refuse as too small for its
 /// headers. Any other outcome, success or a different error, counts as
 /// accepted, so a writer that refuses for another reason still reports it.
