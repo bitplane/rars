@@ -280,7 +280,7 @@ pub(crate) fn write_archive_with_retained_metadata(
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
-    output: &mut dyn Write,
+    output: ArchiveOutput<'_>,
 ) -> Result<()> {
     // Builder validates retained records at their setters and constructs each
     // file with its metadata, so neither record validity nor array length can
@@ -307,7 +307,7 @@ pub(crate) fn write_archive_with_retained_metadata(
         archive_comment,
         resources,
         progress,
-        ArchiveOutput::Stream(output),
+        output,
         header_password,
         archive_comment_password,
     )
@@ -449,16 +449,25 @@ fn write_seekable_archive_with_threshold(
     )
 }
 
-trait SeekWrite: Write + Seek {}
+pub(crate) trait SeekWrite: Write + Seek {}
 
 impl<T: Write + Seek + ?Sized> SeekWrite for T {}
 
-enum ArchiveOutput<'a> {
+pub(crate) enum ArchiveOutput<'a> {
     Stream(&'a mut dyn Write),
     Seekable {
         output: &'a mut dyn SeekWrite,
         stream_above: u64,
     },
+}
+
+impl<'a> ArchiveOutput<'a> {
+    pub(crate) fn seekable(output: &'a mut dyn SeekWrite) -> Self {
+        Self::Seekable {
+            output,
+            stream_above: STREAM_MEMBERS_ABOVE,
+        }
+    }
 }
 
 /// The archive output with cancellation checked on every write.
