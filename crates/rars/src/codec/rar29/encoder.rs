@@ -1004,6 +1004,7 @@ fn encode_member_blocks(
 pub(crate) type SegmentFilters<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<crate::FilterSpec>>;
 
 /// The bytes of [`unpack29_encode_literals_with_options`], or with `filters` of [`Unpack29Encoder::encode_member_with_filters`], without holding the member.
+#[cfg(test)]
 pub(crate) fn unpack29_encode_literals_streamed(
     input: &mut dyn Read,
     len: usize,
@@ -1012,53 +1013,7 @@ pub(crate) fn unpack29_encode_literals_streamed(
     progress: &mut dyn FnMut(usize) -> bool,
     out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
-    let mut options = options.constrained();
-    if let Some(choose) = filters {
-        let block_size = filtered_block_size(options, len);
-        options.block_size = None;
-        let window = options.max_match_distance.max(1);
-        let (mut levels, mut programs) = ([0; TABLE_COUNT], Vec::new());
-        return for_each_block(
-            &mut ReadSegments {
-                input,
-                len,
-                window: Vec::new(),
-                filters: Some(choose),
-            },
-            options,
-            block_size,
-            Some(progress),
-            |base, end, tokens, records| {
-                let records = block_filter_records(records, base, end, window, &mut programs)?;
-                out(&code_block(tokens, &records, end < len, &mut levels)?)
-            },
-        );
-    }
-    let Some(block_size) = options.block_size.filter(|&size| size != 0 && len > size) else {
-        // A single block parses against a smaller finder, so it is read whole to match.
-        let mut data = Vec::with_capacity(len);
-        input.take(len as u64).read_to_end(&mut data)?;
-        if data.len() != len {
-            return Err(Error::NeedMoreInput);
-        }
-        return out(&unpack29_encode_literals_with_options_and_progress(
-            &data, options, progress,
-        )?);
-    };
-    options.block_size = None;
-    let mut levels = [0; TABLE_COUNT];
-    for_each_block(
-        &mut ReadSegments {
-            input,
-            len,
-            window: Vec::new(),
-            filters: None,
-        },
-        options,
-        block_size,
-        Some(progress),
-        |_, end, tokens, _| out(&code_block(tokens, &[], end < len, &mut levels)?),
-    )
+    Unpack29Encoder::with_options(options).encode_lz_streamed(input, len, filters, progress, out)
 }
 
 /// The least a streamed PPMd member codes between reads; it codes four reaches when that is more.
@@ -1069,6 +1024,7 @@ const PPMD_STREAM_LOOKAHEAD: usize = PpmdMatchSearch::MAX_BATCH + MAX_PPMD_REPEA
 /// The bytes of [`unpack29_encode_ppmd_with_progress`] without holding the member; `out` breaks to abandon it.
 ///
 /// `escapes` is the distance LZ escapes reach back, or `None` for literals only.
+#[cfg(test)]
 pub(crate) fn unpack29_encode_ppmd_streamed(
     input: &mut dyn Read,
     len: usize,
@@ -1076,18 +1032,137 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
     progress: &mut dyn FnMut(usize) -> bool,
     out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
+    encode_ppmd_streamed(input, len, escapes, None, None, progress, out).map(|(flow, _)| flow)
+}
+
+impl Unpack29Encoder {
+    /// [`Self::encode_member_with_engine`]'s LZ side read as it is coded; a break leaves the chain as it was.
+    pub(crate) fn encode_lz_streamed(
+        &mut self,
+        input: &mut dyn Read,
+        len: usize,
+        filters: Option<SegmentFilters<'_>>,
+        progress: &mut dyn FnMut(usize) -> bool,
+        out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    ) -> Result<ControlFlow<()>> {
+        let mut options = self.options;
+        let mut levels = self.levels;
+        let filtering = filters.is_some();
+        let block_size = if filtering {
+            filtered_block_size(options, len)
+        } else if let Some(size) = options.block_size.filter(|&size| size != 0 && len > size) {
+            size
+        } else {
+            // A single block parses against a smaller finder, so it is read whole to match.
+            let mut data = Vec::with_capacity(len);
+            input.take(len as u64).read_to_end(&mut data)?;
+            if data.len() != len {
+                return Err(Error::NeedMoreInput);
+            }
+            let packed = encode_member_with_options_impl(
+                &data,
+                &self.history,
+                options,
+                &mut levels,
+                Some(progress),
+            )?;
+            let flow = out(&packed)?;
+            if flow.is_continue() {
+                self.levels = levels;
+                self.remember(&data);
+            }
+            return Ok(flow);
+        };
+        options.block_size = None;
+        let window = options.max_match_distance.max(1);
+        let reach = options.max_match_distance.min(MAX_HISTORY);
+        let mut segments = ReadSegments {
+            input,
+            len,
+            window: self.history[self.history.len().saturating_sub(reach)..].to_vec(),
+            filters,
+        };
+        let mut programs = Vec::new();
+        let flow = for_each_block(
+            &mut segments,
+            options,
+            block_size,
+            Some(progress),
+            |base, end, tokens, records| {
+                let records = match filtering {
+                    true => block_filter_records(records, base, end, window, &mut programs)?,
+                    false => Vec::new(),
+                };
+                out(&code_block(tokens, &records, end < len, &mut levels)?)
+            },
+        )?;
+        if flow.is_continue() {
+            // Every parse reads one reach of history, which the window still holds.
+            let mut history = segments.window;
+            history.drain(..history.len().saturating_sub(reach));
+            self.history = history;
+            self.levels = levels;
+        }
+        Ok(flow)
+    }
+
+    /// [`Self::encode_member_with_engine`]'s PPMd side read as it is coded; a break leaves a chain to discard.
+    pub(crate) fn encode_ppmd_streamed(
+        &mut self,
+        input: &mut dyn Read,
+        len: usize,
+        escapes: Option<usize>,
+        progress: &mut dyn FnMut(usize) -> bool,
+        out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+    ) -> Result<ControlFlow<()>> {
+        // Taken rather than copied: after a break the caller starts a new chain.
+        let mut history = std::mem::take(&mut self.history);
+        let (flow, model) = encode_ppmd_streamed(
+            input,
+            len,
+            escapes,
+            self.ppmd.clone(),
+            Some(&mut history),
+            progress,
+            out,
+        )?;
+        self.history = history;
+        if let Some(model) = model {
+            self.ppmd = Some(model);
+        }
+        Ok(flow)
+    }
+}
+
+/// `history`, when given, is left holding the last [`MAX_HISTORY`] bytes read after it.
+fn encode_ppmd_streamed(
+    input: &mut dyn Read,
+    len: usize,
+    escapes: Option<usize>,
+    model: Option<PpmdDecoder>,
+    mut history: Option<&mut Vec<u8>>,
+    progress: &mut dyn FnMut(usize) -> bool,
+    out: &mut dyn FnMut(&[u8]) -> Result<ControlFlow<()>>,
+) -> Result<(ControlFlow<()>, Option<PpmdDecoder>)> {
     if !progress(0) {
         return Err(Error::Cancelled);
     }
-    if out(&[
-        0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
-        PPMD_DICTIONARY_MB - 1,
-    ])?
-    .is_break()
-    {
-        return Ok(ControlFlow::Break(()));
+    let (mut encoder, head) = match model {
+        Some(model) => (
+            PpmdEncoder::continuing(model, PPMD_ESC),
+            vec![0x80 | ((PPMD_ORDER as u8) - 1)],
+        ),
+        None => (
+            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?,
+            vec![
+                0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+                PPMD_DICTIONARY_MB - 1,
+            ],
+        ),
+    };
+    if out(&head)?.is_break() {
+        return Ok((ControlFlow::Break(()), None));
     }
-    let mut encoder = PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?;
     let reach = escapes.map_or(0, |distance| len.min(distance).min(MAX_HISTORY));
     let mut state = PpmdHybrid::new();
     let mut window = Vec::new();
@@ -1107,6 +1182,10 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
         let have = window.len();
         window.resize(want.max(have), 0);
         input.read_exact(&mut window[have..])?;
+        if let Some(history) = history.as_deref_mut() {
+            history.extend_from_slice(&window[have..]);
+            history.drain(..history.len().saturating_sub(MAX_HISTORY));
+        }
         if let Some(distance) = escapes {
             let mut report = |local: usize| progress(origin + local);
             pos = origin
@@ -1129,15 +1208,15 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
             pos = end;
         }
         if out(&encoder.take_output())?.is_break() {
-            return Ok(ControlFlow::Break(()));
+            return Ok((ControlFlow::Break(()), None));
         }
     }
-    let (packed, _) = encoder.finish_keeping_model()?;
+    let (packed, model) = encoder.finish_keeping_model()?;
     let flow = out(&packed)?;
     if !progress(len) {
         return Err(Error::Cancelled);
     }
-    Ok(flow)
+    Ok((flow, flow.is_continue().then_some(model)))
 }
 
 /// Where a block parse reads its member from, one segment at a time.
@@ -1216,7 +1295,7 @@ impl Segments for InMemory<'_> {
     }
 }
 
-/// Keeps the last reach of what it has read, filtered as a decoder's window holds it.
+/// Keeps the last reach of what it has read, filtered as a decoder's window holds it, after any history it starts with.
 struct ReadSegments<'a, 'f> {
     input: &'a mut dyn Read,
     len: usize,
@@ -1232,16 +1311,18 @@ impl Segments for ReadSegments<'_, '_> {
     fn segment(
         &mut self,
         start: usize,
-        behind: usize,
+        _behind: usize,
         end: usize,
-        _reach: usize,
+        reach: usize,
     ) -> Result<Segment<'_>> {
-        self.window.drain(..self.window.len() - behind);
-        self.window.resize(behind + end - start, 0);
-        self.input.read_exact(&mut self.window[behind..])?;
+        // A chain member starts with the reach before it already in the window.
+        self.window.drain(..self.window.len().saturating_sub(reach));
+        let kept = self.window.len();
+        self.window.resize(kept + end - start, 0);
+        self.input.read_exact(&mut self.window[kept..])?;
         let mut records = Vec::new();
         if let Some(choose) = self.filters.as_mut() {
-            let fresh = &mut self.window[behind..];
+            let fresh = &mut self.window[kept..];
             let mut split = Vec::new();
             for filter in choose(fresh)? {
                 let range = checked_filter_range(fresh.len(), &filter)?;
