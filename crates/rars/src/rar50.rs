@@ -75,6 +75,7 @@ const MHEXTRA_LOCATOR_RECOVERY: u64 = 0x0002;
 const FHEXTRA_CRYPT: u64 = 0x01;
 const FHEXTRA_HASH: u64 = 0x02;
 const FHEXTRA_HTIME: u64 = 0x03;
+const FHEXTRA_VERSION: u64 = 0x04;
 const FHEXTRA_REDIR: u64 = 0x05;
 const FHEXTRA_SUBDATA: u64 = 0x07;
 const MHEXTRA_ARCHIVE_METADATA: u64 = 0x02;
@@ -1569,6 +1570,30 @@ fn parse_file_extra_area(
                 file.htime_mtime = parsed.map(|(seconds, _)| seconds);
                 file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
             }
+            FHEXTRA_VERSION => {
+                // RAR 5 file versioning: the record carries a flags vint
+                // (no flags are defined) then the version-number vint.
+                // Adopt the record by appending ";N" to the member name;
+                // the newest version has no record at all. Version 0 is
+                // "no version" and gets no suffix either. Service blocks
+                // never carry versions, so those names must stay untouched.
+                // Reference readers do not fail an archive over a record
+                // they cannot read, so a short record counts as version 0.
+                let flags_len = read_vint_at(input, data.start, data.end)
+                    .map(|(_, len)| len)
+                    .unwrap_or_default();
+                let version = read_vint_at(input, data.start + flags_len, data.end)
+                    .map(|(version, _)| version)
+                    .unwrap_or_default();
+                if !is_service && version != 0 {
+                    file.name
+                        .extend_from_slice(format!(";{version}").as_bytes());
+                }
+                // The in-memory name no longer matches the stored header
+                // bytes, and the writer does not re-emit this record, so a
+                // rewrite could not reproduce the archive faithfully.
+                file.rewrite_metadata_complete = false;
+            }
             FHEXTRA_SUBDATA => {
                 file.rewrite_metadata_complete &=
                     is_service && (data.is_empty() || file.name == b"RR");
@@ -3003,6 +3028,50 @@ mod tests {
         for payload in [vec![], vec![0x80], vec![3, 1], vec![0x23, 1, 0, 0, 0]] {
             let file = parse(FHEXTRA_HTIME as u8, &payload, false, b"file", None);
             assert!(file.file_times.is_none());
+            assert!(!file.rewrite_metadata_complete);
+        }
+        // RAR 5 file-version records append ";N" to regular member names;
+        // service names stay untouched and the in-memory name no longer matches
+        // the stored header bytes, so rewrites refuse to touch these members.
+        for (flags, version) in [(0u8, 1u8), (0, 2)] {
+            let file = parse(
+                FHEXTRA_VERSION as u8,
+                &[flags, version],
+                false,
+                b"f.txt",
+                None,
+            );
+            assert_eq!(file.name, format!("f.txt;{version}").into_bytes());
+            assert!(!file.rewrite_metadata_complete);
+        }
+        assert_eq!(
+            parse(FHEXTRA_VERSION as u8, &[0, 1], true, b"CMT", None).name,
+            b"CMT"
+        );
+        // A version of 0 reads as "no version" and gets no suffix.
+        {
+            let file = parse(FHEXTRA_VERSION as u8, &[0, 0], false, b"f.txt", None);
+            assert_eq!(file.name, b"f.txt");
+            assert!(!file.rewrite_metadata_complete);
+        }
+        // A version record too short to parse (empty, or flags without the
+        // version number) reads as version 0 instead of failing to open.
+        for payload in [vec![], vec![0]] {
+            let file = parse(FHEXTRA_VERSION as u8, &payload, false, b"f.txt", None);
+            assert_eq!(file.name, b"f.txt");
+            assert!(!file.rewrite_metadata_complete);
+        }
+        // A version needing more than one vint byte exercises the flags
+        // offset arithmetic before the version number.
+        {
+            let file = parse(
+                FHEXTRA_VERSION as u8,
+                &[0, 0xd0, 0x0f],
+                false,
+                b"f.txt",
+                None,
+            );
+            assert_eq!(file.name, b"f.txt;2000");
             assert!(!file.rewrite_metadata_complete);
         }
         let mut no_extras = original.clone();
