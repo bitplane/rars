@@ -380,7 +380,7 @@ export function createApi(runtime) {
     }
     if (options.encryptHeaders) {
       if (options.password == null) throw invalid("encryptHeaders needs a password");
-      if (!["rar30", "rar40", "rar50", "rar70"].includes(version)) {
+      if (!["rar29", "rar30", "rar40", "rar50", "rar70"].includes(version)) {
         throw invalid(`${version} cannot write header encryption`);
       }
     }
@@ -389,7 +389,9 @@ export function createApi(runtime) {
         throw new TypeError("volumeSize must be a safe integer");
       }
       if (options.volumeSize <= 0) throw invalid("volumeSize must be more than 0");
-      if (options.comment != null) throw invalid(`${version} cannot write an archive comment in a volume set`);
+      if (options.comment != null && !["rar29", "rar30", "rar40"].includes(version)) {
+        throw invalid(`${version} cannot write an archive comment in a volume set`);
+      }
     }
     if (options.maxMemoryBytes != null && !modern) {
       throw invalid(`${version} cannot write to a memory limit; only rar50 and rar70 can`);

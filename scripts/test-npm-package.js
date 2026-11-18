@@ -119,6 +119,22 @@ await check("passwords, comments and structured errors work", async () => {
   assert.deepEqual(await archive.get("secret.txt").bytes(), HELLO);
 });
 
+await check("rar29 writes a comment in an encrypted volume set", async () => {
+  const big = new Uint8Array(20 * 1024).map((_, index) => (index * 7919) % 251);
+  const parts = await new RarWriter({
+    version: "rar29",
+    level: 0,
+    password: "hunter2",
+    encryptHeaders: true,
+    comment: "volume note",
+    volumeSize: 4096,
+  }).add("big.bin", big).volumes();
+  assert.ok(parts.length > 1);
+  const archive = await RarArchive.open(parts, { password: "hunter2" });
+  assert.equal(decode(archive.comment), "volume note");
+  assert.deepEqual(await archive.get("big.bin").bytes(), big);
+});
+
 await check("volume sets are logical archives", async () => {
   const payload = new Uint8Array(300000).fill(7);
   const writer = new RarWriter({ version: "rar50", level: 0, volumeSize: 64 * 1024 });

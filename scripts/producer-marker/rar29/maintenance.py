@@ -32,7 +32,8 @@ def main():
         marked = path.parent.name == "marked"
         assert sum(r["name"] == b"RARS" for r in records) == int(marked)
         if marked:
-            index = 2 if records[1]["kind"] == 0x75 else 1
+            leads = records[1]["kind"] == 0x75 or records[1]["name"] == b"CMT"
+            index = 2 if leads else 1
             assert records[index]["name"] == b"RARS"
         evidence["framing"].append(str(path.relative_to(matrix)))
     for engine in json.loads(args.engines.read_text()):

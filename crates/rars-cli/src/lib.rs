@@ -1590,6 +1590,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 password: password_bytes(&password),
                 solid,
                 header_encryption,
+                archive_comment: archive_comment.as_deref(),
                 file_comment: file_comment.as_deref(),
                 volume_size,
                 compress,
@@ -1781,6 +1782,7 @@ struct LegacyVolumeWrite<'a> {
     password: Option<&'a [u8]>,
     solid: bool,
     header_encryption: bool,
+    archive_comment: Option<&'a [u8]>,
     file_comment: Option<&'a [u8]>,
     volume_size: usize,
     compress: bool,
@@ -1901,10 +1903,11 @@ fn write_rar15_legacy_volumes(
         total,
     );
     plan.write_rar15_volumes(progress, |options, sink| {
-        rars::rar15_40::write_volumes_to(
+        rars::rar15_40::write_volumes_with_comment_to(
             &entries,
             options,
             coding,
+            plan.archive_comment,
             plan.volume_size,
             sink,
             &rars::WriterResources::default(),

@@ -45,8 +45,6 @@ pub use extract::extract_volumes_to;
 pub(crate) use extract::{extract_from_feed, extract_volumes_with_links};
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
-pub(crate) use write::write_stored_volumes_with_progress;
-#[cfg(feature = "write")]
 pub(crate) use write::{legacy_volume_payload, render_legacy_volumes};
 #[cfg(feature = "write")]
 pub(crate) use write::{
@@ -61,6 +59,11 @@ pub use write::{
     write_rar29_compressed_archive_with_filter_policy_and_progress, write_seekable_archive_to,
     write_stored_archive, write_stored_archive_with_comment, write_stored_volumes,
     write_stored_volumes_to, write_streaming_archive_to, write_volumes_to,
+    write_volumes_with_comment_to,
+};
+#[cfg(feature = "write")]
+pub(crate) use write::{
+    write_compressed_volumes_with_comment_and_progress, write_stored_volumes_with_progress,
 };
 
 const MARK_HEAD: u8 = 0x72;
@@ -1103,31 +1106,37 @@ impl Archive {
     /// The highest format requirement present in this container, not its creator release.
     #[cfg(feature = "write")]
     pub(crate) fn preservation_version(&self) -> ArchiveVersion {
+        let comment = self
+            .new_subs()
+            .find(|sub| sub.kind == NewSubKind::ArchiveComment);
+        let has_encrypted_headers = self.main.has_encrypted_headers();
+        // Only Rar30/Rar40 take a comment password; Rar29 encrypts a comment only with the headers.
+        if !has_encrypted_headers && comment.is_some_and(|sub| sub.file.is_encrypted()) {
+            return ArchiveVersion::Rar30;
+        }
         // Producer records declare their own minimum unpacker version.
-        if self.main.has_encrypted_headers()
-            || self
-                .new_subs()
-                .any(|sub| sub.kind == NewSubKind::ArchiveComment)
-        {
-            ArchiveVersion::Rar30
+        let producer_version = self
+            .new_subs()
+            .filter(|sub| sub.file.name == crate::producer::NAME)
+            .map(|sub| sub.file.unp_ver)
+            .max()
+            .unwrap_or(15);
+        let floor = if has_encrypted_headers || comment.is_some() {
+            29
         } else {
-            let producer_version = self
-                .new_subs()
-                .filter(|sub| sub.file.name == crate::producer::NAME)
-                .map(|sub| sub.file.unp_ver)
-                .max()
-                .unwrap_or(15);
-            match self
-                .files()
-                .map(|file| file.unp_ver)
-                .max()
-                .unwrap_or(15)
-                .max(producer_version)
-            {
-                29.. => ArchiveVersion::Rar29,
-                20..=28 => ArchiveVersion::Rar20,
-                _ => ArchiveVersion::Rar15,
-            }
+            15
+        };
+        match self
+            .files()
+            .map(|file| file.unp_ver)
+            .max()
+            .unwrap_or(15)
+            .max(producer_version)
+            .max(floor)
+        {
+            29.. => ArchiveVersion::Rar29,
+            20..=28 => ArchiveVersion::Rar20,
+            _ => ArchiveVersion::Rar15,
         }
     }
 

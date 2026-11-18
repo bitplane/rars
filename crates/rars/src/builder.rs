@@ -1824,6 +1824,12 @@ impl Builder {
     ) -> Result<Vec<Vec<u8>>> {
         let entry = self.single_volume_entry()?;
         let options = self.rar15_options();
+        if self.comment_password.is_some() {
+            return Err(Error::InvalidArgument(
+                "encrypted legacy archive comments are unsupported in volume output",
+            ));
+        }
+        let comment = self.comment.as_deref();
         if self.store {
             rar15_40::write_stored_volumes_with_progress(
                 rar15_40::StoredEntry {
@@ -1836,11 +1842,12 @@ impl Builder {
                     file_comment: entry.file_comment.as_deref(),
                 },
                 options,
+                comment,
                 volume_size,
                 progress,
             )
         } else {
-            rar15_40::write_compressed_volumes_with_progress(
+            rar15_40::write_compressed_volumes_with_comment_and_progress(
                 rar15_40::FileEntry {
                     name: &entry.name,
                     data: &entry.data,
@@ -1851,6 +1858,7 @@ impl Builder {
                     file_comment: entry.file_comment.as_deref(),
                 },
                 options,
+                comment,
                 volume_size,
                 progress,
             )

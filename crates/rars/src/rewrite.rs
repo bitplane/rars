@@ -316,12 +316,12 @@ impl Archive {
                     )
                     .solid(archive.main.is_solid())
                     // Preflight accepts one producer and at most one CMT record.
+                    // Rar29 encrypts its comment with the headers rather than by a password of its own.
                     .archive_comment_password(
-                        archive
-                            .new_subs()
-                            .any(|sub| sub.file.is_encrypted())
-                            .then(|| password.clone())
-                            .flatten(),
+                        (version != crate::ArchiveVersion::Rar29
+                            && archive.new_subs().any(|sub| sub.file.is_encrypted()))
+                        .then(|| password.clone())
+                        .flatten(),
                     )
                     .password(password)
                     .header_encryption(archive.main.has_encrypted_headers())

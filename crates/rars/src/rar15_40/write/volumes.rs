@@ -22,6 +22,7 @@ pub fn write_stored_volumes_to(
         &[member],
         options,
         &MemberCoding::Stored,
+        None,
         volume_size,
         sink,
         resources,
@@ -39,11 +40,11 @@ pub fn write_volumes_to(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<()> {
-    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
-    split_members(
-        &members,
+    write_volumes_with_comment_to(
+        entries,
         options,
-        &coding,
+        coding,
+        None,
         volume_size,
         sink,
         resources,
@@ -51,10 +52,37 @@ pub fn write_volumes_to(
     )
 }
 
+/// The comment goes in the first volume only, as RAR writes it.
+#[allow(clippy::too_many_arguments)]
+pub fn write_volumes_with_comment_to(
+    entries: &[StreamingEntry],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
+    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
+    split_members(
+        &members,
+        options,
+        &coding,
+        archive_comment,
+        volume_size,
+        sink,
+        resources,
+        progress,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn split_members(
     members: &[Member<'_>],
     mut options: WriterOptions,
     coding: &MemberCoding,
+    archive_comment: Option<&[u8]>,
     volume_size: usize,
     sink: &mut dyn VolumeSink,
     resources: &WriterResources,
@@ -64,7 +92,12 @@ pub(super) fn split_members(
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = ProgressReporter(&control);
     crate::write_progress::check_cancelled(Some(progress))?;
-    validate_plan(options, coding.shape().volumes(true), false, false)?;
+    validate_plan(
+        options,
+        coding.shape().volumes(true),
+        archive_comment.is_some(),
+        false,
+    )?;
     if let MemberCoding::Filtered(policy) = coding {
         validate_rar29_filter_policy(policy, options.method)?;
     }
@@ -249,11 +282,19 @@ pub(super) fn split_members(
                 })?;
                 let _ = header_key.set(key);
             }
+            let comment = encode_archive_comment(
+                archive_comment,
+                options,
+                header_key.get(),
+                header_comment_password(options.target, header_password),
+                &mut DataKeys::default(),
+            )?;
             let mut opened = VolumePacker::new(
                 sink.take().expect("the packer opens once"),
                 volume_size as u64,
                 options.target,
                 if solid { MHD_SOLID } else { 0 },
+                comment,
                 header_key.get(),
                 progress,
             )?;
@@ -399,6 +440,8 @@ struct VolumePacker<'a> {
     target: ArchiveVersion,
     /// Flags beyond the volume ones every main header carries, such as solid.
     main_flags: u16,
+    /// Built once, so every look at the first volume's head sees the same salt.
+    comment: Vec<u8>,
     header_key: Option<&'a HeaderKey>,
     progress: ProgressReporter<'a>,
     tail_len: u64,
@@ -423,6 +466,7 @@ impl<'a> VolumePacker<'a> {
         volume_size: u64,
         target: ArchiveVersion,
         main_flags: u16,
+        comment: Vec<u8>,
         header_key: Option<&'a HeaderKey>,
         progress: ProgressReporter<'a>,
     ) -> Result<Self> {
@@ -431,6 +475,7 @@ impl<'a> VolumePacker<'a> {
             volume_size,
             target,
             main_flags,
+            comment,
             header_key,
             progress,
             tail_len: 0,
@@ -573,7 +618,13 @@ impl<'a> VolumePacker<'a> {
         write_main_header(&mut head, main_flags);
         // Later volumes carry it in their tail instead: see `tail`.
         if index == 0 {
-            write_producer(&mut head, self.target, self.header_key, Some(self.progress))?;
+            write_lead(
+                &mut head,
+                self.target,
+                &self.comment,
+                self.header_key,
+                Some(self.progress),
+            )?;
         }
         Ok(head)
     }

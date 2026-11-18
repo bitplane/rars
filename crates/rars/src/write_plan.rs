@@ -143,7 +143,8 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         WriterOption::Feature(Feature::Solid) => shape.compressed,
         WriterOption::Feature(Feature::HeaderEncryption) => matches!(
             target,
-            ArchiveVersion::Rar30
+            ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
                 | ArchiveVersion::Rar50
                 | ArchiveVersion::Rar70
@@ -180,10 +181,15 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
             cfg!(feature = "recovery") && family == ArchiveFamily::Rar50Plus
         }
         WriterOption::VolumeSize => true,
-        // No volume writer carries a comment: the legacy one emits the split
-        // member and nothing else, and the RAR 5 one refuses comments outright
-        // because a volume set has no single place to put one.
-        WriterOption::ArchiveComment => !shape.volumes,
+        // A CMT block goes in the first volume. An old-style comment has no
+        // volume layout here, and the RAR 5 volume writer refuses comments.
+        WriterOption::ArchiveComment => {
+            !shape.volumes
+                || matches!(
+                    target,
+                    ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+                )
+        }
         // Embedded legacy file comments and RAR5 service comments are supported
         // for single archives; volume writers cannot retain their association.
         WriterOption::FileComment => !shape.volumes,

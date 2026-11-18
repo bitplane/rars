@@ -34,9 +34,6 @@ fn encrypted_legacy_volumes_preserve_non_utf8_password_failure_context() {
         ArchiveVersion::Rar40,
     ] {
         for header_encryption in [false, true] {
-            if format == ArchiveVersion::Rar29 && header_encryption {
-                continue;
-            }
             let mut features = FeatureSet::store_only();
             features.header_encryption = header_encryption;
             let entry = rar15_40::FileEntry {

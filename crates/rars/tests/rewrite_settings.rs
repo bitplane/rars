@@ -172,6 +172,66 @@ fn preserving_builder_keeps_rar20_unpacker_26() {
     assert_eq!(output.read_member_at(0, None).unwrap().unwrap(), payload);
 }
 
+#[cfg(feature = "encryption")]
+#[test]
+fn rar29_comment_and_header_encryption_rewrite_as_rar29() {
+    for header_encryption in [false, true] {
+        let password = header_encryption.then(|| b"secret".to_vec());
+        let mut builder = Builder::new(ArchiveVersion::Rar29)
+            .store(true)
+            .password(password.clone())
+            .header_encryption(header_encryption)
+            .comment(Some(b"archive note".to_vec()));
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        let source = ArchiveReader::read_owned_with_options(
+            builder.to_bytes().unwrap(),
+            rars::ArchiveReadOptions::with_optional_password(password.as_deref()),
+        )
+        .unwrap();
+        assert!(source.rewrite_preservation_issues().is_empty());
+
+        let mut preserving = source
+            .preserving_builder(password.as_deref())
+            .unwrap()
+            .comment(Some(b"archive note".to_vec()));
+        assert_eq!(
+            preserving.format(),
+            ArchiveVersion::Rar29,
+            "hp={header_encryption}"
+        );
+        preserving
+            .add_bytes(b"added".to_vec(), b"more".to_vec(), None, None)
+            .unwrap();
+        let output = ArchiveReader::read_owned_with_options(
+            preserving.to_bytes().unwrap(),
+            rars::ArchiveReadOptions::with_optional_password(password.as_deref()),
+        )
+        .unwrap();
+        let raw = output.as_rar15_40().unwrap();
+        let Some(rars::rar15_40::Block::NewSub(cmt)) = raw.blocks.first() else {
+            panic!(
+                "hp={header_encryption}: CMT must lead, found {:?}",
+                raw.blocks.first()
+            );
+        };
+        assert_eq!(cmt.file.name, b"CMT");
+        assert_eq!(cmt.file.salt.is_some(), header_encryption);
+        assert_eq!(
+            output.comment(password.as_deref()).unwrap(),
+            Some(b"archive note".to_vec())
+        );
+        assert_eq!(
+            output
+                .read_member(b"added", password.as_deref())
+                .unwrap()
+                .unwrap(),
+            b"more"
+        );
+    }
+}
+
 #[test]
 fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
     let mut builder = Builder::new(ArchiveVersion::Rar30)
@@ -190,7 +250,7 @@ fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
     assert!(matches!(
         preserving.to_bytes(),
         Err(rars::Error::InvalidArgument(
-            "retained archive comment metadata requires a RAR3/4 archive comment"
+            "retained archive comment metadata requires a CMT archive comment"
         ))
     ));
     let output = ArchiveReader::read_owned(
