@@ -197,6 +197,25 @@ def test_builder_writes_and_extracts_volumes(tmp_path):
     assert (out_dir / "large.txt").read_bytes() == b"0123456789" * 200
 
 
+def test_rar29_writes_a_comment_in_an_encrypted_volume_set(tmp_path):
+    payload = bytes((index * 7919) % 251 for index in range(20 * 1024))
+    builder = rars.RarBuilder(
+        version="rar29",
+        level=0,
+        password="hunter2",
+        encrypt_headers=True,
+        comment=b"volume note",
+        volume_size=4096,
+    )
+    builder.add_bytes(payload, "big.bin")
+    paths = builder.write(tmp_path / "archive.rar")
+
+    assert len(paths) > 1
+    with rars.RarFile(paths[0], password="hunter2") as archive:
+        assert archive.comment == b"volume note"
+        assert archive.read("big.bin", volumes=paths[1:]) == payload
+
+
 def test_builder_writes_volumes_from_added_paths(tmp_path):
     source = tmp_path / "large.txt"
     source.write_bytes(b"0123456789" * 200)
