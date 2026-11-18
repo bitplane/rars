@@ -281,6 +281,66 @@ mod tests {
     }
 
     #[test]
+    fn rar5_redirection_types_map_to_their_links_and_unknown_types_are_refused() {
+        let redirection = |redirection_type, flags| crate::rar50::FileRedirection {
+            redirection_type,
+            flags,
+            target_name: b"target".to_vec(),
+        };
+        let target = b"target".as_slice();
+        // Bit 0 of the flags marks a symbolic link to a directory.
+        for (kind, flags, expected) in [
+            (
+                1,
+                0,
+                ExtractedLink::Symlink {
+                    target,
+                    directory: false,
+                },
+            ),
+            (
+                2,
+                0,
+                ExtractedLink::Symlink {
+                    target,
+                    directory: false,
+                },
+            ),
+            (
+                2,
+                1,
+                ExtractedLink::Symlink {
+                    target,
+                    directory: true,
+                },
+            ),
+            (3, 0, ExtractedLink::Junction { target }),
+            (4, 0, ExtractedLink::HardLink { target }),
+            (5, 0, ExtractedLink::FileCopy { target }),
+        ] {
+            let record = redirection(kind, flags);
+            assert_eq!(
+                ExtractedLink::rar50(&record).unwrap(),
+                expected,
+                "type {kind}"
+            );
+        }
+        for kind in [0, 6, u64::MAX] {
+            let record = redirection(kind, 0);
+            assert!(
+                matches!(
+                    ExtractedLink::rar50(&record),
+                    Err(Error::UnsupportedFeature {
+                        feature: "RAR 5 unsupported file redirection type",
+                        ..
+                    })
+                ),
+                "type {kind}"
+            );
+        }
+    }
+
+    #[test]
     fn target_storage_refusals_and_late_cancellation_do_not_emit_links() {
         for cancel_after_decode in [false, true] {
             let allowance = RefusingBudget::new(if cancel_after_decode { usize::MAX } else { 0 });
