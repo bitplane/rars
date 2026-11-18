@@ -289,6 +289,24 @@ fn publish_no_replace(
     }
 }
 
+/// One atomic step that refuses an existing destination; on APFS a hard link costs about five renames.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn rename_no_replace(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use rustix::fs::{renameat_with, RenameFlags, CWD};
+    Ok(renameat_with(
+        CWD,
+        source,
+        CWD,
+        destination,
+        RenameFlags::NOREPLACE,
+    )?)
+}
+
+#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+fn rename_no_replace(_source: &Path, _destination: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
 /// Opens the destination itself, refusing a link or special file that writing would reach through.
 pub fn open_in_place(
     path: &Path,
@@ -378,17 +396,27 @@ fn publish_verified_output_with_rename(
     renames: &mut RenameCounters,
     mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
 ) -> crate::Result<PathBuf> {
-    let link = |to: &Path| {
+    // Ok(true) when the staged entry itself moved, leaving nothing to remove.
+    let publish = |to: &Path| -> std::io::Result<bool> {
+        // An archive hard link must share its earlier target's inode, so it still links.
+        if hardlink_target.is_none() {
+            match rename_no_replace(source, to) {
+                Ok(()) => return Ok(true),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(error)
+                }
+                // Unsupported platforms and filesystems, and cross-device moves.
+                Err(_) => {}
+            }
+        }
         publish_no_replace(source, to, |from, to| {
             fs::hard_link(hardlink_target.unwrap_or(from), to)
         })
+        .map(|()| false)
     };
-    let published = match overwrite {
-        OverwritePolicy::Never => {
-            link(destination)?;
-            destination.to_path_buf()
-        }
-        OverwritePolicy::Rename => renames.claim(destination, link)?.0,
+    let (published, moved) = match overwrite {
+        OverwritePolicy::Never => (destination.to_path_buf(), publish(destination)?),
+        OverwritePolicy::Rename => renames.claim(destination, publish)?,
         OverwritePolicy::Always => match rename(source, destination) {
             Ok(()) => return Ok(destination.to_path_buf()),
             Err(error) if error.kind() == std::io::ErrorKind::CrossesDevices => {
@@ -405,12 +433,14 @@ fn publish_verified_output_with_rename(
                     copy_verified_output(source, &local)?;
                 }
                 rename(&local, destination)?;
-                destination.to_path_buf()
+                (destination.to_path_buf(), false)
             }
             Err(error) => return Err(error.into()),
         },
     };
-    remove_staged_output(source)?;
+    if !moved {
+        remove_staged_output(source)?;
+    }
     Ok(published)
 }
 
@@ -485,6 +515,56 @@ mod tests {
                 .kind(),
             std::io::ErrorKind::AlreadyExists
         );
+        assert_eq!(fs::read(destination).unwrap(), b"verified bytes");
+    }
+
+    #[test]
+    fn no_replace_rename_moves_into_place_but_never_over_an_existing_entry() {
+        let root = scratch("no-replace-rename");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, b"verified bytes").unwrap();
+        match rename_no_replace(&source, &destination) {
+            Err(error) if error.kind() == std::io::ErrorKind::Unsupported => return,
+            result => result.unwrap(),
+        }
+        assert!(fs::symlink_metadata(&source).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"verified bytes");
+        fs::write(&source, b"replacement").unwrap();
+        assert_eq!(
+            rename_no_replace(&source, &destination).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(fs::read(&source).unwrap(), b"replacement");
+        assert_eq!(fs::read(destination).unwrap(), b"verified bytes");
+    }
+
+    #[test]
+    fn never_overwrite_publication_leaves_only_the_destination() {
+        let root = scratch("never-overwrite-publication");
+        let source = root.join("source");
+        let destination = root.join("destination");
+        fs::write(&source, b"verified bytes").unwrap();
+        let published = publish_verified_output(
+            &source,
+            &destination,
+            OverwritePolicy::Never,
+            None,
+            &mut RenameCounters::default(),
+        )
+        .unwrap();
+        assert_eq!(published, destination);
+        assert!(fs::symlink_metadata(&source).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"verified bytes");
+        fs::write(&source, b"replacement").unwrap();
+        assert!(publish_verified_output(
+            &source,
+            &destination,
+            OverwritePolicy::Never,
+            None,
+            &mut RenameCounters::default(),
+        )
+        .is_err());
         assert_eq!(fs::read(destination).unwrap(), b"verified bytes");
     }
 
