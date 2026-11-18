@@ -10,8 +10,10 @@
 //! then holds filtered bytes, so its runs pick filters in one parallel pass and
 //! take their histories from the filtered runs before them in a second.
 //!
-//! Non-solid members each carry their own history and are interleaved so that
-//! several small members keep every core busy. Solid members share one history
+//! Non-solid members each carry their own history. A wave takes a member's
+//! runs in order until it runs out and then moves to the next, so several
+//! small members keep every core busy, and a large member's runs in a wave
+//! share one window between them. Solid members share one history
 //! chain that runs across member boundaries, so their blocks are produced by a
 //! single walk through the members in order — the walk is just reading, which
 //! is cheap, so waves of blocks still compress in parallel.
@@ -303,6 +305,7 @@ where
     let mut members: Vec<usize> = jobs.iter().map(|job| job.blocks[0].0).collect();
     members.sort_unstable();
     members.dedup();
+    let mut groups: Vec<(Vec<usize>, usize)> = Vec::new();
     for member in members {
         // Jobs are taken from a member in order, so its runs here are
         // consecutive in the list's order.
@@ -331,7 +334,7 @@ where
                 continue;
             }
             if group.len() > 1 {
-                share_group(jobs, &group, window_len, dictionary, allowance)?;
+                groups.push((std::mem::take(&mut group), window_len));
             }
             group.clear();
             window_len = 0;
@@ -341,12 +344,29 @@ where
             }
         }
     }
-    Ok(())
+
+    // A wave of small members holds many groups. Each is built on its own
+    // part of the pool, as their jobs built their own indexes before, rather
+    // than one after another.
+    let mut slots: Vec<Option<&mut BlockJob<B>>> = jobs.iter_mut().map(Some).collect();
+    let mut builds: Vec<_> = groups
+        .into_iter()
+        .map(|(indices, window_len)| {
+            let group: Vec<&mut BlockJob<B>> = indices
+                .into_iter()
+                .map(|index| slots[index].take().expect("a run joins one group"))
+                .collect();
+            (group, window_len, Ok(()))
+        })
+        .collect();
+    crate::parallel::for_each_mut(&mut builds, |_, (group, window_len, result)| {
+        *result = share_group(group, *window_len, dictionary, allowance);
+    });
+    builds.into_iter().try_for_each(|(_, _, result)| result)
 }
 
 fn share_group<B: Budget + Send + Sync>(
-    jobs: &mut [BlockJob<B>],
-    group: &[usize],
+    group: &mut [&mut BlockJob<B>],
     window_len: usize,
     dictionary: usize,
     allowance: &B,
@@ -354,7 +374,7 @@ fn share_group<B: Budget + Send + Sync>(
 where
     B::Charge: Send,
 {
-    let first = &jobs[group[0]];
+    let first = &group[0];
     let history = &first.history[first.history.len().saturating_sub(dictionary)..];
     let mut window = Buffer::with_capacity(window_len, allowance)?;
     window
@@ -362,8 +382,7 @@ where
         .map_err(Into::<crate::codec::Error>::into)?;
     let mut bounds = Vec::with_capacity(group.len());
     let mut at = Vec::with_capacity(group.len());
-    for &index in group {
-        let job = &mut jobs[index];
+    for job in group.iter_mut() {
         let start = window.len();
         window
             .extend_from_slice(&job.data)
@@ -387,12 +406,12 @@ where
     }
     let mut pieces = Vec::with_capacity(group.len());
     let mut rest: &mut [u8] = &mut window[bounds[0].0..];
-    for (&index, &(start, end)) in group.iter().zip(&bounds) {
+    for (job, &(start, end)) in group.iter().zip(&bounds) {
         let (bytes, after) = rest.split_at_mut(end - start);
         rest = after;
         pieces.push(Piece {
             bytes,
-            job: &jobs[index],
+            job,
             filtered: None,
         });
     }
@@ -414,8 +433,7 @@ where
         .map(|piece| piece.filtered.transpose())
         .collect::<crate::codec::Result<Vec<_>>>()?;
 
-    for (&index, &(start, _)) in group.iter().zip(&bounds) {
-        let job = &mut jobs[index];
+    for (job, &(start, _)) in group.iter_mut().zip(&bounds) {
         debug_assert!(
             job.history[job.history.len().saturating_sub(dictionary)..]
                 == window[start.saturating_sub(dictionary.min(job.history.len()))..start],
@@ -425,9 +443,9 @@ where
     }
     let finders = SharedPackedIndex::finders_over(&window, &at, allowance)?;
     let window = std::sync::Arc::new(window);
-    let runs = group.iter().zip(bounds).zip(finders).zip(filtered);
-    for (((&job, (start, end)), finder), filtered) in runs {
-        jobs[job].shared = Some(SharedRun {
+    let runs = group.iter_mut().zip(bounds).zip(finders).zip(filtered);
+    for (((job, (start, end)), finder), filtered) in runs {
+        job.shared = Some(SharedRun {
             window: std::sync::Arc::clone(&window),
             start,
             end,
@@ -1060,9 +1078,16 @@ fn compress_fallback_members(
     )
 }
 
-/// Members with independent dictionaries, interleaved so a batch of small
-/// members can still saturate the machine. With `filter_runs`, each run chooses
-/// its own filters.
+/// Members with independent dictionaries. A wave takes each member's runs in
+/// order until it runs out, then the next member's, so a batch of small
+/// members still saturates the machine and a large member's runs in a wave
+/// are consecutive, which is what lets them share a window and an index.
+/// Taking one run from each member in turn left every run of a member in a
+/// wave of its own whenever there were as many members as threads.
+///
+/// A run is coded from its own bytes and its member's history, so which
+/// runs share a wave never changes the archive. With `filter_runs`, each run
+/// chooses its own filters.
 #[allow(clippy::too_many_arguments)]
 fn compress_independent_members<B: Budget + Send + Sync>(
     sources: &[EntrySource],
@@ -1117,11 +1142,10 @@ where
             let mut jobs = Records::new(wave_capacity, resources)?;
             let mut misses = 0usize;
             while jobs.len() < wave_capacity && misses < streams.len() {
-                let stream_count = streams.len();
                 let member = cursor;
                 let stream = &mut streams[member];
-                cursor = (cursor + 1) % stream_count;
                 if !stream.has_more() {
+                    cursor = (cursor + 1) % streams.len();
                     misses += 1;
                     continue;
                 }
