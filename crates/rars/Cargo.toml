@@ -55,6 +55,10 @@ getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Publishes a staged output with one rename that refuses an existing destination.
+[target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
+rustix.workspace = true
+
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
