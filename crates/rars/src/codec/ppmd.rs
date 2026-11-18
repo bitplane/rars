@@ -1,963 +1,199 @@
-use super::workspace::{Allowance, Budget, Buffer};
+// The RAR 2.9 PPMd (var.H) model, kept as the reference keeps it: one pool
+// of 12-byte units holding contexts and state vectors above the raw text,
+// with the reference suballocator's free lists threaded through the pool.
+// Ported from 7-Zip's public-domain Ppmd7.c and Ppmd7aDec.c (Igor Pavlov,
+// after Dmitry Shkarin's PPMd var.H and Dmitry Subbotin's carryless range
+// coder). References are byte offsets into the pool, and 0 is null.
+//
+// The model is consistent whatever the input: input only chooses symbols.
+// So pool indexing never fails on corrupt data, and a failing index is a bug.
+
+#[cfg(any(test, feature = "write"))]
+use super::workspace::Allowance;
+use super::workspace::Budget;
 use super::{Error, Result};
 
 const MAX_FREQ: u32 = 124;
-const MIN_MODEL_CONTEXTS: usize = 1;
-
-// PPMd-H suballocator parameters, per the format-level spec at
-// rar-research/doc/PPMD_ALGORITHM_SPECIFICATION.md §4.
-const ALLOC_UNIT_BYTES: usize = 12;
-const N_BUCKETS: usize = 38;
-const MAX_BUCKET_UNITS: usize = 128;
-// Spec §4.3: countdown reset value after a successful glue pass.
-const GLUE_RESET: u32 = 255;
-// Sentinel offset for "no allocation" (binary contexts carry their state
-// inline; their array_offset field is unused but typed `u32`).
-const NULL_OFFSET: u32 = u32::MAX;
-
-// Lookup tables built once from the spec's bucket-construction algorithm
-// (§4.2):
-//   for i in 0..38: step = if i >= 12 { 4 } else { i / 4 + 1 }
-//                   repeat step times: units_to_index[k++] = i
-//                   index_to_units[i] = k
-struct AllocTables {
-    units_to_index: [u8; MAX_BUCKET_UNITS],
-    index_to_units: [u8; N_BUCKETS],
-}
-
-// Built at compile time, so allocations read them directly.
-const fn build_alloc_tables() -> AllocTables {
-    let mut units_to_index = [0u8; MAX_BUCKET_UNITS];
-    let mut index_to_units = [0u8; N_BUCKETS];
-    let mut k: usize = 0;
-    let mut i = 0;
-    while i < N_BUCKETS {
-        let step = if i >= 12 { 4 } else { i / 4 + 1 };
-        let mut n = 0;
-        while n < step {
-            // The bucket construction has exactly 128 entries: the first
-            // 12 buckets contribute 24 and the remaining 26 contribute 104.
-            units_to_index[k] = i as u8;
-            k += 1;
-            n += 1;
-        }
-        index_to_units[i] = if k > u8::MAX as usize {
-            u8::MAX
-        } else {
-            k as u8
-        };
-        i += 1;
-    }
-    AllocTables {
-        units_to_index,
-        index_to_units,
-    }
-}
-
-static ALLOC_TABLES: AllocTables = build_alloc_tables();
-
-fn alloc_tables() -> &'static AllocTables {
-    &ALLOC_TABLES
-}
-
-// Spec §4.1 layout: contexts grow downward from `hi_unit`, state arrays
-// grow upward from `lo_unit`. Tracking the side matters for adjacency
-// patterns (gluing) and for which bump pointer advances.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AllocSide {
-    Lo, // state arrays
-    Hi, // context headers
-}
-
-#[derive(Debug)]
-struct Suballocator<B: Budget = Allowance> {
-    read_control: crate::read_control::ReadControl,
-    // Original pool size in bytes (C's p->Size). Preserved across restarts so
-    // the text/units split — which depends on the exact byte size, not the
-    // unit-truncated one — stays identical to the reference each restart.
-    size_bytes: usize,
-    // Total unit budget (= dict_mb * 1 MiB / 12, capped at u32::MAX).
-    pool_units: u32,
-    // Byte slack at the pool top (= Size % UNIT_SIZE). The C reference sets
-    // HiUnit = Base + Size with Size not necessarily a unit multiple, so all
-    // its pointers sit at `unit*12 + rem`. We keep unit offsets but fold this
-    // remainder into byte-domain comparisons (text capacity / fallback bump)
-    // so restart timing matches the reference exactly.
-    rem: u32,
-    // Text region capacity in bytes. text_ptr reaching this triggers a
-    // restart. Mirrors C's UnitsStart byte pointer (= Size - 84*text_units).
-    text_capacity_bytes: usize,
-    // Bump pointers (in units). lo_bump grows up, hi_bump grows down;
-    // valid bumpable space is [lo_bump, hi_bump). Both start at units_start.
-    units_start: u32,
-    lo_bump: u32,
-    hi_bump: u32,
-    // Free lists hold released block offsets (in units), one list per bucket.
-    free_lists: [Buffer<u32, B>; N_BUCKETS],
-    // Countdown for the glue pass (spec §4.3). Starts at 0, gets refreshed
-    // to GLUE_RESET after each successful glue.
-    glue_count: u32,
-    // Test escape hatch: when reset hasn't been called (pool_units == 0),
-    // act as unbounded so unit tests bypassing decode_init still work.
-    unbounded: bool,
-}
-
-impl<B: Budget> Suballocator<B> {
-    fn try_clone(&self) -> Result<Self> {
-        let allowance = self.free_lists[0].allowance();
-        let mut free_lists = std::array::from_fn(|_| Buffer::new(&allowance));
-        for (copy, original) in free_lists.iter_mut().zip(&self.free_lists) {
-            *copy = Buffer::copied(original, &allowance)?;
-        }
-        Ok(Self {
-            read_control: self.read_control.clone(),
-            size_bytes: self.size_bytes,
-            pool_units: self.pool_units,
-            rem: self.rem,
-            text_capacity_bytes: self.text_capacity_bytes,
-            units_start: self.units_start,
-            lo_bump: self.lo_bump,
-            hi_bump: self.hi_bump,
-            free_lists,
-            glue_count: self.glue_count,
-            unbounded: self.unbounded,
-        })
-    }
-    fn with_allowance(allowance: &B) -> Self {
-        Self {
-            read_control: crate::read_control::ReadControl::default(),
-            size_bytes: 0,
-            pool_units: 0,
-            rem: 0,
-            text_capacity_bytes: 0,
-            units_start: 0,
-            lo_bump: 0,
-            hi_bump: 0,
-            free_lists: std::array::from_fn(|_| Buffer::new(allowance)),
-            glue_count: 0,
-            unbounded: true,
-        }
-    }
-}
-
-impl<B: Budget> Suballocator<B> {
-    fn reset(&mut self, pool_bytes: usize) {
-        let pool_units_usize = pool_bytes / ALLOC_UNIT_BYTES;
-        // Cap at u32::MAX-1 (NULL_OFFSET is u32::MAX). Even 256 MiB / 12 =
-        // ~22M fits comfortably, so this is theoretical.
-        let pool_units = pool_units_usize.min(u32::MAX as usize - 1) as u32;
-        // Ppmd7_RestartModel byte layout:
-        //   text_units  = Size / 8 / UNIT_SIZE
-        //   UnitsStart  = HiUnit - 7 * text_units * UNIT_SIZE
-        // i.e. the units region is exactly 7*text_units units carved off the
-        // top; the leftover slack (Size % 96, plus Size % 12) all stays in the
-        // text region. The previous code took `pool_units / 8` for text and
-        // gave the slack to the units region — 5+ extra bump units versus the
-        // reference, which desynchronised restart timing on large inputs.
-        let text_units = (pool_bytes / 8 / ALLOC_UNIT_BYTES) as u32;
-        let units_region = text_units.saturating_mul(7).min(pool_units);
-        self.size_bytes = pool_bytes;
-        self.pool_units = pool_units;
-        self.rem = (pool_bytes % ALLOC_UNIT_BYTES) as u32;
-        self.units_start = pool_units - units_region;
-        self.lo_bump = self.units_start;
-        self.hi_bump = pool_units;
-        // UnitsStart byte pointer = units_start*12 + rem (= Size - 84*text_units).
-        self.text_capacity_bytes = self.units_start as usize * ALLOC_UNIT_BYTES + self.rem as usize;
-        for fl in &mut self.free_lists {
-            fl.clear();
-        }
-        self.glue_count = 0;
-        self.unbounded = pool_bytes == 0;
-    }
-
-    fn bucket_for(units: usize) -> Option<usize> {
-        if units == 0 || units > MAX_BUCKET_UNITS {
-            return None;
-        }
-        Some(alloc_tables().units_to_index[units - 1] as usize)
-    }
-
-    fn bucket_units(bucket: usize) -> usize {
-        alloc_tables().index_to_units[bucket] as usize
-    }
-
-    fn try_alloc(
-        &mut self,
-        units: usize,
-        side: AllocSide,
-        text_len_bytes: usize,
-    ) -> Result<Option<u32>> {
-        self.try_alloc_reserving_release(units, side, text_len_bytes, None)
-    }
-
-    // Reserve the old block's eventual release before acquiring its replacement.
-    // Glue and splitting can fill this bucket, so renew the reservation there.
-    fn try_alloc_reserving_release(
-        &mut self,
-        units: usize,
-        side: AllocSide,
-        text_len_bytes: usize,
-        release: Option<usize>,
-    ) -> Result<Option<u32>> {
-        let Some(bucket) = Self::bucket_for(units) else {
-            return Ok(None);
-        };
-        self.reserve_release(release)?;
-        // Reference ordering differs by side. Lo-side state arrays go through
-        // `Ppmd7_AllocUnits` (free_list first, then lo-bump, then rare). Hi-side
-        // 1-unit context headers go through the inlined sequence in
-        // `Ppmd7_CreateSuccessors` (hi-bump first, then free_list[0], then
-        // `Ppmd7_AllocUnitsRare(0)`). The two are not interchangeable: every
-        // time a free 1-unit block exists alongside hi-side headroom, the two
-        // orderings consume different memory cells. Adjacency at the next glue
-        // diverges, and the drift compounds across millions of decode steps.
-        match side {
-            AllocSide::Hi => {
-                if let Some(offset) = self.try_bump(bucket, side) {
-                    return Ok(Some(offset));
-                }
-                if let Some(offset) = self.free_lists[bucket].pop() {
-                    return Ok(Some(offset));
-                }
-            }
-            AllocSide::Lo => {
-                if let Some(offset) = self.free_lists[bucket].pop() {
-                    return Ok(Some(offset));
-                }
-                if let Some(offset) = self.try_bump(bucket, side) {
-                    return Ok(Some(offset));
-                }
-            }
-        }
-        // Rare path (mirrors Ppmd7_AllocUnitsRare):
-        //   1. If glue_count == 0, glue and retry the bucket's free list.
-        //   2. Walk upward through larger buckets; if found, split.
-        //   3. Otherwise shrink units_start (consume text-reservation).
-        if self.glue_count == 0 {
-            self.glue_inner()?;
-            self.glue_count = GLUE_RESET;
-            // Successful glue is a checkpoint: a later refusal retains the
-            // glued lists, with every free block still owned by the allocator.
-            self.reserve_release(release)?;
-            if let Some(offset) = self.free_lists[bucket].pop() {
-                return Ok(Some(offset));
-            }
-        }
-        for i in (bucket + 1)..N_BUCKETS {
-            if let Some(&offset) = self.free_lists[i].last() {
-                let large_size = Self::bucket_units(i) as u32;
-                let need = Self::bucket_units(bucket) as u32;
-                let leftover = large_size - need;
-                self.reserve_run(offset + need, leftover, release)?;
-                self.free_lists[i].pop();
-                self.emit_run_admitted(offset + need, leftover);
-                return Ok(Some(offset));
-            }
-        }
-        self.glue_count = self.glue_count.saturating_sub(1);
-        Ok(self.fallback_bump(bucket, text_len_bytes))
-    }
-
-    // Spec / ref Ppmd7_AllocUnitsRare bump-fallback: when no free block at
-    // any bucket size satisfies the request, shrink `units_start` downward
-    // (into the text-reservation zone). Succeeds only if the new units
-    // floor would still sit above the current text-write position.
-    fn fallback_bump(&mut self, bucket: usize, text_len_bytes: usize) -> Option<u32> {
-        // An unbounded allocator always succeeds in try_bump, so only a
-        // bounded pool reaches this fallback.
-        let need_units = Self::bucket_units(bucket) as u32;
-        let need_bytes = need_units as u64 * ALLOC_UNIT_BYTES as u64;
-        // UnitsStart byte pointer includes the pool-top remainder, matching
-        // the C reference (all its pointers sit at unit*12 + rem).
-        let units_start_bytes = self.units_start as u64 * ALLOC_UNIT_BYTES as u64 + self.rem as u64;
-        // Match C: `(us - Text) > numBytes`. Strict greater-than (not ≥).
-        if units_start_bytes <= text_len_bytes as u64 + need_bytes {
-            return None;
-        }
-        let new_units_start = self.units_start - need_units;
-        self.units_start = new_units_start;
-        // Lower the text capacity so text_has_room reflects the new boundary.
-        self.text_capacity_bytes = new_units_start as usize * ALLOC_UNIT_BYTES + self.rem as usize;
-        Some(new_units_start)
-    }
-
-    fn try_bump(&mut self, bucket: usize, side: AllocSide) -> Option<u32> {
-        let block = Self::bucket_units(bucket) as u32;
-        if self.unbounded {
-            // No real pool; hand out monotonic offsets so each alloc is
-            // distinguishable but never adjacent to another (so gluing is
-            // a no-op for the tests).
-            let off = self.lo_bump;
-            self.lo_bump = self.lo_bump.saturating_add(block);
-            return Some(off);
-        }
-        // hi_bump - lo_bump is the bumpable headroom in units.
-        if self.hi_bump.saturating_sub(self.lo_bump) < block {
-            return None;
-        }
-        match side {
-            AllocSide::Lo => {
-                let off = self.lo_bump;
-                self.lo_bump += block;
-                Some(off)
-            }
-            AllocSide::Hi => {
-                self.hi_bump -= block;
-                Some(self.hi_bump)
-            }
-        }
-    }
-
-    fn try_free(&mut self, offset: u32, units: usize) -> Result<()> {
-        if offset == NULL_OFFSET {
-            return Ok(());
-        }
-        if let Some(bucket) = Self::bucket_for(units) {
-            self.free_lists[bucket].try_push(offset)?;
-        }
-        Ok(())
-    }
-
-    // Ppmd7_SplitBlock: carve a block of `old_units` (bucket I2U value) down
-    // to `new_units` (bucket I2U value) in place. The first `new_units`
-    // stay at `base_offset`; the (old_units - new_units) residue is pushed
-    // onto the appropriate smaller bucket(s). The "kept" prefix is NOT
-    // pushed — the caller is still using it as live storage.
-    fn try_split_in_place(
-        &mut self,
-        base_offset: u32,
-        old_units: u32,
-        new_units: u32,
-    ) -> Result<()> {
-        self.emit_run(base_offset + new_units, old_units - new_units)
-    }
-
-    // Faithful port of Ppmd7_GlueFreeBlocks (§4.4). The earlier
-    // sort-by-offset version diverged from the reference in three ways that
-    // all change the resulting free-list state — and therefore the timing of
-    // the next allocation failure / model restart:
-    //   1. Threading order: the reference walks free_list[0..38], each list
-    //      head-first (most-recent first), prepending every node to a single
-    //      glue list. We rebuild that exact order so the fill pass re-buckets
-    //      runs in the same sequence (per-bucket LIFO must match).
-    //   2. Merge cap: a merged run may not reach 0x10000 units (NU is 16-bit).
-    //   3. Fill split: runs are emitted as repeated 128-unit blocks, then the
-    //      <=128 remainder via Ppmd7_SplitBlock's exact-or-two-piece rule —
-    //      not "largest bucket fitting" greedily.
-    fn glue_inner(&mut self) -> Result<()> {
-        let mut poller = self.read_control.poller();
-        // Step 1: thread free blocks into the reference's list order.
-        // list[k] = (offset, nu). The reference's prepend walk ends with
-        // bucket 37 first, each bucket in its original Vec order.
-        let allowance = self.free_lists[0].allowance();
-        let count = self.free_lists.iter().try_fold(0usize, |total, list| {
-            total
-                .checked_add(list.len())
-                .ok_or(Error::InvalidData("PPMd free-list size overflows"))
-        })?;
-        let mut list = Buffer::with_capacity(count, &allowance)?;
-        // Reversing the bucket order and visiting each bucket oldest-first
-        // produces exactly the prior head-first/prepend walk, without moving
-        // all previous entries for each insertion.
-        for bucket in (0..N_BUCKETS).rev() {
-            let nu = Self::bucket_units(bucket) as u32;
-            for &off in &self.free_lists[bucket] {
-                poller.check_codec(0)?;
-                list.push_admitted((off, nu));
-            }
-        }
-        if list.is_empty() {
-            return Ok(());
-        }
-
-        // Step 2: glue pass. Absorb the physically-next free block while the
-        // combined size stays < 0x10000. `nu_at` maps a block's start offset
-        // to its current size; absorbed blocks are set to 0.
-        let mut nu_at = GlueIndex::new(&list, &allowance, &self.read_control)?;
-        for &(off, _) in list.iter() {
-            poller.check_codec(0)?;
-            let mut cur = match nu_at.get(&off) {
-                Some(&n) if n != 0 => n,
-                _ => continue,
-            };
-            loop {
-                poller.check_codec(0)?;
-                let next_off = off + cur;
-                match nu_at.get(&next_off) {
-                    Some(&n2) => {
-                        let new = cur + n2;
-                        if new >= 0x10000 {
-                            break;
-                        }
-                        cur = new;
-                        nu_at.insert(next_off, 0);
-                    }
-                    None => break,
-                }
-            }
-            nu_at.insert(off, cur);
-        }
-
-        // Step 3: admit every destination before replacing the original lists.
-        // Count in exactly the fill order, including repeated offsets.
-        let mut counts = [0usize; N_BUCKETS];
-        for &(off, _) in list.iter() {
-            poller.check_codec(0)?;
-            if let Some(&nu) = nu_at.get(&off).filter(|&&nu| nu != 0) {
-                Self::visit_run(off, nu, |bucket, _| counts[bucket] += 1);
-            }
-        }
-        for (bucket, &count) in counts.iter().enumerate() {
-            self.free_lists[bucket].reserve_total_capacity(count)?;
-        }
-        self.read_control.check_codec()?;
-
-        // Commit without any further allocation or cancellation points.
-        for free in &mut self.free_lists {
-            free.clear();
-        }
-        for &(off, _) in list.iter() {
-            if let Some(&nu) = nu_at.get(&off).filter(|&&nu| nu != 0) {
-                self.emit_run_admitted(off, nu);
-            }
-        }
-        for (bucket, &count) in counts.iter().enumerate() {
-            debug_assert_eq!(self.free_lists[bucket].len(), count);
-        }
-        Ok(())
-    }
-
-    // Visit pieces in the reference's fill/SplitBlock order: full 128-unit
-    // chunks, then an exact remainder or its small tail followed by its prefix.
-    fn visit_run(mut offset: u32, mut remaining: u32, mut visit: impl FnMut(usize, u32)) {
-        const LAST_BUCKET: usize = N_BUCKETS - 1;
-        while remaining > MAX_BUCKET_UNITS as u32 {
-            visit(LAST_BUCKET, offset);
-            offset += MAX_BUCKET_UNITS as u32;
-            remaining -= MAX_BUCKET_UNITS as u32;
-        }
-        let mut i = Self::bucket_for(remaining as usize).expect("run remainder fits a bucket");
-        if Self::bucket_units(i) as u32 != remaining {
-            let k = Self::bucket_units(i - 1) as u32;
-            visit((remaining - k - 1) as usize, offset + k);
-            i -= 1;
-        }
-        visit(i, offset);
-    }
-
-    fn reserve_release(&mut self, release: Option<usize>) -> Result<()> {
-        if let Some(bucket) = release {
-            let list = &mut self.free_lists[bucket];
-            list.reserve_total_capacity(list.len() + 1)?;
-        }
-        Ok(())
-    }
-
-    fn reserve_run(&mut self, offset: u32, units: u32, release: Option<usize>) -> Result<()> {
-        let mut counts = [0usize; N_BUCKETS];
-        Self::visit_run(offset, units, |bucket, _| counts[bucket] += 1);
-        if let Some(bucket) = release {
-            counts[bucket] += 1;
-        }
-        for (bucket, &count) in counts.iter().enumerate() {
-            if count != 0 {
-                let list = &mut self.free_lists[bucket];
-                list.reserve_total_capacity(list.len() + count)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn emit_run_admitted(&mut self, offset: u32, units: u32) {
-        Self::visit_run(offset, units, |bucket, offset| {
-            self.free_lists[bucket].push_admitted(offset);
-        });
-    }
-
-    fn emit_run(&mut self, offset: u32, units: u32) -> Result<()> {
-        self.reserve_run(offset, units, None)?;
-        self.emit_run_admitted(offset, units);
-        Ok(())
-    }
-
-    fn text_has_room(&self, text_len: usize) -> bool {
-        // When pool isn't initialised (test fixtures that bypass decode_init),
-        // text_capacity is 0 — treat that as "unbounded" so we don't break
-        // out-of-band callers.
-        self.text_capacity_bytes == 0 || text_len < self.text_capacity_bytes
-    }
-}
-const BIN_SCALE: u32 = 1 << 14;
+const UNIT_SIZE: u32 = 12;
 const INT_BITS: u32 = 7;
 const PERIOD_BITS: u8 = 7;
+const BIN_SCALE: u32 = 1 << (INT_BITS + PERIOD_BITS as u32);
+const NUM_INDEXES: usize = 38;
+const MAX_ORDER: usize = 64;
 const TOP: u32 = 1 << 24;
 const BOT: u32 = 1 << 15;
-const INIT_BIN_ESC: [u16; 8] = [
-    0x3cdd, 0x1f3f, 0x59bf, 0x48f3, 0x64a1, 0x5abc, 0x6632, 0x6051,
-];
+// The budget is charged for the pool in steps of this many bytes.
+const CHARGE_STEP: u64 = 64 * 1024;
 const EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
+const INIT_BIN_ESC: [u16; 8] = [
+    0x3CDD, 0x1F3F, 0x59BF, 0x48F3, 0x64A1, 0x5ABC, 0x6632, 0x6051,
+];
 
-#[cfg(test)]
-use super::ppmd7::PpmdByteReader;
-
-#[derive(Debug, Clone)]
-#[cfg(any(test, feature = "write"))]
-pub struct PpmdDecoder {
-    state: PpmdState<Allowance>,
-}
-impl Clone for PpmdState<Allowance> {
-    fn clone(&self) -> Self {
-        self.try_clone().expect("unlimited PPMd model copy")
-    }
-}
-#[cfg(any(test, feature = "write"))]
-impl PpmdDecoder {
-    pub fn new() -> Self {
-        Self {
-            state: PpmdState::with_allowance(&Allowance::default()),
-        }
-    }
-}
-#[cfg(test)]
-impl PpmdState<Allowance> {
-    fn new() -> Self {
-        Self::with_allowance(&Allowance::default())
-    }
-}
-#[derive(Debug)]
-pub(crate) struct PpmdState<B: Budget> {
-    min_context: usize,
-    max_context: usize,
-    found_state: StateRef,
-    order_fall: usize,
-    init_esc: u32,
-    prev_success: u32,
-    max_order: usize,
-    hi_bits_flag: u32,
-    run_length: i32,
-    init_rl: i32,
-    ns2bs_indx: [u8; 256],
-    ns2indx: [u8; 256],
-    bin_summ: [[u16; 64]; 128],
-    see: [[See; 16]; 25],
-    dummy_see: See,
-    contexts: Buffer<Context, B>,
-    arena: StateArena<B>,
-    text: Buffer<u8, B>,
-    #[cfg(test)]
-    range: RangeDecoder,
-    allocated: bool,
-    max_contexts: usize,
-    suballoc: Suballocator<B>,
-    // `create_successors`' list of states to link, kept so it is not
-    // allocated again on every call. Empty between calls.
-    successor_scratch: Buffer<StateRef, B>,
+pub trait PpmdByteReader {
+    fn read_ppmd_byte(&mut self) -> Result<u8>;
 }
 
-#[derive(Debug, Clone)]
-#[cfg(any(test, feature = "write"))]
-pub struct PpmdEncoder {
-    model: PpmdDecoder,
-    range: RangeEncoder,
-    esc_char: u8,
-}
-
-// A context is plain data (32 bytes). Its state is inline when it has one, as
-// the reference keeps OneState inside the context; otherwise its states are a
-// block of the state arena below. The suffix is a u32 index. Where states are
-// kept does not affect the model: the simulated suballocator offsets decide
-// every restart.
-#[derive(Debug, Clone, Copy)]
-struct Context {
-    stats: Stats,
-    num_stats: u16,
-    summ_freq: u16,
-    suffix: Option<u32>,
-    // Simulated suballoc offsets so gluing (spec §4.3) can detect adjacency.
-    // Headers live until model reset; retain their Hi-side offsets for
-    // diagnostics. Lo-side array offsets are needed when resizing/freeing.
-    // Binary contexts carry the state inline and have a NULL_OFFSET array.
-    _header_offset: u32,
-    array_offset: u32,
-}
-
-impl Context {
-    #[inline]
-    fn suffix(&self) -> Option<usize> {
-        self.suffix.map(|suffix| suffix as usize)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-enum Stats {
-    One(State),
-    // The first state of this context's block in `StateArena::states`.
-    Many(u32),
-}
-
-// The states of every context with more than one, in blocks
-// of 2, 4, ..., 256 states: a context with n states has the block of the
-// smallest class that holds n. Freed blocks wait in per-class lists; a larger
-// free block is halved for a smaller class, and a context that shrinks keeps
-// the front of its block and frees the rest the same way. A restart empties
-// the arena and keeps its storage, as the reference reuses its one pool.
-#[derive(Debug)]
-struct StateArena<B: Budget> {
-    states: Buffer<State, B>,
-    free: [Buffer<u32, B>; ARENA_CLASSES],
-    free_slots: usize,
-    released_since_coalesce: usize,
-    read_control: crate::read_control::ReadControl,
-}
-
-const ARENA_CLASSES: usize = 8;
-
-impl<B: Budget> StateArena<B> {
-    fn with_allowance(allowance: &B) -> Self {
-        Self {
-            states: Buffer::new(allowance),
-            free: std::array::from_fn(|_| Buffer::new(allowance)),
-            free_slots: 0,
-            released_since_coalesce: 0,
-            read_control: crate::read_control::ReadControl::default(),
-        }
-    }
-
-    fn try_clone(&self) -> Result<Self> {
-        let allowance = self.states.allowance();
-        let mut free = std::array::from_fn(|_| Buffer::new(&allowance));
-        for (copy, original) in free.iter_mut().zip(&self.free) {
-            *copy = Buffer::copied(original, &allowance)?;
-        }
-        Ok(Self {
-            states: Buffer::copied(&self.states, &allowance)?,
-            free,
-            free_slots: self.free_slots,
-            released_since_coalesce: self.released_since_coalesce,
-            read_control: crate::read_control::ReadControl::default(),
-        })
-    }
-
-    fn reset(&mut self) {
-        self.states.clear();
-        for list in &mut self.free {
-            list.clear();
-        }
-        self.free_slots = 0;
-        self.released_since_coalesce = 0;
-    }
-
-    // The class of the block that holds `states` (at most 256) states.
-    #[inline]
-    fn class(states: usize) -> usize {
-        states.max(2).next_power_of_two().trailing_zeros() as usize - 1
-    }
-
-    #[inline]
-    fn block_len(class: usize) -> usize {
-        2 << class
-    }
-
-    fn reuse(&mut self, class: usize) -> Result<Option<u32>> {
-        if let Some(at) = self.free[class].pop() {
-            self.free_slots -= Self::block_len(class);
-            return Ok(Some(at));
-        }
-        if let Some(larger) = (class + 1..ARENA_CLASSES).find(|&k| !self.free[k].is_empty()) {
-            // Admit every tail before giving up ownership of the source.
-            self.reserve_tail(larger, class)?;
-            let at = self.free[larger].pop().expect("the list was not empty");
-            self.free_slots -= Self::block_len(larger);
-            // Splitting already-free storage is not a new release and must
-            // not bring the next coalescing pass forward.
-            for tail in class..larger {
-                self.free[tail].push_admitted(at + Self::block_len(tail) as u32);
-                self.free_slots += Self::block_len(tail);
-            }
-            return Ok(Some(at));
-        }
-        Ok(None)
-    }
-
-    fn alloc(&mut self, class: usize) -> Result<u32> {
-        self.alloc_reserving_release(class, None)
-    }
-
-    // A growing context will release its old, smaller block after copying.
-    // Admit that release before acquiring a destination, so it cannot fail
-    // with an allocated block that no context owns.
-    fn alloc_reserving_release(
-        &mut self,
-        class: usize,
-        release_class: Option<usize>,
-    ) -> Result<u32> {
-        if let Some(old) = release_class {
-            debug_assert!(old < class);
-            self.reserve_free_entry(old)?;
-        }
-        if let Some(at) = self.reuse(class)? {
-            return Ok(at);
-        }
-        // Every scan, successful or not, is paid for by actual frees.
-        // Otherwise a large arena could be scanned for each tiny allocation.
-        if self.free_slots >= Self::block_len(class)
-            && self.released_since_coalesce >= 256.max(self.states.len() / 8)
-        {
-            match self.coalesce() {
-                Ok(()) => {
-                    // Coalescing can fill the reserved list. Renew its spare
-                    // slot before acquiring the destination. This refusal
-                    // must propagate, not take the maintenance fallback.
-                    if let Some(old) = release_class {
-                        self.reserve_free_entry(old)?;
-                    }
-                    if let Some(at) = self.reuse(class)? {
-                        return Ok(at);
-                    }
-                }
-                Err(Error::WorkspaceLimitExceeded(_)) => {
-                    // Maintenance scratch may not fit even when appending
-                    // into already admitted arena capacity does. Ownership
-                    // remains intact on refusal, so try ordinary growth.
-                    self.released_since_coalesce = 0;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let at = self.states.len();
-        let end = at + Self::block_len(class);
-        if u32::try_from(end).is_err() {
-            return Err(Error::InvalidData("RAR PPMd state arena overflows"));
-        }
-        self.states.resize(end, State::EMPTY)?;
-        Ok(at as u32)
-    }
-
-    fn reserve_free_entry(&mut self, class: usize) -> Result<()> {
-        let list = &mut self.free[class];
-        list.reserve_total_capacity(list.len() + 1)
-    }
-
-    fn release(&mut self, at: u32, class: usize) -> Result<()> {
-        self.reserve_free_entry(class)?;
-        self.release_admitted(at, class);
-        Ok(())
-    }
-
-    fn release_admitted(&mut self, at: u32, class: usize) {
-        self.free[class].push_admitted(at);
-        let len = Self::block_len(class);
-        self.free_slots += len;
-        self.released_since_coalesce = self.released_since_coalesce.saturating_add(len);
-    }
-
-    fn reserve_tail(&mut self, from: usize, to: usize) -> Result<()> {
-        for class in to..from {
-            self.reserve_free_entry(class)?;
-        }
-        Ok(())
-    }
-
-    // Keep the first block of class `to` at `at` and free the rest of the
-    // block of class `from` there, as blocks of classes `to` .. `from` - 1.
-    fn release_tail(&mut self, at: u32, from: usize, to: usize) -> Result<()> {
-        self.reserve_tail(from, to)?;
-        for class in to..from {
-            self.release_admitted(at + Self::block_len(class) as u32, class);
-        }
-        Ok(())
-    }
-
-    // Join free ranges without moving live states or changing the simulated
-    // PPMd allocator. Blocks need only be aligned to two slots, not their
-    // size. One bitmap bit per pair keeps temporary storage at 1/16 byte per
-    // arena slot; all scratch and free-list growth remain budgeted.
-    fn coalesce(&mut self) -> Result<()> {
-        self.read_control.check_codec()?;
-        let mut bitmap = Buffer::filled(
-            self.states.len().div_ceil(128),
-            0u64,
-            &self.states.allowance(),
-        )?;
-        let mut poller = self.read_control.poller();
-        for (class, list) in self.free.iter().enumerate() {
-            for &at in list {
-                for pair in at as usize / 2..(at as usize + Self::block_len(class)) / 2 {
-                    poller.check_codec(pair)?;
-                    bitmap[pair / 64] |= 1 << (pair % 64);
-                }
-            }
-        }
-        let mut counts = [0usize; ARENA_CLASSES];
-        Self::visit_free_blocks(
-            &bitmap,
-            self.states.len(),
-            Some(&self.read_control),
-            |_, class| {
-                counts[class] += 1;
-            },
-        )?;
-        // Admit all destinations before clearing any list. Refusal or
-        // cancellation leaves the original block ownership intact.
-        for (list, count) in self.free.iter_mut().zip(counts) {
-            self.read_control.check_codec()?;
-            list.reserve_total_capacity(count)?;
-        }
-        self.read_control.check_codec()?;
-        for list in &mut self.free {
-            list.clear();
-        }
-        Self::visit_free_blocks(&bitmap, self.states.len(), None, |at, class| {
-            self.free[class].push_admitted(at);
-        })
-        .expect("admitted free-list publication cannot fail");
-        self.released_since_coalesce = 0;
-        debug_assert_eq!(
-            self.free_slots,
-            self.free
-                .iter()
-                .enumerate()
-                .map(|(class, list)| list.len() * Self::block_len(class))
-                .sum::<usize>()
-        );
-        Ok(())
-    }
-
-    // Visit the free runs of a bitmap with one bit per pair of slots, as
-    // the largest blocks that tile each run from its start.
-    fn visit_free_blocks(
-        bitmap: &[u64],
-        slots: usize,
-        control: Option<&crate::read_control::ReadControl>,
-        mut visit: impl FnMut(u32, usize),
-    ) -> Result<()> {
-        let mut poller = control.map(crate::read_control::ReadControl::poller);
-        let pairs = slots / 2;
-        let mut pair = 0;
-        loop {
-            let start = Self::next_pair(bitmap, pair, pairs, true, &mut poller)?;
-            if start == pairs {
-                return Ok(());
-            }
-            pair = Self::next_pair(bitmap, start, pairs, false, &mut poller)?;
-            let mut at = start * 2;
-            let end = pair * 2;
-            while at < end {
-                let class = ((usize::BITS - (end - at).leading_zeros() - 2) as usize)
-                    .min(ARENA_CLASSES - 1);
-                visit(at as u32, class);
-                at += Self::block_len(class);
-            }
-        }
-    }
-
-    // The first pair from `from` whose bit is `free`, or `pairs` if none
-    // is. Whole words of the other value are skipped at once. No bit at or
-    // past `pairs` is set, so a used pair is never found beyond it.
-    fn next_pair(
-        bitmap: &[u64],
-        mut from: usize,
-        pairs: usize,
-        free: bool,
-        poller: &mut Option<crate::read_control::Poller>,
-    ) -> Result<usize> {
-        let flip = if free { 0 } else { u64::MAX };
-        while from < pairs {
-            if let Some(poller) = poller {
-                poller.check_codec(from)?;
-            }
-            let bits = (bitmap[from / 64] ^ flip) >> (from % 64);
-            if bits != 0 {
-                return Ok(from + bits.trailing_zeros() as usize);
-            }
-            from = (from / 64 + 1) * 64;
-        }
-        Ok(pairs)
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct State {
-    symbol: u8,
-    freq: u8,
-    successor: Successor,
-}
-
-impl State {
-    // What unused arena slots hold.
-    const EMPTY: Self = Self {
-        symbol: 0,
-        freq: 0,
-        successor: Successor::None,
-    };
-}
-
-// Text positions and context indices are u32, which keeps a state at 12
-// bytes. Both stay far below u32::MAX (the model is at most 256 MiB, a context
-// at least one 12-byte unit); `raw` and `context` refuse what would not fit
-// rather than wrap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Successor {
-    None,
-    Raw(u32),
-    Context(u32),
-}
-
-impl Successor {
-    fn raw(position: usize) -> Result<Self> {
-        u32::try_from(position)
-            .map(Self::Raw)
-            .map_err(|_| Error::InvalidData("RAR PPMd text position overflows"))
-    }
-
-    fn context(index: usize) -> Result<Self> {
-        u32::try_from(index)
-            .map(Self::Context)
-            .map_err(|_| Error::InvalidData("RAR PPMd context index overflows"))
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct StateRef {
-    context: usize,
-    index: usize,
-}
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 struct See {
     summ: u16,
     shift: u8,
     count: u8,
 }
 
-#[cfg(test)]
+impl See {
+    // After a symbol is found among the states an escape left: the
+    // estimate adapts more slowly as it gathers evidence.
+    #[inline(always)]
+    fn update(&mut self) {
+        if self.shift < PERIOD_BITS {
+            self.count = self.count.wrapping_sub(1);
+            if self.count == 0 {
+                self.summ = self.summ.wrapping_shl(1);
+                self.count = 3 << self.shift;
+                self.shift += 1;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SeeRef {
+    Dummy,
+    Table(usize, usize),
+}
+
 #[derive(Debug, Clone)]
 struct RangeDecoder {
     range: u32,
+    // Relative to `low`, as in Ppmd7aDec.c.
     code: u32,
     low: u32,
 }
 
-impl<B: Budget> PpmdState<B> {
-    #[cfg(test)]
-    pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
-        self.arena.read_control = control.clone();
-        self.suballoc.read_control = control;
+impl RangeDecoder {
+    fn init(&mut self, input: &mut impl PpmdByteReader) -> Result<()> {
+        self.code = 0;
+        self.range = u32::MAX;
+        self.low = 0;
+        for _ in 0..4 {
+            self.code = (self.code << 8) | u32::from(input.read_ppmd_byte()?);
+        }
+        if self.code == u32::MAX {
+            return Err(Error::InvalidData("RAR PPMd range code is invalid"));
+        }
+        Ok(())
     }
+
+    #[inline(always)]
+    fn threshold(&mut self, total: u32) -> u32 {
+        self.range /= total;
+        self.code / self.range
+    }
+
+    #[inline(always)]
+    fn decode(&mut self, start: u32, size: u32) {
+        let start = start.wrapping_mul(self.range);
+        self.low = self.low.wrapping_add(start);
+        self.code = self.code.wrapping_sub(start);
+        self.range = self.range.wrapping_mul(size);
+    }
+
+    #[inline(always)]
+    fn normalize(&mut self, input: &mut impl PpmdByteReader) -> Result<()> {
+        loop {
+            if (self.low ^ self.low.wrapping_add(self.range)) >= TOP {
+                if self.range >= BOT {
+                    return Ok(());
+                }
+                self.range = self.low.wrapping_neg() & (BOT - 1);
+            }
+            self.code = (self.code << 8) | u32::from(input.read_ppmd_byte()?);
+            self.range <<= 8;
+            self.low <<= 8;
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct Ppmd7<B: Budget> {
+    // The pool, reserved at its declared size. Untouched pages cost nothing,
+    // so the budget is charged only for what the model has reached.
+    mem: Vec<u8>,
+    charge: B::Charge,
+    charged: u64,
+    // The furthest each region has reached since the pool was allocated. Its
+    // pages stay touched across restarts, so these never move back.
+    text_peak: u32,
+    lo_peak: u32,
+    units_floor: u32,
+    hi_floor: u32,
+    size: u32,
+    align: u32,
+    text: u32,
+    units_start: u32,
+    lo_unit: u32,
+    hi_unit: u32,
+    glue_count: u32,
+    free_list: [u32; NUM_INDEXES],
+    indx2units: [u8; NUM_INDEXES],
+    units2indx: [u8; 128],
+    ns2bs_indx: [u8; 256],
+    ns2indx: [u8; 256],
+    see: [[See; 16]; 25],
+    dummy_see: See,
+    bin_summ: [[u16; 64]; 128],
+    min_context: u32,
+    max_context: u32,
+    found_state: u32,
+    order_fall: u32,
+    init_esc: u32,
+    prev_success: u32,
+    max_order: u32,
+    hi_bits_flag: u32,
+    run_length: i32,
+    init_rl: i32,
+    rc: RangeDecoder,
+    allocated: bool,
+    read_control: crate::read_control::ReadControl,
+    #[cfg(test)]
+    restarts: usize,
+    #[cfg(test)]
+    glues: usize,
+    #[cfg(test)]
+    text_restarts: usize,
+}
+
+#[inline(always)]
+fn hi_bits_flag3(symbol: u8) -> u32 {
+    ((u32::from(symbol) + 0xc0) >> (8 - 3)) & (1 << 3)
+}
+
+#[inline(always)]
+fn hi_bits_flag4(symbol: u8) -> u32 {
+    ((u32::from(symbol) + 0xc0) >> (8 - 4)) & (1 << 4)
+}
+
+impl<B: Budget> Ppmd7<B> {
     pub(crate) fn with_allowance(allowance: &B) -> Self {
+        let mut indx2units = [0u8; NUM_INDEXES];
+        let mut units2indx = [0u8; 128];
+        let mut k = 0usize;
+        for (i, units) in indx2units.iter_mut().enumerate() {
+            let step = if i >= 12 { 4 } else { (i >> 2) + 1 };
+            for _ in 0..step {
+                units2indx[k] = i as u8;
+                k += 1;
+            }
+            *units = k as u8;
+        }
         let mut ns2bs_indx = [0u8; 256];
         ns2bs_indx[0] = 0;
         ns2bs_indx[1] = 2;
         ns2bs_indx[2..11].fill(4);
         ns2bs_indx[11..].fill(6);
-
         let mut ns2indx = [0u8; 256];
-        ns2indx[0] = 0;
-        ns2indx[1] = 1;
-        ns2indx[2] = 2;
-        let mut m = 3u8;
-        let mut k = 1u8;
+        ns2indx[..3].copy_from_slice(&[0, 1, 2]);
+        let (mut m, mut k) = (3u8, 1u8);
         for item in ns2indx.iter_mut().skip(3) {
             *item = m;
             k -= 1;
@@ -966,14 +202,32 @@ impl<B: Budget> PpmdState<B> {
                 k = m - 2;
             }
         }
-
         Self {
+            mem: Vec::new(),
+            charge: allowance.charge(),
+            charged: 0,
+            text_peak: 0,
+            lo_peak: 0,
+            units_floor: 0,
+            hi_floor: 0,
+            size: 0,
+            align: 0,
+            text: 0,
+            units_start: 0,
+            lo_unit: 0,
+            hi_unit: 0,
+            glue_count: 0,
+            free_list: [0; NUM_INDEXES],
+            indx2units,
+            units2indx,
+            ns2bs_indx,
+            ns2indx,
+            see: [[See::default(); 16]; 25],
+            dummy_see: See::default(),
+            bin_summ: [[0; 64]; 128],
             min_context: 0,
             max_context: 0,
-            found_state: StateRef {
-                context: 0,
-                index: 0,
-            },
+            found_state: 0,
             order_fall: 0,
             init_esc: 0,
             prev_success: 0,
@@ -981,71 +235,47 @@ impl<B: Budget> PpmdState<B> {
             hi_bits_flag: 0,
             run_length: 0,
             init_rl: 0,
-            ns2bs_indx,
-            ns2indx,
-            bin_summ: [[0; 64]; 128],
-            see: [[See {
-                summ: 0,
-                shift: 0,
-                count: 0,
-            }; 16]; 25],
-            dummy_see: See {
-                summ: 0,
-                shift: PERIOD_BITS,
-                count: 64,
+            rc: RangeDecoder {
+                range: 0,
+                code: 0,
+                low: 0,
             },
-            contexts: Buffer::new(allowance),
-            arena: StateArena::with_allowance(allowance),
-            text: Buffer::new(allowance),
-            #[cfg(test)]
-            range: RangeDecoder::new(),
             allocated: false,
-            max_contexts: MIN_MODEL_CONTEXTS,
-            suballoc: Suballocator::with_allowance(allowance),
-            successor_scratch: Buffer::new(allowance),
+            read_control: crate::read_control::ReadControl::default(),
+            #[cfg(test)]
+            restarts: 0,
+            #[cfg(test)]
+            glues: 0,
+            #[cfg(test)]
+            text_restarts: 0,
         }
     }
 
-    // Units occupied by a context's state array. Single-state (binary)
-    // contexts store the state inline, so the array is 0 units. Otherwise
-    // ceil(n/2) units fit n states at 2-per-unit (states are 6 bytes each).
-    fn state_array_units(n: usize) -> usize {
-        if n < 2 {
-            0
-        } else {
-            n.div_ceil(2)
-        }
+    pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
+        self.read_control = control;
     }
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
+        // Only the text, the units in use and the contexts carry data.
+        let mut charge = B::allowance(&self.charge).charge();
+        B::resize(&mut charge, self.charged)?;
+        let mut mem = vec![0u8; self.mem.len()];
+        for range in [
+            0..self.text as usize,
+            self.units_start as usize..self.lo_unit as usize,
+            self.hi_unit as usize..self.mem.len(),
+        ] {
+            mem[range.clone()].copy_from_slice(&self.mem[range]);
+        }
         Ok(Self {
-            min_context: self.min_context,
-            max_context: self.max_context,
-            found_state: self.found_state,
-            order_fall: self.order_fall,
-            init_esc: self.init_esc,
-            prev_success: self.prev_success,
-            max_order: self.max_order,
-            hi_bits_flag: self.hi_bits_flag,
-            run_length: self.run_length,
-            init_rl: self.init_rl,
-            ns2bs_indx: self.ns2bs_indx,
-            ns2indx: self.ns2indx,
-            bin_summ: self.bin_summ,
-            see: self.see,
-            dummy_see: self.dummy_see,
-            contexts: Buffer::copied(&self.contexts, &self.contexts.allowance())?,
-            arena: self.arena.try_clone()?,
-            text: Buffer::copied(&self.text, &self.text.allowance())?,
-            #[cfg(test)]
-            range: self.range.clone(),
-            allocated: self.allocated,
-            max_contexts: self.max_contexts,
-            suballoc: self.suballoc.try_clone()?,
-            successor_scratch: Buffer::new(&self.contexts.allowance()),
+            mem,
+            charge,
+            rc: self.rc.clone(),
+            read_control: self.read_control.clone(),
+            ..*self
         })
     }
-    #[cfg(test)]
+
     pub fn decode_init(
         &mut self,
         first_byte: u8,
@@ -1061,20 +291,32 @@ impl<B: Budget> PpmdState<B> {
         if first_byte & 0x40 != 0 {
             *esc_char = input.read_ppmd_byte()?;
         }
-        self.range.init(input)?;
+        self.rc.init(input)?;
         if reset {
-            let mut max_order = ((first_byte & 0x1f) as usize) + 1;
+            let mut max_order = u32::from(first_byte & 0x1f) + 1;
             if max_order > 16 {
                 max_order = 16 + (max_order - 16) * 3;
             }
             if max_order == 1 {
                 return Err(Error::InvalidData("RAR PPMd order is invalid"));
             }
-            let dictionary_mb = max_mb.unwrap_or(0) as usize + 1;
-            self.max_contexts = model_context_limit(dictionary_mb);
-            self.suballoc
-                .reset(dictionary_mb.saturating_mul(1024 * 1024));
-            self.init_model(max_order)?;
+            let size = (u32::from(max_mb.unwrap_or(0)) + 1) << 20;
+            // Until the new model is charged there is none to continue.
+            self.allocated = false;
+            if self.size != size || self.mem.is_empty() {
+                self.mem = Vec::new();
+                B::resize(&mut self.charge, 0)?;
+                self.charged = 0;
+                self.align = 4u32.wrapping_sub(size) & 3;
+                self.mem = vec![0u8; (self.align + size) as usize];
+                self.size = size;
+            }
+            self.max_order = max_order;
+            self.restart_model();
+            if self.charged == 0 {
+                self.mark_reach();
+            }
+            self.charge_reached()?;
             self.allocated = true;
         } else if !self.allocated {
             return Err(Error::InvalidData("RAR PPMd block reuses missing model"));
@@ -1082,331 +324,343 @@ impl<B: Budget> PpmdState<B> {
         Ok(())
     }
 
-    // An error ends this decode: range/model updates across a whole symbol
-    // are not transactional, even though allocator operations preserve ownership.
-    #[cfg(test)]
-    pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
-        // Ordinary symbol/context work is bounded by the model order and the
-        // 256-symbol alphabet; the enclosing decoder polls between symbols.
-        // Free-list maintenance can traverse the whole model and polls itself.
-        self.decode_symbol_inner(input)
+    #[inline(always)]
+    fn u8_at(&self, at: u32) -> u8 {
+        self.mem[at as usize]
+    }
+    #[inline(always)]
+    fn set_u8(&mut self, at: u32, value: u8) {
+        self.mem[at as usize] = value;
+    }
+    #[inline(always)]
+    fn u16_at(&self, at: u32) -> u16 {
+        u16::from_le_bytes(self.mem[at as usize..][..2].try_into().unwrap())
+    }
+    #[inline(always)]
+    fn set_u16(&mut self, at: u32, value: u16) {
+        self.mem[at as usize..][..2].copy_from_slice(&value.to_le_bytes());
+    }
+    #[inline(always)]
+    fn u32_at(&self, at: u32) -> u32 {
+        u32::from_le_bytes(self.mem[at as usize..][..4].try_into().unwrap())
+    }
+    #[inline(always)]
+    fn set_u32(&mut self, at: u32, value: u32) {
+        self.mem[at as usize..][..4].copy_from_slice(&value.to_le_bytes());
     }
 
-    #[cfg(test)]
-    fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
-        let min = self.min_context;
-        if self.contexts[min].num_stats != 1 {
-            let summ_freq = self.contexts[min].summ_freq as u32;
-            if summ_freq > self.range.range {
-                return Err(Error::InvalidData("RAR PPMd range is invalid"));
+    // Context: NumStats u16, SummFreq u16 (or OneState symbol, freq), Stats
+    // u32 (or OneState successor), Suffix u32.
+    #[inline(always)]
+    fn num_stats(&self, ctx: u32) -> u32 {
+        u32::from(self.u16_at(ctx))
+    }
+    #[inline(always)]
+    fn summ_freq(&self, ctx: u32) -> u32 {
+        u32::from(self.u16_at(ctx + 2))
+    }
+    #[inline(always)]
+    fn set_summ_freq(&mut self, ctx: u32, value: u32) {
+        self.set_u16(ctx + 2, value as u16);
+    }
+    #[inline(always)]
+    fn stats(&self, ctx: u32) -> u32 {
+        self.u32_at(ctx + 4)
+    }
+    #[inline(always)]
+    fn suffix(&self, ctx: u32) -> u32 {
+        self.u32_at(ctx + 8)
+    }
+    #[inline(always)]
+    fn one_state(ctx: u32) -> u32 {
+        ctx + 2
+    }
+
+    // State: Symbol u8, Freq u8, Successor u32 (unaligned).
+    #[inline(always)]
+    fn symbol(&self, s: u32) -> u8 {
+        self.u8_at(s)
+    }
+    #[inline(always)]
+    fn freq(&self, s: u32) -> u32 {
+        u32::from(self.u8_at(s + 1))
+    }
+    #[inline(always)]
+    fn set_freq(&mut self, s: u32, value: u32) {
+        self.set_u8(s + 1, value as u8);
+    }
+    #[inline(always)]
+    fn successor(&self, s: u32) -> u32 {
+        self.u32_at(s + 2)
+    }
+    #[inline(always)]
+    fn set_successor(&mut self, s: u32, value: u32) {
+        self.set_u32(s + 2, value);
+    }
+    #[inline(always)]
+    fn swap_states(&mut self, a: u32, b: u32) {
+        let mut x = [0u8; 6];
+        x.copy_from_slice(&self.mem[a as usize..][..6]);
+        self.mem.copy_within(b as usize..b as usize + 6, a as usize);
+        self.mem[b as usize..][..6].copy_from_slice(&x);
+    }
+    #[inline(always)]
+    fn copy_state(&mut self, from: u32, to: u32) {
+        self.mem
+            .copy_within(from as usize..from as usize + 6, to as usize);
+    }
+
+    #[inline(always)]
+    fn i2u(&self, indx: usize) -> u32 {
+        u32::from(self.indx2units[indx])
+    }
+    #[inline(always)]
+    fn u2i(&self, nu: u32) -> usize {
+        usize::from(self.units2indx[nu as usize - 1])
+    }
+
+    // Where a fresh pool's regions start out.
+    fn mark_reach(&mut self) {
+        self.text_peak = self.text;
+        self.lo_peak = self.lo_unit;
+        self.units_floor = self.units_start;
+        self.hi_floor = self.hi_unit;
+    }
+
+    // Charge the budget for the parts of the pool the model has reached.
+    // Called whenever a region passes its furthest point so far.
+    #[cold]
+    fn charge_reached(&mut self) -> Result<()> {
+        self.text_peak = self.text_peak.max(self.text);
+        self.lo_peak = self.lo_peak.max(self.lo_unit);
+        self.units_floor = self.units_floor.min(self.units_start);
+        self.hi_floor = self.hi_floor.min(self.hi_unit);
+        let end = self.align + self.size;
+        let reached = u64::from(self.text_peak - self.align)
+            + u64::from(self.lo_peak - self.units_floor)
+            + u64::from(end - self.hi_floor);
+        let reached = reached
+            .next_multiple_of(CHARGE_STEP)
+            .min(self.mem.len() as u64);
+        if reached > self.charged {
+            B::resize(&mut self.charge, reached)?;
+            self.charged = reached;
+        }
+        Ok(())
+    }
+
+    // New contexts take units from the top of the pool, downwards.
+    #[inline(always)]
+    fn take_context_unit(&mut self) -> Result<u32> {
+        self.hi_unit -= UNIT_SIZE;
+        if self.hi_unit < self.hi_floor {
+            self.charge_reached()?;
+        }
+        Ok(self.hi_unit)
+    }
+
+    #[inline(always)]
+    fn insert_node(&mut self, node: u32, indx: usize) {
+        self.set_u32(node, self.free_list[indx]);
+        self.free_list[indx] = node;
+    }
+
+    #[inline(always)]
+    fn remove_node(&mut self, indx: usize) -> u32 {
+        let node = self.free_list[indx];
+        self.free_list[indx] = self.u32_at(node);
+        node
+    }
+
+    fn split_block(&mut self, ptr: u32, old_indx: usize, new_indx: usize) {
+        let nu = self.i2u(old_indx) - self.i2u(new_indx);
+        let ptr = ptr + UNIT_SIZE * self.i2u(new_indx);
+        let mut i = self.u2i(nu);
+        if self.i2u(i) != nu {
+            i -= 1;
+            let k = self.i2u(i);
+            self.insert_node(ptr + UNIT_SIZE * k, (nu - k - 1) as usize);
+        }
+        self.insert_node(ptr, i);
+    }
+
+    // Join adjacent free blocks and refill the free lists from them.
+    // Free nodes: Stamp u16 (0 = free), NU u16, Next u32. A walk can visit
+    // every unit of a large pool, so each one polls for cancellation, which
+    // ends the decode.
+    fn glue_free_blocks(&mut self) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.glues += 1;
+        }
+        let mut poller = self.read_control.poller();
+        let mut visited = 0usize;
+        self.glue_count = 255;
+        if self.lo_unit != self.hi_unit {
+            self.set_u16(self.lo_unit, 1);
+        }
+        let mut n = 0u32;
+        for i in 0..NUM_INDEXES {
+            let nu = self.i2u(i) as u16;
+            let mut next = self.free_list[i];
+            self.free_list[i] = 0;
+            while next != 0 {
+                visited += 1;
+                poller.check_codec(visited)?;
+                let node = next;
+                next = self.u32_at(node);
+                self.set_u16(node, 0);
+                self.set_u16(node + 2, nu);
+                self.set_u32(node + 4, n);
+                n = node;
             }
-            let mut count = self.range.get_threshold(summ_freq)?;
-            let mut hi_cnt = 0u32;
-            let mut found = None;
-            for (index, state) in self.states(min).iter().enumerate() {
-                if count < state.freq as u32 {
-                    found = Some((index, hi_cnt, state.freq as u32, state.symbol));
+        }
+        let mut head = n;
+        // Where the link to the current node is kept: `head`, or a node's Next.
+        let mut prev: Option<u32> = None;
+        while n != 0 {
+            visited += 1;
+            poller.check_codec(visited)?;
+            let node = n;
+            let mut nu = u32::from(self.u16_at(node + 2));
+            n = self.u32_at(node + 4);
+            if nu == 0 {
+                match prev {
+                    None => head = n,
+                    Some(link) => self.set_u32(link, n),
+                }
+                continue;
+            }
+            prev = Some(node + 4);
+            loop {
+                let node2 = node + nu * UNIT_SIZE;
+                nu += u32::from(self.u16_at(node2 + 2));
+                if self.u16_at(node2) != 0 || nu >= 0x10000 {
                     break;
                 }
-                count -= state.freq as u32;
-                hi_cnt += state.freq as u32;
+                self.set_u16(node + 2, nu as u16);
+                self.set_u16(node2 + 2, 0);
             }
-            if let Some((index, start, size, symbol)) = found {
-                self.range.decode(start, size);
-                self.found_state = StateRef {
-                    context: min,
-                    index,
-                };
-                if index == 0 {
-                    self.update1_0()?;
-                } else {
-                    self.prev_success = 0;
-                    self.update1()?;
-                }
-                self.range.normalize(input)?;
-                return Ok(Some(symbol));
-            }
-            if hi_cnt >= summ_freq {
-                return Err(Error::InvalidData("RAR PPMd frequency sum is invalid"));
-            }
-            self.prev_success = 0;
-            self.range.decode(hi_cnt, summ_freq - hi_cnt);
-            self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-        } else {
-            let state = self.states(min)[0];
-            let idx = self.bin_summ_index(state)?;
-            let prob = self.bin_summ[idx.0][idx.1] as u32;
-            let size0 = (self.range.range >> 14).wrapping_mul(prob);
-            let next_prob = update_prob_1(prob);
-            if self.range.code.wrapping_sub(self.range.low) < size0 {
-                self.bin_summ[idx.0][idx.1] = (next_prob + (1 << INT_BITS)) as u16;
-                self.range.decode_bit0(size0);
-                self.found_state = StateRef {
-                    context: min,
-                    index: 0,
-                };
-                self.update_bin()?;
-                self.range.normalize(input)?;
-                return Ok(Some(state.symbol));
-            }
-            self.bin_summ[idx.0][idx.1] = next_prob as u16;
-            self.init_esc = EXP_ESCAPE[(next_prob >> 10) as usize] as u32;
-            self.range.decode_bit1(size0);
-            self.prev_success = 0;
         }
-        // The mask is only needed once the first context has escaped, which
-        // most symbols never do. Both escapes above leave this context's
-        // states as they were, so these are the symbols they masked.
-        let mut mask = [true; 256];
-        for state in self.states(min) {
-            mask[state.symbol as usize] = false;
+        n = head;
+        while n != 0 {
+            visited += 1;
+            poller.check_codec(visited)?;
+            let mut node = n;
+            let mut nu = u32::from(self.u16_at(node + 2));
+            n = self.u32_at(node + 4);
+            if nu == 0 {
+                continue;
+            }
+            while nu > 128 {
+                self.insert_node(node, NUM_INDEXES - 1);
+                nu -= 128;
+                node += 128 * UNIT_SIZE;
+            }
+            let mut i = self.u2i(nu);
+            if self.i2u(i) != nu {
+                i -= 1;
+                let k = self.i2u(i);
+                self.insert_node(node + k * UNIT_SIZE, (nu - k - 1) as usize);
+            }
+            self.insert_node(node, i);
         }
+        Ok(())
+    }
 
+    // `None` when the pool is full, which restarts the model.
+    #[cold]
+    fn alloc_units_rare(&mut self, indx: usize) -> Result<Option<u32>> {
+        if self.glue_count == 0 {
+            self.glue_free_blocks()?;
+            if self.free_list[indx] != 0 {
+                return Ok(Some(self.remove_node(indx)));
+            }
+        }
+        let mut i = indx;
         loop {
-            self.range.normalize(input)?;
-            let mut mc = self.min_context;
-            let num_masked = self.contexts[mc].num_stats as usize;
-            loop {
-                self.order_fall += 1;
-                let Some(suffix) = self.contexts[mc].suffix() else {
+            i += 1;
+            if i == NUM_INDEXES {
+                let bytes = UNIT_SIZE * self.i2u(indx);
+                self.glue_count -= 1;
+                if self.units_start - self.text <= bytes {
                     return Ok(None);
-                };
-                mc = suffix;
-                if usize::from(self.contexts[mc].num_stats) != num_masked {
-                    break;
                 }
-            }
-            self.min_context = mc;
-
-            let hi_cnt = self
-                .states(mc)
-                .iter()
-                .filter(|state| mask[state.symbol as usize])
-                .map(|state| state.freq as u32)
-                .sum::<u32>();
-            let (see_ref, esc_freq) = self.make_esc_freq(num_masked)?;
-            let freq_sum = hi_cnt + esc_freq;
-            if freq_sum > self.range.range {
-                return Err(Error::InvalidData("RAR PPMd escape range is invalid"));
-            }
-            let mut count = self.range.get_threshold(freq_sum)?;
-            if count < hi_cnt {
-                let mut start = 0u32;
-                let mut selected = None;
-                for (index, state) in self.states(mc).iter().enumerate() {
-                    if !mask[state.symbol as usize] {
-                        continue;
-                    }
-                    let freq = state.freq as u32;
-                    if count < freq {
-                        selected = Some((index, start, freq, state.symbol));
-                        break;
-                    }
-                    count -= freq;
-                    start += freq;
+                self.units_start -= bytes;
+                if self.units_start < self.units_floor {
+                    self.charge_reached()?;
                 }
-                // hi_cnt was summed from these same unmodified, unmasked
-                // frequencies, so count < hi_cnt must select a state.
-                let (index, start, freq, symbol) =
-                    selected.expect("masked threshold selects a state");
-                self.range.decode(start, freq);
-                self.update_see(see_ref);
-                self.found_state = StateRef { context: mc, index };
-                self.update2()?;
-                self.range.normalize(input)?;
-                return Ok(Some(symbol));
+                return Ok(Some(self.units_start));
             }
-            if count >= freq_sum {
-                return Err(Error::InvalidData("RAR PPMd escape symbol is invalid"));
-            }
-            self.range.decode(hi_cnt, freq_sum - hi_cnt);
-            self.add_see_summ(see_ref, freq_sum);
-            for state in self.states(mc) {
-                mask[state.symbol as usize] = false;
+            if self.free_list[i] != 0 {
+                break;
             }
         }
+        let block = self.remove_node(i);
+        self.split_block(block, i, indx);
+        Ok(Some(block))
     }
 
-    #[cfg(any(test, feature = "write"))]
-    fn encode_symbol(&mut self, symbol: u8, output: &mut RangeEncoder) -> Result<()> {
-        let mut mask = [true; 256];
-        let min = self.min_context;
-        if self.contexts[min].num_stats != 1 {
-            let summ_freq = self.contexts[min].summ_freq as u32;
-            let mut start = 0u32;
-            let mut found = None;
-            for (index, state) in self.states(min).iter().enumerate() {
-                if state.symbol == symbol {
-                    found = Some((index, start, state.freq as u32));
-                    break;
-                }
-                start += state.freq as u32;
-            }
-            if let Some((index, start, size)) = found {
-                output.encode(start, size, summ_freq);
-                self.found_state = StateRef {
-                    context: min,
-                    index,
-                };
-                if index == 0 {
-                    self.update1_0()?;
-                } else {
-                    self.prev_success = 0;
-                    self.update1()?;
-                }
-                output.normalize();
-                return Ok(());
-            }
-            if start >= summ_freq {
-                return Err(Error::InvalidData("RAR PPMd frequency sum is invalid"));
-            }
-            self.prev_success = 0;
-            output.encode(start, summ_freq - start, summ_freq);
-            self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-            for state in self.states(min) {
-                mask[state.symbol as usize] = false;
-            }
-        } else {
-            let state = self.states(min)[0];
-            let idx = self.bin_summ_index(state)?;
-            let prob = self.bin_summ[idx.0][idx.1] as u32;
-            let size0 = (output.range >> 14).wrapping_mul(prob);
-            let next_prob = update_prob_1(prob);
-            if state.symbol == symbol {
-                self.bin_summ[idx.0][idx.1] = (next_prob + (1 << INT_BITS)) as u16;
-                output.encode_bit0(size0);
-                self.found_state = StateRef {
-                    context: min,
-                    index: 0,
-                };
-                self.update_bin()?;
-                output.normalize();
-                return Ok(());
-            }
-            self.bin_summ[idx.0][idx.1] = next_prob as u16;
-            self.init_esc = EXP_ESCAPE[(next_prob >> 10) as usize] as u32;
-            output.encode_bit1(size0);
-            mask[state.symbol as usize] = false;
-            self.prev_success = 0;
+    #[inline]
+    fn alloc_units(&mut self, indx: usize) -> Result<Option<u32>> {
+        if self.free_list[indx] != 0 {
+            return Ok(Some(self.remove_node(indx)));
         }
-
-        loop {
-            output.normalize();
-            let mut mc = self.min_context;
-            let num_masked = self.contexts[mc].num_stats as usize;
-            loop {
-                self.order_fall += 1;
-                let Some(suffix) = self.contexts[mc].suffix() else {
-                    return Err(Error::InvalidData("RAR PPMd symbol is not encodable"));
-                };
-                mc = suffix;
-                if usize::from(self.contexts[mc].num_stats) != num_masked {
-                    break;
-                }
+        let bytes = UNIT_SIZE * self.i2u(indx);
+        if self.hi_unit - self.lo_unit >= bytes {
+            let at = self.lo_unit;
+            self.lo_unit += bytes;
+            if self.lo_unit > self.lo_peak {
+                self.charge_reached()?;
             }
-            self.min_context = mc;
-
-            let hi_cnt = self
-                .states(mc)
-                .iter()
-                .filter(|state| mask[state.symbol as usize])
-                .map(|state| state.freq as u32)
-                .sum::<u32>();
-            let (see_ref, esc_freq) = self.make_esc_freq(num_masked)?;
-            let freq_sum = hi_cnt + esc_freq;
-            let mut start = 0u32;
-            let mut found = None;
-            for (index, state) in self.states(mc).iter().enumerate() {
-                if !mask[state.symbol as usize] {
-                    continue;
-                }
-                let freq = state.freq as u32;
-                if state.symbol == symbol {
-                    found = Some((index, start, freq));
-                    break;
-                }
-                start += freq;
-            }
-            if let Some((index, start, freq)) = found {
-                output.encode(start, freq, freq_sum);
-                self.update_see(see_ref);
-                self.found_state = StateRef { context: mc, index };
-                self.update2()?;
-                output.normalize();
-                return Ok(());
-            }
-            output.encode(hi_cnt, freq_sum - hi_cnt, freq_sum);
-            self.add_see_summ(see_ref, freq_sum);
-            for state in self.states(mc) {
-                mask[state.symbol as usize] = false;
-            }
+            return Ok(Some(at));
         }
+        self.alloc_units_rare(indx)
     }
 
-    fn init_model(&mut self, max_order: usize) -> Result<()> {
-        self.suballoc.read_control.check_codec()?;
-        self.contexts.clear();
-        self.arena.reset();
-        self.text.clear();
-        // Spec §5.2 RestartModel: clear free lists, reserve root context
-        // (1 unit from Hi) + its 256-state array (128 units from Lo).
-        // Reuse the exact original byte size (C's p->Size) so the text/units
-        // split and the pool-top remainder survive the restart unchanged.
-        let unbounded_before = self.suballoc.unbounded;
-        let reset_arg = if unbounded_before {
-            0
-        } else {
-            self.suballoc.size_bytes
-        };
-        self.suballoc.reset(reset_arg);
-        // At init time text is empty.
-        let header_offset = self
-            .suballoc
-            .try_alloc(1, AllocSide::Hi, 0)?
-            .unwrap_or(NULL_OFFSET);
-        let array_offset = self
-            .suballoc
-            .try_alloc(128, AllocSide::Lo, 0)?
-            .unwrap_or(NULL_OFFSET);
-        self.max_order = max_order;
-        self.order_fall = max_order;
-        self.init_rl = -(max_order.min(12) as i32) - 1;
+    fn restart_model(&mut self) {
+        #[cfg(test)]
+        {
+            self.restarts += 1;
+        }
+        self.free_list = [0; NUM_INDEXES];
+        self.text = self.align;
+        self.hi_unit = self.text + self.size;
+        self.units_start = self.hi_unit - self.size / 8 / UNIT_SIZE * 7 * UNIT_SIZE;
+        self.lo_unit = self.units_start;
+        self.glue_count = 0;
+        self.order_fall = self.max_order;
+        self.init_rl = -(self.max_order.min(12) as i32) - 1;
         self.run_length = self.init_rl;
         self.prev_success = 0;
 
-        let at = self.arena.alloc(StateArena::<B>::class(256))?;
-        for (symbol, state) in (0..=255).zip(&mut self.arena.states[at as usize..][..256]) {
-            *state = State {
-                symbol,
-                freq: 1,
-                successor: Successor::None,
-            };
+        self.hi_unit -= UNIT_SIZE;
+        let mc = self.hi_unit;
+        let s = self.lo_unit;
+        self.lo_unit += UNIT_SIZE * 128;
+        self.max_context = mc;
+        self.min_context = mc;
+        self.found_state = s;
+        self.set_u16(mc, 256);
+        self.set_summ_freq(mc, 257);
+        self.set_u32(mc + 4, s);
+        self.set_u32(mc + 8, 0);
+        for i in 0..256u32 {
+            let at = s + 6 * i;
+            self.set_u8(at, i as u8);
+            self.set_u8(at + 1, 1);
+            self.set_successor(at, 0);
         }
-        self.contexts.try_push(Context {
-            stats: Stats::Many(at),
-            num_stats: 256,
-            summ_freq: 257,
-            suffix: None,
-            _header_offset: header_offset,
-            array_offset,
-        })?;
-        self.min_context = 0;
-        self.max_context = 0;
-        self.found_state = StateRef {
-            context: 0,
-            index: 0,
-        };
-
         for (i, row) in self.bin_summ.iter_mut().enumerate() {
-            for (k, &init_bin_esc) in INIT_BIN_ESC.iter().enumerate() {
-                let value = BIN_SCALE - u32::from(init_bin_esc) / (i as u32 + 2);
+            for (k, &esc) in INIT_BIN_ESC.iter().enumerate() {
+                let value = (BIN_SCALE - u32::from(esc) / (i as u32 + 2)) as u16;
                 for m in (0..64).step_by(8) {
-                    row[k + m] = value as u16;
+                    row[k + m] = value;
                 }
             }
         }
         for (i, row) in self.see.iter_mut().enumerate() {
-            let summ = ((5 * i + 10) << (PERIOD_BITS - 4)) as u16;
+            let summ = ((5 * i as u32 + 10) << (PERIOD_BITS - 4)) as u16;
             row.fill(See {
                 summ,
                 shift: PERIOD_BITS - 4,
@@ -1418,253 +672,224 @@ impl<B: Budget> PpmdState<B> {
             shift: PERIOD_BITS,
             count: 64,
         };
-        Ok(())
     }
 
-    fn bin_summ_index(&mut self, state: State) -> Result<(usize, usize)> {
-        let suffix = self.contexts[self.min_context]
-            .suffix()
-            .ok_or(Error::InvalidData("RAR PPMd binary context has no suffix"))?;
-        let suffix_stats = self.contexts[suffix].num_stats as usize;
-        self.hi_bits_flag = hi_bits_flag(self.state(self.found_state)?.symbol, 3);
-        let row = state.freq as usize - 1;
-        let col = self.prev_success as usize
-            + ((self.run_length >> 26) as usize & 0x20)
-            + self.ns2bs_indx[suffix_stats - 1] as usize
-            + hi_bits_flag(state.symbol, 4) as usize
-            + self.hi_bits_flag as usize;
-        Ok((row, col))
-    }
-
-    fn make_esc_freq(&mut self, num_masked: usize) -> Result<(SeeRef, u32)> {
-        let mc = self.min_context;
-        let num_stats = self.contexts[mc].num_stats as usize;
-        if num_stats == 256 {
-            return Ok((SeeRef::Dummy, 1));
+    fn create_successors(&mut self) -> Result<Option<u32>> {
+        let mut c = self.min_context;
+        let up_branch = self.successor(self.found_state);
+        let found_symbol = self.symbol(self.found_state);
+        let mut ps = [0u32; MAX_ORDER];
+        let mut num_ps = 0;
+        if self.order_fall != 0 {
+            ps[num_ps] = self.found_state;
+            num_ps += 1;
         }
-        if num_masked >= num_stats {
-            return Err(Error::InvalidData("RAR PPMd masked-state count is invalid"));
+        while self.suffix(c) != 0 {
+            c = self.suffix(c);
+            let s = if self.num_stats(c) != 1 {
+                let mut s = self.stats(c);
+                while self.symbol(s) != found_symbol {
+                    s += 6;
+                }
+                s
+            } else {
+                Self::one_state(c)
+            };
+            let successor = self.successor(s);
+            if successor != up_branch {
+                c = successor;
+                if num_ps == 0 {
+                    return Ok(Some(c));
+                }
+                break;
+            }
+            ps[num_ps] = s;
+            num_ps += 1;
         }
-        // The guard above establishes num_masked < num_stats.
-        let non_masked = num_stats - num_masked;
-        let suffix = self.contexts[mc].suffix().unwrap_or(mc);
-        let suffix_stats = self.contexts[suffix].num_stats as usize;
-        // Spec §9.1: the subtraction is unsigned C wraparound — when
-        // `suffix.num_stats < min_context.num_stats`, the underflow yields a
-        // very large value and the `non_masked < suffix_delta` comparison
-        // evaluates to TRUE. Replicate the wraparound here.
-        let suffix_delta = suffix_stats.wrapping_sub(num_stats);
-        let col = (non_masked < suffix_delta) as usize
-            + 2 * ((self.contexts[mc].summ_freq as usize) < 11 * num_stats) as usize
-            + 4 * (num_masked > non_masked) as usize
-            + self.hi_bits_flag as usize;
-        let row = self.ns2indx[non_masked - 1] as usize;
-        let see = &mut self.see[row][col];
-        let summ = see.summ;
-        let r = (summ >> see.shift) as u32;
-        see.summ = summ.wrapping_sub(r as u16);
-        Ok((SeeRef::Table(row, col), r + u32::from(r == 0)))
-    }
-
-    fn update_see(&mut self, see_ref: SeeRef) {
-        let see = match see_ref {
-            SeeRef::Dummy => &mut self.dummy_see,
-            SeeRef::Table(row, col) => &mut self.see[row][col],
+        if num_ps == 0 {
+            return Ok(Some(c));
+        }
+        let new_symbol = self.u8_at(up_branch);
+        let up_branch = up_branch + 1;
+        let new_freq = if self.num_stats(c) == 1 {
+            self.freq(Self::one_state(c))
+        } else {
+            let mut s = self.stats(c);
+            while self.symbol(s) != new_symbol {
+                s += 6;
+            }
+            let cf = self.freq(s) - 1;
+            let s0 = self.summ_freq(c) - self.num_stats(c) - cf;
+            1 + if 2 * cf <= s0 {
+                u32::from(5 * cf > s0)
+            } else {
+                (2 * cf + s0 - 1) / (2 * s0) + 1
+            }
         };
-        if see.shift < PERIOD_BITS {
-            see.count = see.count.wrapping_sub(1);
-            if see.count == 0 {
-                see.summ = see.summ.wrapping_shl(1);
-                see.count = 3 << see.shift;
-                see.shift += 1;
+        loop {
+            let c1 = if self.hi_unit != self.lo_unit {
+                self.take_context_unit()?
+            } else if self.free_list[0] != 0 {
+                self.remove_node(0)
+            } else {
+                match self.alloc_units_rare(0)? {
+                    Some(c1) => c1,
+                    None => return Ok(None),
+                }
+            };
+            self.set_u16(c1, 1);
+            let one = Self::one_state(c1);
+            self.set_u8(one, new_symbol);
+            self.set_u8(one + 1, new_freq as u8);
+            self.set_successor(one, up_branch);
+            self.set_u32(c1 + 8, c);
+            num_ps -= 1;
+            self.set_successor(ps[num_ps], c1);
+            c = c1;
+            if num_ps == 0 {
+                return Ok(Some(c));
             }
         }
-    }
-
-    fn add_see_summ(&mut self, see_ref: SeeRef, value: u32) {
-        let see = match see_ref {
-            SeeRef::Dummy => &mut self.dummy_see,
-            SeeRef::Table(row, col) => &mut self.see[row][col],
-        };
-        see.summ = see.summ.wrapping_add(value as u16);
-    }
-
-    fn update1_0(&mut self) -> Result<()> {
-        let fs = self.found_state;
-        let freq = self.state(fs)?.freq as u32;
-        let summ_freq = self.contexts[fs.context].summ_freq as u32;
-        self.prev_success = u32::from(2 * freq > summ_freq);
-        self.run_length += self.prev_success as i32;
-        self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
-        self.state_mut(fs)?.freq = (freq + 4) as u8;
-        if freq + 4 > MAX_FREQ {
-            self.rescale()?;
-        }
-        self.next_context()
-    }
-
-    fn update1(&mut self) -> Result<()> {
-        let fs = self.found_state;
-        let freq = self.state(fs)?.freq as u32 + 4;
-        self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
-        self.state_mut(fs)?.freq = freq as u8;
-        // Both decode and encode call update1 only for a non-first state.
-        if self.states(fs.context)[fs.index].freq > self.states(fs.context)[fs.index - 1].freq {
-            self.states_mut(fs.context).swap(fs.index, fs.index - 1);
-            self.found_state.index -= 1;
-            if freq > MAX_FREQ {
-                self.rescale()?;
-            }
-        }
-        self.next_context()
-    }
-
-    fn update2(&mut self) -> Result<()> {
-        let fs = self.found_state;
-        let freq = self.state(fs)?.freq as u32 + 4;
-        self.run_length = self.init_rl;
-        self.contexts[fs.context].summ_freq = self.contexts[fs.context].summ_freq.wrapping_add(4);
-        self.state_mut(fs)?.freq = freq as u8;
-        if freq > MAX_FREQ {
-            self.rescale()?;
-        }
-        self.update_model()
-    }
-
-    fn update_bin(&mut self) -> Result<()> {
-        let fs = self.found_state;
-        let freq = self.state(fs)?.freq;
-        self.state_mut(fs)?.freq = freq.wrapping_add(u8::from(freq < 128));
-        self.prev_success = 1;
-        self.run_length += 1;
-        self.next_context()
-    }
-
-    fn next_context(&mut self) -> Result<()> {
-        let successor = self.state(self.found_state)?.successor;
-        if let Successor::Context(context) = successor {
-            if self.order_fall == 0 {
-                self.max_context = context as usize;
-                self.min_context = context as usize;
-                return Ok(());
-            }
-        }
-        self.update_model()
     }
 
     fn update_model(&mut self) -> Result<()> {
-        let fs = self.state(self.found_state)?;
-        let found_symbol = fs.symbol;
-        if fs.freq < (MAX_FREQ / 4) as u8 && self.contexts[self.min_context].suffix().is_some() {
-            let suffix = self.contexts[self.min_context].suffix().unwrap();
-            if self.contexts[suffix].num_stats == 1 {
-                let freq = self.states(suffix)[0].freq;
-                if freq < 32 {
-                    self.states_mut(suffix)[0].freq += 1;
+        let fs = self.found_state;
+        let fs_symbol = self.symbol(fs);
+        let fs_freq = self.freq(fs);
+        if fs_freq < MAX_FREQ / 4 && self.suffix(self.min_context) != 0 {
+            let c = self.suffix(self.min_context);
+            if self.num_stats(c) == 1 {
+                let s = Self::one_state(c);
+                if self.freq(s) < 32 {
+                    self.set_freq(s, self.freq(s) + 1);
                 }
-            } else if let Some(mut index) = self
-                .states(suffix)
-                .iter()
-                .position(|state| state.symbol == found_symbol)
-            {
-                if index > 0
-                    && self.states(suffix)[index].freq >= self.states(suffix)[index - 1].freq
-                {
-                    self.states_mut(suffix).swap(index, index - 1);
-                    index -= 1;
+            } else {
+                let mut s = self.stats(c);
+                if self.symbol(s) != fs_symbol {
+                    loop {
+                        s += 6;
+                        if self.symbol(s) == fs_symbol {
+                            break;
+                        }
+                    }
+                    if self.freq(s) >= self.freq(s - 6) {
+                        self.swap_states(s, s - 6);
+                        s -= 6;
+                    }
                 }
-                if self.states(suffix)[index].freq < (MAX_FREQ - 9) as u8 {
-                    self.states_mut(suffix)[index].freq += 2;
-                    self.contexts[suffix].summ_freq =
-                        self.contexts[suffix].summ_freq.wrapping_add(2);
+                if self.freq(s) < MAX_FREQ - 9 {
+                    self.set_freq(s, self.freq(s) + 2);
+                    self.set_summ_freq(c, self.summ_freq(c) + 2);
                 }
             }
         }
 
         if self.order_fall == 0 {
-            let Some(context) = self.create_successors()? else {
-                self.init_model(self.max_order)?;
-                return Ok(());
-            };
-            self.max_context = context;
-            self.min_context = context;
-            self.state_mut(self.found_state)?.successor = Successor::context(context)?;
+            match self.create_successors()? {
+                None => self.restart_model(),
+                Some(c) => {
+                    self.min_context = c;
+                    self.max_context = c;
+                    self.set_successor(self.found_state, c);
+                }
+            }
             return Ok(());
         }
 
-        // Match Ppmd7_UpdateModel exactly: advance text first, then check
-        // `text >= UnitsStart`. The previous "check then push" version
-        // restarted one symbol later than the reference, advancing the range
-        // coder by one extra symbol before resetting — which left the
-        // post-restart state out of sync.
-        self.text.try_push(found_symbol)?;
-        let max_successor = Successor::raw(self.text.len())?;
-        if !self.suballoc.text_has_room(self.text.len()) {
-            self.init_model(self.max_order)?;
+        self.set_u8(self.text, fs_symbol);
+        self.text += 1;
+        if self.text > self.text_peak {
+            self.charge_reached()?;
+        }
+        if self.text >= self.units_start {
+            #[cfg(test)]
+            {
+                self.text_restarts += 1;
+            }
+            self.restart_model();
             return Ok(());
         }
-        let (min_context, had_successor) = match fs.successor {
-            Successor::None => {
-                self.state_mut(self.found_state)?.successor = max_successor;
-                (self.min_context, false)
+        let mut max_successor = self.text;
+        let mut min_successor = self.successor(fs);
+        if min_successor != 0 {
+            if min_successor <= max_successor {
+                match self.create_successors()? {
+                    None => {
+                        self.restart_model();
+                        return Ok(());
+                    }
+                    Some(cs) => min_successor = cs,
+                }
             }
-            Successor::Context(context) => (context as usize, true),
-            Successor::Raw(_) => {
-                let Some(context) = self.create_successors()? else {
-                    self.init_model(self.max_order)?;
-                    return Ok(());
-                };
-                (context, true)
-            }
-        };
-        if had_successor {
             self.order_fall -= 1;
-            if self.order_fall == 0 && self.max_context != self.min_context {
-                self.text.pop();
+            if self.order_fall == 0 {
+                max_successor = min_successor;
+                self.text -= u32::from(self.max_context != self.min_context);
             }
+        } else {
+            self.set_successor(fs, max_successor);
+            min_successor = self.min_context;
         }
-        let min_successor = Successor::context(min_context)?;
 
         let mc = self.min_context;
         let mut c = self.max_context;
-        self.min_context = min_context;
-        self.max_context = min_context;
+        self.min_context = min_successor;
+        self.max_context = min_successor;
         if c == mc {
             return Ok(());
         }
-
-        let ns = u32::from(self.contexts[mc].num_stats);
-        let s0 = self.contexts[mc]
-            .summ_freq
-            .checked_sub(ns as u16)
-            .map(u32::from)
-            .and_then(|value| value.checked_sub(fs.freq as u32 - 1))
-            .ok_or(Error::InvalidData("RAR PPMd model frequency is invalid"))?;
-        while c != mc {
-            let ns1 = u32::from(self.contexts[c].num_stats);
+        let ns = self.num_stats(mc);
+        let fs_freq = self.freq(self.found_state);
+        let s0 = self
+            .summ_freq(mc)
+            .wrapping_sub(ns)
+            .wrapping_sub(fs_freq - 1);
+        loop {
+            let ns1 = self.num_stats(c);
             let mut sum;
             if ns1 != 1 {
-                sum = self.contexts[c].summ_freq as u32;
-                sum += u32::from(2 * ns1 < ns) + 2 * u32::from(4 * ns1 <= ns && sum <= 8 * ns1);
+                if ns1 & 1 == 0 {
+                    let old_nu = ns1 >> 1;
+                    let i = self.u2i(old_nu);
+                    if i != self.u2i(old_nu + 1) {
+                        let Some(ptr) = self.alloc_units(i + 1)? else {
+                            self.restart_model();
+                            return Ok(());
+                        };
+                        let old = self.stats(c);
+                        self.mem.copy_within(
+                            old as usize..(old + old_nu * UNIT_SIZE) as usize,
+                            ptr as usize,
+                        );
+                        self.insert_node(old, i);
+                        self.set_u32(c + 4, ptr);
+                    }
+                }
+                sum = self.summ_freq(c);
+                sum += u32::from(2 * ns1 < ns) + 2 * u32::from((4 * ns1 <= ns) & (sum <= 8 * ns1));
             } else {
-                let old = self.states(c)[0];
-                let freq = if old.freq < (MAX_FREQ / 4 - 1) as u8 {
-                    old.freq * 2
-                } else {
-                    (MAX_FREQ - 4) as u8
+                let Some(s) = self.alloc_units(0)? else {
+                    self.restart_model();
+                    return Ok(());
                 };
-                self.states_mut(c)[0].freq = freq;
-                sum = freq as u32 + self.init_esc + u32::from(ns > 3);
+                let one = Self::one_state(c);
+                let mut freq = self.freq(one);
+                self.copy_state(one, s);
+                self.set_u32(c + 4, s);
+                if freq < MAX_FREQ / 4 - 1 {
+                    freq <<= 1;
+                } else {
+                    freq = MAX_FREQ - 4;
+                }
+                self.set_freq(s, freq);
+                sum = freq + self.init_esc + u32::from(ns > 3);
             }
-
-            // sum is at most u16::MAX + 3 here, s0 at most u16::MAX,
-            // and fs.freq at most u8::MAX. Even the largest product is
-            // below 34 million, so u32 arithmetic cannot overflow.
-            let mut cf = (sum + 6) * 2 * fs.freq as u32;
-            let sf = s0 + sum;
-            if sf == 0 {
-                return Err(Error::InvalidData("RAR PPMd model frequency is invalid"));
-            }
+            let s = self.stats(c) + ns1 * 6;
+            let mut cf = 2 * (sum + 6) * fs_freq;
+            let sf = s0.wrapping_add(sum);
+            self.set_u8(s, fs_symbol);
+            self.set_u16(c, (ns1 + 1) as u16);
+            self.set_successor(s, max_successor);
             if cf < 6 * sf {
                 cf = 1 + u32::from(cf > sf) + u32::from(cf >= 4 * sf);
                 sum += 3;
@@ -1675,598 +900,504 @@ impl<B: Budget> PpmdState<B> {
                     + u32::from(cf >= 15 * sf);
                 sum += cf;
             }
-            let old_n = self.contexts[c].num_stats as usize;
-            if !self.grow_state_array(c, old_n + 1)? {
-                self.init_model(self.max_order)?;
+            self.set_summ_freq(c, sum);
+            self.set_freq(s, cf);
+            c = self.suffix(c);
+            if c == mc {
                 return Ok(());
             }
-            self.push_state(
-                c,
-                State {
-                    symbol: found_symbol,
-                    freq: cf as u8,
-                    successor: if self.order_fall == 0 {
-                        min_successor
-                    } else {
-                        max_successor
-                    },
-                },
-            )?;
-            self.contexts[c].summ_freq = u16::try_from(sum)
-                .map_err(|_| Error::InvalidData("RAR PPMd model frequency overflows"))?;
-            c = self.contexts[c].suffix().unwrap_or(mc);
         }
-        Ok(())
     }
 
-    fn create_successors(&mut self) -> Result<Option<usize>> {
-        // Borrow the kept list for the walk and hand it back emptied,
-        // whichever way the walk ends.
-        let allowance = self.contexts.allowance();
-        let mut ps = std::mem::replace(&mut self.successor_scratch, Buffer::new(&allowance));
-        ps.clear();
-        let created = self.create_successors_with(&mut ps);
-        ps.clear();
-        self.successor_scratch = ps;
-        created
-    }
-
-    fn create_successors_with(&mut self, ps: &mut Buffer<StateRef, B>) -> Result<Option<usize>> {
-        // Missing links retain the reference model's restart path. Workspace
-        // refusal is propagated separately and must never restart the model.
-        macro_rules! pressure {
-            ($value:expr) => {
-                match $value {
-                    Some(value) => value,
-                    None => return Ok(None),
-                }
-            };
+    #[cold]
+    fn rescale(&mut self) {
+        let mc = self.min_context;
+        let stats = self.stats(mc);
+        let mut s = self.found_state;
+        if s != stats {
+            let mut tmp = [0u8; 6];
+            tmp.copy_from_slice(&self.mem[s as usize..][..6]);
+            self.mem
+                .copy_within(stats as usize..s as usize, stats as usize + 6);
+            self.mem[stats as usize..][..6].copy_from_slice(&tmp);
+            s = stats;
         }
-        let up_branch = match pressure!(self.state(self.found_state).ok()).successor {
-            Successor::Raw(pos) => pos,
-            Successor::Context(context) if self.order_fall == 0 => {
-                return Ok(Some(context as usize));
-            }
-            _ => return Ok(None),
-        };
-        let mut c = self.min_context;
-        if self.order_fall != 0 {
-            ps.try_push(self.found_state)?;
-        }
-        // Read once: the walk changes neither the found state nor its
-        // context.
-        let found_symbol = pressure!(self.state(self.found_state).ok()).symbol;
-        while let Some(suffix) = self.contexts[c].suffix() {
-            c = suffix;
-            let index = pressure!(self
-                .states(c)
-                .iter()
-                .position(|state| state.symbol == found_symbol));
-            let successor = self.states(c)[index].successor;
-            if successor != Successor::Raw(up_branch) {
-                if let Successor::Context(context) = successor {
-                    c = context as usize;
-                    if ps.is_empty() {
-                        return Ok(Some(c));
+        let mut sum_freq = self.freq(s);
+        let mut esc_freq = self.summ_freq(mc).wrapping_sub(sum_freq);
+        let adder = u32::from(self.order_fall != 0);
+        sum_freq = (sum_freq + 4 + adder) >> 1;
+        let mut i = self.num_stats(mc) - 1;
+        self.set_freq(s, sum_freq);
+        loop {
+            s += 6;
+            let mut freq = self.freq(s);
+            esc_freq = esc_freq.wrapping_sub(freq);
+            freq = (freq + adder) >> 1;
+            sum_freq += freq;
+            self.set_freq(s, freq);
+            if freq > self.freq(s - 6) {
+                let mut tmp = [0u8; 6];
+                tmp.copy_from_slice(&self.mem[s as usize..][..6]);
+                let mut s1 = s;
+                loop {
+                    self.copy_state(s1 - 6, s1);
+                    s1 -= 6;
+                    if s1 == stats || freq <= self.freq(s1 - 6) {
+                        break;
                     }
+                }
+                self.mem[s1 as usize..][..6].copy_from_slice(&tmp);
+            }
+            i -= 1;
+            if i == 0 {
+                break;
+            }
+        }
+        if self.freq(s) == 0 {
+            let mut removed = 0;
+            loop {
+                removed += 1;
+                s -= 6;
+                if self.freq(s) != 0 {
                     break;
                 }
-                return Ok(None);
             }
-            ps.try_push(StateRef { context: c, index })?;
-        }
-        if ps.is_empty() {
-            return Ok(Some(c));
-        }
-        let new_sym = *pressure!(self.text.get(up_branch as usize));
-        let up_successor = Successor::Raw(up_branch + 1);
-        let new_freq = if self.contexts[c].num_stats == 1 {
-            self.states(c)[0].freq
-        } else {
-            let state = pressure!(self.states(c).iter().find(|state| state.symbol == new_sym));
-            let cf = state.freq as u32 - 1;
-            let s0 = self.contexts[c].summ_freq as u32 - u32::from(self.contexts[c].num_stats) - cf;
-            (1 + if 2 * cf <= s0 {
-                u32::from(5 * cf > s0)
-            } else {
-                (2 * cf + 3 * s0 - 1) / (2 * s0)
-            }) as u8
-        };
-        while let Some(state_ref) = ps.pop() {
-            // c is an existing context index; Successor::context below
-            // checks the newly allocated one's representation.
-            let context = pressure!(self.push_context(
-                State {
-                    symbol: new_sym,
-                    freq: new_freq,
-                    successor: up_successor,
-                },
-                Some(c as u32),
-            )?);
-            pressure!(self.state_mut(state_ref).ok()).successor = Successor::context(context)?;
-            c = context;
-        }
-        Ok(Some(c))
-    }
-
-    fn push_context(&mut self, state: State, suffix: Option<u32>) -> Result<Option<usize>> {
-        if self.contexts.len() >= self.max_contexts {
-            return Ok(None);
-        }
-        // CreateSuccessors only creates binary contexts with an inline state.
-        // Admit the real context before consuming its simulated header.
-        self.contexts
-            .reserve_total_capacity(self.contexts.len() + 1)?;
-        let Some(header_offset) = self.suballoc.try_alloc(1, AllocSide::Hi, self.text.len())?
-        else {
-            return Ok(None);
-        };
-        let index = self.contexts.len();
-        self.contexts.push_admitted(Context {
-            stats: Stats::One(state),
-            num_stats: 1,
-            summ_freq: 0,
-            suffix,
-            _header_offset: header_offset,
-            array_offset: NULL_OFFSET,
-        });
-        Ok(Some(index))
-    }
-
-    // Grow a context's state array from its current size → `new_n` states.
-    // Models ExpandUnits: if the same bucket still fits, no realloc happens;
-    // otherwise allocate the new size first, then release the old slot. The
-    // context's array_offset is updated to point at the new block when
-    // moved.
-    fn grow_state_array(&mut self, ctx_idx: usize, new_n: usize) -> Result<bool> {
-        let old_n = self.contexts[ctx_idx].num_stats as usize;
-        let old_units = Self::state_array_units(old_n);
-        let new_units = Self::state_array_units(new_n);
-        // Called only for old_n + 1 during UpdateModel. The new array has
-        // positive size; unchanged bucket sizes are handled below.
-        if old_units > 0 {
-            let old_b = Suballocator::<B>::bucket_for(old_units);
-            let new_b = Suballocator::<B>::bucket_for(new_units);
-            if old_b == new_b {
-                return Ok(true);
+            esc_freq = esc_freq.wrapping_add(removed);
+            let num_stats = self.num_stats(mc);
+            let num_stats_new = num_stats - removed;
+            self.set_u16(mc, num_stats_new as u16);
+            let n0 = (num_stats + 1) >> 1;
+            if num_stats_new == 1 {
+                let mut freq = self.freq(stats);
+                loop {
+                    esc_freq >>= 1;
+                    freq = (freq + 1) >> 1;
+                    if esc_freq <= 1 {
+                        break;
+                    }
+                }
+                let one = Self::one_state(mc);
+                self.copy_state(stats, one);
+                self.set_freq(one, freq);
+                self.found_state = one;
+                let indx = self.u2i(n0);
+                self.insert_node(stats, indx);
+                return;
             }
-        }
-        let text_len = self.text.len();
-        let new_offset = match self.suballoc.try_alloc_reserving_release(
-            new_units,
-            AllocSide::Lo,
-            text_len,
-            Suballocator::<B>::bucket_for(old_units),
-        )? {
-            Some(off) => off,
-            None => return Ok(false),
-        };
-        if old_units > 0 {
-            let old_offset = self.contexts[ctx_idx].array_offset;
-            let bucket = Suballocator::<B>::bucket_for(old_units).expect("old array fits a bucket");
-            self.suballoc.free_lists[bucket].push_admitted(old_offset);
-        }
-        self.contexts[ctx_idx].array_offset = new_offset;
-        Ok(true)
-    }
-
-    // Rescale shrinks a state array. Mirrors Ppmd7_Rescale's branch at
-    // Ppmd7.c:901-919: if the target bucket has a free block, swap to it
-    // (pop i1, push old to i0); otherwise SplitBlock the existing block in
-    // place — the first i1 units stay at the current address as the new
-    // array, the (i0 - i1)-unit residue is bucketed onto smaller free lists.
-    // No bump is consumed on the in-place path, which matters because over
-    // many rescales the reference never grows lo_bump from shrinks.
-    //
-    // Collapse-to-unary (new_n == 1, new_units == 0) is handled by Rescale's
-    // earlier branch (Ppmd7.c:881-898), which frees `stats` at bucket
-    // U2I(n0) and copies the surviving state into the inline OneState slot.
-    fn shrink_state_array(&mut self, ctx_idx: usize, old_n: usize, new_n: usize) -> Result<()> {
-        let old_units = Self::state_array_units(old_n);
-        let new_units = Self::state_array_units(new_n);
-        // Rescale starts with a multi-state context, so old_units is positive.
-        if new_units >= old_units {
-            return Ok(());
-        }
-        if new_units == 0 {
-            // Collapse to unary: free the whole array, clear the pointer.
-            let old_offset = self.contexts[ctx_idx].array_offset;
-            self.suballoc.try_free(old_offset, old_units)?;
-            self.contexts[ctx_idx].array_offset = NULL_OFFSET;
-            return Ok(());
-        }
-        // Contexts contain at most 256 states, so both nonzero array sizes
-        // are in the allocator's 1..=128-unit range.
-        let i0 = Suballocator::<B>::bucket_for(old_units).expect("old array fits a bucket");
-        let i1 = Suballocator::<B>::bucket_for(new_units).expect("new array fits a bucket");
-        if i0 == i1 {
-            return Ok(());
-        }
-        let old_offset = self.contexts[ctx_idx].array_offset;
-        if let Some(&swap_offset) = self.suballoc.free_lists[i1].last() {
-            // Swap path: take a same-sized block from the target bucket,
-            // return the oversized block to its bucket. Data lives in
-            // the state arena, so no MEM_12_CPY needed.
-            self.suballoc.reserve_release(Some(i0))?;
-            self.suballoc.free_lists[i1].pop();
-            self.suballoc.free_lists[i0].push_admitted(old_offset);
-            self.contexts[ctx_idx].array_offset = swap_offset;
-        } else {
-            // SplitBlock in place: keep the first I2U(i1) units at the same
-            // address, bucket the residue. Matches Ppmd7_SplitBlock.
-            let i0_units = Suballocator::<B>::bucket_units(i0) as u32;
-            let i1_units = Suballocator::<B>::bucket_units(i1) as u32;
-            self.suballoc
-                .try_split_in_place(old_offset, i0_units, i1_units)?;
-            // array_offset is unchanged.
-        }
-        Ok(())
-    }
-
-    fn rescale(&mut self) -> Result<()> {
-        let ctx = self.min_context;
-        let original_state_count = self.contexts[ctx].num_stats as usize;
-        let summ_freq = self.contexts[ctx].summ_freq as u32;
-        let adder = u32::from(self.order_fall != 0);
-        let found = self.found_state.index;
-        self.found_state.index = 0;
-        let states = self.states_mut(ctx);
-        // The found state moves to the front, the ones before it back by one.
-        states[..=found].rotate_right(1);
-        let mut sum_freq = states[0].freq as u32;
-        let mut esc_freq = summ_freq - sum_freq;
-        sum_freq = (sum_freq + 4 + adder) >> 1;
-        states[0].freq = sum_freq as u8;
-        for index in 1..states.len() {
-            let freq = states[index].freq as u32;
-            esc_freq -= freq;
-            let freq = (freq + adder) >> 1;
-            sum_freq += freq;
-            states[index].freq = freq as u8;
-            let mut j = index;
-            while j > 0 && states[j].freq > states[j - 1].freq {
-                states.swap(j, j - 1);
-                j -= 1;
-            }
-        }
-        let mut len = states.len();
-        while len > 0 && states[len - 1].freq == 0 {
-            len -= 1;
-            esc_freq += 1;
-        }
-        if len == 1 {
-            let state = &mut states[0];
-            let mut freq = state.freq as u32;
-            while esc_freq > 1 {
-                esc_freq >>= 1;
-                freq = (freq + 1) >> 1;
-            }
-            state.freq = freq as u8;
-            self.shrink_state_array(ctx, original_state_count, 1)?;
-            return self.truncate_states(ctx, 1);
-        }
-        self.contexts[ctx].summ_freq = (sum_freq + esc_freq - (esc_freq >> 1)) as u16;
-        self.shrink_state_array(ctx, original_state_count, len)?;
-        self.truncate_states(ctx, len)
-    }
-
-    fn state(&self, state: StateRef) -> Result<State> {
-        if state.context >= self.contexts.len() {
-            return Err(Error::InvalidData("RAR PPMd state reference is invalid"));
-        }
-        self.states(state.context)
-            .get(state.index)
-            .copied()
-            .ok_or(Error::InvalidData("RAR PPMd state reference is invalid"))
-    }
-
-    fn state_mut(&mut self, state: StateRef) -> Result<&mut State> {
-        if state.context >= self.contexts.len() {
-            return Err(Error::InvalidData("RAR PPMd state reference is invalid"));
-        }
-        self.states_mut(state.context)
-            .get_mut(state.index)
-            .ok_or(Error::InvalidData("RAR PPMd state reference is invalid"))
-    }
-
-    // A context's states, wherever they are kept.
-    #[inline]
-    fn states(&self, context: usize) -> &[State] {
-        let context = &self.contexts[context];
-        match &context.stats {
-            Stats::One(state) => std::slice::from_ref(state),
-            Stats::Many(at) => &self.arena.states[*at as usize..][..context.num_stats as usize],
-        }
-    }
-
-    #[inline]
-    fn states_mut(&mut self, context: usize) -> &mut [State] {
-        let context = &mut self.contexts[context];
-        match &mut context.stats {
-            Stats::One(state) => std::slice::from_mut(state),
-            Stats::Many(at) => &mut self.arena.states[*at as usize..][..context.num_stats as usize],
-        }
-    }
-
-    // Add a state to a context, moving its states to a larger block when
-    // they outgrow theirs.
-    fn push_state(&mut self, context: usize, state: State) -> Result<()> {
-        let Context {
-            stats, num_stats, ..
-        } = self.contexts[context];
-        let n = num_stats as usize;
-        if n >= 256 {
-            return Err(Error::InvalidData("RAR PPMd context has too many states"));
-        }
-        let at = match stats {
-            Stats::One(first) => {
-                let at = self.arena.alloc(StateArena::<B>::class(2))?;
-                self.arena.states[at as usize] = first;
-                at
-            }
-            Stats::Many(at) => {
-                let (old, new) = (StateArena::<B>::class(n), StateArena::<B>::class(n + 1));
-                if old == new {
-                    at
-                } else {
-                    let moved = self.arena.alloc_reserving_release(new, Some(old))?;
-                    let from = at as usize;
-                    self.arena
-                        .states
-                        .copy_within(from..from + n, moved as usize);
-                    self.arena.release_admitted(at, old);
-                    moved
+            let n1 = (num_stats_new + 1) >> 1;
+            if n0 != n1 {
+                let i0 = self.u2i(n0);
+                let i1 = self.u2i(n1);
+                if i0 != i1 {
+                    if self.free_list[i1] != 0 {
+                        let ptr = self.remove_node(i1);
+                        self.set_u32(mc + 4, ptr);
+                        self.mem.copy_within(
+                            stats as usize..(stats + n1 * UNIT_SIZE) as usize,
+                            ptr as usize,
+                        );
+                        self.insert_node(stats, i0);
+                    } else {
+                        self.split_block(stats, i0, i1);
+                    }
                 }
             }
-        };
-        self.arena.states[at as usize + n] = state;
-        let context = &mut self.contexts[context];
-        context.stats = Stats::Many(at);
-        context.num_stats += 1;
-        Ok(())
+        }
+        self.set_summ_freq(mc, sum_freq + esc_freq - (esc_freq >> 1));
+        self.found_state = self.stats(mc);
     }
 
-    // Keep a context's first `len` (at least one) states.
-    fn truncate_states(&mut self, context: usize, len: usize) -> Result<()> {
-        let Context {
-            stats, num_stats, ..
-        } = self.contexts[context];
-        let Stats::Many(at) = stats else {
-            return Ok(());
-        };
-        let old = StateArena::<B>::class(num_stats as usize);
-        if len == 1 {
-            let first = self.arena.states[at as usize];
-            self.arena.release(at, old)?;
-            self.contexts[context].stats = Stats::One(first);
-        } else {
-            self.arena
-                .release_tail(at, old, StateArena::<B>::class(len))?;
+    #[inline(always)]
+    fn make_esc_freq(&mut self, num_masked: u32) -> (SeeRef, u32) {
+        let mc = self.min_context;
+        let num_stats = self.num_stats(mc);
+        if num_stats == 256 {
+            return (SeeRef::Dummy, 1);
         }
-        self.contexts[context].num_stats = len as u16;
-        Ok(())
+        let non_masked = num_stats - num_masked;
+        let row = usize::from(self.ns2indx[non_masked as usize - 1]);
+        let suffix_stats = self.num_stats(self.suffix(mc));
+        let col = u32::from(non_masked < suffix_stats.wrapping_sub(num_stats))
+            + 2 * u32::from(self.summ_freq(mc) < 11 * num_stats)
+            + 4 * u32::from(num_masked > non_masked)
+            + self.hi_bits_flag;
+        let see = &mut self.see[row][col as usize];
+        let r = u32::from(see.summ >> see.shift);
+        see.summ = see.summ.wrapping_sub(r as u16);
+        (SeeRef::Table(row, col as usize), r + u32::from(r == 0))
+    }
+
+    #[inline(always)]
+    fn see(&mut self, see: SeeRef) -> &mut See {
+        match see {
+            SeeRef::Dummy => &mut self.dummy_see,
+            SeeRef::Table(row, col) => &mut self.see[row][col],
+        }
+    }
+
+    #[inline(always)]
+    fn next_context(&mut self) -> Result<()> {
+        let c = self.successor(self.found_state);
+        if self.order_fall == 0 && c > self.text {
+            self.min_context = c;
+            self.max_context = c;
+            return Ok(());
+        }
+        self.update_model()
+    }
+
+    #[inline(always)]
+    fn update1(&mut self) -> Result<()> {
+        let mut s = self.found_state;
+        let freq = self.freq(s) + 4;
+        let mc = self.min_context;
+        self.set_summ_freq(mc, self.summ_freq(mc) + 4);
+        self.set_freq(s, freq);
+        if freq > self.freq(s - 6) {
+            self.swap_states(s, s - 6);
+            s -= 6;
+            self.found_state = s;
+            if freq > MAX_FREQ {
+                self.rescale();
+            }
+        }
+        self.next_context()
+    }
+
+    #[inline(always)]
+    fn update1_0(&mut self) -> Result<()> {
+        let s = self.found_state;
+        let mc = self.min_context;
+        let freq = self.freq(s);
+        let summ_freq = self.summ_freq(mc);
+        self.prev_success = u32::from(2 * freq > summ_freq);
+        self.run_length += self.prev_success as i32;
+        self.set_summ_freq(mc, summ_freq + 4);
+        self.set_freq(s, freq + 4);
+        if freq + 4 > MAX_FREQ {
+            self.rescale();
+        }
+        self.next_context()
+    }
+
+    // The binary context's probability cell, which also records the high
+    // bit of the previous symbol for the SEE contexts that follow.
+    #[inline(always)]
+    fn bin_summ_index(&mut self, mc: u32) -> (usize, usize) {
+        let s = Self::one_state(mc);
+        self.hi_bits_flag = hi_bits_flag3(self.symbol(self.found_state));
+        let row = self.freq(s) as usize - 1;
+        let col = self.prev_success as usize
+            + ((self.run_length >> 26) & 0x20) as usize
+            + usize::from(self.ns2bs_indx[self.num_stats(self.suffix(mc)) as usize - 1])
+            + hi_bits_flag4(self.symbol(s)) as usize
+            + self.hi_bits_flag as usize;
+        (row, col)
+    }
+
+    #[inline(always)]
+    fn update_bin(&mut self, s: u32) -> Result<()> {
+        let freq = self.freq(s);
+        let c = self.successor(s);
+        self.found_state = s;
+        self.prev_success = 1;
+        self.run_length += 1;
+        self.set_freq(s, freq + u32::from(freq < 128));
+        if self.order_fall == 0 && c > self.text {
+            self.min_context = c;
+            self.max_context = c;
+            return Ok(());
+        }
+        self.update_model()
+    }
+
+    #[inline(always)]
+    fn update2(&mut self) -> Result<()> {
+        let s = self.found_state;
+        let freq = self.freq(s) + 4;
+        self.run_length = self.init_rl;
+        let mc = self.min_context;
+        self.set_summ_freq(mc, self.summ_freq(mc) + 4);
+        self.set_freq(s, freq);
+        if freq > MAX_FREQ {
+            self.rescale();
+        }
+        self.update_model()
+    }
+
+    pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
+        if !self.allocated {
+            return Err(Error::InvalidData("RAR PPMd block reuses missing model"));
+        }
+        let mut mask = [0xffu8; 256];
+        let mc = self.min_context;
+        let num_stats = self.num_stats(mc);
+        if num_stats != 1 {
+            let mut s = self.stats(mc);
+            let summ_freq = self.summ_freq(mc);
+            if summ_freq > self.rc.range {
+                return Err(Error::InvalidData("RAR PPMd range is invalid"));
+            }
+            let mut count = self.rc.threshold(summ_freq);
+            let hi_cnt = count;
+            let freq = self.freq(s);
+            count = count.wrapping_sub(freq);
+            if (count as i32) < 0 {
+                self.rc.decode(0, freq);
+                self.rc.normalize(input)?;
+                self.found_state = s;
+                let symbol = self.symbol(s);
+                self.update1_0()?;
+                return Ok(Some(symbol));
+            }
+            self.prev_success = 0;
+            let mut i = num_stats - 1;
+            loop {
+                s += 6;
+                let freq = self.freq(s);
+                count = count.wrapping_sub(freq);
+                if (count as i32) < 0 {
+                    self.rc
+                        .decode(hi_cnt.wrapping_sub(count).wrapping_sub(freq), freq);
+                    self.rc.normalize(input)?;
+                    self.found_state = s;
+                    let symbol = self.symbol(s);
+                    self.update1()?;
+                    return Ok(Some(symbol));
+                }
+                i -= 1;
+                if i == 0 {
+                    break;
+                }
+            }
+            if hi_cnt >= summ_freq {
+                return Err(Error::InvalidData("RAR PPMd frequency sum is invalid"));
+            }
+            let hi_cnt = hi_cnt.wrapping_sub(count);
+            self.rc.decode(hi_cnt, summ_freq - hi_cnt);
+            self.hi_bits_flag = hi_bits_flag3(self.symbol(self.found_state));
+            let stats = self.stats(mc);
+            for k in 0..num_stats {
+                mask[usize::from(self.symbol(stats + 6 * k))] = 0;
+            }
+        } else {
+            let s = Self::one_state(mc);
+            let (row, col) = self.bin_summ_index(mc);
+            let prob = u32::from(self.bin_summ[row][col]);
+            let size0 = (self.rc.range >> 14).wrapping_mul(prob);
+            let prob = prob - ((prob + (1 << (PERIOD_BITS - 2))) >> PERIOD_BITS);
+            if self.rc.code < size0 {
+                self.bin_summ[row][col] = (prob + (1 << INT_BITS)) as u16;
+                self.rc.range = size0;
+                self.rc.normalize(input)?;
+                let symbol = self.symbol(s);
+                self.update_bin(s)?;
+                return Ok(Some(symbol));
+            }
+            self.bin_summ[row][col] = prob as u16;
+            self.init_esc = u32::from(EXP_ESCAPE[(prob >> 10) as usize]);
+            self.rc.low = self.rc.low.wrapping_add(size0);
+            self.rc.code = self.rc.code.wrapping_sub(size0);
+            self.rc.range = (self.rc.range & !(BIN_SCALE - 1)).wrapping_sub(size0);
+            mask[usize::from(self.symbol(s))] = 0;
+            self.prev_success = 0;
+        }
+
+        loop {
+            self.rc.normalize(input)?;
+            let mut mc = self.min_context;
+            let num_masked = self.num_stats(mc);
+            loop {
+                self.order_fall += 1;
+                let suffix = self.suffix(mc);
+                if suffix == 0 {
+                    return Ok(None);
+                }
+                mc = suffix;
+                if self.num_stats(mc) != num_masked {
+                    break;
+                }
+            }
+            let stats = self.stats(mc);
+            let num_stats = self.num_stats(mc);
+            self.min_context = mc;
+            let mut hi_cnt = 0u32;
+            for k in 0..num_stats {
+                let s = stats + 6 * k;
+                hi_cnt += self.freq(s) & u32::from(mask[usize::from(self.symbol(s))]);
+            }
+            let (see, esc_freq) = self.make_esc_freq(num_masked);
+            let freq_sum = esc_freq + hi_cnt;
+            if freq_sum > self.rc.range {
+                return Err(Error::InvalidData("RAR PPMd escape range is invalid"));
+            }
+            let count = self.rc.threshold(freq_sum);
+            if count < hi_cnt {
+                let mut s = stats;
+                let mut left = count;
+                loop {
+                    left = left
+                        .wrapping_sub(self.freq(s) & u32::from(mask[usize::from(self.symbol(s))]));
+                    s += 6;
+                    if (left as i32) < 0 {
+                        break;
+                    }
+                }
+                s -= 6;
+                let freq = self.freq(s);
+                self.rc
+                    .decode(count.wrapping_sub(left).wrapping_sub(freq), freq);
+                self.rc.normalize(input)?;
+                self.see(see).update();
+                self.found_state = s;
+                let symbol = self.symbol(s);
+                self.update2()?;
+                return Ok(Some(symbol));
+            }
+            if count >= freq_sum {
+                return Err(Error::InvalidData("RAR PPMd escape symbol is invalid"));
+            }
+            self.rc.decode(hi_cnt, freq_sum - hi_cnt);
+            let see = self.see(see);
+            see.summ = see.summ.wrapping_add(freq_sum as u16);
+            for k in 0..num_stats {
+                mask[usize::from(self.symbol(stats + 6 * k))] = 0;
+            }
+        }
+    }
+}
+
+// The writer's side: the same model, coding symbols instead of reading them.
+
+#[cfg(any(test, feature = "write"))]
+impl Ppmd7<Allowance> {
+    fn for_encoding(max_order: usize, dictionary_mb: usize) -> Result<Self> {
+        if !(2..=MAX_ORDER).contains(&max_order) {
+            return Err(Error::InvalidData("RAR PPMd order is invalid"));
+        }
+        if !(1..=256).contains(&dictionary_mb) {
+            return Err(Error::InvalidData("RAR PPMd dictionary size is invalid"));
+        }
+        let mut model = Self::with_allowance(&Allowance::default());
+        let size = (dictionary_mb as u32) << 20;
+        model.align = 4u32.wrapping_sub(size) & 3;
+        model.mem = vec![0u8; (model.align + size) as usize];
+        model.size = size;
+        model.max_order = max_order as u32;
+        model.restart_model();
+        model.mark_reach();
+        model.allocated = true;
+        Ok(model)
+    }
+
+    fn encode_symbol(&mut self, symbol: u8, out: &mut RangeEncoder) -> Result<()> {
+        let mut mask = [0xffu8; 256];
+        let mc = self.min_context;
+        let num_stats = self.num_stats(mc);
+        if num_stats != 1 {
+            let summ_freq = self.summ_freq(mc);
+            let stats = self.stats(mc);
+            let mut start = 0u32;
+            for k in 0..num_stats {
+                let s = stats + 6 * k;
+                let freq = self.freq(s);
+                if self.symbol(s) == symbol {
+                    out.encode(start, freq, summ_freq);
+                    out.normalize();
+                    self.found_state = s;
+                    if k == 0 {
+                        return self.update1_0();
+                    }
+                    self.prev_success = 0;
+                    return self.update1();
+                }
+                start += freq;
+            }
+            if start >= summ_freq {
+                return Err(Error::InvalidData("RAR PPMd frequency sum is invalid"));
+            }
+            self.prev_success = 0;
+            out.encode(start, summ_freq - start, summ_freq);
+            self.hi_bits_flag = hi_bits_flag3(self.symbol(self.found_state));
+            for k in 0..num_stats {
+                mask[usize::from(self.symbol(stats + 6 * k))] = 0;
+            }
+        } else {
+            let s = Self::one_state(mc);
+            let (row, col) = self.bin_summ_index(mc);
+            let prob = u32::from(self.bin_summ[row][col]);
+            let size0 = (out.range >> 14).wrapping_mul(prob);
+            let prob = prob - ((prob + (1 << (PERIOD_BITS - 2))) >> PERIOD_BITS);
+            if self.symbol(s) == symbol {
+                self.bin_summ[row][col] = (prob + (1 << INT_BITS)) as u16;
+                out.range = size0;
+                out.normalize();
+                return self.update_bin(s);
+            }
+            self.bin_summ[row][col] = prob as u16;
+            self.init_esc = u32::from(EXP_ESCAPE[(prob >> 10) as usize]);
+            out.low = out.low.wrapping_add(size0);
+            out.range = (out.range & !(BIN_SCALE - 1)).wrapping_sub(size0);
+            mask[usize::from(self.symbol(s))] = 0;
+            self.prev_success = 0;
+        }
+
+        loop {
+            out.normalize();
+            let mut mc = self.min_context;
+            let num_masked = self.num_stats(mc);
+            loop {
+                self.order_fall += 1;
+                let suffix = self.suffix(mc);
+                if suffix == 0 {
+                    return Err(Error::InvalidData("RAR PPMd symbol is not encodable"));
+                }
+                mc = suffix;
+                if self.num_stats(mc) != num_masked {
+                    break;
+                }
+            }
+            let stats = self.stats(mc);
+            let num_stats = self.num_stats(mc);
+            self.min_context = mc;
+            let mut hi_cnt = 0u32;
+            for k in 0..num_stats {
+                let s = stats + 6 * k;
+                hi_cnt += self.freq(s) & u32::from(mask[usize::from(self.symbol(s))]);
+            }
+            let (see, esc_freq) = self.make_esc_freq(num_masked);
+            let freq_sum = esc_freq + hi_cnt;
+            let mut start = 0u32;
+            for k in 0..num_stats {
+                let s = stats + 6 * k;
+                let offered = self.freq(s) & u32::from(mask[usize::from(self.symbol(s))]);
+                if offered != 0 && self.symbol(s) == symbol {
+                    out.encode(start, offered, freq_sum);
+                    out.normalize();
+                    self.see(see).update();
+                    self.found_state = s;
+                    return self.update2();
+                }
+                start += offered;
+            }
+            out.encode(hi_cnt, freq_sum - hi_cnt, freq_sum);
+            let see = self.see(see);
+            see.summ = see.summ.wrapping_add(freq_sum as u16);
+            for k in 0..num_stats {
+                mask[usize::from(self.symbol(stats + 6 * k))] = 0;
+            }
+        }
     }
 }
 
 #[cfg(any(test, feature = "write"))]
-impl PpmdEncoder {
-    pub fn new(max_order: usize, esc_char: u8, dictionary_mb: usize) -> Result<Self> {
-        if !(2..=64).contains(&max_order) {
-            return Err(Error::InvalidData("RAR PPMd order is invalid"));
-        }
-        if dictionary_mb == 0 {
-            return Err(Error::InvalidData("RAR PPMd dictionary size is invalid"));
-        }
-        let mut model = PpmdDecoder::new();
-        model.state.max_contexts = model_context_limit(dictionary_mb);
-        model
-            .state
-            .suballoc
-            .reset(dictionary_mb.saturating_mul(1024 * 1024));
-        model.state.init_model(max_order)?;
-        model.state.allocated = true;
-        Ok(Self {
-            model,
-            range: RangeEncoder::new(),
-            esc_char,
-        })
-    }
-
-    /// Carries a model from one block into the next.
-    ///
-    /// A block that clears the reset bit in its header leaves the reader's
-    /// model alone and only re-reads the range coder, so a solid chain can keep
-    /// one model across every member in it. Each block still gets a fresh range
-    /// coder, which is what lets a member's packed bytes start on a byte
-    /// boundary of their own.
-    #[cfg(feature = "write")]
-    pub fn continuing(model: PpmdDecoder, esc_char: u8) -> Self {
-        Self {
-            model,
-            range: RangeEncoder::new(),
-            esc_char,
-        }
-    }
-
-    /// The bytes coded so far; a carryless coder never revises them.
-    #[cfg(feature = "write")]
-    pub(crate) fn take_output(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.range.out)
-    }
-
-    /// Ends the block and hands the model back for the next one to continue.
-    pub fn finish_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
-        self.model
-            .state
-            .encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.state.encode_symbol(2, &mut self.range)?;
-        Ok((self.range.finish(), self.model))
-    }
-
-    /// Ends this PPMd block while keeping the member open for another block.
-    #[cfg(all(test, feature = "write"))]
-    pub(crate) fn finish_block_keeping_model(mut self) -> Result<(Vec<u8>, PpmdDecoder)> {
-        self.model
-            .state
-            .encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.state.encode_symbol(0, &mut self.range)?;
-        Ok((self.range.finish(), self.model))
-    }
-
-    #[cfg(all(test, feature = "write"))]
-    pub(crate) fn finish_with_command(self, command: u8) -> Result<Vec<u8>> {
-        self.finish_with_command_prefix(command, &[])
-    }
-
-    #[cfg(all(test, feature = "write"))]
-    pub(crate) fn finish_with_command_prefix(
-        mut self,
-        command: u8,
-        parameters: &[u8],
-    ) -> Result<Vec<u8>> {
-        self.model
-            .state
-            .encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.state.encode_symbol(command, &mut self.range)?;
-        for &parameter in parameters {
-            self.model.state.encode_symbol(parameter, &mut self.range)?;
-        }
-        Ok(self.range.finish())
-    }
-
-    pub fn encode_literal(&mut self, symbol: u8) -> Result<()> {
-        self.model.state.encode_symbol(symbol, &mut self.range)?;
-        if symbol == self.esc_char {
-            self.model.state.encode_symbol(1, &mut self.range)?;
-        }
-        Ok(())
-    }
-
-    pub fn encode_repeat_offset_one(&mut self, length: usize) -> Result<()> {
-        if !(4..=259).contains(&length) {
-            return Err(Error::InvalidData(
-                "RAR PPMd offset-one repeat length is invalid",
-            ));
-        }
-        self.model
-            .state
-            .encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.state.encode_symbol(5, &mut self.range)?;
-        self.model
-            .state
-            .encode_symbol((length - 4) as u8, &mut self.range)?;
-        Ok(())
-    }
-
-    pub fn encode_match(&mut self, offset: usize, length: usize) -> Result<()> {
-        if !(2..=0x1000001).contains(&offset) || !(32..=287).contains(&length) {
-            return Err(Error::InvalidData("RAR PPMd match is invalid"));
-        }
-        let encoded_offset = offset - 2;
-        self.model
-            .state
-            .encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.state.encode_symbol(4, &mut self.range)?;
-        self.model
-            .state
-            .encode_symbol(((encoded_offset >> 16) & 0xff) as u8, &mut self.range)?;
-        self.model
-            .state
-            .encode_symbol(((encoded_offset >> 8) & 0xff) as u8, &mut self.range)?;
-        self.model
-            .state
-            .encode_symbol((encoded_offset & 0xff) as u8, &mut self.range)?;
-        self.model
-            .state
-            .encode_symbol((length - 32) as u8, &mut self.range)?;
-        Ok(())
-    }
-
-    #[cfg(feature = "write")]
-    pub fn encode_vm_filter_record(&mut self, record: &[u8]) -> Result<()> {
-        self.model
-            .state
-            .encode_symbol(self.esc_char, &mut self.range)?;
-        self.model.state.encode_symbol(3, &mut self.range)?;
-        for &byte in record {
-            self.model.state.encode_symbol(byte, &mut self.range)?;
-        }
-        Ok(())
-    }
-
-    /// Bits spent so far, to fractional precision. log2 of the range register
-    /// falls as symbols narrow the interval and rises by eight for every byte
-    /// normalisation flushes, so the difference between two readings is the
-    /// cost of whatever was coded between them. The RAR 2.9 tokeniser reads
-    /// this to price escape tokens against the literals they would replace.
-    #[cfg(feature = "write")]
-    pub(crate) fn spent_bits(&self) -> f64 {
-        8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
+impl Clone for Ppmd7<Allowance> {
+    fn clone(&self) -> Self {
+        self.try_clone().expect("unlimited PPMd model copy")
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SeeRef {
-    Dummy,
-    Table(usize, usize),
-}
-
-#[cfg(test)]
-impl RangeDecoder {
-    fn new() -> Self {
-        Self {
-            range: 0xffff_ffff,
-            code: 0,
-            low: 0,
-        }
-    }
-
-    fn init(&mut self, input: &mut impl PpmdByteReader) -> Result<()> {
-        self.code = 0;
-        self.range = 0xffff_ffff;
-        self.low = 0;
-        for _ in 0..4 {
-            self.code = (self.code << 8) | input.read_ppmd_byte()? as u32;
-        }
-        if self.code == 0xffff_ffff {
-            return Err(Error::InvalidData("RAR PPMd range code is invalid"));
-        }
-        Ok(())
-    }
-
-    fn get_threshold(&mut self, total: u32) -> Result<u32> {
-        if total == 0 {
-            return Err(Error::InvalidData("RAR PPMd frequency sum is zero"));
-        }
-        self.range /= total;
-        Ok(self.code.wrapping_sub(self.low) / self.range)
-    }
-
-    fn decode(&mut self, start: u32, size: u32) {
-        let start = start.wrapping_mul(self.range);
-        self.low = self.low.wrapping_add(start);
-        self.range = self.range.wrapping_mul(size);
-    }
-
-    fn decode_bit0(&mut self, size0: u32) {
-        self.range = size0;
-    }
-
-    fn decode_bit1(&mut self, size0: u32) {
-        self.low = self.low.wrapping_add(size0);
-        self.range = (self.range & !(BIN_SCALE - 1)).wrapping_sub(size0);
-    }
-
-    fn normalize(&mut self, input: &mut impl PpmdByteReader) -> Result<()> {
-        while normalize_range(self.low, &mut self.range) {
-            self.code = (self.code << 8) | input.read_ppmd_byte()? as u32;
-            self.range <<= 8;
-            self.low <<= 8;
-        }
-        Ok(())
-    }
-}
-
+// Subbotin's carryless range coder, writing what `RangeDecoder` reads.
 #[derive(Debug, Clone)]
 #[cfg(any(test, feature = "write"))]
 struct RangeEncoder {
@@ -2280,7 +1411,7 @@ impl RangeEncoder {
     fn new() -> Self {
         Self {
             low: 0,
-            range: 0xffff_ffff,
+            range: u32::MAX,
             out: Vec::new(),
         }
     }
@@ -2291,17 +1422,14 @@ impl RangeEncoder {
         self.range = self.range.wrapping_mul(size);
     }
 
-    fn encode_bit0(&mut self, size0: u32) {
-        self.range = size0;
-    }
-
-    fn encode_bit1(&mut self, size0: u32) {
-        self.low = self.low.wrapping_add(size0);
-        self.range = (self.range & !(BIN_SCALE - 1)).wrapping_sub(size0);
-    }
-
     fn normalize(&mut self) {
-        while normalize_range(self.low, &mut self.range) {
+        loop {
+            if (self.low ^ self.low.wrapping_add(self.range)) >= TOP {
+                if self.range >= BOT {
+                    return;
+                }
+                self.range = self.low.wrapping_neg() & (BOT - 1);
+            }
             self.out.push((self.low >> 24) as u8);
             self.range <<= 8;
             self.low <<= 8;
@@ -2317,138 +1445,147 @@ impl RangeEncoder {
     }
 }
 
-fn normalize_range(low: u32, range: &mut u32) -> bool {
-    if (low ^ low.wrapping_add(*range)) < TOP {
-        return true;
-    }
-    if *range >= BOT {
-        return false;
-    }
-    *range = low.wrapping_neg() & (BOT - 1);
-    true
+/// A PPMd model handed from one block to the next in a solid chain.
+#[derive(Debug, Clone)]
+#[cfg(any(test, feature = "write"))]
+pub struct PpmdModel {
+    state: Ppmd7<Allowance>,
 }
 
-fn update_prob_1(prob: u32) -> u32 {
-    prob - ((prob + (1 << 5)) >> INT_BITS)
+/// Codes one RAR 2.9 PPMd block: literals and the escape commands the
+/// reader understands.
+#[derive(Debug, Clone)]
+#[cfg(any(test, feature = "write"))]
+pub struct PpmdEncoder {
+    model: PpmdModel,
+    range: RangeEncoder,
+    esc_char: u8,
 }
 
-fn hi_bits_flag(symbol: u8, bits: u32) -> u32 {
-    ((symbol as u32 + 0xc0) >> (8 - bits)) & (1 << bits)
-}
+#[cfg(any(test, feature = "write"))]
+impl PpmdEncoder {
+    pub fn new(max_order: usize, esc_char: u8, dictionary_mb: usize) -> Result<Self> {
+        Ok(Self {
+            model: PpmdModel {
+                state: Ppmd7::for_encoding(max_order, dictionary_mb)?,
+            },
+            range: RangeEncoder::new(),
+            esc_char,
+        })
+    }
 
-#[cfg(test)]
-impl Default for Suballocator<Allowance> {
-    fn default() -> Self {
-        Self::with_allowance(&Allowance::default())
-    }
-}
-#[cfg(test)]
-impl Suballocator<Allowance> {
-    fn alloc(&mut self, units: usize, side: AllocSide, text_len_bytes: usize) -> Option<u32> {
-        self.try_alloc(units, side, text_len_bytes)
-            .expect("unlimited arena allocation")
-    }
-    fn free(&mut self, offset: u32, units: usize) {
-        self.try_free(offset, units).unwrap();
-    }
-    fn split_in_place(&mut self, base: u32, old: u32, new: u32) {
-        self.try_split_in_place(base, old, new).unwrap();
-    }
-    fn glue(&mut self) {
-        self.glue_inner().expect("unlimited glue maintenance");
-    }
-}
-/// Keep the glue walk's original order while admitting an exact allocation
-/// for its offset lookup. The last original entry wins for duplicate offsets,
-/// matching the previous map's insert semantics without opaque hash-table RAM.
-struct GlueIndex<B: Budget> {
-    entries: Buffer<Option<(u32, u32)>, B>,
-}
-impl<B: Budget> GlueIndex<B> {
-    fn new(
-        list: &[(u32, u32)],
-        allowance: &B,
-        control: &crate::read_control::ReadControl,
-    ) -> Result<Self> {
-        control.check_codec()?;
-        if list.is_empty() {
-            return Ok(Self {
-                entries: Buffer::new(allowance),
-            });
-        }
-        let count = list
-            .len()
-            .checked_mul(2)
-            .and_then(usize::checked_next_power_of_two)
-            .ok_or(Error::InvalidData("PPMd glue lookup size overflows"))?;
-        let mut out = Self {
-            entries: Buffer::filled(count, None, allowance)?,
-        };
-        let mut poller = control.poller();
-        for &(offset, units) in list {
-            poller.check_codec(0)?;
-            out.insert(offset, units);
-        }
-        Ok(out)
-    }
-    fn hash(mut value: u32) -> usize {
-        value ^= value >> 16;
-        value = value.wrapping_mul(0x85eb_ca6b);
-        value ^= value >> 13;
-        value = value.wrapping_mul(0xc2b2_ae35);
-        (value ^ (value >> 16)) as usize
-    }
-    fn slot(&self, offset: u32) -> Option<usize> {
-        if self.entries.is_empty() {
-            return None;
-        }
-        let mask = self.entries.len() - 1;
-        let mut index = Self::hash(offset) & mask;
-        loop {
-            match self.entries[index] {
-                Some((key, _)) if key != offset => index = (index + 1) & mask,
-                _ => return Some(index),
-            }
+    /// Carries a model from one block into the next.
+    ///
+    /// A block that clears the reset bit in its header leaves the reader's
+    /// model alone and only re-reads the range coder, so a solid chain can keep
+    /// one model across every member in it. Each block still gets a fresh range
+    /// coder, which is what lets a member's packed bytes start on a byte
+    /// boundary of their own.
+    #[cfg(feature = "write")]
+    pub fn continuing(model: PpmdModel, esc_char: u8) -> Self {
+        Self {
+            model,
+            range: RangeEncoder::new(),
+            esc_char,
         }
     }
-    fn get(&self, offset: &u32) -> Option<&u32> {
-        self.entries[self.slot(*offset)?]
-            .as_ref()
-            .map(|(_, units)| units)
-    }
-    fn insert(&mut self, offset: u32, units: u32) {
-        let index = self
-            .slot(offset)
-            .expect("glue inserts into a nonempty lookup");
-        self.entries[index] = Some((offset, units));
-    }
-}
 
-// Upper bound on the number of live context records. The C reference
-// (Ppmd7.c) has NO independent context cap — model restart is driven solely
-// by suballocator exhaustion (`Ppmd7_AllocUnits`/`AllocUnitsRare` returning
-// NULL). A context header is one 12-byte unit, and headers + state arrays
-// share the pool, so the live context count can never exceed `pool_units`
-// (= Size / UNIT_SIZE). Sizing the cap to that makes the suballocator the
-// binding constraint, exactly as in the reference, while still bounding Vec
-// growth defensively. A smaller cap (the old Size/16) forced a premature
-// RestartModel that desynchronised the decoder from the reference.
-fn model_context_limit(dictionary_mb: usize) -> usize {
-    dictionary_mb
-        .saturating_mul(1024 * 1024)
-        .checked_div(ALLOC_UNIT_BYTES)
-        .unwrap_or(usize::MAX)
-        .max(MIN_MODEL_CONTEXTS)
+    fn code(&mut self, symbol: u8) -> Result<()> {
+        self.model.state.encode_symbol(symbol, &mut self.range)
+    }
+
+    /// The bytes coded so far; a carryless coder never revises them.
+    #[cfg(feature = "write")]
+    pub(crate) fn take_output(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.range.out)
+    }
+
+    /// Ends the block and hands the model back for the next one to continue.
+    pub fn finish_keeping_model(mut self) -> Result<(Vec<u8>, PpmdModel)> {
+        self.code(self.esc_char)?;
+        self.code(2)?;
+        Ok((self.range.finish(), self.model))
+    }
+
+    /// Ends this PPMd block while keeping the member open for another block.
+    #[cfg(all(test, feature = "write"))]
+    pub(crate) fn finish_block_keeping_model(mut self) -> Result<(Vec<u8>, PpmdModel)> {
+        self.code(self.esc_char)?;
+        self.code(0)?;
+        Ok((self.range.finish(), self.model))
+    }
+
+    #[cfg(all(test, feature = "write"))]
+    pub(crate) fn finish_with_command(self, command: u8) -> Result<Vec<u8>> {
+        self.finish_with_command_prefix(command, &[])
+    }
+
+    #[cfg(all(test, feature = "write"))]
+    pub(crate) fn finish_with_command_prefix(
+        mut self,
+        command: u8,
+        parameters: &[u8],
+    ) -> Result<Vec<u8>> {
+        self.code(self.esc_char)?;
+        self.code(command)?;
+        for &parameter in parameters {
+            self.code(parameter)?;
+        }
+        Ok(self.range.finish())
+    }
+
+    pub fn encode_literal(&mut self, symbol: u8) -> Result<()> {
+        self.code(symbol)?;
+        if symbol == self.esc_char {
+            self.code(1)?;
+        }
+        Ok(())
+    }
+
+    pub fn encode_repeat_offset_one(&mut self, length: usize) -> Result<()> {
+        if !(4..=259).contains(&length) {
+            return Err(Error::InvalidData(
+                "RAR PPMd offset-one repeat length is invalid",
+            ));
+        }
+        self.code(self.esc_char)?;
+        self.code(5)?;
+        self.code((length - 4) as u8)
+    }
+
+    pub fn encode_match(&mut self, offset: usize, length: usize) -> Result<()> {
+        if !(2..=0x1000001).contains(&offset) || !(32..=287).contains(&length) {
+            return Err(Error::InvalidData("RAR PPMd match is invalid"));
+        }
+        let encoded_offset = offset - 2;
+        self.code(self.esc_char)?;
+        self.code(4)?;
+        self.code(((encoded_offset >> 16) & 0xff) as u8)?;
+        self.code(((encoded_offset >> 8) & 0xff) as u8)?;
+        self.code((encoded_offset & 0xff) as u8)?;
+        self.code((length - 32) as u8)
+    }
+
+    #[cfg(feature = "write")]
+    pub fn encode_vm_filter_record(&mut self, record: &[u8]) -> Result<()> {
+        self.code(self.esc_char)?;
+        self.code(3)?;
+        for &byte in record {
+            self.code(byte)?;
+        }
+        Ok(())
+    }
+
+    /// Bits spent so far, to fractional precision. log2 of the range register
+    /// falls as symbols narrow the interval and rises by eight for every byte
+    /// normalisation flushes, so the difference between two readings is the
+    /// cost of whatever was coded between them. The RAR 2.9 tokeniser reads
+    /// this to price escape tokens against the literals they would replace.
+    #[cfg(feature = "write")]
+    pub(crate) fn spent_bits(&self) -> f64 {
+        8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
+    }
 }
 
 #[cfg(test)]
 mod tests;
-
-#[cfg(test)]
-mod arena_tests;
-
-#[cfg(test)]
-mod allocation_failure_tests;
-
-#[cfg(test)]
-mod suballocator_failure_tests;

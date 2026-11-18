@@ -293,7 +293,7 @@ impl<T, B: Budget> Buffer<T, B> {
         *self = replacement;
         Ok(())
     }
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(feature = "write")]
     pub(crate) fn reserve_total_capacity(&mut self, total: usize) -> Result<()> {
         if total > self.values.capacity() {
             self.reserve(total.saturating_sub(self.values.len()))?;
