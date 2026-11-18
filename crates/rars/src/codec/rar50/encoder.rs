@@ -879,12 +879,18 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
 /// block when the run starts the member; nothing is trimmed. The match finder
 /// then collects what the job's own would, which is what keeps the output
 /// unchanged (#276).
+///
+/// A filtered run passes the blocks and records [`filter_run_in_place`] gave
+/// it, over a window already holding its filtered bytes. Its own encode,
+/// [`encode_filtered_run`], parses those blocks with the same collector, so
+/// long as the run does not start its member: there it searches a tree.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn streaming_blocks_with_finder<B: Budget>(
     window: &[u8],
     start: usize,
     finder: crate::codec::packed_chain::PackedMatchFinder<B>,
     blocks: &[(usize, bool)],
+    records: Option<&[Buffer<EncodeFilter, B>]>,
     algorithm_version: u8,
     options: EncodeOptions,
     block_done: Option<&mut dyn FnMut(usize) -> bool>,
@@ -895,12 +901,17 @@ pub(crate) fn streaming_blocks_with_finder<B: Budget>(
             "RAR 5 shared finder needs an optimal parse within its window",
         ));
     }
+    if records.is_some() && start == 0 {
+        return Err(Error::InvalidData(
+            "RAR 5 filtered run at its member's start searches a tree",
+        ));
+    }
     streaming_blocks_from(
         window,
         start,
         Some(finder),
         blocks,
-        None,
+        records,
         algorithm_version,
         options,
         block_done,
@@ -1061,6 +1072,34 @@ pub(crate) fn filtered_run_bytes<B: Budget>(
     let mut filtered = Buffer::copied(data, allowance)?;
     filter_blocks_in_place(&mut filtered, filters, file_offset, allowance)?;
     Ok(filtered)
+}
+
+/// Each block a filtered run is coded in, by its end in the run and whether
+/// it is the member's last, and the filter records it opens with.
+pub(crate) type FilteredRunBlocks<B> =
+    (Buffer<(usize, bool), B>, Buffer<Buffer<EncodeFilter, B>, B>);
+
+/// Transforms a run in place into the bytes [`encode_filtered_run`] codes,
+/// and returns the blocks it codes them in, in the form
+/// [`streaming_blocks_with_finder`] takes. A run in a window shared with its
+/// neighbours is filtered where it lies, so the window holds what the
+/// decoder's will.
+pub(crate) fn filter_run_in_place<B: Budget>(
+    data: &mut [u8],
+    filters: &[crate::FilterSpec],
+    file_offset: usize,
+    is_last: bool,
+    allowance: &B,
+) -> Result<FilteredRunBlocks<B>> {
+    let len = data.len();
+    let blocks = filter_blocks_in_place(data, filters, file_offset, allowance)?;
+    let mut ends = Buffer::with_capacity(blocks.len(), allowance)?;
+    let mut records = Buffer::with_capacity(blocks.len(), allowance)?;
+    for (block, block_records) in blocks {
+        ends.push_admitted((block.end, is_last && block.end == len));
+        records.push_admitted(block_records);
+    }
+    Ok((ends, records))
 }
 
 /// One run of a member, `file_offset` bytes in, with `filters` ranged over the
