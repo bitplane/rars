@@ -655,12 +655,13 @@ fn write_archive_to(
         total_work,
     );
 
+    let header_key = header_password.map(HeaderKey::derive).transpose()?;
     let result = write_members_to(
         members,
         options,
         &coding,
         archive_comment,
-        header_password,
+        header_key.as_ref(),
         archive_comment_password,
         resources,
         &work,
@@ -680,20 +681,21 @@ fn write_members_to(
     options: WriterOptions,
     coding: &MemberCoding,
     archive_comment: Option<&[u8]>,
-    header_password: Option<&[u8]>,
+    header_key: Option<&HeaderKey>,
     archive_comment_password: Option<&[u8]>,
     resources: &WriterResources,
     progress: &WorkTracker<'_>,
     sink: &mut Sink<'_, '_>,
 ) -> Result<()> {
     let stream_above = sink.stream_above();
+    let mut data_keys = DataKeys::default();
     let output = sink.writer();
     output.write_all(RAR15_SIGNATURE)?;
     let mut main_flags = 0;
     if options.features.solid {
         main_flags |= MHD_SOLID;
     }
-    if header_password.is_some() {
+    if header_key.is_some() {
         main_flags |= MHD_PASSWORD;
     }
     if archive_comment.is_some() && uses_old_style_archive_comment(options.target) {
@@ -703,19 +705,20 @@ fn write_members_to(
     write_main_header(&mut head, main_flags);
     output.write_all(&head)?;
     if !uses_old_style_archive_comment(options.target) {
-        write_producer(output, options.target, header_password, progress.reporter())?;
+        write_producer(output, options.target, header_key, progress.reporter())?;
     }
     write_archive_comment(
         output,
         archive_comment,
         options,
-        header_password,
+        header_key,
         archive_comment_password,
+        &mut data_keys,
     )?;
     // Old-style comments must immediately follow the main header. Readers look
     // there directly when MHD_COMMENT is set, rather than scanning subblocks.
     if uses_old_style_archive_comment(options.target) {
-        write_producer(output, options.target, header_password, progress.reporter())?;
+        write_producer(output, options.target, header_key, progress.reporter())?;
     }
 
     // Solid members share one encoder, so they are coded in order. Independent
@@ -752,7 +755,8 @@ fn write_members_to(
                 encoded,
                 options,
                 solid_continuation,
-                header_password,
+                header_key,
+                &mut data_keys,
                 progress.reporter(),
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
@@ -771,7 +775,9 @@ fn write_members_to(
             window,
             |member| {
                 let streamed = match stream_above {
-                    Some(above) => streams_member(member, options, coding, header_password, above),
+                    Some(above) => {
+                        streams_member(member, options, coding, header_key.is_some(), above)
+                    }
                     None => Ok(false),
                 };
                 match streamed {
@@ -792,7 +798,8 @@ fn write_members_to(
                         encoded,
                         options,
                         false,
-                        header_password,
+                        header_key,
+                        &mut data_keys,
                         progress.reporter(),
                     ),
                     None => match sink {
@@ -811,8 +818,8 @@ fn write_members_to(
         )?;
     }
     let output = sink.writer();
-    if let Some(password) = header_password {
-        write_encrypted_end_block(output, &end_block(ENDARC_FLAGS), password)?;
+    if let Some(key) = header_key {
+        write_encrypted_end_block(output, &end_block(ENDARC_FLAGS), key)?;
     } else if writes_end_block(options.target) {
         output.write_all(&end_block(ENDARC_FLAGS))?;
     }
@@ -1727,11 +1734,11 @@ fn streams_member(
     member: &Member<'_>,
     options: WriterOptions,
     coding: &MemberCoding,
-    header_password: Option<&[u8]>,
+    header_encrypted: bool,
     stream_above: u64,
 ) -> Result<bool> {
     let level = compression_method_for_level(options).saturating_sub(0x30);
-    if header_password.is_some()
+    if header_encrypted
         || member.password.is_some()
         || member.is_directory
         || member.is_symlink
@@ -2020,21 +2027,28 @@ impl<R: Read + ?Sized> Read for CrcReader<'_, R> {
 }
 
 /// Writes one member's header and payload, encrypting either if asked.
+#[allow(clippy::too_many_arguments)]
 fn write_member(
     output: &mut dyn Write,
     member: &Member<'_>,
     encoded: EncodedMember<'_>,
     options: WriterOptions,
     solid_continuation: bool,
-    header_password: Option<&[u8]>,
+    header_key: Option<&HeaderKey>,
+    data_keys: &mut DataKeys,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
     let target = options.target;
     crate::write_progress::check_cancelled(progress)?;
     let (payload, salt) = match encoded.payload {
         MemberPayload::Packed(mut packed) => {
-            let salt =
-                encrypt_packed_data_with_progress(&mut packed, target, member.password, progress)?;
+            let salt = encrypt_packed_data_with_progress(
+                &mut packed,
+                target,
+                member.password,
+                data_keys,
+                progress,
+            )?;
             (MemberPayload::Packed(packed), salt)
         }
         // Unencrypted by construction, so the stored bytes are their own
@@ -2054,8 +2068,8 @@ fn write_member(
             packed_size,
         },
     )?;
-    match header_password {
-        Some(password) => write_encrypted_header(output, &header, password)?,
+    match header_key {
+        Some(key) => write_encrypted_header(output, &header, key)?,
         None => output.write_all(&header)?,
     }
     if matches!(payload, MemberPayload::Copied(_)) {
@@ -2836,19 +2850,21 @@ fn encrypt_packed_data_for_writer(
     data: &mut Vec<u8>,
     target: ArchiveVersion,
     password: Option<&[u8]>,
+    keys: &mut DataKeys,
 ) -> Result<Option<[u8; 8]>> {
-    encrypt_packed_data_with_progress(data, target, password, None)
+    encrypt_packed_data_with_progress(data, target, password, keys, None)
 }
 
 fn encrypt_packed_data_with_progress(
     data: &mut Vec<u8>,
     target: ArchiveVersion,
     password: Option<&[u8]>,
+    keys: &mut DataKeys,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<Option<[u8; 8]>> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (data, target);
+        let _ = (data, target, keys);
         crate::write_progress::check_cancelled(progress)?;
         if password.is_none() {
             Ok(None)
@@ -2887,13 +2903,11 @@ fn encrypt_packed_data_with_progress(
                 Ok(None)
             }
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-                let salt = random_rar30_salt()?;
+                let (salt, mut cipher) = keys.rar30(password)?;
                 // Byte vectors are bounded by isize::MAX, so adding 15 fits usize.
                 let padded_len = checked_align16(data.len(), RAR15_ALIGN_OVERFLOW)
                     .expect("byte vector length plus padding fits usize");
                 data.resize(padded_len, 0);
-                let mut cipher = Rar30Cipher::new(password, Some(salt))
-                    .map_err(super::map_rar30_crypto_error)?;
                 for chunk in data.chunks_mut(64 * 1024) {
                     crate::write_progress::check_cancelled(progress)?;
                     cipher
@@ -2918,6 +2932,66 @@ fn random_rar30_salt() -> Result<[u8; 8]> {
         "RAR 3.x writer could not generate encryption salt",
     )?;
     Ok(salt)
+}
+
+#[cfg(feature = "encryption")]
+fn salted_rar30_cipher(password: &[u8]) -> Result<([u8; 8], Rar30Cipher)> {
+    let salt = random_rar30_salt()?;
+    let cipher = Rar30Cipher::new(password, Some(salt)).map_err(super::map_rar30_crypto_error)?;
+    Ok((salt, cipher))
+}
+
+/// One data salt per password across a write and its volumes, as RAR does.
+#[derive(Default)]
+struct DataKeys {
+    #[cfg(feature = "encryption")]
+    derived: Vec<(zeroize::Zeroizing<Vec<u8>>, [u8; 8], Rar30Cipher)>,
+}
+
+#[cfg(feature = "encryption")]
+impl DataKeys {
+    /// A clone, so every member restarts the CBC chain at the derived IV.
+    fn rar30(&mut self, password: &[u8]) -> Result<([u8; 8], Rar30Cipher)> {
+        if let Some((_, salt, cipher)) = self
+            .derived
+            .iter()
+            .find(|(known, ..)| known.as_slice() == password)
+        {
+            return Ok((*salt, cipher.clone()));
+        }
+        let (salt, cipher) = salted_rar30_cipher(password)?;
+        self.derived.push((
+            zeroize::Zeroizing::new(password.to_vec()),
+            salt,
+            cipher.clone(),
+        ));
+        Ok((salt, cipher))
+    }
+}
+
+/// Every encrypted header shares one salt, apart from the data salt, as RAR does.
+struct HeaderKey {
+    #[cfg(feature = "encryption")]
+    salt: [u8; 8],
+    #[cfg(feature = "encryption")]
+    cipher: Rar30Cipher,
+}
+
+impl HeaderKey {
+    fn derive(password: &[u8]) -> Result<Self> {
+        #[cfg(not(feature = "encryption"))]
+        {
+            let _ = password;
+            Err(Error::FeatureDisabled {
+                feature: "encryption",
+            })
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let (salt, cipher) = salted_rar30_cipher(password)?;
+            Ok(Self { salt, cipher })
+        }
+    }
 }
 
 /// What WinRAR writes on an end-of-archive block. The bit marks the block as
@@ -3024,7 +3098,7 @@ fn write_comment_header(out: &mut Vec<u8>, comment: Option<&[u8]>) -> Result<()>
 fn write_producer(
     out: &mut dyn Write,
     target: ArchiveVersion,
-    header_password: Option<&[u8]>,
+    header_key: Option<&HeaderKey>,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
     crate::write_progress::check_cancelled(progress)?;
@@ -3059,8 +3133,8 @@ fn write_producer(
             extra: &[],
         },
     )?;
-    if let Some(password) = header_password {
-        write_encrypted_header(out, &header, password)?;
+    if let Some(key) = header_key {
+        write_encrypted_header(out, &header, key)?;
     } else {
         out.write_all(&header)?;
     }
@@ -3079,8 +3153,9 @@ fn write_archive_comment(
     out: &mut dyn Write,
     comment: Option<&[u8]>,
     options: WriterOptions,
-    header_password: Option<&[u8]>,
+    header_key: Option<&HeaderKey>,
     password: Option<&[u8]>,
+    data_keys: &mut DataKeys,
 ) -> Result<()> {
     let Some(comment) = comment else {
         return Ok(());
@@ -3092,7 +3167,7 @@ fn write_archive_comment(
         return Ok(());
     }
     let mut packed = unpack29_encode_literals(comment)?;
-    let salt = encrypt_packed_data_for_writer(&mut packed, options.target, password)?;
+    let salt = encrypt_packed_data_for_writer(&mut packed, options.target, password, data_keys)?;
     let metadata = options.archive_comment_metadata;
     let mut header = Vec::new();
     write_file_header(
@@ -3118,8 +3193,8 @@ fn write_archive_comment(
             extra: &[],
         },
     )?;
-    if let Some(password) = header_password {
-        write_encrypted_header(out, &header, password)?;
+    if let Some(key) = header_key {
+        write_encrypted_header(out, &header, key)?;
     } else {
         out.write_all(&header)?;
     }
@@ -3136,30 +3211,29 @@ fn write_archive_comment(
 /// clean end, and 7-Zip treats that as a decryption failure and refuses to open
 /// the archive at all. WinRAR closes the same way. unrar stops at the last
 /// member and never looks, which is why nothing caught this.
-fn write_encrypted_end_block(out: &mut dyn Write, end: &[u8], password: &[u8]) -> Result<()> {
-    write_encrypted_header(out, end, password)
+fn write_encrypted_end_block(out: &mut dyn Write, end: &[u8], key: &HeaderKey) -> Result<()> {
+    write_encrypted_header(out, end, key)
 }
 
-fn write_encrypted_header(out: &mut dyn Write, header: &[u8], password: &[u8]) -> Result<()> {
+fn write_encrypted_header(out: &mut dyn Write, header: &[u8], key: &HeaderKey) -> Result<()> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (out, header, password);
+        let _ = (out, header, key);
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
     }
     #[cfg(feature = "encryption")]
     {
-        let salt = random_rar30_salt()?;
         let encrypted_size = checked_align16(header.len(), RAR15_ALIGN_OVERFLOW)?;
         let mut encrypted_header = Vec::with_capacity(encrypted_size);
         encrypted_header.extend_from_slice(header);
         encrypted_header.resize(encrypted_size, 0);
-        Rar30Cipher::new(password, Some(salt))
-            .map_err(super::map_rar30_crypto_error)?
+        key.cipher
+            .clone()
             .encrypt_in_place(&mut encrypted_header)
             .map_err(super::map_rar30_crypto_error)?;
-        out.write_all(&salt)?;
+        out.write_all(&key.salt)?;
         out.write_all(&encrypted_header)?;
         Ok(())
     }
@@ -3385,6 +3459,206 @@ fn write_comment_header_crc(out: &mut [u8], start: usize) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "encryption")]
+    struct EncryptedWrite {
+        target: crate::ArchiveVersion,
+        store: bool,
+        header_encryption: bool,
+        volume_size: Option<usize>,
+    }
+
+    #[cfg(feature = "encryption")]
+    impl EncryptedWrite {
+        fn cases() -> Vec<Self> {
+            let mut cases = Vec::new();
+            for target in [
+                crate::ArchiveVersion::Rar29,
+                crate::ArchiveVersion::Rar30,
+                crate::ArchiveVersion::Rar40,
+            ] {
+                for store in [true, false] {
+                    for header_encryption in [false, true] {
+                        if header_encryption && target == crate::ArchiveVersion::Rar29 {
+                            continue;
+                        }
+                        for volume_size in [None, Some(4096)] {
+                            cases.push(Self {
+                                target,
+                                store,
+                                header_encryption,
+                                volume_size,
+                            });
+                        }
+                    }
+                }
+            }
+            cases
+        }
+
+        fn has_comment(&self) -> bool {
+            self.volume_size.is_none()
+                && matches!(
+                    self.target,
+                    crate::ArchiveVersion::Rar30 | crate::ArchiveVersion::Rar40
+                )
+        }
+
+        fn write(&self) -> Vec<Vec<u8>> {
+            let names = [b"a", b"b", b"c", b"d", b"e", b"f"];
+            let data = (0..names.len())
+                .map(|index| {
+                    let mut state = 0x9e37_79b9u32 + index as u32;
+                    (0..1500)
+                        .map(|_| {
+                            state ^= state << 13;
+                            state ^= state >> 17;
+                            state ^= state << 5;
+                            state as u8
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let Some(volume_size) = self.volume_size else {
+                let mut builder = crate::Builder::new(self.target)
+                    .store(self.store)
+                    .password(Some(b"password".to_vec()))
+                    .header_encryption(self.header_encryption);
+                if self.has_comment() {
+                    builder = builder
+                        .comment(Some(b"comment".to_vec()))
+                        .archive_comment_password(Some(b"password".to_vec()));
+                }
+                for (name, data) in names.iter().zip(&data) {
+                    builder
+                        .add_bytes(name.to_vec(), data.clone(), None, None)
+                        .unwrap();
+                }
+                return vec![builder.to_bytes().unwrap()];
+            };
+            // The public legacy volume writers take one member, so drive the splitter directly.
+            let entries = names
+                .iter()
+                .zip(&data)
+                .map(|(name, data)| super::FileEntry {
+                    name: name.as_slice(),
+                    data,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 3,
+                    password: Some(b"password"),
+                    file_comment: None,
+                })
+                .collect::<Vec<_>>();
+            let members = entries
+                .iter()
+                .map(super::Member::from_file)
+                .collect::<Vec<_>>();
+            let mut features = crate::FeatureSet::store_only();
+            features.header_encryption = self.header_encryption;
+            let coding = if self.store {
+                crate::MemberCoding::Stored
+            } else {
+                crate::MemberCoding::Compressed
+            };
+            let mut sink = crate::volume_sink::CollectedVolumes::new();
+            super::volumes::split_members(
+                &members,
+                super::WriterOptions::new(self.target, features),
+                &coding,
+                volume_size,
+                &mut sink,
+                &crate::WriterResources::default(),
+                None,
+            )
+            .unwrap();
+            sink.take()
+        }
+    }
+
+    #[cfg(feature = "encryption")]
+    impl std::fmt::Display for EncryptedWrite {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "{:?} store={} header_encryption={} volumes={:?}",
+                self.target, self.store, self.header_encryption, self.volume_size
+            )
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn one_password_derives_data_and_header_keys_once_per_write() {
+        let derivations = || crate::crypto::rar30::DERIVATIONS.with(std::cell::Cell::get);
+        for case in EncryptedWrite::cases() {
+            let before = derivations();
+            case.write();
+            let expected = 1 + usize::from(case.header_encryption);
+            assert_eq!(derivations() - before, expected, "{case}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn members_share_one_data_salt_and_headers_share_another() {
+        for case in EncryptedWrite::cases() {
+            let parts = case.write();
+            assert_eq!(parts.len() > 1, case.volume_size.is_some(), "{case}");
+            let volumes = parts
+                .iter()
+                .map(|part| crate::rar15_40::Archive::parse_with_password(part, Some(b"password")))
+                .collect::<crate::Result<Vec<_>>>()
+                .unwrap();
+            let mut salts = std::collections::BTreeSet::new();
+            let mut names = std::collections::BTreeSet::new();
+            for volume in &volumes {
+                for file in volume.files() {
+                    salts.insert(file.salt.expect("RAR 3 members carry a salt"));
+                    names.insert(file.name.clone());
+                }
+            }
+            assert_eq!(names.len(), 6, "{case}");
+            assert_eq!(salts.len(), 1, "{case}");
+            let data_salt = salts.into_iter().next().unwrap();
+
+            if case.header_encryption {
+                // The first encrypted block's salt follows the 7-byte marker and 13-byte main header.
+                let header_salts = parts
+                    .iter()
+                    .map(|part| <[u8; 8]>::try_from(&part[20..28]).unwrap())
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert_eq!(header_salts.len(), 1, "{case}");
+                let header_salt = header_salts.into_iter().next().unwrap();
+                assert_ne!(header_salt, data_salt, "{case}");
+                // One member header per member, plus at least the producer and end blocks.
+                let blocks: usize = parts
+                    .iter()
+                    .map(|part| part.windows(8).filter(|w| *w == header_salt).count())
+                    .sum();
+                assert!(blocks >= 6 + 2, "{case}: {blocks} header blocks");
+            }
+
+            if case.has_comment() {
+                let comment = volumes[0]
+                    .archive_comment_with_password(Some(b"password"))
+                    .unwrap();
+                assert_eq!(comment.as_deref(), Some(&b"comment"[..]), "{case}");
+            }
+
+            let mut extracted = 0;
+            crate::rar15_40::extract_volumes_to(
+                &volumes,
+                crate::ArchiveReadOptions::with_password(b"password"),
+                |_| {
+                    extracted += 1;
+                    Ok(Box::new(std::io::sink()))
+                },
+            )
+            .unwrap();
+            assert_eq!(extracted, 6, "{case}");
+        }
+    }
+
     #[test]
     fn streaming_directory_sources_cannot_discard_payloads() {
         for (host_os, attributes) in [(3, 0o040750), (2, 0x10)] {
@@ -3420,8 +3694,13 @@ mod tests {
                     .map(|index| (index as u8).wrapping_mul(37))
                     .collect();
                 let mut data = plaintext.clone();
-                let salt =
-                    super::encrypt_packed_data_for_writer(&mut data, target, Some(b"pw")).unwrap();
+                let salt = super::encrypt_packed_data_for_writer(
+                    &mut data,
+                    target,
+                    Some(b"pw"),
+                    &mut super::DataKeys::default(),
+                )
+                .unwrap();
                 let padded = length.div_ceil(16) * 16;
                 assert_eq!(data.len(), padded);
                 match target {

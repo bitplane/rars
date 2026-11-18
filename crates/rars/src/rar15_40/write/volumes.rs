@@ -104,6 +104,8 @@ pub(super) fn split_members(
     } else {
         None
     };
+    let header_key = std::cell::OnceCell::new();
+    let mut data_keys = DataKeys::default();
     if total_bytes == 0 {
         let error =
             Error::InvalidArgument("RAR 1.5 volume writer needs a non-empty packed payload");
@@ -209,9 +211,10 @@ pub(super) fn split_members(
             unpacked_size,
             packed.as_ref().is_some_and(|data| !data.is_empty()),
         );
-        let cipher = CipherPlan::new(options.target, member.password).map_err(|error| {
-            crate::write_stream::member_error(error, name, "encrypting volume member")
-        })?;
+        let cipher =
+            CipherPlan::new(options.target, member.password, &mut data_keys).map_err(|error| {
+                crate::write_stream::member_error(error, name, "encrypting volume member")
+            })?;
         let packed_source_len = bytes.len()?;
         let packed_len = cipher.packed_len(packed_source_len)?;
         let stored_work = (!compresses).then_some(&work);
@@ -233,19 +236,25 @@ pub(super) fn split_members(
                 dictionary_flags_for_options(options)?
             },
             file_flags: writer_file_flags(member.password, None, solid_continuation)
-                | if cipher.salt.is_some() { FHD_SALT } else { 0 },
-            salt: cipher.salt,
+                | if cipher.salt().is_some() { FHD_SALT } else { 0 },
+            salt: cipher.salt(),
             packed_len,
             final_crc,
             payload,
         };
         if packer.is_none() {
+            if let Some(password) = header_password {
+                let key = HeaderKey::derive(password).map_err(|error| {
+                    crate::write_stream::member_error(error, name, "encrypting volume member")
+                })?;
+                let _ = header_key.set(key);
+            }
             let mut opened = VolumePacker::new(
                 sink.take().expect("the packer opens once"),
                 volume_size as u64,
                 options.target,
                 if solid { MHD_SOLID } else { 0 },
-                header_password,
+                header_key.get(),
                 progress,
             )?;
             if members.len() == 1 {
@@ -343,7 +352,7 @@ impl VolumeMember<'_> {
         split_after: bool,
         packed_size: u64,
         file_crc: u32,
-        header_password: Option<&[u8]>,
+        header_key: Option<&HeaderKey>,
     ) -> Result<Vec<u8>> {
         let mut flags = self.file_flags;
         if split_before {
@@ -372,10 +381,10 @@ impl VolumeMember<'_> {
                 extra: &[],
             },
         )?;
-        match header_password {
-            Some(password) => {
+        match header_key {
+            Some(key) => {
                 let mut out = Vec::new();
-                write_encrypted_header(&mut out, &header, password)?;
+                write_encrypted_header(&mut out, &header, key)?;
                 Ok(out)
             }
             None => Ok(header),
@@ -390,7 +399,7 @@ struct VolumePacker<'a> {
     target: ArchiveVersion,
     /// Flags beyond the volume ones every main header carries, such as solid.
     main_flags: u16,
-    header_password: Option<&'a [u8]>,
+    header_key: Option<&'a HeaderKey>,
     progress: ProgressReporter<'a>,
     tail_len: u64,
     open: Option<OpenVolume>,
@@ -414,7 +423,7 @@ impl<'a> VolumePacker<'a> {
         volume_size: u64,
         target: ArchiveVersion,
         main_flags: u16,
-        header_password: Option<&'a [u8]>,
+        header_key: Option<&'a HeaderKey>,
         progress: ProgressReporter<'a>,
     ) -> Result<Self> {
         let mut packer = Self {
@@ -422,7 +431,7 @@ impl<'a> VolumePacker<'a> {
             volume_size,
             target,
             main_flags,
-            header_password,
+            header_key,
             progress,
             tail_len: 0,
             open: None,
@@ -450,9 +459,7 @@ impl<'a> VolumePacker<'a> {
     /// Header length depends only on the member, not on the fragment.
     fn header_len(&self, member: &VolumeMember<'_>) -> Result<u64> {
         let probe = member.packed_len.min(self.volume_size);
-        Ok(member
-            .header(false, true, probe, 0, self.header_password)?
-            .len() as u64)
+        Ok(member.header(false, true, probe, 0, self.header_key)?.len() as u64)
     }
 
     /// `reserve` is the room to leave after the member's last byte, or it goes on into the next volume.
@@ -518,8 +525,7 @@ impl<'a> VolumePacker<'a> {
                 (false, Some(crc)) => crc,
                 (false, None) => member.payload.unpacked_crc(),
             };
-            let header =
-                member.header(continued, split_after, len, file_crc, self.header_password)?;
+            let header = member.header(continued, split_after, len, file_crc, self.header_key)?;
             if header.len() as u64 != header_len {
                 return Err(Error::WriterFailure(
                     "legacy file header changed length when patched",
@@ -556,7 +562,7 @@ impl<'a> VolumePacker<'a> {
 
     fn head(&self, index: u64) -> Result<Vec<u8>> {
         let mut main_flags = MHD_VOLUME | self.main_flags;
-        if self.header_password.is_some() {
+        if self.header_key.is_some() {
             main_flags |= MHD_PASSWORD;
         }
         if index == 0 {
@@ -567,12 +573,7 @@ impl<'a> VolumePacker<'a> {
         write_main_header(&mut head, main_flags);
         // Later volumes carry it in their tail instead: see `tail`.
         if index == 0 {
-            write_producer(
-                &mut head,
-                self.target,
-                self.header_password,
-                Some(self.progress),
-            )?;
+            write_producer(&mut head, self.target, self.header_key, Some(self.progress))?;
         }
         Ok(head)
     }
@@ -624,20 +625,13 @@ impl<'a> VolumePacker<'a> {
     fn tail(&self, index: u64, more: bool, data_crc: u32) -> Result<Vec<u8>> {
         let mut out = Vec::new();
         if index > 0 {
-            write_producer(
-                &mut out,
-                self.target,
-                self.header_password,
-                Some(self.progress),
-            )?;
+            write_producer(&mut out, self.target, self.header_key, Some(self.progress))?;
         }
         let data_crc = crc32_combine(data_crc, crc32(&out), out.len() as u64);
-        match self.header_password {
-            Some(password) => write_encrypted_end_block(
-                &mut out,
-                &volume_end_block(index, more, data_crc),
-                password,
-            )?,
+        match self.header_key {
+            Some(key) => {
+                write_encrypted_end_block(&mut out, &volume_end_block(index, more, data_crc), key)?
+            }
             None if writes_end_block(self.target) => {
                 out.extend_from_slice(&volume_end_block(index, more, data_crc))
             }
@@ -651,39 +645,51 @@ impl<'a> VolumePacker<'a> {
 struct CipherPlan<'a> {
     target: ArchiveVersion,
     password: Option<&'a [u8]>,
-    salt: Option<[u8; 8]>,
+    #[cfg(feature = "encryption")]
+    rar30: Option<([u8; 8], Rar30Cipher)>,
 }
 
 impl<'a> CipherPlan<'a> {
-    fn new(target: ArchiveVersion, password: Option<&'a [u8]>) -> Result<Self> {
-        if password.is_none() {
-            return Ok(Self {
-                target,
-                password,
-                salt: None,
-            });
-        }
+    fn new(
+        target: ArchiveVersion,
+        password: Option<&'a [u8]>,
+        data_keys: &mut DataKeys,
+    ) -> Result<Self> {
         #[cfg(not(feature = "encryption"))]
         {
-            Err(Error::FeatureDisabled {
-                feature: "encryption",
-            })
+            let _ = data_keys;
+            match password {
+                None => Ok(Self { target, password }),
+                Some(_) => Err(Error::FeatureDisabled {
+                    feature: "encryption",
+                }),
+            }
         }
         #[cfg(feature = "encryption")]
         {
-            let salt = match target {
-                ArchiveVersion::Rar15 | ArchiveVersion::Rar20 => None,
-                ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-                    Some(random_rar30_salt()?)
-                }
+            let rar30 = match (password, target) {
+                (None, _) | (Some(_), ArchiveVersion::Rar15 | ArchiveVersion::Rar20) => None,
+                (
+                    Some(secret),
+                    ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40,
+                ) => Some(data_keys.rar30(secret)?),
                 _ => return Err(Error::UnsupportedVersion(target)),
             };
             Ok(Self {
                 target,
                 password,
-                salt,
+                rar30,
             })
         }
+    }
+
+    fn salt(&self) -> Option<[u8; 8]> {
+        #[cfg(feature = "encryption")]
+        {
+            self.rar30.as_ref().map(|(salt, _)| *salt)
+        }
+        #[cfg(not(feature = "encryption"))]
+        None
     }
 
     /// RAR 2.0 onwards encrypts in 16-byte blocks and pads the last one.
@@ -715,12 +721,10 @@ impl<'a> CipherPlan<'a> {
         }
         #[cfg(feature = "encryption")]
         {
-            Ok(Some(match self.target {
-                ArchiveVersion::Rar15 => Cipher::Rar15(Rar15Cipher::new(password)),
-                ArchiveVersion::Rar20 => Cipher::Rar20(Box::new(Rar20Cipher::new(password))),
-                _ => Cipher::Rar30(Box::new(
-                    Rar30Cipher::new(password, self.salt).map_err(super::map_rar30_crypto_error)?,
-                )),
+            Ok(Some(match (&self.rar30, self.target) {
+                (Some((_, cipher)), _) => Cipher::Rar30(Box::new(cipher.clone())),
+                (None, ArchiveVersion::Rar15) => Cipher::Rar15(Rar15Cipher::new(password)),
+                (None, _) => Cipher::Rar20(Box::new(Rar20Cipher::new(password))),
             }))
         }
     }
