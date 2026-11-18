@@ -8632,3 +8632,47 @@ fn final_match_past_the_declared_size_truncates_and_feeds_the_solid_member() {
         assert_eq!(second[550..], first[500..1000], "{name}");
     }
 }
+
+#[test]
+fn rar_shares_one_member_salt_and_one_header_salt_per_archive() {
+    for (name, encrypted_members) in [
+        ("encrypted/rar4_encrypted_files_and_dirs.rar", 3),
+        ("encrypted/rar4_mixed_visible_names_password.rar", 2),
+    ] {
+        let archive = Archive::parse(&std::fs::read(fixture(name)).unwrap()).unwrap();
+        let salts: Vec<_> = archive.files().filter_map(|file| file.salt).collect();
+        assert_eq!(salts.len(), encrypted_members, "{name}");
+        assert!(salts.iter().all(|salt| *salt == salts[0]), "{name}");
+    }
+
+    for set in [
+        [
+            "rar300/header_encrypted_multivol_rar300.rar",
+            "rar300/header_encrypted_multivol_rar300.r00",
+        ],
+        [
+            "rar300/header_encrypted_newnaming_rar300.part01.rar",
+            "rar300/header_encrypted_newnaming_rar300.part02.rar",
+        ],
+    ] {
+        let volumes: Vec<_> = set
+            .iter()
+            .map(|name| std::fs::read(fixture(name)).unwrap())
+            .collect();
+        // The first encrypted block's salt follows the 7-byte marker and 13-byte main header.
+        let header_salt = &volumes[0][20..28];
+        let data_salt = Archive::parse_with_password(&volumes[0], Some(b"password"))
+            .unwrap()
+            .files()
+            .next()
+            .unwrap()
+            .salt
+            .unwrap();
+        for volume in &volumes {
+            assert_eq!(&volume[20..28], header_salt, "{set:?}");
+            let archive = Archive::parse_with_password(volume, Some(b"password")).unwrap();
+            assert!(archive.files().all(|file| file.salt == Some(data_salt)));
+        }
+        assert_ne!(header_salt, data_salt, "{set:?}");
+    }
+}
