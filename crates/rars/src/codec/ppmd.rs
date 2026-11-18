@@ -498,9 +498,8 @@ const INIT_BIN_ESC: [u16; 8] = [
 ];
 const EXP_ESCAPE: [u8; 16] = [25, 14, 9, 7, 5, 5, 4, 4, 4, 3, 3, 3, 2, 2, 2, 2];
 
-pub trait PpmdByteReader {
-    fn read_ppmd_byte(&mut self) -> Result<u8>;
-}
+#[cfg(test)]
+use super::ppmd7::PpmdByteReader;
 
 #[derive(Debug, Clone)]
 #[cfg(any(test, feature = "write"))]
@@ -546,6 +545,7 @@ pub(crate) struct PpmdState<B: Budget> {
     contexts: Buffer<Context, B>,
     arena: StateArena<B>,
     text: Buffer<u8, B>,
+    #[cfg(test)]
     range: RangeDecoder,
     allocated: bool,
     max_contexts: usize,
@@ -931,6 +931,7 @@ struct See {
     count: u8,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct RangeDecoder {
     range: u32,
@@ -939,6 +940,7 @@ struct RangeDecoder {
 }
 
 impl<B: Budget> PpmdState<B> {
+    #[cfg(test)]
     pub(crate) fn set_read_control(&mut self, control: crate::read_control::ReadControl) {
         self.arena.read_control = control.clone();
         self.suballoc.read_control = control;
@@ -995,6 +997,7 @@ impl<B: Budget> PpmdState<B> {
             contexts: Buffer::new(allowance),
             arena: StateArena::with_allowance(allowance),
             text: Buffer::new(allowance),
+            #[cfg(test)]
             range: RangeDecoder::new(),
             allocated: false,
             max_contexts: MIN_MODEL_CONTEXTS,
@@ -1034,6 +1037,7 @@ impl<B: Budget> PpmdState<B> {
             contexts: Buffer::copied(&self.contexts, &self.contexts.allowance())?,
             arena: self.arena.try_clone()?,
             text: Buffer::copied(&self.text, &self.text.allowance())?,
+            #[cfg(test)]
             range: self.range.clone(),
             allocated: self.allocated,
             max_contexts: self.max_contexts,
@@ -1041,6 +1045,7 @@ impl<B: Budget> PpmdState<B> {
             successor_scratch: Buffer::new(&self.contexts.allowance()),
         })
     }
+    #[cfg(test)]
     pub fn decode_init(
         &mut self,
         first_byte: u8,
@@ -1079,6 +1084,7 @@ impl<B: Budget> PpmdState<B> {
 
     // An error ends this decode: range/model updates across a whole symbol
     // are not transactional, even though allocator operations preserve ownership.
+    #[cfg(test)]
     pub fn decode_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
         // Ordinary symbol/context work is bounded by the model order and the
         // 256-symbol alphabet; the enclosing decoder polls between symbols.
@@ -1086,6 +1092,7 @@ impl<B: Budget> PpmdState<B> {
         self.decode_symbol_inner(input)
     }
 
+    #[cfg(test)]
     fn decode_symbol_inner(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
         let min = self.min_context;
         if self.contexts[min].num_stats != 1 {
@@ -2204,6 +2211,7 @@ enum SeeRef {
     Table(usize, usize),
 }
 
+#[cfg(test)]
 impl RangeDecoder {
     fn new() -> Self {
         Self {

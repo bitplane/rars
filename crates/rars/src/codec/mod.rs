@@ -10,7 +10,10 @@ mod match_finder;
 #[cfg(feature = "write")]
 pub(crate) mod packed_chain;
 pub(crate) mod packed_window;
+// The model the writer encodes with, and tests compare the reader against.
+#[cfg(any(test, feature = "write"))]
 mod ppmd;
+mod ppmd7;
 pub mod rar13;
 pub mod rar20;
 pub mod rar29;
