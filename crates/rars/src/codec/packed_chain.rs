@@ -304,77 +304,183 @@ fn walk_paired<B: Budget>(
     Ok(())
 }
 
+/// The packed chains a finder walks: built for it alone, or shared.
+#[derive(Debug)]
+enum Stream<B: Budget> {
+    Own(Buffer<u8, B>),
+    Shared(std::sync::Arc<SharedPackedIndex<B>>),
+}
+
+impl<B: Budget> std::ops::Deref for Stream<B> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Own(packed) => packed,
+            Self::Shared(index) => &index.packed,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct PackedMatchFinder<B: Budget = Allowance> {
     cursor: Buffer<u32, B>,
-    packed: Buffer<u8, B>,
+    packed: Stream<B>,
     next_position: usize,
+}
+
+/// One set of packed chains over a window several finders search, each from
+/// its own position. A bucket's chain here holds every position a finder
+/// built over a later, shorter window would hold, newest first, plus older
+/// ones; a walk stops on its distance floor at the first of those, where the
+/// shorter window's chain would have ended. So a finder handed out at a
+/// position collects what one built over its own window would, provided its
+/// input ends where that window does and its distances are measured the same
+/// way (see `rar50` encoder's block jobs).
+#[derive(Debug)]
+pub(crate) struct SharedPackedIndex<B: Budget = Allowance> {
+    packed: Buffer<u8, B>,
+    /// Where each bucket's records start, before any position is inserted.
+    starts: Buffer<u32, B>,
+}
+
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "block jobs share an index in the next step of #276"
+    )
+)]
+impl<B: Budget> SharedPackedIndex<B> {
+    /// A finder chooses its walk by the length of the input it is given, which
+    /// for a shared index is shorter than the window the stream was built
+    /// over. So the window must stay where every record is one unit or two.
+    pub(crate) fn with_allowance(window: &[u8], allowance: &B) -> Result<std::sync::Arc<Self>> {
+        if window.len() > PAIRED_INPUT_LIMIT {
+            return Err(Error::InvalidData(
+                "shared packed window exceeds the paired walk's reach",
+            ));
+        }
+        let (packed, starts) = build(window, allowance)?;
+        Ok(std::sync::Arc::new(Self { packed, starts }))
+    }
+
+    /// Finders standing at each of `positions`, ascending, as if every
+    /// position of the window before it had been inserted. One pass over the
+    /// window serves them all.
+    pub(crate) fn finders(
+        self: &std::sync::Arc<Self>,
+        window: &[u8],
+        positions: &[usize],
+        allowance: &B,
+    ) -> Result<Buffer<PackedMatchFinder<B>, B>> {
+        debug_assert!(positions.windows(2).all(|pair| pair[0] <= pair[1]));
+        let insertable = window.len().saturating_sub(3);
+        let mut cursor = Buffer::copied(&self.starts, allowance)?;
+        let mut finders = Buffer::with_capacity(positions.len(), allowance)?;
+        let mut pos = 0;
+        for &target in positions {
+            let target = target.min(insertable);
+            while pos < target {
+                let bucket = hash(window, pos);
+                cursor[bucket] = past_record(&self.packed, cursor[bucket] as usize) as u32;
+                pos += 1;
+            }
+            finders.push_admitted(PackedMatchFinder {
+                cursor: Buffer::copied(&cursor, allowance)?,
+                packed: Stream::Shared(std::sync::Arc::clone(self)),
+                next_position: target,
+            });
+        }
+        Ok(finders)
+    }
+}
+
+/// The end of the record that starts at `end`.
+#[inline]
+fn past_record(packed: &[u8], mut end: usize) -> usize {
+    loop {
+        let unit = u16::from_le_bytes(packed[end..end + 2].try_into().unwrap());
+        end += 2;
+        if unit & 0x8000 == 0 {
+            return end;
+        }
+    }
+}
+
+/// Every position's delta to the one before it in its bucket, bucket after
+/// bucket, and where each bucket starts.
+fn build<B: Budget>(input: &[u8], allowance: &B) -> Result<(Buffer<u8, B>, Buffer<u32, B>)> {
+    u32::try_from(input.len())
+        .map_err(|_| Error::InvalidData("packed finder input exceeds u32 positions"))?;
+    let mut head = Buffer::filled(BUCKETS, NO_LINK, allowance)?;
+    let mut cursor = Buffer::filled(BUCKETS, 0u32, allowance)?;
+    let positions = input.len().saturating_sub(3);
+    for pos in 0..positions {
+        let bucket = hash(input, pos);
+        let previous = head[bucket];
+        let delta = if previous == NO_LINK {
+            0
+        } else {
+            pos as u32 - previous
+        };
+        cursor[bucket] = cursor[bucket]
+            .checked_add(encoded_length(delta) as u32)
+            .ok_or(Error::InvalidData(
+                "packed finder bucket exceeds u32 offsets",
+            ))?;
+        head[bucket] = pos as u32;
+    }
+    let mut total = 0u32;
+    for count in cursor.iter_mut() {
+        let length = *count;
+        *count = total;
+        total = total.checked_add(length).ok_or(Error::InvalidData(
+            "packed finder storage exceeds u32 offsets",
+        ))?;
+    }
+    let mut packed = Buffer::filled(total as usize, 0u8, allowance)?;
+    head.fill(NO_LINK);
+    for pos in 0..positions {
+        let bucket = hash(input, pos);
+        let previous = head[bucket];
+        let delta = if previous == NO_LINK {
+            0
+        } else {
+            pos as u32 - previous
+        };
+        let length = encoded_length(delta);
+        let start = cursor[bucket] as usize;
+        encode(&mut packed[start..start + length], delta);
+        cursor[bucket] += length as u32;
+        head[bucket] = pos as u32;
+    }
+    // Each final bucket end is the next bucket's initial start, including
+    // empty buckets. Recover those starts without another input scan.
+    for bucket in (1..BUCKETS).rev() {
+        cursor[bucket] = cursor[bucket - 1];
+    }
+    cursor[0] = 0;
+    // Head positions were needed only to construct exact deltas. Runtime
+    // insertion finds the next record boundary directly in its stream.
+    drop(head);
+    Ok((packed, cursor))
 }
 
 impl<B: Budget> PackedMatchFinder<B> {
     pub(crate) fn with_allowance(input: &[u8], allowance: &B) -> Result<Self> {
-        u32::try_from(input.len())
-            .map_err(|_| Error::InvalidData("packed finder input exceeds u32 positions"))?;
-        let mut head = Buffer::filled(BUCKETS, NO_LINK, allowance)?;
-        let mut cursor = Buffer::filled(BUCKETS, 0u32, allowance)?;
-        let positions = input.len().saturating_sub(3);
-        for pos in 0..positions {
-            let bucket = hash(input, pos);
-            let previous = head[bucket];
-            let delta = if previous == NO_LINK {
-                0
-            } else {
-                pos as u32 - previous
-            };
-            cursor[bucket] = cursor[bucket]
-                .checked_add(encoded_length(delta) as u32)
-                .ok_or(Error::InvalidData(
-                    "packed finder bucket exceeds u32 offsets",
-                ))?;
-            head[bucket] = pos as u32;
-        }
-        let mut total = 0u32;
-        for count in cursor.iter_mut() {
-            let length = *count;
-            *count = total;
-            total = total.checked_add(length).ok_or(Error::InvalidData(
-                "packed finder storage exceeds u32 offsets",
-            ))?;
-        }
-        let mut packed = Buffer::filled(total as usize, 0u8, allowance)?;
-        head.fill(NO_LINK);
-        for pos in 0..positions {
-            let bucket = hash(input, pos);
-            let previous = head[bucket];
-            let delta = if previous == NO_LINK {
-                0
-            } else {
-                pos as u32 - previous
-            };
-            let length = encoded_length(delta);
-            let start = cursor[bucket] as usize;
-            encode(&mut packed[start..start + length], delta);
-            cursor[bucket] += length as u32;
-            head[bucket] = pos as u32;
-        }
-        // Each final bucket end is the next bucket's initial start, including
-        // empty buckets. Recover those starts without another input scan.
-        for bucket in (1..BUCKETS).rev() {
-            cursor[bucket] = cursor[bucket - 1];
-        }
-        cursor[0] = 0;
-        // Head positions were needed only to construct exact deltas. Runtime
-        // insertion finds the next record boundary directly in its stream.
-        drop(head);
+        let (packed, cursor) = build(input, allowance)?;
         Ok(Self {
             cursor,
-            packed,
+            packed: Stream::Own(packed),
             next_position: 0,
         })
     }
 
     pub(crate) fn allowance(&self) -> B {
-        self.packed.allowance()
+        match &self.packed {
+            Stream::Own(packed) => packed.allowance(),
+            Stream::Shared(index) => index.packed.allowance(),
+        }
     }
 
     /// Only dense, increasing positions from this same captured input are
@@ -384,15 +490,7 @@ impl<B: Budget> PackedMatchFinder<B> {
         debug_assert_eq!(pos, self.next_position);
         debug_assert!(pos + 4 <= input.len());
         let bucket = hash(input, pos);
-        let mut end = self.cursor[bucket] as usize;
-
-        loop {
-            let unit = u16::from_le_bytes(self.packed[end..end + 2].try_into().unwrap());
-            end += 2;
-            if unit & 0x8000 == 0 {
-                break;
-            }
-        }
+        let end = past_record(&self.packed, self.cursor[bucket] as usize);
         self.cursor[bucket] = end as u32;
         self.next_position = pos + 1;
         self.cursor[bucket] as usize
@@ -547,8 +645,9 @@ impl<B: Budget> PackedMatchFinder<B> {
         if block.end == input.len() {
             // This captured index has no future readable position. Retire it
             // before the caller allocates the final block's pricing workspace.
-            let allowance = self.packed.allowance();
-            self.packed = Buffer::new(&allowance);
+            // A shared index stays with its other finders.
+            let allowance = self.allowance();
+            self.packed = Stream::Own(Buffer::new(&allowance));
             self.cursor = Buffer::new(&allowance);
         }
         Ok(())
@@ -845,6 +944,164 @@ mod tests {
         }
     }
 
+    /// Each block's runs and the start of each position's runs in them.
+    type Collected = Vec<(Vec<(u32, u32)>, Vec<u32>)>;
+
+    /// A member's runs, collected block by block the way a block job's
+    /// collector does: from its own window (history, then the run), or from a
+    /// finder handed out by one index over the whole group's window. A job
+    /// that starts at the member's start leaves its first block to the tree
+    /// search, as the encoder does, so its finder starts after that block.
+    fn collect_runs(
+        member: &[u8],
+        runs: &[std::ops::Range<usize>],
+        dictionary: usize,
+        block: usize,
+        cut: usize,
+        nice: usize,
+        shared: bool,
+    ) -> Collected {
+        const MAX_MATCH: usize = 0x1001;
+        let allowance = Allowance::default();
+        let blocks_of = |run: &std::ops::Range<usize>| -> Vec<std::ops::Range<usize>> {
+            let first = if run.start == 0 {
+                (run.start + block).min(run.end)
+            } else {
+                run.start
+            };
+            (first..run.end)
+                .step_by(block)
+                .map(|start| start..(start + block).min(run.end))
+                .collect()
+        };
+        let group_start = runs[0].start.saturating_sub(dictionary);
+        let group = &member[group_start..runs.last().unwrap().end];
+        let mut shared_finders = if shared {
+            let index = SharedPackedIndex::with_allowance(group, &allowance).unwrap();
+            let at: Vec<usize> = runs
+                .iter()
+                .map(|run| blocks_of(run).first().map_or(run.end, |b| b.start) - group_start)
+                .collect();
+            Some(
+                index
+                    .finders(group, &at, &allowance)
+                    .unwrap()
+                    .into_vec()
+                    .into_iter(),
+            )
+        } else {
+            None
+        };
+        let mut collected = Vec::new();
+        for run in runs {
+            let blocks = blocks_of(run);
+            let at = blocks.first().map_or(run.end, |b| b.start);
+            let (input, origin, mut finder) = match &mut shared_finders {
+                Some(finders) => (
+                    &group[..run.end - group_start],
+                    group_start,
+                    finders.next().unwrap(),
+                ),
+                None => {
+                    let window_start = run.start.saturating_sub(dictionary);
+                    let window = &member[window_start..run.end];
+                    let mut finder = PackedMatchFinder::with_allowance(window, &allowance).unwrap();
+                    for pos in 0..(at - window_start).min(window.len().saturating_sub(3)) {
+                        finder.insert(window, pos);
+                    }
+                    (window, window_start, finder)
+                }
+            };
+            for block in blocks {
+                let mut found = Buffer::new(&allowance);
+                let mut starts = Buffer::with_capacity(block.len() + 1, &allowance).unwrap();
+                finder
+                    .collect_block(
+                        input,
+                        block.start - origin..block.end - origin,
+                        dictionary,
+                        cut,
+                        nice,
+                        MAX_MATCH,
+                        &mut found,
+                        &mut starts,
+                    )
+                    .unwrap();
+                collected.push((found.into_vec(), starts.into_vec()));
+            }
+        }
+        collected
+    }
+
+    #[test]
+    fn a_shared_index_collects_what_each_jobs_own_index_does() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let length = 64 * 1024;
+        let words: [&[u8]; 8] = [
+            b"volume ", b"header ", b"the ", b"of ", b"match ", b"block ", b"\n", b"window ",
+        ];
+        let mut text = Vec::with_capacity(length + 8);
+        while text.len() < length {
+            text.extend_from_slice(words[(next() % 8) as usize]);
+        }
+        text.truncate(length);
+        let noise: Vec<u8> = (0..length).map(|_| next() as u8).collect();
+        let two_symbols: Vec<u8> = (0..length).map(|_| b'a' + (next() & 1) as u8).collect();
+        // Long repeats with the odd change, so matches reach the nice length
+        // and commit across block and run boundaries.
+        let mut repeats: Vec<u8> = b"0123456789abcdefghij".repeat(length / 20 + 1);
+        repeats.truncate(length);
+        for _ in 0..200 {
+            let at = (next() as usize) % length;
+            repeats[at] = next() as u8;
+        }
+
+        let dictionary = 8 * 1024;
+        let runs_from = |start: usize, sizes: &[usize]| {
+            let mut runs = Vec::new();
+            let mut at = start;
+            for &size in sizes {
+                runs.push(at..(at + size).min(length));
+                at += size;
+            }
+            runs
+        };
+        let groups = [
+            // From the member's start: the first jobs have partial history.
+            runs_from(0, &[5 * 1024, 5 * 1024, 12 * 1024, 12 * 1024]),
+            // Mid-member: every job carries a full dictionary of history.
+            runs_from(10 * 1024, &[12 * 1024, 7 * 1024, 12 * 1024]),
+            // Ending in a run too short to search.
+            runs_from(length - 12 * 1024 - 2, &[12 * 1024, 2]),
+        ];
+        for (name, member) in [
+            ("text", &text),
+            ("noise", &noise),
+            ("two symbols", &two_symbols),
+            ("repeats", &repeats),
+        ] {
+            for runs in &groups {
+                for (cut, nice) in [(32, 64), (128, 1024)] {
+                    let own = collect_runs(member, runs, dictionary, 4 * 1024, cut, nice, false);
+                    let shared = collect_runs(member, runs, dictionary, 4 * 1024, cut, nice, true);
+                    assert_eq!(own.len(), shared.len());
+                    for (index, (own, shared)) in own.iter().zip(&shared).enumerate() {
+                        assert!(
+                            own == shared,
+                            "{name}, runs {runs:?}, cut {cut}, nice {nice}: block {index} differs"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn fixture(length: usize) -> Vec<u8> {
         let mut state = 0x7A59_1234_AA55_0123u64;
         let mut input = Vec::with_capacity(length);
@@ -1028,7 +1285,10 @@ mod tests {
         }
         let allowance = Allowance::limited(u64::MAX);
         let mut finder = PackedMatchFinder::with_allowance(&input, &allowance).unwrap();
-        assert_eq!(finder.packed.capacity(), finder.packed.len());
+        let Stream::Own(packed) = &finder.packed else {
+            panic!("a finder built alone owns its stream");
+        };
+        assert_eq!(packed.capacity(), packed.len());
         let charged = allowance.used();
         assert_eq!(charged, (BUCKETS * 4 + finder.packed.len()) as u64);
         for pos in 0..input.len() - 3 {
