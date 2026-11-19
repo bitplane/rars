@@ -195,13 +195,16 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         // at a time, streaming a large RAR 2.0 to 4.x one, and RAR 1.3 builds
         // the whole set in memory.
         WriterOption::MemoryLimit => family == ArchiveFamily::Rar50Plus || !shape.volumes,
-        // RAR 5 spools its members; RAR 2.0 to 4.x spool a large one when the
-        // output cannot seek back to patch its header.
+        // RAR 5 spools its members; RAR 1.5 to 4.x spool a large one when the
+        // output cannot seek back to patch its header, RAR 1.3 whatever the output.
         WriterOption::TempDir => {
             family == ArchiveFamily::Rar50Plus
                 || (matches!(
                     target,
-                    ArchiveVersion::Rar20
+                    ArchiveVersion::Rar13
+                        | ArchiveVersion::Rar14
+                        | ArchiveVersion::Rar15
+                        | ArchiveVersion::Rar20
                         | ArchiveVersion::Rar29
                         | ArchiveVersion::Rar30
                         | ArchiveVersion::Rar40
@@ -381,11 +384,11 @@ mod tests {
     #[cfg(all(feature = "encryption", feature = "recovery"))]
     fn writer_limits_table_matches_what_each_format_supports() {
         const WRITER_LIMITS_TABLE: &str = "\
-            rar13 single  solid password --- -------- memory ----\n\
+            rar13 single  solid password --- -------- memory temp\n\
             rar13 volumes solid -------- --- -------- ------ ----\n\
-            rar14 single  solid password --- -------- memory ----\n\
+            rar14 single  solid password --- -------- memory temp\n\
             rar14 volumes solid -------- --- -------- ------ ----\n\
-            rar15 single  solid password --- -------- memory ----\n\
+            rar15 single  solid password --- -------- memory temp\n\
             rar15 volumes solid password --- -------- ------ ----\n\
             rar20 single  solid password --- -------- memory temp\n\
             rar20 volumes solid password --- -------- ------ ----\n\
