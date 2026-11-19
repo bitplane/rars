@@ -5063,10 +5063,13 @@ mod tests {
         }
         // Forced PPMd declares each record as it reaches it, and reads a
         // record whole before coding any of it, so even a delta member read in
-        // many segments codes what it does in memory.
+        // many segments codes what it does in memory. It reads at most 512 KiB
+        // a segment at a 128 KiB window, whatever the thread count, so these
+        // shorter members still cross a boundary there; PPMd costs ten times
+        // what LZ does here.
         for (data, kind) in [
-            (&large, FilterKind::E8E9),
-            (&audio, FilterKind::Delta { channels: 4 }),
+            (&large[..512 * 1024 + 4321], FilterKind::E8E9),
+            (&audio[..768 * 1024], FilterKind::Delta { channels: 4 }),
         ] {
             let members = entries(&[("small.txt", small), ("large.bin", data)]);
             for (window, mut options) in [("fitted", rar40()), ("128K", segmented)] {
@@ -5123,8 +5126,10 @@ mod tests {
 
     #[test]
     fn a_named_filter_streams_on_a_solid_chain_and_through_a_pipe() {
-        let large = binary_member(1024 * 1024 + 4321);
-        let noise = noise(1024 * 1024 + 7);
+        // Each over the 256 KiB the large members stream and spool above, and
+        // no larger: forced PPMd codes them at a few hundred KiB a second.
+        let large = binary_member(512 * 1024 + 4321);
+        let noise = noise(300 * 1024 + 7);
         let files: [(&str, &[u8]); 4] = [
             ("before.bin", &large[1000..41000]),
             ("large.bin", &large),
@@ -5381,9 +5386,10 @@ mod tests {
 
     #[test]
     fn a_piped_member_is_spooled_into_the_archive_a_file_gets() {
-        let large = binary_member(1024 * 1024 + 4321);
+        // Over the 256 KiB members are spooled above.
+        let large = binary_member(512 * 1024 + 4321);
         // Noise doesn't pay to compress, so its attempt restarts as stored.
-        let noise = noise(1024 * 1024 + 7);
+        let noise = noise(300 * 1024 + 7);
         let members = entries(&[
             ("small.txt", b"small and below the threshold\n"),
             ("large.bin", &large),
@@ -5411,8 +5417,9 @@ mod tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn a_piped_password_protected_member_is_spooled_and_encrypted() {
-        let large = binary_member(1024 * 1024 + 4321);
-        let noise = noise(1024 * 1024 + 7);
+        // Over the 256 KiB members are spooled above.
+        let large = binary_member(512 * 1024 + 4321);
+        let noise = noise(300 * 1024 + 7);
         let members: Vec<_> = entries(&[("large.bin", &large), ("noise.bin", &noise)])
             .into_iter()
             .map(|entry| entry.with_password(b"password".to_vec()))
@@ -6141,8 +6148,9 @@ mod tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn password_protected_members_stream_into_a_set() {
-        let large = binary_member(1024 * 1024 + 4321);
-        let noise = noise(1024 * 1024 + 7);
+        // Over the 256 KiB members stream above, and several volumes long.
+        let large = binary_member(512 * 1024 + 4321);
+        let noise = noise(300 * 1024 + 7);
         let contents = [
             ("small.txt", &b"small and below the threshold\n"[..]),
             ("large.bin", &large[..]),
