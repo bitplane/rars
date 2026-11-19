@@ -735,7 +735,7 @@ fn encoder_rejects_matches_beyond_the_configured_distance() {
             input,
             5,
             input.len(),
-            &finder,
+            &super::FreshMatches::Chain(finder),
             EncodeOptions::default().with_max_match_distance(2),
             None,
         ),
@@ -1740,7 +1740,8 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
     // Captured from master 61e9cbe0: per level, text, random, windowed, then the
     // second solid member at a full and a 16 KiB window. Captured again once the
     // pre-table was weighted and absent symbols priced: every size is smaller
-    // or, for the solid members on the fixed table, unchanged.
+    // or, for the solid members on the fixed table, unchanged. Level 5's text
+    // moved by a byte once its seed pass read the match lists.
     assert_eq!(
         fingerprints,
         [
@@ -1754,7 +1755,7 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
             (102_255, 2_444_247_513),
             (16_600, 3_409_808_212),
             (25_963, 4_073_131_303),
-            (20_086, 1_796_864_836),
+            (20_087, 2_779_185_340),
             (164_028, 3_930_170_070),
             (101_648, 3_016_247_063),
             (15_486, 1_553_409_529),
@@ -1764,7 +1765,7 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
 }
 
 #[test]
-fn shortest_path_levels_code_to_the_bytes_they_always_have() {
+fn shortest_path_levels_code_to_known_bytes() {
     let text = include_bytes!("../../../tests/fixtures/rar15_40/ppmd/lorem_127k.txt");
     let windowed = windowed_payload(192 * 1024);
     let mut fingerprints = Vec::new();
@@ -1782,15 +1783,16 @@ fn shortest_path_levels_code_to_the_bytes_they_always_have() {
         }
     }
 
-    // Levels 4 and 5 as the writer sets them, text then windowed, captured
-    // from master f223f8e0.
+    // Levels 4 and 5 as the writer sets them, text then windowed. Captured
+    // from master f223f8e0, then moved once the greedy seed read the match
+    // lists instead of searching, which gives the first priced pass new tables.
     assert_eq!(
         fingerprints,
         [
-            (20_085, 3_705_270_237),
-            (88_636, 3_143_814_180),
-            (20_022, 2_498_266_657),
-            (88_627, 4_292_844_804),
+            (20_087, 2_779_185_340),
+            (88_635, 3_316_369_193),
+            (20_040, 4_210_419_601),
+            (88_626, 59_302_239),
         ]
     );
 }

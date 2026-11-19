@@ -510,12 +510,16 @@ fn code_lz_block(
     state: LzState,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<(BitWriter, LzState)> {
+    // Matches do not depend on prices, so every pass shares one search. A
+    // fixed table is never re-parsed, so its greedy pass searches as it goes.
+    let matches = (options.optimal_parse && fixed_table.is_none())
+        .then(|| collect_match_lists(window, start, window.len(), options));
     let tokens = encode_tokens_with_progress(
         window,
         start,
         options,
         None,
-        None,
+        matches.as_ref(),
         state,
         again(&mut progress),
     )?;
@@ -544,12 +548,6 @@ fn code_lz_block(
     // and fourth buy another 0.06% on the bench's small members and 0.03% on its
     // 4 MiB text and binaries, which is what level 5 is for.
     let refinements = if options.optimal_parse { 2 } else { 1 } + options.extra_priced_passes;
-    // Matches do not depend on prices, so both priced passes share one search.
-    let matches = if options.optimal_parse {
-        Some(collect_match_lists(window, start, window.len(), options))
-    } else {
-        None
-    };
     let span = window.len() - start;
     let mut poll = progress.map(|report| move |_: usize| report(span));
     let mut best_table = table_lengths;
@@ -1270,12 +1268,18 @@ fn encode_tokens_with_progress(
         ));
     }
     let mut tokens = Vec::new();
-    // No match reaches past the dictionary, so the finder need not either.
-    let reach = options.max_match_distance.max(1).min(combined.len());
-    let mut finder = Rar20MatchFinder::for_reach(reach, reach);
-    for history_pos in 0..start {
-        finder.insert(combined, history_pos);
-    }
+    let mut finder = match matches {
+        Some(lists) => FreshMatches::Listed(ListCursor::new(lists, start)),
+        None => {
+            // No match reaches past the dictionary, so the finder need not either.
+            let reach = options.max_match_distance.max(1).min(combined.len());
+            let mut finder = Rar20MatchFinder::for_reach(reach, reach);
+            for history_pos in 0..start {
+                finder.insert(combined, history_pos);
+            }
+            FreshMatches::Chain(finder)
+        }
+    };
     let mut pairs = PairTable::new(combined, start);
     let mut literal_totals = LiteralTotals::default();
     // A lazy look ahead prices a whole match from each position it tries.
@@ -1625,7 +1629,7 @@ fn select_match(context: &SearchContext<'_>, pos: usize) -> Option<SelectedMatch
 struct SearchContext<'a> {
     input: &'a [u8],
     end: usize,
-    finder: &'a Rar20MatchFinder,
+    finder: &'a FreshMatches<'a>,
     pairs: &'a PairTable,
     options: EncodeOptions,
     old_offsets: &'a [usize; 4],
@@ -1665,14 +1669,81 @@ fn should_lazy_emit_literal(
         })
 }
 
+/// Lists collected for the shortest-path parse spare its greedy seed a search of its own.
+enum FreshMatches<'a> {
+    Chain(Rar20MatchFinder),
+    Listed(ListCursor<'a>),
+}
+
+impl FreshMatches<'_> {
+    /// Takes positions in order, each once, from the block's start.
+    fn insert(&mut self, input: &[u8], pos: usize) {
+        match self {
+            Self::Chain(finder) => finder.insert(input, pos),
+            Self::Listed(cursor) => cursor.step(pos),
+        }
+    }
+}
+
+struct ListCursor<'a> {
+    lists: &'a MatchLists,
+    start: usize,
+    inserted: usize,
+    next_run: usize,
+}
+
+impl<'a> ListCursor<'a> {
+    fn new(lists: &'a MatchLists, start: usize) -> Self {
+        Self {
+            lists,
+            start,
+            inserted: 0,
+            next_run: 0,
+        }
+    }
+
+    fn step(&mut self, pos: usize) {
+        debug_assert_eq!(
+            pos,
+            self.start + self.inserted,
+            "list positions taken out of order"
+        );
+        self.next_run += usize::from(self.lists.counts[self.inserted]);
+        self.inserted += 1;
+    }
+
+    /// The last run at a position is its longest, at the nearest offset reaching it.
+    fn longest(&self, pos: usize) -> Option<(usize, usize)> {
+        let counts = &self.lists.counts[self.inserted..];
+        let ahead = pos - (self.start + self.inserted);
+        let first = self.next_run
+            + counts[..ahead]
+                .iter()
+                .map(|&count| usize::from(count))
+                .sum::<usize>();
+        let count = usize::from(counts[ahead]);
+        (count != 0).then(|| {
+            let found = self.lists.runs[first + count - 1];
+            (found.length(), found.offset())
+        })
+    }
+}
+
 fn best_match(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar20MatchFinder,
+    finder: &FreshMatches<'_>,
     options: EncodeOptions,
     cost_model: Option<&CostModel<'_>>,
 ) -> Option<(usize, usize)> {
+    let finder = match finder {
+        FreshMatches::Chain(finder) => finder,
+        FreshMatches::Listed(cursor) => {
+            debug_assert!(cost_model.is_none(), "listed matches are not priced");
+            return cursor.longest(pos);
+        }
+    };
     let max_offset = pos.min(options.max_match_distance);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
     if options.max_match_candidates == 0 || max_offset == 0 || max_length < 3 {
