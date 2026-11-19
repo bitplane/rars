@@ -53,6 +53,14 @@ fn decode(packed: &[u8], len: usize) -> Vec<u8> {
     Unpack20::new().decode_member(packed, len).unwrap()
 }
 
+// Other tests' windows elsewhere in the process would turn nesting off.
+fn side_by_side<T: Send>(code: impl FnOnce() -> T + Send) -> T {
+    #[cfg(feature = "parallel")]
+    return crate::parallel::private_pool(4).install(code);
+    #[cfg(not(feature = "parallel"))]
+    code()
+}
+
 fn levels() -> [EncodeOptions; 3] {
     [
         EncodeOptions::new(8),
@@ -277,46 +285,6 @@ fn an_audio_block_with_fewer_channels_starts_again_at_the_first() {
 }
 
 #[test]
-fn a_block_parse_starts_from_the_offsets_the_reader_carries() {
-    // The block opens by repeating bytes 4321 back, the newest offset carried in.
-    let mut window = noise(8_000, 12);
-    let start = window.len();
-    window.extend_from_within(start - 4321..start - 4321 + 200);
-    let state = LzState {
-        old_offsets: [4321, 77, 0, 0],
-        last_match: None,
-    };
-    let opens_with_old_offset = |tokens: &[EncodeToken]| {
-        matches!(
-            tokens[0],
-            EncodeToken::OldOffset {
-                index: 0,
-                offset: 4321,
-                ..
-            }
-        )
-    };
-    let options = EncodeOptions::default();
-    let greedy =
-        encode_tokens_with_progress(&window, start, options, None, None, state, None).unwrap();
-    assert!(opens_with_old_offset(&greedy), "{:?}", &greedy[..2]);
-
-    let options = options.with_optimal_parse(true);
-    let matches = collect_match_lists(&window, start, window.len(), options);
-    let tables = [0u8; TABLE_COUNT];
-    let prices = CostModel::new(&tables);
-    let optimal = encode_tokens_optimal(
-        &window,
-        start,
-        window.len(),
-        &matches,
-        &prices,
-        state.old_offsets,
-    );
-    assert!(opens_with_old_offset(&optimal), "{:?}", &optimal[..2]);
-}
-
-#[test]
 fn every_byte_of_a_member_is_counted_once_whatever_the_level() {
     let data = [text(50_000, 13), noise(20_000, 14), text(30_000, 15)].concat();
     for options in levels() {
@@ -335,4 +303,105 @@ fn every_byte_of_a_member_is_counted_once_whatever_the_level() {
             .unwrap();
         assert_eq!(counted, data.len(), "{options:?}");
     }
+}
+
+#[test]
+fn blocks_coded_side_by_side_code_to_the_one_thread_bytes() {
+    let data = [
+        text(70_000, 16),
+        tone(40_000, 2),
+        noise(20_000, 17),
+        text(60_000, 18),
+    ]
+    .concat();
+    let mut fingerprints = Vec::new();
+    for options in levels() {
+        let packed = side_by_side(|| {
+            encode_member_in_blocks(&data, &[], None, options, true, None, BLOCK).unwrap()
+        });
+        assert_eq!(decode(&packed, data.len()), data, "{options:?}");
+        let one_thread = {
+            let _cap = crate::parallel::ThreadCap::set(Some(1));
+            encode_member_in_blocks(&data, &[], None, options, true, None, BLOCK).unwrap()
+        };
+        assert_eq!(one_thread, packed, "{options:?}");
+        fingerprints.push((packed.len(), crate::crc32::crc32(&packed)));
+    }
+    // A solid member runs its blocks on in the fixed table, after a history.
+    let table = FixedEncodeTable::new().unwrap();
+    let (history, member) = data.split_at(50_000);
+    let options = EncodeOptions::default().with_max_match_distance(64 * 1024);
+    let continue_chain = || {
+        encode_member_in_blocks(member, history, Some(table), options, false, None, BLOCK).unwrap()
+    };
+    let continued = side_by_side(continue_chain);
+    let one_thread = {
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
+        continue_chain()
+    };
+    assert_eq!(one_thread, continued);
+    let mut decoder = Unpack20::new();
+    decoder
+        .decode_member(
+            &encode_member(history, &[], Some(table), options, false, None).unwrap(),
+            history.len(),
+        )
+        .unwrap();
+    assert_eq!(
+        decoder.decode_member(&continued, member.len()).unwrap(),
+        member
+    );
+    fingerprints.push((continued.len(), crate::crc32::crc32(&continued)));
+    // Each block starts from no recent offsets, whatever the thread count.
+    assert_eq!(
+        fingerprints,
+        [
+            (55_326, 969_879_645),
+            (50_277, 2_194_122_934),
+            (48_319, 1_718_131_757),
+            (63_269, 1_086_982_408),
+        ]
+    );
+}
+
+#[test]
+fn a_streamed_member_writes_the_same_at_one_thread_and_counts_forward() {
+    let data = [text(90_000, 19), tone(30_000, 2), text(40_000, 20)].concat();
+    let options = EncodeOptions::default().with_optimal_parse(true);
+    let stream = || {
+        let (mut out, mut reports) = (Vec::new(), Vec::new());
+        let (flow, kept) = encode_streamed(
+            &mut &data[..],
+            data.len(),
+            &[],
+            None,
+            options,
+            true,
+            &mut |at| {
+                reports.push(at);
+                true
+            },
+            &mut |bytes, at| {
+                out.push((bytes.to_vec(), at));
+                Ok(ControlFlow::Continue(()))
+            },
+            BLOCK,
+        )
+        .unwrap();
+        assert!(flow.is_continue());
+        // A batch counts its bytes as it commits them, never going back.
+        assert!(reports.is_sorted(), "{reports:?}");
+        assert_eq!(reports.last(), Some(&data.len()));
+        (out, kept)
+    };
+    let batched = side_by_side(stream);
+    let one_thread = {
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
+        stream()
+    };
+    assert_eq!(batched, one_thread);
+    assert!(
+        batched.0.len() > 5,
+        "the packed bytes leave a block at a time"
+    );
 }

@@ -150,16 +150,8 @@ fn encode_tokens(
 ) -> Vec<EncodeToken> {
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let combined = [history, input].concat();
-    encode_tokens_with_progress(
-        &combined,
-        history.len(),
-        options,
-        cost_model,
-        None,
-        super::LzState::default(),
-        None,
-    )
-    .expect("encoding without cancellation cannot be cancelled")
+    encode_tokens_with_progress(&combined, history.len(), options, cost_model, None, None)
+        .expect("encoding without cancellation cannot be cancelled")
 }
 
 const AUTOREJ_PACKED: &[u8] = &[
@@ -878,7 +870,7 @@ fn optimal_parser_skips_an_out_of_format_fresh_match() {
     let prices = CostModel::new(&lengths);
 
     let matches = super::collect_match_lists(&input, start, end, options);
-    let tokens = super::encode_tokens_optimal(&input, start, end, &matches, &prices, [0; 4]);
+    let tokens = super::encode_tokens_optimal(&input, start, end, &matches, &prices);
     assert_eq!(tokens.len(), 5);
     assert!(tokens
         .iter()
@@ -893,7 +885,7 @@ fn optimal_parser_covers_a_long_repeat_with_full_length_matches() {
     let prices = CostModel::new(&lengths);
 
     let matches = super::collect_match_lists(&input, 0, input.len(), options);
-    let tokens = super::encode_tokens_optimal(&input, 0, input.len(), &matches, &prices, [0; 4]);
+    let tokens = super::encode_tokens_optimal(&input, 0, input.len(), &matches, &prices);
     let mut decoded = Vec::new();
     for token in &tokens {
         match *token {
@@ -1817,11 +1809,14 @@ fn a_match_that_copies_the_last_one_becomes_a_repeat() {
             offset: 4,
         },
     ];
-    assert!(super::use_repeats(&mut tokens, Some((5, 300))));
+    assert!(super::use_repeats(&mut tokens));
     assert_eq!(
         tokens,
         [
-            EncodeToken::RepeatLast,
+            EncodeToken::Match {
+                length: 5,
+                offset: 300,
+            },
             EncodeToken::Literal(b'x'),
             EncodeToken::RepeatLast,
             EncodeToken::ShortOffset { offset: 4 },

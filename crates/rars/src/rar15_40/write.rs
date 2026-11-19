@@ -1802,7 +1802,7 @@ fn member_workspace(
         .saturating_add(dictionary.saturating_mul(12))
         .saturating_add(ppmd_models)
         .saturating_add(optimal_parse)
-        .saturating_add(coder_workspace(options))
+        .saturating_add(coder_workspace(options, unpacked))
         .saturating_add(2 * 1024 * 1024)
 }
 
@@ -1820,13 +1820,14 @@ fn rar29_optimal_parse_workspace(options: WriterOptions, unpacked: u64) -> u64 {
     parses.saturating_mul(crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE)
 }
 
-/// What the RAR 1.5 and 2.0 coders hold whatever the member's size: RAR 1.5's
-/// match index over its 64 KiB window, and RAR 2.0's parse of one block.
-fn coder_workspace(options: WriterOptions) -> u64 {
+/// RAR 1.5's match index over its 64 KiB window, or RAR 2.0's parse of each
+/// block it codes at once.
+fn coder_workspace(options: WriterOptions, unpacked: u64) -> u64 {
     match options.target {
         ArchiveVersion::Rar15 => crate::codec::rar13::ENCODER_WORKSPACE,
-        ArchiveVersion::Rar20 => crate::codec::rar20::block_workspace(
+        ArchiveVersion::Rar20 => crate::codec::rar20::coding_workspace(
             rar20_encode_options_for_options(options).is_ok_and(|options| options.optimal_parse),
+            unpacked,
         ),
         _ => 0,
     }
@@ -2195,10 +2196,10 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
         options.target,
         ArchiveVersion::Rar15 | ArchiveVersion::Rar20
     ) {
-        // One window and one block, and a chain's history.
+        // A window, the parse of each block in a batch, and a chain's history.
         return dictionary
             .saturating_mul(2)
-            .saturating_add(coder_workspace(options))
+            .saturating_add(coder_workspace(options, u64::MAX))
             .saturating_add(2 * 1024 * 1024);
     }
     let segment = engine_sample_len(options) as u64;
@@ -5745,6 +5746,8 @@ mod tests {
 
     #[test]
     fn rar20_charges_a_block_whatever_the_member_size() {
+        // At one thread; each further thread adds a block, up to sixteen.
+        let _cap = crate::parallel::ThreadCap::set(Some(1));
         for level in [3, 5] {
             let options = rar20(level, false);
             let small = super::member_workspace(options, 1 << 20, true, false);
@@ -6497,11 +6500,22 @@ mod tests {
             options.compression_level = Some(level);
             super::member_workspace(options, size, true, false)
         };
-        // RAR 2.0 holds the member and its packed form, and parses a block at a time.
+        // RAR 2.0 holds the member and its packed form, and a block's parse for
+        // each block it codes at once: one per thread, up to sixteen, and no
+        // more than the member's eight. Pin one thread for the per-byte bound.
+        let blocks = crate::parallel::threads().clamp(1, 16).min(8) as u64;
         for level in [3, 4, 5] {
-            let block = crate::codec::rar20::block_workspace(level > 3);
-            assert!(charge(ArchiveVersion::Rar20, level) >= 2 * size + block);
-            assert!(charge(ArchiveVersion::Rar20, level) < 2 * size + block + (16 << 20));
+            let block = crate::codec::rar20::coding_workspace(level > 3, 1);
+            let one = {
+                let _cap = crate::parallel::ThreadCap::set(Some(1));
+                charge(ArchiveVersion::Rar20, level)
+            };
+            assert!(one >= 2 * size + block);
+            assert!(one < 2 * size + block + (16 << 20));
+            assert_eq!(
+                charge(ArchiveVersion::Rar20, level) - one,
+                (blocks - 1) * block
+            );
         }
         // So does RAR 1.5, with a match index over its 64 KiB window.
         for level in [1, 3, 5] {

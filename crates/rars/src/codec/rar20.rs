@@ -2,7 +2,7 @@
 mod encoder;
 #[cfg(feature = "write")]
 pub(crate) use encoder::{
-    block_workspace, unpack20_encode_auto_with_options_and_progress, unpack20_encode_streamed,
+    coding_workspace, unpack20_encode_auto_with_options_and_progress, unpack20_encode_streamed,
 };
 #[cfg(feature = "write")]
 pub use encoder::{

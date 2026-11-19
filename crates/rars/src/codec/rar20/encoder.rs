@@ -264,7 +264,7 @@ const BLOCK_SIZE: usize = 1024 * 1024;
 /// block, the match finders, the tokens, and at levels 4–5 the shortest-path
 /// parse's nodes and match lists. Peak RSS on brett, coding 256 MiB streamed
 /// with 1 MiB blocks, was 18–26 MB at level 3 and 73 MB at level 5.
-pub(crate) const fn block_workspace(optimal_parse: bool) -> u64 {
+const fn block_workspace(optimal_parse: bool) -> u64 {
     if optimal_parse {
         80 * 1024 * 1024
     } else {
@@ -303,40 +303,44 @@ fn encode_member_in_blocks(
     if input.is_empty() {
         return Ok(Vec::new());
     }
-    // The public field can be assigned directly, bypassing the builder clamp.
-    let options = options.constrained();
-    let reach = options.max_match_distance;
-    let history = &history[history.len().saturating_sub(reach)..];
-    let mut coder = BlockCoder::new(options, fixed_table, try_audio, history.is_empty());
-    // Only a block whose reach goes back into the history needs a copy.
-    let mut joined = Vec::new();
-    let mut base = 0;
-    while base < input.len() {
-        let end = (base + block_size).min(input.len());
-        let behind = reach.min(history.len() + base);
-        let window: &[u8] = if behind <= base {
-            &input[base - behind..end]
-        } else {
-            joined.clear();
-            joined.extend_from_slice(&history[history.len() - (behind - base)..]);
-            joined.extend_from_slice(&input[..end]);
-            &joined
-        };
-        coder.code_block(
-            window,
-            behind,
-            end < input.len(),
-            base,
-            again(&mut progress),
-        )?;
-        base = end;
-    }
-    Ok(coder.bits.finish())
+    let mut packed = Vec::new();
+    let _ = encode_streamed(
+        &mut &input[..],
+        input.len(),
+        history,
+        fixed_table,
+        options,
+        try_audio,
+        &mut |at| match progress.as_deref_mut() {
+            Some(report) => report(at),
+            None => true,
+        },
+        &mut |bytes, _| {
+            packed.extend_from_slice(bytes);
+            Ok(ControlFlow::Continue(()))
+        },
+        block_size,
+    )?;
+    // Nothing above breaks, so every packed byte was taken.
+    Ok(packed)
 }
 
-/// Codes a member read from `input`, holding one reach of history and one
-/// block. Returns the last reach of the member, the history a chain's next
-/// member continues from.
+/// Most blocks coded at once, so a batch's window and parses stay bounded.
+const MAX_BLOCKS_SIDE_BY_SIDE: usize = 16;
+
+fn blocks_per_batch() -> usize {
+    crate::parallel::threads().clamp(1, MAX_BLOCKS_SIDE_BY_SIDE)
+}
+
+/// A block's workspace per block coded at once, charged as if this member may fan out.
+pub(crate) fn coding_workspace(optimal_parse: bool, len: u64) -> u64 {
+    let blocks = len.div_ceil(BLOCK_SIZE as u64).max(1);
+    blocks
+        .min(blocks_per_batch() as u64)
+        .saturating_mul(block_workspace(optimal_parse))
+}
+
+/// Returns the member's last reach, which a chain's next member continues from.
 #[allow(clippy::too_many_arguments)]
 fn encode_streamed(
     input: &mut dyn Read,
@@ -353,18 +357,44 @@ fn encode_streamed(
     let reach = options.max_match_distance;
     let mut window = history[history.len().saturating_sub(reach)..].to_vec();
     let mut coder = BlockCoder::new(options, fixed_table, try_audio, window.is_empty());
+    let side_by_side = crate::parallel::may_nest();
+    let batch = match side_by_side {
+        true => block_size.saturating_mul(blocks_per_batch()),
+        false => block_size,
+    };
     let mut base = 0;
     while base < len {
-        let end = (base + block_size).min(len);
+        let end = base.saturating_add(batch).min(len);
         window.drain(..window.len().saturating_sub(reach));
         let behind = window.len();
         window.resize(behind + (end - base), 0);
         input.read_exact(&mut window[behind..])?;
-        coder.code_block(&window, behind, end < len, base, Some(&mut *progress))?;
-        // The last byte may still take bits from the next block.
-        let whole = coder.bits.take_whole_bytes();
-        if !whole.is_empty() && out(&whole, end)?.is_break() {
-            return Ok((ControlFlow::Break(()), Vec::new()));
+        let blocks: Vec<Block> = (behind..window.len())
+            .step_by(block_size)
+            .map(|start| {
+                let stop = (start + block_size).min(window.len());
+                Block {
+                    start,
+                    stop,
+                    more: stop < window.len() || end < len,
+                }
+            })
+            .collect();
+        let lz = coder.code_lz_blocks(&window, &blocks, side_by_side, &mut |consumed| {
+            progress(base + consumed)
+        })?;
+        for (block, lz) in blocks.iter().zip(lz) {
+            let (start, stop) = (block.start, block.stop);
+            coder.commit(&window[start..stop], lz, block.more)?;
+            let at = base + (stop - behind);
+            if !progress(at) {
+                return Err(Error::Cancelled);
+            }
+            // The last byte may still take bits from the next block.
+            let whole = coder.bits.take_whole_bytes();
+            if !whole.is_empty() && out(&whole, at)?.is_break() {
+                return Ok((ControlFlow::Break(()), Vec::new()));
+            }
         }
         base = end;
     }
@@ -386,31 +416,12 @@ fn again<'a>(
     }
 }
 
-/// What a reader carries from one block into the next, so each block's
-/// parse starts where the reader will be.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct LzState {
-    old_offsets: [usize; 4],
-    /// The length and offset a repeat-last symbol copies.
-    last_match: Option<(usize, usize)>,
-}
-
-impl LzState {
-    /// Where a reader is after `tokens`.
-    fn after(mut self, tokens: &[EncodeToken]) -> Self {
-        for &token in tokens {
-            let (length, offset) = match token {
-                EncodeToken::Literal(_) => continue,
-                EncodeToken::RepeatLast => self.last_match.expect("a repeat follows a match"),
-                EncodeToken::OldOffset { length, offset, .. }
-                | EncodeToken::Match { length, offset } => (usize::from(length), offset as usize),
-                EncodeToken::ShortOffset { offset } => (2, offset as usize),
-            };
-            push_old_offset(&mut self.old_offsets, offset);
-            self.last_match = Some((length, offset));
-        }
-        self
-    }
+/// A block's place in a batch's window, and whether any block follows it in the member.
+#[derive(Debug, Clone, Copy)]
+struct Block {
+    start: usize,
+    stop: usize,
+    more: bool,
 }
 
 /// Codes a member a block at a time into one bit stream. A block ends with the
@@ -419,7 +430,6 @@ struct BlockCoder {
     options: EncodeOptions,
     fixed_table: Option<FixedEncodeTable>,
     try_audio: bool,
-    lz: LzState,
     audio: AudioCoder,
     /// False while a solid member continues the fixed table already sent.
     header: bool,
@@ -437,41 +447,58 @@ impl BlockCoder {
             options,
             fixed_table,
             try_audio,
-            lz: LzState::default(),
             audio: AudioCoder::default(),
             header: fixed_table.is_none() || fresh,
             bits: BitWriter::default(),
         }
     }
 
-    /// Codes `window[start..]`, the reach before it in `window` to match
-    /// against, by LZ or, when it packs smaller, as audio. `base` is the
-    /// block's position in the member, for progress.
-    fn code_block(
-        &mut self,
+    /// Workers cannot share `progress`, so blocks side by side report only as they commit.
+    fn code_lz_blocks(
+        &self,
         window: &[u8],
-        start: usize,
-        more: bool,
-        base: usize,
-        progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<()> {
-        let mut report = progress.map(|report| move |consumed: usize| report(base + consumed));
-        // A fixed table never changes, so its blocks run on without new tables.
-        let ends_table = more && self.fixed_table.is_none();
-        let (mut best, lz) = code_lz_block(
-            window,
-            start,
-            self.options,
-            self.fixed_table,
-            self.header,
-            ends_table,
-            self.lz,
-            report
-                .as_mut()
-                .map(|report| report as &mut dyn FnMut(usize) -> bool),
-        )?;
+        blocks: &[Block],
+        side_by_side: bool,
+        progress: &mut dyn FnMut(usize) -> bool,
+    ) -> Result<Vec<BitWriter>> {
+        let reach = self.options.max_match_distance;
+        let code = |index: usize, progress: Option<&mut dyn FnMut(usize) -> bool>| {
+            let Block { start, stop, more } = blocks[index];
+            // A fixed table never changes, so its blocks run on without new tables.
+            let ends_table = more && self.fixed_table.is_none();
+            let header = (index == 0 && self.header) || self.fixed_table.is_none();
+            let behind = reach.min(start);
+            code_lz_block(
+                &window[start - behind..stop],
+                behind,
+                self.options,
+                self.fixed_table,
+                header,
+                ends_table,
+                progress,
+            )
+        };
+        let indices: Vec<usize> = (0..blocks.len()).collect();
+        if !side_by_side || blocks.len() == 1 {
+            let first = blocks[0].start;
+            return indices
+                .into_iter()
+                .map(|index| {
+                    let into = blocks[index].start - first;
+                    code(index, Some(&mut |consumed| progress(into + consumed)))
+                })
+                .collect();
+        }
+        match crate::parallel::map_prefix(indices, |index| code(index, None)) {
+            (_, Some(error)) => Err(error),
+            (coded, None) => Ok(coded),
+        }
+    }
+
+    /// Writes `block` as its LZ coding `lz` or, when it packs smaller, as audio.
+    fn commit(&mut self, block: &[u8], lz: BitWriter, more: bool) -> Result<()> {
+        let mut best = lz;
         let mut audio = None;
-        let block = &window[start..];
         if self.try_audio {
             for channels in 1..=MAX_CHANNELS {
                 if block.len() < channels * 64 {
@@ -484,10 +511,9 @@ impl BlockCoder {
                 }
             }
         }
-        // An audio block leaves the LZ state alone, and an LZ block the audio state.
-        match audio {
-            Some(coder) => self.audio = coder,
-            None => self.lz = lz,
+        // An LZ block leaves the audio state alone.
+        if let Some(coder) = audio {
+            self.audio = coder;
         }
         self.bits.append(&best);
         self.header = self.fixed_table.is_none();
@@ -507,9 +533,8 @@ fn code_lz_block(
     fixed_table: Option<FixedEncodeTable>,
     header: bool,
     more: bool,
-    state: LzState,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<(BitWriter, LzState)> {
+) -> Result<BitWriter> {
     // Matches do not depend on prices, so every pass shares one search. A
     // fixed table is never re-parsed, so its greedy pass searches as it goes.
     let matches = (options.optimal_parse && fixed_table.is_none())
@@ -520,7 +545,6 @@ fn code_lz_block(
         options,
         None,
         matches.as_ref(),
-        state,
         again(&mut progress),
     )?;
     let table_lengths = table_lengths_for_tokens(&tokens, fixed_table, more)?;
@@ -533,9 +557,8 @@ fn code_lz_block(
         &table_lengths,
         more,
     )?;
-    let mut best_state = state.after(&tokens);
     if fixed_table.is_some() {
-        return Ok((best, best_state));
+        return Ok(best);
     }
     // Each pass's tokens die once packed; a pass that reproduces the last one
     // packs to the same length, which ends the loop.
@@ -560,7 +583,6 @@ fn code_lz_block(
             options,
             Some(&cost_model),
             matches.as_ref(),
-            state,
             poll.as_mut()
                 .map(|poll| poll as &mut dyn FnMut(usize) -> bool),
         )?;
@@ -570,7 +592,7 @@ fn code_lz_block(
         // The repeats are tried on the packed result only. Prices drawn from a
         // table with them in would make the next parse shun the very matches
         // that become repeats, which cost 0.18% on an unstripped binary.
-        if matches.is_some() && use_repeats(&mut next_tokens, state.last_match) {
+        if matches.is_some() && use_repeats(&mut next_tokens) {
             let repeat_table = table_lengths_for_tokens(&next_tokens, None, more)?;
             let mut repeated = BitWriter::default();
             write_lz_block(
@@ -590,9 +612,8 @@ fn code_lz_block(
         }
         best_table = next_table;
         best = next;
-        best_state = state.after(&next_tokens);
     }
-    Ok((best, best_state))
+    Ok(best)
 }
 
 /// The table a priced pass reads its prices from, with every symbol the last
@@ -615,7 +636,8 @@ fn absent_priced(table: &[u8; TABLE_COUNT]) -> [u8; TABLE_COUNT] {
 /// after the parse; the greedy one already uses it as it goes. The reader
 /// moves its recent offsets the same way for either, so nothing after the
 /// swap changes. Returns whether anything was swapped.
-fn use_repeats(tokens: &mut [EncodeToken], mut last_match: Option<(usize, usize)>) -> bool {
+fn use_repeats(tokens: &mut [EncodeToken]) -> bool {
+    let mut last_match = None;
     let mut swapped = false;
     for token in tokens {
         let this = match *token {
@@ -1093,7 +1115,6 @@ fn encode_tokens_optimal(
     end: usize,
     matches: &MatchLists,
     cost_model: &CostModel<'_>,
-    old_offsets: [usize; 4],
 ) -> Vec<EncodeToken> {
     let span = end - start;
     let mut nodes = vec![ParseNode::UNREACHED; span + 1];
@@ -1108,8 +1129,8 @@ fn encode_tokens_optimal(
         span,
         "lists collected for another buffer"
     );
+    // A block starts with no recent offsets, which UNREACHED already holds.
     nodes[0].cost = 0;
-    nodes[0].reps = old_offsets.map(|offset| offset as u32);
 
     for index in 0..span {
         // Every position is reachable through the one-byte literal edge.
@@ -1254,7 +1275,6 @@ fn encode_tokens_with_progress(
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
     matches: Option<&MatchLists>,
-    state: LzState,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     if let (Some(cost_model), Some(matches)) = (cost_model, matches) {
@@ -1264,7 +1284,6 @@ fn encode_tokens_with_progress(
             combined.len(),
             matches,
             cost_model,
-            state.old_offsets,
         ));
     }
     let mut tokens = Vec::new();
@@ -1290,8 +1309,9 @@ fn encode_tokens_with_progress(
 
     let mut pos = start;
     let end = combined.len();
-    let mut last_match = state.last_match;
-    let mut old_offsets = state.old_offsets;
+    // A block starts with no recent offsets and nothing to repeat.
+    let mut last_match = None;
+    let mut old_offsets = [0; 4];
     let mut next_report = 0usize;
     while pos < end {
         if let Some(&model) = cost_model {
