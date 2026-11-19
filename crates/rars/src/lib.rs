@@ -264,6 +264,20 @@ pub struct ArchiveReadOptions<'a> {
     /// recovery helpers keep defaults. Each extraction starts a new budget.
     /// Options-aware comment decoding starts a separate single-comment budget.
     pub max_total_output_bytes: Option<u64>,
+    /// Bytes a controlled extraction may decode only to throw away, so it can
+    /// skip a member of a solid archive. None, the default, refuses such a
+    /// skip with [`Error::CannotSkipSolidMember`].
+    ///
+    /// With a budget, a solid member the selector skips is decoded into a sink:
+    /// later members need its history. It must still be readable (a password,
+    /// for one that is encrypted), and a failure decoding it is as fatal as
+    /// for any solid member. Its bytes charge this budget, cumulatively across
+    /// the extraction, instead of [`Self::max_member_output_bytes`] and
+    /// [`Self::max_total_output_bytes`]. A member whose declared size, or whose
+    /// decoded output, would exceed what is left stops the extraction with
+    /// [`Error::SolidSkipBudgetExceeded`]. Memory is that of extracting to a
+    /// sink; bound the time with [`Self::cancellation`].
+    pub solid_skip_budget: Option<u64>,
     /// Aggregate capacity ceiling for reader-owned payload workspace in one
     /// extraction or options-aware comment call, across all members and volumes.
     /// Includes decoder/model state, packed and cipher staging, filter scratch,
@@ -355,6 +369,13 @@ impl<'a> ArchiveReadOptions<'a> {
     /// Sets the total logical output ceiling and selects sequential extraction.
     pub fn with_max_total_output_bytes(mut self, limit: u64) -> Self {
         self.max_total_output_bytes = Some(limit);
+        self
+    }
+
+    /// Lets a controlled extraction skip solid members by decoding and
+    /// discarding up to `bytes` of them; see [`Self::solid_skip_budget`].
+    pub fn with_solid_skip_budget(mut self, bytes: u64) -> Self {
+        self.solid_skip_budget = Some(bytes);
         self
     }
 
@@ -1005,10 +1026,13 @@ impl Archive {
     /// `Stop` returns [`ExtractionOutcome::Stopped`], distinct from reaching the end.
     /// Cancellation takes precedence over a successful callback decision.
     ///
-    /// Skipping file data is conservatively refused in any solid archive with
-    /// [`Error::CannotSkipSolidMember`]. To discard solid output while retaining
-    /// history, return `Extract(Box::new(std::io::sink()))`; this still decodes,
-    /// verifies, requires passwords and counts against output quotas.
+    /// Skipping file data in a solid archive is refused with
+    /// [`Error::CannotSkipSolidMember`] unless
+    /// [`ArchiveReadOptions::solid_skip_budget`] is set, in which case the
+    /// member is decoded and discarded, charging that budget instead of the
+    /// output quotas. Returning `Extract(Box::new(std::io::sink()))` also
+    /// discards solid output while retaining history, but counts against output
+    /// quotas.
     /// Directories can be skipped. RAR5 redirections can be skipped or stop the
     /// scan but cannot be extracted through this writer-only callback.
     /// This sequential API handles a single physical archive; extracting split

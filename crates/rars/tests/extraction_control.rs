@@ -449,3 +449,116 @@ fn controlled_directory_extraction_selects_a_writer_without_spending_output_quot
         assert!(output.borrow().is_empty());
     }
 }
+
+#[test]
+fn a_solid_skip_budget_decodes_a_skipped_member_and_delivers_the_ones_after_it() {
+    let mut state = 0x9e37_79b9u32;
+    let middle: Vec<u8> = (0..8192)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let first = b"before the large member".to_vec();
+    // Only the skipped member's history can produce this one.
+    let last = middle[1000..1300].to_vec();
+    for version in VERSIONS {
+        let mut builder = Builder::new(version).solid(true);
+        for (name, data) in [
+            (b"first".as_slice(), &first),
+            (b"middle", &middle),
+            (b"last", &last),
+        ] {
+            builder
+                .add_bytes(name.to_vec(), data.clone(), None, None)
+                .unwrap();
+        }
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let skip_middle = |output: Extracted| {
+            move |member: &rars::ArchiveMember| {
+                Ok(match member.meta.name.as_slice() {
+                    b"middle" => Decision::Skip,
+                    name => {
+                        let name = name.to_vec();
+                        output.borrow_mut().push((name, Vec::new()));
+                        let output = output.clone();
+                        Decision::Extract(Box::new(Append(output)) as Box<dyn Write>)
+                    }
+                })
+            }
+        };
+        // Output ceilings below the skipped member's size: it doesn't charge them.
+        let options = ArchiveReadOptions::new()
+            .with_max_member_output_bytes(512)
+            .with_max_total_output_bytes(512);
+
+        let error = archive
+            .extract_with_control(options, skip_middle(Rc::default()))
+            .unwrap_err();
+        assert!(
+            matches!(error.root_cause(), Error::CannotSkipSolidMember),
+            "{version:?}: {error}"
+        );
+
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let outcome = archive
+            .extract_with_control(
+                options.with_solid_skip_budget(8192),
+                skip_middle(output.clone()),
+            )
+            .unwrap();
+        assert_eq!(outcome, Outcome::Complete, "{version:?}");
+        assert_eq!(
+            *output.borrow(),
+            vec![
+                (b"first".to_vec(), first.clone()),
+                (b"last".to_vec(), last.clone())
+            ],
+            "{version:?}"
+        );
+
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let error = archive
+            .extract_with_control(
+                options.with_solid_skip_budget(8191),
+                skip_middle(output.clone()),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.root_cause(),
+                Error::SolidSkipBudgetExceeded {
+                    limit: 8191,
+                    required: 8192
+                }
+            ),
+            "{version:?}: {error}"
+        );
+        assert_eq!(error.kind(), rars::ErrorKind::ResourceLimit);
+        assert_eq!(error.entry_context().unwrap().0, b"middle");
+        // Refused on its declared size, so nothing after it was reached.
+        assert_eq!(output.borrow().len(), 1, "{version:?}");
+    }
+}
+
+/// Each extracted member's name and bytes, in order.
+type Extracted = Rc<RefCell<Vec<(Vec<u8>, Vec<u8>)>>>;
+
+/// Appends to the last member pushed onto the shared list.
+struct Append(Extracted);
+impl Write for Append {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .borrow_mut()
+            .last_mut()
+            .unwrap()
+            .1
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
