@@ -6784,45 +6784,45 @@ mod tests {
         }
     }
 
-    /// Fails the test when a payload write isn't covered by the budget, which
-    /// is what a member's charge holding until it is written promises.
-    struct ChargedWrites<'a> {
-        out: std::io::Cursor<Vec<u8>>,
-        resources: &'a crate::WriterResources,
-        payload_writes: usize,
-    }
-
-    impl std::io::Write for ChargedWrites<'_> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            // Headers are written outside any charge; payloads aren't.
-            if bytes.len() > 512 {
-                self.payload_writes += 1;
-                let charged = self.resources.workspace_in_use();
-                assert!(
-                    charged >= bytes.len() as u64,
-                    "{} bytes written with {charged} charged",
-                    bytes.len()
-                );
-            }
-            self.out.write(bytes)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl std::io::Seek for ChargedWrites<'_> {
-        fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
-            self.out.seek(from)
-        }
-    }
-
     #[cfg(all(
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))
     ))]
     #[test]
     fn a_tight_budget_on_many_threads_writes_what_one_thread_writes() {
+        /// Fails the test when a payload write isn't covered by the budget, which
+        /// is what a member's charge holding until it is written promises.
+        struct ChargedWrites<'a> {
+            out: std::io::Cursor<Vec<u8>>,
+            resources: &'a crate::WriterResources,
+            payload_writes: usize,
+        }
+
+        impl std::io::Write for ChargedWrites<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                // Headers are written outside any charge; payloads aren't.
+                if bytes.len() > 512 {
+                    self.payload_writes += 1;
+                    let charged = self.resources.workspace_in_use();
+                    assert!(
+                        charged >= bytes.len() as u64,
+                        "{} bytes written with {charged} charged",
+                        bytes.len()
+                    );
+                }
+                self.out.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl std::io::Seek for ChargedWrites<'_> {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.out.seek(from)
+            }
+        }
+
         const STREAM_ABOVE: u64 = 96 * 1024;
         let (sender, receiver) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
