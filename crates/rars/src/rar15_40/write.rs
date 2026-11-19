@@ -9,7 +9,7 @@ use crate::codec::rar20::{
 use crate::codec::rar29::{
     named_filter_segments, unpack29_encode_literals, unpack29_encode_literals_with_options,
     unpack29_encode_literals_with_options_and_progress, ChainEngine,
-    EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
+    EncodeOptions as Rar29EncodeOptions, PpmdModelSize, Unpack29Encoder,
 };
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
@@ -1252,11 +1252,17 @@ fn encode_rar29_auto_filtered_member_with_progress(
     let searching = !text && crate::filter_search::search_applies(data);
     let best = EncodedPayload {
         data: if searching {
+            // Every finalist is a full encode, so at the levels with a
+            // shortest-path parse they are measured by the lazy parse that
+            // seeds it, and only the winner is parsed the slow way. Which
+            // filter suits the member does not depend on how hard the parse
+            // tries, and the lazy encode stays in hand in case it codes smaller.
+            let lazy = options.with_optimal_parse_passes(0);
             let mut last = 0usize;
-            crate::filter_search::choose_filter(
+            let (filters, measured) = crate::filter_search::choose_filter(
                 &Rar29Search,
                 data,
-                options,
+                lazy,
                 Some(&mut |event| match event {
                     crate::filter_search::EncodeProgress::PassStarted => {
                         last = 0;
@@ -1268,8 +1274,23 @@ fn encode_rar29_auto_filtered_member_with_progress(
                         progress.is_none_or(|work| work.advance(delta as u64))
                     }
                 }),
-            )?
-            .1
+            )?;
+            if options.optimal_parse_passes == 0 {
+                measured
+            } else {
+                use crate::filter_search::FilterSearch;
+                let mut poll = |_| !progress.is_some_and(WorkTracker::is_cancelled);
+                let parsed = if filters.is_empty() {
+                    Rar29Search.encode_plain(data, options, Some(&mut poll))?
+                } else {
+                    Rar29Search.encode_filtered(data, &filters, options, Some(&mut poll))?
+                };
+                if parsed.len() < measured.len() {
+                    parsed
+                } else {
+                    measured
+                }
+            }
         } else {
             with_codec_progress(progress, |report| {
                 unpack29_encode_literals_with_options_and_progress(data, options, report)
@@ -1286,7 +1307,8 @@ fn encode_rar29_auto_filtered_member_with_progress(
     Ok(best)
 }
 
-/// Codes text as LZ, PPMd with escapes and plain PPMd side by side; the smallest wins.
+/// Codes text as LZ, PPMd with escapes and plain PPMd, the PPMd under each
+/// model the level tries; the smallest wins.
 fn encode_rar29_text_member(
     data: &[u8],
     options: Rar29EncodeOptions,
@@ -1300,7 +1322,13 @@ fn encode_rar29_text_member(
     // sample archive overhead dominates, so 128 KiB of one phrase reads as a
     // 45% PPMd win (118 bytes against 213). PPMd costs about three times LZ on
     // the same bytes; `ppmd_trial_pays` decides which levels pay for both.
-    let (_, best) = text_trial(data, options, &|encode| {
+    let models = ppmd_models_for_level(lz_method.saturating_sub(0x30));
+    // PPMd wins almost every text member, so the LZ side of the trial is the
+    // lazy parse: on the bench's eight text classes at levels 4 and 5 the
+    // shortest-path parse changed no packed byte and doubled the time on the
+    // 4 MiB members.
+    let options = options.with_optimal_parse_passes(0);
+    let (_, best) = text_trial(data, options, models, &|encode| {
         with_codec_progress(progress, |report| encode(report))
     })?;
     if best.len() >= data.len() {
@@ -1322,34 +1350,48 @@ type TrialRun<'a> = dyn Fn(
     + Sync
     + 'a;
 
-/// Codes text as LZ, PPMd with escapes and plain PPMd side by side; the smallest wins, LZ then escapes on a tie.
+/// Codes text as LZ, then PPMd with escapes and plain PPMd under each model
+/// size in turn; the smallest wins, earlier on a tie.
+///
+/// The engine says whether PPMd won but not under which model, so a caller
+/// that codes the member again from it passes the default model alone.
 fn text_trial(
     data: &[u8],
     options: Rar29EncodeOptions,
+    models: &[PpmdModelSize],
     run: &TrialRun<'_>,
 ) -> Result<(StreamedEngine, Vec<u8>)> {
-    let ppmd = |escapes: Option<usize>| {
+    let ppmd = |size: PpmdModelSize, escapes: Option<usize>| {
         run(&mut |report| {
-            crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+            crate::codec::rar29::unpack29_encode_ppmd_sized_with_progress(
                 data,
                 escapes.is_some(),
-                None,
                 escapes.unwrap_or(0),
+                size,
                 report,
             )
         })
     };
-    let (lz, (escaped, literals)) = crate::parallel::join(
+    // The escape tokens price themselves against costs measured off the
+    // stream they are shaping, so a member where every escape loses can still
+    // ratify a few before the measurements catch up. A pure-literal stream is
+    // the direct check.
+    let pair = |size: PpmdModelSize| {
+        crate::parallel::join(
+            || ppmd(size, Some(options.max_match_distance)),
+            || ppmd(size, None),
+        )
+    };
+    let (&first, larger) = models
+        .split_first()
+        .expect("every level that trials PPMd names a model");
+    let (lz, first) = crate::parallel::join(
         || {
             run(&mut |report| {
                 unpack29_encode_literals_with_options_and_progress(data, options, report)
             })
         },
-        // The escape tokens price themselves against costs measured off the
-        // stream they are shaping, so a member where every escape loses can
-        // still ratify a few before the measurements catch up. A pure-literal
-        // stream is the direct check.
-        || crate::parallel::join(|| ppmd(Some(options.max_match_distance)), || ppmd(None)),
+        || pair(first),
     );
     let mut best = (
         StreamedEngine::Lz {
@@ -1357,15 +1399,56 @@ fn text_trial(
         },
         lz?,
     );
-    for (escapes, candidate) in [
-        (Some(options.max_match_distance), escaped?),
-        (None, literals?),
-    ] {
-        if candidate.len() < best.1.len() {
-            best = (StreamedEngine::Ppmd { escapes }, candidate);
+    let mut consider = |(escaped, literals): (Result<Vec<u8>>, Result<Vec<u8>>)| -> Result<()> {
+        for (escapes, candidate) in [
+            (Some(options.max_match_distance), escaped?),
+            (None, literals?),
+        ] {
+            if candidate.len() < best.1.len() {
+                best = (StreamedEngine::Ppmd { escapes }, candidate);
+            }
         }
+        Ok(())
+    };
+    consider(first)?;
+    // One model at a time, so the trial holds two of them rather than all.
+    for &size in larger {
+        consider(pair(size))?;
     }
     Ok(best)
+}
+
+/// The PPMd models a level tries on text, smallest first.
+///
+/// Each level tries everything the level below does and one model more, so a
+/// higher level can only find a smaller stream. Order 8 in 25 MB is what rar
+/// 3.00 declares at m5. A higher order needs the memory to hold its contexts:
+/// order 16 in 40 MB restarts its model partway through 4 MiB of man pages and
+/// loses to order 8, and in 64 MB it wins. Measured with escapes, packed bytes:
+///
+/// ```text
+/// model           o8 25MB   o12 64MB   o16 64MB  o25 128MB
+/// man pages       539,345    535,071    534,221    534,134
+/// source tar      551,388    525,240    520,171    512,921
+/// ```
+///
+/// Small members code best as plain literals, where order 16 is worth 0.1% to
+/// 0.6% over order 8 on headers, logs and docs but loses 0.06% on the mixed
+/// class, which is why order 8 stays in the trial rather than being replaced.
+fn ppmd_models_for_level(level: u8) -> &'static [PpmdModelSize] {
+    const ORDER_16: PpmdModelSize = PpmdModelSize {
+        order: 16,
+        memory_mb: 64,
+    };
+    const ORDER_25: PpmdModelSize = PpmdModelSize {
+        order: 25,
+        memory_mb: 128,
+    };
+    match level {
+        0..=3 => &[PpmdModelSize::DEFAULT],
+        4 => &[PpmdModelSize::DEFAULT, ORDER_16],
+        _ => &[PpmdModelSize::DEFAULT, ORDER_16, ORDER_25],
+    }
 }
 
 fn is_text_ppmd_candidate(data: &[u8]) -> bool {
@@ -1615,15 +1698,26 @@ fn member_workspace(
     }
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
-    let ppmd_trials =
-        matches!(
-            options.target,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-        ) && ppmd_trial_pays(compression_method_for_level(options).saturating_sub(0x30));
-    let ppmd_models = if ppmd_trials {
-        (2 * crate::codec::rar29::PPMD_MODEL_BYTES).saturating_add(
-            crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
-        )
+    let rar29 = matches!(
+        options.target,
+        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+    );
+    let level = compression_method_for_level(options).saturating_sub(0x30);
+    let ppmd_models = if rar29 && ppmd_trial_pays(level) {
+        // The trial holds two models of one size at a time.
+        let largest = ppmd_models_for_level(level)
+            .iter()
+            .map(|size| size.bytes())
+            .max()
+            .unwrap_or(crate::codec::rar29::PPMD_MODEL_BYTES);
+        (2 * largest).saturating_add(crate::codec::rar29::ppmd_search_workspace(
+            dictionary as usize,
+        ))
+    } else {
+        0
+    };
+    let optimal_parse = if rar29 {
+        rar29_optimal_parse_workspace(options, unpacked)
     } else {
         0
     };
@@ -1631,8 +1725,23 @@ fn member_workspace(
         .saturating_mul(held_per_byte(options))
         .saturating_add(dictionary.saturating_mul(12))
         .saturating_add(ppmd_models)
+        .saturating_add(optimal_parse)
         .saturating_add(coder_workspace(options))
         .saturating_add(2 * 1024 * 1024)
+}
+
+/// What the shortest-path parse holds beyond the lazy one: a workspace for
+/// each block that parses at once, which is one per thread up to the sixteen
+/// a batch spreads over, and no more than the member has blocks.
+fn rar29_optimal_parse_workspace(options: WriterOptions, unpacked: u64) -> u64 {
+    let parses = rar29_encode_options_for_options(options)
+        .ok()
+        .filter(|options| options.optimal_parse_passes != 0)
+        .map_or(0, |_| {
+            let blocks = unpacked.div_ceil(RAR29_LZ_BLOCK_SIZE as u64).max(1);
+            blocks.min(crate::parallel::threads().clamp(1, 16) as u64)
+        });
+    parses.saturating_mul(crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE)
 }
 
 /// What the RAR 1.5 and 2.0 coders hold whatever the member's size: RAR 1.5's
@@ -1907,9 +2016,15 @@ fn streamed_engine(
             "entry source size changed while compressing",
         ));
     }
-    let (engine, _) = text_trial(&sample, encode_options, &|encode| {
-        encode(&mut |_| !progress.is_cancelled()).map_err(map_codec_cancel)
-    })?;
+    // The streamed PPMd coder declares the default model, so that is the only
+    // one worth measuring for it, and LZ is measured by the lazy parse, as the
+    // in-memory trial measures it.
+    let (engine, _) = text_trial(
+        &sample,
+        encode_options.with_optimal_parse_passes(0),
+        &[PpmdModelSize::DEFAULT],
+        &|encode| encode(&mut |_| !progress.is_cancelled()).map_err(map_codec_cancel),
+    )?;
     Ok(engine)
 }
 
@@ -1965,6 +2080,7 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     let segment = engine_sample_len(options) as u64;
     let lz = dictionary
         .saturating_mul(12 + 6)
+        .saturating_add(rar29_optimal_parse_workspace(options, u64::MAX))
         .saturating_add(2 * 1024 * 1024);
     // A named filter is applied in place, with no candidate to hold beside it.
     let searching = options.method != Rar29Method::Ppmd
@@ -2231,10 +2347,11 @@ fn stream_member(
                     return Ok(Vec::new());
                 }
                 let mut poll = |_| !progress.is_cancelled();
+                // Only the choice is kept, so the lazy parse measures it.
                 crate::filter_search::choose_filter(
                     &Rar29Search,
                     segment,
-                    encode_options,
+                    encode_options.with_optimal_parse_passes(0),
                     Some(&mut poll),
                 )
                 .map(|(specs, _)| specs)
@@ -2671,23 +2788,52 @@ fn validate_header_encrypted_archive_options(
     Ok(())
 }
 
+/// RAR 2.9 levels, as the LZ parse each one runs.
+///
+/// Each level parses at least as well as the one below. Measured on the bench
+/// corpus's 4 MiB classes through LZ alone, no filter, packed bytes:
+///
+/// ```text
+/// parse                    stripped ELF  unstripped ELF  man pages  source tar
+/// greedy, 8 candidates        1,887,716       1,627,511    757,447     811,633
+/// greedy, 32                  1,864,334       1,610,547    720,161     757,785
+/// lazy, 16                    1,822,607       1,545,989    709,905     755,377
+/// lazy, 64                    1,805,783       1,534,280    688,069     720,524
+/// lazy, 128                   1,800,583       1,531,317    682,125     709,487
+/// shortest path, 64, 1 pass   1,743,620       1,438,006    649,359     666,108
+/// shortest path, 128, 3       1,727,188       1,411,736    642,330     655,801
+/// ```
+///
+/// Lazy matching is worth 3-4% for well under a tenth more time, so it starts
+/// at level 2. Greedy past eight candidates was the old level 2, and it lost
+/// to level 1 on long repeats: the deeper search found a far match that scored
+/// better than the repeat offset it displaced, and paid for it on every period
+/// after. The shortest-path parse is worth another 3-7% and costs four to six
+/// times the lazy parse, so it takes the top two levels, which differ in how
+/// far they search and how often they re-price.
+///
+/// An absent level keeps the lazy parse at 128 candidates the writer has
+/// always used, rather than paying for level 5's.
 fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOptions> {
-    let level = level.unwrap_or(5);
-    let candidates = match level {
-        0 => 0,
-        1 => 8,
-        2 => 32,
-        3 => 64,
-        4 => 96,
-        5 => 128,
-        _ => {
+    let options = match level {
+        None => Rar29EncodeOptions::new(128).with_lazy_matching(true),
+        Some(0) => Rar29EncodeOptions::new(0),
+        Some(1) => Rar29EncodeOptions::new(8),
+        Some(2) => Rar29EncodeOptions::new(16).with_lazy_matching(true),
+        Some(3) => Rar29EncodeOptions::new(64).with_lazy_matching(true),
+        Some(4) => Rar29EncodeOptions::new(64)
+            .with_lazy_matching(true)
+            .with_optimal_parse_passes(1),
+        Some(5) => Rar29EncodeOptions::new(128)
+            .with_lazy_matching(true)
+            .with_optimal_parse_passes(3),
+        Some(_) => {
             return Err(Error::InvalidArgument(
                 "RAR compression level must be in the range 0..5",
             ))
         }
     };
-    Ok(Rar29EncodeOptions::new(candidates)
-        .with_lazy_matching(level >= 4)
+    Ok(options
         .with_lazy_lookahead(1)
         .with_block_size(RAR29_LZ_BLOCK_SIZE))
 }
@@ -6729,6 +6875,100 @@ mod tests {
             assert!(options.lazy_matching, "level {level} stopped being lazy");
             assert_eq!(options.lazy_lookahead, 2, "level {level}");
         }
+    }
+
+    #[test]
+    fn only_the_top_two_rar29_levels_pay_for_the_shortest_path() {
+        for level in 0..=3u8 {
+            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
+            assert_eq!(options.optimal_parse_passes, 0, "level {level}");
+        }
+        for level in 4..=5u8 {
+            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
+            assert!(options.optimal_parse_passes > 0, "level {level}");
+        }
+        // An absent level keeps the parse the writer always used.
+        let default = super::rar29_encode_options_for_level(None).unwrap();
+        assert_eq!(default.optimal_parse_passes, 0);
+        assert_eq!(
+            (default.max_match_candidates, default.lazy_matching),
+            (128, true)
+        );
+    }
+
+    /// Each level tries every PPMd model the level below does, so text can
+    /// only come out smaller further up.
+    #[test]
+    fn each_rar29_level_tries_the_ppmd_models_of_the_one_below() {
+        for level in 3..5u8 {
+            let below = super::ppmd_models_for_level(level);
+            let above = super::ppmd_models_for_level(level + 1);
+            assert!(above.starts_with(below), "level {}", level + 1);
+        }
+        assert_eq!(
+            super::ppmd_models_for_level(3),
+            &[crate::codec::rar29::PpmdModelSize::DEFAULT]
+        );
+    }
+
+    /// Level 2 used to be a deeper greedy search than level 1, and on runs of
+    /// zeroes between a repeating phrase it found far matches that displaced
+    /// the repeat offset and packed larger than level 1 did.
+    #[test]
+    fn each_rar29_level_packs_no_larger_than_the_one_below() {
+        let mut period = vec![0u8; 4096];
+        for _ in 0..91 {
+            period.extend_from_slice(b"the quick brown fox jumps over the lazy dog. ");
+        }
+        let runs: Vec<u8> = period.iter().copied().cycle().take(160 * 1024).collect();
+        let samples = [
+            ("binary", binary_member(96 * 1024)),
+            ("text", word_text(96 * 1024)),
+            ("runs", runs),
+        ];
+        for (name, data) in samples {
+            let members = entries(&[(name, &data)]);
+            let mut below = usize::MAX;
+            for level in 1..=5u8 {
+                let mut options =
+                    super::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
+                options.compression_level = Some(level);
+                let archive = in_memory_with(&members, options, crate::MemberCoding::Compressed);
+                assert!(
+                    archive.len() <= below,
+                    "{name}: level {level} packed {} bytes, the level below {below}",
+                    archive.len()
+                );
+                below = archive.len();
+            }
+        }
+    }
+
+    #[test]
+    fn rar29_levels_are_charged_for_the_models_and_parse_they_hold() {
+        const MIB: u64 = 1024 * 1024;
+        let at = |level: u8| {
+            let mut options =
+                super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
+            options.compression_level = Some(level);
+            options
+        };
+        let charge = |level| super::member_workspace(at(level), 8 * MIB, true, false);
+        // Two models of the largest size a level tries, and a parse workspace
+        // per block that runs at once.
+        let parse = crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE;
+        assert_eq!(charge(2), charge(1));
+        assert!(charge(4) >= charge(3) + 2 * (64 - 25) * MIB + parse);
+        assert!(charge(5) >= charge(4) + 2 * (128 - 64) * MIB);
+        // A member of one block parses one block at a time.
+        assert_eq!(
+            super::member_workspace(at(5), 1000, true, false)
+                - super::member_workspace(at(3), 1000, true, false),
+            2 * (128 - 25) * MIB + parse
+        );
+        // Streamed, the parse is charged by the block, not by the member.
+        let streamed = super::streamed_workspace(at(5), &crate::MemberCoding::Compressed);
+        assert!(streamed < super::member_workspace(at(5), 1 << 30, true, false));
     }
 
     #[test]
