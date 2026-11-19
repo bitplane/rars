@@ -69,12 +69,17 @@ pub(crate) fn finish_member(
 
 pub(crate) type Selector<'a> = dyn FnMut(&ArchiveMember) -> Result<ExtractionDecision> + 'a;
 
+/// Asks the selector about the next member. A solid member it skips is
+/// refused, or, with a solid skip budget, decoded into a sink that charges
+/// that budget so the solid history still reaches the members after it.
 pub(crate) fn select(
     selector: &mut Option<&mut Selector<'_>>,
     options: ArchiveReadOptions<'_>,
+    budget: &mut crate::output_limit::OutputBudget,
     member: impl FnOnce() -> ArchiveMember,
     solid: bool,
 ) -> Result<Option<ExtractionDecision>> {
+    budget.set_discarding(false);
     let Some(selector) = selector.as_mut() else {
         return Ok(None);
     };
@@ -93,7 +98,11 @@ pub(crate) fn select(
         && !member.meta.is_directory
         && !member.meta.is_redirection
     {
-        return Err(Error::CannotSkipSolidMember.at_entry(member.meta.name, "selecting"));
+        if !budget.can_discard() {
+            return Err(Error::CannotSkipSolidMember.at_entry(member.meta.name, "selecting"));
+        }
+        budget.set_discarding(true);
+        return Ok(Some(ExtractionDecision::Extract(Box::new(std::io::sink()))));
     }
     Ok(Some(decision))
 }
