@@ -862,28 +862,37 @@ const SEAL_MARGIN: u64 = 32;
 /// whatever the rest would have saved.
 const COMMIT_GROWTH: u64 = 128;
 
+/// RAR 1.5's adaptive Huffman grows random bytes by about 1.0-1.2% at the
+/// levels that code literal runs (3 to 5), more than RAR 2.0 to 4.x's LZ
+/// does, so 1/128 stored any member whose first volume was noise. Levels 1
+/// and 2 code no literal runs and grow noise by about 12%, so a noisy first
+/// volume still stores there: committing would cost that on all-noise input.
+const RAR15_COMMIT_GROWTH: u64 = 48;
+
 #[cfg(test)]
 std::thread_local! {
-    static COMMIT_GROWTH_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(COMMIT_GROWTH) };
+    static COMMIT_GROWTH_HERE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Runs `write` with members committing if they grew by at most 1/`growth`; `u64::MAX` allows none.
 #[cfg(test)]
 pub(super) fn with_commit_growth<T>(growth: u64, write: impl FnOnce() -> T) -> T {
-    let was = COMMIT_GROWTH_HERE.replace(growth);
+    let was = COMMIT_GROWTH_HERE.replace(Some(growth));
     let result = write();
     COMMIT_GROWTH_HERE.set(was);
     result
 }
 
-#[cfg(not(test))]
-fn commit_growth() -> u64 {
-    COMMIT_GROWTH
-}
-
-#[cfg(test)]
-fn commit_growth() -> u64 {
-    COMMIT_GROWTH_HERE.get()
+/// The growth, as a fraction 1/n, a member's first volume may show and still commit.
+fn commit_growth(target: ArchiveVersion) -> u64 {
+    #[cfg(test)]
+    if let Some(growth) = COMMIT_GROWTH_HERE.get() {
+        return growth;
+    }
+    match target {
+        ArchiveVersion::Rar15 => RAR15_COMMIT_GROWTH,
+        _ => COMMIT_GROWTH,
+    }
 }
 
 /// Codes a member into the set as it reads; volumes are handed on as they fill.
@@ -1018,7 +1027,7 @@ impl StreamedOut for StreamedFragments<'_, '_, '_> {
         if coded == 0 || self.held.len() as u64 + block + SEAL_MARGIN <= self.room() {
             return true;
         }
-        self.committed = packed + block <= coded + coded / commit_growth();
+        self.committed = packed + block <= coded + coded / commit_growth(self.head.target);
         self.committed
     }
 
