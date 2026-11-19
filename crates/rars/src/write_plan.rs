@@ -199,8 +199,18 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         // it, and the older ones use it to decide how many members to have in
         // flight. A legacy volume set is the exception, still built in memory.
         WriterOption::MemoryLimit => family == ArchiveFamily::Rar50Plus || !shape.volumes,
-        // Only the RAR 5 engine spills to disk.
-        WriterOption::TempDir => family == ArchiveFamily::Rar50Plus,
+        // RAR 5 spools its members; RAR 2.0 to 4.x spool a large one when the
+        // output cannot seek back to patch its header.
+        WriterOption::TempDir => {
+            family == ArchiveFamily::Rar50Plus
+                || (matches!(
+                    target,
+                    ArchiveVersion::Rar20
+                        | ArchiveVersion::Rar29
+                        | ArchiveVersion::Rar30
+                        | ArchiveVersion::Rar40
+                ) && !shape.volumes)
+        }
     }
 }
 

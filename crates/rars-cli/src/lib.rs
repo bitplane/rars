@@ -1633,9 +1633,16 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     features.solid = solid;
     features.header_encryption = header_encryption;
     let password = password_bytes(&password);
-    let resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
+    let mut resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
         rars::WriterResources::new(limit as u64)
     });
+    // A large member written to a pipe is spooled; like RAR 5, beside the archive.
+    let default_temp = archive_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(directory) = temp_dir.as_deref().or(default_temp) {
+        resources = resources.with_temp_dir(directory);
+    }
     progress.bar("Compressing archive", total);
 
     write_archive_streaming(&archive_path, |mut output| {

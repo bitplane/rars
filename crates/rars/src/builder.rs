@@ -1222,9 +1222,12 @@ impl Builder {
     ///
     /// RAR 5 and RAR 7 stream using the supplied workspace and spool policy;
     /// see [`WriterResources`] for its scope and bare-WASM memory limits.
-    /// Legacy families emit headers and members directly, retaining compressed
-    /// members in memory. Stored sources are read twice to prepare and verify
-    /// checksums. Legacy managed-memory quotas are not supported.
+    /// Legacy families emit headers and members directly. RAR 2.0 to 4.x code
+    /// a compressed member over 64 MiB into a spool in the resources' temp
+    /// directory, so its header can carry the sizes; smaller ones, and every
+    /// RAR 1.3 and 1.5 member, are held in memory. Stored sources are read
+    /// twice to prepare and verify checksums. Legacy managed-memory quotas are
+    /// not supported.
     /// On failure, `output` may contain a partial archive. Use
     /// [`write_to_path`](Self::write_to_path) for atomic file publication.
     pub fn write_to(
@@ -1568,7 +1571,7 @@ impl Builder {
         match self.format.family() {
             ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
             ArchiveFamily::Rar15To40 => self.write_rar15_single(
-                rar15_40::ArchiveOutput::Stream(output),
+                rar15_40::ArchiveOutput::stream(output),
                 resources,
                 progress,
             ),
