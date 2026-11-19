@@ -915,6 +915,11 @@ impl Archive {
                     &control,
                 );
             }
+            if let Some(report) =
+                self.repair_recovery_to_rebuilding(writer, &recovery_data, &control)?
+            {
+                return Ok(report);
+            }
             let bytes = self.read_range(0..self.source_len()?)?;
             let options = crate::recovery::rar5::InlineRepairOptions {
                 password,
@@ -1003,6 +1008,116 @@ impl Archive {
             expected_recovery_shards: Some(expected),
         })
     }
+    /// Rebuilds a recovery record that lost chunks, streaming as
+    /// [`Self::repair_recovery_to_legacy`] does: the repaired prefix and the
+    /// rebuilt record are written as they are made, and only the recovery
+    /// chunks and the new record's parity are held. The output is what the
+    /// whole-archive repair writes.
+    ///
+    /// `None` leaves the repair to the whole-archive path, before anything is
+    /// written: a record that is compressed or encrypted, that does not
+    /// protect everything before its own block, or that ends the archive, so
+    /// an end-of-archive header has to be framed from the repaired bytes.
+    #[cfg(feature = "recovery")]
+    fn repair_recovery_to_rebuilding(
+        &self,
+        writer: &mut dyn Write,
+        stored: &[u8],
+        control: &crate::read_control::ReadControl,
+    ) -> Result<Option<crate::RecoveryRepairReport>> {
+        use crate::recovery::rar5 as recovery;
+        control.check()?;
+        let service = self.recovery_service()?;
+        let source_len = self.source_len()?;
+        let layout = match recovery::record_layout(stored, control) {
+            Ok(layout) => layout,
+            Err(recovery::Error::Cancelled) => return Err(Error::Cancelled),
+            Err(_) => return Ok(None),
+        };
+        let data = service.block.data_range.clone();
+        let record = data.start + layout.record.start..data.start + layout.record.end;
+        let protected = layout.protected_size;
+        if self.sfx_offset != 0
+            || data.len() != stored.len()
+            || protected != service.block.offset
+            || record.start < protected
+            || record.end >= source_len
+            || !self.range_holds(data.clone(), stored, control)?
+        {
+            return Ok(None);
+        }
+
+        let repaired = recovery::repair_inline_recovery_prefix_shards_with_control(
+            protected,
+            &layout.recovery_data,
+            |range| {
+                self.read_range(range)
+                    .map_err(|_| recovery::Error::BadRecoveryChunk)
+            },
+            control,
+        )?;
+        let data_repaired = !repaired.is_empty();
+        // Refused rebuilds keep the incomplete record, as the whole-archive
+        // repair does when its own rebuild is refused.
+        let rebuild =
+            recovery::record_rebuild_admitted(layout.plan, protected as u64, source_len as u64);
+
+        let mut cursor = 0usize;
+        for (range, bytes) in &repaired {
+            control.check()?;
+            self.copy_repair_range(cursor..range.start, writer, control)?;
+            control.finish(control.write_all(writer, bytes).map_err(Error::from))?;
+            cursor = range.end;
+        }
+        self.copy_repair_range(cursor..protected, writer, control)?;
+        if rebuild {
+            self.copy_repair_range(protected..record.start, writer, control)?;
+            let mut body = RepairedPrefix {
+                archive: self,
+                len: protected,
+                shards: &repaired,
+                pos: 0,
+                control,
+            };
+            let written =
+                recovery::write_rebuilt_record(&mut body, protected as u64, layout.plan, writer);
+            control.check()?;
+            written?;
+            self.copy_repair_range(record.end..source_len, writer, control)?;
+        } else {
+            self.copy_repair_range(protected..source_len, writer, control)?;
+        }
+        control.check()?;
+        Ok(Some(crate::RecoveryRepairReport {
+            changed: data_repaired || rebuild,
+            data_repaired,
+            recovery_record_rebuilt: rebuild,
+            end_record_rebuilt: false,
+            available_recovery_shards: Some(layout.available),
+            expected_recovery_shards: Some(layout.plan.recovery_shards),
+        }))
+    }
+
+    /// Whether the archive holds `expected` at `range` as it stands, compared
+    /// a block at a time.
+    #[cfg(feature = "recovery")]
+    fn range_holds(
+        &self,
+        range: Range<usize>,
+        expected: &[u8],
+        control: &crate::read_control::ReadControl,
+    ) -> Result<bool> {
+        for (index, start) in (range.start..range.end).step_by(64 * 1024).enumerate() {
+            control.check()?;
+            let end = start.saturating_add(64 * 1024).min(range.end);
+            let offset = index * 64 * 1024;
+            if self.read_range(start..end)? != expected[offset..offset + (end - start)] {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     #[cfg(feature = "recovery")]
     fn copy_repair_range(
         &self,
@@ -1016,6 +1131,67 @@ impl Archive {
             control.finish(control.write_all(writer, &data).map_err(Error::from))?;
         }
         control.check()
+    }
+}
+
+/// The protected prefix as it reads once repaired: the archive's bytes, with
+/// each repaired shard in place of the damaged one. Reads stop at
+/// cancellation.
+#[cfg(feature = "recovery")]
+struct RepairedPrefix<'a> {
+    archive: &'a Archive,
+    len: usize,
+    /// In order, as the repair returns them.
+    shards: &'a [(Range<usize>, Vec<u8>)],
+    pos: usize,
+    control: &'a crate::read_control::ReadControl,
+}
+
+#[cfg(feature = "recovery")]
+impl std::io::Read for RepairedPrefix<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.control
+            .check()
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        if self.pos >= self.len || buffer.is_empty() {
+            return Ok(0);
+        }
+        let want = buffer.len().min(self.len - self.pos);
+        let next = self.shards.iter().find(|(range, _)| range.end > self.pos);
+        let count = match next {
+            Some((range, bytes)) if range.start <= self.pos => {
+                let from = self.pos - range.start;
+                let count = want.min(range.end - self.pos);
+                buffer[..count].copy_from_slice(&bytes[from..from + count]);
+                count
+            }
+            _ => {
+                let until = next.map_or(self.len, |(range, _)| range.start);
+                let count = want.min(until - self.pos);
+                let bytes = self
+                    .archive
+                    .read_range(self.pos..self.pos + count)
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                buffer[..count].copy_from_slice(&bytes);
+                count
+            }
+        };
+        self.pos += count;
+        Ok(count)
+    }
+}
+
+#[cfg(feature = "recovery")]
+impl std::io::Seek for RepairedPrefix<'_> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        let target = match from {
+            std::io::SeekFrom::Start(at) => Some(at),
+            std::io::SeekFrom::End(delta) => (self.len as u64).checked_add_signed(delta),
+            std::io::SeekFrom::Current(delta) => (self.pos as u64).checked_add_signed(delta),
+        }
+        .ok_or_else(|| std::io::Error::other("seek before the start of the prefix"))?;
+        self.pos = usize::try_from(target).map_err(std::io::Error::other)?;
+        Ok(target)
     }
 }
 
