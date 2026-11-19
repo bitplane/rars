@@ -4920,6 +4920,44 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     );
 }
 
+/// A member's encode is charged its finder, a batch of tokens, a filtered copy
+/// of the member, its packed bytes and the best packed bytes before it, at
+/// every thread count the batch follows.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_member_encode_is_charged_for_what_its_parser_holds() {
+    let block_size = 64 * 1024;
+    let pool = crate::parallel::private_pool(16);
+    for (len, reach, split) in [
+        (5000, 4 << 20, false),
+        (8 << 20, 4 << 20, false),
+        (8 << 20, 4 << 20, true),
+        (8 << 20, 128 << 10, true),
+    ] {
+        let input = vec![0u8; len];
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(reach)
+            .with_block_size(block_size)
+            .with_split_blocks(split);
+        for threads in [1, 4, 16] {
+            let (charge, finder, batch) = pool.install(|| {
+                let _cap = crate::parallel::ThreadCap::set(Some(threads));
+                let parser = super::LzParser::new(&input, 0, options, block_size);
+                (
+                    super::member_encode_workspace(len, options),
+                    super::Rar29MatchFinder::bytes_for_reach(parser.finder.window(), reach),
+                    super::LzParser::batch_bytes(block_size).min(len),
+                )
+            });
+            // Cutting a block holds its tokens twice over for a moment.
+            let tokens =
+                batch * std::mem::size_of::<super::EncodeToken>() * (1 + usize::from(split));
+            let held = finder + (tokens + 3 * len) as u64;
+            assert!(charge >= held, "{len} {reach} {threads}: {charge} < {held}");
+        }
+    }
+}
+
 /// A batch of blocks is coded side by side, which only works because each
 /// block's table depends on its own tokens alone. The table before it still
 /// decides how the table is written, so each block has to be coded against its
