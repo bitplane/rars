@@ -46,14 +46,14 @@ Pinned by `writer_limits_table_matches_what_each_format_supports`.
 Peak resident memory writing 1 GiB (512 MiB of random bytes, then 512 MiB of
 text) at `--level 3`, on a 32-thread machine. Single archives ran under
 `--memory-limit 256m`. Legacy volume sets refuse that flag, so they ran
-without it. The solid column is two 512 MiB members. The `rar20` and `rar40`
-compressed volume sets gave up compressing after the first volume and stored
-the member (#342), so their peaks cover only that attempt.
+without it. The solid column is two 512 MiB members. The `rar15`, `rar20` and
+`rar40` compressed volume sets gave up compressing after the first volume and
+stored the member (#342), so their peaks cover only that attempt.
 
 | format | stored | compressed, to a file | compressed, to a pipe | solid | password | encrypted headers | volumes, stored / compressed | recovery |
 |---|---|---|---|---|---|---|---|---|
-| `rar14` | 7 MB | 11.8 GB | 11.8 GB | 7.0 GB | 11.8 GB | refused | 3.2 GB / 11.9 GB | refused |
-| `rar15` | 6 MB | 11.8 GB | 11.9 GB | 7.0 GB | 11.8 GB | refused | 6 MB / 11.8 GB | refused |
+| `rar14` | 7 MB | 10 MB | 10 MB | 10 MB | 10 MB | refused | 3.2 GB / 2.3 GB | refused |
+| `rar15` | 6 MB | 10 MB | 10 MB | 10 MB | 11 MB | refused | 6 MB / 10 MB | refused |
 | `rar20` | 6 MB | 27 MB | 28 MB | 25 MB | 31 MB | refused | 6 MB / 27 MB | refused |
 | `rar40` | 6 MB | 144 MB | 145 MB | 181 MB | 146 MB | 145 MB | 6 MB / 144 MB | refused |
 | `rar50` | 6 MB | 219 MB | 221 MB | 222 MB | 214 MB | 222 MB | 221 MB | 220 MB |

@@ -1112,6 +1112,17 @@ pub(super) enum Cipher {
 }
 
 impl Cipher {
+    /// RAR 2.0 onwards encrypts whole 16-byte blocks; RAR 1.5 a byte at a
+    /// time, so its last bytes go out as they are.
+    pub(super) fn pads(&self) -> bool {
+        match self {
+            #[cfg(feature = "encryption")]
+            Self::Rar15(_) => false,
+            #[cfg(feature = "encryption")]
+            Self::Rar20(_) | Self::Rar30(_) => true,
+        }
+    }
+
     pub(super) fn encrypt(&mut self, data: &mut [u8]) {
         match self {
             #[cfg(feature = "encryption")]

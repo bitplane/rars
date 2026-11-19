@@ -219,8 +219,10 @@ pub fn write_compressed_archive_with_comment_and_progress(
 /// Writes an archive straight to `output`, holding only the member being coded
 /// rather than every input at once.
 ///
-/// `resources` bounds the working set. RAR 1.3 compresses a member as a unit,
-/// so a member larger than the budget is coded on its own rather than refused.
+/// `resources` bounds the working set. A compressed member over 64 MiB is
+/// packed into a spool in `resources`' temp directory, holding one window of
+/// it; a smaller one is held while it is coded, and one larger than the budget
+/// is coded on its own rather than refused.
 pub fn write_streaming_archive_to(
     entries: &[StreamingEntry],
     options: WriterOptions,

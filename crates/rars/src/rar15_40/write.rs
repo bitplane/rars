@@ -2366,7 +2366,9 @@ impl Sealed {
     fn finish(mut self, output: &mut dyn StreamedOut) -> Result<()> {
         if let Some(cipher) = &mut self.cipher {
             if !self.pending.is_empty() {
-                self.pending.resize(16, 0);
+                if cipher.pads() {
+                    self.pending.resize(16, 0);
+                }
                 cipher.encrypt(&mut self.pending);
                 output.write_packed(&self.pending)?;
             }
@@ -5040,6 +5042,33 @@ mod tests {
             assert!(streamed.len() > 2);
             assert!(streamed == whole, "solid: {solid}");
             assert_eq!(extracted_set(&streamed, None), named_contents(&contents));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn a_password_protected_rar15_member_streams_without_padding() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(300 * 1024 + 5);
+        let contents = [("large.bin", &large[..]), ("noise.bin", &noise[..])];
+        let members: Vec<_> = entries(&contents)
+            .into_iter()
+            .map(|entry| entry.with_password(b"password".to_vec()))
+            .collect();
+        let coding = || crate::MemberCoding::Compressed;
+        for solid in [false, true] {
+            let out = streamed_with(&members, rar15(3, solid), coding(), None).unwrap();
+
+            assert!(out.seeks > 0, "the large members were not streamed");
+            let archive = out.inner.into_inner();
+            // The RAR 1.5 cipher works a byte at a time, so nothing is padded,
+            // and with no salt the archive is the one written in memory.
+            let whole = in_memory_with(&members, rar15(3, solid), coding());
+            assert!(archive == whole, "solid: {solid}");
+            assert_eq!(
+                extracted(&archive, Some(b"password")),
+                named_contents(&contents)
+            );
         }
     }
 
