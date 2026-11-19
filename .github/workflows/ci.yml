@@ -23,12 +23,18 @@ env:
   CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
-  msrv:
-    name: Minimum Rust (1.89)
+  # The checks that only compile, for another compiler or target, and the
+  # independent reader's feature matrix. They were five jobs, four of them
+  # under a minute, and every job waits its own turn for a runner. Each step
+  # runs even when one before it failed, so one failure hides no other.
+  portability:
+    name: Portability and reader features
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
-      CARGO_BUILD_JOBS: 1
+      CARGO_BUILD_JOBS: 4
+      RUST_TEST_THREADS: 2
+      RAYON_NUM_THREADS: 2
     steps:
       - uses: actions/checkout@v7
         with:
@@ -38,6 +44,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.89.0
+      # Installed last, so stable is the default and 1.89 is asked for by name.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown, i686-unknown-linux-musl, powerpc-unknown-linux-gnu
+          components: clippy
+      # The independent reader consumer builds under target/, which this caches.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
@@ -47,11 +59,49 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.13'
-      - name: Check workspace and independent readers at the minimum compiler version
+
+      - name: Minimum Rust (1.89)
+        if: ${{ !cancelled() }}
         run: |
-          cargo check --workspace --lib --bins --locked
-          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml
-          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --features encryption
+          cargo +1.89.0 check --workspace --lib --bins --locked
+          cargo +1.89.0 check --locked --manifest-path scripts/reader-consumer/Cargo.toml
+          cargo +1.89.0 check --locked --manifest-path scripts/reader-consumer/Cargo.toml --features encryption
+
+      # Minimal and encrypted readers without workspace unification, then the
+      # full library.
+      - name: Reader target (wasm32-unknown-unknown)
+        if: ${{ !cancelled() }}
+        env:
+          TARGET: wasm32-unknown-unknown
+        run: |
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target "$TARGET"
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target "$TARGET" --features encryption
+          cargo check -p rars --lib --locked --target "$TARGET"
+      - name: Reader target (i686-unknown-linux-musl)
+        if: ${{ !cancelled() }}
+        env:
+          TARGET: i686-unknown-linux-musl
+        run: |
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target "$TARGET"
+          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target "$TARGET" --features encryption
+          cargo check -p rars --lib --locked --target "$TARGET"
+
+      # Criterion's alloca dependency builds C even during cargo check.
+      - name: Install PowerPC C compiler
+        if: ${{ !cancelled() }}
+        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc-linux-gnu
+      # Compile the binary and tests on a target that exercises the mutex
+      # fallback, without needing an emulator to run them.
+      - name: Library and CLI without 64-bit atomics
+        if: ${{ !cancelled() }}
+        run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
+
+      - name: Independent reader feature matrix
+        if: ${{ !cancelled() }}
+        run: |
+          cargo fetch --locked
+          cargo fetch --locked --manifest-path scripts/reader-consumer/Cargo.toml
+          python3 scripts/check-reader-features.py
 
   rust:
     name: Rust checks
@@ -248,6 +298,10 @@ jobs:
           ./scripts/build-npm.sh
           node scripts/test-npm-package.js
 
+  # Unoptimised on purpose: this is the guard against stack frames that
+  # optimisation hides. Windows gives the CLI's main thread 1 MiB, and when a
+  # solid PPMd chain moved its model by value, three solid-archive tests here
+  # overflowed it. Every other job that runs tests builds rars at opt-level 1.
   native-cli:
     name: Native CLI (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -271,114 +325,35 @@ jobs:
       - name: Test the CLI on the native filesystem
         run: cargo test -p rars-cli --locked
 
-  reader-features:
-    name: Independent reader feature matrix
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      CARGO_BUILD_JOBS: 1
-      RUST_TEST_THREADS: 2
-      RAYON_NUM_THREADS: 2
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      # The consumer builds under target/, which this caches.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - name: Fetch locked dependencies
-        run: |
-          cargo fetch --locked
-          cargo fetch --locked --manifest-path scripts/reader-consumer/Cargo.toml
-      - name: Check independent reader consumer and dependency exclusions
-        run: python3 scripts/check-reader-features.py
-
-  reader-targets:
-    name: Reader target (${{ matrix.target }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [wasm32-unknown-unknown, i686-unknown-linux-musl]
-    env:
-      CARGO_BUILD_JOBS: 1
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Check minimal and encrypted readers without workspace unification
-        run: |
-          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target '${{ matrix.target }}'
-          cargo check --locked --manifest-path scripts/reader-consumer/Cargo.toml --target '${{ matrix.target }}' --features encryption
-      - name: Check full library
-        run: cargo check -p rars --lib --locked --target '${{ matrix.target }}'
-
-  portable-atomics:
-    name: Library and CLI without 64-bit atomics
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      CARGO_BUILD_JOBS: 1
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: powerpc-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      # Criterion's alloca dependency builds C even during cargo check.
-      - name: Install PowerPC C compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc-linux-gnu
-      # Compile the binary and tests on a target that exercises the mutex
-      # fallback, without needing an emulator to run them.
-      - name: Check library, CLI and tests
-        run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
-
   # Every optional-feature combination of the library, without workspace
-  # feature unification. Running the unit tests is most of each set's time, so
-  # every write set gets a job of its own; the read and recovery sets are
-  # quicker and share two jobs, reusing their dependency builds.
+  # feature unification. Each set compiles rars and runs its unit tests, a few
+  # minutes for a write set, so the sets are spread over four jobs of about
+  # the same length. A job runs its sets in a row in one target directory, and
+  # a failing set does not stop the sets after it.
   unit-features:
-    name: Library unit features (${{ matrix.group }})
+    name: Library unit features (${{ matrix.name }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         include:
-          - group: read
-            features: none parallel encryption encryption,parallel
-          - group: recovery
-            features: recovery recovery,parallel recovery,encryption recovery,encryption,parallel
-          - group: write
-            features: write
+          # cache: the group's widest feature set, whose dependencies cover
+          # the others'. Cache keys cannot contain commas.
+          - name: write+recovery+encryption+parallel, write+recovery, read
+            cache: write+recovery+encryption+parallel
+            sets: write,recovery,encryption,parallel write,recovery none parallel encryption encryption,parallel
+          - name: write+recovery+encryption, write+recovery+parallel, recovery
+            cache: write+recovery+encryption
+            sets: write,recovery,encryption write,recovery,parallel recovery recovery,parallel recovery,encryption recovery,encryption,parallel
+          - name: write, write+encryption
+            cache: write
+            sets: write write,encryption
             memory: write
-          - group: write+parallel
-            features: write,parallel
+          - name: write+parallel, write+encryption+parallel
+            cache: write+parallel
+            sets: write,parallel write,encryption,parallel
             memory: write,parallel
-          - group: write+encryption
-            features: write,encryption
-          - group: write+encryption+parallel
-            features: write,encryption,parallel
-          - group: write+recovery
-            features: write,recovery
-          - group: write+recovery+parallel
-            features: write,recovery,parallel
-          - group: write+recovery+encryption
-            features: write,recovery,encryption
-          - group: write+recovery+encryption+parallel
-            features: write,recovery,encryption,parallel
     env:
       CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0
@@ -391,29 +366,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      # The group names the cache, and cache keys cannot contain commas.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-          key: ${{ matrix.group }}
-      # As in Rust checks: unoptimised rars spends test runs decoding. The plain
-      # write group stays at opt-level 0, where the 1 MiB-stack test
-      # (a_solid_ppmd_chain_codes_on_a_1_mib_stack) can still catch a large
-      # stack frame that optimisation would hide.
+          key: ${{ matrix.cache }}
+      # As in Rust checks: unoptimised rars spends test runs decoding. The
+      # unoptimised stack-frame guard is the Windows Native CLI job.
       - name: Optimise the rars crate in test builds
-        if: matrix.group != 'write'
         shell: bash
         run: |
           mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
           printf '[profile.dev.package.rars]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Lint and test the library without workspace feature unification
         env:
-          SETS: ${{ matrix.features }}
+          SETS: ${{ matrix.sets }}
         run: |
-          set -euo pipefail
+          failed=""
           for features in $SETS; do
-            python3 scripts/check-unit-features.py --features "$features"
+            python3 scripts/check-unit-features.py --features "$features" || failed="$failed $features"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::Failed feature sets:$failed"
+            exit 1
+          fi
       - name: Check encoder memory bounds without workspace feature unification
         if: matrix.memory != ''
         env:
