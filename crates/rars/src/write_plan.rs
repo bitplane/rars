@@ -388,6 +388,26 @@ mod tests {
     #[test]
     #[cfg(all(feature = "encryption", feature = "recovery"))]
     fn writer_limits_table_matches_what_each_format_supports() {
+        const WRITER_LIMITS_TABLE: &str = "\
+            rar13 single  solid password --- -------- memory ----\n\
+            rar13 volumes solid -------- --- -------- ------ ----\n\
+            rar14 single  solid password --- -------- memory ----\n\
+            rar14 volumes solid -------- --- -------- ------ ----\n\
+            rar15 single  solid password --- -------- memory ----\n\
+            rar15 volumes solid password --- -------- ------ ----\n\
+            rar20 single  solid password --- -------- memory temp\n\
+            rar20 volumes solid password --- -------- ------ ----\n\
+            rar29 single  solid password -hp -------- memory temp\n\
+            rar29 volumes solid password -hp -------- ------ ----\n\
+            rar30 single  solid password -hp -------- memory temp\n\
+            rar30 volumes solid password -hp -------- ------ ----\n\
+            rar40 single  solid password -hp -------- memory temp\n\
+            rar40 volumes solid password -hp -------- ------ ----\n\
+            rar50 single  solid password -hp recovery memory temp\n\
+            rar50 volumes solid password -hp recovery memory temp\n\
+            rar70 single  solid password -hp recovery memory temp\n\
+            rar70 volumes solid password -hp recovery memory temp\n\
+        ";
         let columns = [
             ("solid", WriterOption::Feature(Feature::Solid)),
             ("password", WriterOption::Password),
@@ -414,27 +434,6 @@ mod tests {
         }
         assert_eq!(table, WRITER_LIMITS_TABLE, "\n{table}");
     }
-
-    const WRITER_LIMITS_TABLE: &str = "\
-        rar13 single  solid password --- -------- memory ----\n\
-        rar13 volumes solid -------- --- -------- ------ ----\n\
-        rar14 single  solid password --- -------- memory ----\n\
-        rar14 volumes solid -------- --- -------- ------ ----\n\
-        rar15 single  solid password --- -------- memory ----\n\
-        rar15 volumes solid password --- -------- ------ ----\n\
-        rar20 single  solid password --- -------- memory temp\n\
-        rar20 volumes solid password --- -------- ------ ----\n\
-        rar29 single  solid password -hp -------- memory temp\n\
-        rar29 volumes solid password -hp -------- ------ ----\n\
-        rar30 single  solid password -hp -------- memory temp\n\
-        rar30 volumes solid password -hp -------- ------ ----\n\
-        rar40 single  solid password -hp -------- memory temp\n\
-        rar40 volumes solid password -hp -------- ------ ----\n\
-        rar50 single  solid password -hp recovery memory temp\n\
-        rar50 volumes solid password -hp recovery memory temp\n\
-        rar70 single  solid password -hp recovery memory temp\n\
-        rar70 volumes solid password -hp recovery memory temp\n\
-    ";
 
     /// A refusal is only useful if it can point somewhere, so every option has
     /// to be available on at least one format.

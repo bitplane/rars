@@ -6,7 +6,7 @@
 
 use rars::{ArchiveVersion, Builder, EntrySource, WriterResources};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const MEMBER: u64 = 16 << 20;
@@ -16,7 +16,7 @@ const AHEAD: u64 = 1 << 20;
 /// Bytes made up from their position, so the test holds none of them.
 struct Pattern {
     pos: u64,
-    read: Arc<AtomicU64>,
+    read: Arc<AtomicUsize>,
 }
 
 impl Read for Pattern {
@@ -26,7 +26,7 @@ impl Read for Pattern {
             *byte = ((self.pos + offset as u64) * 31 % 251) as u8;
         }
         self.pos += n as u64;
-        self.read.fetch_add(n as u64, Ordering::Relaxed);
+        self.read.fetch_add(n, Ordering::Relaxed);
         Ok(n)
     }
 }
@@ -45,7 +45,7 @@ impl Seek for Pattern {
 /// Counts what is written and checks the source's current pass against it.
 struct Output {
     written: u64,
-    read: Arc<AtomicU64>,
+    read: Arc<AtomicUsize>,
     furthest_ahead: u64,
 }
 
@@ -54,10 +54,8 @@ impl Write for Output {
         self.written += bytes.len() as u64;
         // Past the headers, the copying pass is the one under way.
         if self.written > AHEAD {
-            let ahead = self
-                .read
-                .load(Ordering::Relaxed)
-                .saturating_sub(self.written);
+            let read = self.read.load(Ordering::Relaxed) as u64;
+            let ahead = read.saturating_sub(self.written);
             self.furthest_ahead = self.furthest_ahead.max(ahead);
         }
         Ok(bytes.len())
@@ -78,7 +76,7 @@ fn a_stored_member_is_copied_through_not_loaded_in_every_format() {
         ArchiveVersion::Rar50,
         ArchiveVersion::Rar70,
     ] {
-        let read = Arc::new(AtomicU64::new(0));
+        let read = Arc::new(AtomicUsize::new(0));
         let source = {
             let read = read.clone();
             EntrySource::from_opener(MEMBER, move || {
