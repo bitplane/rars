@@ -582,11 +582,8 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 ///
 /// Nearly all of it is the match finder's chain links: four bytes per byte of
 /// window, and the window is a power of two, so a dictionary just over one costs
-/// almost double the one just under. That rounding is why a flat multiple of the
-/// dictionary never described this well. It used to charge twelve times the
-/// dictionary, which is the middle of the eight-to-sixteen the rounding then
-/// produced, so it over-charged a dictionary that was already a power of two and
-/// came close to under-charging one that had just crossed.
+/// almost double the one just under, which no flat multiple of the dictionary
+/// describes.
 ///
 /// Peak resident bytes for one member encode, over the member itself, taken on a
 /// 16 MiB member so every window is filled:

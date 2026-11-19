@@ -1,8 +1,7 @@
 # Local fuzzing
 
-This is a separate Cargo workspace; normal workspace checks do not build these
-targets. Run fuzzing locally or in explicitly scheduled jobs. PR checks run the
-ordinary deterministic tests, not random fuzz campaigns.
+This is a separate Cargo workspace, so normal workspace checks don't build
+these targets and CI doesn't run them.
 
 From the repository root, install the tooling once:
 
@@ -14,12 +13,12 @@ cargo +nightly fuzz list
 cargo +nightly fuzz build
 ```
 
-Builds, corpora and artifacts stay on disk under the repository, rather than
-putting large working data in a potentially RAM-backed `/tmp`. After a rars
-version/dependency change, refresh this workspace's lockfile with
-`RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins`, then
-commit `fuzz/Cargo.lock`. The `--cfg fuzzing` flag, which `cargo fuzz` sets itself,
-is what makes rars expose its RAR 3 VM to `rarvm_parse_execute`.
+Builds, corpora and artifacts stay under the repository, not in a possibly
+RAM-backed `/tmp`. After a rars version or dependency change, refresh
+`fuzz/Cargo.lock` with
+`RUSTFLAGS="--cfg fuzzing" cargo check --manifest-path fuzz/Cargo.toml --bins`.
+`--cfg fuzzing`, which `cargo fuzz` sets itself, exposes the RAR 3 VM to
+`rarvm_parse_execute`.
 
 ## Targets
 
@@ -57,16 +56,8 @@ cp crates/rars/tests/fixtures/rar50/filter_e8e9.rar fuzz/corpus/archive_extract/
 timeout --kill-after=5s 70s cargo +nightly fuzz run archive_extract -- -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -max_len=1048576
 ```
 
-The outer `timeout` command is available on Linux. It covers the whole command,
-so build first. Adjust durations explicitly for longer runs. Other targets use
-the same runner flags, with input sizes suited to their individual harnesses.
+Other targets take the same flags. `-rss_limit_mb` is sampled, not a hard
+ceiling; use a cgroup when you need one.
 
-Logical output and dictionary admission are not an aggregate RAM/CPU budget.
-Keep the per-input timeout and process RSS guard even with reader limits;
-libFuzzer's RSS guard is sampled, not a strict OS memory ceiling. Use a dedicated
-container/cgroup when a hard machine-wide resource ceiling is required. Reader
-cancellation cannot preempt blocked I/O, allocations or every library primitive.
-
-Crashes/timeouts are saved under `fuzz/artifacts/<target>/`. Triage them locally
-and turn confirmed bugs into small deterministic regression tests. A successful
-smoke replay verifies the harness, not the robustness of the parser or codecs.
+Crashes and timeouts land in `fuzz/artifacts/<target>/`. Turn confirmed bugs
+into small deterministic regression tests.
