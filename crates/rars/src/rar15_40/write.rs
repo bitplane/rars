@@ -1044,16 +1044,12 @@ fn encode_rar29_policy_filtered_payload(
 
 /// Whether this level is willing to encode the member twice to choose an engine.
 ///
-/// Takes the resolved level, not the option. Reading `Option<u8>` meant an
-/// absent level and `--level 3` disagreed, though both write method 0x33: the
-/// default paid for the trial and the level that names the same number did not,
-/// so the two produced archives 24% apart on the same 4 MiB of text.
+/// Takes the resolved level, so an absent level and `--level 3` agree.
 ///
-/// Levels 1 and 2 are the ones asking for speed and still skip it. Level 3 is
-/// the default and where most archives are written, and it is worth about a
-/// fifth of the size on text for roughly twice the encode. WinRAR turns PPMd on
-/// one level later, at m4: on the bench text member WinRAR 3.00 packs 657,294
-/// bytes at m3 and 585,357 at m4, where we now write 540,517 at both.
+/// Levels 1 and 2 ask for speed and skip it. Level 3 is the default, and the
+/// trial is worth about a fifth of the size on text for roughly twice the
+/// encode. WinRAR turns PPMd on one level later, at m4: on 4 MiB of text WinRAR
+/// 3.00 packs 657,294 bytes at m3 and 585,357 at m4, and rars 540,517 at both.
 fn ppmd_trial_pays(level: u8) -> bool {
     level >= 3
 }
@@ -1297,23 +1293,13 @@ fn encode_rar29_text_member(
     lz_method: u8,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    // Whichever engine wins, it wins because it was measured against the other
-    // over the whole member. Size used to decide it instead: under 1 MiB text
-    // was measured, over 16 MiB it went to PPMd unmeasured, and everything
-    // between kept the LZ bytes without ever encoding PPMd to compare. That
-    // middle band cost 24% on 2 MiB of man pages and 12% on 4 MiB, and the
-    // unmeasured end can lose just as badly the other way: 8 MiB of content
-    // that repeats every 4 MiB packs to 843 KB under LZ and 1.44 MB under PPMd.
-    //
-    // Screening on a sample first, the way the filter search earns its
-    // candidates, was tried and does not work here. The two engines are only
-    // comparable once there is enough output to compare: on 128 KiB of one
-    // repeating phrase LZ lands on 213 bytes and PPMd on 118, so the screen
-    // reads a 45% PPMd win off what is almost entirely archive overhead. And
-    // in the case worth catching, repetition further apart than the sample is
-    // wide, the sample cannot see the repetition at all. PPMd costs about
-    // three times LZ on the same bytes, so text at the top two levels pays for
-    // both engines. Levels 1 to 4 skip the trial as they always have.
+    // Encode the whole member with both engines and keep the smaller. Neither
+    // size nor a sample predicts the winner: 8 MiB of content that repeats
+    // every 4 MiB packs to 843 KB under LZ and 1.44 MB under PPMd, and a sample
+    // narrower than the repeat distance cannot see the repetition. On a small
+    // sample archive overhead dominates, so 128 KiB of one phrase reads as a
+    // 45% PPMd win (118 bytes against 213). PPMd costs about three times LZ on
+    // the same bytes; `ppmd_trial_pays` decides which levels pay for both.
     let (_, best) = text_trial(data, options, &|encode| {
         with_codec_progress(progress, |report| encode(report))
     })?;
@@ -2637,13 +2623,8 @@ fn rar29_encode_options_for_options(options: WriterOptions) -> Result<Rar29Encod
 
 /// RAR 2.0 levels, as candidates searched per position.
 ///
-/// The ladder used to run 16, 64, 256, 96, 128, so the top two levels searched
-/// less than the middle one and asking for more compression got less of it: on
-/// 4 MiB of man pages level 3 packed 848,854 bytes, level 5 packed 861,371 and
-/// level 4 packed 867,857, which is the candidate order exactly.
-///
-/// Lazy matching was off at every level, which cost more than the ladder did.
-/// Measured on that member, packed bytes and seconds:
+/// Each level searches more than the one below. Measured on 4 MiB of man
+/// pages, packed bytes and seconds:
 ///
 /// ```text
 /// candidates       16       64      256      512     1024
