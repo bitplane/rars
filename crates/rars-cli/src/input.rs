@@ -1,19 +1,7 @@
-use crate::password::Password;
 use crate::{CliResult, DOS_ARCHIVE_ATTR};
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io::Read;
+use std::fs;
 use std::path::{Component, Path, PathBuf};
-use zeroize::Zeroizing;
-
-/// An input read fully into memory, for the RAR 1.3 writer.
-pub(crate) struct OwnedInput {
-    pub(crate) name: Vec<u8>,
-    pub(crate) data: Vec<u8>,
-    pub(crate) file_attr: u8,
-    pub(crate) mtime: Option<rars::Timestamp>,
-    pub(crate) password: Option<Password>,
-}
 
 pub(crate) struct LazyInput {
     pub(crate) is_directory: bool,
@@ -41,12 +29,6 @@ pub(crate) trait StoredTime {
     fn unix_seconds(&self) -> Option<u32> {
         self.mtime()
             .and_then(|time| u32::try_from(time.unix_seconds()).ok())
-    }
-}
-
-impl StoredTime for OwnedInput {
-    fn mtime(&self) -> Option<rars::Timestamp> {
-        self.mtime
     }
 }
 
@@ -78,36 +60,6 @@ pub(crate) fn collect_inputs(paths: &[PathBuf]) -> CliResult<Vec<LazyInput>> {
     }
     reject_duplicate_input_names(pending.iter().map(|entry| entry.name.as_slice()))?;
     Ok(pending)
-}
-
-pub(crate) fn read_inputs_with_progress<F, G>(
-    paths: &[PathBuf],
-    password: Option<&[u8]>,
-    discovered: F,
-    mut advanced: G,
-) -> CliResult<Vec<OwnedInput>>
-where
-    F: FnOnce(usize, u64),
-    G: FnMut(u64, &[u8]),
-{
-    let pending = collect_inputs(paths)?;
-    discovered(pending.len(), pending.iter().map(|entry| entry.size).sum());
-    let mut out = Vec::with_capacity(pending.len());
-    for entry in pending {
-        let data = if entry.is_directory {
-            Vec::new()
-        } else {
-            read_file_with_progress(&entry.path, "input", |bytes| advanced(bytes, &entry.name))?
-        };
-        out.push(OwnedInput {
-            name: entry.name,
-            data,
-            file_attr: entry.file_attr,
-            mtime: entry.mtime,
-            password: password.map(|p| Zeroizing::new(p.to_vec())),
-        });
-    }
-    Ok(out)
 }
 
 fn collect_input(path: &Path, archive_name: &Path, out: &mut Vec<LazyInput>) -> CliResult<()> {
@@ -205,28 +157,6 @@ fn reject_duplicate_input_names<'a>(entries: impl IntoIterator<Item = &'a [u8]>)
     Ok(())
 }
 
-fn read_file_with_progress(
-    path: &Path,
-    role: &str,
-    mut advanced: impl FnMut(u64),
-) -> CliResult<Vec<u8>> {
-    let mut file = File::open(path)
-        .map_err(|err| format!("failed to read {role} '{}': {err}", path.display()))?;
-    let mut data = Vec::new();
-    let mut buffer = vec![0; 1024 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|err| format!("failed to read {role} '{}': {err}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        data.extend_from_slice(&buffer[..read]);
-        advanced(read as u64);
-    }
-    Ok(data)
-}
-
 #[cfg(unix)]
 fn source_unix_mode(metadata: &fs::Metadata) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
@@ -300,15 +230,8 @@ mod tests {
     }
 
     #[test]
-    fn validation_failure_does_not_emit_discovery_or_progress() {
-        let error = read_inputs_with_progress(
-            &[],
-            None,
-            |_, _| panic!("invalid inputs must not emit discovery"),
-            |_, _| panic!("invalid inputs must not emit progress"),
-        )
-        .err()
-        .unwrap();
+    fn validation_failure_names_what_was_wrong() {
+        let error = collect_inputs(&[]).err().unwrap();
         assert_eq!(error.to_string(), "no input files or directories found");
         #[cfg(unix)]
         assert_eq!(
@@ -349,87 +272,26 @@ mod tests {
     }
 
     #[test]
-    fn reads_sorted_inputs_with_exact_progress_contents_and_passwords() {
-        use std::cell::RefCell;
-        let root = crate::scratch::case("input-progress-contents");
+    fn collects_inputs_sorted_with_their_sizes_and_attributes() {
+        let root = crate::scratch::case("input-collection-order");
         let input = root.join("input");
         fs::create_dir_all(input.join("nested")).unwrap();
         fs::write(input.join("a-empty"), []).unwrap();
-        let payload: Vec<_> = (0..1024 * 1024 + 17).map(|n| (n % 251) as u8).collect();
-        fs::write(input.join("nested/z-data"), &payload).unwrap();
-        let lazy = collect_inputs(std::slice::from_ref(&input)).unwrap();
-        let events = RefCell::new(Vec::new());
-        let owned = read_inputs_with_progress(
-            std::slice::from_ref(&input),
-            Some(b"secret"),
-            |count, bytes| {
-                assert_eq!((count, bytes), (4, payload.len() as u64));
-                events.borrow_mut().push((bytes, Vec::new()));
-            },
-            |bytes, name| events.borrow_mut().push((bytes, name.to_vec())),
-        )
-        .unwrap();
-        assert_eq!(owned.len(), 4);
-        assert_eq!(owned[0].name, b"input");
-        assert!(owned[0].data.is_empty());
-        assert_eq!(owned[1].name, b"input/a-empty");
-        assert!(owned[1].data.is_empty());
-        assert_eq!(owned[2].name, b"input/nested");
-        assert!(owned[2].data.is_empty());
-        assert_eq!(owned[3].name, b"input/nested/z-data");
-        assert_eq!(owned[3].data, payload);
-        for (owned, lazy) in owned.iter().zip(lazy) {
-            assert_eq!(owned.name, lazy.name);
-            assert_eq!(
-                owned.file_attr,
-                if lazy.is_directory {
-                    0x10
-                } else {
-                    DOS_ARCHIVE_ATTR
-                }
-            );
-            assert_eq!(owned.mtime, lazy.mtime);
-            assert_eq!(owned.password.as_deref().unwrap().as_slice(), b"secret");
-        }
-        let events = events.into_inner();
-        assert!(events.len() >= 3);
-        assert_eq!(
-            events[1..].iter().map(|event| event.0).sum::<u64>(),
-            payload.len() as u64
-        );
-        assert!(events[1..]
+        fs::write(input.join("nested/z-data"), [7; 17]).unwrap();
+        let inputs = collect_inputs(std::slice::from_ref(&input)).unwrap();
+        let seen: Vec<_> = inputs
             .iter()
-            .all(|event| event.0 > 0 && event.1 == b"input/nested/z-data"));
-        let without_password =
-            read_inputs_with_progress(&[input.join("a-empty")], None, |_, _| {}, |_, _| {})
-                .unwrap();
-        assert!(without_password[0].password.is_none());
-    }
-
-    #[test]
-    fn read_failure_after_discovery_is_reported_without_success_progress() {
-        let root = crate::scratch::case("input-disappears-after-discovery");
-        let input = root.join("file");
-        fs::write(&input, b"payload").unwrap();
-        let error = read_inputs_with_progress(
-            std::slice::from_ref(&input),
-            None,
-            |count, size| {
-                assert_eq!((count, size), (1, 7));
-                fs::remove_file(&input).unwrap();
-            },
-            |_, _| panic!("failed read must not report successful bytes"),
-        )
-        .err()
-        .unwrap();
-        assert!(error.to_string().contains("failed to read input"));
-        #[cfg(unix)]
-        {
-            let error =
-                read_file_with_progress(&root, "input", |_| panic!("directory read must fail"))
-                    .unwrap_err();
-            assert!(error.to_string().contains("failed to read input"));
-        }
+            .map(|entry| (entry.name.as_slice(), entry.size, entry.file_attr))
+            .collect();
+        assert_eq!(
+            seen,
+            [
+                (b"input".as_slice(), 0, 0x10),
+                (b"input/a-empty".as_slice(), 0, DOS_ARCHIVE_ATTR),
+                (b"input/nested".as_slice(), 0, 0x10),
+                (b"input/nested/z-data".as_slice(), 17, DOS_ARCHIVE_ATTR),
+            ]
+        );
     }
 
     #[cfg(unix)]

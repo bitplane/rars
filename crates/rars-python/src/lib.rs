@@ -2736,19 +2736,18 @@ impl RarBuilder {
             cancellation,
             output_directory(&first_path),
             |builder, progress| {
+                // Spools go beside the set, as a single archive's do.
+                let resources = self
+                    .resources
+                    .clone()
+                    .with_temp_dir(output_directory(&first_path));
                 if self.resources.max_memory_bytes().is_some() {
                     builder
-                        .to_volume_output(
-                            &self
-                                .resources
-                                .clone()
-                                .with_temp_dir(output_directory(&first_path)),
-                            progress,
-                        )
+                        .to_volume_output(&resources, progress)
                         .map(PythonVolumes::Tracked)
                 } else {
                     builder
-                        .build_volumes_with_resources(&self.resources, progress)
+                        .build_volumes_with_resources(&resources, progress)
                         .map(PythonVolumes::Untracked)
                 }
             },

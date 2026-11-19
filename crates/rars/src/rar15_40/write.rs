@@ -24,6 +24,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 
 mod volumes;
+pub(crate) use volumes::write_retained_volumes_to;
 pub use volumes::{write_stored_volumes_to, write_volumes_to, write_volumes_with_comment_to};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4272,74 +4273,6 @@ fn rar15_compatible_metadata(target: ArchiveVersion, host_os: u8, file_attr: u32
 
 fn dictionary_flags_for_target(target: ArchiveVersion) -> u16 {
     ((rar29_default_dictionary_size(target).trailing_zeros() - 16) as u16) << 5
-}
-
-fn report_volume(
-    progress: ProgressReporter<'_>,
-    index: usize,
-    total: usize,
-    bytes: usize,
-) -> Result<()> {
-    progress.report(WriteProgressEvent::VolumeFinished {
-        volume_index: index,
-        total_volumes: Some(total),
-        bytes: bytes as u64,
-    });
-    crate::write_progress::check_cancelled(Some(progress))
-}
-
-/// How many packed bytes fit in each volume of `volume_size` bytes.
-///
-/// Every volume repeats the same headers around its slice of the payload, and
-/// no header field grows as the slice shrinks, so measuring one volume around
-/// the largest slice any volume could hold gives an overhead that holds for
-/// all of them. RAR 1.3 volumes are framed the same way and share this.
-pub(crate) fn legacy_volume_payload(
-    volume_size: usize,
-    packed: &[u8],
-    render: impl Fn(&[u8]) -> Result<Vec<u8>>,
-) -> Result<usize> {
-    if volume_size == 0 {
-        return Err(Error::InvalidArgument("volume size must be non-zero"));
-    }
-    let probe = &packed[..packed.len().min(volume_size)];
-    let overhead = render(probe)?.len() - probe.len();
-    match volume_size.checked_sub(overhead) {
-        Some(payload) if payload > 0 => Ok(payload),
-        _ => Err(Error::InvalidArgument(
-            "volume size is too small to hold the volume headers",
-        )),
-    }
-}
-
-/// Cuts `packed` into `payload`-byte slices and renders a volume around each,
-/// checking that none came out longer than `volume_size`.
-pub(crate) fn render_legacy_volumes(
-    packed: &[u8],
-    payload: usize,
-    volume_size: usize,
-    progress: ProgressReporter<'_>,
-    render: impl Fn(usize, bool, &[u8]) -> Result<Vec<u8>>,
-) -> Result<Vec<Vec<u8>>> {
-    // Packing well enough to need only one volume is not an error. With one
-    // chunk neither split flag is set, so the member is an ordinary unsplit
-    // file inside a volume set of one, which is what WinRAR writes. Refusing
-    // it meant a fixed `--volume-size` in a script could start failing because
-    // compression improved, which is how it was found.
-    let chunks: Vec<&[u8]> = packed.chunks(payload).collect();
-    let mut volumes = Vec::with_capacity(chunks.len());
-    for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(Some(progress))?;
-        let out = render(index, index + 1 < chunks.len(), chunk)?;
-        if out.len() > volume_size {
-            return Err(Error::WriterFailure(
-                "legacy volume came out longer than the volume size",
-            ));
-        }
-        report_volume(progress, index, chunks.len(), out.len())?;
-        volumes.push(out);
-    }
-    Ok(volumes)
 }
 
 fn write_header_crc(out: &mut [u8], start: usize) {
