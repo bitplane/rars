@@ -1151,6 +1151,8 @@ impl Cipher {
             Self::Rar15(_) => false,
             #[cfg(feature = "encryption")]
             Self::Rar20(_) | Self::Rar30(_) => true,
+            #[cfg(not(feature = "encryption"))]
+            _ => unreachable!("no cipher without the encryption feature"),
         }
     }
 
