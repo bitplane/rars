@@ -1764,6 +1764,38 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
 }
 
 #[test]
+fn shortest_path_levels_code_to_the_bytes_they_always_have() {
+    let text = include_bytes!("../../../tests/fixtures/rar15_40/ppmd/lorem_127k.txt");
+    let windowed = windowed_payload(192 * 1024);
+    let mut fingerprints = Vec::new();
+    for extra in [0, 2] {
+        let options = EncodeOptions::new(512)
+            .with_lazy_matching(true)
+            .with_lazy_lookahead(2)
+            .with_optimal_parse(true)
+            .with_extra_priced_passes(extra)
+            .with_try_audio(false);
+        for input in [&text[..], &windowed[..]] {
+            let packed = super::unpack20_encode_literals_with_options(input, options).unwrap();
+            assert_eq!(unpack20_decode(&packed, input.len()).unwrap(), input);
+            fingerprints.push((packed.len(), crate::crc32::crc32(&packed)));
+        }
+    }
+
+    // Levels 4 and 5 as the writer sets them, text then windowed, captured
+    // from master f223f8e0.
+    assert_eq!(
+        fingerprints,
+        [
+            (20_085, 3_705_270_237),
+            (88_636, 3_143_814_180),
+            (20_022, 2_498_266_657),
+            (88_627, 4_292_844_804),
+        ]
+    );
+}
+
+#[test]
 fn a_match_that_copies_the_last_one_becomes_a_repeat() {
     let mut tokens = [
         EncodeToken::Match {
