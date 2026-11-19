@@ -219,6 +219,9 @@ pub(crate) struct AddArgs {
     pub dict_size: Option<usize>,
     /// Maximum total compression working memory (default: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
     ///
+    /// Raising it lets more work run at once and never changes the archive.
+    /// Below 256m it also plans smaller jobs, which can.
+    ///
     /// Left unset rather than defaulted here, so a volume set below RAR 5, which
     /// is still built in memory, can tell an explicit request from a default and
     /// refuse the one it cannot honour.

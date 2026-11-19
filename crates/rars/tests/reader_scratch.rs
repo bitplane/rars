@@ -61,6 +61,9 @@ fn disk_scratch_handles_all_filters_encryption_and_parallel_entry_points() {
             FilterKind::Delta { channels: 3 },
         ] {
             for encrypted in [false, true] {
+                if encrypted && !cfg!(feature = "encryption") {
+                    continue;
+                }
                 let archive = archive(kind, encrypted, version);
                 let mut options = ArchiveReadOptions::new()
                     .with_rar50_buffered_decode_limit(1024)
@@ -159,6 +162,9 @@ fn integrity_and_sink_failures_release_scratch() {
 fn split_filtered_members_use_scratch_and_keep_limit_errors() {
     let dir = scratch::case("reader-scratch-split");
     for encrypted in [false, true] {
+        if encrypted && !cfg!(feature = "encryption") {
+            continue;
+        }
         let member = entry(&payload(), encrypted);
         // Past any volume's headers, yet still splits the member.
         let mut sink = rars::rar50::CollectedVolumes::new();

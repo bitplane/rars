@@ -18,6 +18,8 @@
 
 use rars::rar50::{ArchiveEntry, ArchiveMetadataEntry, Rar50Writer, WriterOptions};
 use rars::{ArchiveVersion, EntrySource, Error, FeatureSet, WriterResources};
+// Only the recovery digest uses sha2, which the encryption feature links.
+#[cfg(all(feature = "recovery", feature = "encryption"))]
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
@@ -91,6 +93,7 @@ fn assert_golden(name: &str, produced: &[u8]) {
 
 /// Large fixtures are pinned by digest rather than stored whole, so the repo
 /// does not carry hundreds of kilobytes of binary per case.
+#[cfg(all(feature = "recovery", feature = "encryption"))]
 fn assert_golden_digest(name: &str, produced: &[u8]) {
     let hash = Sha256::digest(produced)
         .iter()
@@ -189,6 +192,7 @@ fn golden_quick_open_layout_is_stable() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn golden_recovery_record_layout_is_stable() {
     let data = deterministic_bytes(8192, 5);
     let entries = [entry(b"protected.bin", &data)];
@@ -206,6 +210,7 @@ fn golden_recovery_record_layout_is_stable() {
 }
 
 #[test]
+#[cfg(all(feature = "recovery", feature = "encryption"))]
 fn golden_recovery_record_over_200kib_is_stable() {
     // Above 200 KiB the recovery planner switches to the fixed 200-data-shard
     // layout, which is the case real archives hit.

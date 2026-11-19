@@ -13,11 +13,12 @@ use rars::{
 };
 
 const MIB: u64 = 1024 * 1024;
-const MEMBER: usize = 2 << 20;
-/// Below the 2 MiB member's whole-member charge (173.1 MiB at a 128 KiB
+/// Two runs, the second a quarter of one.
+const MEMBER: usize = (1 << 20) + (256 << 10);
+/// Below the 1.25 MiB member's whole-member charge (170.1 MiB at a 128 KiB
 /// dictionary) and above one 1 MiB run's filter search (169.1 MiB), so the
 /// member is coded run by run and each run still searches.
-const LIMIT: u64 = 171 * MIB;
+const LIMIT: u64 = 169 * MIB + MIB / 2;
 
 /// The same few instructions before each call to one of eight targets. Once
 /// the E8 filter makes the addresses absolute, the member is eight records.
@@ -101,8 +102,8 @@ fn an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run() {
     let data = code(MEMBER);
     let resources = WriterResources::new(LIMIT).with_temp_dir(&root);
     let plain = write(&data, FilterPolicy::None, &resources);
-    // The range starts and ends mid-run.
-    for range in [None, Some(MEMBER / 3..MEMBER * 2 / 3)] {
+    // The range starts and ends mid-run, in different runs.
+    for range in [None, Some(MEMBER / 2..MEMBER * 7 / 8)] {
         let spec = match range.clone() {
             Some(range) => FilterSpec::range(FilterKind::E8, range),
             None => FilterSpec::whole(FilterKind::E8),
@@ -117,41 +118,6 @@ fn an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run() {
         assert!(
             saved * 4 > plain.len() * covered / MEMBER,
             "{range:?} took {} down only to {}",
-            plain.len(),
-            filtered.len()
-        );
-    }
-}
-
-/// A member longer than one 4 MiB filter search is filtered as well whole as
-/// run by run. The member opens with text, as a tar of `/usr` can open with a
-/// script, which the whole-member search used to read as text and give up on,
-/// and which kept the first run unsearched. The two paths choose the same
-/// filters (`a_large_member_is_searched_on_the_block_paths_grid`); they code
-/// a filtered member a few bytes apart at this level (#383).
-#[test]
-fn a_member_too_long_for_one_search_is_filtered_on_both_paths() {
-    let root = scratch::case("rar50-large-member-filter-paths");
-    let mut data = b"#!/bin/sh\n# a script at the front of the member\n".repeat(400);
-    data.extend(code((4 << 20) + (64 << 10)));
-    let blocks = WriterResources::new(LIMIT).with_temp_dir(&root);
-    let whole = WriterResources::new(1024 * MIB).with_temp_dir(&root);
-    let plain = write(&data, FilterPolicy::None, &blocks);
-    let by_runs = write(&data, FilterPolicy::Auto, &blocks);
-    let at_once = write(&data, FilterPolicy::Auto, &whole);
-    assert!(
-        by_runs.len().abs_diff(at_once.len()) * 1000 < at_once.len(),
-        "runs packed to {} and the whole member to {}",
-        by_runs.len(),
-        at_once.len()
-    );
-    for filtered in [by_runs, at_once] {
-        let archive = ArchiveReader::read(&filtered).unwrap();
-        archive.test(None).unwrap();
-        assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
-        assert!(
-            filtered.len() * 4 < plain.len() * 3,
-            "filters took {} down only to {}",
             plain.len(),
             filtered.len()
         );

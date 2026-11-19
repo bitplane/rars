@@ -1,30 +1,35 @@
-#![cfg(feature = "write")]
-
+#[cfg(feature = "write")]
 #[path = "support/scratch.rs"]
 mod scratch;
 #[path = "support/volume_size.rs"]
 mod volume_size;
 
-use rars::codec::rar50::{
-    decode_lz, encode_lz_member, encode_table_lengths, parse_compressed_block, read_table_lengths,
-    DecodeTables,
-};
+use rars::codec::rar50::{decode_lz, parse_compressed_block, read_table_lengths, DecodeTables};
+#[cfg(feature = "write")]
+use rars::codec::rar50::{encode_lz_member, encode_table_lengths};
 use rars::crc32::crc32;
+#[cfg(all(feature = "write", feature = "encryption"))]
 use rars::crypto::rar50::{Rar50Cipher, Rar50Keys};
-use rars::rar50::{
-    extract_volumes_to, repair_inline_recovery_bytes, repair_rev5_volumes_to, Archive,
-    ArchiveMetadataEntry, Block, FilterKind, FilterPolicy, Rev5Volume, Rev5VolumeMeta,
-    ServiceEntry,
-};
+#[cfg(all(feature = "write", feature = "recovery"))]
+use rars::rar50::repair_inline_recovery_bytes;
+#[cfg(feature = "recovery")]
+use rars::rar50::repair_rev5_volumes_to;
+#[cfg(any(feature = "write", feature = "encryption"))]
+use rars::rar50::Block;
+use rars::rar50::{extract_volumes_to, Archive, Rev5Volume, Rev5VolumeMeta};
+#[cfg(feature = "write")]
+use rars::rar50::{ArchiveMetadataEntry, FilterKind, FilterPolicy, ServiceEntry};
 use rars::recovery::rar5::crc64_xz;
-use rars::{
-    detect_archive_family, rar50, ArchiveFamily, ArchiveReadOptions, ArchiveVersion, Error,
-    FeatureSet,
-};
+use rars::{detect_archive_family, rar50, ArchiveFamily, ArchiveReadOptions, Error};
+#[cfg(feature = "write")]
+use rars::{ArchiveVersion, FeatureSet};
 use std::cell::RefCell;
 use std::fs;
-use std::io::{Read, Result as IoResult, Write};
+#[cfg(feature = "write")]
+use std::io::Read;
+use std::io::{Result as IoResult, Write};
 use std::path::{Path, PathBuf};
+#[cfg(feature = "write")]
 use std::process::Command;
 use std::rc::Rc;
 
@@ -35,6 +40,7 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn public_rar50_table_encoder_checks_each_table_shape() {
     let packed = encode_lz_member(b"ABABABAB", 0).unwrap();
     let block = parse_compressed_block(&packed).unwrap();
@@ -61,6 +67,7 @@ fn public_rar50_table_encoder_checks_each_table_shape() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn rar50_member_encoder_rejects_invalid_filter_ranges_in_both_size_paths() {
     for data in [vec![b'A'; 16], vec![b'A'; 0x40000 + 1]] {
         for range in [0..0, data.len()..data.len() - 1, data.len()..data.len() + 1] {
@@ -79,6 +86,7 @@ fn rar50_member_encoder_rejects_invalid_filter_ranges_in_both_size_paths() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn large_rar50_member_routes_reject_unknown_version_without_committing_history() {
     let data = vec![b'A'; 64 * 1024 + 1];
     let expected_error =
@@ -101,6 +109,7 @@ fn large_rar50_member_routes_reject_unknown_version_without_committing_history()
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn large_rar50_delta_filter_rejects_invalid_channels_without_committing_history() {
     let data = vec![b'A'; 64 * 1024 + 1];
     let retry = b"ABABABAB";
@@ -163,6 +172,7 @@ fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>, Error> {
     collect_extract_with_password(archive, None)
 }
 
+#[cfg(feature = "write")]
 fn assert_rar50_end_header_has_flags_vint(archive: &Archive) {
     let end = archive
         .blocks
@@ -183,6 +193,7 @@ fn assert_rar50_end_header_has_flags_vint(archive: &Archive) {
 /// from the file names and does not care, but 7-Zip believes the flag: with it
 /// clear it stops at the volume it was handed, and a member continuing into the
 /// next one comes out truncated as a data error.
+#[cfg(feature = "write")]
 fn assert_volume_set_links_its_parts(parts: &[Vec<u8>], password: Option<&[u8]>) {
     for (index, part) in parts.iter().enumerate() {
         let archive = match password {
@@ -291,6 +302,7 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
     }
 }
 
+#[cfg(feature = "write")]
 fn deterministic_noise(len: usize) -> Vec<u8> {
     let mut state = 0x1234_5678u32;
     (0..len)
@@ -303,6 +315,7 @@ fn deterministic_noise(len: usize) -> Vec<u8> {
 
 /// Fills the cipher-block padding after the unpacked data with non-zero
 /// bytes, as WinRAR does, and re-encrypts it.
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn fill_encrypted_stored_padding(bytes: &mut [u8], password: &[u8]) {
     let archive = Archive::parse(bytes).unwrap();
     let file = archive.files().next().unwrap();
@@ -322,6 +335,7 @@ fn fill_encrypted_stored_padding(bytes: &mut [u8], password: &[u8]) {
 }
 
 /// The split-volume form of [`fill_encrypted_stored_padding`].
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn fill_encrypted_stored_split_padding(volumes: &mut [Vec<u8>], password: &[u8]) {
     let archives = volumes
         .iter()
@@ -357,12 +371,14 @@ fn fill_encrypted_stored_split_padding(volumes: &mut [Vec<u8>], password: &[u8])
     }
 }
 
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn fill_padding(padding: &mut [u8]) {
     for (index, byte) in padding.iter_mut().enumerate() {
         *byte = (0x6f ^ (index as u8).wrapping_mul(0x3b)) | 1;
     }
 }
 
+#[cfg(feature = "write")]
 fn level_sensitive_payload() -> Vec<u8> {
     let long_match = [b"abc".as_slice(), &[b'Z'; 256]].concat();
     let mut data = long_match.clone();
@@ -375,6 +391,7 @@ fn level_sensitive_payload() -> Vec<u8> {
     data
 }
 
+#[cfg(feature = "recovery")]
 fn repair_rev5_volumes(
     data_volumes: &[Option<&[u8]>],
     recovery_volumes: &[Rev5Volume],
@@ -388,6 +405,7 @@ fn repair_rev5_volumes(
 }
 
 /// Reads a member's bytes back out, for tests that assert on what they wrote.
+#[cfg(feature = "write")]
 fn entry_data(entry: &rar50::ArchiveEntry) -> Vec<u8> {
     let mut data = Vec::new();
     entry.source.open().unwrap().read_to_end(&mut data).unwrap();
@@ -395,6 +413,7 @@ fn entry_data(entry: &rar50::ArchiveEntry) -> Vec<u8> {
 }
 
 /// Builds a member from bytes the test already holds.
+#[cfg(feature = "write")]
 fn entry(name: &[u8], data: &[u8]) -> rar50::ArchiveEntry {
     rar50::ArchiveEntry::new(
         name.to_vec(),
@@ -403,10 +422,12 @@ fn entry(name: &[u8], data: &[u8]) -> rar50::ArchiveEntry {
 }
 
 /// Storing is a compression level, not a kind of member.
+#[cfg(feature = "write")]
 fn stored(options: rar50::WriterOptions) -> rar50::WriterOptions {
     options.with_compression_level(0)
 }
 
+#[cfg(feature = "write")]
 fn write_stored_archive(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -416,6 +437,7 @@ fn write_stored_archive(
         .finish()
 }
 
+#[cfg(feature = "write")]
 fn write_stored_archive_with_comment(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -427,6 +449,7 @@ fn write_stored_archive_with_comment(
         .finish()
 }
 
+#[cfg(feature = "write")]
 fn write_stored_archive_with_comment_and_metadata(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -440,6 +463,7 @@ fn write_stored_archive_with_comment_and_metadata(
         .finish()
 }
 
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn write_stored_archive_with_recovery(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -451,6 +475,7 @@ fn write_stored_archive_with_recovery(
         .finish()
 }
 
+#[cfg(feature = "write")]
 fn write_compressed_archive(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -460,6 +485,7 @@ fn write_compressed_archive(
         .finish()
 }
 
+#[cfg(feature = "write")]
 fn write_compressed_archive_with_metadata(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -471,6 +497,7 @@ fn write_compressed_archive_with_metadata(
         .finish()
 }
 
+#[cfg(feature = "write")]
 fn write_compressed_archive_with_comment(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -482,6 +509,7 @@ fn write_compressed_archive_with_comment(
         .finish()
 }
 
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn write_compressed_archive_with_recovery(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -493,6 +521,7 @@ fn write_compressed_archive_with_recovery(
         .finish()
 }
 
+#[cfg(feature = "write")]
 fn write_compressed_archive_with_filter_policy(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -504,6 +533,7 @@ fn write_compressed_archive_with_filter_policy(
         .finish()
 }
 
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn write_encrypted_archive_with_comment(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -524,6 +554,7 @@ fn write_encrypted_archive_with_comment(
 /// time; only the test keeps them all.
 /// Writes a set whose volumes carry about `payload` bytes of member data
 /// each, so the tests can force many small volumes.
+#[cfg(feature = "write")]
 fn write_volumes(
     entries: &[rar50::ArchiveEntry],
     options: rar50::WriterOptions,
@@ -582,6 +613,7 @@ fn assert_rar5_inline_recovery_chunks(data: &[u8]) {
     assert_eq!(Some(chunks), expected_recovery_shards);
 }
 
+#[cfg(feature = "write")]
 fn read_test_vint(input: &[u8], offset: &mut usize) -> u64 {
     let mut value = 0;
     for shift in (0..70).step_by(7) {
@@ -595,6 +627,7 @@ fn read_test_vint(input: &[u8], offset: &mut usize) -> u64 {
     panic!("overlong test vint");
 }
 
+#[cfg(feature = "write")]
 fn count_verified_quick_open_wrappers(data: &[u8]) -> usize {
     let mut offset = 0;
     let mut count = 0;
@@ -617,6 +650,7 @@ fn count_verified_quick_open_wrappers(data: &[u8]) -> usize {
     count
 }
 
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn header_encryption_salt_and_first_header_iv(data: &[u8]) -> ([u8; 16], [u8; 16]) {
     let mut offset = b"Rar!\x1a\x07\x01\x00".len() + 4;
     let header_size = read_test_vint(data, &mut offset) as usize;
@@ -692,6 +726,7 @@ fn parses_and_extracts_rar50_stored_file() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_store_only_rar50_archive_that_reader_extracts() {
     let entries = [
         entry(b"hello5.txt", b"hello from rars rar5 writer\n")
@@ -731,6 +766,7 @@ fn writes_store_only_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn rar50_writer_builder_writes_stored_archive_with_comment_and_metadata() {
     let entries = [entry(
         b"builder-stored.txt",
@@ -771,6 +807,7 @@ fn rar50_writer_builder_writes_stored_archive_with_comment_and_metadata() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_compressed_rar50_archive_that_reader_extracts() {
     let entries = [
         entry(
@@ -805,6 +842,7 @@ fn writes_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn compressed_rar50_writer_stores_member_when_lz_payload_would_grow() {
     let data = deterministic_noise(8192);
     assert!(encode_lz_member(&data, 0).unwrap().len() >= data.len());
@@ -831,6 +869,7 @@ fn compressed_rar50_writer_stores_member_when_lz_payload_would_grow() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn compressed_rar50_writer_level_zero_stores_member() {
     let data = b"level zero stores through compressed writer\n".repeat(64);
     for target in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
@@ -853,6 +892,7 @@ fn compressed_rar50_writer_level_zero_stores_member() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn compressed_rar50_writer_uses_compression_level_for_match_effort() {
     let data = level_sensitive_payload();
     for target in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
@@ -885,6 +925,7 @@ fn compressed_rar50_writer_uses_compression_level_for_match_effort() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn compressed_rar50_writer_stamps_requested_method_levels() {
     let data = level_sensitive_payload();
     for target in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
@@ -911,6 +952,7 @@ fn compressed_rar50_writer_stamps_requested_method_levels() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn rar50_writer_builder_writes_filtered_compressed_archive() {
     let payload = b"\xe8\0\0\0\0builder filtered payload\n".repeat(8);
     let entries = [entry(b"builder-filtered.bin", &payload)
@@ -933,6 +975,7 @@ fn rar50_writer_builder_writes_filtered_compressed_archive() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_solid_compressed_rar50_archive_that_reader_extracts() {
     let first = b"rar50 solid shared phrase alpha beta gamma\n".repeat(32);
     let second = b"rar50 solid shared phrase alpha beta gamma\nsecond\n".repeat(8);
@@ -980,6 +1023,7 @@ fn writes_solid_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_delta_filtered_compressed_rar50_archive_that_reader_extracts() {
     let data: Vec<u8> = (0..180)
         .map(|index| (index * 5 + index / 2) as u8)
@@ -1010,6 +1054,7 @@ fn writes_delta_filtered_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_e8_filtered_compressed_rar50_archive_that_reader_extracts() {
     let data = b"\xe8\0\0\0\0rar5 e8 filtered call payload".to_vec();
     let entries = [entry(b"e8-filtered.bin", &data)
@@ -1037,6 +1082,7 @@ fn writes_e8_filtered_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_e8e9_filtered_compressed_rar50_archive_that_reader_extracts() {
     let data = b"\xe9\0\0\0\0rar5 e8e9 filtered jump payload".to_vec();
     let entries = [entry(b"e8e9-filtered.bin", &data)
@@ -1058,6 +1104,7 @@ fn writes_e8e9_filtered_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_arm_filtered_compressed_rar50_archive_that_reader_extracts() {
     let data = [0x04, 0x00, 0x00, 0xeb, b'A', b'R', b'M', b'!'];
     let entries = [entry(b"arm-filtered.bin", &data)
@@ -1085,6 +1132,7 @@ fn writes_arm_filtered_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_auto_filtered_compressed_rar50_archive_that_reader_extracts() {
     let mut data = Vec::new();
     for _ in 0..48 {
@@ -1112,6 +1160,7 @@ fn writes_auto_filtered_compressed_rar50_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn auto_filtered_compressed_rar50_writer_accepts_empty_member() {
     let entries = [entry(b"afile.txt", b"")
         .with_mtime(Some(0x5a21_0028))
@@ -1136,6 +1185,7 @@ fn auto_filtered_compressed_rar50_writer_accepts_empty_member() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
     let payload = b"rar5 compressed split payload from rars\n".repeat(24);
     let entry = entry(b"compressed-split.txt", &payload)
@@ -1181,6 +1231,7 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
 /// fragment and compares it against the last, so a first fragment offering only
 /// a CRC32 fails a member that is perfectly intact.
 #[test]
+#[cfg(feature = "write")]
 fn every_rar50_volume_fragment_checksums_the_bytes_it_stores() {
     let payload = deterministic_noise(4096);
     let entry = entry(b"fragment-checksums.bin", &payload).with_mtime(Some(0x5a21_0031));
@@ -1225,6 +1276,7 @@ fn every_rar50_volume_fragment_checksums_the_bytes_it_stores() {
 /// and then report one checksum error for the member, which says nothing about
 /// where the damage is. The fragment checksums are enough to say, so say it.
 #[test]
+#[cfg(feature = "write")]
 fn a_damaged_rar50_volume_is_reported_by_its_number() {
     // Compressible enough that the member is packed rather than stored, and
     // large enough that the packed bytes still need several volumes.
@@ -1286,6 +1338,9 @@ fn a_damaged_winrar_htb_volume_is_reported_by_its_number() {
         ("htb_multivol_p", 3, Some(&b"password"[..])),
         ("htb_multivol_hp", 4, Some(&b"password"[..])),
     ] {
+        if password.is_some() && !cfg!(feature = "encryption") {
+            continue;
+        }
         let mut parts: Vec<Vec<u8>> = (1..=count)
             .map(|part| std::fs::read(fixture(&format!("{name}.part{part}.rar"))).unwrap())
             .collect();
@@ -1321,6 +1376,7 @@ fn a_damaged_winrar_htb_volume_is_reported_by_its_number() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn compressed_rar50_volume_writer_stores_member_when_lz_payload_would_grow() {
     let data = deterministic_noise(8192);
     assert!(encode_lz_member(&data, 0).unwrap().len() >= data.len());
@@ -1352,6 +1408,7 @@ fn compressed_rar50_volume_writer_stores_member_when_lz_payload_would_grow() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn writes_compressed_rar50_volume_set_with_recovery_records() {
     let payload = b"rar5 compressed recovery split payload from rars\n".repeat(24);
     let entry = entry(b"compressed-split-rr.txt", &payload)
@@ -1393,6 +1450,7 @@ fn writes_compressed_rar50_volume_set_with_recovery_records() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_solid_compressed_rar50_volume_set_that_reader_reassembles() {
     let payload = b"rar5 solid compressed split payload from rars\n".repeat(24);
     let entry = entry(b"solid-compressed-split.txt", &payload)
@@ -1431,6 +1489,7 @@ fn writes_solid_compressed_rar50_volume_set_that_reader_reassembles() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_multi_file_solid_compressed_rar50_volume_set_that_reader_reassembles() {
     let first = b"rar5 multi-file solid split shared phrase alpha beta gamma\n".repeat(20);
     let second = b"rar5 multi-file solid split shared phrase alpha beta gamma\nsecond\n".repeat(16);
@@ -1479,6 +1538,7 @@ fn writes_multi_file_solid_compressed_rar50_volume_set_that_reader_reassembles()
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_rar50_archive_comment_service_record() {
     let entries = [entry(b"payload.txt", b"payload with comment service\n")
         .with_attributes(0x20)
@@ -1510,6 +1570,7 @@ fn writes_rar50_archive_comment_service_record() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_compressed_rar50_archive_comment_service_record() {
     let payload = b"compressed payload with archive comment\n".repeat(8);
     let entries = [entry(b"compressed-comment.txt", &payload)
@@ -1552,6 +1613,7 @@ fn writes_compressed_rar50_archive_comment_service_record() {
 /// So this asks each writer for the index and goes looking for the block,
 /// rather than asking the table what it thinks.
 #[test]
+#[cfg(feature = "write")]
 fn every_rar50_writer_agrees_with_the_table_about_quick_open() {
     fn wrote_the_index(bytes: &[u8]) -> bool {
         let archive = Archive::parse(bytes).unwrap();
@@ -1621,6 +1683,7 @@ fn every_rar50_writer_agrees_with_the_table_about_quick_open() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_rar50_quick_open_service_record() {
     let entries = [
         entry(b"first.txt", b"first quick-open payload\n")
@@ -1656,6 +1719,7 @@ fn writes_rar50_quick_open_service_record() {
     assert_eq!(extracted[1].data, entry_data(&entries[1]));
 }
 
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn archives_with_a_locator() -> [Vec<u8>; 2] {
     let entries = [
         entry(b"first.txt", b"first member\n"),
@@ -1679,6 +1743,7 @@ fn archives_with_a_locator() -> [Vec<u8>; 2] {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn a_rar5_archive_whose_locator_points_past_the_end_is_refused() {
     for bytes in archives_with_a_locator() {
         let archive = Archive::parse(&bytes).unwrap();
@@ -1697,6 +1762,7 @@ fn a_rar5_archive_whose_locator_points_past_the_end_is_refused() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn a_rar5_archive_whose_locator_points_inside_the_file_is_read() {
     for bytes in archives_with_a_locator() {
         let archive = Archive::parse(&bytes).unwrap();
@@ -1706,6 +1772,7 @@ fn a_rar5_archive_whose_locator_points_inside_the_file_is_read() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_rar50_acl_and_stream_file_service_records() {
     let entries = [entry(b"serviced.txt", b"payload with attached services\n")
         .with_attributes(0x20)
@@ -1747,6 +1814,7 @@ fn writes_rar50_acl_and_stream_file_service_records() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_rar50_file_comment_service_record() {
     let entries = [entry(
         b"file-commented.txt",
@@ -1828,6 +1896,7 @@ fn rar50_blake2sp_supersedes_a_wrong_crc32() {
 /// The archive here is written with a 200-character password and opened with
 /// its first 127 characters. Both must derive the same key, and 126 must not.
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn rar50_password_is_clamped_to_127_characters() {
     let long = "A".repeat(197) + "ZZZ";
     let kept = &long[..127];
@@ -1856,6 +1925,7 @@ fn rar50_password_is_clamped_to_127_characters() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_rar50_file_comment_service_record() {
     let entries = [entry(
         b"encrypted-file-commented.txt",
@@ -1914,6 +1984,7 @@ fn writes_encrypted_rar50_file_comment_service_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_rar50_file_comment_service_record() {
     let entries = [entry(
         b"header-encrypted-file-commented.txt",
@@ -1960,6 +2031,7 @@ fn writes_header_encrypted_rar50_file_comment_service_record() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 #[ignore = "requires local rar command; used by scripts/reference-rar5-writer.sh"]
 fn reference_rar_accepts_rar50_acl_and_stream_file_service_records() {
     let entries = [entry(b"serviced.txt", b"payload with attached services\n")
@@ -2029,6 +2101,7 @@ fn external_sparse_rar50_large_member_streams_to_sink() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn writes_rar50_recovery_service_record() {
     let entries = [entry(
         b"recoverable.txt",
@@ -2081,6 +2154,7 @@ fn writes_rar50_recovery_service_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn repairs_rar50_inline_recovery_payload_damage() {
     let payload = b"payload with structural recovery service\n".repeat(64);
     let entries = [entry(b"recoverable.txt", &payload)
@@ -2112,6 +2186,7 @@ fn repairs_rar50_inline_recovery_payload_damage() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rejects_rar50_inline_recovery_when_all_recovery_chunks_are_damaged() {
     let bytes = write_stored_archive_with_recovery(
         &[entry(b"recoverable.txt", b"payload protected by recovery")],
@@ -2140,6 +2215,7 @@ fn rejects_rar50_inline_recovery_when_all_recovery_chunks_are_damaged() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rar50_recovery_rejects_a_public_service_offset_past_the_archive() {
     let bytes = write_stored_archive_with_recovery(
         &[entry(b"recoverable.txt", b"payload protected by recovery")],
@@ -2176,6 +2252,7 @@ fn rar50_recovery_rejects_a_public_service_offset_past_the_archive() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rejects_rar50_inline_recovery_when_damage_exceeds_available_shards() {
     let bytes = write_stored_archive_with_recovery(
         &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
@@ -2198,6 +2275,7 @@ fn rejects_rar50_inline_recovery_when_damage_exceeds_available_shards() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rar50_recovery_reports_output_failure_before_a_late_repaired_shard() {
     struct FailingWriter;
 
@@ -2230,6 +2308,7 @@ fn rar50_recovery_reports_output_failure_before_a_late_repaired_shard() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rar50_recovery_observes_cancellation_from_output_in_both_repair_paths() {
     struct CancellingWriter<'a>(&'a rars::ReadCancellation);
     impl Write for CancellingWriter<'_> {
@@ -2272,6 +2351,7 @@ fn rar50_recovery_observes_cancellation_from_output_in_both_repair_paths() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn repairs_sfx_prefixed_rar50_data_with_a_missing_recovery_row() {
     let archive_bytes = write_stored_archive_with_recovery(
         &[entry(b"recoverable.txt", &vec![b'A'; 32 * 1024])],
@@ -2311,6 +2391,7 @@ fn repairs_sfx_prefixed_rar50_data_with_a_missing_recovery_row() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn repairs_rar50_inline_recovery_header_damage_without_parsing() {
     let payload = b"payload protected by raw inline recovery fallback\n".repeat(64);
     let entries = [entry(b"header-damaged.txt", &payload)
@@ -2340,6 +2421,7 @@ fn repairs_rar50_inline_recovery_header_damage_without_parsing() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rejects_rar50_inline_recovery_service_header_damage_without_prefix_damage() {
     let payload = b"payload with only the recovery service header damaged\n".repeat(64);
     let entries = [entry(b"rr-header-damaged.txt", &payload)
@@ -2368,6 +2450,7 @@ fn rejects_rar50_inline_recovery_service_header_damage_without_prefix_damage() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn repairs_rar50_inline_recovery_with_damaged_recovery_chunk() {
     let payload = b"payload with a damaged recovery shard still recoverable\n".repeat(512);
     let entries = [entry(b"recoverable-with-bad-rr.txt", &payload)
@@ -2415,6 +2498,7 @@ fn repairs_rar50_inline_recovery_with_damaged_recovery_chunk() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rebuilds_damaged_recovery_chunk_without_claiming_data_repair() {
     let payload = b"healthy data with one damaged recovery row\n".repeat(1024);
     let entries = [entry(b"healthy-data.txt", &payload)];
@@ -2447,6 +2531,7 @@ fn rebuilds_damaged_recovery_chunk_without_claiming_data_repair() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rebuilds_truncated_rar50_inline_recovery_tail() {
     let payload = b"payload protected when the recovery tail is truncated\n".repeat(4096);
     let entries = [entry(b"truncated-recovery.txt", &payload)];
@@ -2468,6 +2553,7 @@ fn rebuilds_truncated_rar50_inline_recovery_tail() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn rebuilds_a_damaged_chunk_in_an_archive_storing_a_recovery_archive() {
     // The stored inner archive carries its own {RB} chunks, which sit earlier
     // in the file than the outer record's.
@@ -2507,6 +2593,7 @@ fn rebuilds_a_damaged_chunk_in_an_archive_storing_a_recovery_archive() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn rebuilds_a_header_encrypted_archive_end_from_a_parsed_archive() {
     // Framing a replacement end-of-archive header for a header-encrypted
     // archive needs the key, so the repair has to be given the password even
@@ -2555,6 +2642,7 @@ fn rebuilds_a_header_encrypted_archive_end_from_a_parsed_archive() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn rebuilds_truncated_header_encrypted_rar50_recovery_tail() {
     let payload = b"encrypted headers with a truncated recovery tail\n".repeat(4096);
     let entries =
@@ -2586,6 +2674,7 @@ fn rebuilds_truncated_header_encrypted_rar50_recovery_tail() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn repairs_encrypted_rar50_inline_recovery_payload_damage_with_password() {
     let payload = b"encrypted payload with structural recovery service\n".repeat(64);
     let entries = [entry(b"secret-recoverable.txt", &payload)
@@ -2617,6 +2706,7 @@ fn repairs_encrypted_rar50_inline_recovery_payload_damage_with_password() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn repairs_header_encrypted_rar50_inline_recovery_payload_damage_with_password() {
     let payload = b"header encrypted payload with structural recovery service\n".repeat(64);
     let entries = [entry(b"header-secret-recoverable.txt", &payload)
@@ -2650,6 +2740,7 @@ fn repairs_header_encrypted_rar50_inline_recovery_payload_damage_with_password()
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn writes_compressed_rar50_recovery_service_record() {
     let payload = b"compressed recovery payload with repeated phrase. ".repeat(32);
     let entries = [entry(b"compressed-recoverable.txt", &payload)
@@ -2696,6 +2787,7 @@ fn writes_compressed_rar50_recovery_service_record() {
 /// once as a percentage, and the writer had to reject the case where the two
 /// disagreed. Only the percentage is asked for now, so they cannot.
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn a_recovery_record_is_asked_for_by_percentage_alone() {
     let entries = [entry(b"payload.txt", b"payload without recovery writer\n")
         .with_attributes(0x20)
@@ -2721,6 +2813,7 @@ fn a_recovery_record_is_asked_for_by_percentage_alone() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_stored_rar50_volume_set_that_reader_reassembles() {
     let payload = b"RAR5 stored volume payload split across generated parts.\n".repeat(12);
     let entry = entry(b"split50.txt", &payload)
@@ -2773,6 +2866,7 @@ fn writes_stored_rar50_volume_set_that_reader_reassembles() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn writes_stored_rar50_volume_set_with_recovery_records() {
     let payload = b"RAR5 stored recovery volume payload split across generated parts.\n".repeat(12);
     let entry = entry(b"split50-rr.txt", &payload)
@@ -2818,6 +2912,7 @@ fn writes_stored_rar50_volume_set_with_recovery_records() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_rar50_archive_metadata_main_extra_record() {
     let entries = [entry(b"payload.txt", b"payload with archive metadata\n")
         .with_attributes(0x20)
@@ -2850,6 +2945,7 @@ fn writes_rar50_archive_metadata_main_extra_record() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn writes_compressed_rar50_archive_metadata_main_extra_record() {
     let payload = b"compressed payload with archive metadata\n".repeat(8);
     let entries = [entry(b"compressed-metadata.txt", &payload)
@@ -2877,6 +2973,7 @@ fn writes_compressed_rar50_archive_metadata_main_extra_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_stored_rar50_archive_that_reader_extracts_with_password() {
     let entries = [
         entry(b"secret.txt", b"encrypted stored RAR5 payload from rars\n")
@@ -2954,6 +3051,7 @@ fn writes_encrypted_stored_rar50_archive_that_reader_extracts_with_password() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_stored_rar50_archive_metadata_record() {
     let entries = [entry(
         b"metadata-secret.txt",
@@ -2987,6 +3085,7 @@ fn writes_encrypted_stored_rar50_archive_metadata_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_compressed_rar50_archive_that_reader_extracts_with_password() {
     let entries = [entry(b"secret-compressed.txt", b"encrypted compressed RAR5 payload from rars\nencrypted compressed RAR5 payload from rars\n").with_mtime(Some(0x5a21_0055)).with_attributes(0x20).with_host_os(3).with_password(b"secret".to_vec())];
     let features = FeatureSet::store_only();
@@ -3029,6 +3128,7 @@ fn writes_encrypted_compressed_rar50_archive_that_reader_extracts_with_password(
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn encrypted_compressed_rar50_writer_stores_member_when_lz_payload_would_grow() {
     let data = deterministic_noise(8192);
     assert!(encode_lz_member(&data, 0).unwrap().len() >= data.len());
@@ -3055,6 +3155,7 @@ fn encrypted_compressed_rar50_writer_stores_member_when_lz_payload_would_grow() 
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_compressed_rar50_archive_metadata_record() {
     let payload = b"encrypted compressed metadata payload repeated repeated\n".repeat(8);
     let entries = [entry(b"secret-compressed-metadata.txt", &payload)
@@ -3084,6 +3185,7 @@ fn writes_encrypted_compressed_rar50_archive_metadata_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_solid_compressed_rar50_archive_that_reader_extracts_with_password() {
     let first = b"encrypted rar50 solid shared phrase alpha beta gamma\n".repeat(16);
     let second = b"encrypted rar50 solid shared phrase alpha beta gamma\nsecond\n".repeat(8);
@@ -3119,6 +3221,7 @@ fn writes_encrypted_solid_compressed_rar50_archive_that_reader_extracts_with_pas
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_rar50_archive_comment_service_that_reader_extracts_with_password() {
     let entries = [entry(
         b"secret.txt",
@@ -3185,6 +3288,7 @@ fn writes_encrypted_rar50_archive_comment_service_that_reader_extracts_with_pass
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_compressed_rar50_archive_comment_service_with_password() {
     let payload = b"encrypted compressed payload with encrypted comment\n".repeat(8);
     let entries = [entry(b"encrypted-compressed-comment.txt", &payload)
@@ -3232,6 +3336,7 @@ fn writes_encrypted_compressed_rar50_archive_comment_service_with_password() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn writes_encrypted_rar50_recovery_service_that_reader_extracts_with_password() {
     let entries = [entry(
         b"secret-recovery.txt",
@@ -3289,6 +3394,7 @@ fn writes_encrypted_rar50_recovery_service_that_reader_extracts_with_password() 
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn writes_encrypted_compressed_rar50_recovery_service_that_reader_extracts_with_password() {
     let payload = b"encrypted compressed recovery payload repeated repeated. ".repeat(24);
     let entries = [entry(b"secret-compressed-recovery.txt", &payload)
@@ -3339,6 +3445,7 @@ fn writes_encrypted_compressed_rar50_recovery_service_that_reader_extracts_with_
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_rar50_archive_that_reader_extracts_with_password() {
     let entries = [entry(
         b"header-secret.txt",
@@ -3377,6 +3484,7 @@ fn writes_header_encrypted_rar50_archive_that_reader_extracts_with_password() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_compressed_rar50_archive_that_reader_extracts_with_password() {
     let entries = [entry(b"header-compressed-secret.txt", b"RAR5 header encrypted compressed payload from rars\nRAR5 header encrypted compressed payload from rars\n").with_mtime(Some(0x5a21_0056)).with_attributes(0x20).with_host_os(3).with_password(b"password".to_vec())];
     let mut features = FeatureSet::store_only();
@@ -3412,6 +3520,7 @@ fn writes_header_encrypted_compressed_rar50_archive_that_reader_extracts_with_pa
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_solid_compressed_rar50_archive_that_reader_extracts_with_password() {
     let first = b"header encrypted rar50 solid shared phrase alpha beta gamma\n".repeat(16);
     let second = b"header encrypted rar50 solid shared phrase alpha beta gamma\nsecond\n".repeat(8);
@@ -3449,6 +3558,7 @@ fn writes_header_encrypted_solid_compressed_rar50_archive_that_reader_extracts_w
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_rar50_archive_comment_service_that_reader_extracts_with_password() {
     let entries = [entry(
         b"header-comment-secret.txt",
@@ -3484,6 +3594,7 @@ fn writes_header_encrypted_rar50_archive_comment_service_that_reader_extracts_wi
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_compressed_rar50_archive_comment_service_with_password() {
     let payload = b"header encrypted compressed payload with archive comment\n".repeat(8);
     let entries = [entry(b"header-compressed-comment-secret.txt", &payload)
@@ -3517,6 +3628,7 @@ fn writes_header_encrypted_compressed_rar50_archive_comment_service_with_passwor
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_rar50_archive_metadata_record() {
     let entries = [entry(
         b"header-metadata-secret.txt",
@@ -3552,6 +3664,7 @@ fn writes_header_encrypted_rar50_archive_metadata_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn writes_header_encrypted_rar50_recovery_service_that_reader_extracts_with_password() {
     let entries = [entry(
         b"header-recovery-secret.txt",
@@ -3592,6 +3705,7 @@ fn writes_header_encrypted_rar50_recovery_service_that_reader_extracts_with_pass
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn writes_header_encrypted_compressed_rar50_recovery_service_that_reader_extracts_with_password() {
     let payload = b"header encrypted compressed recovery payload repeated repeated. ".repeat(24);
     let entries = [entry(b"header-secret-compressed-recovery.txt", &payload)
@@ -3625,6 +3739,7 @@ fn writes_header_encrypted_compressed_rar50_recovery_service_that_reader_extract
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_compressed_rar50_archive_metadata_record() {
     let payload = b"header encrypted compressed metadata payload repeated repeated\n".repeat(8);
     let entries = [entry(b"header-secret-compressed-metadata.txt", &payload)
@@ -3656,6 +3771,7 @@ fn writes_header_encrypted_compressed_rar50_archive_metadata_record() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_stored_rar50_volume_set_that_reader_reassembles_with_password() {
     let payload = b"RAR5 encrypted stored split payload from rars.\n".repeat(16);
     let entry = entry(b"split-secret.txt", &payload)
@@ -3726,6 +3842,7 @@ fn writes_encrypted_stored_rar50_volume_set_that_reader_reassembles_with_passwor
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn writes_encrypted_stored_rar50_volume_set_with_recovery_records() {
     let payload = b"RAR5 encrypted stored recovery split payload from rars.\n".repeat(16);
     let entry = entry(b"split-secret-rr.txt", &payload)
@@ -3769,6 +3886,7 @@ fn writes_encrypted_stored_rar50_volume_set_with_recovery_records() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_stored_rar50_volume_set_that_reader_reassembles_with_password() {
     let payload = b"RAR5 header encrypted stored split payload from rars.\n".repeat(16);
     let entry = entry(b"split-header-secret.txt", &payload)
@@ -3820,6 +3938,7 @@ fn writes_header_encrypted_stored_rar50_volume_set_that_reader_reassembles_with_
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_compressed_rar50_volume_set_that_reader_reassembles_with_password() {
     let payload = b"RAR5 encrypted compressed split payload from rars.\n".repeat(18);
     let entry = entry(b"split-secret-compressed50.txt", &payload)
@@ -3869,6 +3988,7 @@ fn writes_encrypted_compressed_rar50_volume_set_that_reader_reassembles_with_pas
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn encrypted_compressed_rar50_volume_writer_stores_member_when_lz_payload_would_grow() {
     let data = deterministic_noise(8192);
     assert!(encode_lz_member(&data, 0).unwrap().len() >= data.len());
@@ -3903,6 +4023,7 @@ fn encrypted_compressed_rar50_volume_writer_stores_member_when_lz_payload_would_
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn writes_encrypted_compressed_rar50_volume_set_with_recovery_records() {
     let payload = b"RAR5 encrypted compressed recovery split payload from rars.\n".repeat(18);
     let entry = entry(b"split-secret-compressed-rr.txt", &payload)
@@ -3945,6 +4066,7 @@ fn writes_encrypted_compressed_rar50_volume_set_with_recovery_records() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_solid_compressed_rar50_volume_set_that_reader_reassembles_with_password() {
     let payload = b"RAR5 encrypted solid compressed split payload from rars.\n".repeat(18);
     let entry = entry(b"split-solid-secret-compressed50.txt", &payload)
@@ -3979,6 +4101,7 @@ fn writes_encrypted_solid_compressed_rar50_volume_set_that_reader_reassembles_wi
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_compressed_rar50_volume_set_that_reader_reassembles_with_password() {
     let payload = b"RAR5 header encrypted compressed split payload from rars.\n".repeat(18);
     let entry = entry(b"split-header-secret-compressed50.txt", &payload)
@@ -4026,6 +4149,7 @@ fn writes_header_encrypted_compressed_rar50_volume_set_that_reader_reassembles_w
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_solid_compressed_rar50_volume_set_that_reader_reassembles_with_password()
 {
     let payload = b"RAR5 header encrypted solid compressed split payload from rars.\n".repeat(18);
@@ -4067,6 +4191,7 @@ fn writes_header_encrypted_solid_compressed_rar50_volume_set_that_reader_reassem
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_encrypted_multi_file_solid_compressed_rar50_volume_set_that_reader_reassembles() {
     let first = b"RAR5 encrypted multi-file solid split shared phrase.\n".repeat(14);
     let second = b"RAR5 encrypted multi-file solid split shared phrase.\nsecond\n".repeat(12);
@@ -4112,6 +4237,7 @@ fn writes_encrypted_multi_file_solid_compressed_rar50_volume_set_that_reader_rea
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn writes_header_encrypted_multi_file_solid_compressed_rar50_volume_set_that_reader_reassembles() {
     let first = b"RAR5 header encrypted multi-file solid split shared phrase.\n".repeat(14);
     let second =
@@ -4155,6 +4281,7 @@ fn writes_header_encrypted_multi_file_solid_compressed_rar50_volume_set_that_rea
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn decrypts_rar50_crc32_mac_file_with_password() {
     let bytes = std::fs::read(fixture("password_crc32.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -4183,6 +4310,7 @@ fn decrypts_rar50_crc32_mac_file_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn decrypts_rar50_blake2_mac_file_with_password() {
     let bytes = std::fs::read(fixture("password_aes.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -4198,6 +4326,7 @@ fn decrypts_rar50_blake2_mac_file_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_wrong_password_for_rar50_encrypted_file() {
     let bytes = std::fs::read(fixture("password_crc32.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -4213,6 +4342,7 @@ fn rejects_wrong_password_for_rar50_encrypted_file() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_rar50_header_encrypted_archive_without_or_with_wrong_password() {
     let bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
 
@@ -4224,6 +4354,7 @@ fn rejects_rar50_header_encrypted_archive_without_or_with_wrong_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_unsupported_rar50_header_encryption_version() {
     let mut bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
     let start = 8; // RAR5 signature length.
@@ -4261,6 +4392,7 @@ fn rejects_unsupported_rar50_header_encryption_version() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parses_rar50_header_encryption_without_optional_password_check() {
     let mut bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
     // This fixture has a one-byte header size and the check value is the last
@@ -4280,6 +4412,7 @@ fn parses_rar50_header_encryption_without_optional_password_check() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parses_and_extracts_rar50_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("header_encrypted.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -4295,6 +4428,7 @@ fn parses_and_extracts_rar50_header_encrypted_archive_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parses_rar50_header_encrypted_archive_from_path_with_password() {
     let archive =
         Archive::parse_path_with_password(fixture("header_encrypted.rar"), Some(b"password"))
@@ -4308,6 +4442,7 @@ fn parses_rar50_header_encrypted_archive_from_path_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parses_winrar721_header_encrypted_quick_open_archive_with_password() {
     let bytes = std::fs::read(fixture("winrar721_header_encrypted_quickopen.rar")).unwrap();
 
@@ -4336,6 +4471,7 @@ fn parses_winrar721_header_encrypted_quick_open_archive_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar50_header_encrypted_comment_service_with_password() {
     let bytes = std::fs::read(fixture("header_encrypted_comment.rar")).unwrap();
 
@@ -4658,6 +4794,7 @@ fn extracts_rar50_solid_archive() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn accepts_nonzero_encrypted_stored_padding_in_streaming_extraction() {
     let payload = b"encrypted stored RAR5 padding check";
     let entries = [entry(b"secret.txt", payload)
@@ -4763,6 +4900,7 @@ fn extracts_rar50_solid_multivolume_archive() {
 /// RAR 7.12 and UnRAR 7.20 both abort with a bad-archive error rather than
 /// extract. rars refuses too, before reading anything from the spliced volume.
 #[test]
+#[cfg(feature = "encryption")]
 fn rar50_refuses_a_volume_set_that_changes_encryption_partway() {
     let volumes: Vec<_> = [
         "header_encrypted_stored_multivol.part1.rar",
@@ -4882,6 +5020,7 @@ fn rar50_reads_the_modification_time_from_the_htime_record() {
 /// A wrong password must still be refused, just later and by a different
 /// mechanism, which is the second half of this test.
 #[test]
+#[cfg(feature = "encryption")]
 fn opens_rar50_archive_whose_password_check_is_all_zeroes() {
     let data = fs::read(fixture("zeroed_password_check.rar")).unwrap();
 
@@ -4907,6 +5046,7 @@ fn opens_rar50_archive_whose_password_check_is_all_zeroes() {
 /// Compressed volume sets verify elsewhere, which is why the sibling
 /// `encrypted_multivol` fixtures never caught this.
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar50_header_encrypted_stored_multivolume_archive() {
     let volumes: Vec<_> = (1..=3)
         .map(|part| {
@@ -4928,6 +5068,7 @@ fn extracts_rar50_header_encrypted_stored_multivolume_archive() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar50_encrypted_compressed_multivolume_archive() {
     let volumes = [
         Archive::parse_path_with_password(
@@ -4961,6 +5102,7 @@ fn extracts_rar50_encrypted_compressed_multivolume_archive() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar50_compressed_split_streams_and_preserves_failure_kinds() {
     let mut volumes: Vec<_> = (1..=3)
         .map(|part| {
@@ -5027,6 +5169,7 @@ fn extracts_rar50_compressed_split_streams_and_preserves_failure_kinds() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn accepts_nonzero_encrypted_stored_padding_in_split_streaming_extraction() {
     let data = b"encrypted stored split RAR5 padding check".repeat(3);
     let entry = entry(b"split-secret.txt", &data)
@@ -5379,6 +5522,7 @@ fn rejects_rar50_rev5_header_boundaries_before_reading_payload() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_missing_rar50_data_volume_from_rev5_recovery_volume() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5399,6 +5543,7 @@ fn repairs_missing_rar50_data_volume_from_rev5_recovery_volume() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar50_rev5_repair_preserves_reconstruction_and_sink_errors() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5459,6 +5604,7 @@ fn rar50_rev5_repair_rejects_data_size_above_native_range() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_two_missing_rar50_data_volumes_from_rev5_recovery_volumes() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5481,6 +5627,7 @@ fn repairs_two_missing_rar50_data_volumes_from_rev5_recovery_volumes() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rejects_duplicate_rar50_rev5_recovery_rows() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5504,6 +5651,7 @@ fn rejects_duplicate_rar50_rev5_recovery_rows() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rejects_rar50_rev5_repair_inputs_with_inconsistent_metadata() {
     let rev =
         Rev5Volume::parse(&std::fs::read(fixture("multivol_rev.part1.rev")).unwrap()).unwrap();
@@ -5546,6 +5694,7 @@ fn rejects_rar50_rev5_repair_inputs_with_inconsistent_metadata() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rejects_non_rar50_input_to_inline_recovery() {
     assert!(matches!(
         rars::rar50::repair_inline_recovery_bytes(b"not a RAR archive"),
@@ -5554,6 +5703,7 @@ fn rejects_non_rar50_input_to_inline_recovery() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rejects_rar50_rev5_repaired_data_with_wrong_size_or_checksum() {
     let data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5591,6 +5741,7 @@ fn rejects_rar50_rev5_repaired_data_with_wrong_size_or_checksum() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_corrupt_rar50_data_volume_from_rev5_recovery_volume() {
     let mut data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5613,6 +5764,7 @@ fn repairs_corrupt_rar50_data_volume_from_rev5_recovery_volume() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_truncated_rar50_data_volume_from_rev5_recovery_volume() {
     let mut data: Vec<_> = (1..=5)
         .map(|index| std::fs::read(fixture(&format!("multivol_rev.part{index}.rar"))).unwrap())
@@ -5821,6 +5973,7 @@ fn parse_owned_takes_input_buffer_by_value() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parse_owned_with_password_unlocks_header_encrypted_archive() {
     let bytes = fs::read(fixture("header_encrypted.rar")).unwrap();
 
@@ -5839,6 +5992,7 @@ fn parse_owned_with_password_unlocks_header_encrypted_archive() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parse_with_options_accepts_borrowed_bytes_and_options() {
     let bytes = fs::read(fixture("header_encrypted.rar")).unwrap();
     let archive =
@@ -5904,6 +6058,7 @@ fn direct_rar50_parser_rejects_legacy_input_and_stale_signatures() {
 
 /// Members whose contents overlap heavily, and which together fit inside the
 /// default dictionary, so a shared dictionary has something obvious to find.
+#[cfg(feature = "write")]
 fn solid_test_entries() -> Vec<rar50::ArchiveEntry> {
     let base: Vec<u8> = (0..800u32)
         .flat_map(|index| {
@@ -5925,6 +6080,7 @@ fn solid_test_entries() -> Vec<rar50::ArchiveEntry> {
         .collect()
 }
 
+#[cfg(feature = "write")]
 fn write_streaming(entries: &[rar50::ArchiveEntry], solid: bool) -> Vec<u8> {
     let mut features = FeatureSet::store_only();
     features.solid = solid;
@@ -5941,6 +6097,7 @@ fn write_streaming(entries: &[rar50::ArchiveEntry], solid: bool) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_solid_members_share_one_dictionary() {
     let entries = solid_test_entries();
     let solid = write_streaming(&entries, true);
@@ -5969,6 +6126,7 @@ fn streaming_solid_members_share_one_dictionary() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_solid_archives_round_trip() {
     let entries = solid_test_entries();
     let archive_bytes = write_streaming(&entries, true);
@@ -5993,6 +6151,7 @@ fn streaming_solid_archives_round_trip() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_solid_chains_history_across_block_and_member_boundaries() {
     // Two 64 KiB chunks of noise over disjoint alphabets, so every chunk cuts a
     // block and only history can shrink a repeat of either.
@@ -6075,6 +6234,7 @@ fn streaming_solid_chains_history_across_block_and_member_boundaries() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_solid_output_does_not_depend_on_the_memory_budget() {
     let entries = solid_test_entries();
     let mut features = FeatureSet::store_only();
@@ -6111,6 +6271,7 @@ fn streaming_solid_output_does_not_depend_on_the_memory_budget() {
 
 /// Tests an archive with whichever reference tool is installed, returning
 /// `None` when neither is.
+#[cfg(feature = "write")]
 fn reference_test_archive(label: &str, archive: &[u8]) -> Option<std::process::Output> {
     let dir = scratch::case(&format!("rars-{label}"));
     let path = dir.join("archive.rar");
@@ -6131,6 +6292,7 @@ fn reference_test_archive(label: &str, archive: &[u8]) -> Option<std::process::O
 }
 
 #[test]
+#[cfg(feature = "write")]
 #[ignore = "requires a local unrar or rar command"]
 fn reference_rar_accepts_streaming_solid_archive() {
     let archive = write_streaming(&solid_test_entries(), true);
@@ -6150,6 +6312,7 @@ fn reference_rar_accepts_streaming_solid_archive() {
 /// The exact flag combination from issue #29, which used to abort trying to
 /// allocate more than ten gigabytes.
 #[test]
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn streaming_writer_handles_solid_encrypted_headers_and_recovery_together() {
     let entries: Vec<_> = (0..3u8)
         .map(|index| {
@@ -6233,6 +6396,7 @@ fn streaming_writer_handles_solid_encrypted_headers_and_recovery_together() {
     );
 }
 
+#[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn reference_test_archive_with_password(
     label: &str,
     archive: &[u8],
@@ -6263,11 +6427,13 @@ fn reference_test_archive_with_password(
 
 /// Generates deterministic incompressible bytes without holding them, so the
 /// source itself does not dominate the memory being measured.
+#[cfg(feature = "write")]
 struct GeneratedSource {
     remaining: u64,
     state: u64,
 }
 
+#[cfg(feature = "write")]
 impl std::io::Read for GeneratedSource {
     fn read(&mut self, buffer: &mut [u8]) -> IoResult<usize> {
         let want = buffer.len().min(self.remaining as usize);
@@ -6283,6 +6449,7 @@ impl std::io::Read for GeneratedSource {
     }
 }
 
+#[cfg(feature = "write")]
 impl std::io::Seek for GeneratedSource {
     fn seek(&mut self, _: std::io::SeekFrom) -> IoResult<u64> {
         Err(std::io::Error::new(
@@ -6296,6 +6463,7 @@ impl std::io::Seek for GeneratedSource {
 /// recovery record whose parity also exceeds that budget. Run with
 /// `/usr/bin/time -v` to see the peak resident size.
 #[test]
+#[cfg(feature = "write")]
 #[ignore = "writes a 300 MiB archive; run manually to measure peak memory"]
 fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
     const MEMBER_BYTES: u64 = 300 * 1024 * 1024;
@@ -6340,6 +6508,7 @@ fn streaming_writer_stays_within_its_memory_budget_on_a_large_archive() {
     );
 }
 
+#[cfg(feature = "write")]
 fn streaming_entry(name: &str, data: &[u8]) -> rar50::ArchiveEntry {
     rar50::ArchiveEntry::new(
         name,
@@ -6348,6 +6517,7 @@ fn streaming_entry(name: &str, data: &[u8]) -> rar50::ArchiveEntry {
     .with_attributes(0x20)
 }
 
+#[cfg(feature = "write")]
 fn write_with_extras(
     entries: &[rar50::ArchiveEntry],
     features: FeatureSet,
@@ -6366,6 +6536,7 @@ fn write_with_extras(
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_writer_stores_an_archive_comment() {
     let entries = [streaming_entry("member.txt", b"comment carrier payload\n")];
     let features = FeatureSet::store_only();
@@ -6390,6 +6561,7 @@ fn streaming_writer_stores_an_archive_comment() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_writer_records_archive_metadata() {
     let entries = [streaming_entry("member.txt", b"metadata carrier\n")];
     let bytes = write_with_extras(
@@ -6415,6 +6587,7 @@ fn streaming_writer_records_archive_metadata() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_writer_attaches_file_services() {
     let entries = [streaming_entry("member.txt", b"service carrier payload\n")
         .with_service(rar50::ServiceEntry::new("CMT", "a file comment"))];
@@ -6436,6 +6609,7 @@ fn streaming_writer_attaches_file_services() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_writer_writes_a_usable_quick_open_index() {
     let entries: Vec<_> = (0..4u8)
         .map(|index| {
@@ -6474,6 +6648,7 @@ fn streaming_writer_writes_a_usable_quick_open_index() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_writer_applies_filters_when_asked() {
     // x86-shaped data, which the E8 filter is meant to help with.
     let mut data = Vec::new();
@@ -6507,6 +6682,7 @@ fn streaming_writer_applies_filters_when_asked() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_writer_drops_an_automatic_filter_it_cannot_afford() {
     // Too large to hold whole under this budget, so the filter is skipped
     // rather than the write failing.
@@ -6530,6 +6706,7 @@ fn streaming_writer_drops_an_automatic_filter_it_cannot_afford() {
 
 /// Barely compressible bytes, so the packed payload stays big enough to span
 /// several volumes.
+#[cfg(feature = "write")]
 fn volume_payload(len: u32) -> Vec<u8> {
     let mut state = 0x2545_f491_4f6c_dd1du64;
     (0..len)
@@ -6551,6 +6728,7 @@ fn volume_payload(len: u32) -> Vec<u8> {
 /// compares `supports` with `validate_plan`, which are two halves of the same
 /// table; nothing compared either with the writer.
 #[test]
+#[cfg(feature = "write")]
 fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
     use rars::WriterOption;
 
@@ -6612,6 +6790,7 @@ fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
 /// capability table agreed with the writer that it was supported. What the
 /// writer must never do is accept the request and lose it.
 #[test]
+#[cfg(feature = "write")]
 fn a_file_comment_on_a_volume_set_is_refused_or_written() {
     let payload = volume_payload(40_000);
     let entries = [
@@ -6651,6 +6830,7 @@ fn a_file_comment_on_a_volume_set_is_refused_or_written() {
 /// all: the member loop never ran, and the writer finished without asking the
 /// sink to start one. The volume writer that was deleted refused this.
 #[test]
+#[cfg(feature = "write")]
 fn a_volume_set_with_no_members_is_refused() {
     let mut sink = rar50::CollectedVolumes::new();
     let result = rar50::write_streaming_volumes_to(
@@ -6670,6 +6850,7 @@ fn a_volume_set_with_no_members_is_refused() {
 /// them. Both entry points have to say so; the archive path used to and the
 /// volume path silently dropped the request.
 #[test]
+#[cfg(feature = "write")]
 fn both_rar50_entry_points_refuse_a_filter_with_solid() {
     let payload = volume_payload(40_000);
     let entries = [streaming_entry("member.bin", &payload)];
@@ -6708,6 +6889,7 @@ fn both_rar50_entry_points_refuse_a_filter_with_solid() {
     assert!(archive.is_err());
 }
 
+#[cfg(feature = "write")]
 fn write_volume_set(
     entries: &[rar50::ArchiveEntry],
     features: FeatureSet,
@@ -6731,6 +6913,7 @@ fn write_volume_set(
 /// `progress: None` and its compression stage was called without the callback
 /// the single-archive path uses.
 #[test]
+#[cfg(feature = "write")]
 fn a_volume_set_reports_compression_progress() {
     use rars::atomic64::AtomicU64;
     use rars::{WriteOperation, WriteProgressEvent};
@@ -6796,6 +6979,7 @@ fn a_volume_set_reports_compression_progress() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 fn streaming_volume_set_round_trips() {
     let payload = volume_payload(120_000);
     let entries = [streaming_entry("split.bin", &payload)];
@@ -6818,6 +7002,7 @@ fn streaming_volume_set_round_trips() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn streaming_volume_set_carries_encryption_across_splits() {
     let payload = volume_payload(90_000);
     let entries = [streaming_entry("secret.bin", &payload).with_password(b"volume-pass".to_vec())];
@@ -6840,6 +7025,7 @@ fn streaming_volume_set_carries_encryption_across_splits() {
 }
 
 #[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn streaming_volume_set_recovers_each_volume() {
     let payload = volume_payload(80_000);
     let entries = [streaming_entry("protected.bin", &payload)];
@@ -6866,6 +7052,7 @@ fn streaming_volume_set_recovers_each_volume() {
 }
 
 #[test]
+#[cfg(feature = "write")]
 #[ignore = "requires a local unrar or rar command"]
 fn reference_rar_accepts_a_streaming_volume_set() {
     let payload = volume_payload(150_000);
@@ -6972,6 +7159,7 @@ fn streams_rar50_match_that_reaches_past_the_start_of_the_window() {
 /// The KDF count byte from the archive encryption header, which sits in the
 /// clear right after the marker: CRC32, then vints for header size, type 4,
 /// header flags, encryption version and encryption flags, then the byte.
+#[cfg(all(feature = "write", feature = "encryption"))]
 fn head_crypt_kdf_count(bytes: &[u8]) -> u8 {
     let mut pos = 8 + 4;
     let read_vint = |pos: &mut usize| {

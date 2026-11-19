@@ -1,7 +1,8 @@
 //! `Builder::write_to_path` streams a large RAR 2.0-4.x member into the file.
 //!
-//! Inside the crate so the test can lower the size members stream above:
-//! crossing the real 64 MiB took a debug build most of a CI run's test time.
+//! Inside the crate so the test can lower the size members stream above, and
+//! the window that sets a segment of the streamed parse: crossing the real
+//! 64 MiB took a debug build most of a CI run's test time.
 
 use super::{write_seekable_archive_with_threshold, StreamingEntry, WriterOptions};
 use crate::{
@@ -15,17 +16,22 @@ use std::sync::{Arc, Mutex};
 thread_local! {
     /// What `ArchiveOutput::seekable` streams members above on this thread.
     pub(super) static STREAM_ABOVE: Cell<u64> = const { Cell::new(super::STREAM_MEMBERS_ABOVE) };
+    /// The largest window a member is fitted on this thread.
+    pub(super) static DICTIONARY_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
 const MODE: u32 = 0o100644;
 const MIB: usize = 1024 * 1024;
 const STREAMS_ABOVE: u64 = 256 * 1024;
-/// A member over 4 MiB gets the largest dictionary, and one segment of the
+/// The window members are fitted to here, in place of 4 MiB.
+const DICTIONARY: usize = MIB;
+/// A member over 1 MiB gets the capped dictionary, and one segment of the
 /// streamed parse reads four of them. A member a little longer than that has
-/// its first segment coded and written before its last megabyte is read.
-const MEMBER: usize = 18 * MIB;
+/// its first segment coded and written before its last quarter megabyte is
+/// read.
+const MEMBER: usize = 4 * DICTIONARY + DICTIONARY / 2;
 /// How close to the member's end the archive is measured.
-const LAST: u64 = MIB as u64;
+const LAST: u64 = DICTIONARY as u64 / 4;
 
 /// Numbered lines with the top bit set. Not text, so the member is coded LZ
 /// without first trying PPMd on a sample as large as a segment, which would
@@ -80,6 +86,7 @@ fn bytes_in(dir: &Path) -> u64 {
 #[test]
 fn write_to_path_streams_a_large_member_as_a_seekable_archive_does() {
     STREAM_ABOVE.set(STREAMS_ABOVE);
+    DICTIONARY_CAP.set(DICTIONARY);
     let dir = crate::scratch::case("builder-path-streams-legacy");
     let data = large_member();
 

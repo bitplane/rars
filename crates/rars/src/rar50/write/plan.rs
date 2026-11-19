@@ -10,9 +10,51 @@ use crate::{Result, WriterResources};
 /// search inside the one-thread default budget at every level.
 pub(super) const FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
 
+#[cfg(test)]
+std::thread_local! {
+    static FILTER_SEARCH_HERE: std::cell::Cell<usize> = const { std::cell::Cell::new(FILTER_SEARCH_BYTES) };
+}
+
+/// [`FILTER_SEARCH_BYTES`], or what a test lowered it to on this thread, so a
+/// member crosses it without coding 4 MiB in a debug build.
+pub(super) fn filter_search_bytes() -> usize {
+    #[cfg(test)]
+    {
+        FILTER_SEARCH_HERE.get()
+    }
+    #[cfg(not(test))]
+    {
+        FILTER_SEARCH_BYTES
+    }
+}
+
+/// Runs `run` with filter searches covering at most `bytes`, on this thread
+/// and on the workers of the pool it runs in.
+#[cfg(test)]
+pub(super) fn with_filter_search_bytes<T: Send>(bytes: usize, run: impl FnOnce() -> T + Send) -> T {
+    let was = FILTER_SEARCH_HERE.replace(bytes);
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    let result = rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon::current_num_threads())
+        .start_handler(move |_| FILTER_SEARCH_HERE.set(bytes))
+        .build()
+        .unwrap()
+        .install(run);
+    #[cfg(any(
+        not(feature = "parallel"),
+        all(target_arch = "wasm32", target_os = "unknown")
+    ))]
+    let result = run();
+    FILTER_SEARCH_HERE.set(was);
+    result
+}
+
 /// The most one filter search covers: a run, or a piece of one.
 fn search_piece(settings: &CompressPlan) -> u64 {
-    super::compress::run_size(settings).min(FILTER_SEARCH_BYTES) as u64
+    super::compress::run_size(settings).min(filter_search_bytes()) as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,5 +1,3 @@
-#![cfg(feature = "write")]
-
 use rars::rar13::{extract_volumes_to, file_checksum, Archive, Entry};
 use rars::{detect_archive_family, find_archive_start, ArchiveFamily, Error};
 use std::cell::RefCell;
@@ -18,6 +16,7 @@ const README_COMPRESSED: &[u8] = include_bytes!("fixtures/rar13/README.RAR");
 const README_STORE: &[u8] = include_bytes!("fixtures/rar13/README_store.rar");
 const README_EXPECTED: &[u8] = include_bytes!("fixtures/rar13/README");
 const CMULTI_EXPECTED: &[u8] = include_bytes!("fixtures/rar13/CMULTI.TXT");
+#[cfg(feature = "encryption")]
 const STOREPWD: &[u8] = include_bytes!("fixtures/rar13/STOREPWD.RAR");
 const SFXSRC: &[u8] = include_bytes!("fixtures/rar13/SFXSRC.EXE");
 const SOLID: &[u8] = include_bytes!("fixtures/rar13/SOLID.RAR");
@@ -36,6 +35,7 @@ const CMULTIV_R05: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R05");
 const CMULTIV_R06: &[u8] = include_bytes!("fixtures/rar13/CMULTIV.R06");
 const RAR140_NOAV: &[u8] = include_bytes!("fixtures/rar13/rar140_av/rar140_noav_baseline.rar");
 const RAR140_AV: &[u8] = include_bytes!("fixtures/rar13/rar140_av/rar140_av_patched.rar");
+#[cfg(feature = "encryption")]
 const ENCRYPTED_SPLIT: [&[u8]; 3] = [
     include_bytes!("fixtures/rar13/encrypted_split/ESPLIT.RAR"),
     include_bytes!("fixtures/rar13/encrypted_split/ESPLIT.R00"),
@@ -85,6 +85,7 @@ fn ignores_a_cleared_solid_flag() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn decrypts_a_rar1402_compressed_member_across_volume_boundaries() {
     let volumes: Vec<_> = ENCRYPTED_SPLIT
         .iter()
@@ -456,6 +457,7 @@ fn parses_encrypted_compressed_file_metadata() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn decodes_real_rar1402_encrypted_compressed_file() {
     let archive =
         Archive::parse(README_PASSWORD).expect("parse encrypted compressed RAR 1.402 archive");
@@ -470,6 +472,7 @@ fn decodes_real_rar1402_encrypted_compressed_file() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extract_to_decodes_real_rar1402_encrypted_compressed_file() {
     #[derive(Clone)]
     struct SharedWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
@@ -529,6 +532,7 @@ fn rejects_truncated_compressed_payload() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn decodes_real_rar1402_encrypted_stored_file() {
     let archive = Archive::parse(STOREPWD).expect("parse encrypted stored RAR 1.402 archive");
     assert_eq!(archive.entries.len(), 1);
@@ -736,6 +740,7 @@ fn expected_repeatb() -> Vec<u8> {
 /// different way of getting at the bytes, so the archives they produce have to
 /// be the same archives.
 #[test]
+#[cfg(feature = "write")]
 fn streaming_and_buffered_writers_agree_byte_for_byte() {
     use rars::rar13::{
         write_compressed_archive_with_comment, write_stored_archive_with_comment,
@@ -841,6 +846,7 @@ fn streaming_and_buffered_writers_agree_byte_for_byte() {
 /// RAR 1.3 has no filters, so a filter policy has to be turned away rather
 /// than routed into a compression engine it does not have.
 #[test]
+#[cfg(feature = "write")]
 fn a_filter_policy_is_refused_by_name() {
     use rars::rar13::{write_streaming_archive_to, StreamingEntry, WriterOptions};
     use rars::{

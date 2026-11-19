@@ -57,7 +57,9 @@ libc.workspace = true
 [target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
 rustix.workspace = true
 
-[dev-dependencies]
+# Criterion pulls in alloca, which builds C; the benches only target hosts with
+# 64-bit atomics, so targets without them skip it and need no C cross-compiler.
+[target.'cfg(target_has_atomic = "64")'.dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

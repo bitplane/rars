@@ -84,6 +84,9 @@ fn streamed_split_members_match_buffered_plain_encrypted_and_solid_fixtures() {
         ("encrypted_multivol", 3, false, Some(b"password".as_slice())),
         ("solid_multivol", 6, true, None),
     ] {
+        if password.is_some() && !cfg!(feature = "encryption") {
+            continue;
+        }
         let volumes = fixtures(prefix, count, padded, password);
         let expected = collect(&volumes, u64::MAX, password).unwrap();
         let streamed = collect(&volumes, 1, password).unwrap();

@@ -182,6 +182,7 @@ fn resource_aware_byte_output_matches_the_standard_builder_path() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn header_encryption_uses_a_shared_entry_password_without_a_builder_default() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -207,6 +208,7 @@ fn header_encryption_uses_a_shared_entry_password_without_a_builder_default() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn missing_header_password_fails_before_reading_a_source() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)

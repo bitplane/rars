@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::rar15_40::{
     write_stored_volumes_to, CollectedVolumes, EntrySource, StreamingEntry, WriterOptions,
 };
@@ -43,6 +45,7 @@ fn stream(
 /// bump changes these. The release hook regenerates them with the RAR 5
 /// fixtures: `RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_streaming_volumes`.
 #[test]
+#[cfg(feature = "encryption")]
 fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
     let mut cases = Vec::new();
     for password in [None, Some(&b"secret"[..])] {
@@ -101,6 +104,7 @@ fn streamed_volumes_match_the_in_memory_writer_byte_for_byte() {
     assert_eq!(expected.lines().count(), produced.lines().count());
 }
 
+#[cfg(feature = "encryption")]
 fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {
     let archives: Vec<_> = volumes
         .iter()
@@ -132,6 +136,7 @@ fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_streamed_volumes_extract_to_the_source() {
     for header_encryption in [false, true] {
         for target in [
@@ -168,6 +173,9 @@ fn the_source_is_read_once() {
         (ArchiveVersion::Rar40, None),
         (ArchiveVersion::Rar30, Some(&b"secret"[..])),
     ] {
+        if password.is_some() && !cfg!(feature = "encryption") {
+            continue;
+        }
         opens.store(0, std::sync::atomic::Ordering::SeqCst);
         let options = WriterOptions::new(target, FeatureSet::store_only());
         let volumes = stream(&entry(source.clone(), password), options, 3000).unwrap();

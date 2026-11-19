@@ -12,7 +12,11 @@ fn preparation_limit_preserves_plain_output_and_releases_failed_writes() {
             (true, false, false),
             (false, false, false),
             (false, true, true),
-        ] {
+        ]
+        .into_iter()
+        // Recovery rows need the recovery feature.
+        .filter(|&(_, _, recovery)| cfg!(feature = "recovery") || !recovery)
+        {
             let mut builder = Builder::new(target)
                 .store(store)
                 .solid(solid)
@@ -99,6 +103,7 @@ fn legacy_writers_refuse_the_unsupported_hard_policy_before_emission() {
 }
 
 #[test]
+#[cfg(all(feature = "recovery", feature = "encryption"))]
 fn volume_headers_and_encryption_state_obey_preparation_policy() {
     use rars::rar50::{
         write_streaming_volumes_to, ArchiveEntry, ArchiveExtras, CollectedVolumes, WriterOptions,
