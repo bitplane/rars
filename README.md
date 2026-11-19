@@ -9,6 +9,7 @@ A Rust implementation of RAR.
   * 📜 [npm](https://www.npmjs.com/package/@bitplane/rars)
 * 🐱 [source](https://github.com/bitplane/rars)
   * 📃 [spec](https://github.com/bitplane/rar-research)
+  * 📏 [writer limits](https://github.com/bitplane/rars/blob/master/docs/writer-limits.md)
 
 `rars` is free software for compression, decompression and recovery of RAR
 archives. It supports all the archive types I could find - from the early `RE~^`

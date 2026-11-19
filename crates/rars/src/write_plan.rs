@@ -155,9 +155,9 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
             family == ArchiveFamily::Rar50Plus && !shape.volumes
         }
         WriterOption::CompressionLevel => true,
-        // PPMd arrived with RAR 2.9 and left again with RAR 5. The legacy
-        // volume writer takes a packed payload rather than a method, so a
-        // split set is always LZ.
+        // PPMd arrived with RAR 2.9 and left again with RAR 5. A split set
+        // takes the automatic choice only: the volume writer is handed the
+        // method, but asking for one across volumes has never been tested.
         WriterOption::CompressionMethod => {
             matches!(
                 target,
@@ -166,8 +166,8 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         }
         WriterOption::DictionarySize => !family_is(family, ArchiveFamily::Rar13),
         // RAR 1.3 and 1.5 have no filters at all; RAR 2.0 predates the VM. The
-        // legacy volume writer takes a payload rather than a policy, so a
-        // filter cannot be asked for across a split set.
+        // legacy volume writer is handed a policy, but a named filter across
+        // a split set has never been tested, so a set searches on its own.
         WriterOption::Filter => {
             !matches!(
                 target,
@@ -194,10 +194,14 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         // for single archives; volume writers cannot retain their association.
         WriterOption::FileComment => !shape.volumes,
         WriterOption::ArchiveMetadata => family == ArchiveFamily::Rar50Plus && !shape.volumes,
-        WriterOption::Password => true,
+        // RAR 1.3's volume writer has nowhere to carry the encryption state
+        // from one volume to the next.
+        WriterOption::Password => !(family_is(family, ArchiveFamily::Rar13) && shape.volumes),
         // Every writer compresses to a budget now: RAR 5 sizes its blocks by
         // it, and the older ones use it to decide how many members to have in
-        // flight. A legacy volume set is the exception, still built in memory.
+        // flight. A legacy volume set is the exception: it writes one member
+        // at a time, streaming a large RAR 2.0 to 4.x one, and RAR 1.3 builds
+        // the whole set in memory.
         WriterOption::MemoryLimit => family == ArchiveFamily::Rar50Plus || !shape.volumes,
         // RAR 5 spools its members; RAR 2.0 to 4.x spool a large one when the
         // output cannot seek back to patch its header.
@@ -378,6 +382,59 @@ mod tests {
             }
         }
     }
+
+    /// The format-support cells of `docs/writer-limits.md`, pinned so a
+    /// writer that gains or loses one has to update the table too.
+    #[test]
+    #[cfg(all(feature = "encryption", feature = "recovery"))]
+    fn writer_limits_table_matches_what_each_format_supports() {
+        let columns = [
+            ("solid", WriterOption::Feature(Feature::Solid)),
+            ("password", WriterOption::Password),
+            ("-hp", WriterOption::Feature(Feature::HeaderEncryption)),
+            ("recovery", WriterOption::RecoveryRecord),
+            ("memory", WriterOption::MemoryLimit),
+            ("temp", WriterOption::TempDir),
+        ];
+        let mut table = String::new();
+        for target in ArchiveVersion::ALL {
+            for volumes in [false, true] {
+                let shape = PlanShape::new().compressed(true).volumes(volumes);
+                let shape_name = if volumes { "volumes" } else { "single" };
+                table.push_str(&format!("{target:<6} {shape_name:<7}"));
+                for (name, option) in columns {
+                    if supports(target, option, shape) {
+                        table.push_str(&format!(" {name}"));
+                    } else {
+                        table.push_str(&format!(" {}", "-".repeat(name.len())));
+                    }
+                }
+                table.push('\n');
+            }
+        }
+        assert_eq!(table, WRITER_LIMITS_TABLE, "\n{table}");
+    }
+
+    const WRITER_LIMITS_TABLE: &str = "\
+        rar13 single  solid password --- -------- memory ----\n\
+        rar13 volumes solid -------- --- -------- ------ ----\n\
+        rar14 single  solid password --- -------- memory ----\n\
+        rar14 volumes solid -------- --- -------- ------ ----\n\
+        rar15 single  solid password --- -------- memory ----\n\
+        rar15 volumes solid password --- -------- ------ ----\n\
+        rar20 single  solid password --- -------- memory temp\n\
+        rar20 volumes solid password --- -------- ------ ----\n\
+        rar29 single  solid password -hp -------- memory temp\n\
+        rar29 volumes solid password -hp -------- ------ ----\n\
+        rar30 single  solid password -hp -------- memory temp\n\
+        rar30 volumes solid password -hp -------- ------ ----\n\
+        rar40 single  solid password -hp -------- memory temp\n\
+        rar40 volumes solid password -hp -------- ------ ----\n\
+        rar50 single  solid password -hp recovery memory temp\n\
+        rar50 volumes solid password -hp recovery memory temp\n\
+        rar70 single  solid password -hp recovery memory temp\n\
+        rar70 volumes solid password -hp recovery memory temp\n\
+    ";
 
     /// A refusal is only useful if it can point somewhere, so every option has
     /// to be available on at least one format.

@@ -209,7 +209,7 @@ impl BuilderEntry {
     }
 }
 
-/// A pending file can seek, which lets large RAR 2.9-4.x members stream into it.
+/// A pending file can seek, which lets large RAR 2.0-4.x members stream into it.
 enum SingleOutput<'a> {
     Stream(&'a mut dyn Write),
     File(&'a mut fs::File),
@@ -1282,7 +1282,7 @@ impl Builder {
 
     /// Write the archive to `path`, streaming where the format allows it.
     /// The completed archive replaces the destination only after writing and syncing succeed.
-    /// Large compressed RAR 2.9-4.x members stream, as a file can seek back to fill in their headers.
+    /// Large compressed RAR 2.0-4.x members stream, as a file can seek back to fill in their headers.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem
