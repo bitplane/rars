@@ -4890,7 +4890,7 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
 
     let mut parser = super::LzParser::new(&input, 0, options, block_size);
     assert_eq!(parser.finder.window(), input.len().next_power_of_two());
-    let tokens = parser.parse_blocks(&[input.len()]);
+    let tokens = parser.parse_blocks(&[input.len()]).unwrap();
 
     // The links it would have kept are the same links: nothing in a member
     // this short is far enough back to be overwritten either way.
@@ -4901,10 +4901,11 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     );
     assert!(roomy.finder.window() > 16 * parser.finder.window());
     assert_eq!(
-        format!("{:?}", roomy.parse_blocks(&[input.len()])),
+        format!("{:?}", roomy.parse_blocks(&[input.len()]).unwrap()),
         format!("{tokens:?}")
     );
-    assert!(tokens[0]
+    assert!(tokens[0][0]
+        .tokens
         .iter()
         .any(|token| matches!(token, super::EncodeToken::Match { .. })));
 
