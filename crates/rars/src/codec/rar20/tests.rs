@@ -1067,6 +1067,102 @@ fn a_cut_trailing_header_still_sets_the_block_kind_and_channels_it_read() {
     assert_eq!(decoder.channels, 2);
 }
 
+#[test]
+fn kept_audio_tables_survive_an_lz_block_between_them() {
+    // RAR 2.50 writes a member whose blocks go LZ, two-channel audio, LZ,
+    // four-channel audio, each keeping the previous tables (issue #360).
+    // An LZ block reads 374 lengths, which replace only the start of the
+    // 1028-entry old table: the second channel's lengths past 374 survive
+    // it, and the next audio block's deltas apply to them, not to zero.
+    let text = b"text, not audio. ";
+    let samples = 64;
+    let mut ch0 = vec![0u8; super::AUDIO_COUNT];
+    ch0[0] = 1; // delta 0
+    ch0[256] = 1; // end of block
+    let mut ch1 = vec![0u8; super::AUDIO_COUNT];
+    ch1[200] = 1; // delta 200, at old-table position 457
+    ch1[256] = 1; // end of block, at old-table position 513
+    let audio_lengths = [ch0, ch1].concat();
+    let mut lz_lengths = vec![0u8; super::TABLE_COUNT];
+    for symbol in *b"te " {
+        lz_lengths[usize::from(symbol)] = 3;
+    }
+    for symbol in *b"x,noaudi." {
+        lz_lengths[usize::from(symbol)] = 4;
+    }
+    lz_lengths[269] = 4; // end of block
+
+    let member = |keep_last_audio_tables: bool| {
+        let mut bits = BitWriter::default();
+        let mut old = [0u8; super::OLD_LEVEL_COUNT];
+        write_plain_level_block(&mut bits, Some(2), false, &mut old, &audio_lengths);
+        write_audio_samples(&mut bits, &audio_lengths, samples, true);
+        write_plain_level_block(&mut bits, None, true, &mut old, &lz_lengths);
+        let main_codes = super::canonical_codes(&lz_lengths[..super::MAIN_COUNT]).unwrap();
+        let symbols = text.iter().map(|&byte| usize::from(byte));
+        for symbol in symbols.chain([269]) {
+            let code = main_codes[symbol].unwrap();
+            bits.write_bits(u32::from(code.code), code.len);
+        }
+        let keep = keep_last_audio_tables;
+        write_plain_level_block(&mut bits, Some(2), keep, &mut old, &audio_lengths);
+        write_audio_samples(&mut bits, &audio_lengths, samples, false);
+        bits.finish()
+    };
+    let size = 2 * samples + text.len() + 2 * samples;
+
+    let fresh = Unpack20::new().decode_member(&member(false), size).unwrap();
+    assert_eq!(&fresh[2 * samples..2 * samples + text.len()], text);
+    let kept = Unpack20::new().decode_member(&member(true), size).unwrap();
+    assert_eq!(kept, fresh);
+}
+
+/// Writes a block header whose code lengths are all coded as plain deltas
+/// against `old`, then records them there as the reader does.
+fn write_plain_level_block(
+    bits: &mut BitWriter,
+    audio_channels: Option<usize>,
+    keep_tables: bool,
+    old: &mut [u8; super::OLD_LEVEL_COUNT],
+    lengths: &[u8],
+) {
+    bits.write_bit(audio_channels.is_some());
+    bits.write_bit(keep_tables);
+    if let Some(channels) = audio_channels {
+        bits.write_bits(channels as u32 - 1, 2);
+    }
+    if !keep_tables {
+        *old = [0; super::OLD_LEVEL_COUNT];
+    }
+    // Level symbols 0..=15 at four bits each, so each code is its symbol.
+    for symbol in 0..LEVEL_COUNT {
+        bits.write_bits(if symbol < 16 { 4 } else { 0 }, 4);
+    }
+    for (old, &len) in old.iter_mut().zip(lengths) {
+        bits.write_bits(u32::from(len.wrapping_sub(*old) & 0x0f), 4);
+        *old = len;
+    }
+}
+
+/// Writes `samples` frames of the first coded delta on each channel, then
+/// optionally the end-of-block symbol on the first channel.
+fn write_audio_samples(bits: &mut BitWriter, lengths: &[u8], samples: usize, end: bool) {
+    let codes: Vec<_> = lengths
+        .chunks(super::AUDIO_COUNT)
+        .map(|table| super::canonical_codes(table).unwrap())
+        .collect();
+    for _ in 0..samples {
+        for channel in &codes {
+            let code = channel[..256].iter().flatten().next().unwrap();
+            bits.write_bits(u32::from(code.code), code.len);
+        }
+    }
+    if end {
+        let code = codes[0][256].unwrap();
+        bits.write_bits(u32::from(code.code), code.len);
+    }
+}
+
 type WriteBlock = fn(&mut BitWriter, usize, bool);
 
 const TRAILING_HEADER_BLOCKS: [(&str, WriteBlock); 2] = [

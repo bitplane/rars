@@ -22,6 +22,11 @@ pub(crate) struct OutputBudget {
     member_limit: Option<u64>,
     total_limit: Option<u64>,
     used: u64,
+    skip_limit: Option<u64>,
+    skipped: u64,
+    /// The current member is a solid one decoded only to be thrown away: it
+    /// charges the skip budget instead of the output ceilings.
+    discarding: bool,
 }
 
 impl OutputBudget {
@@ -31,15 +36,44 @@ impl OutputBudget {
             member_limit: options.max_member_output_bytes,
             total_limit: options.max_total_output_bytes,
             used: 0,
+            skip_limit: options.solid_skip_budget,
+            skipped: 0,
+            discarding: false,
         }
     }
 
     pub(crate) fn is_limited(&self) -> bool {
-        self.member_limit.is_some() || self.total_limit.is_some()
+        self.member_limit.is_some() || self.total_limit.is_some() || self.discarding
+    }
+
+    /// Whether a skipped solid member may be decoded and discarded instead.
+    pub(crate) fn can_discard(&self) -> bool {
+        self.skip_limit.is_some()
+    }
+
+    /// Sets whether the next member is decoded only to be discarded.
+    pub(crate) fn set_discarding(&mut self, discarding: bool) {
+        self.discarding = discarding && self.can_discard();
+    }
+
+    fn skip_error(&self, limit: u64, additional: u64) -> Error {
+        Error::SolidSkipBudgetExceeded {
+            limit,
+            required: self.skipped.saturating_add(additional),
+        }
     }
 
     pub(crate) fn check(&self, required: u64, name: &[u8]) -> Result<()> {
         self.control.check()?;
+        if self.discarding {
+            let limit = self.skip_limit.unwrap_or(u64::MAX);
+            if required > limit - self.skipped {
+                return Err(self
+                    .skip_error(limit, required)
+                    .at_entry(name.to_vec(), "limiting output"));
+            }
+            return Ok(());
+        }
         check(self.member_limit, required, name)?;
         if let Some(limit) = self.total_limit {
             if required > limit - self.used {
@@ -152,6 +186,19 @@ impl<W: Write> Write for LimitedWriter<'_, W> {
                 bytes.len()
             };
             return self.write_sink(&bytes[..len]);
+        }
+        if self.budget.discarding {
+            let limit = self.budget.skip_limit.unwrap_or(u64::MAX);
+            let count = bytes.len() as u64;
+            if self.exceeded.is_none() && count > limit - self.budget.skipped {
+                self.exceeded = Some(self.budget.skip_error(limit, count));
+            }
+            if self.exceeded.is_some() {
+                return Err(io::Error::other("solid skip budget exceeded"));
+            }
+            let n = self.write_sink(&bytes[..bytes.len().min(64 * 1024)])?;
+            self.budget.skipped += n as u64;
+            return Ok(n);
         }
         if self.exceeded.is_none() {
             let count = bytes.len() as u64;
@@ -479,5 +526,48 @@ mod tests {
         .unwrap();
         assert_eq!(out, b"abc");
         check(Some(u64::MAX), u64::MAX, b"member").unwrap();
+    }
+
+    #[test]
+    fn discarded_output_charges_the_skip_budget_cumulatively_and_not_the_ceilings() {
+        let mut budget = OutputBudget::new(
+            ArchiveReadOptions::new()
+                .with_max_member_output_bytes(2)
+                .with_max_total_output_bytes(2)
+                .with_solid_skip_budget(7),
+        );
+        budget.set_discarding(true);
+        budget.check(4, b"one").unwrap();
+        budget
+            .run(b"one", io::sink(), |writer| Ok(writer.write_all(b"1234")?))
+            .unwrap();
+        // Three left: a declared four is refused before decoding...
+        let refused = budget.check(4, b"two").unwrap_err();
+        assert!(matches!(
+            refused.root_cause(),
+            Error::SolidSkipBudgetExceeded {
+                limit: 7,
+                required: 8
+            }
+        ));
+        // ...and so is output past what was declared.
+        let error = budget
+            .run(b"two", io::sink(), |writer| Ok(writer.write_all(b"5678")?))
+            .unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            Error::SolidSkipBudgetExceeded { limit: 7, .. }
+        ));
+        assert_eq!(error.entry_context().unwrap().0, b"two");
+
+        // Kept output still charges the ceilings, not the skip budget.
+        budget.set_discarding(false);
+        budget.check(2, b"kept").unwrap();
+        assert!(budget.check(3, b"kept").is_err());
+
+        // Without a budget, nothing is discarded.
+        let mut unbudgeted = OutputBudget::new(ArchiveReadOptions::new());
+        unbudgeted.set_discarding(true);
+        assert!(!unbudgeted.can_discard() && !unbudgeted.is_limited());
     }
 }
