@@ -4083,7 +4083,7 @@ mod tests {
                     bytes.len() as u64,
                     0,
                     ArchiveSource::Memory(Arc::from(bytes.clone())),
-                    cancellation.map_or_else(|| options, |token| options.with_cancellation(token)),
+                    cancellation.map_or(options, |token| options.with_cancellation(token)),
                 )
             };
             let archive = parse(usize::MAX, None).unwrap();
