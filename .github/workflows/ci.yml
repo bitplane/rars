@@ -387,11 +387,13 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           key: ${{ matrix.group }}
-      - name: Test the library without workspace feature unification
+      - name: Lint and test the library without workspace feature unification
         env:
           SETS: ${{ matrix.features }}
         run: |
