@@ -1296,12 +1296,14 @@ fn encode_ppmd_streamed(
                     Some(&mut report),
                 )?;
         } else {
-            for at in pos - origin..end - origin {
+            let start = pos - origin;
+            for (at, &byte) in window[start..end - origin].iter().enumerate() {
+                let at = start + at;
                 if (origin + at).is_multiple_of(4096) && !progress(origin + at) {
                     return Err(Error::Cancelled);
                 }
                 declare(&mut encoder, at, 1)?;
-                encoder.encode_literal(window[at])?;
+                encoder.encode_literal(byte)?;
             }
             pos = end;
         }
