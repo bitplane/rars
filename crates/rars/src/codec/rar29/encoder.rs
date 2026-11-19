@@ -204,11 +204,14 @@ pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, false, None, 0)
 }
 
+/// One member as PPMd, filtered first when `filter` is given, starting a
+/// model of the given size.
 pub(crate) fn unpack29_encode_ppmd_with_progress(
     input: &[u8],
     lz_escapes: bool,
     filter: Option<crate::FilterSpec>,
     max_match_distance: usize,
+    size: PpmdModelSize,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
     if !progress(0) {
@@ -229,26 +232,6 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
         filtered.as_deref().unwrap_or(input),
         lz_escapes,
         declared.as_mut(),
-        max_match_distance,
-        None,
-        PpmdModelSize::DEFAULT,
-        Some(progress),
-    )
-    .map(|(packed, _)| packed)
-}
-
-/// One unfiltered member as PPMd, with a model of the given size.
-pub(crate) fn unpack29_encode_ppmd_sized_with_progress(
-    input: &[u8],
-    lz_escapes: bool,
-    max_match_distance: usize,
-    size: PpmdModelSize,
-    progress: &mut dyn FnMut(usize) -> bool,
-) -> Result<Vec<u8>> {
-    encode_ppmd_block_with_model(
-        input,
-        lz_escapes,
-        None,
         max_match_distance,
         None,
         size,
@@ -724,6 +707,9 @@ pub struct EncodeOptions {
     /// the tables the parse before it produced. The block keeps whichever
     /// parse codes smallest, the lazy one included. Zero leaves the lazy parse.
     pub optimal_parse_passes: usize,
+    /// Whether a block's tokens may be cut into several blocks, each with
+    /// tables of its own, where the cuts price smaller than one table.
+    pub split_blocks: bool,
 }
 
 impl EncodeOptions {
@@ -735,6 +721,7 @@ impl EncodeOptions {
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
             block_size: None,
             optimal_parse_passes: 0,
+            split_blocks: false,
         }
     }
 
@@ -764,6 +751,11 @@ impl EncodeOptions {
 
     pub const fn with_optimal_parse_passes(mut self, passes: usize) -> Self {
         self.optimal_parse_passes = passes;
+        self
+    }
+
+    pub const fn with_split_blocks(mut self, enabled: bool) -> Self {
+        self.split_blocks = enabled;
         self
     }
 
@@ -823,8 +815,12 @@ pub struct Unpack29Encoder {
     /// The PPMd model a reader holds, once some member in the chain has built
     /// one. A reader keeps it across every block that does not ask for a reset,
     /// LZ blocks included, so a member can go PPMd against everything the chain
-    /// has read even when the member before it went LZ.
-    ppmd: Option<PpmdModel>,
+    /// has read even when the member before it went LZ. The size is the one
+    /// it started with, which every later block keeps.
+    ppmd: Option<(PpmdModel, PpmdModelSize)>,
+    /// The sizes a member that starts the chain's model tries, in order; the
+    /// one that codes it smallest is the one the rest of the chain continues.
+    ppmd_sizes: &'static [PpmdModelSize],
 }
 
 impl Default for Unpack29Encoder {
@@ -844,7 +840,19 @@ impl Unpack29Encoder {
             options: options.constrained(),
             levels: [0; TABLE_COUNT],
             ppmd: None,
+            ppmd_sizes: &[PpmdModelSize::DEFAULT],
         }
+    }
+
+    /// The PPMd model sizes to try when a member starts the chain's model.
+    ///
+    /// A chain keeps the model its first PPMd member starts, so the size is
+    /// chosen there and nowhere else. An empty list keeps the default.
+    pub(crate) fn with_ppmd_sizes(mut self, sizes: &'static [PpmdModelSize]) -> Self {
+        if !sizes.is_empty() {
+            self.ppmd_sizes = sizes;
+        }
+        self
     }
 
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
@@ -992,20 +1000,54 @@ impl Unpack29Encoder {
 
     /// Codes the member against a copy of the chain's model, so a trial that
     /// loses leaves the reader's model where the winning member expects it.
+    ///
+    /// A member that starts the model codes under each of the chain's sizes
+    /// and keeps the smallest, earlier on a tie, holding two models at a time.
+    /// Only the first size reports progress; the others poll at the end.
     fn encode_ppmd_member(
         &self,
         input: &[u8],
         progress: &mut dyn FnMut(usize) -> bool,
-    ) -> Result<(Vec<u8>, PpmdModel)> {
-        encode_ppmd_block_with_model(
-            input,
-            true,
-            None,
-            self.options.max_match_distance,
-            self.ppmd.clone(),
-            PpmdModelSize::DEFAULT,
-            Some(progress),
-        )
+    ) -> Result<(Vec<u8>, (PpmdModel, PpmdModelSize))> {
+        let distance = self.options.max_match_distance;
+        if let Some((model, size)) = &self.ppmd {
+            let (packed, model) = encode_ppmd_block_with_model(
+                input,
+                true,
+                None,
+                distance,
+                Some(model.clone()),
+                *size,
+                Some(progress),
+            )?;
+            return Ok((packed, (model, *size)));
+        }
+        let mut best: Option<(Vec<u8>, (PpmdModel, PpmdModelSize))> = None;
+        for (index, &size) in self.ppmd_sizes.iter().enumerate() {
+            let mut report =
+                |position: usize| progress(if index == 0 { position } else { input.len() });
+            let (packed, model) = encode_ppmd_block_with_model(
+                input,
+                true,
+                None,
+                distance,
+                None,
+                size,
+                Some(&mut report),
+            )?;
+            if best
+                .as_ref()
+                .is_none_or(|(best, _)| packed.len() < best.len())
+            {
+                best = Some((packed, (model, size)));
+            }
+        }
+        Ok(best.expect("a chain always has a PPMd size to try"))
+    }
+
+    /// Whether the chain holds a PPMd model a member would continue.
+    pub(crate) fn has_ppmd_model(&self) -> bool {
+        self.ppmd.is_some()
     }
 
     pub fn encode_member_with_filter(
@@ -1140,8 +1182,8 @@ fn encode_member_blocks(
         options,
         block_size,
         progress,
-        |_, end, tokens, _| {
-            out.extend_from_slice(&code_block(tokens, &[], end < input.len(), levels)?);
+        |_, end, tokens, state, _| {
+            out.extend_from_slice(&code_block(tokens, state, &[], end < input.len(), levels)?);
             Ok(ControlFlow::Continue(()))
         },
     )?
@@ -1186,8 +1228,18 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
     progress: &mut dyn FnMut(usize) -> bool,
     out: PackedOut<'_>,
 ) -> Result<ControlFlow<()>> {
-    encode_ppmd_streamed(input, len, escapes, filter, None, None, progress, out)
-        .map(|(flow, _)| flow)
+    encode_ppmd_streamed(
+        input,
+        len,
+        escapes,
+        filter,
+        None,
+        PpmdModelSize::DEFAULT,
+        None,
+        progress,
+        out,
+    )
+    .map(|(flow, _)| flow)
 }
 
 impl Unpack29Encoder {
@@ -1243,12 +1295,15 @@ impl Unpack29Encoder {
             options,
             block_size,
             Some(progress),
-            |base, end, tokens, records| {
+            |base, end, tokens, state, records| {
                 let records = match filtering {
                     true => block_filter_records(records, base, end, window, &mut programs)?,
                     false => Vec::new(),
                 };
-                out(&code_block(tokens, &records, end < len, &mut levels)?, end)
+                out(
+                    &code_block(tokens, state, &records, end < len, &mut levels)?,
+                    end,
+                )
             },
         )?;
         if flow.is_continue() {
@@ -1264,30 +1319,40 @@ impl Unpack29Encoder {
     /// [`Self::encode_member_with_engine`]'s PPMd side read as it is coded; a break leaves a chain to discard.
     ///
     /// With `filter`, a fresh encoder codes what [`unpack29_encode_ppmd_with_progress`] does with it.
+    ///
+    /// `size` is the model to start when the chain holds none; a model the
+    /// chain holds is continued at the size it started with.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_ppmd_streamed(
         &mut self,
         input: &mut dyn Read,
         len: usize,
         escapes: Option<usize>,
         filter: Option<crate::FilterSpec>,
+        size: PpmdModelSize,
         progress: &mut dyn FnMut(usize) -> bool,
         out: PackedOut<'_>,
     ) -> Result<ControlFlow<()>> {
         // Taken rather than copied: after a break the caller starts a new chain.
         let mut history = std::mem::take(&mut self.history);
+        let (model, size) = match &self.ppmd {
+            Some((model, size)) => (Some(model.clone()), *size),
+            None => (None, size),
+        };
         let (flow, model) = encode_ppmd_streamed(
             input,
             len,
             escapes,
             filter,
-            self.ppmd.clone(),
+            model,
+            size,
             Some(&mut history),
             progress,
             out,
         )?;
         self.history = history;
         if let Some(model) = model {
-            self.ppmd = Some(model);
+            self.ppmd = Some((model, size));
         }
         Ok(flow)
     }
@@ -1304,6 +1369,7 @@ fn encode_ppmd_streamed(
     escapes: Option<usize>,
     filter: Option<crate::FilterSpec>,
     model: Option<PpmdModel>,
+    size: PpmdModelSize,
     mut history: Option<&mut Vec<u8>>,
     progress: &mut dyn FnMut(usize) -> bool,
     out: PackedOut<'_>,
@@ -1314,17 +1380,15 @@ fn encode_ppmd_streamed(
     let mut filters = filter
         .map(|filter| PpmdFilters::new(len, filter))
         .transpose()?;
+    // Headed as [`encode_ppmd_block_with_model`] heads a block.
     let (mut encoder, head) = match model {
         Some(model) => (
             PpmdEncoder::continuing(model, PPMD_ESC),
-            vec![0x80 | ((PPMD_ORDER as u8) - 1)],
+            vec![0x80 | size.order_bits()],
         ),
         None => (
-            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?,
-            vec![
-                0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
-                PPMD_DICTIONARY_MB - 1,
-            ],
+            PpmdEncoder::new(size.order, PPMD_ESC, usize::from(size.memory_mb))?,
+            vec![0x80 | 0x20 | size.order_bits(), size.memory_mb - 1],
         ),
     };
     if out(&head, 0)?.is_break() {
@@ -1529,6 +1593,7 @@ fn for_each_block(
         usize,
         usize,
         &[EncodeToken],
+        EncoderMatchState,
         &[OwnedVmFilterRecord],
     ) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
@@ -1563,11 +1628,17 @@ fn for_each_block(
                 return Err(Error::Cancelled);
             }
             let local: Vec<usize> = batch.iter().map(|&end| base + end - origin).collect();
-            for (tokens, &end) in parser.parse_blocks(&local).iter().zip(batch) {
-                if code(block_start, end, tokens, &records)?.is_break() {
-                    return Ok(ControlFlow::Break(()));
+            for (pieces, &end) in parser.parse_blocks(&local)?.iter().zip(batch) {
+                for piece in pieces {
+                    let piece_end = origin + piece.end - base;
+                    if code(block_start, piece_end, &piece.tokens, piece.state, &records)?
+                        .is_break()
+                    {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                    block_start = piece_end;
                 }
-                block_start = end;
+                debug_assert_eq!(block_start, end);
                 if progress.as_deref_mut().is_some_and(|report| !report(end)) {
                     return Err(Error::Cancelled);
                 }
@@ -1598,91 +1669,107 @@ fn encode_member_inner(
     previous_levels: &mut [u8; TABLE_COUNT],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<u8>> {
-    let tokens = encode_tokens_with_progress(input, history, options, progress)?;
-    code_block(
-        &tokens,
-        initial_filters,
-        more_blocks_follow,
-        previous_levels,
-    )
+    let pieces = parse_member(input, history, options, progress)?;
+    let mut out = Vec::new();
+    let mut filters = initial_filters;
+    for (index, piece) in pieces.iter().enumerate() {
+        let more = more_blocks_follow || index + 1 < pieces.len();
+        out.extend_from_slice(&code_block(
+            &piece.tokens,
+            piece.state,
+            filters,
+            more,
+            previous_levels,
+        )?);
+        filters = &[];
+    }
+    Ok(out)
 }
 
 /// The code-length table a block of these tokens is coded with.
 fn table_lengths_for_tokens(
     tokens: &[EncodeToken],
+    mut match_state: EncoderMatchState,
     filter_records: usize,
 ) -> Result<[u8; TABLE_COUNT]> {
-    let mut main_frequencies = vec![0usize; MAIN_COUNT];
-    let mut offset_frequencies = vec![0usize; OFFSET_COUNT];
-    let mut low_offset_frequencies = vec![0usize; LOW_OFFSET_COUNT];
-    let mut length_frequencies = vec![0usize; LENGTH_COUNT];
-    main_frequencies[257] += filter_records;
-    let mut match_state = EncoderMatchState::default();
+    let mut frequencies = [0usize; TABLE_COUNT];
+    frequencies[257] += filter_records;
     for token in tokens {
         match *token {
             EncodeToken::Literal(byte) => {
-                main_frequencies[byte as usize] += 1;
+                frequencies[byte as usize] += 1;
             }
             EncodeToken::Match { length, offset } => {
                 let (length, offset) = (length as usize, offset as usize);
-                match match_state.encode_match(length, offset)? {
-                    EncodedMatch::LastLengthRepeat => {
-                        main_frequencies[258] += 1;
-                    }
-                    EncodedMatch::RepeatOffset {
-                        index, length_slot, ..
-                    } => {
-                        main_frequencies[259 + index] += 1;
-                        length_frequencies[length_slot] += 1;
-                    }
-                    EncodedMatch::Short { slot, .. } => {
-                        main_frequencies[263 + slot] += 1;
-                    }
-                    EncodedMatch::Fresh {
-                        length_slot,
-                        offset_slot,
-                        offset_extra,
-                        ..
-                    } => {
-                        main_frequencies[271 + length_slot] += 1;
-                        offset_frequencies[offset_slot] += 1;
-                        if offset_slot > 9 {
-                            low_offset_frequencies[offset_extra & 0x0f] += 1;
-                        }
-                    }
-                }
+                count_match(match_state.encode_match(length, offset)?, &mut frequencies);
                 match_state.remember(length, offset);
             }
         }
     }
-    main_frequencies[256] += 1;
+    frequencies[256] += 1;
+    Ok(table_lengths_for_frequencies(frequencies))
+}
 
-    let mut table_lengths = [0u8; TABLE_COUNT];
-    if low_offset_frequencies
-        .iter()
-        .all(|&frequency| frequency == 0)
-    {
-        low_offset_frequencies[0] = 1;
+/// Where each alphabet starts in a table, and in counts laid out like one.
+const OFFSET_TABLE: usize = MAIN_COUNT;
+const LOW_OFFSET_TABLE: usize = OFFSET_TABLE + OFFSET_COUNT;
+const LENGTH_TABLE: usize = LOW_OFFSET_TABLE + LOW_OFFSET_COUNT;
+
+/// Counts the symbols one match codes as, in counts laid out like a table.
+fn count_match(encoded: EncodedMatch, frequencies: &mut [usize; TABLE_COUNT]) {
+    match encoded {
+        EncodedMatch::LastLengthRepeat => frequencies[258] += 1,
+        EncodedMatch::RepeatOffset {
+            index, length_slot, ..
+        } => {
+            frequencies[259 + index] += 1;
+            frequencies[LENGTH_TABLE + length_slot] += 1;
+        }
+        EncodedMatch::Short { slot, .. } => frequencies[263 + slot] += 1,
+        EncodedMatch::Fresh {
+            length_slot,
+            offset_slot,
+            offset_extra,
+            ..
+        } => {
+            frequencies[271 + length_slot] += 1;
+            frequencies[OFFSET_TABLE + offset_slot] += 1;
+            if offset_slot > 9 {
+                frequencies[LOW_OFFSET_TABLE + (offset_extra & 0x0f)] += 1;
+            }
+        }
     }
-    let main_lengths = huffman::lengths_for_frequencies(&main_frequencies, 15);
-    let offset_lengths = huffman::lengths_for_frequencies(&offset_frequencies, 15);
-    let low_offset_lengths = huffman::lengths_for_frequencies(&low_offset_frequencies, 15);
-    let length_lengths = huffman::lengths_for_frequencies(&length_frequencies, 15);
-    table_lengths[..MAIN_COUNT].copy_from_slice(&main_lengths);
-    table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT].copy_from_slice(&offset_lengths);
-    table_lengths[MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT]
-        .copy_from_slice(&low_offset_lengths);
-    table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..].copy_from_slice(&length_lengths);
-    Ok(table_lengths)
+}
+
+/// The code-length table for a block's symbol counts, end of block included.
+fn table_lengths_for_frequencies(mut frequencies: [usize; TABLE_COUNT]) -> [u8; TABLE_COUNT] {
+    let low_offsets = &mut frequencies[LOW_OFFSET_TABLE..LENGTH_TABLE];
+    if low_offsets.iter().all(|&frequency| frequency == 0) {
+        low_offsets[0] = 1;
+    }
+    let mut table_lengths = [0u8; TABLE_COUNT];
+    for alphabet in [
+        0..OFFSET_TABLE,
+        OFFSET_TABLE..LOW_OFFSET_TABLE,
+        LOW_OFFSET_TABLE..LENGTH_TABLE,
+        LENGTH_TABLE..TABLE_COUNT,
+    ] {
+        table_lengths[alphabet.clone()].copy_from_slice(&huffman::lengths_for_frequencies(
+            &frequencies[alphabet],
+            15,
+        ));
+    }
+    table_lengths
 }
 
 fn code_block(
     tokens: &[EncodeToken],
+    state: EncoderMatchState,
     initial_filters: &[Vec<u8>],
     more_blocks_follow: bool,
     previous_levels: &mut [u8; TABLE_COUNT],
 ) -> Result<Vec<u8>> {
-    let table_lengths = table_lengths_for_tokens(tokens, initial_filters.len())?;
+    let table_lengths = table_lengths_for_tokens(tokens, state, initial_filters.len())?;
 
     // Two ways to say the same table: outright, or as a delta against the one
     // the reader already holds. Neither wins everywhere, so code both and take
@@ -1730,7 +1817,7 @@ fn code_block(
             bits.write_bits(u32::from(byte), 8);
         }
     }
-    let mut match_state = EncoderMatchState::default();
+    let mut match_state = state;
     for &token in tokens {
         match token {
             EncodeToken::Literal(byte) => {
@@ -1905,9 +1992,15 @@ fn encode_filtered_member_blocks(
         inner,
         block_size,
         progress,
-        |base, end, tokens, records| {
+        |base, end, tokens, state, records| {
             let records = block_filter_records(records, base, end, window, &mut programs)?;
-            out.extend_from_slice(&code_block(tokens, &records, end < data.len(), levels)?);
+            out.extend_from_slice(&code_block(
+                tokens,
+                state,
+                &records,
+                end < data.len(),
+                levels,
+            )?);
             Ok(ControlFlow::Continue(()))
         },
     )?
@@ -2258,12 +2351,27 @@ impl EncoderMatchState {
     }
 }
 
+/// Every block's tokens in order, coded from one state as a single block would be.
+#[cfg(test)]
 fn encode_tokens_with_progress(
     input: &[u8],
     history: &[u8],
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
+    Ok(parse_member(input, history, options, progress)?
+        .into_iter()
+        .flat_map(|piece| piece.tokens)
+        .collect())
+}
+
+/// A member parsed as one block, or cut into several where that codes smaller.
+fn parse_member(
+    input: &[u8],
+    history: &[u8],
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<Piece>> {
     let combined = with_history(history, input, options);
     let start = combined.len() - input.len();
     let reach = options.max_match_distance.min(MAX_HISTORY);
@@ -2335,9 +2443,9 @@ impl<'a> LzParser<'a> {
     }
 
     /// `ends` must stay within one batch of where the last call ended.
-    fn parse_blocks(&mut self, ends: &[usize]) -> Vec<Vec<EncodeToken>> {
+    fn parse_blocks(&mut self, ends: &[usize]) -> Result<Vec<Vec<Piece>>> {
         let Some(&last) = ends.last() else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
         debug_assert!(last - self.filled <= self.batch_bytes);
         let first = self.filled;
@@ -2354,18 +2462,29 @@ impl<'a> LzParser<'a> {
             parse_block(data, start, end, &mut FilledAhead(finder), options, None)
         };
         if !crate::parallel::may_nest() {
-            return ranges
-                .into_iter()
-                .map(|range| parse(range).expect("a parse without progress cannot fail"))
-                .collect();
+            return ranges.into_iter().map(parse).collect();
         }
-        let (tokens, failure) = crate::parallel::map_prefix(ranges, parse);
-        debug_assert!(failure.is_none(), "a parse without progress cannot fail");
-        tokens
+        // A failure must not leave the blocks after it out of the member.
+        match crate::parallel::map_prefix(ranges, parse) {
+            (_, Some(error)) => Err(error),
+            (pieces, None) => Ok(pieces),
+        }
     }
 }
 
-/// The lazy parse, then at the levels that ask for it a shortest-path one.
+/// One block's tokens, and where in the parsed bytes the block ends.
+#[derive(Debug)]
+struct Piece {
+    end: usize,
+    /// The repeat offsets the parse carried into the block. The reader keeps
+    /// its own across blocks, and agrees on every one of these it remembers.
+    state: EncoderMatchState,
+    tokens: Vec<EncodeToken>,
+}
+
+/// The lazy parse, at the levels that ask for it parsed again by shortest
+/// path, then cut into blocks where that codes smaller. At those levels each
+/// block is parsed again once cut, priced by the tables it now has.
 fn parse_block<C: Candidates>(
     data: &[u8],
     start: usize,
@@ -2373,12 +2492,67 @@ fn parse_block<C: Candidates>(
     finder: &mut C,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<Vec<EncodeToken>> {
-    let tokens = parse_range(data, start, end, finder, options, progress)?;
-    if options.optimal_parse_passes == 0 {
-        return Ok(tokens);
+) -> Result<Vec<Piece>> {
+    let mut tokens = parse_range(data, start, end, finder, options, progress)?;
+    let fresh = EncoderMatchState::default();
+    let refiner = match options.optimal_parse_passes {
+        0 => None,
+        _ => optimal_parse::Refiner::new(data, start, end, &*finder, options),
+    };
+    if let Some(refiner) = &refiner {
+        tokens = refiner
+            .refine(data, (start, end), options, tokens, (fresh, fresh))?
+            .0;
     }
-    optimal_parse::refine(data, start, end, &*finder, options, tokens)
+    if !options.split_blocks {
+        return Ok(vec![Piece {
+            end,
+            state: fresh,
+            tokens,
+        }]);
+    }
+    let pieces = block_split::split(start, end, tokens)?;
+    let Some(refiner) = refiner.filter(|_| pieces.len() > 1) else {
+        return Ok(pieces);
+    };
+    // Coming in with the offsets the pieces before it now leave, which the
+    // tokens it was cut with may no longer code from. That can cost a piece
+    // more than its own parse saved, so the cut parse stays if it was smaller.
+    //
+    // One pass a piece. Level 5's three took its time on 4 MiB of a binary
+    // from 1.13 to 1.33 times what it was before cutting, for 0.03-0.06%.
+    let mut cut_bits = 0usize;
+    let mut parsed_bits = 0usize;
+    let mut parsed = Vec::with_capacity(pieces.len());
+    let mut state = fresh;
+    let mut from = start;
+    for piece in &pieces {
+        cut_bits += optimal_parse::priced_bits(&piece.tokens, piece.state)?;
+        let (tokens, bits) = refiner.refine(
+            data,
+            (from, piece.end),
+            options.with_optimal_parse_passes(1),
+            piece.tokens.clone(),
+            (piece.state, state),
+        )?;
+        parsed_bits = parsed_bits.saturating_add(bits);
+        let piece = Piece {
+            end: piece.end,
+            state,
+            tokens,
+        };
+        for token in &piece.tokens {
+            if let EncodeToken::Match { length, offset } = *token {
+                state.remember(length as usize, offset as usize);
+            }
+        }
+        from = piece.end;
+        parsed.push(piece);
+    }
+    Ok(match parsed_bits < cut_bits {
+        true => parsed,
+        false => pieces,
+    })
 }
 
 /// No match crosses `end`, so a block covers exactly the bytes it was given.
@@ -3362,6 +3536,8 @@ impl BitWriter {
     }
 }
 
+#[path = "block_split.rs"]
+mod block_split;
 #[path = "optimal_parse.rs"]
 mod optimal_parse;
 pub(crate) use optimal_parse::OPTIMAL_PARSE_WORKSPACE;
