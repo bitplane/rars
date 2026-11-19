@@ -1242,6 +1242,61 @@ mod allowance_tests {
 mod run_search_tests {
     use super::*;
 
+    /// x86 code that opens with a script: calls to a few targets, which E8
+    /// turns into repeats.
+    fn scripted_code(len: usize) -> Vec<u8> {
+        let mut data = b"#!/bin/sh\n# a script at the front of the member\n".repeat(400);
+        let mut state = 0x2545_f491u32;
+        while data.len() + 16 <= len {
+            data.extend_from_slice(&[
+                0x48, 0x89, 0x8b, 0xc3, 0x83, 0x0f, 0x85, 0x31, 0xff, 0x74, 0x41,
+            ]);
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let target = [0x1000u32, 0x2340, 0x8800, 0x10000][(state >> 30) as usize];
+            let at = data.len() as u32;
+            data.push(0xe8);
+            data.extend_from_slice(&target.wrapping_sub(at + 5).to_le_bytes());
+        }
+        data.resize(len, 0x90);
+        data
+    }
+
+    #[test]
+    fn a_large_member_is_searched_on_the_block_paths_grid() {
+        let dictionary = 128 * 1024;
+        let options = encode_options_for_level(Some(2), dictionary).unwrap();
+        let run = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
+        let data = scripted_code(FILTER_SEARCH_BYTES + 64 * 1024);
+        let allowance = Allowance::default();
+        let (specs, _) = choose_owned_filter(&data, 0, options, None, &allowance).unwrap();
+        // What the block path chooses, run by run.
+        let mut runs = Vec::new();
+        for start in (0..data.len()).step_by(run) {
+            let end = (start + run).min(data.len());
+            let found = run_filters_with_allowance(
+                &data[start..end],
+                start,
+                0,
+                options,
+                &|| false,
+                &allowance,
+            )
+            .unwrap();
+            for spec in found.iter() {
+                let range = spec
+                    .range
+                    .clone()
+                    .map_or(start..end, |range| start + range.start..start + range.end);
+                runs.push(FilterSpec::range(spec.kind, range));
+            }
+        }
+        assert_eq!(specs.into_vec(), runs);
+        // The script in front no longer keeps the first run unsearched.
+        assert!(runs
+            .first()
+            .is_some_and(|spec| spec.range.as_ref().is_some_and(|range| range.start < run)));
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn an_explicit_filter_over_a_member_stops_at_4_gib() {

@@ -123,37 +123,37 @@ fn an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run() {
     }
 }
 
-/// A member longer than one 4 MiB filter search gets the same filters whether
-/// it is filtered whole or run by run: here, E8 over all of it. The member
-/// opens with text, as a tar of `/usr` can open with a script, which the
-/// whole-member search used to read as text and give up on, and which kept
-/// the first run unsearched.
+/// A member longer than one 4 MiB filter search is filtered as well whole as
+/// run by run. The member opens with text, as a tar of `/usr` can open with a
+/// script, which the whole-member search used to read as text and give up on,
+/// and which kept the first run unsearched. The two paths choose the same
+/// filters (`a_large_member_is_searched_on_the_block_paths_grid`); they code
+/// a filtered member a few bytes apart at this level (#383).
 #[test]
-fn a_member_too_long_for_one_search_gets_the_same_filters_on_both_paths() {
+fn a_member_too_long_for_one_search_is_filtered_on_both_paths() {
     let root = scratch::case("rar50-large-member-filter-paths");
     let mut data = b"#!/bin/sh\n# a script at the front of the member\n".repeat(400);
     data.extend(code((4 << 20) + (64 << 10)));
     let blocks = WriterResources::new(LIMIT).with_temp_dir(&root);
     let whole = WriterResources::new(1024 * MIB).with_temp_dir(&root);
     let plain = write(&data, FilterPolicy::None, &blocks);
-    let e8 = FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8));
-    for resources in [&blocks, &whole] {
-        let chosen = write(&data, FilterPolicy::Auto, resources);
-        let asked = write(&data, e8.clone(), resources);
-        assert!(
-            chosen == asked,
-            "the search packed to {} and E8 to {}",
-            chosen.len(),
-            asked.len()
-        );
-        let archive = ArchiveReader::read(&chosen).unwrap();
+    let by_runs = write(&data, FilterPolicy::Auto, &blocks);
+    let at_once = write(&data, FilterPolicy::Auto, &whole);
+    assert!(
+        by_runs.len().abs_diff(at_once.len()) * 1000 < at_once.len(),
+        "runs packed to {} and the whole member to {}",
+        by_runs.len(),
+        at_once.len()
+    );
+    for filtered in [by_runs, at_once] {
+        let archive = ArchiveReader::read(&filtered).unwrap();
         archive.test(None).unwrap();
         assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
         assert!(
-            chosen.len() * 4 < plain.len() * 3,
+            filtered.len() * 4 < plain.len() * 3,
             "filters took {} down only to {}",
             plain.len(),
-            chosen.len()
+            filtered.len()
         );
     }
 }
