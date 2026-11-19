@@ -700,6 +700,15 @@ impl WriterResources {
     pub(crate) fn try_acquire(&self, required: u64) -> Option<MemoryPermit> {
         self.budget.try_acquire(required)
     }
+
+    /// [`Self::acquire_serialising_cancellable`] without the wait: `None` when
+    /// the budget has no room for it yet.
+    pub(crate) fn try_acquire_serialising(&self, required: u64) -> Result<Option<MemoryPermit>> {
+        if self.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        Ok(self.budget.try_acquire(required.min(self.memory_limit)))
+    }
 }
 
 /// Live storage and reservations share one ledger across resource clones.
@@ -876,18 +885,6 @@ impl MemoryBudget {
         }
     }
 
-    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<MemoryPermit> {
-        let mut used = self.used.lock().expect("memory budget lock poisoned");
-        if self.limit.saturating_sub(*used) < bytes {
-            return None;
-        }
-        *used += bytes;
-        Some(MemoryPermit {
-            budget: Arc::clone(self),
-            bytes,
-        })
-    }
-
     fn acquire_cancellable(
         self: &Arc<Self>,
         bytes: u64,
@@ -899,14 +896,11 @@ impl MemoryBudget {
             if cancelled() {
                 return Err(Error::Cancelled);
             }
-            let mut used = self.used.lock().expect("memory budget lock poisoned");
-            if self.limit.saturating_sub(*used) >= bytes {
-                *used += bytes;
-                return Ok(MemoryPermit {
-                    budget: Arc::clone(self),
-                    bytes,
-                });
-            }
+            let used = self.used.lock().expect("memory budget lock poisoned");
+            let used = match self.admit(used, bytes) {
+                Ok(permit) => return Ok(permit),
+                Err(used) => used,
+            };
             // Tokens and progress callbacks need not notify this condition
             // variable, so wake periodically even while all permits are held.
             drop(
@@ -921,6 +915,52 @@ impl MemoryBudget {
 pub(crate) struct MemoryPermit {
     budget: Arc<MemoryBudget>,
     bytes: u64,
+}
+
+impl MemoryBudget {
+    /// Takes `bytes` if they fit, handing the lock back if they don't.
+    fn admit<'g>(
+        self: &Arc<Self>,
+        mut used: std::sync::MutexGuard<'g, u64>,
+        bytes: u64,
+    ) -> std::result::Result<MemoryPermit, std::sync::MutexGuard<'g, u64>> {
+        if self.limit.saturating_sub(*used) < bytes {
+            return Err(used);
+        }
+        *used += bytes;
+        Ok(MemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<MemoryPermit> {
+        let used = self.used.lock().expect("memory budget lock poisoned");
+        self.admit(used, bytes).ok()
+    }
+}
+
+impl MemoryPermit {
+    /// Hands back all but `bytes` of the charge, once the work that needed the
+    /// rest is done. A permit never grows.
+    pub(crate) fn shrink_to(&mut self, bytes: u64) {
+        if bytes >= self.bytes {
+            return;
+        }
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .expect("memory budget lock poisoned");
+        *used = used.saturating_sub(self.bytes - bytes);
+        self.bytes = bytes;
+        self.budget.changed.notify_all();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
 }
 
 /// Where a spool keeps its bytes.

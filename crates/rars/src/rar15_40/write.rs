@@ -14,7 +14,7 @@ use crate::codec::rar29::{
 use crate::crc32::Crc32;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
 pub use crate::streaming::EntrySource;
-use crate::streaming::WriterResources;
+use crate::streaming::{MemoryPermit, WriterResources};
 use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
@@ -525,6 +525,7 @@ impl Sink<'_, '_> {
         data_keys: &mut DataKeys,
         solid: Option<SolidLink<'_>>,
         resources: &WriterResources,
+        admitted: Option<MemoryPermit>,
         progress: &WorkTracker<'_>,
     ) -> Result<u8> {
         progress.check()?;
@@ -542,8 +543,9 @@ impl Sink<'_, '_> {
                     header_at: 0,
                     header_len: 0,
                 };
-                stream_member(
-                    &mut out, member, options, coding, data_keys, solid, resources, progress,
+                stream_member_admitted(
+                    &mut out, member, options, coding, data_keys, solid, resources, admitted,
+                    progress,
                 )
             }
             Self::Stream(output, _) => {
@@ -557,8 +559,9 @@ impl Sink<'_, '_> {
                     spool: None,
                     resources,
                 };
-                stream_member(
-                    &mut out, member, options, coding, data_keys, solid, resources, progress,
+                stream_member_admitted(
+                    &mut out, member, options, coding, data_keys, solid, resources, admitted,
+                    progress,
                 )
             }
         }
@@ -773,6 +776,7 @@ fn write_members_to(
     progress: &WorkTracker<'_>,
     sink: &mut Sink<'_, '_>,
 ) -> Result<()> {
+    let coding = level_coding(options, coding);
     let stream_above = sink.stream_above();
     let mut data_keys = DataKeys::default();
     let output = sink.writer();
@@ -837,6 +841,7 @@ fn write_members_to(
                             continues: solid_run_has_member,
                         }),
                         resources,
+                        None,
                         progress,
                     )
                     .map_err(|error| {
@@ -890,27 +895,46 @@ fn write_members_to(
             .filter_map(|member| member.bytes.source())
             .map(EntrySource::max_preparation_window)
             .fold(crate::parallel::default_window(), usize::min);
+        // Each member is charged as it is let into a window, in order, and
+        // keeps the charge until it is written: a coded member holds its
+        // packed form until then, and a streamed one holds its coder while it
+        // is written. Only the member opening a window waits for room, so a
+        // window never waits on what its own members hold.
         crate::parallel::map_slice_windowed(
             members,
             window,
-            |member| {
-                let streamed = match stream_above {
-                    Some(above) => streams_member(member, options, coding, above),
-                    None => Ok(false),
-                };
-                match streamed {
-                    Ok(true) => Ok(None),
-                    Ok(false) => {
-                        encode_member(member, options, coding, &mut None, resources, progress)
-                            .map(Some)
-                    }
-                    Err(error) => Err(error),
+            |member, opens| {
+                admit_to_window(
+                    member,
+                    options,
+                    coding,
+                    stream_above,
+                    resources,
+                    progress,
+                    opens,
+                )
+                .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))
+            },
+            |member, admitted| {
+                match admitted.unpacked_size {
+                    Some(unpacked_size) => encode_measured(
+                        member,
+                        options,
+                        coding,
+                        &mut None,
+                        unpacked_size,
+                        admitted.permit,
+                        resources,
+                        progress,
+                    )
+                    .map(Prepared::Coded),
+                    None => Ok(Prepared::Streams(admitted.permit)),
                 }
                 .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))
             },
-            |member, encoded| {
-                match encoded {
-                    Some(encoded) => write_member(
+            |member, prepared| {
+                match prepared {
+                    Prepared::Coded(encoded) => write_member(
                         sink.writer(),
                         member,
                         encoded,
@@ -920,7 +944,7 @@ fn write_members_to(
                         &mut data_keys,
                         progress.reporter(),
                     ),
-                    None => sink
+                    Prepared::Streams(permit) => sink
                         .stream_member(
                             member,
                             options,
@@ -929,6 +953,7 @@ fn write_members_to(
                             &mut data_keys,
                             None,
                             resources,
+                            permit,
                             progress,
                         )
                         .map(|_| ()),
@@ -948,6 +973,70 @@ fn write_members_to(
         output.write_all(&end_block(ENDARC_FLAGS))?;
     }
     Ok(())
+}
+
+/// Level 0 stores every member, so it is written as a stored member is: from
+/// the caller's bytes or its source, never from a copy of them.
+fn level_coding(options: WriterOptions, coding: &MemberCoding) -> &MemberCoding {
+    match coding {
+        MemberCoding::Compressed if options.compression_level == Some(0) => &MemberCoding::Stored,
+        coding => coding,
+    }
+}
+
+/// A member let into a window: its size if it is coded whole, `None` if it
+/// streams, and the charge it holds until it is written.
+struct Admitted {
+    unpacked_size: Option<u64>,
+    permit: Option<MemoryPermit>,
+}
+
+/// A member of a window, ready to write.
+enum Prepared<'a> {
+    Coded(EncodedMember<'a>),
+    Streams(Option<MemoryPermit>),
+}
+
+/// Charges the budget for a member about to join a window. The member that
+/// opens one waits for room; any other gets `None` when there is none, which
+/// closes the window, since the room it needs may be held by the members ahead
+/// of it, and they are only written once the window is coded.
+fn admit_to_window(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    stream_above: Option<u64>,
+    resources: &WriterResources,
+    progress: &WorkTracker<'_>,
+    opens: bool,
+) -> Result<Option<Admitted>> {
+    let streams = match stream_above {
+        Some(above) => streams_member(member, options, coding, above)?,
+        None => false,
+    };
+    let (unpacked_size, charge) = if streams {
+        (None, Some(streamed_workspace(options, coding)))
+    } else {
+        let unpacked_size = measure_member(member, options, progress)?;
+        (
+            Some(unpacked_size),
+            member_charge(member, options, coding, unpacked_size),
+        )
+    };
+    let permit = match charge {
+        None => None,
+        Some(charge) if opens => {
+            Some(resources.acquire_serialising_cancellable(charge, &|| progress.is_cancelled())?)
+        }
+        Some(charge) => match resources.try_acquire_serialising(charge)? {
+            Some(permit) => Some(permit),
+            None => return Ok(None),
+        },
+    };
+    Ok(Some(Admitted {
+        unpacked_size,
+        permit,
+    }))
 }
 
 /// Encodes one member, choosing an engine and a filter independently.
@@ -1754,7 +1843,14 @@ struct EncodedMember<'a> {
     method: u8,
     unpacked_size: u64,
     file_crc: u32,
+    /// The budget's charge for what waits to be written, released when the
+    /// member has been. A directory holds nothing and has none.
+    held: Option<MemoryPermit>,
 }
+
+/// What writing one member holds beyond its payload: the buffer a stored
+/// member is copied and encrypted through.
+const WRITE_WORKSPACE: u64 = 1024 * 1024;
 
 /// Working memory one member needs while it is coded.
 ///
@@ -1762,17 +1858,11 @@ struct EncodedMember<'a> {
 /// a prediction: the encoder holds the member, its packed output, and a match
 /// finder sized by the block it works in. Text at the levels that try PPMd
 /// also holds two PPMd models at once, one per trial, and the escape search.
-fn member_workspace(
-    options: WriterOptions,
-    unpacked: u64,
-    compressing: bool,
-    encrypting: bool,
-) -> u64 {
+fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) -> u64 {
     if !compressing {
-        // An encrypted stored member held in memory is copied and encrypted in
-        // place. One with a source is encrypted as it is copied.
-        let held = if encrypting { unpacked } else { 0 };
-        return held.saturating_add(1024 * 1024);
+        // A stored member is never loaded: it is written from the caller's
+        // bytes or copied from its source, encrypted as it goes.
+        return WRITE_WORKSPACE;
     }
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
@@ -1848,29 +1938,71 @@ fn encode_member<'a>(
     resources: &WriterResources,
     progress: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
+    let unpacked_size = measure_member(member, options, progress)?;
+    let permit = member_charge(member, options, coding, unpacked_size)
+        .map(|charge| {
+            resources.acquire_serialising_cancellable(charge, &|| progress.is_cancelled())
+        })
+        .transpose()?;
+    encode_measured(
+        member,
+        options,
+        coding,
+        solid_encoder,
+        unpacked_size,
+        permit,
+        resources,
+        progress,
+    )
+}
+
+/// A member's size, taken once so its header and its charge agree.
+fn measure_member(
+    member: &Member<'_>,
+    options: WriterOptions,
+    progress: &WorkTracker<'_>,
+) -> Result<u64> {
     progress.check()?;
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, options.target, unpacked_size)?;
+    if member.is_directory && unpacked_size != 0 {
+        return Err(Error::InvalidArgument("directory source must be empty"));
+    }
+    Ok(unpacked_size)
+}
+
+/// What coding a member and then writing it holds; a directory holds nothing.
+fn member_charge(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    unpacked_size: u64,
+) -> Option<u64> {
+    (!member.is_directory).then(|| member_workspace(options, unpacked_size, coding.compresses()))
+}
+
+/// [`encode_member`] once the member is measured and charged for. The charge
+/// goes with the coded member and is cut to what it holds once coding is done.
+#[allow(clippy::too_many_arguments)]
+fn encode_measured<'a>(
+    member: &Member<'a>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    solid_encoder: &mut Option<SolidEncoder>,
+    unpacked_size: u64,
+    mut held: Option<MemoryPermit>,
+    resources: &WriterResources,
+    progress: &WorkTracker<'_>,
+) -> Result<EncodedMember<'a>> {
     if member.is_directory {
-        if unpacked_size != 0 {
-            return Err(Error::InvalidArgument("directory source must be empty"));
-        }
         return Ok(EncodedMember {
             payload: MemberPayload::Packed(Vec::new()),
             method: 0x30,
             unpacked_size: 0,
             file_crc: 0,
+            held,
         });
     }
-    let _permit = resources.acquire_serialising_cancellable(
-        member_workspace(
-            options,
-            unpacked_size,
-            coding.compresses(),
-            member.password.is_some() && member.bytes.source().is_none(),
-        ),
-        &|| progress.is_cancelled(),
-    )?;
 
     // Legacy link targets must not become dependencies of later solid data:
     // reference readers handle links separately from the solid unpacker.
@@ -1902,6 +2034,7 @@ fn encode_member<'a>(
                 )?;
                 crc.finish()
             },
+            held,
         });
     }
 
@@ -1919,10 +2052,17 @@ fn encode_member<'a>(
     let file_crc = crc.finish();
     progress.check()?;
     let payload = match coding {
-        MemberCoding::Stored => EncodedPayload {
-            data: data.into_owned(),
-            method: 0x30,
-        },
+        // The caller's bytes are written as they stand, encrypted as they go
+        // out. A copy would hold the member a second time.
+        MemberCoding::Stored => {
+            return Ok(EncodedMember {
+                payload: member.bytes.stored(),
+                method: 0x30,
+                unpacked_size,
+                file_crc,
+                held,
+            })
+        }
         MemberCoding::Compressed => encode_or_store_payload(
             &data,
             options,
@@ -1939,11 +2079,22 @@ fn encode_member<'a>(
             Some(resources),
         )?,
     };
+    drop(data);
+    let mut packed = payload.data;
+    if let Some(permit) = &mut held {
+        // Encryption pads the packed form in place, so make room for that now,
+        // while the coder's charge still covers moving it.
+        if member.password.is_some() {
+            packed.reserve_exact(15);
+        }
+        permit.shrink_to((packed.capacity() as u64).saturating_add(WRITE_WORKSPACE));
+    }
     Ok(EncodedMember {
-        payload: MemberPayload::Packed(payload.data),
+        payload: MemberPayload::Packed(packed),
         method: payload.method,
         unpacked_size,
         file_crc,
+        held,
     })
 }
 
@@ -2378,18 +2529,40 @@ fn stream_member(
     options: WriterOptions,
     coding: &MemberCoding,
     data_keys: &mut DataKeys,
+    solid: Option<SolidLink<'_>>,
+    resources: &WriterResources,
+    progress: &WorkTracker<'_>,
+) -> Result<u8> {
+    stream_member_admitted(
+        out, member, options, coding, data_keys, solid, resources, None, progress,
+    )
+}
+
+/// [`stream_member`], charged with `admitted` when the member was let into the
+/// budget earlier and for [`streamed_workspace`] here otherwise.
+#[allow(clippy::too_many_arguments)]
+fn stream_member_admitted(
+    out: &mut dyn StreamedOut,
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    data_keys: &mut DataKeys,
     mut solid: Option<SolidLink<'_>>,
     resources: &WriterResources,
+    admitted: Option<MemoryPermit>,
     progress: &WorkTracker<'_>,
 ) -> Result<u8> {
     progress.check()?;
     let unpacked_size = member.unpacked_size()?;
     let len = usize::try_from(unpacked_size)
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
-    let _permit = resources
-        .acquire_serialising_cancellable(streamed_workspace(options, coding), &|| {
-            progress.is_cancelled()
-        })?;
+    let _permit = match admitted {
+        Some(permit) => permit,
+        None => resources
+            .acquire_serialising_cancellable(streamed_workspace(options, coding), &|| {
+                progress.is_cancelled()
+            })?,
+    };
     // RAR 1.5 and 2.0 have one engine; RAR 2.9 chooses before coding anything.
     let rar29 = match options.target {
         ArchiveVersion::Rar15 | ArchiveVersion::Rar20 => None,
@@ -2733,6 +2906,8 @@ fn write_member(
     data_keys: &mut DataKeys,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
+    // The member's charge goes once it is written.
+    let _held = encoded.held;
     let target = options.target;
     crate::write_progress::check_cancelled(progress)?;
     let (payload, salt) = match encoded.payload {
@@ -2748,13 +2923,12 @@ fn write_member(
         }
         copied => (copied, None),
     };
-    let cipher =
-        match payload {
-            MemberPayload::Copied(_) if member.password.is_some() => Some(
-                volumes::CipherPlan::new(target, member.password, data_keys)?,
-            ),
-            _ => None,
-        };
+    let cipher = match payload {
+        MemberPayload::Copied(_) | MemberPayload::Borrowed(_) if member.password.is_some() => Some(
+            volumes::CipherPlan::new(target, member.password, data_keys)?,
+        ),
+        _ => None,
+    };
     let salt = salt.or(cipher.as_ref().and_then(volumes::CipherPlan::salt));
     let packed_size = match &cipher {
         // Padded to the cipher's block, as the in-memory path pads.
@@ -3356,10 +3530,7 @@ impl SolidEncoder {
                     .map_err(|error| {
                         crate::write_stream::member_error(error, member.name, "preparing")
                     })?;
-                packed += match &encoded.payload {
-                    MemberPayload::Packed(data) => data.len() as u64,
-                    MemberPayload::Copied(_) => encoded.unpacked_size,
-                };
+                packed += encoded.payload.size(encoded.unpacked_size);
             }
             if best.is_none_or(|(smallest, _)| packed < smallest) {
                 best = Some((packed, index));
@@ -4682,7 +4853,7 @@ mod tests {
         let mut options =
             super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
         options.compression_level = Some(1);
-        let charge = super::member_workspace(options, data.len() as u64, true, false);
+        let charge = super::member_workspace(options, data.len() as u64, true);
         let lazy = super::rar29_encode_options_for_options(options)
             .unwrap()
             .with_optimal_parse_passes(0);
@@ -4714,7 +4885,10 @@ mod tests {
                     )
                 })
                 .unwrap();
-            assert_eq!(resources.workspace_in_use(), 0, "every room handed back");
+            // Every finalist's room is handed back; the member keeps a charge
+            // for its packed form until it is written.
+            let held = encoded.held.as_ref().map_or(0, |permit| permit.bytes());
+            assert_eq!(resources.workspace_in_use(), held, "every room handed back");
             let super::MemberPayload::Packed(packed) = encoded.payload else {
                 unreachable!("a member held in memory is packed in memory")
             };
@@ -5734,8 +5908,8 @@ mod tests {
     fn rar15_charges_an_index_whatever_the_member_size() {
         for level in [1, 3, 5] {
             let options = rar15(level, false);
-            let small = super::member_workspace(options, 1 << 20, true, false);
-            let large = super::member_workspace(options, 1 << 30, true, false);
+            let small = super::member_workspace(options, 1 << 20, true);
+            let large = super::member_workspace(options, 1 << 30, true);
             // Beyond the bytes it holds, a large member costs what a small one does.
             assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
             let streamed = super::streamed_workspace(options, &crate::MemberCoding::Compressed);
@@ -5747,8 +5921,8 @@ mod tests {
     fn rar20_charges_a_block_whatever_the_member_size() {
         for level in [3, 5] {
             let options = rar20(level, false);
-            let small = super::member_workspace(options, 1 << 20, true, false);
-            let large = super::member_workspace(options, 1 << 30, true, false);
+            let small = super::member_workspace(options, 1 << 20, true);
+            let large = super::member_workspace(options, 1 << 30, true);
             // Beyond the bytes it holds, a large member costs what a small one does.
             assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
             let streamed = super::streamed_workspace(options, &crate::MemberCoding::Compressed);
@@ -6293,7 +6467,7 @@ mod tests {
         for options in [independent, solid] {
             let charge = super::streamed_workspace(options, &coding);
             assert!(charge < 256 * MIB, "{} MiB", charge / MIB);
-            assert!(charge < super::member_workspace(options, 1 << 30, true, true));
+            assert!(charge < super::member_workspace(options, 1 << 30, true));
         }
     }
 
@@ -6478,15 +6652,371 @@ mod tests {
         assert!(!large(&header_for(ArchiveVersion::Rar15, max - 1, max - 1)));
     }
 
+    /// A member handed over as bytes, for the charge tests below.
+    fn handed_over<'a>(data: &'a [u8], password: Option<&'a [u8]>) -> super::FileEntry<'a> {
+        super::FileEntry {
+            name: b"member.bin",
+            data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password,
+            file_comment: None,
+        }
+    }
+
+    /// The passwords a test can write with in this build.
+    fn passwords() -> Vec<Option<&'static [u8]>> {
+        let mut passwords: Vec<Option<&'static [u8]>> = vec![None];
+        if cfg!(feature = "encryption") {
+            passwords.push(Some(b"password"));
+        }
+        passwords
+    }
+
     #[test]
-    fn an_encrypted_stored_member_is_charged_for_the_member_it_holds() {
-        let options = super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
-        let size = 5u64 << 30;
-        assert!(super::member_workspace(options, size, false, true) > size);
-        assert_eq!(
-            super::member_workspace(options, size, false, false),
-            1024 * 1024
-        );
+    fn a_stored_member_is_written_from_the_bytes_it_was_handed() {
+        let data = binary_member(300_000);
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            for password in passwords() {
+                let case = format!("{target:?}, password {}", password.is_some());
+                let options = super::WriterOptions::new(target, FeatureSet::store_only());
+                let entry = handed_over(&data, password);
+                let member = super::Member::from_file(&entry);
+                let resources = crate::WriterResources::default();
+                let work =
+                    super::WorkTracker::new(None, crate::WriteOperation::Compression, u64::MAX);
+                let encoded = super::encode_member(
+                    &member,
+                    options,
+                    &crate::MemberCoding::Stored,
+                    &mut None,
+                    &resources,
+                    &work,
+                )
+                .unwrap();
+                // The payload is the caller's bytes, not a copy of them, so
+                // the charge is the buffer it is written through.
+                let super::MemberPayload::Borrowed(bytes) = encoded.payload else {
+                    panic!("{case}: a stored member was copied");
+                };
+                assert_eq!(bytes.as_ptr(), data.as_ptr(), "{case}");
+                assert_eq!(
+                    resources.workspace_in_use(),
+                    super::WRITE_WORKSPACE,
+                    "{case}"
+                );
+                drop(encoded);
+                assert_eq!(resources.workspace_in_use(), 0, "{case}");
+
+                let archive = super::collect_archive(
+                    &[member],
+                    options,
+                    crate::MemberCoding::Stored,
+                    None,
+                    None,
+                )
+                .unwrap();
+                assert_eq!(
+                    extracted_set(std::slice::from_ref(&archive), password),
+                    [(b"member.bin".to_vec(), data.clone())],
+                    "{case}"
+                );
+                // RAR 1.5 and 2.0 draw no salt, so the bytes must match the
+                // ones a source copied through the same cipher gives.
+                if target != ArchiveVersion::Rar40 {
+                    let mut streaming = super::StreamingEntry::new(
+                        b"member.bin".to_vec(),
+                        super::EntrySource::from_bytes(data.clone()),
+                    )
+                    .with_file_attr(0x20)
+                    .with_host_os(3);
+                    if let Some(password) = password {
+                        streaming = streaming.with_password(password.to_vec());
+                    }
+                    let from_source = super::collect_archive(
+                        &[super::Member::from_streaming(&streaming)],
+                        options,
+                        crate::MemberCoding::Stored,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    assert_eq!(archive, from_source, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn level_zero_writes_a_member_from_the_bytes_it_was_handed() {
+        let data = binary_member(300_000);
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            let mut options = super::WriterOptions::new(target, FeatureSet::default());
+            options.compression_level = Some(0);
+            let entry = handed_over(&data, None);
+            let member = super::Member::from_file(&entry);
+            let coding = super::level_coding(options, &crate::MemberCoding::Compressed);
+            assert!(matches!(coding, crate::MemberCoding::Stored), "{target:?}");
+            let resources = crate::WriterResources::default();
+            let work = super::WorkTracker::new(None, crate::WriteOperation::Compression, u64::MAX);
+            let encoded =
+                super::encode_member(&member, options, coding, &mut None, &resources, &work)
+                    .unwrap();
+            let super::MemberPayload::Borrowed(bytes) = encoded.payload else {
+                panic!("{target:?}: a level 0 member was copied");
+            };
+            assert_eq!(bytes.as_ptr(), data.as_ptr(), "{target:?}");
+            assert_eq!(resources.workspace_in_use(), super::WRITE_WORKSPACE);
+            drop(encoded);
+
+            // Writing it so is writing it stored, as level 0 always did.
+            let write = |coding| {
+                super::collect_archive(
+                    &[super::Member::from_file(&entry)],
+                    options,
+                    coding,
+                    None,
+                    None,
+                )
+                .unwrap()
+            };
+            let archive = write(crate::MemberCoding::Compressed);
+            assert_eq!(archive, write(crate::MemberCoding::Stored), "{target:?}");
+            assert_eq!(
+                extracted_set(&[archive], None),
+                [(b"member.bin".to_vec(), data.clone())]
+            );
+        }
+    }
+
+    #[test]
+    fn a_coded_member_is_charged_for_its_packed_form_until_it_is_written() {
+        let data = binary_member(300_000);
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            for password in passwords() {
+                let case = format!("{target:?}, password {}", password.is_some());
+                let options = super::WriterOptions::new(target, FeatureSet::default());
+                let entry = handed_over(&data, password);
+                let member = super::Member::from_file(&entry);
+                let resources = crate::WriterResources::default();
+                let work =
+                    super::WorkTracker::new(None, crate::WriteOperation::Compression, u64::MAX);
+                let encoded = super::encode_member(
+                    &member,
+                    options,
+                    &crate::MemberCoding::Compressed,
+                    &mut None,
+                    &resources,
+                    &work,
+                )
+                .unwrap();
+                let super::MemberPayload::Packed(packed) = &encoded.payload else {
+                    panic!("{case}: a coded member is in memory");
+                };
+                assert!(packed.len() < data.len(), "{case}");
+                if password.is_some() {
+                    // Room for the cipher's padding, so encrypting it in
+                    // place moves nothing.
+                    assert!(packed.capacity() >= packed.len() + 15, "{case}");
+                }
+                // The coder's charge is cut to the packed form once it is done,
+                // and that much stays charged until the member is written.
+                let held = encoded.held.as_ref().unwrap().bytes();
+                assert!(held >= packed.capacity() as u64, "{case}");
+                assert!(
+                    held < super::member_workspace(options, data.len() as u64, true),
+                    "{case}"
+                );
+                assert_eq!(resources.workspace_in_use(), held, "{case}");
+                let mut out = Vec::new();
+                super::write_member(
+                    &mut out,
+                    &member,
+                    encoded,
+                    options,
+                    false,
+                    None,
+                    &mut super::DataKeys::default(),
+                    None,
+                )
+                .unwrap();
+                assert_eq!(resources.workspace_in_use(), 0, "{case}");
+            }
+        }
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_tight_budget_on_many_threads_writes_what_one_thread_writes() {
+        /// Fails the test when a payload write isn't covered by the budget, which
+        /// is what a member's charge holding until it is written promises.
+        struct ChargedWrites<'a> {
+            out: std::io::Cursor<Vec<u8>>,
+            resources: &'a crate::WriterResources,
+            payload_writes: usize,
+        }
+
+        impl std::io::Write for ChargedWrites<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                // Headers are written outside any charge; payloads aren't.
+                if bytes.len() > 512 {
+                    self.payload_writes += 1;
+                    let charged = self.resources.workspace_in_use();
+                    assert!(
+                        charged >= bytes.len() as u64,
+                        "{} bytes written with {charged} charged",
+                        bytes.len()
+                    );
+                }
+                self.out.write(bytes)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl std::io::Seek for ChargedWrites<'_> {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.out.seek(from)
+            }
+        }
+
+        const STREAM_ABOVE: u64 = 96 * 1024;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            // Coded members, ones coding doesn't shrink, streamed ones, an
+            // empty one and a directory, so every kind of member waits in a
+            // window for the ones before it.
+            let datas: Vec<Vec<u8>> = (0..30usize)
+                .map(|index| match index % 5 {
+                    _ if index == 7 || index == 12 => Vec::new(),
+                    0 | 2 => binary_member(24_000 + index * 1_500),
+                    1 => noise(8_000 + index * 700),
+                    3 => binary_member(STREAM_ABOVE as usize + 4_000 + index * 900),
+                    _ => b"several threads, a small budget\n".repeat(400 + index * 20),
+                })
+                .collect();
+            let names: Vec<Vec<u8>> = (0..datas.len())
+                .map(|index| format!("member-{index:02}").into_bytes())
+                .collect();
+            let entries: Vec<_> = datas
+                .iter()
+                .zip(&names)
+                .map(|(data, name)| super::FileEntry {
+                    name,
+                    ..handed_over(data, None)
+                })
+                .collect();
+            let members = || -> Vec<_> {
+                entries
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        let mut member = super::Member::from_file(entry);
+                        if index == 12 {
+                            member.is_directory = true;
+                            member.file_attr = 0x10;
+                        }
+                        member
+                    })
+                    .collect()
+            };
+            let mut written = Vec::new();
+            for target in [ArchiveVersion::Rar20, ArchiveVersion::Rar40] {
+                let mut options = super::WriterOptions::new(target, FeatureSet::default());
+                let largest = datas.iter().map(Vec::len).max().unwrap() as u64;
+                options.dictionary_size = Some(super::fitted_dictionary_size(target, largest));
+                let coding = crate::MemberCoding::Compressed;
+                let write = |resources: &crate::WriterResources| {
+                    let mut out = ChargedWrites {
+                        out: std::io::Cursor::new(Vec::new()),
+                        resources,
+                        payload_writes: 0,
+                    };
+                    super::write_archive_to(
+                        &members(),
+                        options,
+                        coding.clone(),
+                        None,
+                        resources,
+                        None,
+                        super::ArchiveOutput::Seekable {
+                            output: &mut out,
+                            stream_above: STREAM_ABOVE,
+                        },
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                    assert!(out.payload_writes > datas.len() / 2, "{target:?}");
+                    out.out.into_inner()
+                };
+                let one = {
+                    let _one = crate::parallel::ThreadCap::set(Some(1));
+                    write(&crate::WriterResources::default())
+                };
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(4)
+                    .build()
+                    .unwrap();
+                let many = pool.install(|| {
+                    // Room for two or three of the largest charges at once, so
+                    // windows close early and members wait in them.
+                    let largest_charge = members()
+                        .iter()
+                        .map(|member| {
+                            let len = member.unpacked_size().unwrap();
+                            super::member_charge(member, options, &coding, len)
+                                .unwrap_or(0)
+                                .max(super::streamed_workspace(options, &coding))
+                        })
+                        .max()
+                        .unwrap();
+                    let resources = crate::WriterResources::new(largest_charge * 5 / 2);
+                    let archive = write(&resources);
+                    assert_eq!(resources.workspace_in_use(), 0, "{target:?}");
+                    archive
+                });
+                assert!(one == many, "{target:?}: threads changed the archive");
+                let directory = b"member-12".as_slice();
+                assert_eq!(
+                    extracted_set(&[many], None)
+                        .into_iter()
+                        .filter(|(name, _)| name != directory)
+                        .collect::<Vec<_>>(),
+                    names
+                        .iter()
+                        .zip(&datas)
+                        .enumerate()
+                        .filter(|(index, _)| *index != 12)
+                        .map(|(_, (name, data))| (name.clone(), data.clone()))
+                        .collect::<Vec<_>>(),
+                    "{target:?}"
+                );
+                written.push(target);
+            }
+            sender.send(written).unwrap();
+        });
+        let written = receiver
+            .recv_timeout(std::time::Duration::from_secs(600))
+            .expect("a window waited on what its own members hold");
+        assert_eq!(written, [ArchiveVersion::Rar20, ArchiveVersion::Rar40]);
     }
 
     #[test]
@@ -6495,7 +7025,7 @@ mod tests {
         let charge = |target, level| {
             let mut options = super::WriterOptions::new(target, FeatureSet::default());
             options.compression_level = Some(level);
-            super::member_workspace(options, size, true, false)
+            super::member_workspace(options, size, true)
         };
         // RAR 2.0 holds the member and its packed form, and parses a block at a time.
         for level in [3, 4, 5] {
@@ -7385,7 +7915,7 @@ mod tests {
             options.compression_level = Some(level);
             options
         };
-        let charge = |level| super::member_workspace(at(level), 8 * MIB, true, false);
+        let charge = |level| super::member_workspace(at(level), 8 * MIB, true);
         // Two models of the largest size a level tries, and a parse workspace
         // per block that runs at once.
         let parse = crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE;
@@ -7394,14 +7924,13 @@ mod tests {
         assert!(charge(5) >= charge(4) + 2 * (128 - 64) * MIB);
         // A member of one block parses one block at a time.
         assert_eq!(
-            super::member_workspace(at(5), 1000, true, false)
-                - super::member_workspace(at(3), 1000, true, false),
+            super::member_workspace(at(5), 1000, true) - super::member_workspace(at(3), 1000, true),
             2 * (128 - 25) * MIB + parse
         );
         // Streamed, the parse is charged by the block, not by the member.
         let coding = crate::MemberCoding::Compressed;
         let streamed = |options| super::streamed_workspace(options, &coding);
-        assert!(streamed(at(5)) < super::member_workspace(at(5), 1 << 30, true, false));
+        assert!(streamed(at(5)) < super::member_workspace(at(5), 1 << 30, true));
         // A streamed trial holds two of the level's largest models, and a
         // chain keeps one between members.
         assert!(streamed(at(5)) >= streamed(at(3)) + 2 * (128 - 25) * MIB);
@@ -7417,12 +7946,8 @@ mod tests {
             options.method = super::Rar29Method::Ppmd;
             options
         };
-        assert!(
-            super::member_workspace(forced(1), 8 * MIB, true, false) >= charge(1) + 2 * 25 * MIB
-        );
-        assert!(
-            super::member_workspace(forced(5), 8 * MIB, true, false) >= charge(1) + 2 * 128 * MIB
-        );
+        assert!(super::member_workspace(forced(1), 8 * MIB, true) >= charge(1) + 2 * 25 * MIB);
+        assert!(super::member_workspace(forced(5), 8 * MIB, true) >= charge(1) + 2 * 128 * MIB);
         assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
     }
 

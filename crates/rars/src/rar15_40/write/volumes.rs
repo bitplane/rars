@@ -335,6 +335,7 @@ pub(super) fn split_members_above(
                 method,
                 unpacked_size,
                 file_crc,
+                ..
             }) => (Some(packed), unpacked_size, method, Some(file_crc)),
             Some(_) => {
                 return Err(Error::WriterFailure(
