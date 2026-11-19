@@ -25,6 +25,34 @@ const MAX_PPMD_REPEAT_LENGTH: usize = 259;
 const PPMD_ORDER: usize = 8;
 const PPMD_DICTIONARY_MB: u8 = 25;
 pub(crate) const PPMD_MODEL_BYTES: u64 = PPMD_DICTIONARY_MB as u64 * 1024 * 1024;
+
+/// The order and memory a PPMd block declares when it starts a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PpmdModelSize {
+    pub(crate) order: usize,
+    pub(crate) memory_mb: u8,
+}
+
+impl PpmdModelSize {
+    pub(crate) const DEFAULT: Self = Self {
+        order: PPMD_ORDER,
+        memory_mb: PPMD_DICTIONARY_MB,
+    };
+
+    pub(crate) const fn bytes(self) -> u64 {
+        self.memory_mb as u64 * 1024 * 1024
+    }
+
+    /// The header's five order bits. Past 16 they count in threes, so only
+    /// 19, 22 and so on are expressible there.
+    const fn order_bits(self) -> u8 {
+        if self.order <= 16 {
+            self.order as u8 - 1
+        } else {
+            ((self.order - 16) / 3 + 15) as u8
+        }
+    }
+}
 const PPMD_ESC: u8 = 2;
 // Seeds and weights for the escape-token cost model in `encode_ppmd_hybrid`.
 // The seeds only steer the first few decisions; measured costs take over as
@@ -54,11 +82,17 @@ trait Candidates {
     fn first(&self, input: &[u8], pos: usize, limit: usize) -> usize;
     fn previous(&self, candidate: usize) -> usize;
     fn insert(&mut self, input: &[u8], pos: usize);
+    /// The newest candidate before `pos`, once `pos` itself has been inserted.
+    fn before(&self, pos: usize) -> usize;
 }
 
 impl<const MIN_MATCH: usize> Candidates for match_finder::MatchFinder<MIN_MATCH> {
     fn first(&self, input: &[u8], pos: usize, _limit: usize) -> usize {
         match_finder::MatchFinder::first(self, input, pos)
+    }
+
+    fn before(&self, pos: usize) -> usize {
+        self.first_before(pos, pos)
     }
 
     fn previous(&self, candidate: usize) -> usize {
@@ -82,6 +116,10 @@ impl<const MIN_MATCH: usize> Candidates for FilledAhead<'_, MIN_MATCH> {
     }
 
     fn insert(&mut self, _input: &[u8], _pos: usize) {}
+
+    fn before(&self, pos: usize) -> usize {
+        self.0.first_before(pos, pos)
+    }
 }
 
 // RAR 3.x standard filters are stored as RARVM bytecode in the compressed
@@ -193,6 +231,27 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
         declared.as_mut(),
         max_match_distance,
         None,
+        PpmdModelSize::DEFAULT,
+        Some(progress),
+    )
+    .map(|(packed, _)| packed)
+}
+
+/// One unfiltered member as PPMd, with a model of the given size.
+pub(crate) fn unpack29_encode_ppmd_sized_with_progress(
+    input: &[u8],
+    lz_escapes: bool,
+    max_match_distance: usize,
+    size: PpmdModelSize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    encode_ppmd_block_with_model(
+        input,
+        lz_escapes,
+        None,
+        max_match_distance,
+        None,
+        size,
         Some(progress),
     )
     .map(|(packed, _)| packed)
@@ -491,8 +550,16 @@ fn encode_ppmd_block(
     filters: Option<&mut PpmdFilters>,
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
-    encode_ppmd_block_with_model(input, lz_escapes, filters, max_match_distance, None, None)
-        .map(|(packed, _)| packed)
+    encode_ppmd_block_with_model(
+        input,
+        lz_escapes,
+        filters,
+        max_match_distance,
+        None,
+        PpmdModelSize::DEFAULT,
+        None,
+    )
+    .map(|(packed, _)| packed)
 }
 
 /// Codes one PPMd block, either starting a model or carrying one on.
@@ -511,21 +578,24 @@ fn encode_ppmd_block_with_model(
     mut filters: Option<&mut PpmdFilters>,
     max_match_distance: usize,
     model: Option<PpmdModel>,
+    size: PpmdModelSize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<(Vec<u8>, PpmdModel)> {
     if progress.as_mut().is_some_and(|report| !report(0)) {
         return Err(Error::Cancelled);
     }
     let mut out = Vec::new();
+    // A continued model keeps the order it started with, and the reader
+    // ignores the bits here unless the model is reset.
     let mut encoder = match model {
         Some(model) => {
-            out.push(0x80 | ((PPMD_ORDER as u8) - 1));
+            out.push(0x80 | size.order_bits());
             PpmdEncoder::continuing(model, PPMD_ESC)
         }
         None => {
-            out.push(0x80 | 0x20 | ((PPMD_ORDER as u8) - 1));
-            out.push(PPMD_DICTIONARY_MB - 1);
-            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?
+            out.push(0x80 | 0x20 | size.order_bits());
+            out.push(size.memory_mb - 1);
+            PpmdEncoder::new(size.order, PPMD_ESC, usize::from(size.memory_mb))?
         }
     };
     let mut declare = |encoder: &mut PpmdEncoder, pos: usize, len: usize| match filters.as_mut() {
@@ -650,6 +720,10 @@ pub struct EncodeOptions {
     pub lazy_lookahead: usize,
     pub max_match_distance: usize,
     pub block_size: Option<usize>,
+    /// How many times to re-parse each block by shortest path, each priced by
+    /// the tables the parse before it produced. The block keeps whichever
+    /// parse codes smallest, the lazy one included. Zero leaves the lazy parse.
+    pub optimal_parse_passes: usize,
 }
 
 impl EncodeOptions {
@@ -660,6 +734,7 @@ impl EncodeOptions {
             lazy_lookahead: 1,
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
             block_size: None,
+            optimal_parse_passes: 0,
         }
     }
 
@@ -684,6 +759,11 @@ impl EncodeOptions {
 
     pub const fn with_block_size(mut self, bytes: usize) -> Self {
         self.block_size = Some(bytes);
+        self
+    }
+
+    pub const fn with_optimal_parse_passes(mut self, passes: usize) -> Self {
+        self.optimal_parse_passes = passes;
         self
     }
 
@@ -923,6 +1003,7 @@ impl Unpack29Encoder {
             None,
             self.options.max_match_distance,
             self.ppmd.clone(),
+            PpmdModelSize::DEFAULT,
             Some(progress),
         )
     }
@@ -1526,17 +1607,16 @@ fn encode_member_inner(
     )
 }
 
-fn code_block(
+/// The code-length table a block of these tokens is coded with.
+fn table_lengths_for_tokens(
     tokens: &[EncodeToken],
-    initial_filters: &[Vec<u8>],
-    more_blocks_follow: bool,
-    previous_levels: &mut [u8; TABLE_COUNT],
-) -> Result<Vec<u8>> {
+    filter_records: usize,
+) -> Result<[u8; TABLE_COUNT]> {
     let mut main_frequencies = vec![0usize; MAIN_COUNT];
     let mut offset_frequencies = vec![0usize; OFFSET_COUNT];
     let mut low_offset_frequencies = vec![0usize; LOW_OFFSET_COUNT];
     let mut length_frequencies = vec![0usize; LENGTH_COUNT];
-    main_frequencies[257] += initial_filters.len();
+    main_frequencies[257] += filter_records;
     let mut match_state = EncoderMatchState::default();
     for token in tokens {
         match *token {
@@ -1554,6 +1634,9 @@ fn code_block(
                     } => {
                         main_frequencies[259 + index] += 1;
                         length_frequencies[length_slot] += 1;
+                    }
+                    EncodedMatch::Short { slot, .. } => {
+                        main_frequencies[263 + slot] += 1;
                     }
                     EncodedMatch::Fresh {
                         length_slot,
@@ -1590,6 +1673,16 @@ fn code_block(
     table_lengths[MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT]
         .copy_from_slice(&low_offset_lengths);
     table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..].copy_from_slice(&length_lengths);
+    Ok(table_lengths)
+}
+
+fn code_block(
+    tokens: &[EncodeToken],
+    initial_filters: &[Vec<u8>],
+    more_blocks_follow: bool,
+    previous_levels: &mut [u8; TABLE_COUNT],
+) -> Result<Vec<u8>> {
+    let table_lengths = table_lengths_for_tokens(tokens, initial_filters.len())?;
 
     // Two ways to say the same table: outright, or as a delta against the one
     // the reader already holds. Neither wins everywhere, so code both and take
@@ -1666,6 +1759,12 @@ fn code_block(
                         if LENGTH_BITS[length_slot] != 0 {
                             bits.write_bits(length_extra as u32, LENGTH_BITS[length_slot]);
                         }
+                    }
+                    EncodedMatch::Short { slot, extra } => {
+                        let code =
+                            main_codes[263 + slot].expect("counted short match Huffman code");
+                        bits.write_bits(code.code as u32, code.len);
+                        bits.write_bits(extra as u32, SHORT_BITS[slot]);
                     }
                     EncodedMatch::Fresh {
                         length_slot,
@@ -2081,6 +2180,11 @@ enum EncodedMatch {
         length_slot: usize,
         length_extra: usize,
     },
+    /// A two-byte match up to 256 back, which only the shortest-path parse emits.
+    Short {
+        slot: usize,
+        extra: usize,
+    },
     Fresh {
         length_slot: usize,
         length_extra: usize,
@@ -2110,6 +2214,10 @@ impl EncoderMatchState {
                     length_extra,
                 });
             }
+        }
+        if length == 2 {
+            let (slot, extra) = short_slot_for_match(offset)?;
+            return Ok(EncodedMatch::Short { slot, extra });
         }
         let encoded_length =
             length
@@ -2163,7 +2271,7 @@ fn encode_tokens_with_progress(
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
     }
-    parse_range(
+    parse_block(
         &combined,
         start,
         combined.len(),
@@ -2243,7 +2351,7 @@ impl<'a> LzParser<'a> {
             .collect();
         let (data, options, finder) = (self.data, self.options, &self.finder);
         let parse = |(start, end): (usize, usize)| {
-            parse_range(data, start, end, &mut FilledAhead(finder), options, None)
+            parse_block(data, start, end, &mut FilledAhead(finder), options, None)
         };
         if !crate::parallel::may_nest() {
             return ranges
@@ -2255,6 +2363,22 @@ impl<'a> LzParser<'a> {
         debug_assert!(failure.is_none(), "a parse without progress cannot fail");
         tokens
     }
+}
+
+/// The lazy parse, then at the levels that ask for it a shortest-path one.
+fn parse_block<C: Candidates>(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    finder: &mut C,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<EncodeToken>> {
+    let tokens = parse_range(data, start, end, finder, options, progress)?;
+    if options.optimal_parse_passes == 0 {
+        return Ok(tokens);
+    }
+    optimal_parse::refine(data, start, end, &*finder, options, tokens)
 }
 
 /// No match crosses `end`, so a block covers exactly the bytes it was given.
@@ -2869,6 +2993,7 @@ fn estimated_match_cost(state: &EncoderMatchState, length: usize, offset: usize)
         EncodedMatch::RepeatOffset { length_slot, .. } => {
             Ok(5 + usize::from(LENGTH_BITS[length_slot]))
         }
+        EncodedMatch::Short { slot, .. } => Ok(5 + usize::from(SHORT_BITS[slot])),
         EncodedMatch::Fresh {
             length_slot,
             offset_slot,
@@ -2927,6 +3052,20 @@ fn length_slot_for_repeat_match(length: usize) -> Result<(usize, usize)> {
     }
     Err(Error::InvalidData(
         "RAR 2.9 repeat match length is too long",
+    ))
+}
+
+fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
+    let adjusted = offset
+        .checked_sub(1)
+        .ok_or(Error::InvalidData("RAR 2.9 match offset is zero"))?;
+    for (slot, &base) in SHORT_BASES.iter().enumerate() {
+        if adjusted < base + (1usize << SHORT_BITS[slot]) {
+            return Ok((slot, adjusted - base));
+        }
+    }
+    Err(Error::InvalidData(
+        "RAR 2.9 two-byte match offset is too large",
     ))
 }
 
@@ -3214,6 +3353,10 @@ impl BitWriter {
         self.bytes
     }
 }
+
+#[path = "optimal_parse.rs"]
+mod optimal_parse;
+pub(crate) use optimal_parse::OPTIMAL_PARSE_WORKSPACE;
 
 // Round-trip and malformed-input tests use private encoder helpers and ancestor
 // decoder state, without exposing those internals to sibling production code.

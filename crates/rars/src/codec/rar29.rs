@@ -3,8 +3,9 @@ mod encoder;
 #[cfg(feature = "write")]
 pub(crate) use encoder::{
     filtered_members, named_filter_segments, ppmd_search_workspace,
-    unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd_with_progress,
-    MAX_VM_DELTA_FILTER_BLOCK_SIZE, PPMD_MODEL_BYTES,
+    unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd_sized_with_progress,
+    unpack29_encode_ppmd_with_progress, PpmdModelSize, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
+    OPTIMAL_PARSE_WORKSPACE, PPMD_MODEL_BYTES,
 };
 #[cfg(feature = "write")]
 pub use encoder::{
@@ -480,6 +481,11 @@ impl<B: Budget> Reader29State<B> {
         // follower legitimately starts after the previous member's new-file
         // marker, so do not mistake that marker for an early end in this one.
         self.last_block_end = None;
+        // Filters never span members, even in a solid stream: one still
+        // pending from the previous member, such as a record written after
+        // its last byte for a range past its end, is dropped here. Programs
+        // stay, because a later record may refer to them by index.
+        self.filters.clear();
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
@@ -796,7 +802,7 @@ impl<B: Budget> Reader29State<B> {
         require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)
     }
 
-    fn finish_ppmd_member(&mut self) -> Result<bool> {
+    fn finish_ppmd_member(&mut self, src: &mut dyn Read) -> Result<bool> {
         let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         if symbol != self.ppmd_esc {
             return Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"));
@@ -813,6 +819,11 @@ impl<B: Budget> Reader29State<B> {
                 self.in_lz_block = true;
                 Ok(false)
             }
+            // As in LZ, a filter record may follow the last byte of output.
+            3 => {
+                self.read_vm_code_ppmd(src)?;
+                Ok(false)
+            }
             _ => Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data")),
         }
     }
@@ -822,7 +833,7 @@ impl<B: Budget> Reader29State<B> {
             self.bits.top_up(src)?;
             let finished = match self.block_mode {
                 BlockMode::Lz => self.finish_lz_member()?,
-                BlockMode::Ppmd => self.finish_ppmd_member()?,
+                BlockMode::Ppmd => self.finish_ppmd_member(src)?,
             };
             if finished {
                 return Ok(());
@@ -837,6 +848,14 @@ impl<B: Budget> Reader29State<B> {
             return Ok(true);
         }
         let symbol = self.main.decode(&mut self.bits)?;
+        if symbol == 257 {
+            // A filter record after the last byte of output is legal: it
+            // registers its program, which later members may reuse, and its
+            // filter waits for bytes this member never produces. The member
+            // boundary drops it (see `decode_bits_member_to`).
+            self.read_vm_code()?;
+            return Ok(false);
+        }
         if symbol != 256 {
             return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
         }

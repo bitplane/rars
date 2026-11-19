@@ -357,7 +357,10 @@ impl<B: Budget> Reader20State<B> {
             }
         }
 
-        self.levels = new_levels;
+        // A block replaces only the lengths it read, a run past the table
+        // included. An LZ block between two audio blocks leaves the later
+        // channels' lengths for the next block's deltas to build on.
+        self.levels[..pos].copy_from_slice(&new_levels[..pos]);
         if self.audio_block {
             for channel in 0..self.channels {
                 let start = channel * AUDIO_COUNT;
