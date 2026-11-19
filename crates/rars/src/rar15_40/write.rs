@@ -2958,7 +2958,7 @@ fn encode_filtered_payload(
     ) {
         (true, Some(SolidEncoder::Rar29(encoder))) => encoder,
         _ => {
-            return encode_rar29_policy_filtered_payload(
+            let payload = encode_rar29_policy_filtered_payload(
                 data,
                 policy,
                 options.method,
@@ -2966,7 +2966,8 @@ fn encode_filtered_payload(
                 lz_method,
                 ppmd_trial_pays(lz_method.saturating_sub(0x30)),
                 progress,
-            )
+            )?;
+            return stored_unless_smaller(data, payload, options, solid_encoder);
         }
     };
 
@@ -3001,18 +3002,40 @@ fn encode_filtered_payload(
         }
     };
 
-    // A member the encoder could not shrink is stored, exactly as an unfiltered
-    // one is, which rebuilds the encoder and ends the chain here.
-    if should_store_fallback(options.target, true, data.len(), packed.len()) {
+    stored_unless_smaller(
+        data,
+        EncodedPayload {
+            data: packed,
+            method: lz_method,
+        },
+        options,
+        solid_encoder,
+    )
+}
+
+/// Stores a member its coding did not shrink, filtered or not, as the
+/// streamed writer does once the packed bytes reach the member's size.
+///
+/// In a chain this rebuilds the encoder, so the chain ends here and the member
+/// after it starts a new one.
+fn stored_unless_smaller(
+    data: &[u8],
+    payload: EncodedPayload,
+    options: WriterOptions,
+    solid_encoder: &mut Option<SolidEncoder>,
+) -> Result<EncodedPayload> {
+    let solid = solid_encoder.is_some();
+    if payload.method == 0x30
+        || !should_store_fallback(options.target, solid, data.len(), payload.data.len())
+    {
+        return Ok(payload);
+    }
+    if solid {
         *solid_encoder = Some(SolidEncoder::for_target(options)?);
-        return Ok(EncodedPayload {
-            data: data.to_vec(),
-            method: 0x30,
-        });
     }
     Ok(EncodedPayload {
-        data: packed,
-        method: lz_method,
+        data: data.to_vec(),
+        method: 0x30,
     })
 }
 
@@ -3044,7 +3067,7 @@ fn encode_or_store_payload(
         } else {
             FilterPolicy::Auto
         };
-        return encode_rar29_policy_filtered_payload(
+        let payload = encode_rar29_policy_filtered_payload(
             data,
             &policy,
             options.method,
@@ -3052,22 +3075,19 @@ fn encode_or_store_payload(
             lz_method,
             ppmd_trial_pays(lz_method.saturating_sub(0x30)),
             progress,
-        );
+        )?;
+        return stored_unless_smaller(data, payload, options, solid_encoder);
     }
     let compressed = encode_compressed_payload(data, options, solid_encoder.as_mut(), progress)?;
-    if should_store_fallback(target, solid, data.len(), compressed.len()) {
-        if solid {
-            *solid_encoder = Some(SolidEncoder::for_target(options)?);
-        }
-        return Ok(EncodedPayload {
-            data: data.to_vec(),
-            method: 0x30,
-        });
-    }
-    Ok(EncodedPayload {
-        data: compressed,
-        method: compression_method_for_level(options),
-    })
+    stored_unless_smaller(
+        data,
+        EncodedPayload {
+            data: compressed,
+            method: compression_method_for_level(options),
+        },
+        options,
+        solid_encoder,
+    )
 }
 
 /// Codes one member into a RAR 2.9 solid chain, choosing both the engine and,
@@ -4655,23 +4675,67 @@ mod tests {
             assert_eq!(piped, file, "{name}");
             let whole = in_memory_with(&members, options, coding());
             // In a chain, forced PPMd codes a named filter's member on its own,
-            // as it does in memory, so it streams the bytes it codes there. The
-            // noise is the exception: streamed, it is stored once it outgrows
-            // itself, which the in-memory writer never does for a named filter
-            // (#354).
+            // as it does in memory, so it streams the bytes it codes there.
             if options.method == super::Rar29Method::Ppmd {
-                let (streamed, whole) = (packed_members(&file), packed_members(&whole));
-                assert_eq!(streamed.len(), whole.len(), "{name}");
-                for (index, (streamed, whole)) in streamed.iter().zip(&whole).enumerate() {
-                    if index < 3 {
-                        assert_eq!(streamed, whole, "{name}: member {index}");
-                    } else {
-                        assert_eq!(streamed.0, 0x30, "{name}: the noise was not stored");
-                    }
-                }
+                assert_eq!(file, whole, "{name}");
+            }
+            // Both store the noise once it outgrows itself, filter or not.
+            for archive in [&file, &whole] {
+                assert_eq!(
+                    packed_members(archive)[3].0,
+                    0x30,
+                    "{name}: the noise was not stored"
+                );
             }
             assert_eq!(extracted_set(&[file], None), expected, "{name}");
             assert_eq!(extracted_set(&[whole], None), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_member_that_does_not_shrink_is_stored_whatever_codes_it() {
+        use super::Rar29Method;
+        use crate::FilterKind;
+        let text = word_text(40_000);
+        let noise = noise(20_000);
+        let files: [(&str, &[u8]); 3] = [
+            ("before.txt", &text),
+            ("noise.bin", &noise),
+            ("after.txt", &text),
+        ];
+        let members = entries(&files);
+        let expected: Vec<_> = files
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect();
+        for solid in [false, true] {
+            for method in [Rar29Method::Auto, Rar29Method::Lz, Rar29Method::Ppmd] {
+                for coding in [
+                    crate::MemberCoding::Compressed,
+                    named(FilterKind::E8E9),
+                    named(FilterKind::Delta { channels: 4 }),
+                ] {
+                    let mut options = rar40();
+                    options.features.solid = solid;
+                    options.method = method;
+                    let case = format!("solid {solid}, {method:?}, {coding:?}");
+
+                    let archive = in_memory_with(&members, options, coding);
+
+                    let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+                    let headers: Vec<_> = parsed.files().collect();
+                    assert_eq!(headers[1].method, 0x30, "{case}");
+                    assert_eq!(headers[1].pack_size, noise.len() as u64, "{case}");
+                    // Storing ends a chain, so the member after it starts another.
+                    assert!(!headers[2].is_solid(), "{case}");
+                    assert_ne!(headers[2].method, 0x30, "{case}");
+                    assert_eq!(
+                        extracted_set(std::slice::from_ref(&archive), None),
+                        expected,
+                        "{case}"
+                    );
+                }
+            }
         }
     }
 
