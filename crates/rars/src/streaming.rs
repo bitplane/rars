@@ -690,6 +690,16 @@ impl WriterResources {
                 self.is_cancelled() || cancelled()
             })
     }
+
+    /// Reserves `required` if the budget has that much free now, and never
+    /// waits for it.
+    ///
+    /// For work that can run in the time it is admitted or wait for work in
+    /// flight instead: a member asking for more beside what it already holds
+    /// must not queue behind members waiting for what it holds.
+    pub(crate) fn try_acquire(&self, required: u64) -> Option<MemoryPermit> {
+        self.budget.try_acquire(required)
+    }
 }
 
 /// Live storage and reservations share one ledger across resource clones.
@@ -864,6 +874,18 @@ impl MemoryBudget {
             used: Mutex::new(0),
             changed: Condvar::new(),
         }
+    }
+
+    fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<MemoryPermit> {
+        let mut used = self.used.lock().expect("memory budget lock poisoned");
+        if self.limit.saturating_sub(*used) < bytes {
+            return None;
+        }
+        *used += bytes;
+        Some(MemoryPermit {
+            budget: Arc::clone(self),
+            bytes,
+        })
     }
 
     fn acquire_cancellable(

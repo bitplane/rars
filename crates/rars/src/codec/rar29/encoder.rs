@@ -2622,6 +2622,43 @@ impl<'a> LzParser<'a> {
     }
 }
 
+/// The most one in-memory LZ encode of a `len` byte member holds beside the
+/// member itself, filtered or not: a filtered copy of it, its packed bytes, the
+/// match finder, and one parse batch's tokens, pieces and packed blocks. Plus the
+/// packed bytes of an earlier encode, for a caller comparing encodes to keep
+/// the best so far while the next one runs.
+///
+/// The shortest-path parse's own workspace is not included; a caller that
+/// asks for it charges [`OPTIMAL_PARSE_WORKSPACE`] per block parsing at once.
+pub(crate) fn member_encode_workspace(len: usize, options: EncodeOptions) -> u64 {
+    let options = options.constrained();
+    let reach = options.max_match_distance.min(MAX_HISTORY);
+    // A filtered member's blocks are never longer than a plain one's.
+    let block = options
+        .block_size
+        .filter(|&size| size != 0)
+        .unwrap_or(len)
+        .max(1);
+    let batch = LzParser::batch_bytes(block).min(len.max(1));
+    let finder = Rar29MatchFinder::bytes_for_reach(reach.saturating_add(batch).min(len), reach);
+    // A token per byte at worst, and a packed byte. Cutting a block splits
+    // the tail of its tokens off into fresh pieces while the head keeps its
+    // capacity, beside a running count per cut it weighs.
+    let token = std::mem::size_of::<EncodeToken>() as u64;
+    let per_byte = match options.split_blocks {
+        true => 2 * token + 2,
+        false => token + 1,
+    };
+    let tokens = (batch as u64).saturating_mul(per_byte);
+    let len = len as u64;
+    // The packed member can come out a little larger than the member.
+    let packed = len.saturating_add(len / 8);
+    finder
+        .saturating_add(tokens)
+        .saturating_add(len)
+        .saturating_add(packed.saturating_mul(2))
+}
+
 /// One block's tokens, and where in the parsed bytes the block ends.
 #[derive(Debug)]
 struct Piece {
