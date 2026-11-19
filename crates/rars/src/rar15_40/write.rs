@@ -2666,8 +2666,12 @@ fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOption
         1 => 16,
         2 => 64,
         3 => 256,
-        4 => 512,
-        5 => 1024,
+        // Level 5 searches no further than 4. Under the shortest-path parse
+        // 1,024 candidates packed larger than 512 on every 4 MiB class of the
+        // bench and on its small binaries, so level 5 came out larger than
+        // level 4. It spends its time on more priced passes instead, which
+        // start from level 4's result and are kept only when smaller.
+        4 | 5 => 512,
         _ => {
             return Err(Error::InvalidArgument(
                 "RAR compression level must be in the range 0..5",
@@ -2696,6 +2700,7 @@ fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOption
         // the encode time, so it goes where the ladder already means "spend
         // whatever it takes". rar29 gates its lazy matching at the same rung.
         .with_optimal_parse(level >= 4)
+        .with_extra_priced_passes(if level == 5 { 2 } else { 0 })
         // The audio trial is a second encode of the member, which is the one
         // thing level 1 is trying not to pay for.
         .with_try_audio(level > 1))
@@ -6310,6 +6315,19 @@ mod tests {
         assert!(
             !rar20_encode_options_for_level(None).unwrap().optimal_parse,
             "an absent level is the default level, which is not the top of the ladder",
+        );
+    }
+
+    #[test]
+    fn rar20_level_5_is_level_4_with_more_priced_passes() {
+        let four = rar20_encode_options_for_level(Some(4)).unwrap();
+        let five = rar20_encode_options_for_level(Some(5)).unwrap();
+        // Each extra pass is kept only if it packs smaller, so level 5 can
+        // never come out larger than level 4.
+        assert!(five.extra_priced_passes > four.extra_priced_passes);
+        assert_eq!(
+            five.with_extra_priced_passes(four.extra_priced_passes),
+            four
         );
     }
 
