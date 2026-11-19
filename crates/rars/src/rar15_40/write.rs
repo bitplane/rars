@@ -3173,6 +3173,10 @@ fn dictionary_range(target: ArchiveVersion) -> (usize, usize) {
 /// ```
 fn fitted_dictionary_size(target: ArchiveVersion, content: u64) -> usize {
     let (floor, cap) = dictionary_range(target);
+    // A test caps the window on its own thread, so a member crosses a
+    // segment of the streamed parse without coding 16 MiB in a debug build.
+    #[cfg(test)]
+    let cap = cap.min(builder_path_tests::DICTIONARY_CAP.get());
     let mut size = floor;
     while size < cap && size as u64 <= content {
         size *= 2;
