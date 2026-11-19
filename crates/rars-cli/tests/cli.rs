@@ -6811,6 +6811,12 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
          or --format rar70",
     ),
     (
+        &["--format", "rar14", "--volume-size", "1m", "--password", "pw"],
+        "error: --password is not supported by --format rar14 (in a volume set); use --format rar15, \
+         --format rar20, --format rar29, --format rar30, --format rar40, --format rar50 \
+         or --format rar70",
+    ),
+    (
         &["--format", "rar15", "--temp-dir", "."],
         "error: --temp-dir is not supported by --format rar15; use --format rar20, \
          --format rar29, --format rar30, --format rar40, --format rar50 or --format rar70",

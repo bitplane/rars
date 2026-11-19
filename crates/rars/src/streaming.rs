@@ -1817,6 +1817,33 @@ mod tests {
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
+    /// The legacy writers' rule: a member costing more than the whole limit is
+    /// admitted, not refused, but only alone. The limit bounds how many run at
+    /// once, never how large one is.
+    #[test]
+    fn an_oversized_member_is_admitted_alone_rather_than_refused() {
+        let resources = WriterResources::new(100);
+        let alone = resources
+            .acquire_serialising_cancellable(10_000, &|| false)
+            .unwrap();
+        assert_eq!(*resources.budget.used.lock().unwrap(), 100);
+        // A second one would have to wait for the first; asked not to wait, it
+        // is cancelled rather than admitted beside it.
+        let polls = AtomicU64::new(0);
+        assert_eq!(
+            resources
+                .acquire_serialising_cancellable(10_000, &|| {
+                    polls.fetch_add(1, Ordering::Relaxed) >= 2
+                })
+                .map(|_| ()),
+            Err(Error::Cancelled)
+        );
+        drop(alone);
+        assert!(resources
+            .acquire_serialising_cancellable(10_000, &|| false)
+            .is_ok());
+    }
+
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn admission_waits_can_be_cancelled_without_releasing_the_held_permit() {

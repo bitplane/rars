@@ -100,7 +100,7 @@ fn stored_members_over_4_gib_round_trip() {
 }
 
 #[test]
-#[ignore = "compresses and encrypts members of over 4 GiB, holding each in memory"]
+#[ignore = "compresses and encrypts members of over 4 GiB, spooling each to disk"]
 fn compressed_and_encrypted_members_over_4_gib_round_trip() {
     round_trip(ArchiveVersion::Rar20, MemberCoding::Compressed, None);
     round_trip(ArchiveVersion::Rar40, MemberCoding::Compressed, None);
@@ -113,5 +113,28 @@ fn compressed_and_encrypted_members_over_4_gib_round_trip() {
             MemberCoding::Compressed,
             Some(b"secret"),
         );
+    }
+}
+
+#[test]
+#[ignore = "writes and reads back two RAR 5 archives of over 4 GiB each"]
+fn rar5_members_over_4_gib_round_trip() {
+    for store in [true, false] {
+        let dir = scratch::case("rar5-large-member");
+        let path = dir.join("big.rar");
+        let source = EntrySource::from_opener(SIZE, || Ok(Box::new(Pattern { position: 0 })));
+        let mut builder = rars::Builder::new(ArchiveVersion::Rar50).store(store);
+        builder
+            .add_source(b"big.bin".to_vec(), source, None, None)
+            .unwrap();
+        builder.write_to_path(&path, None).unwrap();
+
+        let archive = ArchiveReader::read_path(&path).unwrap();
+        let sizes: Vec<_> = archive
+            .members()
+            .map(|member| member.meta.unpacked_size)
+            .collect();
+        assert_eq!(sizes, [SIZE], "store {store}");
+        archive.test(None).unwrap();
     }
 }
