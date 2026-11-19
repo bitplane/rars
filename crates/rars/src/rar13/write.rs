@@ -442,7 +442,28 @@ struct EncodedMember<'a> {
     method: u8,
     unpacked_size: usize,
     file_crc: u16,
+    /// The budget's charge for what waits to be written, released when the
+    /// member has been. A directory holds nothing and has none.
+    held: Option<crate::streaming::MemoryPermit>,
 }
+
+impl EncodedMember<'_> {
+    /// Keeps `permit` until the member is written, cut to what it then holds:
+    /// the packed form if it is in memory, and a buffer to copy through.
+    fn holding(mut self, mut permit: crate::streaming::MemoryPermit) -> Self {
+        let waiting = match &self.payload {
+            Payload::Shared(MemberPayload::Packed(packed)) => packed.capacity() as u64,
+            _ => 0,
+        };
+        permit.shrink_to(waiting.saturating_add(WRITE_WORKSPACE));
+        self.held = Some(permit);
+        self
+    }
+}
+
+/// What writing one member holds beyond its payload: the buffer a stored or
+/// spooled member is copied and encrypted through.
+const WRITE_WORKSPACE: u64 = 1024 * 1024;
 
 /// A member's bytes as they go into the archive, before any encryption.
 enum Payload<'a> {
@@ -468,7 +489,8 @@ fn streamed_workspace() -> u64 {
 /// index and the verifying decoder are a fixed size whatever the member's.
 fn member_workspace(unpacked: u64, compressing: bool) -> u64 {
     if !compressing {
-        return 1024 * 1024;
+        // Never loaded: written from the caller's bytes or copied from its source.
+        return WRITE_WORKSPACE;
     }
     unpacked
         .saturating_mul(2)
@@ -501,6 +523,7 @@ fn encode_member<'a>(
             method: METHOD_STORE,
             unpacked_size: 0,
             file_crc: file_checksum(&[]),
+            held: None,
         });
     }
     // A large member read from a source is packed into a spool a window at a
@@ -511,7 +534,7 @@ fn encode_member<'a>(
             && unpacked_size as u64 > stream_above,
         member.bytes.source(),
     ) {
-        let _permit = resources
+        let permit = resources
             .acquire_serialising_cancellable(streamed_workspace(), &|| work.is_cancelled())?;
         return encode_spooled_member(
             member,
@@ -521,9 +544,10 @@ fn encode_member<'a>(
             solid_encoder,
             resources,
             work,
-        );
+        )
+        .map(|encoded| encoded.holding(permit));
     }
-    let _permit = resources.acquire_serialising_cancellable(
+    let permit = resources.acquire_serialising_cancellable(
         member_workspace(unpacked_size as u64, coding.compresses()),
         &|| work.is_cancelled(),
     )?;
@@ -547,7 +571,9 @@ fn encode_member<'a>(
                 )?;
                 checksum.finish()
             },
-        });
+            held: None,
+        }
+        .holding(permit));
     }
 
     let data = member
@@ -564,12 +590,16 @@ fn encode_member<'a>(
     let file_crc = checksum.finish();
     work.check()?;
     if !coding.compresses() {
+        // The caller's bytes are written as they stand, encrypted as they go
+        // out. A copy would hold the member a second time.
         return Ok(EncodedMember {
-            payload: Payload::Shared(MemberPayload::Packed(data.into_owned())),
+            payload: Payload::Shared(member.bytes.stored()),
             method: METHOD_STORE,
             unpacked_size,
             file_crc,
-        });
+            held: None,
+        }
+        .holding(permit));
     }
 
     let solid = solid_encoder.is_some();
@@ -591,7 +621,9 @@ fn encode_member<'a>(
         method,
         unpacked_size,
         file_crc,
-    })
+        held: None,
+    }
+    .holding(permit))
 }
 
 /// [`encode_member`] for a member packed into a spool: the same attempts,
@@ -626,6 +658,7 @@ fn encode_spooled_member<'a>(
             method: METHOD_BEST,
             unpacked_size,
             file_crc: checksum.finish(),
+            held: None,
         });
     }
     // The first attempt reads the member for its checksum too.
@@ -657,6 +690,7 @@ fn encode_spooled_member<'a>(
                     method: METHOD_BEST,
                     unpacked_size,
                     file_crc: crc,
+                    held: None,
                 });
             }
             break;
@@ -667,6 +701,7 @@ fn encode_spooled_member<'a>(
         method: METHOD_STORE,
         unpacked_size,
         file_crc: file_crc.expect("every attempt list has a first attempt"),
+        held: None,
     })
 }
 
@@ -761,6 +796,8 @@ fn write_member(
     options: WriterOptions,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
+    // The member's charge goes once it is written.
+    let _held = encoded.held;
     crate::write_progress::check_cancelled(progress)?;
     // A payload in memory is encrypted in place; one copied from a source or
     // a spool is encrypted as it is copied.
@@ -1481,6 +1518,69 @@ mod tests {
         // Beyond the bytes it holds, a large member costs what a small one does.
         assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
         assert!(small < 16 << 20, "{small}");
+    }
+
+    #[test]
+    fn a_member_is_charged_for_what_it_holds_until_it_is_written() {
+        let data: Vec<u8> = (0..300_000u32)
+            .map(|index| ((index * 7 / 5) ^ (index >> 9)) as u8)
+            .collect();
+        let mut passwords: Vec<Option<&[u8]>> = vec![None];
+        if cfg!(feature = "encryption") {
+            passwords.push(Some(b"password"));
+        }
+        for password in passwords {
+            for coding in [MemberCoding::Stored, MemberCoding::Compressed] {
+                let case = format!("{coding:?}, password {}", password.is_some());
+                let entry = FileEntry {
+                    name: b"member.bin",
+                    data: &data,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    password,
+                    file_comment: None,
+                };
+                let member = Member::from_file(&entry);
+                let options = WriterOptions::default();
+                let resources = WriterResources::default();
+                let work = WorkTracker::new(None, WriteOperation::Compression, u64::MAX);
+                let encoded = encode_member(
+                    &member,
+                    options,
+                    &coding,
+                    rar15_encode_options_for_level(options.compression_level),
+                    None,
+                    &resources,
+                    &work,
+                    u64::MAX,
+                )
+                .unwrap();
+                let held = match &encoded.payload {
+                    // A stored member is the caller's bytes, not a copy of
+                    // them, so it holds only the buffer it is written through.
+                    Payload::Shared(MemberPayload::Borrowed(bytes)) => {
+                        assert!(matches!(coding, MemberCoding::Stored), "{case}");
+                        assert_eq!(bytes.as_ptr(), data.as_ptr(), "{case}");
+                        WRITE_WORKSPACE
+                    }
+                    // A packed one holds its packed form until it is written.
+                    Payload::Shared(MemberPayload::Packed(packed)) => {
+                        assert!(matches!(coding, MemberCoding::Compressed), "{case}");
+                        assert!(packed.len() < data.len(), "{case}");
+                        packed.capacity() as u64 + WRITE_WORKSPACE
+                    }
+                    _ => panic!("{case}: unexpected payload"),
+                };
+                assert_eq!(resources.workspace_in_use(), held, "{case}");
+                let mut archive = Vec::new();
+                write_main_header(&mut archive, options.features, None).unwrap();
+                write_member(&mut archive, &member, encoded, options, None).unwrap();
+                assert_eq!(resources.workspace_in_use(), 0, "{case}");
+                let extracted =
+                    collect_extract(&Archive::parse(&archive).unwrap(), password).unwrap();
+                assert!(extracted.len() == 1 && extracted[0].data == data, "{case}");
+            }
+        }
     }
 
     /// The archive written with members over `stream_above` packed into a

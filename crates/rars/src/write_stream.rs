@@ -194,6 +194,15 @@ impl<'a> MemberBytes<'a> {
         }
     }
 
+    /// The member as a stored payload, which is never loaded: written from
+    /// the caller's bytes, or copied from its source.
+    pub(crate) fn stored(&self) -> MemberPayload<'a> {
+        match self {
+            Self::Borrowed(data) => MemberPayload::Borrowed(data),
+            Self::Source(source) | Self::NamedSource(source, _) => MemberPayload::Copied(source),
+        }
+    }
+
     /// The source behind this member, when there is one to copy from.
     pub(crate) fn source(&self) -> Option<&'a EntrySource> {
         match self {
@@ -219,6 +228,9 @@ pub(crate) enum MemberPayload<'a> {
     /// Copied from the source as the archive is written, which keeps a stored
     /// member off the heap however large it is.
     Copied(&'a EntrySource),
+    /// A stored member written from the bytes the caller handed over, which
+    /// would otherwise be copied only to be written out.
+    Borrowed(&'a [u8]),
 }
 
 impl MemberPayload<'_> {
@@ -227,6 +239,7 @@ impl MemberPayload<'_> {
     pub(crate) fn size(&self, unpacked_size: u64) -> u64 {
         match self {
             Self::Packed(packed) => packed.len() as u64,
+            Self::Borrowed(data) => data.len() as u64,
             Self::Copied(_) => unpacked_size,
         }
     }
@@ -234,6 +247,7 @@ impl MemberPayload<'_> {
     pub(crate) fn write_to(&self, output: &mut dyn Write, expected: u64) -> Result<()> {
         match self {
             Self::Packed(packed) => output.write_all(packed)?,
+            Self::Borrowed(data) => output.write_all(data)?,
             Self::Copied(source) => {
                 let mut reader = source.open()?;
                 let copied = std::io::copy(&mut reader.by_ref().take(expected), output)?;

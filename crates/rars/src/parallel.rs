@@ -157,28 +157,54 @@ mod threaded {
     /// Mapping everything up front is simpler, but it holds every result at
     /// once; when the results are compressed file payloads that is the
     /// difference between one copy of the archive in memory and two.
+    ///
+    /// `admit` lets each item into a window, in order and on the calling
+    /// thread, and what it returns goes with the item until it is consumed: a
+    /// budget's permit, say, held until the item's result is written. A window
+    /// is consumed only once all of it is mapped, so no item may wait on what
+    /// an earlier item of its window holds. `admit(item, true)` opens a window,
+    /// with nothing of this call's held, and may wait; `admit(item, false)`
+    /// returns `None` rather than wait, which closes the window, and the item
+    /// opens the next one.
     #[cfg(any(test, feature = "write"))]
-    pub(crate) fn map_slice_windowed<'a, T, O, E, F, C>(
+    pub(crate) fn map_slice_windowed<'a, T, A, O, E, D, F, C>(
         items: &'a [T],
         window: usize,
+        mut admit: D,
         map: F,
         mut consume: C,
     ) -> Result<(), E>
     where
         T: Sync + 'a,
+        A: Send,
         O: Send,
         E: Send,
-        F: Fn(&'a T) -> Result<O, E> + Sync + Send,
+        D: FnMut(&'a T, bool) -> Result<Option<A>, E>,
+        F: Fn(&'a T, A) -> Result<O, E> + Sync + Send,
         C: FnMut(&'a T, O) -> Result<(), E>,
     {
         let window = window.max(1);
-        for chunk in items.chunks(window) {
+        let mut rest = items;
+        while !rest.is_empty() {
+            let mut admitted = Vec::with_capacity(window.min(rest.len()));
+            for item in rest.iter().take(window) {
+                match admit(item, admitted.is_empty())? {
+                    Some(ticket) => admitted.push((item, ticket)),
+                    None if admitted.is_empty() => {
+                        unreachable!("the item that opens a window is always admitted")
+                    }
+                    None => break,
+                }
+            }
+            rest = &rest[admitted.len()..];
             // A lone item has no sibling to steal, so its own work may still fan out.
-            let fan_out = (chunk.len() > 1).then(FanOut::start);
-            let mapped: Result<Vec<O>, E> = chunk.par_iter().map(&map).collect();
+            let fan_out = (admitted.len() > 1).then(FanOut::start);
+            let mapped: Result<Vec<(&'a T, O)>, E> = admitted
+                .into_par_iter()
+                .map(|(item, ticket)| map(item, ticket).map(|output| (item, output)))
+                .collect();
             drop(fan_out);
-            let mapped = mapped?;
-            for (item, output) in chunk.iter().zip(mapped) {
+            for (item, output) in mapped? {
                 consume(item, output)?;
             }
         }
@@ -282,23 +308,30 @@ mod sequential {
     }
 
     /// One at a time, so the window only decides how much output is alive at
-    /// once rather than how much work runs at once.
+    /// once rather than how much work runs at once. Each item opens its own
+    /// window, so each is admitted with nothing else of this call's held.
     #[cfg(any(test, feature = "write"))]
-    pub(crate) fn map_slice_windowed<'a, T, O, E, F, C>(
+    pub(crate) fn map_slice_windowed<'a, T, A, O, E, D, F, C>(
         items: &'a [T],
         _window: usize,
+        mut admit: D,
         map: F,
         mut consume: C,
     ) -> Result<(), E>
     where
         T: Sync + 'a,
+        A: Send,
         O: Send,
         E: Send,
-        F: Fn(&'a T) -> Result<O, E> + Sync + Send,
+        D: FnMut(&'a T, bool) -> Result<Option<A>, E>,
+        F: Fn(&'a T, A) -> Result<O, E> + Sync + Send,
         C: FnMut(&'a T, O) -> Result<(), E>,
     {
         for item in items {
-            let output = map(item)?;
+            let Some(ticket) = admit(item, true)? else {
+                unreachable!("the item that opens a window is always admitted")
+            };
+            let output = map(item, ticket)?;
             consume(item, output)?;
         }
         Ok(())
@@ -431,7 +464,8 @@ mod tests {
             let result: Result<(), ()> = sequential::map_slice_windowed(
                 &input,
                 window,
-                |x| Ok(x * 2),
+                |_, _| Ok(Some(())),
+                |x, ()| Ok(x * 2),
                 |x, y| {
                     emitted.push((*x, y));
                     Ok(())
@@ -444,7 +478,8 @@ mod tests {
         let result = sequential::map_slice_windowed(
             &input,
             2,
-            |x| if *x == 1 { Err(11) } else { Ok(x * 2) },
+            |_, _| Ok(Some(())),
+            |x, ()| if *x == 1 { Err(11) } else { Ok(x * 2) },
             |x, y| {
                 emitted.push((*x, y));
                 Ok(())
@@ -457,7 +492,8 @@ mod tests {
         let result = sequential::map_slice_windowed(
             &input,
             2,
-            |x| {
+            |_, _| Ok(Some(())),
+            |x, ()| {
                 visited.lock().unwrap().push(*x);
                 Ok(x * 2)
             },
@@ -473,13 +509,77 @@ mod tests {
         assert_eq!(result, Err(12));
         assert_eq!(emitted, [(3, 6), (1, 2)]);
         assert_eq!(*visited.lock().unwrap(), [3, 1]);
-        let empty: Result<(), ()> = sequential::map_slice_windowed::<usize, usize, _, _, _>(
+        let empty: Result<(), ()> = sequential::map_slice_windowed::<usize, (), usize, _, _, _, _>(
             &[],
             0,
-            |_| panic!("empty map"),
+            |_, _| Ok(Some(())),
+            |_, ()| panic!("empty map"),
             |_, _| panic!("empty consume"),
         );
         assert_eq!(empty, Ok(()));
+    }
+
+    /// What a windowed map did, in order: `A` for an admission (and whether
+    /// it opened a window), `R` for one refused, `C` for a consumption.
+    fn admission_log(
+        windowed: impl FnOnce(
+            &mut dyn FnMut(&usize, bool) -> Result<Option<usize>, ()>,
+            &mut dyn FnMut(&usize, usize) -> Result<(), ()>,
+        ) -> Result<(), ()>,
+    ) -> Vec<String> {
+        let log = std::cell::RefCell::new(Vec::new());
+        // Refuses 3 and 5 unless they open a window, as a full budget would.
+        let mut admit = |item: &usize, opens: bool| {
+            let admitted = opens || (*item != 3 && *item != 5);
+            let mark = if admitted { "A" } else { "R" };
+            log.borrow_mut()
+                .push(format!("{mark}{item}{}", if opens { "*" } else { "" }));
+            Ok(admitted.then_some(*item * 10))
+        };
+        let mut consume = |item: &usize, output: usize| {
+            assert_eq!(output, item * 10 + 1);
+            log.borrow_mut().push(format!("C{item}"));
+            Ok(())
+        };
+        windowed(&mut admit, &mut consume).unwrap();
+        log.into_inner()
+    }
+
+    #[test]
+    fn a_refused_admission_closes_the_window_and_opens_the_next() {
+        let input = [1, 2, 3, 4, 5, 6];
+        // One at a time, every item opens its own window and may wait.
+        let sequential = admission_log(|admit, consume| {
+            sequential::map_slice_windowed(&input, 4, admit, |_, ticket| Ok(ticket + 1), consume)
+        });
+        assert_eq!(
+            sequential,
+            ["A1*", "C1", "A2*", "C2", "A3*", "C3", "A4*", "C4", "A5*", "C5", "A6*", "C6"]
+        );
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        {
+            // A window is written before the item it refused is admitted
+            // again, now opening the next one, where it may wait.
+            let threaded = admission_log(|admit, consume| {
+                super::threaded::map_slice_windowed(
+                    &input,
+                    4,
+                    admit,
+                    |_, ticket| Ok(ticket + 1),
+                    consume,
+                )
+            });
+            assert_eq!(
+                threaded,
+                [
+                    "A1*", "A2", "R3", "C1", "C2", "A3*", "A4", "R5", "C3", "C4", "A5*", "A6",
+                    "C5", "C6"
+                ]
+            );
+        }
     }
 
     #[cfg(all(
@@ -503,7 +603,8 @@ mod tests {
             let result: Result<(), ()> = super::threaded::map_slice_windowed(
                 &input,
                 window,
-                |x| {
+                |_, _| Ok(Some(())),
+                |x, ()| {
                     active.fetch_add(1, Ordering::Relaxed);
                     let _active = Active(&active);
                     Ok(x * 2)
@@ -521,7 +622,8 @@ mod tests {
         let result = super::threaded::map_slice_windowed(
             &input,
             2,
-            |x| {
+            |_, _| Ok(Some(())),
+            |x, ()| {
                 active.fetch_add(1, Ordering::Relaxed);
                 let _active = Active(&active);
                 if *x == 2 {
@@ -546,7 +648,8 @@ mod tests {
         let result = super::threaded::map_slice_windowed(
             &input,
             2,
-            |x| {
+            |_, _| Ok(Some(())),
+            |x, ()| {
                 visited.lock().unwrap().push(*x);
                 Ok(x * 2)
             },
@@ -574,7 +677,8 @@ mod tests {
             let _: Result<(), ()> = super::threaded::map_slice_windowed(
                 &input,
                 2,
-                |x| {
+                |_, _| Ok(Some(())),
+                |x, ()| {
                     active.fetch_add(1, Ordering::Relaxed);
                     let _active = Active(&active);
                     assert_ne!(*x, 2, "injected map panic");
@@ -589,12 +693,14 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(emitted, [(3, 6), (1, 2)]);
         assert_eq!(active.load(Ordering::Acquire), 0);
-        let empty: Result<(), ()> = super::threaded::map_slice_windowed::<usize, usize, _, _, _>(
-            &[],
-            0,
-            |_| panic!("empty map"),
-            |_, _| panic!("empty consume"),
-        );
+        let empty: Result<(), ()> =
+            super::threaded::map_slice_windowed::<usize, (), usize, _, _, _, _>(
+                &[],
+                0,
+                |_, _| Ok(Some(())),
+                |_, ()| panic!("empty map"),
+                |_, _| panic!("empty consume"),
+            );
         assert_eq!(empty, Ok(()));
     }
 }
