@@ -554,3 +554,42 @@ def test_legacy_volume_names_follow_the_first_extension_case(tmp_path, first, se
     assert [Path(path).name for path in paths[:2]] == [first, second]
     with rars.RarFile(paths[0]) as archive:
         archive.testrar(volumes=paths[1:])
+
+
+@pytest.mark.parametrize("format", ["rar14", "rar20", "rar50"])
+def test_a_volume_set_is_written_to_disk_as_it_fills(tmp_path, format):
+    builder = rars.RarBuilder(version=format, level=0, volume_size=64 << 10)
+    payload = os.urandom(1 << 20)
+    builder.add_bytes(payload, "payload.bin")
+    first = tmp_path / ("archive.part1.rar" if format == "rar50" else "archive.rar")
+    staged_while_writing = []
+
+    def watch(event):
+        if event.phase == "writing":
+            staged_while_writing.append(
+                sum(path.stat().st_size for path in tmp_path.iterdir() if ".rars-volume-" in path.name)
+            )
+
+    parts = builder.write(first, progress=watch)
+    assert len(parts) > 2
+    # Volumes reached the disk while the set was written, not after it was built.
+    assert max(staged_while_writing, default=0) > 0
+    assert set(tmp_path.iterdir()) == set(parts)
+    with rars.RarFile(parts[0]) as archive:
+        assert archive.read("payload.bin", volumes=parts[1:]) == payload
+
+
+def test_a_legacy_set_past_z99_is_refused_before_it_is_built(tmp_path):
+    builder = rars.RarBuilder(version="rar14", level=0, volume_size=150)
+    builder.add_bytes(bytes(range(256)) * 4000, "payload.bin")
+    reached = []
+
+    def watch(event):
+        if event.phase == "writing":
+            reached.append(event.percentage)
+
+    with pytest.raises(ValueError, match=r"run out after \.z99"):
+        builder.write(tmp_path / "archive.rar", progress=watch)
+    # About a tenth of this set fits the 901 names, so writing stops there.
+    assert max(reached, default=0) < 50
+    assert list(tmp_path.iterdir()) == []
