@@ -105,3 +105,55 @@ fn failed_or_cancelled_publication_keeps_the_destination_and_removes_staging() {
     assert_eq!(std::fs::read(&path).unwrap(), b"repaired");
     assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 2);
 }
+
+#[test]
+fn repairing_to_a_path_publishes_what_the_repair_returns_and_nothing_else() {
+    let dir = scratch::case("repair-to-path");
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(10));
+    builder
+        .add_bytes(b"file".to_vec(), vec![42; 200_000], None, None)
+        .unwrap();
+    let mut damaged = builder.to_bytes().unwrap();
+    let middle = damaged.len() / 2;
+    damaged[middle..middle + 64]
+        .iter_mut()
+        .for_each(|byte| *byte ^= 0xff);
+    for archive_bytes in [
+        include_bytes!("fixtures/rar15_40/rar250_protect_head_rr5.rar").to_vec(),
+        include_bytes!("fixtures/rar15_40/rar300/with_compressed_recovery_rar300.rar").to_vec(),
+        damaged,
+    ] {
+        let source = dir.join("source.rar");
+        std::fs::write(&source, &archive_bytes).unwrap();
+        let archive = ArchiveReader::read_path(&source).unwrap();
+        let expected = archive.repair_recovery_with_report(None).unwrap();
+
+        let output = dir.join("output.rar");
+        std::fs::write(&output, b"keep").unwrap();
+        let token = ReadCancellation::new();
+        token.cancel();
+        let cancelled = ArchiveReadOptions::new().with_cancellation(&token);
+        let error = archive
+            .repair_recovery_to_path_with_options(&output, cancelled)
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Cancelled);
+        assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 2);
+
+        let report = archive
+            .repair_recovery_to_path_with_options(&output, ArchiveReadOptions::new())
+            .unwrap();
+        assert_eq!(report, expected.report);
+        assert_eq!(std::fs::read(&output).unwrap(), expected.data);
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 2);
+
+        // Over its own source, which is read until the repaired copy replaces it.
+        archive
+            .repair_recovery_to_path_with_options(&source, ArchiveReadOptions::new())
+            .unwrap();
+        assert_eq!(std::fs::read(&source).unwrap(), expected.data);
+        std::fs::remove_file(&output).unwrap();
+    }
+}
