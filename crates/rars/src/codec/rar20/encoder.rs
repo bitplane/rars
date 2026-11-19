@@ -1638,6 +1638,10 @@ fn best_match(
         length: 0,
     };
     let mut checked = 0usize;
+    // No match under three bytes is encodable, so a candidate that differs in
+    // its first three needs no measuring. On data with nothing to find that
+    // is every candidate at every position.
+    let prefix = &input[pos..pos + 3];
     let mut candidate = finder.first(input, pos);
     while candidate != match_finder::NO_POSITION {
         // Callers search before inserting this position, so every candidate is older.
@@ -1663,9 +1667,10 @@ fn best_match(
         };
         // A best match reaching `max_length` breaks the loop, so without a
         // cost model `must_reach` never passes it.
-        let reachable = must_reach <= 1
+        let reachable = (must_reach <= 1
             || (must_reach <= max_length
-                && input[candidate + must_reach - 1] == input[pos + must_reach - 1]);
+                && input[candidate + must_reach - 1] == input[pos + must_reach - 1]))
+            && input[candidate..candidate + 3] == *prefix;
         if reachable {
             let length = super::super::fast::match_length(input, pos, offset, max_length);
             let encodable = length >= 3 + match_length_adjustment(offset);
@@ -1751,8 +1756,13 @@ fn best_old_offset_match(
 ) -> Option<(usize, usize, usize)> {
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
     let mut best = None;
+    // An old offset codes two bytes at the least.
+    if max_length < 2 {
+        return None;
+    }
+    let prefix = &input[pos..pos + 2];
     for (index, &offset) in old_offsets.iter().enumerate() {
-        if offset == 0 {
+        if offset == 0 || input[pos - offset..pos - offset + 2] != *prefix {
             continue;
         }
         let length = match_length_at_offset(input, pos, max_length, offset);

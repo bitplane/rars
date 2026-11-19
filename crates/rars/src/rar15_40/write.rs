@@ -2437,6 +2437,7 @@ fn stream_member(
         sizes.packed_size += size;
         Ok(ControlFlow::Continue(()))
     };
+    let unchained_storable = storable && solid.is_none();
     let flow = match rar29 {
         None => match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
             Some(SolidEncoder::Rar15(encoder)) => {
@@ -2449,6 +2450,11 @@ fn stream_member(
                 rar15_encode_options_for_level(options.compression_level)?,
             )
             .encode_member_streamed(&mut counted, len, &mut advance, &mut write),
+            // Noise is stored without coding it first: the attempt would only
+            // learn that at the end, which for gigabytes is half an hour.
+            _ if unchained_storable && rar20_samples_expand(member, len, options, progress)? => {
+                Ok(ControlFlow::Break(()))
+            }
             _ => unpack20_encode_streamed(
                 &mut counted,
                 len,
@@ -2573,6 +2579,55 @@ fn stream_member(
     }
     out.finish(sizes)?;
     Ok(sizes.method)
+}
+
+/// Samples a streamed RAR 2.0 member codes before it is coded whole.
+const RAR20_PROBE_SAMPLES: usize = 4;
+
+/// Whether every sample of a large RAR 2.0 member packs no smaller than it
+/// is, so the member would be stored after coding it all.
+///
+/// Each sample is a dictionary long, so it holds every distance a match could
+/// reach and data that repeats at long range still shrinks. They sit at the
+/// middle of each quarter, so a compressible stretch after a noisy start is
+/// still seen, and the first that shrinks ends the probe. A member under
+/// sixteen samples' worth is coded whole, which costs little anyway.
+fn rar20_samples_expand(
+    member: &Member<'_>,
+    len: usize,
+    options: WriterOptions,
+    progress: &WorkTracker<'_>,
+) -> Result<bool> {
+    let encode_options = rar20_encode_options_for_options(options)?;
+    let sample = encode_options.max_match_distance.max(64 * 1024);
+    if len < sample.saturating_mul(4 * RAR20_PROBE_SAMPLES) {
+        return Ok(false);
+    }
+    let mut source = member.bytes.open()?;
+    let mut bytes = vec![0; sample];
+    let stride = len / RAR20_PROBE_SAMPLES;
+    for index in 0..RAR20_PROBE_SAMPLES {
+        progress.check()?;
+        let start = index * stride + (stride - sample) / 2;
+        source.seek(SeekFrom::Start(start as u64))?;
+        source
+            .read_exact(&mut bytes)
+            .map_err(|error| match error.kind() {
+                std::io::ErrorKind::UnexpectedEof => {
+                    Error::SourceChanged("entry source size changed while compressing")
+                }
+                _ => error.into(),
+            })?;
+        let packed =
+            unpack20_encode_auto_with_options_and_progress(&bytes, encode_options, &mut |_| {
+                !progress.is_cancelled()
+            })
+            .map_err(map_codec_cancel)?;
+        if packed.len() < bytes.len() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// A solid run a streamed member codes on from, and whether its header says so.
@@ -7488,5 +7543,86 @@ mod tests {
                 "{target:?}"
             );
         }
+    }
+
+    /// Entries whose sources count every byte read from them.
+    fn read_counted(
+        members: &[(&str, &[u8])],
+    ) -> (
+        Vec<super::StreamingEntry>,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        struct Counted(
+            std::io::Cursor<Vec<u8>>,
+            std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        );
+        impl std::io::Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.0.read(buffer)?;
+                self.1.fetch_add(read, std::sync::atomic::Ordering::Relaxed);
+                Ok(read)
+            }
+        }
+        impl std::io::Seek for Counted {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(from)
+            }
+        }
+        let read = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entries = members
+            .iter()
+            .map(|(name, data)| {
+                let data = data.to_vec();
+                let read = read.clone();
+                super::StreamingEntry::new(
+                    name.as_bytes().to_vec(),
+                    crate::EntrySource::from_opener(data.len() as u64, move || {
+                        Ok(Box::new(Counted(
+                            std::io::Cursor::new(data.clone()),
+                            read.clone(),
+                        )))
+                    }),
+                )
+            })
+            .collect();
+        (entries, read)
+    }
+
+    #[test]
+    fn streamed_rar20_noise_is_stored_without_coding_it_first() {
+        // Sixteen dictionaries long, so the probe runs.
+        let mut options = rar20(1, false);
+        options.dictionary_size = Some(64 * 1024);
+        let len = 16 * 64 * 1024 + 4321;
+        let coding = || crate::MemberCoding::Compressed;
+
+        let noise = noise(len);
+        let (members, read) = read_counted(&[("noise.bin", &noise)]);
+        let out = streamed_with(&members, options, coding(), None).unwrap();
+        assert!(out.seeks > 0, "the member was not streamed");
+        // Four samples and one copy, not a whole coding pass and a copy.
+        let read = read.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            read < len + len / 2,
+            "read {read} bytes of a {len} byte member"
+        );
+        let archive = out.inner.into_inner();
+        // The archive the in-memory writer stores after coding it all.
+        assert_eq!(archive, in_memory_with(&members, options, coding()));
+        let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+        assert_eq!(parsed.files().next().unwrap().method, 0x30);
+
+        // A noisy start is not the member: the second sample shrinks.
+        let mut mixed = noise[..len / 4].to_vec();
+        mixed.extend_from_slice(&binary_member(len - len / 4));
+        let members = entries(&[("mixed.bin", &mixed)]);
+        let archive = streamed_with(&members, options, coding(), None)
+            .unwrap()
+            .inner
+            .into_inner();
+        assert_eq!(archive, in_memory_with(&members, options, coding()));
+        let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+        assert_ne!(parsed.files().next().unwrap().method, 0x30);
+        rar20_members(&archive, false, &[&mixed]);
     }
 }
