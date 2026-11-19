@@ -22,6 +22,7 @@
 use super::filter_policy::encode_member_with_filter_policy_candidates_and_progress;
 use super::filter_policy::{
     candidates_with_allowance, compression_info, should_store_compressed_payload,
+    within_filter_reach,
 };
 use super::FilterPolicy;
 use crate::codec::packed_chain::{PackedMatchFinder, SharedPackedIndex};
@@ -1517,16 +1518,24 @@ fn check_source_end(reader: &mut dyn Read) -> Result<()> {
 
 /// The part of an explicit filter that falls in a job's run, ranged over it.
 fn explicit_run_filter<B: Budget>(job: &mut BlockJob<B>, spec: &crate::FilterSpec) -> Result<()> {
-    let run = job.offset..job.offset + job.data.len();
-    let range = spec.range.clone().unwrap_or(run.clone());
-    let (start, end) = (range.start.max(run.start), range.end.min(run.end));
-    if start < end {
-        job.filters.push_growing(crate::FilterSpec::range(
-            spec.kind,
-            start - run.start..end - run.start,
-        ))?;
+    if let Some(range) = explicit_run_range(spec, job.offset..job.offset + job.data.len()) {
+        job.filters
+            .push_growing(crate::FilterSpec::range(spec.kind, range))?;
     }
     Ok(())
+}
+
+/// The part of `spec` that falls in `run`, a range of its member, ranged over
+/// the run. Nothing past [`FILTER_REACH`](super::filter_policy::FILTER_REACH)
+/// is filtered, so a run there is coded as it is, and no later run fails
+/// after the earlier ones were written.
+fn explicit_run_range(
+    spec: &crate::FilterSpec,
+    run: std::ops::Range<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let range = within_filter_reach(spec.range.clone().unwrap_or(run.clone()));
+    let (start, end) = (range.start.max(run.start), range.end.min(run.end));
+    (start < end).then(|| start - run.start..end - run.start)
 }
 
 /// Chooses each run's filters, in parallel and against the same admission as
@@ -1895,6 +1904,41 @@ pub(super) fn compress_members_reporting(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn explicit_filter_runs_past_4_gib_are_coded_unfiltered() {
+        use super::super::filter_policy::FILTER_REACH;
+        let e8 = crate::FilterKind::E8;
+        let run = 1 << 20;
+        let whole = crate::FilterSpec::whole(e8);
+        let at = |start: usize| start..start + run;
+        // Runs before 4 GiB keep the whole filter.
+        assert_eq!(
+            super::explicit_run_range(&whole, at(FILTER_REACH - 2 * run)),
+            Some(0..run)
+        );
+        // The run 4 GiB falls in is filtered up to it.
+        assert_eq!(
+            super::explicit_run_range(&whole, at(FILTER_REACH - 10)),
+            Some(0..10)
+        );
+        // Runs past it carry no filter, so the encoder never sees an offset
+        // it refuses.
+        for start in [FILTER_REACH, FILTER_REACH + 1, 3 * FILTER_REACH] {
+            assert_eq!(super::explicit_run_range(&whole, at(start)), None);
+            let ranged = crate::FilterSpec::range(e8, 0..start + run);
+            assert_eq!(super::explicit_run_range(&ranged, at(start)), None);
+        }
+        // A range is still cut to the run it falls in.
+        let ranged = crate::FilterSpec::range(e8, 100..FILTER_REACH + 100);
+        assert_eq!(super::explicit_run_range(&ranged, at(0)), Some(100..run));
+        assert_eq!(super::explicit_run_range(&ranged, at(run)), Some(0..run));
+        assert_eq!(
+            super::explicit_run_range(&ranged, at(2 * run)),
+            Some(0..run)
+        );
+    }
+
     #[cfg(all(
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))
