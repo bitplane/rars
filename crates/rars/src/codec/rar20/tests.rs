@@ -747,7 +747,7 @@ fn encoder_rejects_matches_beyond_the_configured_distance() {
 fn missing_literal_code_has_a_nonzero_refinement_cost() {
     let lengths = [0u8; super::TABLE_COUNT];
     let prices = CostModel::new(&lengths);
-    assert_eq!(prices.literal_bits(b"x", 0, 1), super::ABSENT_LITERAL_BITS);
+    assert_eq!(prices.literal_bits(b"x", 0, 1), super::ABSENT_SYMBOL_BITS);
 }
 
 #[test]
@@ -1661,4 +1661,70 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
             (25_937, 4_031_144_444),
         ]
     );
+}
+
+#[test]
+fn a_match_that_copies_the_last_one_becomes_a_repeat() {
+    let mut tokens = [
+        EncodeToken::Match {
+            length: 5,
+            offset: 300,
+        },
+        EncodeToken::Literal(b'x'),
+        EncodeToken::OldOffset {
+            index: 0,
+            length: 5,
+            offset: 300,
+        },
+        EncodeToken::ShortOffset { offset: 4 },
+        EncodeToken::ShortOffset { offset: 4 },
+        EncodeToken::Match {
+            length: 6,
+            offset: 4,
+        },
+    ];
+    super::use_repeats(&mut tokens, Some((5, 300)));
+    assert_eq!(
+        tokens,
+        [
+            EncodeToken::RepeatLast,
+            EncodeToken::Literal(b'x'),
+            EncodeToken::RepeatLast,
+            EncodeToken::ShortOffset { offset: 4 },
+            EncodeToken::RepeatLast,
+            EncodeToken::Match {
+                length: 6,
+                offset: 4,
+            },
+        ]
+    );
+}
+
+#[test]
+fn the_pre_table_codes_common_levels_shorter() {
+    let mut table = [0u8; super::TABLE_COUNT];
+    for (symbol, length) in table[..256].iter_mut().enumerate() {
+        *length = [8, 8, 8, 9, 10, 11, 12, 13][symbol % 8];
+    }
+    table[256] = 7;
+    let tokens = super::encode_table_level_tokens(&table);
+    let lengths = super::level_code_lengths_for_tokens(&tokens);
+    let mut used = [false; LEVEL_COUNT];
+    for token in &tokens {
+        used[token.symbol] = true;
+    }
+    let flat = level_code_lengths_for_used_symbols(used);
+    let bits = |lengths: &[u8; LEVEL_COUNT]| -> usize {
+        tokens
+            .iter()
+            .map(|token| usize::from(lengths[token.symbol]))
+            .sum()
+    };
+    assert!(bits(&lengths) < bits(&flat), "{lengths:?} against {flat:?}");
+    let kraft: u32 = lengths
+        .iter()
+        .filter(|&&len| len != 0)
+        .map(|&len| 1u32 << (15 - len))
+        .sum();
+    assert_eq!(kraft, 1 << 15, "{lengths:?} leaves part of the code unused");
 }

@@ -79,6 +79,10 @@ pub struct EncodeOptions {
     /// Parse by shortest path rather than greedily. Costs several times the
     /// encode time, so it belongs at the top of the level ladder.
     pub optimal_parse: bool,
+    /// Priced re-parses beyond the ones a block needs to settle its tables.
+    /// Each is kept only if it packs the block smaller, so adding them never
+    /// makes the output larger.
+    pub extra_priced_passes: usize,
     pub try_audio: bool,
 }
 
@@ -90,6 +94,7 @@ impl EncodeOptions {
             lazy_matching: false,
             lazy_lookahead: 1,
             optimal_parse: false,
+            extra_priced_passes: 0,
             try_audio: true,
         }
     }
@@ -110,6 +115,11 @@ impl EncodeOptions {
 
     pub const fn with_optimal_parse(mut self, enabled: bool) -> Self {
         self.optimal_parse = enabled;
+        self
+    }
+
+    pub const fn with_extra_priced_passes(mut self, passes: usize) -> Self {
+        self.extra_priced_passes = passes;
         self
     }
 
@@ -530,8 +540,10 @@ fn code_lz_block(
     // Re-parse against the prices the first pass implies, then again against
     // the prices that produced. A greedy parse has converged by the first
     // re-parse and a second buys 0.02%, but the shortest-path parse is far more
-    // sensitive to its prices and a second pass is worth 0.12% to it.
-    let refinements = if options.optimal_parse { 2 } else { 1 };
+    // sensitive to its prices and a second pass is worth 0.12% to it. A third
+    // and fourth buy another 0.06% on the bench's small members and 0.03% on its
+    // 4 MiB text and binaries, which is what level 5 is for.
+    let refinements = if options.optimal_parse { 2 } else { 1 } + options.extra_priced_passes;
     // Matches do not depend on prices, so both priced passes share one search.
     let matches = if options.optimal_parse {
         Some(collect_match_lists(window, start, window.len(), options))
@@ -542,7 +554,8 @@ fn code_lz_block(
     let mut poll = progress.map(|report| move |_: usize| report(span));
     let mut best_table = table_lengths;
     for _ in 0..refinements {
-        let cost_model = CostModel::new(&best_table);
+        let prices = absent_priced(&best_table);
+        let cost_model = CostModel::new(&prices);
         let next_tokens = encode_tokens_with_progress(
             window,
             start,
@@ -564,6 +577,42 @@ fn code_lz_block(
         best_state = state.after(&next_tokens);
     }
     Ok((best, best_state))
+}
+
+/// The table a priced pass reads its prices from, with every symbol the last
+/// pass left without a code priced as dear as an absent literal.
+///
+/// Read as it stands, a missing length or offset slot costs nothing but its
+/// extra bits, so the parse spends the next table on symbols it chose because
+/// they looked free. Pricing them like a missing literal is worth 0.14% at
+/// levels 4 and 5 on the bench's small members and 0.05% at level 3.
+fn absent_priced(table: &[u8; TABLE_COUNT]) -> [u8; TABLE_COUNT] {
+    table.map(|length| match length {
+        0 => ABSENT_SYMBOL_BITS as u8,
+        length => length,
+    })
+}
+
+/// Swaps each match that copies what the one before it did, length and
+/// offset both, for the repeat symbol, which says the same with no length or
+/// offset. The shortest-path parse does not know the symbol, so it is found
+/// after the parse; the greedy one already uses it as it goes. The reader
+/// moves its recent offsets the same way for either, so nothing after the
+/// swap changes.
+fn use_repeats(tokens: &mut [EncodeToken], mut last_match: Option<(usize, usize)>) {
+    for token in tokens {
+        let this = match *token {
+            EncodeToken::Literal(_) => continue,
+            EncodeToken::RepeatLast => last_match.expect("a repeat follows a match"),
+            EncodeToken::OldOffset { length, offset, .. }
+            | EncodeToken::Match { length, offset } => (usize::from(length), offset as usize),
+            EncodeToken::ShortOffset { offset } => (2, offset as usize),
+        };
+        if last_match == Some(this) {
+            *token = EncodeToken::RepeatLast;
+        }
+        last_match = Some(this);
+    }
 }
 
 /// `more` when another block follows, whose tables symbol 269 announces.
@@ -1142,14 +1191,16 @@ fn encode_tokens_with_progress(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     if let (Some(cost_model), Some(matches)) = (cost_model, matches) {
-        return Ok(encode_tokens_optimal(
+        let mut tokens = encode_tokens_optimal(
             combined,
             start,
             combined.len(),
             matches,
             cost_model,
             state.old_offsets,
-        ));
+        );
+        use_repeats(&mut tokens, state.last_match);
+        return Ok(tokens);
     }
     let mut tokens = Vec::new();
     // No match reaches past the dictionary, so the finder need not either.
@@ -1251,8 +1302,8 @@ fn encode_tokens_with_progress(
     Ok(tokens)
 }
 
-/// Stand-in price for a literal the current table has no code for.
-const ABSENT_LITERAL_BITS: usize = 15;
+/// Stand-in price for a symbol the current table has no code for.
+const ABSENT_SYMBOL_BITS: usize = 15;
 
 #[derive(Debug, Clone, Copy)]
 struct CostModel<'a> {
@@ -1292,7 +1343,7 @@ impl<'a> CostModel<'a> {
 
     fn literal_price(self, byte: u8) -> usize {
         match self.main[usize::from(byte)] {
-            0 => ABSENT_LITERAL_BITS,
+            0 => ABSENT_SYMBOL_BITS,
             bits => usize::from(bits),
         }
     }
@@ -1982,12 +2033,26 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
     }
 }
 
+/// Codes the level alphabet by how often each symbol is used, not by how many
+/// of them appear.
+///
+/// A flat code charges every symbol in play the same, so a table spelled
+/// mostly in a few lengths pays as if they were spread evenly. On the bench's
+/// small members, where the tables are a tenth of the packed bytes, that was
+/// an eighth of every table and the whole of the gap to RAR 2.50 there.
+///
+/// The 19 lengths are written four bits each, hence the cap of 15.
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
-    let mut used = [false; LEVEL_COUNT];
+    let mut frequencies = [0usize; LEVEL_COUNT];
     for token in tokens {
-        used[token.symbol] = true;
+        frequencies[token.symbol] += 1;
     }
-    level_code_lengths_for_used_symbols(used)
+    // One symbol in play gives a code with one branch and an empty slot beside
+    // it, which a strict reader rejects. Only the flat assignment pads it.
+    if frequencies.iter().filter(|&&count| count != 0).count() <= 1 {
+        return level_code_lengths_for_used_symbols(frequencies.map(|count| count != 0));
+    }
+    huffman::lengths_for_frequency_array(&frequencies, 15)
 }
 
 /// A whole member coded as one audio block.
@@ -2040,8 +2105,10 @@ fn code_audio_block(
         }
     }
 
-    let level_symbols = encode_audio_table_level_symbols(&levels);
-    let level_lengths = level_code_lengths_for_symbols(&level_symbols);
+    // The reader runs one loop over either kind of table, so audio levels take
+    // the same run symbols as LZ ones.
+    let level_tokens = encode_level_tokens(&levels);
+    let level_lengths = level_code_lengths_for_tokens(&level_tokens);
     let level_codes = canonical_codes(&level_lengths)?;
     let mut bits = BitWriter::default();
     bits.write_bits(0b10, 2); // audio block, do not keep previous tables.
@@ -2049,12 +2116,14 @@ fn code_audio_block(
     for &len in &level_lengths {
         bits.write_bits(len as u32, 4);
     }
-    for symbol in level_symbols {
-        let code = level_codes[symbol].ok_or(Error::InvalidData(
+    for token in level_tokens {
+        let code = level_codes[token.symbol].ok_or(Error::InvalidData(
             "RAR 2.0 encoder missing audio-level Huffman code",
         ))?;
         bits.write_bits(code.code as u32, code.len);
-        // Audio levels are emitted directly as 0..=15, without run symbols.
+        if token.extra_bits != 0 {
+            bits.write_bits(token.extra_value as u32, token.extra_bits);
+        }
     }
 
     let audio_codes = (0..channels)
@@ -2073,18 +2142,6 @@ fn code_audio_block(
         bits.write_bits(code.code as u32, code.len);
     }
     Ok((bits, coder))
-}
-
-fn encode_audio_table_level_symbols(levels: &[u8]) -> Vec<usize> {
-    levels.iter().map(|&len| len as usize).collect()
-}
-
-fn level_code_lengths_for_symbols(symbols: &[usize]) -> [u8; LEVEL_COUNT] {
-    let mut used = [false; LEVEL_COUNT];
-    for &symbol in symbols {
-        used[symbol] = true;
-    }
-    level_code_lengths_for_used_symbols(used)
 }
 
 fn level_code_lengths_for_used_symbols(used: [bool; LEVEL_COUNT]) -> [u8; LEVEL_COUNT] {
