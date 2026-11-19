@@ -478,10 +478,8 @@ fn encode_member<'a>(
     )?;
 
     // A stored member never needs to be resident: checksum it from its source
-    // and let the writer copy it straight through.
-    if let (MemberCoding::Stored, None, Some(source)) =
-        (coding, member.password, member.bytes.source())
-    {
+    // and let the writer copy it straight through, encrypting as it goes.
+    if let (MemberCoding::Stored, Some(source)) = (coding, member.bytes.source()) {
         return Ok(EncodedMember {
             payload: MemberPayload::Copied(source),
             method: METHOD_STORE,
@@ -567,8 +565,7 @@ fn write_member(
             }
             MemberPayload::Packed(packed)
         }
-        // Unencrypted by construction, so the stored bytes are their own
-        // payload.
+        // Encrypted, if at all, as it is copied: the cipher keeps the size.
         copied => copied,
     };
     let packed_size = payload.size(encoded.unpacked_size as u64);
@@ -604,6 +601,18 @@ fn write_member(
     )?;
     output.write_all(&header)?;
     if matches!(payload, MemberPayload::Copied(_)) {
+        let mut encrypting;
+        let output: &mut dyn Write = match member.password {
+            Some(password) => {
+                encrypting = Rar13EncryptingWriter {
+                    inner: output,
+                    cipher: Rar13Cipher::for_password(password)?,
+                    buffer: Vec::new(),
+                };
+                &mut encrypting
+            }
+            None => output,
+        };
         let mut checksum = Rar13Checksum::new();
         payload.write_to(
             &mut Rar13ChecksumWriter {
@@ -620,6 +629,31 @@ fn write_member(
         Ok(())
     } else {
         payload.write_to(output, u64::from(packed_size))
+    }
+}
+
+/// Encrypts a copied member as it passes through, a chunk at a time.
+struct Rar13EncryptingWriter<'a> {
+    inner: &'a mut dyn Write,
+    cipher: Rar13Cipher,
+    buffer: Vec<u8>,
+}
+
+impl Write for Rar13EncryptingWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let take = buf.len().min(64 * 1024);
+        self.buffer.clear();
+        self.buffer.extend(
+            buf[..take]
+                .iter()
+                .map(|&byte| self.cipher.encrypt_byte(byte)),
+        );
+        self.inner.write_all(&self.buffer)?;
+        Ok(take)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -3819,5 +3853,50 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
         assert_eq!(cancelling.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn an_encrypted_stored_member_is_encrypted_as_it_is_copied() {
+        let data: Vec<u8> = (0..4 * 1024 * 1024 + 7u32)
+            .map(|at| (at ^ (at >> 11)) as u8)
+            .collect();
+        let options = WriterOptions::new(ArchiveVersion::Rar14, FeatureSet::store_only());
+        let whole = write_stored_archive(
+            &[StoredEntry {
+                name: b"secret.bin",
+                data: &data,
+                file_time: 0,
+                file_attr: 0x20,
+                password: Some(b"password"),
+                file_comment: None,
+            }],
+            options,
+        )
+        .unwrap();
+
+        let (source, watch) = crate::write_stream::watched_source(data.clone());
+        let mut entry = StreamingEntry::new(b"secret.bin".to_vec(), source);
+        entry.file_attr = 0x20;
+        entry.password = Some(b"password".to_vec());
+        let mut streamed = Vec::new();
+        write_streaming_archive_to(
+            &[entry],
+            options,
+            MemberCoding::Stored,
+            None,
+            &WriterResources::default(),
+            None,
+            &mut watch.sink(&mut streamed),
+        )
+        .unwrap();
+
+        assert_eq!(streamed, whole);
+        // Read as it was written, so never held whole.
+        let written = watch.written_while_reading();
+        assert!(
+            written + 1024 * 1024 >= data.len() as u64,
+            "only {written} bytes were written while the member was read"
+        );
     }
 }

@@ -329,10 +329,16 @@ pub(super) fn split_members_above(
         let packed_source_len = bytes.len()?;
         let packed_len = cipher.packed_len(packed_source_len)?;
         let stored_work = (!compresses).then_some(&work);
-        let payload = PackedStream::open(bytes, packed_source_len, &cipher, progress, stored_work)
-            .map_err(|error| {
-                crate::write_stream::member_error(error, name, "encrypting volume member")
-            })?;
+        let payload = PackedStream::open(
+            bytes,
+            packed_source_len,
+            &cipher,
+            Some(progress),
+            stored_work,
+        )
+        .map_err(|error| {
+            crate::write_stream::member_error(error, name, "encrypting volume member")
+        })?;
         let volume_member = VolumeMember {
             head: FragmentHead {
                 name,
@@ -1092,7 +1098,7 @@ impl<'a> CipherPlan<'a> {
     }
 
     /// RAR 2.0 onwards encrypts in 16-byte blocks and pads the last one.
-    fn pads(&self) -> bool {
+    pub(super) fn pads(&self) -> bool {
         self.password.is_some() && self.target != ArchiveVersion::Rar15
     }
 
@@ -1161,7 +1167,7 @@ impl Cipher {
 }
 
 /// The member as stored: read in pieces, encrypted and padded if asked.
-struct PackedStream<'a> {
+pub(super) struct PackedStream<'a> {
     reader: Box<dyn Read + 'a>,
     expected: u64,
     left: u64,
@@ -1170,16 +1176,16 @@ struct PackedStream<'a> {
     buffer: Vec<u8>,
     position: usize,
     unpacked_crc: Crc32,
-    progress: ProgressReporter<'a>,
+    progress: Option<ProgressReporter<'a>>,
     work: Option<&'a WorkTracker<'a>>,
 }
 
 impl<'a> PackedStream<'a> {
-    fn open(
+    pub(super) fn open(
         bytes: &MemberBytes<'a>,
         expected: u64,
         cipher: &CipherPlan<'_>,
-        progress: ProgressReporter<'a>,
+        progress: Option<ProgressReporter<'a>>,
         work: Option<&'a WorkTracker<'a>>,
     ) -> Result<Self> {
         Ok(Self {
@@ -1196,12 +1202,12 @@ impl<'a> PackedStream<'a> {
         })
     }
 
-    fn unpacked_crc(&self) -> u32 {
+    pub(super) fn unpacked_crc(&self) -> u32 {
         self.unpacked_crc.finish()
     }
 
     /// Copies the next `len` packed bytes to `out`, returning their CRC.
-    fn copy(&mut self, mut len: u64, out: &mut dyn Write) -> Result<u32> {
+    pub(super) fn copy(&mut self, mut len: u64, out: &mut dyn Write) -> Result<u32> {
         let mut crc = Crc32::new();
         while len > 0 {
             if self.position == self.buffer.len() {
@@ -1219,7 +1225,7 @@ impl<'a> PackedStream<'a> {
 
     fn fill(&mut self) -> Result<()> {
         const CHANGED: &str = "entry source size changed while writing";
-        crate::write_progress::check_cancelled(Some(self.progress))?;
+        crate::write_progress::check_cancelled(self.progress)?;
         if self.left == 0 {
             return Err(Error::WriterFailure(
                 "legacy volume payload ran past the member",
