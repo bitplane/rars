@@ -26,6 +26,7 @@ const FORMATS: [ArchiveVersion; 7] = [
 ];
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_legacy_volumes_preserve_non_utf8_password_failure_context() {
     let payload = b"legacy compressed volume payload".repeat(32);
     for format in [
@@ -106,6 +107,7 @@ fn invalid_legacy_compression_level_fails_before_member_io_or_output() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_header_encryption_requires_password_before_member_io_or_output() {
     let entries = [rar15_40::StreamingEntry::new(
         b"member".to_vec(),
@@ -359,6 +361,7 @@ fn legacy_source_length_failure_identifies_the_member_before_output() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_archive_rejects_modern_target_before_encrypted_member_io() {
     let entries = [rar15_40::StreamingEntry::new(
         b"file".to_vec(),
@@ -384,6 +387,7 @@ fn legacy_archive_rejects_modern_target_before_encrypted_member_io() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_volume_preflight_rejects_unsupported_options_and_empty_payloads() {
     let entry = rar15_40::StoredEntry {
         name: b"member",
@@ -485,6 +489,9 @@ fn volume_validation_identifies_members_but_not_global_options() {
 #[test]
 fn encrypted_and_plain_volume_framing_failures_identify_the_member() {
     for encrypted in [false, true] {
+        if encrypted && !cfg!(feature = "encryption") {
+            continue;
+        }
         let name = vec![b'a'; 65535];
         let mut builder = Builder::new(ArchiveVersion::Rar30)
             .store(true)

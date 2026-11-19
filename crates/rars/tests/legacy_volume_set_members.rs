@@ -1,3 +1,5 @@
+#![cfg(feature = "write")]
+
 use rars::rar15_40::{
     extract_volumes_to, write_volumes_to, Archive, CollectedVolumes, EntrySource, MemberCoding,
     StreamingEntry, WriterOptions,
@@ -209,6 +211,9 @@ fn compressed_sets_can_be_solid_encrypted_or_both() {
             (true, false, Some(&b"secret"[..])),
             (false, true, Some(&b"secret"[..])),
         ] {
+            if password.is_some() && !cfg!(feature = "encryption") {
+                continue;
+            }
             if header_encryption && target == ArchiveVersion::Rar20 {
                 continue;
             }

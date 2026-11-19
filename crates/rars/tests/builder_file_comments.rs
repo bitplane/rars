@@ -6,6 +6,7 @@ use rars::{
 };
 
 #[test]
+#[cfg(feature = "recovery")]
 fn recovery_service_does_not_change_rar5_member_comments() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -101,6 +102,7 @@ fn comments_follow_renames_and_round_trip_through_supported_writers() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_headers_reject_incompatible_embedded_comments() {
     for version in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let mut builder = Builder::new(version)
@@ -159,6 +161,7 @@ fn volume_output_refuses_comments_even_when_configured_after_the_comment() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rar5_file_comments_follow_output_encryption_and_can_be_removed() {
     let mut builder = Builder::new(ArchiveVersion::Rar50).password(Some(b"secret".to_vec()));
     builder
@@ -236,6 +239,7 @@ fn preflight_accepts_attached_comments_but_rejects_duplicates_and_read_checks_in
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_archive_comment_encryption_is_independent_of_member_passwords() {
     for encrypted_headers in [false, true] {
         let password = b"secret";

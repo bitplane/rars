@@ -471,6 +471,7 @@ fn a_missing_volume_is_reported_the_same_inside_and_between_members() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rar3_volumes_rars_writes_record_their_numbers() {
     // Each volume's number, after checking its end block's data CRC covers
     // every byte before the block, as RAR 3.93's does.

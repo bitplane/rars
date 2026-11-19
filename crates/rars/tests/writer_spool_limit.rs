@@ -16,7 +16,11 @@ fn spool_quota_does_not_change_successful_archive_bytes() {
             (false, true, false),
             (true, false, true),
             (false, false, true),
-        ] {
+        ]
+        .into_iter()
+        // Recovery rows need the recovery feature.
+        .filter(|&(_, _, recovery)| cfg!(feature = "recovery") || !recovery)
+        {
             let mut builder = Builder::new(target)
                 .store(stored)
                 .solid(solid)
@@ -77,6 +81,7 @@ fn spool_refusal_is_typed_and_resources_can_be_reused_after_failure() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn recovery_payload_growth_preserves_spool_error_details() {
     let root = scratch::case("writer-spool-recovery");
     let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -101,6 +106,7 @@ fn recovery_payload_growth_preserves_spool_error_details() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_volume_preparation_uses_the_shared_spool_quota() {
     use rars::rar50::{
         write_streaming_volumes_to, ArchiveEntry, ArchiveExtras, CollectedVolumes, WriterOptions,
@@ -315,19 +321,22 @@ fn quick_open_payload_obeys_exact_spool_limit_and_cleans_up() {
             ArchiveReader::read(&output).unwrap().test(None).unwrap();
             assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
         }
-        let recovery = builder.recovery_percent(Some(10));
-        let mut recovered = Vec::new();
-        recovery
-            .write_to(
-                &mut recovered,
-                &WriterResources::default()
-                    .with_temp_dir(&*root)
-                    .with_max_spool_bytes(1 << 20),
-                None,
-            )
-            .unwrap();
-        ArchiveReader::read(&recovered).unwrap().test(None).unwrap();
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        #[cfg(feature = "recovery")]
+        {
+            let recovery = builder.recovery_percent(Some(10));
+            let mut recovered = Vec::new();
+            recovery
+                .write_to(
+                    &mut recovered,
+                    &WriterResources::default()
+                        .with_temp_dir(&*root)
+                        .with_max_spool_bytes(1 << 20),
+                    None,
+                )
+                .unwrap();
+            ArchiveReader::read(&recovered).unwrap().test(None).unwrap();
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
     }
 }
 

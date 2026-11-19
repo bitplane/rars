@@ -47,6 +47,7 @@ fn cancellation_from_the_last_directory_callback_is_not_success() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn compressed_encrypted_splits_keep_cancellation_ahead_of_checksum_diagnostics() {
     let mut state = 0x1234_5678u32;
     let noise: Vec<u8> = (0..4096)
@@ -292,6 +293,7 @@ fn extraction_observes_callbacks_without_retaining_parse_policy() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn cancellation_stops_solid_history_and_encrypted_split_extraction() {
     for format in [
         ArchiveVersion::Rar15,

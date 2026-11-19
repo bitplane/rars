@@ -3,6 +3,7 @@
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 
 #[test]
+#[cfg(feature = "encryption")]
 fn dictionary_limit_covers_streaming_and_encrypted_split_members() {
     let mut state = 0x1234_5678u32;
     let noise: Vec<u8> = (0..4096)

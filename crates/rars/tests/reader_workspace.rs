@@ -105,6 +105,7 @@ fn limited_parallel_legacy_extraction_handles_directories_and_stored_files() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn workspace_refusal_is_not_remapped_to_a_password_or_integrity_failure() {
     for version in [
         ArchiveVersion::Rar13,

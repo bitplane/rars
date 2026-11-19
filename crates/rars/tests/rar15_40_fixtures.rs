@@ -7,12 +7,14 @@ mod volume_size;
 
 use rars::crc32::crc32;
 use rars::rar15_40::{
-    extract_volumes_to, repair_rev3_volumes_to, write_compressed_archive,
-    write_compressed_archive_with_comment, write_compressed_volumes,
-    write_rar29_compressed_archive_with_filter_policy, write_stored_archive,
-    write_stored_archive_with_comment, write_stored_volumes, Archive, Block, FileEntry, FilterKind,
-    FilterPolicy, FilterSpec, NewSubKind, ProtectHeader, Rar29Method, StoredEntry, WriterOptions,
+    extract_volumes_to, write_compressed_archive, write_compressed_archive_with_comment,
+    write_compressed_volumes, write_rar29_compressed_archive_with_filter_policy,
+    write_stored_archive, write_stored_archive_with_comment, write_stored_volumes, Archive, Block,
+    FileEntry, FilterKind, FilterPolicy, FilterSpec, NewSubKind, Rar29Method, StoredEntry,
+    WriterOptions,
 };
+#[cfg(feature = "recovery")]
+use rars::rar15_40::{repair_rev3_volumes_to, ProtectHeader};
 use rars::{
     detect_archive_family, ArchiveFamily, ArchiveReadOptions, ArchiveVersion, Error, FeatureSet,
 };
@@ -323,6 +325,7 @@ fn run_reference_unrar(reference: &ReferenceUnrar, archive_path: &Path) -> std::
         .unwrap()
 }
 
+#[cfg(feature = "recovery")]
 fn repair_rev3_volumes(
     data_volumes: &[Option<&[u8]>],
     recovery_count: usize,
@@ -785,6 +788,7 @@ fn generated_rar29_solid_e8_filtered_archive_round_trips() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn generated_rar29_encrypted_e8_filtered_archive_round_trips() {
     let payload = b"\xe8\0\0\0\0rar29 encrypted e8 filtered payload\n".repeat(12);
     let entries = [FileEntry {
@@ -818,6 +822,7 @@ fn generated_rar29_encrypted_e8_filtered_archive_round_trips() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn generated_rar30_header_encrypted_e8_filtered_archive_round_trips() {
     let payload = b"\xe8\0\0\0\0rar30 header encrypted e8 filtered payload\n".repeat(12);
     let entries = [FileEntry {
@@ -1752,6 +1757,9 @@ fn extracts_file_data_when_a_nested_legacy_comment_header_is_malformed() {
 fn extracts_stored_newsub_comments_with_and_without_encryption() {
     let plain = b"stored service comment";
     for password in [None, Some(b"secret".as_slice())] {
+        if password.is_some() && !cfg!(feature = "encryption") {
+            continue;
+        }
         let entry = StoredEntry {
             name: b"CMT",
             data: plain,
@@ -1931,6 +1939,7 @@ fn extracts_stored_solid_flagged_member_via_parallel_entry_point() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_unsupported_stored_split_cipher_without_decoding_or_diagnostics() {
     let entry = StoredEntry {
         name: b"file",
@@ -1973,6 +1982,7 @@ fn rejects_unsupported_stored_split_cipher_without_decoding_or_diagnostics() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_stored_members_through_public_member_writer_for_each_cipher() {
     for version in [
         ArchiveVersion::Rar15,
@@ -2819,6 +2829,7 @@ fn rar20_writer_stores_member_when_lz_payload_would_grow() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar20_archives_that_reader_extracts_with_password() {
     let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar20, features);
@@ -2877,6 +2888,7 @@ fn writes_encrypted_rar20_archives_that_reader_extracts_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar29_archives_that_reader_extracts_with_password() {
     let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar29, features);
@@ -4565,6 +4577,7 @@ fn writes_solid_compressed_rar15_archive_that_reader_extracts() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar15_archives_that_reader_extracts_with_password() {
     let features = FeatureSet::store_only();
 
@@ -4615,6 +4628,7 @@ fn writes_encrypted_rar15_archives_that_reader_extracts_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_aes_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
     let features = FeatureSet::store_only();
 
@@ -4680,6 +4694,7 @@ fn writes_aes_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_passwor
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let mut features = FeatureSet::store_only();
@@ -4718,6 +4733,7 @@ fn writes_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_pass
 /// looks, which is why every header-encrypted archive we wrote was unreadable in
 /// 7-Zip and nothing said so.
 #[test]
+#[cfg(feature = "encryption")]
 fn a_header_encrypted_archive_ends_with_an_end_of_archive_block() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let mut features = FeatureSet::store_only();
@@ -4743,6 +4759,7 @@ fn a_header_encrypted_archive_ends_with_an_end_of_archive_block() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_solid_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         let mut features = FeatureSet::store_only();
@@ -4788,6 +4805,7 @@ fn writes_solid_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_wit
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rar3_and_rar4_aes_writer_uses_fresh_salts() {
     let features = FeatureSet::store_only();
     let entry = [FileEntry {
@@ -4933,7 +4951,11 @@ fn solid_compressed_volume_sets_keep_the_solid_main_flag() {
         (ArchiveVersion::Rar20, false),
         (ArchiveVersion::Rar29, false),
         (ArchiveVersion::Rar30, true),
-    ] {
+    ]
+    .into_iter()
+    // Encrypted rows need the encryption feature.
+    .filter(|&(_, encrypted)| cfg!(feature = "encryption") || !encrypted)
+    {
         let mut features = FeatureSet::store_only();
         features.solid = true;
         features.header_encryption = encrypted_headers;
@@ -5073,6 +5095,7 @@ fn writes_compressed_rar29_volume_set_that_reader_reassembles() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
     let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar15, features);
@@ -5135,6 +5158,7 @@ fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
     let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar20, features);
@@ -5201,6 +5225,7 @@ fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar29_volume_sets_that_reader_reassembles_with_password() {
     let features = FeatureSet::store_only();
     let options = WriterOptions::new(ArchiveVersion::Rar29, features);
@@ -5275,6 +5300,7 @@ fn writes_encrypted_rar29_volume_sets_that_reader_reassembles_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_encrypted_rar3_and_rar4_volume_sets_that_reader_reassembles_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         assert_encrypted_rar3_volume_sets_round_trip(target);
@@ -5282,12 +5308,14 @@ fn writes_encrypted_rar3_and_rar4_volume_sets_that_reader_reassembles_with_passw
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn writes_header_encrypted_rar3_and_rar4_volume_sets_that_reader_reassembles_with_password() {
     for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
         assert_header_encrypted_rar3_volume_sets_round_trip(target);
     }
 }
 
+#[cfg(feature = "encryption")]
 fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
     let features = FeatureSet::store_only();
     let options = WriterOptions::new(target, features);
@@ -5371,6 +5399,7 @@ fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
     assert_eq!(extracted[0].data, compressed.data);
 }
 
+#[cfg(feature = "encryption")]
 fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
     let mut features = FeatureSet::store_only();
     features.header_encryption = true;
@@ -5494,6 +5523,7 @@ fn extracts_rars_generated_rar15_writer_oracles() {
 /// The other oracles in that directory are pinned by size and CRC alone. This
 /// one is pinned byte for byte, because the file comment inside it is the one
 /// piece of the RAR 1.5 header layout the writer got wrong for six releases.
+#[cfg(feature = "encryption")]
 fn rars_generated_comments_archive() -> Vec<u8> {
     let entries = [FileEntry {
         name: b"payload.txt",
@@ -5510,6 +5540,7 @@ fn rars_generated_comments_archive() -> Vec<u8> {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
     let comment_bytes = std::fs::read(fixture("rars_generated/comments.rar")).unwrap();
     let comment_archive = Archive::parse(&comment_bytes).unwrap();
@@ -5549,6 +5580,7 @@ fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rars_generated_rar15_writer_volume_oracles() {
     let stored_archives: Vec<_> = [
         "rars_generated/split-store.rar",
@@ -5583,6 +5615,7 @@ fn extracts_rars_generated_rar15_writer_volume_oracles() {
 /// RAR 1.5 has no header encryption, and used to be told so only by a message
 /// naming neither the option nor a format that does support it.
 #[test]
+#[cfg(feature = "encryption")]
 fn rar15_writer_rejects_header_encryption_by_name() {
     let mut features = FeatureSet::store_only();
     features.header_encryption = true;
@@ -5756,6 +5789,7 @@ fn a_written_file_comment_matches_the_block_winrar_writes() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn an_encrypted_member_with_a_comment_keeps_its_header_checksum() {
     // The comment sits outside the header CRC, the salt inside it. Reading the
     // salt as part of the comment cost eight bytes of coverage and left an
@@ -5789,6 +5823,7 @@ fn an_encrypted_member_with_a_comment_keeps_its_header_checksum() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar202_encrypted_files_with_rar20_cipher() {
     let bytes = std::fs::read(fixture("rar202/comment_psw.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -5812,6 +5847,7 @@ fn extracts_rar202_encrypted_files_with_rar20_cipher() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_wrong_password_for_rar20_encrypted_file_as_password_error() {
     let bytes = std::fs::read(fixture("rar202/comment_psw.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -5823,6 +5859,7 @@ fn rejects_wrong_password_for_rar20_encrypted_file_as_password_error() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn header_encrypted_rar3_archive_requires_password_to_parse() {
     let bytes = std::fs::read(fixture("encrypted/header_enc_1234.rar")).unwrap();
 
@@ -5830,6 +5867,7 @@ fn header_encrypted_rar3_archive_requires_password_to_parse() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn header_encrypted_rar3_rejects_non_utf8_password_before_decryption() {
     let bytes = std::fs::read(fixture("encrypted/header_enc_1234.rar")).unwrap();
     let expected = |result: Result<Archive, Error>| {
@@ -5849,6 +5887,7 @@ fn header_encrypted_rar3_rejects_non_utf8_password_before_decryption() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar300_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("encrypted/header_rar300_password.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -5866,6 +5905,7 @@ fn extracts_rar300_header_encrypted_archive_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parses_rar300_header_encrypted_archive_from_path_with_password() {
     let archive = Archive::parse_path_with_password(
         fixture("encrypted/header_rar300_password.rar"),
@@ -5881,6 +5921,7 @@ fn parses_rar300_header_encrypted_archive_from_path_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn header_encrypted_archives_reject_a_wrong_password_at_open() {
     for name in [
         "encrypted/header_rar300_password.rar",
@@ -5899,6 +5940,7 @@ fn header_encrypted_archives_reject_a_wrong_password_at_open() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn header_encrypted_archive_with_a_damaged_second_header_is_not_a_wrong_password() {
     let mut bytes = std::fs::read(fixture("encrypted/header_rar300_password.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -5920,6 +5962,7 @@ fn header_encrypted_archive_with_a_damaged_second_header_is_not_a_wrong_password
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar420_header_encrypted_archive_with_password() {
     let bytes = std::fs::read(fixture("encrypted/header_rar420_password.rar")).unwrap();
     let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
@@ -5937,6 +5980,7 @@ fn extracts_rar420_header_encrypted_archive_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn parses_rar420_header_encrypted_archive_from_path_with_password() {
     let archive = Archive::parse_path_with_password(
         fixture("encrypted/header_rar420_password.rar"),
@@ -5952,6 +5996,7 @@ fn parses_rar420_header_encrypted_archive_from_path_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar300_aes_encrypted_file_with_password() {
     let bytes = std::fs::read(fixture("encrypted/per_file_rar300_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -5978,6 +6023,7 @@ fn extracts_rar300_aes_encrypted_file_with_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_wrong_password_for_rar3_encrypted_file_as_password_error() {
     let bytes = std::fs::read(fixture("encrypted/per_file_rar300_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -5989,6 +6035,7 @@ fn rejects_wrong_password_for_rar3_encrypted_file_as_password_error() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar4_aes_encrypted_compressed_member() {
     let bytes = std::fs::read(fixture("encrypted/per_file_rar4_libarchive_mixed.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6008,6 +6055,7 @@ fn extracts_rar4_aes_encrypted_compressed_member() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar4_encrypted_member_with_correct_password() {
     let bytes = std::fs::read(fixture("encrypted/rar4_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6030,6 +6078,7 @@ fn extracts_rar4_encrypted_member_with_correct_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_wrong_password_for_rar4_encrypted_file_as_password_error() {
     let bytes = std::fs::read(fixture("encrypted/rar4_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6041,6 +6090,7 @@ fn rejects_wrong_password_for_rar4_encrypted_file_as_password_error() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar4_header_encrypted_member_with_correct_password() {
     let bytes = std::fs::read(fixture("encrypted/rar4_header_encrypted.rar")).unwrap();
 
@@ -6056,6 +6106,7 @@ fn extracts_rar4_header_encrypted_member_with_correct_password() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn decodes_rar4_compact_unicode_name_before_extraction() {
     let bytes = std::fs::read(fixture("encrypted/rar4_unicode_name_encrypted.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6072,6 +6123,7 @@ fn decodes_rar4_compact_unicode_name_before_extraction() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar4_encrypted_files_and_directories_archive() {
     let bytes = std::fs::read(fixture("encrypted/rar4_encrypted_files_and_dirs.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6102,6 +6154,7 @@ fn extracts_rar4_encrypted_files_and_directories_archive() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar4_mixed_visible_names_known_password_fixture() {
     let bytes = std::fs::read(fixture("encrypted/rar4_mixed_visible_names_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6278,6 +6331,7 @@ fn extracts_rar154_unp15_compressed_file() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_rar154_crypt15_encrypted_compressed_file() {
     let bytes = std::fs::read(fixture("rar154/readme_154_password.rar")).unwrap();
     let expected = std::fs::read(fixture("rar154/expected/README.md")).unwrap();
@@ -6301,6 +6355,7 @@ fn extracts_rar154_crypt15_encrypted_compressed_file() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rejects_wrong_password_for_rar15_encrypted_file_as_password_error() {
     let bytes = std::fs::read(fixture("rar154/readme_154_password.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6419,6 +6474,7 @@ fn rewrite_recovery_header_crc(bytes: &mut [u8], offset: usize, head_size: usize
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar250_recovery_rejects_invalid_mark_in_archive_bytes() {
     let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6435,6 +6491,7 @@ fn rar250_recovery_rejects_invalid_mark_in_archive_bytes() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar250_recovery_rejects_zero_parity_record_in_archive_bytes() {
     let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6457,6 +6514,7 @@ fn rar250_recovery_rejects_zero_parity_record_in_archive_bytes() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar250_recovery_rejects_protected_range_past_archive_end() {
     let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6515,6 +6573,7 @@ fn rar250_parser_rejects_inconsistent_recovery_header_geometry() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar250_repair_rejects_inconsistent_public_protection_metadata() {
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let mut archive = Archive::parse(&bytes).unwrap();
@@ -6580,6 +6639,7 @@ fn parses_rar300_newsub_recovery_record() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn intact_rar300_recovery_record_leaves_archive_unchanged() {
     let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let archive = Archive::parse(&bytes).unwrap();
@@ -6619,6 +6679,7 @@ fn preserves_unknown_rar300_service_records_without_hiding_files() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar300_recovery_rejects_stored_size_mismatch_in_archive_bytes() {
     let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6641,6 +6702,7 @@ fn rar300_recovery_rejects_stored_size_mismatch_in_archive_bytes() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar300_repair_rejects_inconsistent_public_recovery_metadata() {
     fn recovery_file(archive: &mut Archive) -> &mut rars::rar15_40::FileHeader {
         archive
@@ -6685,6 +6747,7 @@ fn rar300_repair_rejects_inconsistent_public_recovery_metadata() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar300_recovery_rejects_malformed_stored_body_lengths() {
     let original = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&original).unwrap();
@@ -6716,6 +6779,7 @@ fn rar300_recovery_rejects_malformed_stored_body_lengths() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn encrypted_rar300_newsub_recovery_is_rejected_before_decoding() {
     let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let mut archive = Archive::parse(&bytes).unwrap();
@@ -6752,6 +6816,7 @@ fn parses_compressed_rar300_newsub_recovery_record_fixture() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rejects_corrupt_compressed_rar300_newsub_recovery_record_fixture() {
     let bytes = std::fs::read(fixture(
         "rar300/with_compressed_recovery_header_synthetic.rar",
@@ -6778,6 +6843,7 @@ fn rejects_corrupt_compressed_rar300_newsub_recovery_record_fixture() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_rar250_protect_head_single_damaged_sector() {
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6800,6 +6866,7 @@ fn repairs_rar250_protect_head_single_damaged_sector() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar250_recovery_rejects_damage_beyond_parity_capacity() {
     let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6820,6 +6887,7 @@ fn rar250_recovery_rejects_damage_beyond_parity_capacity() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar250_recovery_rejects_incorrect_parity() {
     let mut bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6838,6 +6906,7 @@ fn rar250_recovery_rejects_incorrect_parity() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn protect_head_does_not_repair_trailing_partial_sector_before_record() {
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6859,6 +6928,7 @@ fn protect_head_does_not_repair_trailing_partial_sector_before_record() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn protect_head_repairs_last_stable_sector_before_metadata_overlap() {
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6887,6 +6957,7 @@ fn protect_head_repairs_last_stable_sector_before_metadata_overlap() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_rar300_newsub_recovery_single_damaged_sector() {
     let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let mut damaged = bytes.clone();
@@ -6906,6 +6977,7 @@ fn repairs_rar300_newsub_recovery_single_damaged_sector() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar300_recovery_rejects_incorrect_parity() {
     let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6928,6 +7000,7 @@ fn rar300_recovery_rejects_incorrect_parity() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar300_recovery_rejects_damage_beyond_parity_capacity() {
     let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6953,6 +7026,7 @@ fn rar300_recovery_rejects_damage_beyond_parity_capacity() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rar300_recovery_rejects_two_damaged_sectors_in_one_parity_group() {
     let mut bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -6977,6 +7051,7 @@ fn rar300_recovery_rejects_two_damaged_sectors_in_one_parity_group() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_compressed_rar300_newsub_recovery_single_damaged_sector() {
     let compressed = std::fs::read(fixture("rar300/with_compressed_recovery_rar300.rar")).unwrap();
     let expected = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
@@ -7001,6 +7076,7 @@ fn repairs_compressed_rar300_newsub_recovery_single_damaged_sector() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn newsub_recovery_repairs_trailing_partial_sector_before_record() {
     let bytes = std::fs::read(fixture("rar300/with_recovery_rar300.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -7027,6 +7103,7 @@ fn newsub_recovery_repairs_trailing_partial_sector_before_record() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rejects_rar250_protect_head_same_group_damage() {
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&bytes).unwrap();
@@ -7046,6 +7123,7 @@ fn rejects_rar250_protect_head_same_group_damage() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_rar300_old_style_recovery_volume_set() {
     let part1 = std::fs::read(fixture("rar300/rev_oldstyle.part1.rar")).unwrap();
     let part2 = std::fs::read(fixture("rar300/rev_oldstyle.part2.rar")).unwrap();
@@ -7073,6 +7151,7 @@ fn repairs_rar300_old_style_recovery_volume_set() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn rev3_repair_keeps_supplied_damaged_volume_when_no_shard_is_missing() {
     let mut volume = std::fs::read(fixture("rar300/rev_oldstyle.part1.rar")).unwrap();
     volume[0] ^= 1;
@@ -7085,6 +7164,7 @@ fn rev3_repair_keeps_supplied_damaged_volume_when_no_shard_is_missing() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn repairs_rar4_new_style_recovery_volume_set_with_zeroed_rev_trailer() {
     let part1 = std::fs::read(fixture("rar300/rev_newstyle.part1.rar")).unwrap();
     let part2 = std::fs::read(fixture("rar300/rev_newstyle.part2.rar")).unwrap();
@@ -7559,6 +7639,7 @@ fn extracts_compressed_rar300_new_numbered_volume_set() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_encrypted_rar300_old_numbered_volume_set() {
     let archives: Vec<_> = [
         "rar300/encrypted_multivol_rar300.rar",
@@ -7586,6 +7667,7 @@ fn extracts_encrypted_rar300_old_numbered_volume_set() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_encrypted_rar300_new_numbered_volume_set() {
     let archives: Vec<_> = [
         "rar300/encrypted_newnaming_rar300.part01.rar",
@@ -7614,6 +7696,7 @@ fn extracts_encrypted_rar300_new_numbered_volume_set() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_header_encrypted_rar300_old_numbered_volume_set() {
     let archives: Vec<_> = [
         "rar300/header_encrypted_multivol_rar300.rar",
@@ -7646,6 +7729,7 @@ fn extracts_header_encrypted_rar300_old_numbered_volume_set() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn extracts_header_encrypted_rar300_new_numbered_volume_set() {
     let archives: Vec<_> = [
         "rar300/header_encrypted_newnaming_rar300.part01.rar",
@@ -8399,6 +8483,7 @@ fn local_reference_test_volumes(
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn reference_tool_accepts_rar29_header_encrypted_archives_and_volumes() {
     let text = b"rar29 header encrypted text that compresses well\n".repeat(200);
     let mut state = 0x9e37_79b9u32;
@@ -8484,6 +8569,7 @@ fn reference_tool_accepts_rar29_header_encrypted_archives_and_volumes() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn reference_tool_accepts_rar29_header_encrypted_comments() {
     let comment = b"rar29 encrypted archive note\r\n";
     let mut state = 0x9e37_79b9u32;
@@ -8814,6 +8900,7 @@ fn final_match_past_the_declared_size_truncates_and_feeds_the_solid_member() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn rar_shares_one_member_salt_and_one_header_salt_per_archive() {
     for (name, encrypted_members) in [
         ("encrypted/rar4_encrypted_files_and_dirs.rar", 3),
@@ -8858,11 +8945,13 @@ fn rar_shares_one_member_salt_and_one_header_salt_per_archive() {
 }
 
 /// Remembers the largest single read asked of it.
+#[cfg(feature = "recovery")]
 struct LargestRead {
     input: std::io::Cursor<Vec<u8>>,
     largest: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
+#[cfg(feature = "recovery")]
 impl std::io::Read for LargestRead {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.largest
@@ -8871,6 +8960,7 @@ impl std::io::Read for LargestRead {
     }
 }
 
+#[cfg(feature = "recovery")]
 impl std::io::Seek for LargestRead {
     fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
         self.input.seek(from)
@@ -8878,6 +8968,7 @@ impl std::io::Seek for LargestRead {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn protect_head_repair_reads_the_archive_in_blocks_not_whole() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();

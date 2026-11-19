@@ -75,6 +75,7 @@ fn volume_lookup_counts_redirections_in_logical_member_indices() {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn mixed(format: ArchiveVersion, solid: bool, stored: bool) -> Archive {
     let mut builder = Builder::new(format).solid(solid).store(stored);
     builder
@@ -92,6 +93,7 @@ fn mixed(format: ArchiveVersion, solid: bool, stored: bool) -> Archive {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn batch_reads_share_budgets_and_decode_solid_dependencies_once() {
     use rars::{ArchiveReadOptions, ReadCancellation};
     for format in ArchiveVersion::ALL {
@@ -253,6 +255,7 @@ fn batch_reads_reduce_payload_io_compared_with_repeated_solid_reads() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn plaintext_selection_ignores_independent_encrypted_members_before_and_after_it() {
     for format in ArchiveVersion::ALL {
         for stored in [false, true] {
@@ -300,6 +303,7 @@ fn plaintext_selection_ignores_independent_encrypted_members_before_and_after_it
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn solid_selection_stops_after_target_but_verifies_encrypted_predecessors() {
     for format in ArchiveVersion::ALL {
         let archive = mixed(format, true, false);
@@ -378,6 +382,7 @@ fn selection_preserves_target_integrity_and_last_duplicate_name_identity() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn option_bearing_reads_apply_budgets_to_selected_payloads_and_solid_dependencies() {
     use rars::ArchiveReadOptions;
     for format in ArchiveVersion::ALL {

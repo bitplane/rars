@@ -23,6 +23,7 @@ const FORMATS: [ArchiveVersion; 9] = [
 ];
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_encrypted_archive_comment_requires_comment_password_and_rar3_or_rar4() {
     for (format, comment, password) in [
         (ArchiveVersion::Rar30, None, b"secret".as_slice()),
@@ -138,6 +139,7 @@ fn comment_limits_cover_all_versions_empty_comments_and_fresh_budgets() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_comment_admission_precedes_password_work() {
     for format in [
         ArchiveVersion::Rar30,
@@ -184,6 +186,9 @@ fn historical_comment_fixtures_keep_their_contents_under_limits() {
 fn modern_comments_apply_dictionary_and_buffering_policy() {
     for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         for encrypted in [false, true] {
+            if encrypted && !cfg!(feature = "encryption") {
+                continue;
+            }
             let comment = b"repeatable text\n".repeat(100);
             let stored =
                 ArchiveReader::read_owned(bytes(format, Some(&comment), encrypted)).unwrap();

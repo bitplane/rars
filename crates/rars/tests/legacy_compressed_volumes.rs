@@ -1,6 +1,10 @@
+#![cfg(feature = "write")]
+
+#[cfg(feature = "encryption")]
+use rars::rar15_40::write_compressed_volumes;
 use rars::rar15_40::{
-    write_compressed_volumes, write_compressed_volumes_to, CollectedVolumes, FileEntry,
-    VolumeOutput, VolumeSink, WriterOptions,
+    write_compressed_volumes_to, CollectedVolumes, FileEntry, VolumeOutput, VolumeSink,
+    WriterOptions,
 };
 use rars::{ArchiveVersion, FeatureSet};
 
@@ -18,6 +22,7 @@ fn data() -> Vec<u8> {
         .collect()
 }
 
+#[cfg(feature = "encryption")]
 fn noise() -> Vec<u8> {
     let mut state = 0x9e37_79b9u32;
     (0..9_000)
@@ -42,6 +47,7 @@ fn entry<'a>(data: &'a [u8], password: Option<&'a [u8]>) -> FileEntry<'a> {
     }
 }
 
+#[cfg(feature = "encryption")]
 fn features(solid: bool, header_encryption: bool) -> FeatureSet {
     let mut features = FeatureSet::store_only();
     features.solid = solid;
@@ -56,6 +62,7 @@ fn features(solid: bool, header_encryption: bool) -> FeatureSet {
 /// bump changes these. The release hook regenerates them with the RAR 5
 /// fixtures: `RARS_BLESS_GOLDEN=1 cargo test -p rars --test legacy_compressed_volumes`.
 #[test]
+#[cfg(feature = "encryption")]
 fn compressed_volumes_match_the_collecting_writer_byte_for_byte() {
     let data = data();
     let noise = noise();
@@ -163,6 +170,7 @@ fn each_volume_is_finished_before_the_next_starts() {
     );
 }
 
+#[cfg(feature = "encryption")]
 fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {
     let archives: Vec<_> = volumes
         .iter()
@@ -194,6 +202,7 @@ fn extract(volumes: &[Vec<u8>], password: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_compressed_volumes_extract_to_the_source() {
     let data = data();
     for (header_encryption, solid) in [(false, false), (true, false), (true, true)] {
