@@ -1820,7 +1820,7 @@ fn member_header(
     Ok(header)
 }
 
-/// Forced PPMd declares a named filter's records before its first byte, so it needs the whole member.
+/// Whether a member is coded as it is read rather than held whole.
 fn streams_member(
     member: &Member<'_>,
     options: WriterOptions,
@@ -1842,7 +1842,7 @@ fn streams_member(
             MemberCoding::Compressed
             | MemberCoding::Filtered(FilterPolicy::None | FilterPolicy::Auto) => true,
             MemberCoding::Filtered(FilterPolicy::Explicit(_)) => {
-                options.target != ArchiveVersion::Rar20 && options.method != Rar29Method::Ppmd
+                options.target != ArchiveVersion::Rar20
             }
             MemberCoding::Stored => false,
         }
@@ -2226,15 +2226,25 @@ fn stream_member(
                 .map(|(specs, _)| specs)
                 .map_err(|error| crate::codec::Error::Io(Box::new(error)))
             };
-            // A named filter is applied to every segment the search would have chosen for.
-            let mut named = match coding {
-                MemberCoding::Filtered(FilterPolicy::Explicit(filter)) => {
-                    Some(named_filter_segments(len, filter.clone()).map_err(map_codec_cancel)?)
-                }
+            let explicit = match coding {
+                MemberCoding::Filtered(FilterPolicy::Explicit(filter)) => Some(filter),
                 _ => None,
             };
+            // A named filter is applied to every segment the search would have chosen for.
+            let mut named = explicit
+                .map(|filter| named_filter_segments(len, filter.clone()))
+                .transpose()
+                .map_err(map_codec_cancel)?;
+            // Forced PPMd filters too, and codes the member on its own as it
+            // does in memory, leaving a chain's history and model as they were.
+            // A PPMd trial's winner is unfiltered, as its candidate in memory is.
+            let ppmd_filter = explicit.filter(|_| options.method == Rar29Method::Ppmd);
             let mut own = None;
-            let encoder = match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
+            let encoder = match solid
+                .as_mut()
+                .and_then(|link| link.encoder.as_mut())
+                .filter(|_| ppmd_filter.is_none())
+            {
                 Some(SolidEncoder::Rar29(encoder)) => encoder,
                 _ => own.insert(Box::new(Unpack29Encoder::with_options(encode_options))),
             };
@@ -2254,6 +2264,7 @@ fn stream_member(
                     &mut counted,
                     len,
                     escapes,
+                    ppmd_filter.cloned(),
                     &mut advance,
                     &mut write,
                 ),
@@ -4501,6 +4512,35 @@ mod tests {
                 }
             }
         }
+        // Forced PPMd declares each record as it reaches it, and reads a
+        // record whole before coding any of it, so even a delta member read in
+        // many segments codes what it does in memory.
+        for (data, kind) in [
+            (&large, FilterKind::E8E9),
+            (&audio, FilterKind::Delta { channels: 4 }),
+        ] {
+            let members = entries(&[("small.txt", small), ("large.bin", data)]);
+            for (window, mut options) in [("fitted", rar40()), ("128K", segmented)] {
+                options.method = super::Rar29Method::Ppmd;
+                let out = streamed_with(&members, options, named(kind), None).unwrap();
+
+                assert!(out.seeks > 0, "PPMd {kind:?} {window}: not streamed");
+                let archive = out.inner.into_inner();
+                assert_eq!(
+                    archive,
+                    in_memory_with(&members, options, named(kind)),
+                    "PPMd {kind:?} {window}"
+                );
+                assert_eq!(
+                    extracted_set(std::slice::from_ref(&archive), None),
+                    [
+                        (b"small.txt".to_vec(), small.to_vec()),
+                        (b"large.bin".to_vec(), data.to_vec()),
+                    ],
+                    "PPMd {kind:?} {window}"
+                );
+            }
+        }
         // The filter was applied, not just named.
         let members = entries(&[("audio.wav", &audio)]);
         let unfiltered = streamed_with(
@@ -4523,20 +4563,42 @@ mod tests {
         );
     }
 
+    /// Each member's method and packed bytes.
+    fn packed_members(archive: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        let parsed = crate::rar15_40::Archive::parse(archive).unwrap();
+        parsed
+            .files()
+            .map(|file| (file.method, file.packed_data(&parsed).unwrap()))
+            .collect()
+    }
+
     #[test]
     fn a_named_filter_streams_on_a_solid_chain_and_through_a_pipe() {
         let large = binary_member(1024 * 1024 + 4321);
         let noise = noise(1024 * 1024 + 7);
-        let members = entries(&[
+        let files: [(&str, &[u8]); 4] = [
             ("before.bin", &large[1000..41000]),
             ("large.bin", &large),
             ("after.bin", &large[large.len() - 40000..]),
             ("noise.bin", &noise),
-        ]);
+        ];
+        let members = entries(&files);
+        let expected: Vec<_> = files
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect();
         let coding = || named(crate::FilterKind::E8E9);
         let mut solid40 = rar40();
         solid40.features.solid = true;
-        for (name, options) in [("rar40", rar40()), ("solid rar40", solid40)] {
+        // Unchained, forced PPMd is held to the in-memory bytes in
+        // `a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes`.
+        let mut solid_ppmd = solid40;
+        solid_ppmd.method = super::Rar29Method::Ppmd;
+        for (name, options) in [
+            ("rar40", rar40()),
+            ("solid rar40", solid40),
+            ("solid PPMd rar40", solid_ppmd),
+        ] {
             let out = streamed_with(&members, options, coding(), None).unwrap();
             assert!(out.seeks > 0, "{name}: not streamed");
             let file = out.inner.into_inner();
@@ -4544,14 +4606,25 @@ mod tests {
             assert!(spooled, "{name}: the large members were not spooled");
             assert_eq!(piped, file, "{name}");
             let whole = in_memory_with(&members, options, coding());
-            assert_eq!(extracted_set(&[file], None), extracted_set(&[whole], None));
+            // In a chain, forced PPMd codes a named filter's member on its own,
+            // as it does in memory, so it streams the bytes it codes there. The
+            // noise is the exception: streamed, it is stored once it outgrows
+            // itself, which the in-memory writer never does for a named filter
+            // (#354).
+            if options.method == super::Rar29Method::Ppmd {
+                let (streamed, whole) = (packed_members(&file), packed_members(&whole));
+                assert_eq!(streamed.len(), whole.len(), "{name}");
+                for (index, (streamed, whole)) in streamed.iter().zip(&whole).enumerate() {
+                    if index < 3 {
+                        assert_eq!(streamed, whole, "{name}: member {index}");
+                    } else {
+                        assert_eq!(streamed.0, 0x30, "{name}: the noise was not stored");
+                    }
+                }
+            }
+            assert_eq!(extracted_set(&[file], None), expected, "{name}");
+            assert_eq!(extracted_set(&[whole], None), expected, "{name}");
         }
-        // Forced PPMd declares every record up front, so it still holds the member.
-        let mut ppmd = rar40();
-        ppmd.method = super::Rar29Method::Ppmd;
-        let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
-        assert!(!super::streams_member(&routed[1], ppmd, &coding(), 256 * 1024).unwrap());
-        assert!(super::streams_member(&routed[1], rar40(), &coding(), 256 * 1024).unwrap());
     }
 
     #[test]
