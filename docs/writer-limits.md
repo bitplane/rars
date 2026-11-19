@@ -78,5 +78,5 @@ What each writer holds, what bounds it, and the tests that pin it:
 
 Some library calls hold the whole archive by design, because they return it:
 `Builder::to_bytes`, `Builder::build_volumes` and `Rar50Writer::finish`.
-`Builder::add_bytes` payloads are copied again for a RAR 5 write (#337). Some
-copies are not counted against the budget (#336).
+A RAR 5 write shares `Builder::add_bytes` payloads rather than copying them
+(#337). Some copies are not counted against the budget (#336).
