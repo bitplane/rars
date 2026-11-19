@@ -711,7 +711,8 @@ fn generated_rar29_segmented_e8_filtered_archive_round_trips() {
     let filter_start = payload.len();
     payload.extend_from_slice(b"\xe8\0\0\0\0rar29 segmented e8 filter payload\n");
     let filter_end = payload.len();
-    payload.extend_from_slice(b"unfiltered suffix after x86 segment\n");
+    // Repeated so the member packs smaller than itself and is not stored.
+    payload.extend_from_slice(&b"unfiltered suffix after x86 segment\n".repeat(16));
     let entries = [FileEntry {
         name: b"rar29-segmented-e8-filtered.bin",
         data: &payload,
@@ -1123,6 +1124,8 @@ fn generated_rar29_itanium_filtered_archive_round_trips() {
     payload[16] = 22;
     payload[21] = 20;
     payload.extend_from_slice(b"rar29 itanium format payload\n");
+    // Repeated so it packs smaller than itself and is not stored instead.
+    let payload = payload.repeat(16);
     let entries = [FileEntry {
         name: b"rar29-itanium-filtered.bin",
         data: &payload,
@@ -1157,7 +1160,8 @@ fn generated_rar29_segmented_itanium_filtered_archive_round_trips() {
     payload[filter_start + 21] = 20;
     payload.extend_from_slice(b"rar29 segmented itanium format payload\n");
     let filter_end = payload.len();
-    payload.extend_from_slice(b"unfiltered suffix after itanium segment\n");
+    // Repeated so the member packs smaller than itself and is not stored.
+    payload.extend_from_slice(&b"unfiltered suffix after itanium segment\n".repeat(16));
     let entries = [FileEntry {
         name: b"rar29-segmented-itanium-filtered.bin",
         data: &payload,
@@ -1231,7 +1235,8 @@ fn reference_unrar_accepts_rar29_segmented_itanium_filter_record() {
 #[test]
 fn generated_rar29_rgb_filtered_archive_round_trips() {
     let width = 12;
-    let payload: Vec<u8> = (0..96).map(|index| (index * 31 + 13) as u8).collect();
+    // Repeated so it packs smaller than itself and is not stored instead.
+    let payload: Vec<u8> = (0..96 * 16).map(|index| (index * 31 + 13) as u8).collect();
     let entries = [FileEntry {
         name: b"rar29-rgb-filtered.bin",
         data: &payload,
@@ -1264,7 +1269,8 @@ fn generated_rar29_segmented_rgb_filtered_archive_round_trips() {
     let filter_start = payload.len();
     payload.extend((0..96).map(|index| (index * 31 + 13) as u8));
     let filter_end = payload.len();
-    payload.extend_from_slice(b"unfiltered suffix after rgb segment\n");
+    // Repeated so the member packs smaller than itself and is not stored.
+    payload.extend_from_slice(&b"unfiltered suffix after rgb segment\n".repeat(16));
     let entries = [FileEntry {
         name: b"rar29-segmented-rgb-filtered.bin",
         data: &payload,
@@ -1335,9 +1341,11 @@ fn reference_unrar_accepts_rar29_segmented_rgb_filter_record() {
 
 #[test]
 fn generated_rar29_audio_filtered_archive_round_trips() {
+    // Repeated so it packs smaller than itself and is not stored instead.
     let payload: Vec<u8> = (0..160)
         .map(|index| (index * 9 + index / 5) as u8)
-        .collect();
+        .collect::<Vec<u8>>()
+        .repeat(16);
     let entries = [FileEntry {
         name: b"rar29-audio-filtered.bin",
         data: &payload,
@@ -1369,7 +1377,8 @@ fn generated_rar29_segmented_audio_filtered_archive_round_trips() {
     let filter_start = payload.len();
     payload.extend((0..160).map(|index| (index * 9 + index / 5) as u8));
     let filter_end = payload.len();
-    payload.extend_from_slice(b"unfiltered suffix after audio segment\n");
+    // Repeated so the member packs smaller than itself and is not stored.
+    payload.extend_from_slice(&b"unfiltered suffix after audio segment\n".repeat(16));
     let entries = [FileEntry {
         name: b"rar29-segmented-audio-filtered.bin",
         data: &payload,
