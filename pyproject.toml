@@ -30,6 +30,7 @@ classifiers = [
 manifest-path = "crates/rars-python/Cargo.toml"
 module-name = "rars"
 features = ["extension-module"]
+profile = "release-python"
 include = [
     { path = "COPYING", format = "sdist" },
     { path = "rars.pyi", format = "sdist" },
@@ -39,7 +40,7 @@ include = [
 # run at both ends.
 [tool.cibuildwheel]
 build = "cp310-* cp315-*"
-config-settings = { build-args = "--profile release-python --locked" }
+config-settings = { build-args = "--locked" }
 test-requires = ["pytest"]
 test-sources = ["python/tests", "crates/rars/tests/fixtures"]
 test-command = "pytest -q python/tests"
