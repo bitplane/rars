@@ -4948,7 +4948,7 @@ mod tests {
         options
     }
 
-    fn named(contents: &[(&str, &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    fn named_contents(contents: &[(&str, &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
         contents
             .iter()
             .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
@@ -4978,7 +4978,11 @@ mod tests {
         let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
         let methods: Vec<_> = parsed.files().map(|file| file.method).collect();
         assert_eq!(methods, [0x33, 0x33, 0x30]);
-        assert_eq!(extracted_set(&[archive], None), named(&contents));
+        // An output that cannot seek gets the same archive through a spool.
+        let (piped, saw_spool) = piped_with(&members, rar15(3, false), coding());
+        assert!(saw_spool, "the large member was not spooled");
+        assert!(piped == archive);
+        assert_eq!(extracted_set(&[archive], None), named_contents(&contents));
     }
 
     #[test]
@@ -5002,7 +5006,7 @@ mod tests {
         // Storing one would break the chain RAR 1.5 readers follow.
         let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
         assert!(parsed.files().all(|file| file.method != 0x30));
-        assert_eq!(extracted_set(&[archive], None), named(&contents));
+        assert_eq!(extracted_set(&[archive], None), named_contents(&contents));
     }
 
     #[test]
@@ -5035,7 +5039,7 @@ mod tests {
                 volume_set(&members, rar15(3, solid), coding(), 100_000, u64::MAX, None).unwrap();
             assert!(streamed.len() > 2);
             assert!(streamed == whole, "solid: {solid}");
-            assert_eq!(extracted_set(&streamed, None), named(&contents));
+            assert_eq!(extracted_set(&streamed, None), named_contents(&contents));
         }
     }
 

@@ -188,6 +188,7 @@ pub(crate) fn write_archive_with_sources(
         resources,
         progress,
         output,
+        STREAM_MEMBERS_ABOVE,
     )
 }
 
@@ -251,6 +252,7 @@ pub fn write_streaming_archive_to(
         resources,
         progress,
         output,
+        STREAM_MEMBERS_ABOVE,
     )
 }
 
@@ -322,10 +324,12 @@ fn collect_archive(
         &WriterResources::default(),
         progress,
         &mut out,
+        STREAM_MEMBERS_ABOVE,
     )?;
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_archive_to(
     members: &[Member<'_>],
     options: WriterOptions,
@@ -334,6 +338,7 @@ fn write_archive_to(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
+    stream_above: u64,
 ) -> Result<()> {
     if members.iter().any(|member| member.password.is_some()) {
         crate::crypto::require_encryption()?;
@@ -406,6 +411,7 @@ fn write_archive_to(
             solid_encoder.as_mut(),
             resources,
             &work,
+            stream_above,
         )
         .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
         write_member(output, member, encoded, options, work.reporter())
@@ -430,10 +436,27 @@ fn write_archive_to(
 }
 
 struct EncodedMember<'a> {
-    payload: MemberPayload<'a>,
+    payload: Payload<'a>,
     method: u8,
     unpacked_size: usize,
     file_crc: u16,
+}
+
+/// A member's bytes as they go into the archive, before any encryption.
+enum Payload<'a> {
+    Shared(MemberPayload<'a>),
+    /// Packed into a spool in the temp directory, so neither the member nor
+    /// its packed form is held.
+    Spooled(crate::streaming::Spool),
+}
+
+/// Members larger than this are packed into a spool rather than in memory.
+const STREAM_MEMBERS_ABOVE: u64 = 64 * 1024 * 1024;
+
+/// What a member packed into a spool holds: the encoder's window and index,
+/// and a verifying decoder.
+fn streamed_workspace() -> u64 {
+    crate::codec::rar13::ENCODER_WORKSPACE.saturating_add(2 * 1024 * 1024)
 }
 
 /// Working memory one member needs while it is coded. This is the admission
@@ -460,6 +483,7 @@ fn encode_member<'a>(
     solid_encoder: Option<&mut Unpack15Encoder>,
     resources: &WriterResources,
     work: &WorkTracker<'_>,
+    stream_above: u64,
 ) -> Result<EncodedMember<'a>> {
     work.check()?;
     let unpacked_size = member.unpacked_size()?;
@@ -471,11 +495,31 @@ fn encode_member<'a>(
             ));
         }
         return Ok(EncodedMember {
-            payload: MemberPayload::Packed(Vec::new()),
+            payload: Payload::Shared(MemberPayload::Packed(Vec::new())),
             method: METHOD_STORE,
             unpacked_size: 0,
             file_crc: file_checksum(&[]),
         });
+    }
+    // A large member read from a source is packed into a spool a window at a
+    // time, and a stored fallback copied from the source.
+    if let (true, Some(source)) = (
+        coding.compresses()
+            && options.compression_level != Some(0)
+            && unpacked_size as u64 > stream_above,
+        member.bytes.source(),
+    ) {
+        let _permit = resources
+            .acquire_serialising_cancellable(streamed_workspace(), &|| work.is_cancelled())?;
+        return encode_spooled_member(
+            member,
+            source,
+            unpacked_size,
+            encode_options,
+            solid_encoder,
+            resources,
+            work,
+        );
     }
     let _permit = resources.acquire_serialising_cancellable(
         member_workspace(unpacked_size as u64, coding.compresses()),
@@ -488,7 +532,7 @@ fn encode_member<'a>(
         (coding, member.password, member.bytes.source())
     {
         return Ok(EncodedMember {
-            payload: MemberPayload::Copied(source),
+            payload: Payload::Shared(MemberPayload::Copied(source)),
             method: METHOD_STORE,
             unpacked_size,
             file_crc: {
@@ -521,7 +565,7 @@ fn encode_member<'a>(
     work.check()?;
     if !coding.compresses() {
         return Ok(EncodedMember {
-            payload: MemberPayload::Packed(data.into_owned()),
+            payload: Payload::Shared(MemberPayload::Packed(data.into_owned())),
             method: METHOD_STORE,
             unpacked_size,
             file_crc,
@@ -543,11 +587,170 @@ fn encode_member<'a>(
     };
     let (packed, method) = select_verified_payload(data, packed, solid);
     Ok(EncodedMember {
-        payload: MemberPayload::Packed(packed),
+        payload: Payload::Shared(MemberPayload::Packed(packed)),
         method,
         unpacked_size,
         file_crc,
     })
+}
+
+/// [`encode_member`] for a member packed into a spool: the same attempts,
+/// verification and stored fallback, reading the member from its source each
+/// time instead of holding it.
+fn encode_spooled_member<'a>(
+    member: &Member<'a>,
+    source: &'a EntrySource,
+    unpacked_size: usize,
+    encode_options: Rar15EncodeOptions,
+    solid_encoder: Option<&mut Unpack15Encoder>,
+    resources: &WriterResources,
+    work: &WorkTracker<'_>,
+) -> Result<EncodedMember<'a>> {
+    let mut last = 0usize;
+    let mut advance = |position: usize| advance_rar15_attempt(&mut last, work, position);
+    // A solid member is not verified or stored, as in memory.
+    if let Some(encoder) = solid_encoder {
+        let mut checksum = Rar13Checksum::new();
+        let spool = spool_attempt(
+            member,
+            unpacked_size,
+            resources,
+            work,
+            Some(&mut checksum),
+            &mut |input, out| {
+                encoder.encode_member_streamed(input, unpacked_size, &mut advance, out)
+            },
+        )?;
+        return Ok(EncodedMember {
+            payload: Payload::Spooled(spool),
+            method: METHOD_BEST,
+            unpacked_size,
+            file_crc: checksum.finish(),
+        });
+    }
+    // The first attempt reads the member for its checksum too.
+    let mut file_crc = None;
+    for candidate in rar15_encode_fallback_options(encode_options) {
+        let mut sum = Rar13Checksum::new();
+        let mut spool = spool_attempt(
+            member,
+            unpacked_size,
+            resources,
+            work,
+            file_crc.is_none().then_some(&mut sum),
+            &mut |input, out| {
+                Unpack15Encoder::with_options(candidate).encode_member_streamed(
+                    input,
+                    unpacked_size,
+                    &mut advance,
+                    out,
+                )
+            },
+        )?;
+        let crc = *file_crc.get_or_insert_with(|| sum.finish());
+        work.check()?;
+        if spooled_payload_matches(&mut spool, member, unpacked_size)? {
+            // Stored when packing did not help, as `select_verified_payload` does.
+            if spool.len() < unpacked_size as u64 {
+                return Ok(EncodedMember {
+                    payload: Payload::Spooled(spool),
+                    method: METHOD_BEST,
+                    unpacked_size,
+                    file_crc: crc,
+                });
+            }
+            break;
+        }
+    }
+    Ok(EncodedMember {
+        payload: Payload::Shared(MemberPayload::Copied(source)),
+        method: METHOD_STORE,
+        unpacked_size,
+        file_crc: file_crc.expect("every attempt list has a first attempt"),
+    })
+}
+
+type StreamedEncode<'e> = dyn FnMut(
+        &mut dyn Read,
+        &mut dyn FnMut(&[u8], usize) -> crate::codec::Result<std::ops::ControlFlow<()>>,
+    ) -> crate::codec::Result<std::ops::ControlFlow<()>>
+    + 'e;
+
+/// Packs the member from its source into a new spool, adding what it reads to
+/// `checksum` if given.
+fn spool_attempt(
+    member: &Member<'_>,
+    len: usize,
+    resources: &WriterResources,
+    work: &WorkTracker<'_>,
+    checksum: Option<&mut Rar13Checksum>,
+    encode: &mut StreamedEncode<'_>,
+) -> Result<crate::streaming::Spool> {
+    let mut spool = crate::streaming::Spool::create(resources)?;
+    let mut reader = crate::write_progress::CancellableIo {
+        inner: member.bytes.open()?,
+        progress: work.reporter(),
+    };
+    let mut counted = SummingReader {
+        inner: &mut reader,
+        checksum,
+        read: 0,
+    };
+    let mut out = |bytes: &[u8], _: usize| -> crate::codec::Result<std::ops::ControlFlow<()>> {
+        spool.write_all(bytes)?;
+        Ok(std::ops::ControlFlow::Continue(()))
+    };
+    let coded = encode(&mut counted, &mut out);
+    let read = counted.read;
+    match coded {
+        Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
+        Err(_) if read < len as u64 => {
+            return Err(Error::SourceChanged(
+                "entry source size changed while compressing",
+            ))
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    crate::write_stream::check_source_length(
+        &mut reader,
+        len as u64,
+        len as u64,
+        "entry source size changed while compressing",
+    )?;
+    Ok(spool)
+}
+
+/// Reads through to `inner`, counting the bytes and summing them if asked.
+struct SummingReader<'r, 'c> {
+    inner: &'r mut dyn Read,
+    checksum: Option<&'c mut Rar13Checksum>,
+    read: u64,
+}
+
+impl Read for SummingReader<'_, '_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if let Some(checksum) = self.checksum.as_deref_mut() {
+            checksum.update(&buffer[..read]);
+        }
+        self.read += read as u64;
+        Ok(read)
+    }
+}
+
+/// [`unpack15_payload_matches`] for a spooled payload, against the member
+/// read again from its source.
+fn spooled_payload_matches(
+    spool: &mut crate::streaming::Spool,
+    member: &Member<'_>,
+    len: usize,
+) -> Result<bool> {
+    spool.rewind()?;
+    let mut decoded = MatchesMember::new(member.bytes.open()?);
+    let result = Unpack15::new().decode_member_from_reader(spool, len, false, &mut decoded);
+    spool.park();
+    Ok(result.is_ok() && decoded.at == len)
 }
 
 /// Writes one member's header and payload.
@@ -559,10 +762,15 @@ fn write_member(
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<()> {
     crate::write_progress::check_cancelled(progress)?;
+    // A payload in memory is encrypted in place; one copied from a source or
+    // a spool is encrypted as it is copied.
+    let mut cipher = match member.password {
+        Some(password) => Some(Rar13Cipher::for_password(password)?),
+        None => None,
+    };
     let payload = match encoded.payload {
-        MemberPayload::Packed(mut packed) => {
-            if let Some(password) = member.password {
-                let mut cipher = Rar13Cipher::for_password(password)?;
+        Payload::Shared(MemberPayload::Packed(mut packed)) => {
+            if let Some(mut cipher) = cipher.take() {
                 for chunk in packed.chunks_mut(64 * 1024) {
                     crate::write_progress::check_cancelled(progress)?;
                     for byte in chunk {
@@ -570,13 +778,14 @@ fn write_member(
                     }
                 }
             }
-            MemberPayload::Packed(packed)
+            Payload::Shared(MemberPayload::Packed(packed))
         }
-        // Unencrypted by construction, so the stored bytes are their own
-        // payload.
-        copied => copied,
+        other => other,
     };
-    let packed_size = payload.size(encoded.unpacked_size as u64);
+    let packed_size = match &payload {
+        Payload::Shared(shared) => shared.size(encoded.unpacked_size as u64),
+        Payload::Spooled(spool) => spool.len(),
+    };
     let packed_size = u32::try_from(packed_size)
         .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))?;
 
@@ -608,23 +817,65 @@ fn write_member(
         },
     )?;
     output.write_all(&header)?;
-    if matches!(payload, MemberPayload::Copied(_)) {
-        let mut checksum = Rar13Checksum::new();
-        payload.write_to(
-            &mut Rar13ChecksumWriter {
+    let mut encrypting;
+    let output: &mut dyn Write = match cipher {
+        Some(cipher) => {
+            encrypting = Encrypting {
                 inner: output,
-                checksum: &mut checksum,
-            },
-            u64::from(packed_size),
-        )?;
-        if checksum.finish() != encoded.file_crc {
-            return Err(Error::SourceChanged(
-                "entry source contents changed while writing",
-            ));
+                cipher,
+                buffer: Vec::new(),
+            };
+            &mut encrypting
         }
-        Ok(())
-    } else {
-        payload.write_to(output, u64::from(packed_size))
+        None => output,
+    };
+    match payload {
+        Payload::Shared(copied @ MemberPayload::Copied(_)) => {
+            let mut checksum = Rar13Checksum::new();
+            copied.write_to(
+                &mut Rar13ChecksumWriter {
+                    inner: output,
+                    checksum: &mut checksum,
+                },
+                u64::from(packed_size),
+            )?;
+            if checksum.finish() != encoded.file_crc {
+                return Err(Error::SourceChanged(
+                    "entry source contents changed while writing",
+                ));
+            }
+            Ok(())
+        }
+        Payload::Shared(packed) => packed.write_to(output, u64::from(packed_size)),
+        Payload::Spooled(mut spool) => {
+            if spool.copy_to(output)? != u64::from(packed_size) {
+                return Err(Error::WriterFailure(
+                    "spooled member is not the size its header gives",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Encrypts what passes through on its way to `inner`.
+struct Encrypting<'w> {
+    inner: &'w mut dyn Write,
+    cipher: Rar13Cipher,
+    buffer: Vec<u8>,
+}
+
+impl Write for Encrypting<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.clear();
+        self.buffer
+            .extend(buf.iter().map(|&byte| self.cipher.encrypt_byte(byte)));
+        self.inner.write_all(&self.buffer)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -956,10 +1207,7 @@ fn rar15_encode_fallback_options(options: Rar15EncodeOptions) -> Vec<Rar15Encode
 /// Decodes `packed` and checks it against `data` as it comes out, so the check
 /// holds a decoder window rather than a second copy of the member.
 fn unpack15_payload_matches(packed: &[u8], data: &[u8]) -> Result<bool> {
-    let mut decoded = MatchesMember {
-        member: data,
-        at: 0,
-    };
+    let mut decoded = MatchesMember::new(data);
     let result = Unpack15::new().decode_member_from_reader(
         &mut &packed[..],
         data.len(),
@@ -969,21 +1217,33 @@ fn unpack15_payload_matches(packed: &[u8], data: &[u8]) -> Result<bool> {
     Ok(result.is_ok() && decoded.at == data.len())
 }
 
-/// Takes decoded bytes only while they are the member's, from its start.
-struct MatchesMember<'a> {
-    member: &'a [u8],
+/// Takes decoded bytes only while they are the member's, read from its start.
+struct MatchesMember<R> {
+    member: R,
     at: usize,
+    expected: Vec<u8>,
 }
 
-impl std::io::Write for MatchesMember<'_> {
+impl<R: Read> MatchesMember<R> {
+    fn new(member: R) -> Self {
+        Self {
+            member,
+            at: 0,
+            expected: Vec::new(),
+        }
+    }
+}
+
+impl<R: Read> Write for MatchesMember<R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let end = self.at + buf.len();
-        if self.member.get(self.at..end) != Some(buf) {
+        self.expected.resize(buf.len(), 0);
+        self.member.read_exact(&mut self.expected)?;
+        if self.expected != buf {
             return Err(std::io::Error::other(
                 "decoded bytes differ from the member",
             ));
         }
-        self.at = end;
+        self.at += buf.len();
         Ok(buf.len())
     }
 
@@ -1218,6 +1478,128 @@ mod tests {
         assert!(small < 16 << 20, "{small}");
     }
 
+    /// The archive written with members over `stream_above` packed into a
+    /// spool, and whether a spool sat in the temp directory while it was
+    /// written out.
+    fn written_above(
+        entries: &[super::StreamingEntry],
+        options: super::WriterOptions,
+        stream_above: u64,
+    ) -> (Vec<u8>, bool) {
+        struct Watching {
+            out: Vec<u8>,
+            dir: std::path::PathBuf,
+            saw_spool: bool,
+        }
+        impl std::io::Write for Watching {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.saw_spool |= std::fs::read_dir(&self.dir)?.next().is_some();
+                self.out.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let dir = crate::scratch::case("rars-rar13-spooled");
+        let resources = super::WriterResources::default().with_temp_dir(dir.to_path_buf());
+        let members: Vec<_> = entries.iter().map(super::Member::from_streaming).collect();
+        let mut out = Watching {
+            out: Vec::new(),
+            dir: dir.to_path_buf(),
+            saw_spool: false,
+        };
+        super::write_archive_to(
+            &members,
+            options,
+            super::MemberCoding::Compressed,
+            None,
+            &resources,
+            None,
+            &mut out,
+            stream_above,
+        )
+        .unwrap();
+        let left = std::fs::read_dir(&*dir).unwrap().count();
+        assert_eq!(left, 0, "a spool was left behind");
+        (out.out, out.saw_spool)
+    }
+
+    fn spooled_members() -> Vec<(&'static str, Vec<u8>)> {
+        let mut state = 0x2545_f491_u32;
+        let noise = (0..150_000)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect();
+        vec![
+            ("small.txt", b"small and below the threshold\n".to_vec()),
+            ("log.txt", synthetic_log_payload(1500)),
+            ("noise.bin", noise),
+        ]
+    }
+
+    fn check_spooled_archive(password: Option<&[u8]>) {
+        let contents = spooled_members();
+        let entries: Vec<_> = contents
+            .iter()
+            .map(|(name, data)| {
+                let entry = super::StreamingEntry::new(
+                    name.as_bytes().to_vec(),
+                    super::EntrySource::from_bytes(data.clone()),
+                );
+                match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                }
+            })
+            .collect();
+        for solid in [false, true] {
+            let mut features = FeatureSet::store_only();
+            features.solid = solid;
+            let options = WriterOptions {
+                target: ArchiveVersion::Rar14,
+                features,
+                compression_level: Some(3),
+            };
+
+            let (spooled, saw_spool) = written_above(&entries, options, 64 * 1024);
+
+            assert!(saw_spool, "nothing was spooled");
+            let (whole, saw_spool) = written_above(&entries, options, u64::MAX);
+            assert!(!saw_spool);
+            assert!(spooled == whole, "solid: {solid}");
+            let archive = Archive::parse(&spooled).unwrap();
+            let methods: Vec<_> = archive
+                .entries
+                .iter()
+                .map(|entry| entry.header.method)
+                .collect();
+            // What packing does not shrink is stored, except in a solid run,
+            // which a stored member would break.
+            let stored = if solid { METHOD_BEST } else { METHOD_STORE };
+            assert_eq!(methods, [stored, METHOD_BEST, stored]);
+            let extracted = collect_extract(&archive, password).unwrap();
+            let extracted: Vec<_> = extracted.into_iter().map(|entry| entry.data).collect();
+            let expected: Vec<_> = contents.iter().map(|(_, data)| data.clone()).collect();
+            assert!(extracted == expected, "solid: {solid}");
+        }
+    }
+
+    #[test]
+    fn a_spooled_member_writes_the_archive_the_in_memory_writer_does() {
+        check_spooled_archive(None);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn a_spooled_member_is_encrypted_as_it_is_copied_out() {
+        check_spooled_archive(Some(b"spooled"));
+    }
+
     #[test]
     fn verification_decodes_against_the_member_without_a_copy() {
         let data = b"verification compares as it decodes, verification compares".repeat(40);
@@ -1269,6 +1651,7 @@ mod tests {
                 None,
                 &resources,
                 &work,
+                u64::MAX,
             ),
             Err(crate::Error::Cancelled)
         ));
