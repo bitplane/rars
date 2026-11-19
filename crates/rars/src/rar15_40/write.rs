@@ -5949,12 +5949,14 @@ mod tests {
     #[test]
     fn a_member_whose_first_volume_does_not_compress_still_compresses_in_a_set() {
         // The noise fills the volume the member starts in, so it is all the member is judged by.
-        let mut mixed = noise(300_000);
+        // RAR 1.5 hands its packed bytes on a 1 MiB window at a time, so it needs more.
+        let mut mixed = noise(1_200_000);
         mixed.extend_from_slice(&word_text(1024 * 1024));
         let contents = [("mixed.bin", &mixed[..])];
         let (members, _) = counted_entries(&contents);
         let coding = || crate::MemberCoding::Compressed;
-        for options in [rar40(), rar20(3, false)] {
+        // RAR 1.5 grows noise by about 1% at level 3, past the margin RAR 2.0 on gets.
+        for options in [rar40(), rar20(3, false), rar15(3, false)] {
             let streamed =
                 volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
 
@@ -5971,7 +5973,11 @@ mod tests {
     fn an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin() {
         let noise = noise(1024 * 1024 + 7);
         let total = |set: &[Vec<u8>]| set.iter().map(Vec::len).sum::<usize>();
-        for options in [rar40(), rar20(3, false)] {
+        for (options, margin) in [
+            (rar40(), 128),
+            (rar20(3, false), 128),
+            (rar15(3, false), 48),
+        ] {
             // The noise starts with most of a volume, or a few bytes, to be judged by.
             for lead_len in [100, 99_800] {
                 let lead = super::tests::noise(lead_len);
@@ -5984,7 +5990,7 @@ mod tests {
                 let stored = set(crate::MemberCoding::Stored).unwrap();
                 let case = format!("{:?}, a {lead_len} byte lead", options.target);
                 assert!(
-                    total(&compressed) <= total(&stored) + noise.len() / 128,
+                    total(&compressed) <= total(&stored) + noise.len() / margin,
                     "{case}: {} bytes against {} stored",
                     total(&compressed),
                     total(&stored)
