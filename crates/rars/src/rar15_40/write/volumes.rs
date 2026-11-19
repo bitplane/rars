@@ -806,6 +806,37 @@ impl<'a> VolumePacker<'a> {
 /// Room kept past a streamed block for cipher bytes held from the last one and the final padding.
 const SEAL_MARGIN: u64 = 32;
 
+/// A streamed member commits to compression when its first volume fills
+/// unless what it has coded by then grew by more than 1/`COMMIT_GROWTH`.
+/// That much of the member is only a sample: LZ grows random bytes by a
+/// fraction of a percent, so carrying on costs little, while storing gives up
+/// whatever the rest would have saved.
+const COMMIT_GROWTH: u64 = 128;
+
+#[cfg(test)]
+std::thread_local! {
+    static COMMIT_GROWTH_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(COMMIT_GROWTH) };
+}
+
+/// Runs `write` with members committing if they grew by at most 1/`growth`; `u64::MAX` allows none.
+#[cfg(test)]
+pub(super) fn with_commit_growth<T>(growth: u64, write: impl FnOnce() -> T) -> T {
+    let was = COMMIT_GROWTH_HERE.replace(growth);
+    let result = write();
+    COMMIT_GROWTH_HERE.set(was);
+    result
+}
+
+#[cfg(not(test))]
+fn commit_growth() -> u64 {
+    COMMIT_GROWTH
+}
+
+#[cfg(test)]
+fn commit_growth() -> u64 {
+    COMMIT_GROWTH_HERE.get()
+}
+
 /// Codes a member into the set as it reads; volumes are handed on as they fill.
 #[allow(clippy::too_many_arguments)]
 fn stream_member_into(
@@ -938,7 +969,7 @@ impl StreamedOut for StreamedFragments<'_, '_, '_> {
         if coded == 0 || self.held.len() as u64 + block + SEAL_MARGIN <= self.room() {
             return true;
         }
-        self.committed = packed + block < coded;
+        self.committed = packed + block <= coded + coded / commit_growth();
         self.committed
     }
 

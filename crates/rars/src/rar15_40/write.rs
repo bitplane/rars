@@ -5012,8 +5012,11 @@ mod tests {
             ];
             let (members, opens) = counted_entries(&contents);
 
-            let streamed =
-                volume_set(&members, rar40(), coding(), 100_000, 256 * 1024, None).unwrap();
+            // Noise grows by less than the margin, so it is stored only where no growth is allowed.
+            let streamed = super::volumes::with_commit_growth(u64::MAX, || {
+                volume_set(&members, rar40(), coding(), 100_000, 256 * 1024, None)
+            })
+            .unwrap();
 
             assert!(
                 opens.load(std::sync::atomic::Ordering::Relaxed) > 4,
@@ -5026,6 +5029,59 @@ mod tests {
                 .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
                 .collect();
             assert_eq!(extracted_set(&streamed, None), expected);
+        }
+    }
+
+    #[test]
+    fn a_member_whose_first_volume_does_not_compress_still_compresses_in_a_set() {
+        // The noise fills the volume the member starts in, so it is all the member is judged by.
+        let mut mixed = noise(300_000);
+        mixed.extend_from_slice(&word_text(1024 * 1024));
+        let contents = [("mixed.bin", &mixed[..])];
+        let (members, _) = counted_entries(&contents);
+        let coding = || crate::MemberCoding::Compressed;
+        for options in [rar40(), rar20(3, false)] {
+            let streamed =
+                volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
+
+            let whole = volume_set(&members, options, coding(), 100_000, u64::MAX, None).unwrap();
+            assert_eq!(streamed, whole, "{:?}", options.target);
+            let first = crate::rar15_40::Archive::parse(&streamed[0]).unwrap();
+            assert_ne!(first.files().next().unwrap().method, 0x30);
+            let expected = vec![(b"mixed.bin".to_vec(), mixed.clone())];
+            assert_eq!(extracted_set(&streamed, None), expected);
+        }
+    }
+
+    #[test]
+    fn an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin() {
+        let noise = noise(1024 * 1024 + 7);
+        let total = |set: &[Vec<u8>]| set.iter().map(Vec::len).sum::<usize>();
+        for options in [rar40(), rar20(3, false)] {
+            // The noise starts with most of a volume, or a few bytes, to be judged by.
+            for lead_len in [100, 99_800] {
+                let lead = super::tests::noise(lead_len);
+                let contents = [("lead.bin", &lead[..]), ("noise.bin", &noise[..])];
+                let (members, _) = counted_entries(&contents);
+                let set = |coding| volume_set(&members, options, coding, 100_000, 256 * 1024, None);
+
+                let compressed = set(crate::MemberCoding::Compressed).unwrap();
+
+                let stored = set(crate::MemberCoding::Stored).unwrap();
+                let case = format!("{:?}, a {lead_len} byte lead", options.target);
+                assert!(
+                    total(&compressed) <= total(&stored) + noise.len() / 128,
+                    "{case}: {} bytes against {} stored",
+                    total(&compressed),
+                    total(&stored)
+                );
+                assert!(compressed.iter().all(|volume| volume.len() <= 100_000));
+                let expected: Vec<_> = contents
+                    .iter()
+                    .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+                    .collect();
+                assert_eq!(extracted_set(&compressed, None), expected, "{case}");
+            }
         }
     }
 
@@ -5144,7 +5200,11 @@ mod tests {
         ]);
         let coding = || crate::MemberCoding::Compressed;
 
-        let streamed = volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
+        // Allowed no growth, the noise is stored, as it is in memory.
+        let streamed = super::volumes::with_commit_growth(u64::MAX, || {
+            volume_set(&members, options, coding(), 100_000, 256 * 1024, None)
+        })
+        .unwrap();
 
         assert!(
             opens.load(std::sync::atomic::Ordering::Relaxed) > 5,
@@ -5193,8 +5253,11 @@ mod tests {
             let coding = || crate::MemberCoding::Compressed;
             let case = format!("-hp {header_encryption}, solid {solid}");
 
-            let streamed =
-                volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
+            // Allowed no growth, the noise is stored, as it is in memory.
+            let streamed = super::volumes::with_commit_growth(u64::MAX, || {
+                volume_set(&members, options, coding(), 100_000, 256 * 1024, None)
+            })
+            .unwrap();
 
             let whole = volume_set(&members, options, coding(), 100_000, u64::MAX, None).unwrap();
             assert_eq!(sizes(&streamed), sizes(&whole), "{case}");
