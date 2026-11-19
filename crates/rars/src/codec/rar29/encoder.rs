@@ -25,6 +25,34 @@ const MAX_PPMD_REPEAT_LENGTH: usize = 259;
 const PPMD_ORDER: usize = 8;
 const PPMD_DICTIONARY_MB: u8 = 25;
 pub(crate) const PPMD_MODEL_BYTES: u64 = PPMD_DICTIONARY_MB as u64 * 1024 * 1024;
+
+/// The order and memory a PPMd block declares when it starts a model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PpmdModelSize {
+    pub(crate) order: usize,
+    pub(crate) memory_mb: u8,
+}
+
+impl PpmdModelSize {
+    pub(crate) const DEFAULT: Self = Self {
+        order: PPMD_ORDER,
+        memory_mb: PPMD_DICTIONARY_MB,
+    };
+
+    pub(crate) const fn bytes(self) -> u64 {
+        self.memory_mb as u64 * 1024 * 1024
+    }
+
+    /// The header's five order bits. Past 16 they count in threes, so only
+    /// 19, 22 and so on are expressible there.
+    const fn order_bits(self) -> u8 {
+        if self.order <= 16 {
+            self.order as u8 - 1
+        } else {
+            ((self.order - 16) / 3 + 15) as u8
+        }
+    }
+}
 const PPMD_ESC: u8 = 2;
 // Seeds and weights for the escape-token cost model in `encode_ppmd_hybrid`.
 // The seeds only steer the first few decisions; measured costs take over as
@@ -54,11 +82,17 @@ trait Candidates {
     fn first(&self, input: &[u8], pos: usize, limit: usize) -> usize;
     fn previous(&self, candidate: usize) -> usize;
     fn insert(&mut self, input: &[u8], pos: usize);
+    /// The newest candidate before `pos`, once `pos` itself has been inserted.
+    fn before(&self, pos: usize) -> usize;
 }
 
 impl<const MIN_MATCH: usize> Candidates for match_finder::MatchFinder<MIN_MATCH> {
     fn first(&self, input: &[u8], pos: usize, _limit: usize) -> usize {
         match_finder::MatchFinder::first(self, input, pos)
+    }
+
+    fn before(&self, pos: usize) -> usize {
+        self.first_before(pos, pos)
     }
 
     fn previous(&self, candidate: usize) -> usize {
@@ -82,6 +116,10 @@ impl<const MIN_MATCH: usize> Candidates for FilledAhead<'_, MIN_MATCH> {
     }
 
     fn insert(&mut self, _input: &[u8], _pos: usize) {}
+
+    fn before(&self, pos: usize) -> usize {
+        self.0.first_before(pos, pos)
+    }
 }
 
 // RAR 3.x standard filters are stored as RARVM bytecode in the compressed
@@ -163,7 +201,7 @@ pub(crate) fn unpack29_encode_literals_with_options_and_progress(
 }
 
 pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
-    encode_ppmd_member(input, false, &[], 0)
+    encode_ppmd_member(input, false, None, 0)
 }
 
 pub(crate) fn unpack29_encode_ppmd_with_progress(
@@ -176,28 +214,44 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
     if !progress(0) {
         return Err(Error::Cancelled);
     }
-    let filtered = if let Some(filter) = filter {
-        let filters = split_large_filter(input.len(), filter)?;
-        Some(filtered_members_with_progress(
-            input,
-            &filters,
-            Some(&mut *progress),
-        )?)
-    } else {
-        None
-    };
-    let records = if let Some(filtered) = &filtered {
-        let refs: Vec<_> = filtered.records.iter().collect();
-        encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new())?
-    } else {
-        Vec::new()
+    let (filtered, mut declared) = match filter {
+        Some(filter) => {
+            let filters = split_large_filter(input.len(), filter)?;
+            let filtered = filtered_members_with_progress(input, &filters, Some(&mut *progress))?;
+            (
+                Some(filtered.data),
+                Some(PpmdFilters::applied(filtered.records)),
+            )
+        }
+        None => (None, None),
     };
     encode_ppmd_block_with_model(
-        filtered.as_ref().map_or(input, |filtered| &filtered.data),
+        filtered.as_deref().unwrap_or(input),
         lz_escapes,
-        &records,
+        declared.as_mut(),
         max_match_distance,
         None,
+        PpmdModelSize::DEFAULT,
+        Some(progress),
+    )
+    .map(|(packed, _)| packed)
+}
+
+/// One unfiltered member as PPMd, with a model of the given size.
+pub(crate) fn unpack29_encode_ppmd_sized_with_progress(
+    input: &[u8],
+    lz_escapes: bool,
+    max_match_distance: usize,
+    size: PpmdModelSize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<Vec<u8>> {
+    encode_ppmd_block_with_model(
+        input,
+        lz_escapes,
+        None,
+        max_match_distance,
+        None,
+        size,
         Some(progress),
     )
     .map(|(packed, _)| packed)
@@ -208,7 +262,7 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
 /// that reaches further back than the header promises lands on whatever the
 /// decoder still happens to hold, and unrar fails the member on its checksum.
 pub fn unpack29_encode_ppmd(input: &[u8], max_match_distance: usize) -> Result<Vec<u8>> {
-    encode_ppmd_member(input, true, &[], max_match_distance)
+    encode_ppmd_member(input, true, None, max_match_distance)
 }
 
 pub fn unpack29_encode_ppmd_with_filter(
@@ -227,11 +281,13 @@ fn encode_ppmd_filtered_member(
 ) -> Result<Vec<u8>> {
     let filters = split_large_filter(input.len(), filter)?;
     let filtered = filtered_members(input, &filters)?;
-    // PPMd codes the member as one unit rather than in LZ blocks, so every
-    // record is declared at the start and the window does not constrain them.
-    let refs: Vec<&OwnedVmFilterRecord> = filtered.records.iter().collect();
-    let records = encoded_filter_records_at(&refs, 0, usize::MAX, &mut Vec::new())?;
-    encode_ppmd_member(&filtered.data, lz_escapes, &records, max_match_distance)
+    let mut declared = PpmdFilters::applied(filtered.records);
+    encode_ppmd_member(
+        &filtered.data,
+        lz_escapes,
+        Some(&mut declared),
+        max_match_distance,
+    )
 }
 
 pub(crate) fn filtered_members(
@@ -316,25 +372,53 @@ fn split_large_filter(
     filter: crate::FilterSpec,
 ) -> Result<Vec<crate::FilterSpec>> {
     let range = checked_filter_range(input_len, &filter)?;
-    let (unit, chunk_size) = filter_chunking(filter.kind)?;
+    let (_, chunk_size) = filter_chunking(filter.kind)?;
     if range.len() <= chunk_size {
         return Ok(vec![filter]);
     }
+    Ok(FilterPieces::new(input_len, &filter)?
+        .map(|piece| crate::FilterSpec::range(filter.kind, piece))
+        .collect())
+}
 
-    let mut filters = Vec::new();
-    let mut start = range.start;
-    while start < range.end {
-        let end = (start + chunk_size).min(range.end);
+/// The ranges [`split_large_filter`] cuts a filter into, worked out one at a time.
+#[derive(Clone)]
+struct FilterPieces {
+    next: usize,
+    end: usize,
+    chunk_size: usize,
+    unit: usize,
+}
+
+impl FilterPieces {
+    fn new(input_len: usize, filter: &crate::FilterSpec) -> Result<Self> {
+        let range = checked_filter_range(input_len, filter)?;
+        let (unit, chunk_size) = filter_chunking(filter.kind)?;
+        Ok(Self {
+            next: range.start,
+            end: range.end,
+            chunk_size,
+            // A range one record covers is kept whole, however short.
+            unit: if range.len() <= chunk_size { 0 } else { unit },
+        })
+    }
+}
+
+impl Iterator for FilterPieces {
+    type Item = std::ops::Range<usize>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let end = self.next.saturating_add(self.chunk_size).min(self.end);
         // Chunking can leave a remainder the filter has no way to transform.
         // Those bytes stay as they are; a filter covering part of a member is
         // exactly what a range is for.
-        if end - start < unit {
-            break;
+        if self.next >= self.end || end - self.next < self.unit {
+            return None;
         }
-        filters.push(crate::FilterSpec::range(filter.kind, start..end));
-        start = end;
+        let piece = self.next..end;
+        self.next = end;
+        Some(piece)
     }
-    Ok(filters)
 }
 
 /// The fewest bytes a filter of `kind` transforms, and the most one record covers.
@@ -454,24 +538,25 @@ struct OwnedVmFilterRecord {
 fn encode_ppmd_member(
     input: &[u8],
     lz_escapes: bool,
-    initial_filters: &[Vec<u8>],
+    filters: Option<&mut PpmdFilters>,
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
-    encode_ppmd_block(input, lz_escapes, initial_filters, max_match_distance)
+    encode_ppmd_block(input, lz_escapes, filters, max_match_distance)
 }
 
 fn encode_ppmd_block(
     input: &[u8],
     lz_escapes: bool,
-    initial_filters: &[Vec<u8>],
+    filters: Option<&mut PpmdFilters>,
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
     encode_ppmd_block_with_model(
         input,
         lz_escapes,
-        initial_filters,
+        filters,
         max_match_distance,
         None,
+        PpmdModelSize::DEFAULT,
         None,
     )
     .map(|(packed, _)| packed)
@@ -490,35 +575,43 @@ fn encode_ppmd_block(
 fn encode_ppmd_block_with_model(
     input: &[u8],
     lz_escapes: bool,
-    initial_filters: &[Vec<u8>],
+    mut filters: Option<&mut PpmdFilters>,
     max_match_distance: usize,
     model: Option<PpmdModel>,
+    size: PpmdModelSize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<(Vec<u8>, PpmdModel)> {
     if progress.as_mut().is_some_and(|report| !report(0)) {
         return Err(Error::Cancelled);
     }
     let mut out = Vec::new();
+    // A continued model keeps the order it started with, and the reader
+    // ignores the bits here unless the model is reset.
     let mut encoder = match model {
         Some(model) => {
-            out.push(0x80 | ((PPMD_ORDER as u8) - 1));
+            out.push(0x80 | size.order_bits());
             PpmdEncoder::continuing(model, PPMD_ESC)
         }
         None => {
-            out.push(0x80 | 0x20 | ((PPMD_ORDER as u8) - 1));
-            out.push(PPMD_DICTIONARY_MB - 1);
-            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?
+            out.push(0x80 | 0x20 | size.order_bits());
+            out.push(size.memory_mb - 1);
+            PpmdEncoder::new(size.order, PPMD_ESC, usize::from(size.memory_mb))?
         }
     };
-    for record in initial_filters {
-        encoder.encode_vm_filter_record(record)?;
-    }
+    let mut declare = |encoder: &mut PpmdEncoder, pos: usize, len: usize| match filters.as_mut() {
+        Some(filters) => filters.declare(encoder, pos, len),
+        None => Ok(()),
+    };
     if lz_escapes {
         let mut report = |position| progress.as_mut().is_none_or(|report| report(position));
-        encode_ppmd_hybrid_with_progress(
-            input,
-            max_match_distance,
+        let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
+        encode_ppmd_hybrid_span(
+            &mut PpmdMatchSearch::new(input, max_match_distance, reach),
+            0,
+            input.len(),
             &mut encoder,
+            &mut PpmdHybrid::new(),
+            &mut declare,
             |_| (),
             Some(&mut report),
         )?;
@@ -529,6 +622,7 @@ fn encode_ppmd_block_with_model(
             {
                 return Err(Error::Cancelled);
             }
+            declare(&mut encoder, position, 1)?;
             encoder.encode_literal(byte)?;
         }
     }
@@ -626,6 +720,10 @@ pub struct EncodeOptions {
     pub lazy_lookahead: usize,
     pub max_match_distance: usize,
     pub block_size: Option<usize>,
+    /// How many times to re-parse each block by shortest path, each priced by
+    /// the tables the parse before it produced. The block keeps whichever
+    /// parse codes smallest, the lazy one included. Zero leaves the lazy parse.
+    pub optimal_parse_passes: usize,
 }
 
 impl EncodeOptions {
@@ -636,6 +734,7 @@ impl EncodeOptions {
             lazy_lookahead: 1,
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
             block_size: None,
+            optimal_parse_passes: 0,
         }
     }
 
@@ -660,6 +759,11 @@ impl EncodeOptions {
 
     pub const fn with_block_size(mut self, bytes: usize) -> Self {
         self.block_size = Some(bytes);
+        self
+    }
+
+    pub const fn with_optimal_parse_passes(mut self, passes: usize) -> Self {
+        self.optimal_parse_passes = passes;
         self
     }
 
@@ -896,9 +1000,10 @@ impl Unpack29Encoder {
         encode_ppmd_block_with_model(
             input,
             true,
-            &[],
+            None,
             self.options.max_match_distance,
             self.ppmd.clone(),
+            PpmdModelSize::DEFAULT,
             Some(progress),
         )
     }
@@ -1077,10 +1182,12 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
     input: &mut dyn Read,
     len: usize,
     escapes: Option<usize>,
+    filter: Option<crate::FilterSpec>,
     progress: &mut dyn FnMut(usize) -> bool,
     out: PackedOut<'_>,
 ) -> Result<ControlFlow<()>> {
-    encode_ppmd_streamed(input, len, escapes, None, None, progress, out).map(|(flow, _)| flow)
+    encode_ppmd_streamed(input, len, escapes, filter, None, None, progress, out)
+        .map(|(flow, _)| flow)
 }
 
 impl Unpack29Encoder {
@@ -1155,11 +1262,14 @@ impl Unpack29Encoder {
     }
 
     /// [`Self::encode_member_with_engine`]'s PPMd side read as it is coded; a break leaves a chain to discard.
+    ///
+    /// With `filter`, a fresh encoder codes what [`unpack29_encode_ppmd_with_progress`] does with it.
     pub(crate) fn encode_ppmd_streamed(
         &mut self,
         input: &mut dyn Read,
         len: usize,
         escapes: Option<usize>,
+        filter: Option<crate::FilterSpec>,
         progress: &mut dyn FnMut(usize) -> bool,
         out: PackedOut<'_>,
     ) -> Result<ControlFlow<()>> {
@@ -1169,6 +1279,7 @@ impl Unpack29Encoder {
             input,
             len,
             escapes,
+            filter,
             self.ppmd.clone(),
             Some(&mut history),
             progress,
@@ -1183,10 +1294,15 @@ impl Unpack29Encoder {
 }
 
 /// `history`, when given, is left holding the last [`MAX_HISTORY`] bytes read after it.
+///
+/// `filter` is applied a record at a time as the bytes each covers are read,
+/// and each record is declared as the coder reaches it.
+#[allow(clippy::too_many_arguments)]
 fn encode_ppmd_streamed(
     input: &mut dyn Read,
     len: usize,
     escapes: Option<usize>,
+    filter: Option<crate::FilterSpec>,
     model: Option<PpmdModel>,
     mut history: Option<&mut Vec<u8>>,
     progress: &mut dyn FnMut(usize) -> bool,
@@ -1195,6 +1311,9 @@ fn encode_ppmd_streamed(
     if !progress(0) {
         return Err(Error::Cancelled);
     }
+    let mut filters = filter
+        .map(|filter| PpmdFilters::new(len, filter))
+        .transpose()?;
     let (mut encoder, head) = match model {
         Some(model) => (
             PpmdEncoder::continuing(model, PPMD_ESC),
@@ -1226,14 +1345,24 @@ fn encode_ppmd_streamed(
             .saturating_add(reach.saturating_mul(4).max(PPMD_STREAM_SEGMENT))
             .min(len);
         let lookahead = escapes.map_or(0, |_| PPMD_STREAM_LOOKAHEAD);
-        let want = end.saturating_add(lookahead).min(len) - origin;
+        let mut want = end.saturating_add(lookahead).min(len);
+        if let Some(filters) = &filters {
+            want = filters.read_end(want);
+        }
         let have = window.len();
-        window.resize(want.max(have), 0);
+        window.resize((want - origin).max(have), 0);
         input.read_exact(&mut window[have..])?;
+        if let Some(filters) = &mut filters {
+            filters.apply(&mut window, origin)?;
+        }
         if let Some(history) = history.as_deref_mut() {
             history.extend_from_slice(&window[have..]);
             history.drain(..history.len().saturating_sub(MAX_HISTORY));
         }
+        let mut declare = |encoder: &mut PpmdEncoder, at: usize, len: usize| match &mut filters {
+            Some(filters) => filters.declare(encoder, origin + at, len),
+            None => Ok(()),
+        };
         if let Some(distance) = escapes {
             let mut report = |local: usize| progress(origin + local);
             pos = origin
@@ -1243,14 +1372,18 @@ fn encode_ppmd_streamed(
                     end - origin,
                     &mut encoder,
                     &mut state,
+                    &mut declare,
                     |_| (),
                     Some(&mut report),
                 )?;
         } else {
-            for (at, &byte) in window[pos - origin..end - origin].iter().enumerate() {
-                if (pos + at).is_multiple_of(4096) && !progress(pos + at) {
+            let start = pos - origin;
+            for (at, &byte) in window[start..end - origin].iter().enumerate() {
+                let at = start + at;
+                if (origin + at).is_multiple_of(4096) && !progress(origin + at) {
                     return Err(Error::Cancelled);
                 }
+                declare(&mut encoder, at, 1)?;
                 encoder.encode_literal(byte)?;
             }
             pos = end;
@@ -1474,17 +1607,16 @@ fn encode_member_inner(
     )
 }
 
-fn code_block(
+/// The code-length table a block of these tokens is coded with.
+fn table_lengths_for_tokens(
     tokens: &[EncodeToken],
-    initial_filters: &[Vec<u8>],
-    more_blocks_follow: bool,
-    previous_levels: &mut [u8; TABLE_COUNT],
-) -> Result<Vec<u8>> {
+    filter_records: usize,
+) -> Result<[u8; TABLE_COUNT]> {
     let mut main_frequencies = vec![0usize; MAIN_COUNT];
     let mut offset_frequencies = vec![0usize; OFFSET_COUNT];
     let mut low_offset_frequencies = vec![0usize; LOW_OFFSET_COUNT];
     let mut length_frequencies = vec![0usize; LENGTH_COUNT];
-    main_frequencies[257] += initial_filters.len();
+    main_frequencies[257] += filter_records;
     let mut match_state = EncoderMatchState::default();
     for token in tokens {
         match *token {
@@ -1502,6 +1634,9 @@ fn code_block(
                     } => {
                         main_frequencies[259 + index] += 1;
                         length_frequencies[length_slot] += 1;
+                    }
+                    EncodedMatch::Short { slot, .. } => {
+                        main_frequencies[263 + slot] += 1;
                     }
                     EncodedMatch::Fresh {
                         length_slot,
@@ -1538,6 +1673,16 @@ fn code_block(
     table_lengths[MAIN_COUNT + OFFSET_COUNT..MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT]
         .copy_from_slice(&low_offset_lengths);
     table_lengths[MAIN_COUNT + OFFSET_COUNT + LOW_OFFSET_COUNT..].copy_from_slice(&length_lengths);
+    Ok(table_lengths)
+}
+
+fn code_block(
+    tokens: &[EncodeToken],
+    initial_filters: &[Vec<u8>],
+    more_blocks_follow: bool,
+    previous_levels: &mut [u8; TABLE_COUNT],
+) -> Result<Vec<u8>> {
+    let table_lengths = table_lengths_for_tokens(tokens, initial_filters.len())?;
 
     // Two ways to say the same table: outright, or as a delta against the one
     // the reader already holds. Neither wins everywhere, so code both and take
@@ -1614,6 +1759,12 @@ fn code_block(
                         if LENGTH_BITS[length_slot] != 0 {
                             bits.write_bits(length_extra as u32, LENGTH_BITS[length_slot]);
                         }
+                    }
+                    EncodedMatch::Short { slot, extra } => {
+                        let code =
+                            main_codes[263 + slot].expect("counted short match Huffman code");
+                        bits.write_bits(code.code as u32, code.len);
+                        bits.write_bits(extra as u32, SHORT_BITS[slot]);
                     }
                     EncodedMatch::Fresh {
                         length_slot,
@@ -2029,6 +2180,11 @@ enum EncodedMatch {
         length_slot: usize,
         length_extra: usize,
     },
+    /// A two-byte match up to 256 back, which only the shortest-path parse emits.
+    Short {
+        slot: usize,
+        extra: usize,
+    },
     Fresh {
         length_slot: usize,
         length_extra: usize,
@@ -2058,6 +2214,10 @@ impl EncoderMatchState {
                     length_extra,
                 });
             }
+        }
+        if length == 2 {
+            let (slot, extra) = short_slot_for_match(offset)?;
+            return Ok(EncodedMatch::Short { slot, extra });
         }
         let encoded_length =
             length
@@ -2111,7 +2271,7 @@ fn encode_tokens_with_progress(
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
     }
-    parse_range(
+    parse_block(
         &combined,
         start,
         combined.len(),
@@ -2191,7 +2351,7 @@ impl<'a> LzParser<'a> {
             .collect();
         let (data, options, finder) = (self.data, self.options, &self.finder);
         let parse = |(start, end): (usize, usize)| {
-            parse_range(data, start, end, &mut FilledAhead(finder), options, None)
+            parse_block(data, start, end, &mut FilledAhead(finder), options, None)
         };
         if !crate::parallel::may_nest() {
             return ranges
@@ -2203,6 +2363,22 @@ impl<'a> LzParser<'a> {
         debug_assert!(failure.is_none(), "a parse without progress cannot fail");
         tokens
     }
+}
+
+/// The lazy parse, then at the levels that ask for it a shortest-path one.
+fn parse_block<C: Candidates>(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    finder: &mut C,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<EncodeToken>> {
+    let tokens = parse_range(data, start, end, finder, options, progress)?;
+    if options.optimal_parse_passes == 0 {
+        return Ok(tokens);
+    }
+    optimal_parse::refine(data, start, end, &*finder, options, tokens)
 }
 
 /// No match crosses `end`, so a block covers exactly the bytes it was given.
@@ -2375,16 +2551,6 @@ fn encode_ppmd_hybrid(
     encoder: &mut PpmdEncoder,
     on_token: impl FnMut(PpmdEncodeToken),
 ) -> Result<()> {
-    encode_ppmd_hybrid_with_progress(input, max_match_distance, encoder, on_token, None)
-}
-
-fn encode_ppmd_hybrid_with_progress(
-    input: &[u8],
-    max_match_distance: usize,
-    encoder: &mut PpmdEncoder,
-    on_token: impl FnMut(PpmdEncodeToken),
-    progress: Option<&mut dyn FnMut(usize) -> bool>,
-) -> Result<()> {
     let reach = input.len().min(max_match_distance).min(MAX_HISTORY);
     encode_ppmd_hybrid_span(
         &mut PpmdMatchSearch::new(input, max_match_distance, reach),
@@ -2392,10 +2558,93 @@ fn encode_ppmd_hybrid_with_progress(
         input.len(),
         encoder,
         &mut PpmdHybrid::new(),
+        &mut |_, _, _| Ok(()),
         on_token,
-        progress,
+        None,
     )
     .map(|_| ())
+}
+
+/// Called with each token's position and length before it is coded.
+type Declare<'a> = &'a mut dyn FnMut(&mut PpmdEncoder, usize, usize) -> Result<()>;
+
+/// A named filter's records in a PPMd member, each declared just ahead of its bytes.
+///
+/// A record is coded behind the escape symbol, as an LZ match is, so it can be
+/// declared anywhere in the stream, and gives its start relative to where it
+/// is declared. Declaring every record before the first byte, as this coder
+/// once did, needs the whole member filtered first, and works only while the
+/// reader can hold every record pending at once: our decoder takes 8192, which
+/// a named filter's 120,000-byte records pass before a member is 1 GB. Declared
+/// as the coder reaches it, each record is applied and dropped long before the
+/// next arrives, and a member read whole codes to the bytes a streamed one does.
+struct PpmdFilters {
+    /// The filter's records not yet applied, in member order.
+    pieces: Option<(crate::FilterKind, FilterPieces)>,
+    /// Applied and waiting for the coder to reach them, in member order.
+    records: std::collections::VecDeque<OwnedVmFilterRecord>,
+    programs: Vec<&'static [u8]>,
+}
+
+impl PpmdFilters {
+    /// `filter` cut into the records [`split_large_filter`] gives, none applied yet.
+    fn new(len: usize, filter: crate::FilterSpec) -> Result<Self> {
+        Ok(Self {
+            pieces: Some((filter.kind, FilterPieces::new(len, &filter)?)),
+            records: std::collections::VecDeque::new(),
+            programs: Vec::new(),
+        })
+    }
+
+    /// Records already applied to the bytes they cover, in member order.
+    fn applied(records: Vec<OwnedVmFilterRecord>) -> Self {
+        Self {
+            pieces: None,
+            records: records.into(),
+            programs: Vec::new(),
+        }
+    }
+
+    /// Where a read meant to stop at `end` stops instead, so no record is left half read.
+    fn read_end(&self, end: usize) -> usize {
+        self.pieces
+            .iter()
+            .flat_map(|(_, pieces)| pieces.clone())
+            .find(|piece| piece.end > end)
+            .filter(|piece| piece.start < end)
+            .map_or(end, |piece| piece.end)
+    }
+
+    /// Applies each record whose bytes `window`, the member from `origin` on, now holds.
+    fn apply(&mut self, window: &mut [u8], origin: usize) -> Result<()> {
+        let held = origin + window.len();
+        let Some((kind, pieces)) = &mut self.pieces else {
+            return Ok(());
+        };
+        while let Some(piece) = pieces.clone().next().filter(|piece| piece.end <= held) {
+            pieces.next();
+            let piece = crate::FilterSpec::range(*kind, piece);
+            // A record the decoder could not undo comes back empty, as in memory.
+            let applied = filter_window(window, origin, std::slice::from_ref(&piece), None)?;
+            self.records.extend(applied);
+        }
+        Ok(())
+    }
+
+    /// Declares each record starting in `pos..pos + len`, before the token that codes those bytes.
+    fn declare(&mut self, encoder: &mut PpmdEncoder, pos: usize, len: usize) -> Result<()> {
+        while let Some(record) = self.records.front() {
+            if record.block_start >= pos + len {
+                break;
+            }
+            for bytes in encoded_filter_records_at(&[record], pos, usize::MAX, &mut self.programs)?
+            {
+                encoder.encode_vm_filter_record(&bytes)?;
+            }
+            self.records.pop_front();
+        }
+        Ok(())
+    }
 }
 
 /// Carried across spans so a streamed member decides as one coded whole would.
@@ -2422,12 +2671,17 @@ impl PpmdHybrid {
 }
 
 /// Returns where it stopped, since a token that starts before `end` may finish past it.
+///
+/// `declare` is handed each token's position and length before the token is
+/// coded, so a filter record that starts under it is declared ahead of its bytes.
+#[allow(clippy::too_many_arguments)]
 fn encode_ppmd_hybrid_span(
     search: &mut PpmdMatchSearch<'_>,
     mut pos: usize,
     end: usize,
     encoder: &mut PpmdEncoder,
     state: &mut PpmdHybrid,
+    declare: Declare<'_>,
     mut on_token: impl FnMut(PpmdEncodeToken),
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<usize> {
@@ -2441,6 +2695,7 @@ fn encode_ppmd_hybrid_span(
         }
         if let Some(length) = ppmd_offset_one_repeat(input, pos) {
             if state.costs.repeat_pays(length) {
+                declare(encoder, pos, length)?;
                 let before = encoder.spent_bits();
                 encoder.encode_repeat_offset_one(length)?;
                 state.costs.record_repeat(encoder.spent_bits() - before);
@@ -2453,6 +2708,7 @@ fn encode_ppmd_hybrid_span(
         if pos >= state.search_from {
             if let Some((length, offset)) = search.best(pos) {
                 if state.costs.match_pays(length) {
+                    declare(encoder, pos, length)?;
                     let before = encoder.spent_bits();
                     encoder.encode_match(offset, length)?;
                     state.costs.record_match(encoder.spent_bits() - before);
@@ -2464,6 +2720,7 @@ fn encode_ppmd_hybrid_span(
             }
         }
 
+        declare(encoder, pos, 1)?;
         let before = encoder.spent_bits();
         encoder.encode_literal(input[pos])?;
         state.costs.record_literal(encoder.spent_bits() - before);
@@ -2736,6 +2993,7 @@ fn estimated_match_cost(state: &EncoderMatchState, length: usize, offset: usize)
         EncodedMatch::RepeatOffset { length_slot, .. } => {
             Ok(5 + usize::from(LENGTH_BITS[length_slot]))
         }
+        EncodedMatch::Short { slot, .. } => Ok(5 + usize::from(SHORT_BITS[slot])),
         EncodedMatch::Fresh {
             length_slot,
             offset_slot,
@@ -2794,6 +3052,20 @@ fn length_slot_for_repeat_match(length: usize) -> Result<(usize, usize)> {
     }
     Err(Error::InvalidData(
         "RAR 2.9 repeat match length is too long",
+    ))
+}
+
+fn short_slot_for_match(offset: usize) -> Result<(usize, usize)> {
+    let adjusted = offset
+        .checked_sub(1)
+        .ok_or(Error::InvalidData("RAR 2.9 match offset is zero"))?;
+    for (slot, &base) in SHORT_BASES.iter().enumerate() {
+        if adjusted < base + (1usize << SHORT_BITS[slot]) {
+            return Ok((slot, adjusted - base));
+        }
+    }
+    Err(Error::InvalidData(
+        "RAR 2.9 two-byte match offset is too large",
     ))
 }
 
@@ -3081,6 +3353,10 @@ impl BitWriter {
         self.bytes
     }
 }
+
+#[path = "optimal_parse.rs"]
+mod optimal_parse;
+pub(crate) use optimal_parse::OPTIMAL_PARSE_WORKSPACE;
 
 // Round-trip and malformed-input tests use private encoder helpers and ancestor
 // decoder state, without exposing those internals to sibling production code.

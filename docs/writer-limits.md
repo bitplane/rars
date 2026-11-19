@@ -31,9 +31,9 @@ Pinned by `writer_limits_table_matches_what_each_format_supports`.
 
 | format | archive | solid | password | encrypted headers | recovery record | `--memory-limit` | `--temp-dir` |
 |---|---|---|---|---|---|---|---|
-| `rar14` | single | yes | yes | no | no | yes | no |
+| `rar14` | single | yes | yes | no | no | yes | yes |
 | `rar14` | volumes | yes | no | no | no | no | no |
-| `rar15` | single | yes | yes | no | no | yes | no |
+| `rar15` | single | yes | yes | no | no | yes | yes |
 | `rar15` | volumes | yes | yes | no | no | no | no |
 | `rar20` | single | yes | yes | no | no | yes | yes |
 | `rar20` | volumes | yes | yes | no | no | no | no |
@@ -50,8 +50,8 @@ without it. The solid column is two 512 MiB members.
 
 | format | stored | compressed, to a file | compressed, to a pipe | solid | password | encrypted headers | volumes, stored / compressed | recovery |
 |---|---|---|---|---|---|---|---|---|
-| `rar14` | 7 MB | 11.8 GB | 11.8 GB | 7.0 GB | 11.8 GB | refused | 3.2 GB / 11.9 GB | refused |
-| `rar15` | 6 MB | 11.8 GB | 11.9 GB | 7.0 GB | 11.8 GB | refused | 6 MB / 11.8 GB | refused |
+| `rar14` | 7 MB | 10 MB | 10 MB | 10 MB | 10 MB | refused | 3.2 GB / 2.3 GB | refused |
+| `rar15` | 6 MB | 10 MB | 10 MB | 10 MB | 11 MB | refused | 6 MB / 10 MB | refused |
 | `rar20` | 6 MB | 27 MB | 28 MB | 25 MB | 31 MB | refused | 6 MB / 28 MB | refused |
 | `rar40` | 6 MB | 144 MB | 145 MB | 181 MB | 146 MB | 145 MB | 6 MB / 193 MB | refused |
 | `rar50` | 6 MB | 219 MB | 221 MB | 222 MB | 214 MB | 222 MB | 221 MB | 220 MB |
@@ -62,15 +62,16 @@ What each writer holds, what bounds it, and the tests that pin it:
 | format and path | holds | bounded by | tests |
 |---|---|---|---|
 | any format, stored | a copy buffer; the source is read twice, for the CRC and then the copy | constant | `a_stored_member_is_copied_through_not_loaded_in_every_format`, `stored_split_member_reads_its_source_at_most_twice` |
-| `rar14`, `rar15` compressed | the whole member, a match index of about 8–16 bytes per byte and, for `rar14`, a verifying decode | nothing: the charge admits one oversized member alone (#332) | `an_oversized_member_is_admitted_alone_rather_than_refused`, `rar15_and_rar20_parse_levels_are_charged_for_what_they_hold` (`rar15` only) |
+| `rar14` compressed | one 64 KiB window, the next 1 MiB and a match index over the window; a member over 64 MiB is packed into a spool in the temp directory, verified by decoding the spool against the source, then copied out | the window, plus disk | `a_spooled_member_writes_the_archive_the_in_memory_writer_does`, `a_spooled_member_is_encrypted_as_it_is_copied_out`, `a_member_coded_a_window_at_a_time_packs_as_it_does_whole` |
+| `rar15` compressed | one 64 KiB window, the next 1 MiB and a match index over the window | the window, whatever the member's size | `rar15_charges_an_index_whatever_the_member_size`, `a_streamed_rar15_member_writes_the_archive_the_in_memory_writer_does`, `solid_rar15_members_stream_on_the_chain_and_are_never_stored`, `a_member_coded_a_window_at_a_time_packs_as_it_does_whole` |
 | `rar20` compressed | one 1 MiB block and its tables | the block, whatever the member's size | `rar20_charges_a_block_whatever_the_member_size`, `a_streamed_rar20_member_writes_the_archive_the_in_memory_writer_does`, `solid_rar20_members_stream_on_the_chain_and_leave_it_for_the_next` |
 | `rar40` compressed | the LZ window or PPMd model | dictionary and level | `a_streamed_member_is_charged_what_it_holds_not_its_size`, `a_streamed_member_writes_the_archive_the_in_memory_writer_does` |
-| `rar20`, `rar40` to a pipe | as to a file; a member over 64 MiB is packed into a spool in the temp directory first | as to a file, plus disk | `a_piped_member_is_spooled_into_the_archive_a_file_gets`, `a_piped_password_protected_member_is_spooled_and_encrypted` |
-| `rar15`, `rar20`, `rar40` members of 64 MiB or less | the member and its packed form, one per member in flight | `--memory-limit` decides how many are in flight; copies it doesn't count are #336 | `an_oversized_member_is_admitted_alone_rather_than_refused`, `legacy_resource_limits_fail_before_opening_a_member_or_writing_output` |
+| `rar15`, `rar20`, `rar40` to a pipe | as to a file; a member over 64 MiB is packed into a spool in the temp directory first | as to a file, plus disk | `a_streamed_rar15_member_writes_the_archive_the_in_memory_writer_does`, `a_piped_member_is_spooled_into_the_archive_a_file_gets`, `a_piped_password_protected_member_is_spooled_and_encrypted` |
+| legacy members of 64 MiB or less | the member and its packed form, one per member in flight | `--memory-limit` decides how many are in flight; copies it doesn't count are #336 | `a_compressed_member_is_charged_itself_its_packed_form_and_a_fixed_index`, `an_oversized_member_is_admitted_alone_rather_than_refused`, `legacy_resource_limits_fail_before_opening_a_member_or_writing_output` |
 | legacy stored with a password, single archive | the whole member (#334) | its size | `an_encrypted_stored_member_is_charged_for_the_member_it_holds` |
-| `rar40` with a named filter | as compressed: a member over 64 MiB streams, filtered a segment at a time (79 MB for the 1 GiB above, 3.8 GB before #335); under `--ppmd` the whole member, filtered and packed (#345) | dictionary and level; under `--ppmd`, nothing | `a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes`, `a_named_filter_streams_on_a_solid_chain_and_through_a_pipe` |
+| `rar40` with a named filter | as compressed: a member over 64 MiB streams, filtered a segment at a time (79 MB for the 1 GiB above, 3.8 GB before #335); under `--ppmd` too, a record at a time (121 MB for 512 MiB of ELF binaries, 1.4 GB before #345) | dictionary and level | `a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes`, `a_named_filter_streams_on_a_solid_chain_and_through_a_pipe`, `a_filtered_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes` |
 | `rar14` volume set | the input and every volume (#340) | nothing | |
-| `rar20`, `rar40` volume set | as a single archive: large members stream into the set | as a single archive | `a_streamed_rar20_member_splits_into_the_volumes_the_in_memory_writer_does`, `a_compressed_member_over_4_gib_streams_into_a_set`* |
+| `rar15`, `rar20`, `rar40` volume set | as a single archive: large members stream into the set | as a single archive | `a_streamed_rar15_member_splits_into_the_volumes_the_in_memory_writer_does`, `a_streamed_rar20_member_splits_into_the_volumes_the_in_memory_writer_does`, `a_compressed_member_over_4_gib_streams_into_a_set`* |
 | `rar50`, `rar70` compressed | blocks in flight; each member spooled to disk before it's written | `--memory-limit`, dictionary × jobs; disk only if a spool quota is set | `default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings`, `two_codec_workers_hold_admitted_capacity_concurrently`, `the_workspace_charge_covers_what_a_member_measured`, `spool_quota_does_not_change_successful_archive_bytes` |
 | `rar50`, `rar70` solid | the dictionary carried between members | dictionary | `solid_multirun_history_fits_fixed_ceiling_and_extracts` |
 | `rar50`, `rar70` recovery | the parity, or 64 MiB stripes of it under pressure | `--memory-limit` | `recovery_memory_mode_switches_to_striping_under_pressure`, `striped_recovery_matches_resident_recovery_byte_for_byte` |

@@ -136,8 +136,11 @@ fn long_match_search_rejects_zero_history_or_distance_budget() {
     let input = b"repeated repeated";
     assert_eq!(find_long_lz(input, 0, 16), None);
     assert_eq!(find_long_lz(input, 9, 0), None);
-    let buckets = long_lz_buckets(input);
-    assert_eq!(find_long_lz_with_buckets(input, 9, 0, &buckets, 8), None);
+    let mut buckets = long_lz_buckets(input);
+    assert_eq!(
+        find_long_lz_with_buckets(input, 9, 0, &mut buckets, 8),
+        None
+    );
 }
 
 #[test]
@@ -164,9 +167,9 @@ fn equal_length_match_candidates_keep_nearest_distance() {
         long.extend_from_slice(prefix);
         long.push(suffix);
     }
-    let buckets = long_lz_buckets(&long);
+    let mut buckets = long_lz_buckets(&long);
     assert_eq!(
-        find_long_lz_with_buckets(&long, 26, 0x7fff, &buckets, 64),
+        find_long_lz_with_buckets(&long, 26, 0x7fff, &mut buckets, 64),
         Some(LongLz {
             distance: 13,
             length: 12,

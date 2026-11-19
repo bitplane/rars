@@ -1,28 +1,62 @@
 //! RAR13 member encoding and bit emission.
 use super::*;
+use std::ops::ControlFlow;
 
-/// Prebuilt long-LZ candidate index. Unlike the other encoders, rar13 builds
-/// the index for the whole member up front and then queries it at arbitrary
-/// positions, so candidates are stored per hash as position-sorted arrays: a
-/// binary search finds the newest candidate before the query position and
-/// iteration proceeds toward older ones with array locality. A linked-chain
-/// finder is a poor fit here because its head always points at the newest
-/// position in the member, forcing every query to pointer-chase past all
-/// not-yet-reached positions.
+/// Takes packed bytes and how far into the member they reach; a break stops the coding.
+type PackedOut<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>;
+
+/// Long-LZ candidate index: a hash chain over the last [`HISTORY`] positions.
+///
+/// Positions go in lazily, just before a query needs them, and queries move
+/// forward through the member, so a chain lists exactly the earlier positions
+/// that share the query's 3-byte hash, newest first. That is the order the
+/// candidate search depends on. The chain links live in a ring of [`HISTORY`]
+/// slots, so the index costs the same for any member size; every distance the
+/// format can code is inside the ring.
+///
+/// Positions are member positions. `base` is the member position of the
+/// window's first byte, so a member coded a window at a time is indexed the
+/// same way as one coded whole.
 #[derive(Debug, Clone)]
 struct Rar13MatchFinder {
-    buckets: Vec<Vec<usize>>,
+    head: Vec<usize>,
+    prev: Vec<usize>,
+    base: usize,
+    /// Member positions below this are in the chains.
+    inserted: usize,
 }
 
 const LONG_LZ_HASH_BITS: u32 = 16;
 
+/// No position: the end of a chain.
+const NO_POSITION: usize = usize::MAX;
+
+/// History a window keeps behind the coding position. The Unpack15 window is
+/// 64 KiB, and no token reaches back further than 32 KiB.
+const HISTORY: usize = 0x10000;
+
+/// How far past the start of a flags group its planning can read: nine tokens
+/// of at most 258 bytes (a straddled one and eight more), then a lazy look one
+/// byte on for another 258.
+const LOOKAHEAD: usize = 4096;
+
+/// Bytes a streamed member reads per window.
+const STREAM_CHUNK: usize = 1024 * 1024;
+
+/// What coding a member holds besides the member and its packed form: the
+/// match index (two rings of 64 Ki positions), a flags group's planning, and a
+/// verifying decoder's window. When streaming, the window of the member and
+/// the packed bytes of one window also fit in it.
+pub(crate) const ENCODER_WORKSPACE: u64 = 8 * 1024 * 1024;
+
 impl Rar13MatchFinder {
-    fn build(input: &[u8]) -> Self {
-        let mut buckets = vec![Vec::new(); 1 << LONG_LZ_HASH_BITS];
-        for pos in 0..input.len().saturating_sub(2) {
-            buckets[Self::hash(input, pos)].push(pos);
+    fn new() -> Self {
+        Self {
+            head: vec![NO_POSITION; 1 << LONG_LZ_HASH_BITS],
+            prev: vec![NO_POSITION; HISTORY],
+            base: 0,
+            inserted: 0,
         }
-        Self { buckets }
     }
 
     fn hash(input: &[u8], pos: usize) -> usize {
@@ -32,12 +66,66 @@ impl Rar13MatchFinder {
         (value.wrapping_mul(0x9E37_79B1) >> (32 - LONG_LZ_HASH_BITS)) as usize
     }
 
+    /// Indexes every position of the window before `pos`. Each needs its 3
+    /// bytes in the window, which any position before a query has.
+    fn insert_before(&mut self, input: &[u8], pos: usize) {
+        let end = self.base + pos;
+        while self.inserted < end {
+            let at = self.inserted;
+            let hash = Self::hash(input, at - self.base);
+            self.prev[at & (HISTORY - 1)] = self.head[hash];
+            self.head[hash] = at;
+            self.inserted += 1;
+        }
+    }
+
+    /// Moves the window start on to member position `base`, indexing what the
+    /// window drops first.
+    fn slide(&mut self, input: &[u8], pos: usize, base: usize) {
+        self.insert_before(input, pos);
+        debug_assert!(base >= self.base && base <= self.inserted);
+        self.base = base;
+    }
+
     /// Candidate positions strictly before `pos` sharing its 3-byte hash,
     /// newest first. The caller must ensure 3 bytes are readable at `pos`.
-    fn candidates_before(&self, input: &[u8], pos: usize) -> impl Iterator<Item = usize> + '_ {
-        let bucket = &self.buckets[Self::hash(input, pos)];
-        let end = bucket.partition_point(|&candidate| candidate < pos);
-        bucket[..end].iter().rev().copied()
+    fn candidates_before(&mut self, input: &[u8], pos: usize) -> Candidates<'_> {
+        self.insert_before(input, pos);
+        Candidates {
+            next: self.head[Self::hash(input, pos)],
+            pos: self.base + pos,
+            finder: self,
+        }
+    }
+}
+
+struct Candidates<'a> {
+    finder: &'a Rar13MatchFinder,
+    next: usize,
+    pos: usize,
+}
+
+impl Iterator for Candidates<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        loop {
+            let candidate = self.next;
+            if candidate == NO_POSITION || candidate < self.finder.base {
+                return None;
+            }
+            // Links only run to older positions. A ring slot a newer position
+            // has taken since would point forward, and ends the chain instead.
+            let older = self.finder.prev[candidate & (HISTORY - 1)];
+            self.next = if older < candidate {
+                older
+            } else {
+                NO_POSITION
+            };
+            if candidate < self.pos {
+                return Some(candidate - self.finder.base);
+            }
+        }
     }
 }
 
@@ -230,7 +318,7 @@ impl Unpack15Encoder {
             self.emit_payloads(payloads);
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, None, &mut pos);
+                    self.emit_stmode_literal_run(input, None, &mut pos, input.len());
                 }
                 self.emit_stmode_exit();
             }
@@ -259,6 +347,81 @@ impl Unpack15Encoder {
         if input.is_empty() {
             return Ok(Vec::new());
         }
+        let mut member = self.start_member();
+        self.code_window(&mut member, input, input.len(), &mut progress)?;
+        if progress.is_some_and(|report| !report(input.len())) {
+            return Err(Error::Cancelled);
+        }
+        Ok(std::mem::take(&mut self.bits).finish())
+    }
+
+    /// [`Self::encode_member_with_progress`], reading the member as it is
+    /// coded and handing `out` the packed bytes a window at a time, with how
+    /// far into the member they reach. Only the window is held: the last 64 KiB
+    /// coded and up to [`STREAM_CHUNK`] ahead. A break from `out` stops the
+    /// coding.
+    ///
+    /// The packed bytes are the ones [`Self::encode_member_with_progress`]
+    /// gives for the same member: a window stops at the end of a flags group
+    /// that still has [`LOOKAHEAD`] bytes ahead of it, so every decision sees
+    /// what it would have seen with the whole member.
+    pub(crate) fn encode_member_streamed(
+        &mut self,
+        input: &mut dyn std::io::Read,
+        len: usize,
+        progress: &mut dyn FnMut(usize) -> bool,
+        out: PackedOut<'_>,
+    ) -> Result<ControlFlow<()>> {
+        self.encode_member_streamed_in(input, len, progress, out, STREAM_CHUNK)
+    }
+
+    fn encode_member_streamed_in(
+        &mut self,
+        input: &mut dyn std::io::Read,
+        len: usize,
+        progress: &mut dyn FnMut(usize) -> bool,
+        out: PackedOut<'_>,
+        chunk: usize,
+    ) -> Result<ControlFlow<()>> {
+        debug_assert!(chunk > LOOKAHEAD);
+        if len == 0 {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let mut member = self.start_member();
+        let mut progress = Some(progress);
+        let mut window = Vec::new();
+        let mut read = 0usize;
+        loop {
+            let want = (len - read).min(chunk);
+            let have = window.len();
+            window.resize(have + want, 0);
+            input.read_exact(&mut window[have..])?;
+            read += want;
+            debug_assert!(window.len() <= HISTORY + LOOKAHEAD + chunk);
+            self.code_window(&mut member, &window, len, &mut progress)?;
+            let whole = self.bits.take_whole_bytes();
+            if !whole.is_empty() && out(&whole, member.pos)?.is_break() {
+                return Ok(ControlFlow::Break(()));
+            }
+            if read == len {
+                break;
+            }
+            let base = member.finder.base;
+            let keep_from = member.pos.saturating_sub(HISTORY).max(base);
+            member.finder.slide(&window, member.pos - base, keep_from);
+            window.drain(..keep_from - base);
+        }
+        if progress.is_some_and(|report| !report(len)) {
+            return Err(Error::Cancelled);
+        }
+        let tail = std::mem::take(&mut self.bits).finish();
+        if !tail.is_empty() && out(&tail, len)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    fn start_member(&mut self) -> MemberState {
         self.bits = BitWriter::new();
         // Everything the decoder drops at a member boundary has to be dropped
         // here too. The adaptive tables carry across a solid run, but the
@@ -268,11 +431,50 @@ impl Unpack15Encoder {
         // was going to read, and one stray bit desynchronises the rest of the
         // archive.
         self.l_count = 0;
-        let buckets = long_lz_buckets(input);
-        let mut pos = 0usize;
-        let mut next_report = 0usize;
-        let mut straddle: Option<Straddle> = None;
-        while pos < input.len() || straddle.is_some() {
+        MemberState {
+            finder: Rar13MatchFinder::new(),
+            pos: 0,
+            straddle: None,
+            stmode_open: false,
+            next_report: 0,
+        }
+    }
+
+    /// Codes the member from `member.pos` on, given the window of it that
+    /// starts at `member.finder.base`. A window that does not reach the end of
+    /// the member is coded up to the first flags group that starts within
+    /// [`LOOKAHEAD`] of its end, and `member` keeps where that left off.
+    fn code_window(
+        &mut self,
+        member: &mut MemberState,
+        input: &[u8],
+        len: usize,
+        progress: &mut Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<()> {
+        let base = member.finder.base;
+        let last = base + input.len() == len;
+        let limit = if last {
+            input.len()
+        } else {
+            input.len().saturating_sub(LOOKAHEAD)
+        };
+        let buckets = &mut member.finder;
+        let mut pos = member.pos - base;
+        let mut straddle = member.straddle.take();
+        if member.stmode_open {
+            if !self.emit_stmode_literal_run(input, Some(&mut *buckets), &mut pos, limit) {
+                member.pos = base + pos;
+                member.straddle = straddle;
+                return Ok(());
+            }
+            member.stmode_open = false;
+            self.emit_stmode_exit();
+        }
+        while if last {
+            pos < input.len() || straddle.is_some()
+        } else {
+            pos < limit
+        } {
             let mut flags = 0u8;
             let mut flag_bits = 0usize;
             let mut payloads = Vec::new();
@@ -288,20 +490,20 @@ impl Unpack15Encoder {
 
             while flag_bits < 8 && pos < input.len() {
                 let state = plan_encoder.lz_plan_state();
-                if let Some(token) = plan_encoder
-                    .choose_lz_token(input, pos, &buckets, state)
+                let token = plan_encoder
+                    .choose_lz_token(input, pos, buckets, state)
                     .filter(|token| {
                         !self.options.lazy_matching
                             || !should_lazy_emit_literal(
                                 input,
                                 pos,
-                                &buckets,
+                                buckets,
                                 *token,
                                 state.max_dist3,
                                 self.options,
                             )
-                    })
-                {
+                    });
+                if let Some(token) = token {
                     let flag = token.flag_bits(state.nlzb, state.nhfb);
                     let next_pos = pos + token.length() as usize;
                     if flag_fits(flag_bits, flag) {
@@ -339,22 +541,27 @@ impl Unpack15Encoder {
             self.emit_flags_byte(flags);
             self.emit_payloads(payloads);
             if group_enters_stmode {
-                if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, Some(&buckets), &mut pos);
+                if self.options.stmode_literal_runs
+                    && !self.emit_stmode_literal_run(input, Some(&mut *buckets), &mut pos, limit)
+                {
+                    member.stmode_open = true;
+                    break;
                 }
                 self.emit_stmode_exit();
             }
-            if pos >= next_report {
-                if progress.as_deref_mut().is_some_and(|report| !report(pos)) {
+            if base + pos >= member.next_report {
+                if progress
+                    .as_deref_mut()
+                    .is_some_and(|report| !report(base + pos))
+                {
                     return Err(Error::Cancelled);
                 }
-                next_report = pos.saturating_add(1024 * 1024);
+                member.next_report = (base + pos).saturating_add(1024 * 1024);
             }
         }
-        if progress.is_some_and(|report| !report(input.len())) {
-            return Err(Error::Cancelled);
-        }
-        Ok(std::mem::take(&mut self.bits).finish())
+        member.pos = base + pos;
+        member.straddle = straddle;
+        Ok(())
     }
 
     fn clone_for_planning(&self) -> Self {
@@ -404,7 +611,7 @@ impl Unpack15Encoder {
         &self,
         input: &[u8],
         pos: usize,
-        buckets: &Rar13MatchFinder,
+        buckets: &mut Rar13MatchFinder,
         state: LzPlanState,
     ) -> Option<MatchToken> {
         let candidates = find_lz_tokens(input, pos, buckets, state, self.options);
@@ -537,32 +744,33 @@ impl Unpack15Encoder {
         self.emit_literal_place(byte_place + 1, byte_place, false)
     }
 
+    /// Codes literals in stmode until a match turns up or the member ends,
+    /// and says whether the run is over. A run that reaches `limit` first
+    /// stops there, still open, for the next window to go on with.
     fn emit_stmode_literal_run(
         &mut self,
         input: &[u8],
-        buckets: Option<&Rar13MatchFinder>,
+        mut buckets: Option<&mut Rar13MatchFinder>,
         pos: &mut usize,
-    ) {
+        limit: usize,
+    ) -> bool {
         while *pos + 1 < input.len() {
+            if *pos >= limit {
+                return false;
+            }
+            let state = LzPlanState {
+                last_dist: self.last_dist,
+                last_length: self.last_length,
+                old_dist: self.old_dist,
+                old_dist_ptr: self.old_dist_ptr,
+                max_dist3: self.max_dist3,
+                nlzb: self.nlzb,
+                nhfb: self.nhfb,
+                l_count: self.l_count,
+            };
             if buckets
-                .and_then(|buckets| {
-                    find_lz_token(
-                        input,
-                        *pos,
-                        buckets,
-                        LzPlanState {
-                            last_dist: self.last_dist,
-                            last_length: self.last_length,
-                            old_dist: self.old_dist,
-                            old_dist_ptr: self.old_dist_ptr,
-                            max_dist3: self.max_dist3,
-                            nlzb: self.nlzb,
-                            nhfb: self.nhfb,
-                            l_count: self.l_count,
-                        },
-                        self.options,
-                    )
-                })
+                .as_deref_mut()
+                .and_then(|buckets| find_lz_token(input, *pos, buckets, state, self.options))
                 .is_some()
             {
                 break;
@@ -570,6 +778,7 @@ impl Unpack15Encoder {
             self.emit_stmode_literal(input[*pos]);
             *pos += 1;
         }
+        true
     }
 
     fn emit_literal_place(
@@ -1001,6 +1210,18 @@ fn long_lz_flag_bits(prefer_long_lz_on_one: bool) -> &'static [bool] {
     }
 }
 
+/// Where a member's coding has got to, so a window can stop at the end of a
+/// flags group and the next one go on from there.
+struct MemberState {
+    finder: Rar13MatchFinder,
+    /// The member position coded up to.
+    pos: usize,
+    straddle: Option<Straddle>,
+    /// A stmode literal run reached the end of the window still open.
+    stmode_open: bool,
+    next_report: usize,
+}
+
 /// A token whose flag did not fit in what was left of a flags byte.
 ///
 /// `Unpack15` fetches the next flags byte the moment it runs out of bits, and
@@ -1057,7 +1278,7 @@ fn l_count_break_bit_cost(l_count: u32) -> usize {
 fn find_lz_token(
     input: &[u8],
     pos: usize,
-    buckets: &Rar13MatchFinder,
+    buckets: &mut Rar13MatchFinder,
     state: LzPlanState,
     options: EncodeOptions,
 ) -> Option<MatchToken> {
@@ -1069,7 +1290,7 @@ fn find_lz_token(
 fn find_lz_tokens(
     input: &[u8],
     pos: usize,
-    buckets: &Rar13MatchFinder,
+    buckets: &mut Rar13MatchFinder,
     state: LzPlanState,
     options: EncodeOptions,
 ) -> Vec<MatchToken> {
@@ -1108,7 +1329,7 @@ fn find_lz_tokens(
 fn should_lazy_emit_literal(
     input: &[u8],
     pos: usize,
-    buckets: &Rar13MatchFinder,
+    buckets: &mut Rar13MatchFinder,
     current: MatchToken,
     max_dist3: u32,
     options: EncodeOptions,
@@ -1302,7 +1523,7 @@ fn find_long_lz_with_buckets(
     input: &[u8],
     pos: usize,
     max_match_distance: usize,
-    buckets: &Rar13MatchFinder,
+    buckets: &mut Rar13MatchFinder,
     max_candidates: usize,
 ) -> Option<LongLz> {
     if pos == 0 || pos + 2 >= input.len() {
@@ -1357,8 +1578,10 @@ fn find_long_lz_with_buckets(
     (best.length >= 3).then_some(best)
 }
 
-fn long_lz_buckets(input: &[u8]) -> Rar13MatchFinder {
-    Rar13MatchFinder::build(input)
+/// An index for queries on `_input`, which fills itself as they move on.
+#[cfg(test)]
+fn long_lz_buckets(_input: &[u8]) -> Rar13MatchFinder {
+    Rar13MatchFinder::new()
 }
 
 fn emit_long_lz_length(bits: &mut BitWriter, avr_ln2: u32, length_code: u32) {
@@ -1460,6 +1683,14 @@ impl BitWriter {
         );
     }
 
+    /// Hands over the whole bytes written so far, keeping a part-filled one.
+    fn take_whole_bytes(&mut self) -> Vec<u8> {
+        let whole = self.bit_pos / 8;
+        let rest = self.output.split_off(whole);
+        self.bit_pos -= whole * 8;
+        std::mem::replace(&mut self.output, rest)
+    }
+
     fn finish(self) -> Vec<u8> {
         self.output
     }
@@ -1468,3 +1699,7 @@ impl BitWriter {
 #[cfg(test)]
 #[path = "solid_regressions.rs"]
 mod solid_regressions;
+
+#[cfg(test)]
+#[path = "window_tests.rs"]
+mod window_tests;
