@@ -204,11 +204,14 @@ pub fn unpack29_encode_ppmd_literals(input: &[u8]) -> Result<Vec<u8>> {
     encode_ppmd_member(input, false, None, 0)
 }
 
+/// One member as PPMd, filtered first when `filter` is given, starting a
+/// model of the given size.
 pub(crate) fn unpack29_encode_ppmd_with_progress(
     input: &[u8],
     lz_escapes: bool,
     filter: Option<crate::FilterSpec>,
     max_match_distance: usize,
+    size: PpmdModelSize,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
     if !progress(0) {
@@ -229,26 +232,6 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
         filtered.as_deref().unwrap_or(input),
         lz_escapes,
         declared.as_mut(),
-        max_match_distance,
-        None,
-        PpmdModelSize::DEFAULT,
-        Some(progress),
-    )
-    .map(|(packed, _)| packed)
-}
-
-/// One unfiltered member as PPMd, with a model of the given size.
-pub(crate) fn unpack29_encode_ppmd_sized_with_progress(
-    input: &[u8],
-    lz_escapes: bool,
-    max_match_distance: usize,
-    size: PpmdModelSize,
-    progress: &mut dyn FnMut(usize) -> bool,
-) -> Result<Vec<u8>> {
-    encode_ppmd_block_with_model(
-        input,
-        lz_escapes,
-        None,
         max_match_distance,
         None,
         size,
@@ -823,8 +806,12 @@ pub struct Unpack29Encoder {
     /// The PPMd model a reader holds, once some member in the chain has built
     /// one. A reader keeps it across every block that does not ask for a reset,
     /// LZ blocks included, so a member can go PPMd against everything the chain
-    /// has read even when the member before it went LZ.
-    ppmd: Option<PpmdModel>,
+    /// has read even when the member before it went LZ. The size is the one
+    /// it started with, which every later block keeps.
+    ppmd: Option<(PpmdModel, PpmdModelSize)>,
+    /// The sizes a member that starts the chain's model tries, in order; the
+    /// one that codes it smallest is the one the rest of the chain continues.
+    ppmd_sizes: &'static [PpmdModelSize],
 }
 
 impl Default for Unpack29Encoder {
@@ -844,7 +831,19 @@ impl Unpack29Encoder {
             options: options.constrained(),
             levels: [0; TABLE_COUNT],
             ppmd: None,
+            ppmd_sizes: &[PpmdModelSize::DEFAULT],
         }
+    }
+
+    /// The PPMd model sizes to try when a member starts the chain's model.
+    ///
+    /// A chain keeps the model its first PPMd member starts, so the size is
+    /// chosen there and nowhere else. An empty list keeps the default.
+    pub(crate) fn with_ppmd_sizes(mut self, sizes: &'static [PpmdModelSize]) -> Self {
+        if !sizes.is_empty() {
+            self.ppmd_sizes = sizes;
+        }
+        self
     }
 
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
@@ -992,20 +991,54 @@ impl Unpack29Encoder {
 
     /// Codes the member against a copy of the chain's model, so a trial that
     /// loses leaves the reader's model where the winning member expects it.
+    ///
+    /// A member that starts the model codes under each of the chain's sizes
+    /// and keeps the smallest, earlier on a tie, holding two models at a time.
+    /// Only the first size reports progress; the others poll at the end.
     fn encode_ppmd_member(
         &self,
         input: &[u8],
         progress: &mut dyn FnMut(usize) -> bool,
-    ) -> Result<(Vec<u8>, PpmdModel)> {
-        encode_ppmd_block_with_model(
-            input,
-            true,
-            None,
-            self.options.max_match_distance,
-            self.ppmd.clone(),
-            PpmdModelSize::DEFAULT,
-            Some(progress),
-        )
+    ) -> Result<(Vec<u8>, (PpmdModel, PpmdModelSize))> {
+        let distance = self.options.max_match_distance;
+        if let Some((model, size)) = &self.ppmd {
+            let (packed, model) = encode_ppmd_block_with_model(
+                input,
+                true,
+                None,
+                distance,
+                Some(model.clone()),
+                *size,
+                Some(progress),
+            )?;
+            return Ok((packed, (model, *size)));
+        }
+        let mut best: Option<(Vec<u8>, (PpmdModel, PpmdModelSize))> = None;
+        for (index, &size) in self.ppmd_sizes.iter().enumerate() {
+            let mut report =
+                |position: usize| progress(if index == 0 { position } else { input.len() });
+            let (packed, model) = encode_ppmd_block_with_model(
+                input,
+                true,
+                None,
+                distance,
+                None,
+                size,
+                Some(&mut report),
+            )?;
+            if best
+                .as_ref()
+                .is_none_or(|(best, _)| packed.len() < best.len())
+            {
+                best = Some((packed, (model, size)));
+            }
+        }
+        Ok(best.expect("a chain always has a PPMd size to try"))
+    }
+
+    /// Whether the chain holds a PPMd model a member would continue.
+    pub(crate) fn has_ppmd_model(&self) -> bool {
+        self.ppmd.is_some()
     }
 
     pub fn encode_member_with_filter(
@@ -1186,8 +1219,18 @@ pub(crate) fn unpack29_encode_ppmd_streamed(
     progress: &mut dyn FnMut(usize) -> bool,
     out: PackedOut<'_>,
 ) -> Result<ControlFlow<()>> {
-    encode_ppmd_streamed(input, len, escapes, filter, None, None, progress, out)
-        .map(|(flow, _)| flow)
+    encode_ppmd_streamed(
+        input,
+        len,
+        escapes,
+        filter,
+        None,
+        PpmdModelSize::DEFAULT,
+        None,
+        progress,
+        out,
+    )
+    .map(|(flow, _)| flow)
 }
 
 impl Unpack29Encoder {
@@ -1264,30 +1307,40 @@ impl Unpack29Encoder {
     /// [`Self::encode_member_with_engine`]'s PPMd side read as it is coded; a break leaves a chain to discard.
     ///
     /// With `filter`, a fresh encoder codes what [`unpack29_encode_ppmd_with_progress`] does with it.
+    ///
+    /// `size` is the model to start when the chain holds none; a model the
+    /// chain holds is continued at the size it started with.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_ppmd_streamed(
         &mut self,
         input: &mut dyn Read,
         len: usize,
         escapes: Option<usize>,
         filter: Option<crate::FilterSpec>,
+        size: PpmdModelSize,
         progress: &mut dyn FnMut(usize) -> bool,
         out: PackedOut<'_>,
     ) -> Result<ControlFlow<()>> {
         // Taken rather than copied: after a break the caller starts a new chain.
         let mut history = std::mem::take(&mut self.history);
+        let (model, size) = match &self.ppmd {
+            Some((model, size)) => (Some(model.clone()), *size),
+            None => (None, size),
+        };
         let (flow, model) = encode_ppmd_streamed(
             input,
             len,
             escapes,
             filter,
-            self.ppmd.clone(),
+            model,
+            size,
             Some(&mut history),
             progress,
             out,
         )?;
         self.history = history;
         if let Some(model) = model {
-            self.ppmd = Some(model);
+            self.ppmd = Some((model, size));
         }
         Ok(flow)
     }
@@ -1304,6 +1357,7 @@ fn encode_ppmd_streamed(
     escapes: Option<usize>,
     filter: Option<crate::FilterSpec>,
     model: Option<PpmdModel>,
+    size: PpmdModelSize,
     mut history: Option<&mut Vec<u8>>,
     progress: &mut dyn FnMut(usize) -> bool,
     out: PackedOut<'_>,
@@ -1314,17 +1368,15 @@ fn encode_ppmd_streamed(
     let mut filters = filter
         .map(|filter| PpmdFilters::new(len, filter))
         .transpose()?;
+    // Headed as [`encode_ppmd_block_with_model`] heads a block.
     let (mut encoder, head) = match model {
         Some(model) => (
             PpmdEncoder::continuing(model, PPMD_ESC),
-            vec![0x80 | ((PPMD_ORDER as u8) - 1)],
+            vec![0x80 | size.order_bits()],
         ),
         None => (
-            PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB))?,
-            vec![
-                0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
-                PPMD_DICTIONARY_MB - 1,
-            ],
+            PpmdEncoder::new(size.order, PPMD_ESC, usize::from(size.memory_mb))?,
+            vec![0x80 | 0x20 | size.order_bits(), size.memory_mb - 1],
         ),
     };
     if out(&head, 0)?.is_break() {
