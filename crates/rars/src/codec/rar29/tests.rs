@@ -4925,6 +4925,7 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
 /// decides how the table is written, so each block has to be coded against its
 /// own predecessor's and not the one the batch started with.
 #[test]
+#[cfg(feature = "parallel")]
 fn a_batch_of_blocks_codes_as_it_does_one_block_at_a_time() {
     let options = EncodeOptions::new(8).with_max_match_distance(1 << 20);
     let tokens_of = |data: &[u8]| super::encode_tokens_with_progress(data, &[], options, None);
