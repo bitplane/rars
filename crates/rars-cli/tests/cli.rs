@@ -6811,9 +6811,9 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
          or --format rar70",
     ),
     (
-        &["--format", "rar29", "--temp-dir", "."],
-        "error: --temp-dir is not supported by --format rar29; use --format rar50 \
-         or --format rar70",
+        &["--format", "rar15", "--temp-dir", "."],
+        "error: --temp-dir is not supported by --format rar15; use --format rar20, \
+         --format rar29, --format rar30, --format rar40, --format rar50 or --format rar70",
     ),
     // Two filters have to be reported as the conflict they are. Asking which
     // one the format supports has no answer, and the two checks rank the flags
