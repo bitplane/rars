@@ -1494,19 +1494,20 @@ impl<B: Budget> StreamedHistory<B> {
     }
 
     /// Grows the allocation itself so no second copy is resident; true if it moved.
+    /// Grows the ring in place to exactly `capacity` bytes. Unwrapping it
+    /// first means the allocator can extend it, rather than a fresh ring
+    /// holding a copy of the old one while it is filled. Kept out of line so
+    /// the hot path that checks for room stays small enough to inline.
+    #[cold]
+    #[inline(never)]
     fn grow(&mut self, capacity: usize) -> Result<bool> {
-        if B::LIMITED {
-            // Keep the exact charge rather than the ledger's doubling.
-            self.relocate(capacity)?;
-            return Ok(true);
-        }
         let moved = self.len > self.end;
         if moved {
             let start = self.back(self.len);
             self.bytes.rotate_left(start);
             self.end = self.len;
         }
-        self.bytes.reserve_exact(capacity - self.bytes.len());
+        self.bytes.grow_exact(capacity)?;
         self.bytes.resize(capacity, 0)?;
         Ok(moved)
     }

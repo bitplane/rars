@@ -329,9 +329,25 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn retain(&mut self, keep: impl FnMut(&T) -> bool) {
         self.values.retain(keep);
     }
-    pub(crate) fn reserve_exact(&mut self, additional: usize) {
-        debug_assert!(!B::LIMITED);
-        self.values.reserve_exact(additional);
+    /// Grows the allocation in place to exactly `capacity` values. The
+    /// allocator can often extend a large block without copying it, where a
+    /// fresh buffer always holds the old and new storage at once. Some
+    /// allocators do copy, so the charge covers both until growth is done.
+    pub(crate) fn grow_exact(&mut self, capacity: usize) -> Result<()> {
+        if capacity <= self.values.capacity() {
+            return Ok(());
+        }
+        let old = allocation_size::<T>(self.values.capacity())?;
+        let new = allocation_size::<T>(capacity)?;
+        let peak = old
+            .checked_add(new)
+            .ok_or(Error::InvalidData("codec capacity overflows"))?;
+        B::resize(&mut self.charge, peak)?;
+        self.values.reserve_exact(capacity - self.values.len());
+        B::resize(
+            &mut self.charge,
+            allocation_size::<T>(self.values.capacity())?,
+        )
     }
     pub(crate) fn shrink_to(&mut self, capacity: usize) -> Result<()> {
         self.values.shrink_to(capacity);
@@ -791,5 +807,26 @@ mod tests {
         assert_eq!(second.used(), 0);
         drop(kept);
         assert_eq!(first.used(), 0);
+    }
+
+    #[test]
+    fn growing_in_place_admits_both_copies_then_settles_at_the_new_capacity() {
+        let allowance = Allowance::limited(48);
+        let mut bytes = Buffer::filled(16, 7u8, &allowance).unwrap();
+        bytes.grow_exact(32).unwrap();
+        assert_eq!(bytes.capacity(), 32);
+        assert_eq!(allowance.used(), 32);
+        assert!(bytes.iter().all(|&byte| byte == 7) && bytes.len() == 16);
+        bytes.grow_exact(8).unwrap();
+        assert_eq!(allowance.used(), 32);
+
+        // 32 held and 48 more would be 80 at the move: refused, and unchanged.
+        assert!(matches!(
+            bytes.grow_exact(48),
+            Err(Error::WorkspaceLimitExceeded(_))
+        ));
+        assert_eq!((bytes.capacity(), allowance.used()), (32, 32));
+        drop(bytes);
+        assert_eq!(allowance.used(), 0);
     }
 }
