@@ -396,6 +396,16 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           key: ${{ matrix.group }}
+      # As in Rust checks: unoptimised rars spends test runs decoding. The plain
+      # write group stays at opt-level 0, where the 1 MiB-stack test
+      # (a_solid_ppmd_chain_codes_on_a_1_mib_stack) can still catch a large
+      # stack frame that optimisation would hide.
+      - name: Optimise the rars crate in test builds
+        if: matrix.group != 'write'
+        shell: bash
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[profile.dev.package.rars]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Lint and test the library without workspace feature unification
         env:
           SETS: ${{ matrix.features }}
