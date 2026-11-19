@@ -25,9 +25,9 @@ fn final_literal_flag_crosses_into_a_terminal_flags_group() {
     let input: Vec<u8> = [b'A'; 24].into_iter().chain(*b"XYZ").collect();
     let mut planned = encoder.clone_for_planning();
     planned.emit_literal(b'A');
-    let buckets = long_lz_buckets(&input);
+    let mut buckets = long_lz_buckets(&input);
     assert_eq!(
-        planned.choose_lz_token(&input, 1, &buckets, planned.lz_plan_state()),
+        planned.choose_lz_token(&input, 1, &mut buckets, planned.lz_plan_state()),
         Some(MatchToken::LongLz(LongLz {
             distance: 1,
             length: 23
@@ -1073,12 +1073,17 @@ fn near_candidates_do_not_spend_the_far_match_budget() {
     let mut positions = vec![128];
     positions.extend(far_distractors);
     positions.extend(near_distractors);
-    let mut buckets = vec![Vec::new(); 1 << super::LONG_LZ_HASH_BITS];
-    buckets[Rar13MatchFinder::hash(&input, pos)] = positions;
-    let finder = Rar13MatchFinder { buckets };
+    // Only these positions are chained, oldest first, as the encoder would have.
+    let mut finder = Rar13MatchFinder::new();
+    let hash = Rar13MatchFinder::hash(&input, pos);
+    for position in positions {
+        finder.prev[position & (super::HISTORY - 1)] = finder.head[hash];
+        finder.head[hash] = position;
+    }
+    finder.inserted = pos;
 
     assert_eq!(
-        find_long_lz_with_buckets(&input, pos, 0x8000, &finder, 64),
+        find_long_lz_with_buckets(&input, pos, 0x8000, &mut finder, 64),
         Some(LongLz {
             distance: (pos - 128) as u32,
             length: pattern.len() as u32,
@@ -1089,11 +1094,11 @@ fn near_candidates_do_not_spend_the_far_match_budget() {
 #[test]
 fn encoder_selects_and_round_trips_a_near_long_lz_match() {
     let input = b"abcdefghijklmnop".repeat(64);
-    let buckets = long_lz_buckets(&input);
+    let mut buckets = long_lz_buckets(&input);
     let encoder = Unpack15Encoder::new();
 
     assert!(matches!(
-        encoder.choose_lz_token(&input, 16, &buckets, encoder.lz_plan_state()),
+        encoder.choose_lz_token(&input, 16, &mut buckets, encoder.lz_plan_state()),
         Some(MatchToken::LongLz(LongLz {
             distance: 16,
             length: 258,
@@ -1241,12 +1246,12 @@ fn planner_emits_safe_old_distance_token() {
     input.extend_from_within(pos - 33..pos - 13);
 
     let encoder = Unpack15Encoder::new();
-    let buckets = long_lz_buckets(&input);
+    let mut buckets = long_lz_buckets(&input);
     let token = encoder
         .choose_lz_token(
             &input,
             pos,
-            &buckets,
+            &mut buckets,
             LzPlanState {
                 last_dist: u32::MAX,
                 last_length: 0,
@@ -1342,11 +1347,11 @@ fn long_lz_search_rejects_unencodable_32k_distance() {
 #[test]
 fn lazy_match_prefers_longer_next_position_match() {
     let input = b"abcXbcQRSTabcQRSTUV";
-    let buckets = long_lz_buckets(input);
+    let mut buckets = long_lz_buckets(input);
     let token = find_lz_token(
         input,
         10,
-        &buckets,
+        &mut buckets,
         LzPlanState {
             last_dist: u32::MAX,
             last_length: 0,
@@ -1368,7 +1373,7 @@ fn lazy_match_prefers_longer_next_position_match() {
     assert!(should_lazy_emit_literal(
         input,
         10,
-        &buckets,
+        &mut buckets,
         token,
         0x2001,
         EncodeOptions::default()
@@ -1391,12 +1396,12 @@ fn cost_aware_selection_prefers_better_bits_per_byte_token() {
 
     let mut encoder = Unpack15Encoder::new();
     encoder.old_dist = [u32::MAX, u32::MAX, u32::MAX, 33];
-    let buckets = long_lz_buckets(&input);
+    let mut buckets = long_lz_buckets(&input);
     let token = encoder
         .choose_lz_token(
             &input,
             pos,
-            &buckets,
+            &mut buckets,
             LzPlanState {
                 last_dist: u32::MAX,
                 last_length: 0,
@@ -1436,11 +1441,11 @@ fn planner_uses_simulated_max_dist3_for_old_distance_candidates() {
 
     let mut encoder = Unpack15Encoder::new();
     encoder.max_dist3 = 0x7f00;
-    let buckets = long_lz_buckets(&input);
+    let mut buckets = long_lz_buckets(&input);
     let token = encoder.choose_lz_token(
         &input,
         pos,
-        &buckets,
+        &mut buckets,
         LzPlanState {
             last_dist: u32::MAX,
             last_length: 0,

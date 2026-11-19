@@ -1726,7 +1726,7 @@ fn member_workspace(
         .saturating_add(dictionary.saturating_mul(12))
         .saturating_add(ppmd_models)
         .saturating_add(optimal_parse)
-        .saturating_add(rar20_block_workspace(options))
+        .saturating_add(coder_workspace(options))
         .saturating_add(2 * 1024 * 1024)
 }
 
@@ -1744,10 +1744,11 @@ fn rar29_optimal_parse_workspace(options: WriterOptions, unpacked: u64) -> u64 {
     parses.saturating_mul(crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE)
 }
 
-/// RAR 2.0 codes a member a block at a time, so its parse holds one block's
-/// worth whatever the member's size.
-fn rar20_block_workspace(options: WriterOptions) -> u64 {
+/// What the RAR 1.5 and 2.0 coders hold whatever the member's size: RAR 1.5's
+/// match index over its 64 KiB window, and RAR 2.0's parse of one block.
+fn coder_workspace(options: WriterOptions) -> u64 {
     match options.target {
+        ArchiveVersion::Rar15 => crate::codec::rar13::ENCODER_WORKSPACE,
         ArchiveVersion::Rar20 => crate::codec::rar20::block_workspace(
             rar20_encode_options_for_options(options).is_ok_and(|options| options.optimal_parse),
         ),
@@ -1755,17 +1756,11 @@ fn rar20_block_workspace(options: WriterOptions) -> u64 {
     }
 }
 
-/// Bytes held per member byte while it is coded.
-///
-/// RAR 1.5 parses the member whole. Peak RSS of one member at one thread on
-/// brett was 11–13 bytes per input byte at levels 3 and 5. RAR 2.0 holds the
-/// member and its packed form, and parses a block at a time, which
-/// [`rar20_block_workspace`] charges.
-fn held_per_byte(options: WriterOptions) -> u64 {
-    match options.target {
-        ArchiveVersion::Rar15 => 12,
-        _ => 2,
-    }
+/// Bytes held per member byte while it is coded: the member and its packed
+/// form. RAR 1.5 and 2.0 index and parse a bounded stretch of the member,
+/// which [`coder_workspace`] charges.
+fn held_per_byte(_options: WriterOptions) -> u64 {
+    2
 }
 
 /// Codes one member, holding its bytes only while it is being coded.
@@ -1941,7 +1936,8 @@ fn streams_member(
         || level == 0
         || !matches!(
             options.target,
-            ArchiveVersion::Rar20
+            ArchiveVersion::Rar15
+                | ArchiveVersion::Rar20
                 | ArchiveVersion::Rar29
                 | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
@@ -2071,11 +2067,14 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<bool> {
 fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
-    if options.target == ArchiveVersion::Rar20 {
+    if matches!(
+        options.target,
+        ArchiveVersion::Rar15 | ArchiveVersion::Rar20
+    ) {
         // One window and one block, and a chain's history.
         return dictionary
             .saturating_mul(2)
-            .saturating_add(rar20_block_workspace(options))
+            .saturating_add(coder_workspace(options))
             .saturating_add(2 * 1024 * 1024);
     }
     let segment = engine_sample_len(options) as u64;
@@ -2117,6 +2116,8 @@ trait StreamedOut {
     fn begin(&mut self, salt: Option<[u8; 8]>, sizes: HeaderPayload) -> Result<()>;
     /// False stores the member instead; `coded` is how far into it the packed bytes reach with `block`.
     fn goes_on(&mut self, packed: u64, block: u64, coded: u64, unpacked: u64) -> bool;
+    /// The member will not be stored instead, so nothing needs holding back to allow it.
+    fn commit(&mut self) {}
     fn write_packed(&mut self, bytes: &[u8]) -> Result<()>;
     /// Back to the start of the payload; the stored copy is longer than the attempt, so it covers it.
     fn restart(&mut self) -> Result<()>;
@@ -2266,9 +2267,9 @@ fn stream_member(
         .acquire_serialising_cancellable(streamed_workspace(options, coding), &|| {
             progress.is_cancelled()
         })?;
-    // RAR 2.0 has one engine; RAR 2.9 chooses before coding anything.
+    // RAR 1.5 and 2.0 have one engine; RAR 2.9 chooses before coding anything.
     let rar29 = match options.target {
-        ArchiveVersion::Rar20 => None,
+        ArchiveVersion::Rar15 | ArchiveVersion::Rar20 => None,
         _ => {
             let encode_options = rar29_encode_options_for_options(options)?;
             let engine = streamed_engine(member, len, options, coding, encode_options, progress)?;
@@ -2283,6 +2284,13 @@ fn stream_member(
         packed_size: 0,
     };
     out.begin(cipher.salt(), sizes)?;
+    // A RAR 1.5 solid member is never swapped for a stored copy, which would
+    // break the chain (see `should_store_fallback`), so it goes out whatever
+    // it packs to.
+    let storable = !(options.target == ArchiveVersion::Rar15 && solid.is_some());
+    if !storable {
+        out.commit();
+    }
     let mut sealed = Sealed::new(cipher.start()?);
 
     let mut crc = Crc32::new();
@@ -2303,7 +2311,7 @@ fn stream_member(
     };
     let mut write = |block: &[u8], coded: usize| -> crate::codec::Result<ControlFlow<()>> {
         let size = block.len() as u64;
-        if !out.goes_on(sizes.packed_size, size, coded as u64, unpacked_size) {
+        if !out.goes_on(sizes.packed_size, size, coded as u64, unpacked_size) && storable {
             return Ok(ControlFlow::Break(()));
         }
         sealed.write(out, block).map_err(|error| match error {
@@ -2315,9 +2323,16 @@ fn stream_member(
     };
     let flow = match rar29 {
         None => match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
+            Some(SolidEncoder::Rar15(encoder)) => {
+                encoder.encode_member_streamed(&mut counted, len, &mut advance, &mut write)
+            }
             Some(SolidEncoder::Rar20(encoder)) => {
                 encoder.encode_member_streamed(&mut counted, len, &mut advance, &mut write)
             }
+            _ if options.target == ArchiveVersion::Rar15 => Unpack15Encoder::with_options(
+                rar15_encode_options_for_level(options.compression_level)?,
+            )
+            .encode_member_streamed(&mut counted, len, &mut advance, &mut write),
             _ => unpack20_encode_streamed(
                 &mut counted,
                 len,
@@ -2478,7 +2493,9 @@ impl Sealed {
     fn finish(mut self, output: &mut dyn StreamedOut) -> Result<()> {
         if let Some(cipher) = &mut self.cipher {
             if !self.pending.is_empty() {
-                self.pending.resize(16, 0);
+                if cipher.pads() {
+                    self.pending.resize(16, 0);
+                }
                 cipher.encrypt(&mut self.pending);
                 output.write_packed(&self.pending)?;
             }
@@ -5175,6 +5192,149 @@ mod tests {
         assert!(after.pack_size < 1000, "{} bytes", after.pack_size);
     }
 
+    fn rar15(level: u8, solid: bool) -> super::WriterOptions {
+        let mut options =
+            super::WriterOptions::new(ArchiveVersion::Rar15, FeatureSet::store_only());
+        options.compression_level = Some(level);
+        options.features.solid = solid;
+        options
+    }
+
+    fn named_contents(contents: &[(&str, &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        contents
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn a_streamed_rar15_member_writes_the_archive_the_in_memory_writer_does() {
+        // Over a window, so the member is coded in two.
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(300 * 1024);
+        let contents = [
+            ("small.txt", &b"small and below the threshold\n"[..]),
+            ("large.bin", &large[..]),
+            ("noise.bin", &noise[..]),
+        ];
+        let members = entries(&contents);
+        let coding = || crate::MemberCoding::Compressed;
+        let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
+        assert!(super::streams_member(&routed[1], rar15(3, false), &coding(), 256 * 1024).unwrap());
+
+        let out = streamed_with(&members, rar15(3, false), coding(), None).unwrap();
+
+        assert!(out.seeks > 0, "the large member was not streamed");
+        let archive = out.inner.into_inner();
+        assert_eq!(archive, in_memory_with(&members, rar15(3, false), coding()));
+        let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+        let methods: Vec<_> = parsed.files().map(|file| file.method).collect();
+        assert_eq!(methods, [0x33, 0x33, 0x30]);
+        // An output that cannot seek gets the same archive through a spool.
+        let (piped, saw_spool) = piped_with(&members, rar15(3, false), coding());
+        assert!(saw_spool, "the large member was not spooled");
+        assert!(piped == archive);
+        assert_eq!(extracted_set(&[archive], None), named_contents(&contents));
+    }
+
+    #[test]
+    fn solid_rar15_members_stream_on_the_chain_and_are_never_stored() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(300 * 1024);
+        let contents = [
+            ("before.bin", &large[1000..41000]),
+            ("large.bin", &large[..]),
+            ("noise.bin", &noise[..]),
+            ("after.bin", &large[large.len() - 40000..]),
+        ];
+        let members = entries(&contents);
+        let coding = || crate::MemberCoding::Compressed;
+
+        let out = streamed_with(&members, rar15(3, true), coding(), None).unwrap();
+
+        assert!(out.seeks > 0, "the large members were not streamed");
+        let archive = out.inner.into_inner();
+        assert_eq!(archive, in_memory_with(&members, rar15(3, true), coding()));
+        // Storing one would break the chain RAR 1.5 readers follow.
+        let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+        assert!(parsed.files().all(|file| file.method != 0x30));
+        assert_eq!(extracted_set(&[archive], None), named_contents(&contents));
+    }
+
+    #[test]
+    fn a_streamed_rar15_member_splits_into_the_volumes_the_in_memory_writer_does() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(300 * 1024);
+        let contents = [
+            ("small.txt", &b"small and below the threshold\n"[..]),
+            ("large.bin", &large[..]),
+            ("noise.bin", &noise[..]),
+        ];
+        let members = entries(&contents);
+        let coding = || crate::MemberCoding::Compressed;
+        for solid in [false, true] {
+            let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
+            let streams = super::streams_member(&routed[1], rar15(3, solid), &coding(), 256 * 1024);
+            assert!(streams.unwrap());
+
+            let streamed = volume_set(
+                &members,
+                rar15(3, solid),
+                coding(),
+                100_000,
+                256 * 1024,
+                None,
+            )
+            .unwrap();
+
+            let whole =
+                volume_set(&members, rar15(3, solid), coding(), 100_000, u64::MAX, None).unwrap();
+            assert!(streamed.len() > 2);
+            assert!(streamed == whole, "solid: {solid}");
+            assert_eq!(extracted_set(&streamed, None), named_contents(&contents));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn a_password_protected_rar15_member_streams_without_padding() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(300 * 1024 + 5);
+        let contents = [("large.bin", &large[..]), ("noise.bin", &noise[..])];
+        let members: Vec<_> = entries(&contents)
+            .into_iter()
+            .map(|entry| entry.with_password(b"password".to_vec()))
+            .collect();
+        let coding = || crate::MemberCoding::Compressed;
+        for solid in [false, true] {
+            let out = streamed_with(&members, rar15(3, solid), coding(), None).unwrap();
+
+            assert!(out.seeks > 0, "the large members were not streamed");
+            let archive = out.inner.into_inner();
+            // The RAR 1.5 cipher works a byte at a time, so nothing is padded,
+            // and with no salt the archive is the one written in memory.
+            let whole = in_memory_with(&members, rar15(3, solid), coding());
+            assert!(archive == whole, "solid: {solid}");
+            assert_eq!(
+                extracted(&archive, Some(b"password")),
+                named_contents(&contents)
+            );
+        }
+    }
+
+    #[test]
+    fn rar15_charges_an_index_whatever_the_member_size() {
+        for level in [1, 3, 5] {
+            let options = rar15(level, false);
+            let small = super::member_workspace(options, 1 << 20, true, false);
+            let large = super::member_workspace(options, 1 << 30, true, false);
+            // Beyond the bytes it holds, a large member costs what a small one does.
+            assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
+            let streamed = super::streamed_workspace(options, &crate::MemberCoding::Compressed);
+            assert!(streamed < 16 * 1024 * 1024, "{streamed}");
+        }
+    }
+
     #[test]
     fn rar20_charges_a_block_whatever_the_member_size() {
         for level in [3, 5] {
@@ -5876,7 +6036,12 @@ mod tests {
             assert!(charge(ArchiveVersion::Rar20, level) >= 2 * size + block);
             assert!(charge(ArchiveVersion::Rar20, level) < 2 * size + block + (16 << 20));
         }
-        assert!(charge(ArchiveVersion::Rar15, 3) >= 12 * size);
+        // So does RAR 1.5, with a match index over its 64 KiB window.
+        for level in [1, 3, 5] {
+            let index = crate::codec::rar13::ENCODER_WORKSPACE;
+            assert!(charge(ArchiveVersion::Rar15, level) >= 2 * size + index);
+            assert!(charge(ArchiveVersion::Rar15, level) < 2 * size + index + (16 << 20));
+        }
         assert!(charge(ArchiveVersion::Rar29, 5) < 50 * size);
     }
 

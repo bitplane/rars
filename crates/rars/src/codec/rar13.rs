@@ -1,12 +1,12 @@
 #[cfg(feature = "write")]
 mod encoder;
 #[cfg(feature = "write")]
-pub(crate) use encoder::unpack15_encode_with_options_and_progress;
-#[cfg(feature = "write")]
 pub use encoder::{
     find_long_lz, unpack15_encode, unpack15_encode_with_options, EncodeOptions, LongLz,
     Unpack15Encoder,
 };
+#[cfg(feature = "write")]
+pub(crate) use encoder::{unpack15_encode_with_options_and_progress, ENCODER_WORKSPACE};
 
 #[cfg(all(test, feature = "write"))]
 mod streaming_tests;
