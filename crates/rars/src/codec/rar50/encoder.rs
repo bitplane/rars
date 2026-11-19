@@ -2042,13 +2042,8 @@ impl<B: Budget> OptimalCollector<B> {
             match &mut self.finder {
                 CollectorFinder::Packed(_) => unreachable!("packed collector dispatched above"),
                 CollectorFinder::Tree(tree) => {
-                    // Inserting into a tree is the same descent as searching
-                    // it, so a position the parse steps over is stepped over
-                    // here too rather than inserted for nothing. Its bytes are
-                    // a copy of what the match already points at, so the tree
-                    // loses little by not holding them.
                     let avail = combined.len() - pos;
-                    if !searching || avail < 4 {
+                    if avail < 4 {
                         continue;
                     }
                     // Compares stop where the parse stops caring about better
@@ -2056,6 +2051,26 @@ impl<B: Budget> OptimalCollector<B> {
                     // out to its real end, which is the length the parse
                     // commits to and steps over.
                     let len_limit = avail.min(options.nice());
+                    if !searching {
+                        // A position the parse steps over still goes in, with
+                        // a distance limit of zero so nothing is reported.
+                        // Leaving it out would save its descent but leave a
+                        // hole the length of the match, and a third copy of
+                        // something then finds only the first, which may have
+                        // left the window. 32 MiB of C headers and sources,
+                        // many repeated, packs 11.8% larger at an 8 MiB
+                        // dictionary with the holes.
+                        tree.matches(
+                            combined,
+                            pos,
+                            len_limit,
+                            0,
+                            options.max_match_candidates,
+                            &mut matches.runs,
+                        )
+                        .map_err(Into::into)?;
+                        continue;
+                    }
                     tree.matches(
                         combined,
                         pos,
