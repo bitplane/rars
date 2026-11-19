@@ -59,6 +59,7 @@ impl Write for Capture {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn seekable_sources_cover_families_encryption_sfx_and_parallel_extraction() {
     for version in [
         ArchiveVersion::Rar14,

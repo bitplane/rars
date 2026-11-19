@@ -118,6 +118,7 @@ fn unknown_logical_size_is_refused_only_under_an_output_policy() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn split_limit_uses_final_size_and_preserves_early_unknown_placeholders() {
     for total in [false, true] {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -251,6 +252,7 @@ fn legacy_output_limits_cover_sequential_parallel_and_discarded_solid_members() 
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_split_ceiling_applies_to_the_whole_member() {
     for format in [
         ArchiveVersion::Rar14,
@@ -298,6 +300,9 @@ fn legacy_split_ceiling_applies_to_the_whole_member() {
 fn actual_stored_output_is_guarded_when_legacy_header_understates_size() {
     for total in [false, true] {
         for encrypted in [false, true] {
+            if encrypted && !cfg!(feature = "encryption") {
+                continue;
+            }
             let mut builder = Builder::new(ArchiveVersion::Rar14)
                 .store(true)
                 .password(encrypted.then(|| b"secret".to_vec()));
@@ -651,6 +656,7 @@ fn typed_parallel_calls_admit_total_before_later_payload_errors() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn total_quota_persists_across_regular_split_and_following_volume_members() {
     for format in [
         ArchiveVersion::Rar14,
@@ -757,6 +763,7 @@ fn output_options(
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn total_admission_precedes_compressed_payload_decryption_including_split_streams() {
     let mut state = 0x1234_5678u32;
     let noise: Vec<u8> = (0..4096)

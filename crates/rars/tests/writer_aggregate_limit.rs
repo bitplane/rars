@@ -27,7 +27,11 @@ fn aggregate_limit_preserves_output_and_releases_execution_owners() {
             (true, false, false),
             (false, false, false),
             (false, true, true),
-        ] {
+        ]
+        .into_iter()
+        // Recovery rows need the recovery feature.
+        .filter(|&(_, _, recovery)| cfg!(feature = "recovery") || !recovery)
+        {
             let builder = builder(version)
                 .store(store)
                 .solid(solid)
@@ -135,6 +139,7 @@ fn legacy_families_refuse_before_emission_even_with_zero_budget() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn managed_builder_handles_encrypted_file_comment_and_releases_its_charge() {
     let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
     builder

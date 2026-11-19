@@ -206,6 +206,9 @@ fn comments_and_encrypted_headers_are_charged_once_by_plaintext_size() {
         ArchiveVersion::Rar70,
     ] {
         for encrypted in [false, true] {
+            if encrypted && !cfg!(feature = "encryption") {
+                continue;
+            }
             if encrypted && matches!(format, ArchiveVersion::Rar14 | ArchiveVersion::Rar29) {
                 continue;
             }

@@ -102,6 +102,9 @@ fn rar50_stored_emission_rejects_crc_collisions_using_the_payload_hash() {
         (false, true, 2), // First fragment's CRC matches, but its hash changed after header preparation.
         (true, true, 1), // Encrypted volume staging must verify the source before retaining ciphertext.
     ] {
+        if encrypted && !cfg!(feature = "encryption") {
+            continue;
+        }
         let (original, changed) = crc_collision_payloads();
         let opens = Arc::new(AtomicUsize::new(0));
         let source = EntrySource::from_opener(original.len() as u64, move || {
@@ -153,6 +156,7 @@ fn unchanged_rar50_sources_produce_identical_plain_archive_and_volume_bytes() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn unchanged_encrypted_sources_pass_extraction_integrity_checks() {
     for volumes in [false, true] {
         let bytes = write_rar50(changing_source(4096, usize::MAX, 4096), true, volumes, 0).unwrap();

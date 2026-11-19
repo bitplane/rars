@@ -1,8 +1,8 @@
 #![cfg(feature = "write")]
 
-use rars::{
-    ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind, ReadCancellation,
-};
+#[cfg(feature = "encryption")]
+use rars::{ArchiveReadOptions, ErrorKind, ReadCancellation};
+use rars::{ArchiveReader, ArchiveVersion, Builder};
 
 #[test]
 fn unix_symlinks_round_trip_without_resolving_targets() {
@@ -189,6 +189,7 @@ fn zero_size_rar5_unix_link_header_preserves_its_target() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn links_survive_solid_and_encrypted_output_and_unix_byte_mapping() {
     for solid in [false, true] {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -331,6 +332,7 @@ fn link_setters_refuse_shapes_the_target_format_cannot_write() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_link_payloads_are_decoded_with_integrity_and_password_checks() {
     for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar40] {
         let mut builder = Builder::new(format).password(Some(b"secret".to_vec()));
@@ -479,6 +481,7 @@ fn batch_link_targets_reject_invalid_targets_and_corrupt_dependencies() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn legacy_link_targets_apply_per_call_password_limits_and_cancellation() {
     let mut builder = Builder::new(ArchiveVersion::Rar40).password(Some(b"secret".to_vec()));
     builder

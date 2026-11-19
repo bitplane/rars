@@ -84,6 +84,7 @@ fn skip_precedes_limits_and_stop_precedes_later_members() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_members_can_be_skipped_without_a_password() {
     for version in VERSIONS.into_iter().filter(|v| *v != ArchiveVersion::Rar14) {
         let archive = archive(version, false, true);

@@ -269,6 +269,7 @@ fn sources_and_independent_readers_own_the_staged_files() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_sources_require_password_and_respect_cancellation() {
     let root = scratch::case("rewrite-password");
     for format in [

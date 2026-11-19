@@ -251,6 +251,7 @@ fn cancellation_during_output_preserves_partial_output_and_omits_completion() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn cancellation_interrupts_encrypted_volume_preparation() {
     use rars::{Error, WriteCancellation};
     use std::io::{Read, Seek, SeekFrom};
@@ -309,6 +310,7 @@ fn cancellation_interrupts_encrypted_volume_preparation() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn callback_cancellation_during_encoding_and_recovery_is_typed() {
     use rars::{Error, WriteProgress};
     use std::sync::atomic::{AtomicBool, Ordering};

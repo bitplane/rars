@@ -267,6 +267,7 @@ fn retained_legacy_comment_metadata_requires_the_comment_to_be_copied() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn preserving_builder_requires_password_for_encrypted_legacy_archive_comment() {
     let mut builder = Builder::new(ArchiveVersion::Rar30)
         .store(true)
@@ -343,6 +344,7 @@ fn preserving_builder_keeps_rar7_compression_version() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn preserving_builder_requires_password_for_encrypted_legacy_members() {
     for version in [
         ArchiveVersion::Rar14,
@@ -632,6 +634,7 @@ fn preservation_preflight_refuses_metadata_it_cannot_rewrite() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn preservation_preflight_checks_derived_service_and_locator_consistency() {
     use rars::{rar50, Archive};
 
@@ -696,6 +699,7 @@ fn preservation_preflight_checks_derived_service_and_locator_consistency() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn preservation_preflight_checks_every_derived_service_field() {
     use rars::rar50::{self, RecordTime, TimeRecord};
     use rars::Archive;
@@ -873,6 +877,7 @@ fn link_target_scan_skips_corrupt_regular_payloads_in_every_family() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn preserving_builder_retains_encrypted_rar5_archive_comment_settings() {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
         .store(true)
@@ -924,6 +929,7 @@ fn preservation_preflight_refuses_volume_layout() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn mixed_data_and_comment_encryption_are_independent() {
     for solid in [false, true] {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -963,6 +969,7 @@ fn mixed_data_and_comment_encryption_are_independent() {
 }
 
 #[test]
+#[cfg(feature = "recovery")]
 fn metadata_lock_indexes_and_recovery_are_retained_and_regenerated() {
     use rars::rar50::{
         ArchiveEntry, ArchiveMetadataEntry, MainExtraRecord, Rar50Writer, WriterOptions,

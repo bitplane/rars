@@ -57,7 +57,11 @@ fn images() -> Vec<(ArchiveVersion, bool, Vec<u8>)> {
     ] {
         for stored in [false, true] {
             for encrypted in [false, true] {
-                if encrypted && matches!(version, ArchiveVersion::Rar13 | ArchiveVersion::Rar14) {
+                // Without the encryption feature only the unencrypted images are built.
+                if encrypted
+                    && (!cfg!(feature = "encryption")
+                        || matches!(version, ArchiveVersion::Rar13 | ArchiveVersion::Rar14))
+                {
                     continue;
                 }
                 let mut builder = Builder::new(version)
@@ -316,6 +320,7 @@ fn split_and_parallel_sink_failures_keep_member_context() {
 }
 
 #[test]
+#[cfg(feature = "encryption")]
 fn encrypted_header_source_failures_remain_io_errors() {
     for version in [ArchiveVersion::Rar30, ArchiveVersion::Rar50] {
         let mut builder = Builder::new(version)

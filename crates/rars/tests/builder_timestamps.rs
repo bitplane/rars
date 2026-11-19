@@ -186,6 +186,9 @@ fn fractional_mtime_survives_all_rar5_output_paths() {
         (ArchiveVersion::Rar50, false),
         (ArchiveVersion::Rar70, true),
     ] {
+        if encrypted && !cfg!(feature = "encryption") {
+            continue;
+        }
         let password = encrypted.then_some(b"secret".to_vec());
         let mut builder = Builder::new(format)
             .password(password.clone())
