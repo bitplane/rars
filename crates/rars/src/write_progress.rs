@@ -226,21 +226,20 @@ fn callback_panic_keeps_peer_progress_and_completion_usable() {
 }
 
 /// Count accepted output without buffering an archive or guessing its final size.
-pub(crate) struct EmissionWriter<'a> {
-    output: &'a mut dyn std::io::Write,
+pub(crate) struct EmissionWriter<'a, W: ?Sized = dyn std::io::Write> {
+    output: &'a mut W,
     progress: Option<ProgressReporter<'a>>,
+    position: u64,
     completed: u64,
     reported: u64,
     started: bool,
 }
-impl<'a> EmissionWriter<'a> {
-    pub(crate) fn new(
-        output: &'a mut dyn std::io::Write,
-        progress: Option<ProgressReporter<'a>>,
-    ) -> Self {
+impl<'a, W: std::io::Write + ?Sized> EmissionWriter<'a, W> {
+    pub(crate) fn new(output: &'a mut W, progress: Option<ProgressReporter<'a>>) -> Self {
         Self {
             output,
             progress,
+            position: 0,
             completed: 0,
             reported: 0,
             started: false,
@@ -286,11 +285,13 @@ impl<'a> EmissionWriter<'a> {
         check_cancelled(self.progress)
     }
 }
-impl std::io::Write for EmissionWriter<'_> {
+impl<W: std::io::Write + ?Sized> std::io::Write for EmissionWriter<'_, W> {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.start().map_err(std::io::Error::other)?;
         let written = self.output.write(&bytes[..bytes.len().min(64 * 1024)])?;
-        self.completed += written as u64;
+        // Patching a header rewrites bytes already counted.
+        self.position += written as u64;
+        self.completed = self.completed.max(self.position);
         if self.completed - self.reported >= 64 * 1024 {
             self.advance().map_err(std::io::Error::other)?;
         }
@@ -300,5 +301,12 @@ impl std::io::Write for EmissionWriter<'_> {
     fn flush(&mut self) -> std::io::Result<()> {
         check_cancelled(self.progress).map_err(std::io::Error::other)?;
         self.output.flush()
+    }
+}
+impl<W: std::io::Write + std::io::Seek + ?Sized> std::io::Seek for EmissionWriter<'_, W> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        check_cancelled(self.progress).map_err(std::io::Error::other)?;
+        self.position = self.output.seek(position)?;
+        Ok(self.position)
     }
 }

@@ -209,6 +209,21 @@ impl BuilderEntry {
     }
 }
 
+/// A pending file can seek, which lets large RAR 2.9-4.x members stream into it.
+enum SingleOutput<'a> {
+    Stream(&'a mut dyn Write),
+    File(&'a mut fs::File),
+}
+
+impl<'a> SingleOutput<'a> {
+    fn writer(self) -> &'a mut dyn Write {
+        match self {
+            Self::Stream(output) => output,
+            Self::File(output) => output,
+        }
+    }
+}
+
 /// Assembles an archive from members added one at a time.
 ///
 /// Nothing is encoded until [`to_bytes`](Self::to_bytes),
@@ -1218,9 +1233,18 @@ impl Builder {
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
+        self.write_single(SingleOutput::Stream(output), resources, progress)
+    }
+
+    fn write_single(
+        &self,
+        output: SingleOutput<'_>,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
         self.check_single()?;
         if self.streams_rar50() {
-            return self.write_streaming_rar50(output, resources, progress);
+            return self.write_streaming_rar50(output.writer(), resources, progress);
         }
         if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
             return Err(Error::UnsupportedFamilyFeature {
@@ -1235,13 +1259,27 @@ impl Builder {
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));
         check_cancelled(reporting)?;
-        let mut output = EmissionWriter::new(output, reporting);
-        self.write_legacy_to(&mut output, resources, Some(&progress))?;
-        output.finish()
+        match output {
+            SingleOutput::File(output) if self.format.family() == ArchiveFamily::Rar15To40 => {
+                let mut output = EmissionWriter::new(output, reporting);
+                self.write_rar15_single(
+                    rar15_40::ArchiveOutput::seekable(&mut output),
+                    resources,
+                    Some(&progress),
+                )?;
+                output.finish()
+            }
+            output => {
+                let mut output = EmissionWriter::new(output.writer(), reporting);
+                self.write_legacy_to(&mut output, resources, Some(&progress))?;
+                output.finish()
+            }
+        }
     }
 
     /// Write the archive to `path`, streaming where the format allows it.
     /// The completed archive replaces the destination only after writing and syncing succeed.
+    /// Large compressed RAR 2.9-4.x members stream, as a file can seek back to fill in their headers.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem
@@ -1277,7 +1315,7 @@ impl Builder {
         // open files. Declaration order also closes it first during unwinding.
         {
             let mut output = output;
-            self.write_to(&mut output, resources, progress)?;
+            self.write_single(SingleOutput::File(&mut output), resources, progress)?;
             output.sync_all()?;
         }
         check_cancelled(progress.map(ProgressReporter))?;
@@ -1529,7 +1567,11 @@ impl Builder {
     ) -> Result<()> {
         match self.format.family() {
             ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
-            ArchiveFamily::Rar15To40 => self.write_rar15_single(output, resources, progress),
+            ArchiveFamily::Rar15To40 => self.write_rar15_single(
+                rar15_40::ArchiveOutput::Stream(output),
+                resources,
+                progress,
+            ),
             ArchiveFamily::Rar13 => self.write_rar13_single(output, resources, progress),
         }
     }
@@ -1710,7 +1752,7 @@ impl Builder {
 
     fn write_rar15_single(
         &self,
-        output: &mut dyn Write,
+        output: rar15_40::ArchiveOutput<'_>,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {

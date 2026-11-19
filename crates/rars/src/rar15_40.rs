@@ -48,7 +48,7 @@ use extract::{DecoderSession, DecryptingReader, PackedReader};
 pub(crate) use write::{legacy_volume_payload, render_legacy_volumes};
 #[cfg(feature = "write")]
 pub(crate) use write::{
-    write_archive_with_retained_metadata, RetainedFileEntry, RetainedMemberMetadata,
+    write_archive_with_retained_metadata, ArchiveOutput, RetainedFileEntry, RetainedMemberMetadata,
 };
 #[cfg(feature = "write")]
 pub use write::{
