@@ -799,7 +799,14 @@ fn write_members_to(
     // Solid members share one encoder, so they are coded in order. Independent
     // ones are coded a window at a time and written as each window lands.
     if options.features.solid {
-        let mut solid_encoder = Some(SolidEncoder::for_target(options)?);
+        let mut solid_encoder = Some(SolidEncoder::for_chain(
+            members,
+            options,
+            coding,
+            stream_above,
+            resources,
+            progress,
+        )?);
         let mut solid_run_has_member = false;
         for member in members {
             let streams = match stream_above {
@@ -964,34 +971,21 @@ fn encode_rar29_policy_filtered_payload(
     // it writes at -m4. Stamping 0x35 on every PPMd payload only looked right
     // while the trial ran at level 5, and made a level 3 archive claim to be a
     // level 5 one as soon as it ran anywhere else.
-    let ppmd = |data: &[u8]| -> Result<EncodedPayload> {
+    let ppmd = |filter: Option<&FilterSpec>| -> Result<EncodedPayload> {
         Ok(EncodedPayload {
-            data: with_codec_progress(progress, |report| {
-                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
-                    data,
-                    true,
-                    None,
-                    options.max_match_distance,
-                    report,
-                )
-            })?,
+            data: encode_rar29_ppmd_member(
+                data,
+                filter,
+                options.max_match_distance,
+                ppmd_models_for_level(lz_method.saturating_sub(0x30)),
+                progress,
+            )?,
             method: lz_method,
         })
     };
     match (method, policy) {
-        (Rar29Method::Ppmd, FilterPolicy::None) => ppmd(data),
-        (Rar29Method::Ppmd, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
-            data: with_codec_progress(progress, |report| {
-                crate::codec::rar29::unpack29_encode_ppmd_with_progress(
-                    data,
-                    true,
-                    Some(filter.clone()),
-                    options.max_match_distance,
-                    report,
-                )
-            })?,
-            method: lz_method,
-        }),
+        (Rar29Method::Ppmd, FilterPolicy::None) => ppmd(None),
+        (Rar29Method::Ppmd, FilterPolicy::Explicit(filter)) => ppmd(Some(filter)),
         // Filtered writes are rejected before encoding; plain compressed writes
         // use FilterPolicy::None when PPMd is forced.
         (Rar29Method::Ppmd, FilterPolicy::Auto) => unreachable!(),
@@ -1032,7 +1026,7 @@ fn encode_rar29_policy_filtered_payload(
             // Gated on the content, so a binary member never pays for a PPMd
             // encode it was always going to lose.
             if ppmd_trial && is_text_ppmd_candidate(data) {
-                let candidate = ppmd(data)?;
+                let candidate = ppmd(None)?;
                 if candidate.data.len() < best.data.len() {
                     best = candidate;
                 }
@@ -1040,6 +1034,43 @@ fn encode_rar29_policy_filtered_payload(
             Ok(best)
         }
     }
+}
+
+/// Codes a member as PPMd with escapes under each model in `sizes`, and keeps
+/// the smallest, earlier on a tie.
+///
+/// Only the first model's pass moves the progress bar; the others poll for
+/// cancellation, so the bar counts the member once.
+fn encode_rar29_ppmd_member(
+    data: &[u8],
+    filter: Option<&FilterSpec>,
+    max_match_distance: usize,
+    sizes: &[PpmdModelSize],
+    progress: Option<&WorkTracker<'_>>,
+) -> Result<Vec<u8>> {
+    let mut best: Option<Vec<u8>> = None;
+    for (index, &size) in sizes.iter().enumerate() {
+        let encode = |report: &mut dyn FnMut(usize) -> bool| {
+            crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                data,
+                true,
+                filter.cloned(),
+                max_match_distance,
+                size,
+                report,
+            )
+        };
+        let packed = if index == 0 {
+            with_codec_progress(progress, encode)?
+        } else {
+            encode(&mut |_| progress.is_none_or(|work| !work.is_cancelled()))
+                .map_err(map_codec_cancel)?
+        };
+        if best.as_ref().is_none_or(|best| packed.len() < best.len()) {
+            best = Some(packed);
+        }
+    }
+    best.ok_or(Error::InvalidArgument("no PPMd model to code with"))
 }
 
 /// Whether this level is willing to encode the member twice to choose an engine.
@@ -1353,8 +1384,8 @@ type TrialRun<'a> = dyn Fn(
 /// Codes text as LZ, then PPMd with escapes and plain PPMd under each model
 /// size in turn; the smallest wins, earlier on a tie.
 ///
-/// The engine says whether PPMd won but not under which model, so a caller
-/// that codes the member again from it passes the default model alone.
+/// A PPMd engine names the model it won under, so a caller that codes the
+/// member again from it starts the same one.
 fn text_trial(
     data: &[u8],
     options: Rar29EncodeOptions,
@@ -1363,9 +1394,10 @@ fn text_trial(
 ) -> Result<(StreamedEngine, Vec<u8>)> {
     let ppmd = |size: PpmdModelSize, escapes: Option<usize>| {
         run(&mut |report| {
-            crate::codec::rar29::unpack29_encode_ppmd_sized_with_progress(
+            crate::codec::rar29::unpack29_encode_ppmd_with_progress(
                 data,
                 escapes.is_some(),
+                None,
                 escapes.unwrap_or(0),
                 size,
                 report,
@@ -1385,7 +1417,7 @@ fn text_trial(
     let (&first, larger) = models
         .split_first()
         .expect("every level that trials PPMd names a model");
-    let (lz, first) = crate::parallel::join(
+    let (lz, first_pair) = crate::parallel::join(
         || {
             run(&mut |report| {
                 unpack29_encode_literals_with_options_and_progress(data, options, report)
@@ -1399,23 +1431,39 @@ fn text_trial(
         },
         lz?,
     );
-    let mut consider = |(escaped, literals): (Result<Vec<u8>>, Result<Vec<u8>>)| -> Result<()> {
+    let mut consider = |size: PpmdModelSize,
+                        (escaped, literals): (Result<Vec<u8>>, Result<Vec<u8>>)|
+     -> Result<()> {
         for (escapes, candidate) in [
             (Some(options.max_match_distance), escaped?),
             (None, literals?),
         ] {
             if candidate.len() < best.1.len() {
-                best = (StreamedEngine::Ppmd { escapes }, candidate);
+                best = (StreamedEngine::Ppmd { escapes, size }, candidate);
             }
         }
         Ok(())
     };
-    consider(first)?;
+    consider(first, first_pair)?;
     // One model at a time, so the trial holds two of them rather than all.
     for &size in larger {
-        consider(pair(size))?;
+        consider(size, pair(size))?;
     }
     Ok(best)
+}
+
+/// The bytes of the largest PPMd model the writer's level tries.
+fn largest_ppmd_model(options: WriterOptions) -> u64 {
+    ppmd_models_for_options(options)
+        .iter()
+        .map(|size| size.bytes())
+        .max()
+        .unwrap_or(crate::codec::rar29::PPMD_MODEL_BYTES)
+}
+
+/// The PPMd models the writer's level tries, smallest first.
+fn ppmd_models_for_options(options: WriterOptions) -> &'static [PpmdModelSize] {
+    ppmd_models_for_level(compression_method_for_level(options).saturating_sub(0x30))
 }
 
 /// The PPMd models a level tries on text, smallest first.
@@ -1435,6 +1483,18 @@ fn text_trial(
 /// Small members code best as plain literals, where order 16 is worth 0.1% to
 /// 0.6% over order 8 on headers, logs and docs but loses 0.06% on the mixed
 /// class, which is why order 8 stays in the trial rather than being replaced.
+///
+/// A streamed member is coded under the model that wins on a sample from its
+/// middle, and past 64 MiB that sample still ranks the models the way the
+/// whole member does. With escapes, a 16 MiB sample against the whole:
+///
+/// ```text
+/// model                     o8 25MB     o16 64MB    o25 128MB
+/// C headers, sample       1,187,996    1,133,289    1,126,435
+/// C headers, 150 MB      14,203,877   13,672,734   13,581,772
+/// man and docs, sample    2,389,131    2,365,099    2,333,977
+/// man and docs, 120 MB   11,123,884   10,997,130   10,822,915
+/// ```
 fn ppmd_models_for_level(level: u8) -> &'static [PpmdModelSize] {
     const ORDER_16: PpmdModelSize = PpmdModelSize {
         order: 16,
@@ -1703,16 +1763,12 @@ fn member_workspace(
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
     );
     let level = compression_method_for_level(options).saturating_sub(0x30);
-    let ppmd_models = if rar29 && ppmd_trial_pays(level) {
-        // The trial holds two models of one size at a time.
-        let largest = ppmd_models_for_level(level)
-            .iter()
-            .map(|size| size.bytes())
-            .max()
-            .unwrap_or(crate::codec::rar29::PPMD_MODEL_BYTES);
-        (2 * largest).saturating_add(crate::codec::rar29::ppmd_search_workspace(
-            dictionary as usize,
-        ))
+    let ppmd_models = if rar29 && (ppmd_trial_pays(level) || options.method == Rar29Method::Ppmd) {
+        // A trial holds two models of one size at a time, and so does a chain
+        // coding against a copy of the model it keeps.
+        (2 * largest_ppmd_model(options)).saturating_add(
+            crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
+        )
     } else {
         0
     };
@@ -1962,9 +2018,11 @@ enum StreamedEngine {
     Lz {
         filter_search: bool,
     },
-    /// `escapes` is how far LZ escapes reach back, `None` for literals only.
+    /// `escapes` is how far LZ escapes reach back, `None` for literals only;
+    /// `size` is the model a member that starts one starts.
     Ppmd {
         escapes: Option<usize>,
+        size: PpmdModelSize,
     },
 }
 
@@ -1973,17 +2031,50 @@ enum StreamedEngine {
 /// That is enough output for the engines to be compared on, which a 128 KiB
 /// screen is not, but repeats further apart than the sample stay invisible to
 /// it, the other case [`encode_rar29_text_member`] records against sampling.
+///
+/// `models` is the PPMd models to measure, smallest first. A member that
+/// continues a chain's model passes one, since its size is already fixed.
 fn streamed_engine(
     member: &Member<'_>,
     len: usize,
     options: WriterOptions,
     coding: &MemberCoding,
     encode_options: Rar29EncodeOptions,
+    models: &[PpmdModelSize],
     progress: &WorkTracker<'_>,
 ) -> Result<StreamedEngine> {
+    let (&first, larger) = models
+        .split_first()
+        .ok_or(Error::InvalidArgument("no PPMd model to code with"))?;
     if options.method == Rar29Method::Ppmd {
+        let escapes = encode_options.max_match_distance;
+        if larger.is_empty() {
+            return Ok(StreamedEngine::Ppmd {
+                escapes: Some(escapes),
+                size: first,
+            });
+        }
+        // Forced PPMd codes with escapes, so that is all the sample measures,
+        // under each model the level tries.
+        let sample = engine_sample(member, len, options)?;
+        let mut best: Option<(usize, PpmdModelSize)> = None;
+        for &size in models {
+            let packed = crate::codec::rar29::unpack29_encode_ppmd_with_progress(
+                &sample,
+                true,
+                None,
+                escapes,
+                size,
+                &mut |_| !progress.is_cancelled(),
+            )
+            .map_err(map_codec_cancel)?;
+            if best.is_none_or(|(len, _)| packed.len() < len) {
+                best = Some((packed.len(), size));
+            }
+        }
         return Ok(StreamedEngine::Ppmd {
-            escapes: Some(encode_options.max_match_distance),
+            escapes: Some(escapes),
+            size: best.map_or(first, |(_, size)| size),
         });
     }
     // A named filter in a chain is coded LZ, as it is in memory.
@@ -2003,6 +2094,19 @@ fn streamed_engine(
             filter_search: policy_searches && !text,
         });
     }
+    let sample = engine_sample(member, len, options)?;
+    // LZ is measured by the lazy parse, as the in-memory trial measures it.
+    let (engine, _) = text_trial(
+        &sample,
+        encode_options.with_optimal_parse_passes(0),
+        models,
+        &|encode| encode(&mut |_| !progress.is_cancelled()).map_err(map_codec_cancel),
+    )?;
+    Ok(engine)
+}
+
+/// The middle of the member, as much as one segment of the streamed LZ parse codes.
+fn engine_sample(member: &Member<'_>, len: usize, options: WriterOptions) -> Result<Vec<u8>> {
     let sample_len = engine_sample_len(options).min(len);
     let mut sample = Vec::with_capacity(sample_len);
     let mut reader = member.bytes.open()?;
@@ -2016,16 +2120,7 @@ fn streamed_engine(
             "entry source size changed while compressing",
         ));
     }
-    // The streamed PPMd coder declares the default model, so that is the only
-    // one worth measuring for it, and LZ is measured by the lazy parse, as the
-    // in-memory trial measures it.
-    let (engine, _) = text_trial(
-        &sample,
-        encode_options.with_optimal_parse_passes(0),
-        &[PpmdModelSize::DEFAULT],
-        &|encode| encode(&mut |_| !progress.is_cancelled()).map_err(map_codec_cancel),
-    )?;
-    Ok(engine)
+    Ok(sample)
 }
 
 fn trials_engines(options: WriterOptions) -> bool {
@@ -2093,17 +2188,16 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     } else {
         0
     };
+    let model = largest_ppmd_model(options);
     let ppmd = if options.method == Rar29Method::Ppmd || trials_engines(options) {
-        segment
-            .saturating_add(2 * crate::codec::rar29::PPMD_MODEL_BYTES)
-            .saturating_add(crate::codec::rar29::ppmd_search_workspace(
-                dictionary as usize,
-            ))
+        segment.saturating_add(2 * model).saturating_add(
+            crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
+        )
     } else {
         0
     };
     let chain = if options.features.solid {
-        dictionary.saturating_add(crate::codec::rar29::PPMD_MODEL_BYTES)
+        dictionary.saturating_add(model)
     } else {
         0
     };
@@ -2272,7 +2366,29 @@ fn stream_member(
         ArchiveVersion::Rar15 | ArchiveVersion::Rar20 => None,
         _ => {
             let encode_options = rar29_encode_options_for_options(options)?;
-            let engine = streamed_engine(member, len, options, coding, encode_options, progress)?;
+            // Forced PPMd with a named filter codes the member on its own, so
+            // only it starts a model whatever the chain holds.
+            let continues_model = !(options.method == Rar29Method::Ppmd
+                && matches!(coding, MemberCoding::Filtered(FilterPolicy::Explicit(_))))
+                && matches!(
+                    solid.as_ref().and_then(|link| link.encoder.as_ref()),
+                    Some(SolidEncoder::Rar29(encoder)) if encoder.has_ppmd_model()
+                );
+            let models = ppmd_models_for_options(options);
+            let models = if continues_model {
+                &models[..1]
+            } else {
+                models
+            };
+            let engine = streamed_engine(
+                member,
+                len,
+                options,
+                coding,
+                encode_options,
+                models,
+                progress,
+            )?;
             Some((encode_options, engine))
         }
     };
@@ -2391,11 +2507,12 @@ fn stream_member(
                     &mut advance,
                     &mut write,
                 ),
-                StreamedEngine::Ppmd { escapes } => encoder.encode_ppmd_streamed(
+                StreamedEngine::Ppmd { escapes, size } => encoder.encode_ppmd_streamed(
                     &mut counted,
                     len,
                     escapes,
                     ppmd_filter.cloned(),
+                    size,
                     &mut advance,
                     &mut write,
                 ),
@@ -3064,15 +3181,114 @@ impl SolidEncoder {
                 rar20_encode_options_for_options(options)?,
             )),
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
-                Self::Rar29(Box::new(Unpack29Encoder::with_options(
-                    rar29_encode_options_for_options(options)?,
-                )))
+                Self::Rar29(Box::new(
+                    Unpack29Encoder::with_options(rar29_encode_options_for_options(options)?)
+                        .with_ppmd_sizes(ppmd_models_for_options(options)),
+                ))
             }
             _ => return Err(Error::UnsupportedVersion(options.target)),
         };
         Ok(encoder)
     }
+
+    /// The encoder a solid run starts with, its PPMd model already chosen.
+    ///
+    /// A chain keeps the model its first PPMd member starts, so a chain that
+    /// let that member pick the model kept whatever suited the member: on the
+    /// bench's logs the largest model coded the first file smallest and the
+    /// whole run 23 bytes larger than the level below. So the start of the run,
+    /// up to [`CHAIN_PPMD_TRIAL_BYTES`], is coded once under each model the
+    /// level tries, and the run keeps the model that coded it smallest, earlier
+    /// on a tie. A run that fits is coded exactly as its winner was, so a level
+    /// that tries more models can't pack it larger. A run that starts with a
+    /// member that size or larger leaves the choice to that member, which is
+    /// the same choice, and so does a run with only one model to try.
+    fn for_chain(
+        members: &[Member<'_>],
+        options: WriterOptions,
+        coding: &MemberCoding,
+        stream_above: Option<u64>,
+        resources: &WriterResources,
+        progress: &WorkTracker<'_>,
+    ) -> Result<Self> {
+        let encoder = Self::for_target(options)?;
+        let models = ppmd_models_for_options(options);
+        let codes_ppmd = options.method == Rar29Method::Ppmd || trials_engines(options);
+        if !matches!(encoder, Self::Rar29(_))
+            || models.len() < 2
+            || !codes_ppmd
+            || !coding.compresses()
+        {
+            return Ok(encoder);
+        }
+        let mut trial = 0usize;
+        let mut trial_bytes = 0u64;
+        for member in members {
+            let streams = match stream_above {
+                Some(above) => streams_member(member, options, coding, above)?,
+                None => false,
+            };
+            let len = member.unpacked_size()?;
+            if streams || trial_bytes >= CHAIN_PPMD_TRIAL_BYTES || len >= CHAIN_PPMD_TRIAL_BYTES {
+                break;
+            }
+            trial_bytes += len;
+            trial += 1;
+        }
+        if trial < 2 {
+            return Ok(encoder);
+        }
+        // The trial's coding is thrown away, so it moves no progress bar, but
+        // cancelling still stops it.
+        struct CancelOnly<'a>(Option<ProgressReporter<'a>>);
+        impl WriteProgress for CancelOnly<'_> {
+            fn report(&self, _event: WriteProgressEvent<'_>) {}
+            fn is_cancelled(&self) -> bool {
+                self.0.is_some_and(ProgressReporter::is_cancelled)
+            }
+        }
+        let quiet = CancelOnly(progress.reporter());
+        let quiet = WorkTracker::new(
+            Some(ProgressReporter(&quiet)),
+            WriteOperation::Compression,
+            u64::MAX,
+        );
+        let mut best: Option<(u64, usize)> = None;
+        for index in 0..models.len() {
+            let mut chain = Some(Self::Rar29(Box::new(
+                Unpack29Encoder::with_options(rar29_encode_options_for_options(options)?)
+                    .with_ppmd_sizes(&models[index..=index]),
+            )));
+            let mut packed = 0u64;
+            for member in &members[..trial] {
+                let encoded = encode_member(member, options, coding, &mut chain, resources, &quiet)
+                    .map_err(|error| {
+                        crate::write_stream::member_error(error, member.name, "preparing")
+                    })?;
+                packed += match &encoded.payload {
+                    MemberPayload::Packed(data) => data.len() as u64,
+                    MemberPayload::Copied(_) => encoded.unpacked_size,
+                };
+            }
+            if best.is_none_or(|(smallest, _)| packed < smallest) {
+                best = Some((packed, index));
+            }
+            // A run no member of which went PPMd codes the same under any model.
+            let ppmd = matches!(&chain, Some(Self::Rar29(chain)) if chain.has_ppmd_model());
+            if index == 0 && !ppmd {
+                return Ok(encoder);
+            }
+        }
+        let index = best.map_or(0, |(_, index)| index);
+        Ok(Self::Rar29(Box::new(
+            Unpack29Encoder::with_options(rar29_encode_options_for_options(options)?)
+                .with_ppmd_sizes(&models[index..=index]),
+        )))
+    }
 }
+
+/// How much of a solid run [`SolidEncoder::for_chain`] codes under each PPMd model.
+const CHAIN_PPMD_TRIAL_BYTES: u64 = 1024 * 1024;
 
 struct EncodedPayload {
     data: Vec<u8>,
@@ -6903,8 +7119,113 @@ mod tests {
             2 * (128 - 25) * MIB + parse
         );
         // Streamed, the parse is charged by the block, not by the member.
-        let streamed = super::streamed_workspace(at(5), &crate::MemberCoding::Compressed);
-        assert!(streamed < super::member_workspace(at(5), 1 << 30, true, false));
+        let coding = crate::MemberCoding::Compressed;
+        let streamed = |options| super::streamed_workspace(options, &coding);
+        assert!(streamed(at(5)) < super::member_workspace(at(5), 1 << 30, true, false));
+        // A streamed trial holds two of the level's largest models, and a
+        // chain keeps one between members.
+        assert!(streamed(at(5)) >= streamed(at(3)) + 2 * (128 - 25) * MIB);
+        let solid = |level| {
+            let mut options = at(level);
+            options.features.solid = true;
+            options
+        };
+        assert!(streamed(solid(5)) >= streamed(at(5)) + 128 * MIB);
+        // Forced PPMd holds models at every level, the trial's two at the top.
+        let forced = |level| {
+            let mut options = at(level);
+            options.method = super::Rar29Method::Ppmd;
+            options
+        };
+        assert!(
+            super::member_workspace(forced(1), 8 * MIB, true, false) >= charge(1) + 2 * 25 * MIB
+        );
+        assert!(
+            super::member_workspace(forced(5), 8 * MIB, true, false) >= charge(1) + 2 * 128 * MIB
+        );
+        assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
+    }
+
+    /// Solid chains, forced PPMd and streamed members try the level's PPMd
+    /// models too, so none of them packs text larger a level up.
+    #[test]
+    fn rar29_text_packs_no_larger_a_level_up_in_chains_forced_and_streamed() {
+        let text = word_text(320 * 1024);
+        let parts: [(&str, &[u8]); 3] = [
+            ("one.txt", &text[..40 * 1024]),
+            ("two.txt", &text[40 * 1024..100 * 1024]),
+            ("three.txt", &text[100 * 1024..160 * 1024]),
+        ];
+        let whole: [(&str, &[u8]); 1] = [("text.txt", &text)];
+        let at = |level: u8, solid: bool, method| {
+            let mut options =
+                super::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
+            options.compression_level = Some(level);
+            options.features.solid = solid;
+            options.method = method;
+            options
+        };
+        for (name, files, streams, solid, method) in [
+            ("solid", &parts[..], false, true, super::Rar29Method::Auto),
+            (
+                "solid PPMd",
+                &parts[..],
+                false,
+                true,
+                super::Rar29Method::Ppmd,
+            ),
+            ("PPMd", &parts[..], false, false, super::Rar29Method::Ppmd),
+            (
+                "streamed",
+                &whole[..],
+                true,
+                false,
+                super::Rar29Method::Auto,
+            ),
+            (
+                "streamed PPMd",
+                &whole[..],
+                true,
+                false,
+                super::Rar29Method::Ppmd,
+            ),
+            (
+                "streamed solid",
+                &whole[..],
+                true,
+                true,
+                super::Rar29Method::Auto,
+            ),
+        ] {
+            let members = entries(files);
+            let expected: Vec<_> = files
+                .iter()
+                .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+                .collect();
+            let mut below = usize::MAX;
+            for level in 3..=5u8 {
+                let options = at(level, solid, method);
+                let coding = crate::MemberCoding::Compressed;
+                let archive = if streams {
+                    let out = streamed_with(&members, options, coding, None).unwrap();
+                    assert!(out.seeks > 0, "{name}: not streamed");
+                    out.inner.into_inner()
+                } else {
+                    in_memory_with(&members, options, coding)
+                };
+                assert!(
+                    archive.len() <= below,
+                    "{name}: level {level} packed {} bytes, the level below {below}",
+                    archive.len()
+                );
+                below = archive.len();
+                assert_eq!(
+                    extracted_set(std::slice::from_ref(&archive), None),
+                    expected,
+                    "{name}: level {level}"
+                );
+            }
+        }
     }
 
     #[test]
