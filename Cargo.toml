@@ -68,6 +68,13 @@ codegen-units = 1
 panic = "abort"
 strip = true
 
+# The Python wheels, stripped for the same reason as the npm package: line
+# tables were five sixths of the extension. No LTO: it saved under 1% and
+# doubled the stack extraction needs, overflowing musl's 128 KiB thread stack.
+[profile.release-python]
+inherits = "release"
+strip = true
+
 # Key derivation and hashing run hundreds of thousands of rounds per volume, too slow unoptimised in tests.
 [profile.dev.package.aes]
 opt-level = 3

@@ -21,6 +21,7 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "Topic :: System :: Archiving :: Compression",
 ]
@@ -33,6 +34,26 @@ include = [
     { path = "COPYING", format = "sdist" },
     { path = "rars.pyi", format = "sdist" },
 ]
+
+# The oldest CPython builds the abi3 wheel and the newest reuses it, so tests
+# run at both ends.
+[tool.cibuildwheel]
+build = "cp310-* cp315-*"
+config-settings = { build-args = "--profile release-python --locked" }
+test-requires = ["pytest"]
+test-sources = ["python/tests", "crates/rars/tests/fixtures"]
+test-command = "pytest -q python/tests"
+
+[tool.cibuildwheel.linux]
+build-frontend = "build[uv]"
+manylinux-x86_64-image = "manylinux2014"
+manylinux-aarch64-image = "manylinux2014"
+before-all = "curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal"
+environment = { PATH = "$HOME/.cargo/bin:$PATH" }
+
+# Rust targets macOS 10.12 at the oldest; CPython before 3.12 would allow 10.9.
+[tool.cibuildwheel.macos.environment]
+MACOSX_DEPLOYMENT_TARGET = "10.12"
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]
