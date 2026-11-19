@@ -6,7 +6,7 @@
 [[profile.default.overrides]]
 filter = '''
     (binary_id(rars::encoder_memory_regression) & test(=default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings))
-  | (binary_id(rars) & test(/^rar15_40::write::tests::a_(member_with_a|named)_filter_streams/))
+  | (binary_id(rars) & test(/^rar15_40::write::tests::a_(member_with_a_)?named_filter_streams/))
   | (binary_id(rars) & test(=rar15_40::write::builder_path_tests::write_to_path_streams_a_large_member_as_a_seekable_archive_does))
 '''
 priority = 100
@@ -14,7 +14,8 @@ priority = 100
 [[profile.default.overrides]]
 filter = '''
     binary_id(rars::rar50_shared_block_windows)
-  | (binary_id(rars::rar50_large_member_filters) & test(=runs_of_a_large_member_choose_their_own_filters))
+  | binary_id(rars::rar50_large_member_filters)
+  | (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_large_member_is_searched_on_the_block_paths_grid))
   | (binary_id(rars::legacy_large_volumes) & test(=a_stored_member_over_4_gib_splits_across_volumes_with_large_headers))
   | (binary_id(rars::encoder_memory_regression) & test(=solid_multirun_history_fits_fixed_ceiling_and_extracts))
   | (binary_id(rars) & test(=rar15_40::write::tests::rar29_text_packs_no_larger_a_level_up_in_chains_forced_and_streamed))
@@ -25,7 +26,6 @@ priority = 90
 [[profile.default.overrides]]
 filter = '''
     (binary_id(rars::rar50_fixtures) & test(=streaming_writer_handles_solid_encrypted_headers_and_recovery_together))
-  | (binary_id(rars::rar50_large_member_filters) & test(=an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run))
   | (binary_id(rars) & test(/^rar15_40::write::tests::(a_piped_member_is_spooled_into_the_archive_a_file_gets|a_member_whose_first_volume_does_not_compress_still_compresses_in_a_set|password_protected_members_stream_into_a_set)$/))
 '''
 priority = 80
