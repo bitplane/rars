@@ -4647,7 +4647,8 @@ mod tests {
     #[test]
     #[cfg(feature = "parallel")]
     fn finalists_run_side_by_side_only_in_room_the_budget_grants() {
-        use std::sync::atomic::{AtomicU64, Ordering};
+        use crate::atomic64::AtomicU64;
+        use std::sync::atomic::Ordering;
         use std::sync::Arc;
 
         // Stereo 16-bit samples, so delta reaches the finalists beside the
