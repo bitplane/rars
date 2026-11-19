@@ -5490,3 +5490,64 @@ fn a_chain_starts_its_ppmd_model_at_the_size_its_first_member_codes_smallest() {
         assert!(decoder.decode_member(&packed, member.len()).unwrap() == *member);
     }
 }
+
+/// A PPMd block codes both ways from the same model and keeps the smaller,
+/// escapes on a tie, with the model the winner leaves behind.
+#[test]
+fn a_ppmd_member_codes_with_escapes_or_as_literals_whichever_is_smaller() {
+    let size = super::PpmdModelSize::DEFAULT;
+    // Text that rarely repeats far back codes smaller as literals; a block
+    // repeated whole codes smaller with matches.
+    let rare = phrase_member(65_536);
+    let repeated = mixed_member(16_384).repeat(4);
+    let coded = |data: &[u8], escapes: bool| {
+        super::encode_ppmd_block_with_model(data, escapes, None, 1 << 22, None, size, None)
+            .unwrap()
+            .0
+    };
+    let mut winners = Vec::new();
+    for data in [&rare, &repeated] {
+        let (escaped, literals) = (coded(data, true), coded(data, false));
+        let (packed, _) =
+            super::encode_ppmd_either_way(data, 1 << 22, None, size, &mut |_| true).unwrap();
+        let literals_win = literals.len() < escaped.len();
+        assert_eq!(packed, if literals_win { literals } else { escaped });
+        winners.push(literals_win);
+    }
+    assert_eq!(winners, [true, false], "each case must exercise its side");
+
+    // A chain carries the winner's model on, and the reader agrees with it.
+    let members = [
+        phrase_member(98_304)[..65_536].to_vec(),
+        repeated.clone(),
+        phrase_member(98_304)[32_768..].to_vec(),
+    ];
+    // The chain's own engine trial codes both ways; forced PPMd, which a
+    // streamed member must match, keeps escapes.
+    let mut encoder = super::Unpack29Encoder::new();
+    let packed: Vec<Vec<u8>> = members
+        .iter()
+        .map(|member| {
+            let (packed, model) = encoder
+                .encode_ppmd_member(member, true, &mut |_| true)
+                .unwrap();
+            encoder.ppmd = Some(model);
+            encoder.remember(member);
+            packed
+        })
+        .collect();
+    let forced = super::Unpack29Encoder::new()
+        .encode_member_with_engine(&members[0], super::ChainEngine::Ppmd, &[], &mut |_| true)
+        .unwrap();
+    assert_eq!(forced, coded(&members[0], true));
+    // The first member starts the model and codes as literals here.
+    assert_eq!(packed[0].len(), coded(&members[0], false).len());
+    let mut decoder = super::Unpack29::new();
+    for (index, (member, packed)) in members.iter().zip(&packed).enumerate() {
+        let decoded = match index {
+            0 => decoder.decode_non_solid_member(packed, member.len()),
+            _ => decoder.decode_member(packed, member.len()),
+        };
+        assert_eq!(&decoded.unwrap(), member, "member {index}");
+    }
+}

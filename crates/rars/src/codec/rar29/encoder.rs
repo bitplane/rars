@@ -617,6 +617,46 @@ fn encode_ppmd_block_with_model(
     Ok((out, model))
 }
 
+/// Codes a PPMd block with LZ escapes and as plain literals, from the same
+/// model, and keeps the smaller, escapes on a tie.
+///
+/// An escape prices itself against costs measured off the stream it shapes,
+/// so on text that rarely repeats it can lose to literals: a 4.3 MB source
+/// tar at order 25 packs 1.8% smaller without them. The model each coding
+/// leaves differs, and the winner's is the one returned, since that is what a
+/// reader of the winner holds. The literal coding only polls for cancellation.
+fn encode_ppmd_either_way(
+    input: &[u8],
+    max_match_distance: usize,
+    model: Option<&PpmdModel>,
+    size: PpmdModelSize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Vec<u8>, PpmdModel)> {
+    let escaped = encode_ppmd_block_with_model(
+        input,
+        true,
+        None,
+        max_match_distance,
+        model.cloned(),
+        size,
+        Some(&mut *progress),
+    )?;
+    let literals = encode_ppmd_block_with_model(
+        input,
+        false,
+        None,
+        max_match_distance,
+        model.cloned(),
+        size,
+        Some(&mut |_| progress(input.len())),
+    )?;
+    Ok(if literals.0.len() < escaped.0.len() {
+        literals
+    } else {
+        escaped
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PpmdEncodeToken {
     Literal(u8),
@@ -886,7 +926,7 @@ impl Unpack29Encoder {
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
         if engine == ChainEngine::Ppmd {
-            let (packed, model) = self.encode_ppmd_member(input, progress)?;
+            let (packed, model) = self.encode_ppmd_member(input, false, progress)?;
             self.ppmd = Some(model);
             self.remember(input);
             return Ok(packed);
@@ -896,7 +936,7 @@ impl Unpack29Encoder {
 
         let ppmd = match engine {
             ChainEngine::Smaller => {
-                Some(self.encode_ppmd_member(input, &mut |_| progress(input.len()))?)
+                Some(self.encode_ppmd_member(input, true, &mut |_| progress(input.len()))?)
             }
             _ => None,
         };
@@ -1002,39 +1042,45 @@ impl Unpack29Encoder {
     /// loses leaves the reader's model where the winning member expects it.
     ///
     /// A member that starts the model codes under each of the chain's sizes
-    /// and keeps the smallest, earlier on a tie, holding two models at a time.
-    /// Only the first size reports progress; the others poll at the end.
+    /// and keeps the smallest, earlier on a tie. With `either_way`, each size,
+    /// or the model the chain continues, is coded with LZ escapes and as plain
+    /// literals, and the smaller kept, escapes on a tie: the model carries on
+    /// from whichever was written, as the reader's does. Forced PPMd codes with
+    /// escapes only, which is what a streamed member can match. Only the first
+    /// coding reports progress; the others poll at the end.
     fn encode_ppmd_member(
         &self,
         input: &[u8],
+        either_way: bool,
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<(Vec<u8>, (PpmdModel, PpmdModelSize))> {
         let distance = self.options.max_match_distance;
+        let code = |model: Option<&PpmdModel>,
+                    size: PpmdModelSize,
+                    progress: &mut dyn FnMut(usize) -> bool| {
+            if either_way {
+                encode_ppmd_either_way(input, distance, model, size, progress)
+            } else {
+                encode_ppmd_block_with_model(
+                    input,
+                    true,
+                    None,
+                    distance,
+                    model.cloned(),
+                    size,
+                    Some(progress),
+                )
+            }
+        };
         if let Some((model, size)) = &self.ppmd {
-            let (packed, model) = encode_ppmd_block_with_model(
-                input,
-                true,
-                None,
-                distance,
-                Some(model.clone()),
-                *size,
-                Some(progress),
-            )?;
+            let (packed, model) = code(Some(model), *size, progress)?;
             return Ok((packed, (model, *size)));
         }
         let mut best: Option<(Vec<u8>, (PpmdModel, PpmdModelSize))> = None;
         for (index, &size) in self.ppmd_sizes.iter().enumerate() {
             let mut report =
                 |position: usize| progress(if index == 0 { position } else { input.len() });
-            let (packed, model) = encode_ppmd_block_with_model(
-                input,
-                true,
-                None,
-                distance,
-                None,
-                size,
-                Some(&mut report),
-            )?;
+            let (packed, model) = code(None, size, &mut report)?;
             if best
                 .as_ref()
                 .is_none_or(|(best, _)| packed.len() < best.len())
