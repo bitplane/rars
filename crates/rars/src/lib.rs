@@ -1358,9 +1358,7 @@ impl Archive {
         }
         match self {
             Self::Rar15To40(archive) => {
-                let repaired = archive.repair_protect_head_with_report()?;
-                writer.write_all(&repaired.data)?;
-                Ok(repaired.report)
+                archive.repair_protect_head_to_with_options(writer, ArchiveReadOptions::new())
             }
             Self::Rar50Plus(archive) => archive.repair_recovery_to_with_report(writer, password),
             Self::Rar13(_) => Err(Error::UnsupportedFamilyFeature {
@@ -1376,10 +1374,10 @@ impl Archive {
     /// is untouched on failure. Only password and cancellation apply from the
     /// read options.
     ///
-    /// A RAR 5 archive whose recovery record is whole streams through, so an
-    /// archive opened from a path or reader is held neither whole nor as its
-    /// repaired copy. Rebuilding a RAR 5 recovery record, and repairing RAR
-    /// 1.5-4.x, still read the archive into memory.
+    /// A RAR 5 archive whose recovery record is whole, and a RAR 1.5-4.x
+    /// archive, stream through, so an archive opened from a path or reader
+    /// is held neither whole nor as its repaired copy. Rebuilding a RAR 5
+    /// recovery record still reads the archive into memory.
     pub fn repair_recovery_to_path_with_options(
         &self,
         path: &Path,
@@ -1408,13 +1406,7 @@ impl Archive {
                     archive.repair_recovery_to_with_options(&mut output, options)?
                 }
                 Self::Rar15To40(archive) => {
-                    let repaired = archive.repair_protect_head_with_options(options)?;
-                    control.finish(
-                        control
-                            .write_all(&mut output, &repaired.data)
-                            .map_err(Error::from),
-                    )?;
-                    repaired.report
+                    archive.repair_protect_head_to_with_options(&mut output, options)?
                 }
                 Self::Rar13(_) => unreachable!("refused above"),
             };

@@ -8847,3 +8847,45 @@ fn rar_shares_one_member_salt_and_one_header_salt_per_archive() {
         assert_ne!(header_salt, data_salt, "{set:?}");
     }
 }
+
+/// Remembers the largest single read asked of it.
+struct LargestRead {
+    input: std::io::Cursor<Vec<u8>>,
+    largest: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl std::io::Read for LargestRead {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.largest
+            .fetch_max(buffer.len(), std::sync::atomic::Ordering::Relaxed);
+        self.input.read(buffer)
+    }
+}
+
+impl std::io::Seek for LargestRead {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.input.seek(from)
+    }
+}
+
+#[test]
+fn protect_head_repair_reads_the_archive_in_blocks_not_whole() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let bytes = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
+    let mut damaged = bytes.clone();
+    damaged[512 + 16..512 + 80].fill(0xa5);
+    let largest = std::sync::Arc::new(AtomicUsize::new(0));
+    let archive = rars::ArchiveReader::read_reader(LargestRead {
+        input: std::io::Cursor::new(damaged.clone()),
+        largest: largest.clone(),
+    })
+    .unwrap();
+    largest.store(0, Ordering::Relaxed);
+
+    let repaired = archive.repair_recovery_with_report(None).unwrap();
+
+    assert_eq!(repaired.data, bytes);
+    assert!(repaired.report.data_repaired);
+    let largest = largest.load(Ordering::Relaxed);
+    assert!(largest < damaged.len(), "read all {largest} bytes at once");
+}
