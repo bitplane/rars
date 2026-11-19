@@ -21,8 +21,6 @@ all-features = true
 [features]
 # Default builds retain all capabilities; each optional feature is independent.
 default = ["write", "parallel", "recovery", "encryption"]
-# Compatibility alias: exact matching and bounded pricing state are standard with write.
-experimental-ring-state = ["write"]
 parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
 write = ["dep:getrandom"]

@@ -1,156 +1,74 @@
-# RAR 5 producer-marker investigation
+# Producer marker
 
-The CLI defaults to `rar50`. Its writer now emits the producer service described
-below, as does the shared RAR 7 writer. RAR 3/4 use a corresponding
-[new-subblock marker](rar34/README.md); earlier formats remain unmarked. Preserving
-rewrites replace an intact schema-1 record with the current producer version;
-unknown, duplicate, misplaced or damaged records remain errors.
-
-The interoperability investigation used source revision
-`f9060ef3dada3c16c313968e283ba37cb0a0ee66` (0.10.2) plus `prototype.patch`.
-`results.json` is that historical evidence; it is not a claim to have tested
-future library or decoder versions.
-
-## Record format
-
-Use an archive-level RAR 5 service block immediately after the main header,
-before any archive comment or file. Its name is `RARS`; its stored payload is:
+Every archive and volume rars writes carries a small stored record named `RARS`
+whose payload is:
 
 ```text
-rars/0.10.2
+rars/<library version>
 marker-schema=1
 ```
 
-The name identifies the producer; the version is the **library** version, not
-necessarily the embedding application's version. The schema line versions this
-marker representation separately from rars itself.
+The version is the rars library's, not the embedding application's. The record
+is advisory: anyone can strip or forge it, and its CRC detects damage, not
+tampering. The payload stays plaintext even when headers are encrypted, so it
+names the producer without the password but exposes no file names or data.
+RARLAB has not allocated `RARS`; we picked it.
 
-The block uses type 3, common flags `0x0006` (data present, skip unknown blocks
-on update), file flags `0x0004` (CRC32), stored compression information 0, zero
-attributes and host OS 0. It has no extra records, timestamps, file dependency
-flag, or quick-open cache entry. Both header and payload have their normal CRCs.
-The writer's existing layout and recovery calculations include the new block.
-Each volume receives its own mark. At this version string length, overhead is
-50 bytes per plain-header archive/volume, or 76 with encrypted headers.
+Preserving rewrites replace a recognised record with the current version.
+Unknown, duplicate, misplaced or damaged records are refused rather than
+dropped. RAR's own updates discard the record, as its flags ask, so it marks
+the original writer, not the last one.
 
-The service header follows the archive's header-encryption
-policy, but its payload remains plaintext. This intentionally allows the
-producer/version string to be found without a password; it does not expose file
-names or contents. Structured recognition of the service header
-requires the password when headers are encrypted.
+## Framing
 
-The [official RAR 5 format description](https://www.rarlab.com/technote.htm)
-defines service blocks and extension framing. `RARS` is our chosen name, not
-an officially allocated service name. The experiment establishes reader behavior;
-it does not establish a private namespace reservation by RARLAB.
+| Format | Container | Overhead per volume at 0.10.2 |
+| --- | --- | --- |
+| RAR 5/7 | Service header (type 3) after the main header, before any comment or file. Flags `0x0006`, file flags `0x0004` (CRC32), stored, zero attributes and host OS, no extras or quick-open entry | 50 bytes, 76 with encrypted headers |
+| RAR 1.5-4 | `NEWSUB_HEAD` (`0x7a`), flags `0xc000`, 36-byte header, method `0x30`, zero host/attributes/time. Placed after any old-style archive comment, before files | 64 bytes, 84 with encrypted headers |
+| RAR 1.3/1.4 | Appended to the `RE~^` main header after any comment, with `HeadSize` raised: `RARS`, 2-byte payload length, payload, 4-byte payload CRC32 | 38 bytes |
 
-## Observed compatibility
+The `NEWSUB_HEAD` unpacker version follows the target: 15 for `rar15`, 20 for
+`rar20`, 29 for `rar29` to `rar40`. A marker alone therefore needs RAR 2.9, not
+3.0, and rewrites infer the lowest format the members and producer allow.
+The record must follow an old-style comment: RAR 3.93 reports a corrupt comment
+when it comes first.
 
-`results.json` records the completed matrix and tool fingerprints. Every case
-has a control archive from the unmodified writer and a marked archive from the
-prototype. Success requires test/list command success, extraction success, and
-an exact map of extracted filenames to SHA-256 content hashes. This also catches
-a reader mistakenly extracting the marker as an extra file or silently omitting
-members. Inputs include binary data, repeated text, an empty file, and a Unicode
-filename. This is a small deterministic corpus, not exhaustive codec testing.
+## Compatibility evidence
 
-The 14 cases are stored, default compression, solid, archive comment, quick-open,
-recovery record, password-protected data, encrypted headers, combined solid +
-encrypted headers + recovery + comment, ordinary volumes, solid volumes,
-encrypted-header volumes, recovery volumes, and a lone empty file.
+Each family was tested by writing pairs of archives, one unmarked control and
+one marked, and checking that every reader produced the same verified output
+for both. A pair passes when test/list and extraction succeed and the extracted
+names and SHA-256s match the input exactly. Readers included UnRAR 7.20, RAR
+7.12, RAR 3.93, official 7-Zip 26.04, libarchive 3.8.5, The Unarchiver 1.10.8,
+Bandizip 7.47, RAR and WinRAR consoles and GUIs from 2.90 to 7.21b1 under Wine,
+DOS RAR 1.402/1.55/2.50 under DOSBox-X, and WinRAR 1.54 driven through its GUI.
 
-| Tested executable | Passed case pairs | Control failures | Marker regressions |
-| --- | ---: | ---: | ---: |
-| UnRAR 7.20, Linux | 14 | 0 | 0 |
-| RAR 7.12, Linux | 14 | 0 | 0 |
-| Official 7-Zip 26.04 (`7zz`), Linux | 14 | 0 | 0 |
-| libarchive 3.8.5 (`bsdtar`), Linux | 7 | 7 | 0 |
-| The Unarchiver 1.10.8 (`unar`/`lsar`), Linux | 13 | 1 | 0 |
-| RAR 5.00, Windows command line under Wine | 14 | 0 | 0 |
-| RAR 6.02, Windows command line under Wine | 14 | 0 | 0 |
-| RAR 7.21 beta 1, Windows command line under Wine | 14 | 0 | 0 |
-| WinRAR 6.02 (`WinRAR.exe`), under Wine/Xvfb | 14 | 0 | 0 |
-| WinRAR 7.21 beta 1 (`WinRAR.exe`), under Wine/Xvfb | 14 | 0 | 0 |
-| Bandizip 7.47 (binary banner says Beta), Windows console under Wine | 10 | 4 | 0 |
-| Unmodified rars 0.10.2 reader, Linux | 14 | 0 | 0 |
+| Family | Pairs | Pass | Control failures | Marker regressions |
+| --- | ---: | ---: | ---: | ---: |
+| RAR 5/7 | 168 | 156 | 12 | 0 |
+| RAR 3/4 (production rerun) | 540 | 500 | 40 | 0 |
+| RAR 2.9 | 220 | 208 | 12 | 0 |
+| RAR 2.0 | 242 | 232 | 10 | 0 |
+| RAR 1.5 (+11 WinRAR 1.54 GUI pairs, all pass) | 242 | 227 | 15 | 0 |
+| RAR 1.3/1.4 (+10 WinRAR 1.54 GUI pairs, all pass) | 250 | 202 | 48 | 0 |
 
-The libarchive invocation fails the encrypted or multivolume controls. The
-Unarchiver invocation fails the encrypted-header multivolume control. In some
-cases a tool exits successfully but produces incomplete output, which the hash
-manifest catches. These are **not passing interoperability cases** and are not
-attributed to the marker. No marked case regressed a passing control.
-Bandizip rejects all four multivolume controls with `Cannot open archive
-(0xa0000044)`, and rejects their marked counterparts identically. Its remaining
-ten cases pass. This investigation does not diagnose those baseline failures.
+Control failures are readers that already fail the unmarked archive:
+libarchive on most compressed, solid, encrypted or multivolume cases; The
+Unarchiver on solid and encrypted cases; Bandizip on multivolume RAR 5 and
+encrypted-header volumes; 7-Zip, libarchive, The Unarchiver and Bandizip on
+anything before RAR 1.5; RAR 5.00 dropping the last byte of an old-style
+comment. Corruption controls (a flipped member byte) returned exit code 3 from
+every RAR and WinRAR build tested, so silent GUI testing does not hide CRC
+errors. RAR 3/4 recovery repair restores a marked archive byte for byte.
 
-The distribution's 7-Zip 26.00 package lacks required RAR codecs, so it was
-replaced in the matrix by the official binary. Merely finding a `7z` command is
-not sufficient evidence of RAR support.
+`results.json` in each directory holds the case definitions, outcomes and
+executable fingerprints. These cover Wine, not native Windows, and say nothing
+about readers not listed above (WinZip, Explorer, SharpCompress, Go rardecode).
 
-The WinRAR follow-up uses the actual GUI executables copied from
-`~/src/tmp/rars-bench/_refs/wineprefixes/winrar602` and `winrar721` into the
-isolated test directory. The source prefixes are not modified. Both applications
-are invoked with `t` and `x` under Wine/Xvfb, using `-ibck -inul -y` and the test
-password. This exercises WinRAR itself, separately from the `Rar.exe` console
-tests. It does not exercise manual menu navigation. Four negative controls
-(both builds, marked and unmarked archives) flip a byte of stored file data;
-every test returns CRC-error exit code 3, verifying that silent mode does not
-turn integrity failures into successful test results.
+## Rerunning
 
-Additional checks with native RAR 7.12:
-
-- Update a commented archive by adding a member: extraction remains correct,
-  the user comment is preserved, and the unknown producer service is removed.
-  The mark therefore describes original production, not permanent authorship.
-- Flip a byte inside a file's packed data in a recovery-bearing archive:
-  testing reports corruption; recovery repair succeeds; all extracted hashes
-  match the originals; the repaired marked archive retains its producer block.
-- Independently walk all 44 generated archive/volume headers, checking header
-  CRCs and producer record framing where headers are plaintext. Encrypted
-  headers are checked through the external readers instead.
-
-Earlier exploratory probes found that a private **main-header extra-record
-type** passed UnRAR but failed libarchive. The named service is preferable on
-the evidence here. Those exploratory probes are not part of this matrix.
-
-## Limits and release decision
-
-This is strong evidence for the record format, not proof about every archiver or
-every version. WinZip, Windows Explorer, macOS GUI applications, mobile readers,
-SharpCompress, and Go rardecode have not been exercised. Windows executables
-were tested under Wine, not on native Windows. WinRAR's GUI executable was
-automated through its command arguments; manual GUI interactions remain untested. PeaZip
-[documents its use of 7-Zip/UnRAR backends](https://peazip.github.io/peazip_help.pdf),
-but testing those engines is not a separate PeaZip application test.
-
-Do not make a universal compatibility claim on this evidence alone. Missing
-target applications can be added to the matrix. Production regression tests
-cover marker placement, empty archives, encrypted headers, every volume, and
-preserving rewrites, alongside the existing resource-limit/cancellation tests.
-The historical external matrix covers RAR 5; the shared RAR 7 path is also
-covered by Rust regression tests and the repository's external decoder tests.
-
-Identification is advisory: the mark can be removed or forged and does not
-authenticate an archive. Existing archives remain unmarked. Reserved fields,
-authenticity records, and changes to the RAR signature are unnecessary.
-
-## Reproducing
-
-`prototype.patch` preserves the exact investigation-only writer change against
-the source revision above. Production code now incorporates the marker plus
-rewrite handling and regression coverage; do not apply the historical patch
-over the current tree. No PR or tracker comment was created.
-
-Build separate binaries from the same revision in a disposable working copy:
-build the unmodified CLI and copy it to `rars-control`; apply `prototype.patch`,
-build again and copy it to `rars-marked`. Restore the patch afterward. Keep build
-trees and Wine prefixes on disk, not RAM-backed `/tmp`.
-
-The harness itself never patches sources or installs software. Supply an engine
-JSON array with `name`, `family` and a `command` argument array. Supported families
-are `rar`, `winrar`, `7zip`, `libarchive`, `unar`, `rars`, and `bandizip`. `unar` also needs a
-`list_command` for `lsar`. Windows commands use `windows: true`, a `wine` command
-prefix and an isolated `WINEPREFIX` in the optional `env` object. Example:
+The scripts never patch source or install software. Build an unmarked control
+CLI and the current CLI, then describe the readers in an engine list:
 
 ```json
 [
@@ -159,34 +77,22 @@ prefix and an isolated `WINEPREFIX` in the optional `env` object. Example:
 ]
 ```
 
-```sh
-python3 scripts/producer-marker/probe.py \
-  --control /path/to/rars-control --marked /path/to/rars-marked \
-  --engines /path/to/engines.json --output target/producer-marker/run
-
-python3 scripts/producer-marker/maintenance.py \
-  --matrix target/producer-marker/run --rar /path/to/rar \
-  --output target/producer-marker/maintenance
-```
-
-For `WinRAR.exe`, use family `winrar` and run the harness under `xvfb-run -a`.
-The additional CRC-error control is reproducible with:
+Families are `rar`, `winrar`, `7zip`, `libarchive`, `unar` (also needs a
+`list_command` for `lsar`), `rars` and `bandizip`. Windows engines take
+`windows: true`, a `wine` command prefix and a `WINEPREFIX` in `env`. Run
+`WinRAR.exe` engines under `xvfb-run -a`, one Wine job at a time per prefix.
 
 ```sh
-xvfb-run -a python3 scripts/producer-marker/negative.py \
-  --matrix target/producer-marker/run --engines /path/to/winrar-engines.json \
-  --output target/producer-marker/winrar-negative
+python3 scripts/producer-marker/rar34/probe.py \
+  --control /path/to/rars-control --marked /path/to/rars \
+  --engines engines.json --output target/producer-marker/rar34
 ```
 
-Use a fresh output directory. `--resume` retains completed case/engine pairs;
-`--reuse-archives` permits testing existing pairs with another engine matrix.
-Command logs, generated archives, extracted files and full JSON reports remain
-under the requested output directory. A `CONTROL_FAIL` is recorded explicitly;
-only a `REGRESSION` makes the matrix harness exit unsuccessfully. Always inspect
-the report for coverage rather than interpreting exit 0 as universal success.
-
-Local evidence for this run is under `target/producer-marker/{native-final,
-windows,bandizip,maintenance-final,winrar-gui,winrar-negative-final}`. Tools came from existing RAR distributions,
-Ubuntu packages extracted locally, the
-[official 7-Zip download](https://www.7-zip.org/download.html), and the
-[official Bandizip download](https://www.bandisoft.com/bandizip/).
+The top-level scripts cover RAR 5/7; `rar14/`, `rar15/`, `rar20/`, `rar29/` and
+`rar34/` cover the older families with the same `probe.py`, `negative.py`
+(corruption controls) and `maintenance.py` (RAR update checks). `dos.py` and
+`winrar154.py` drive the DOS and WinRAR 1.54 readers, and
+`rar34/protected_marker.py` builds recovery-protected marked archives. Use a
+fresh output directory, or `--resume` with unchanged binaries and engines. Exit
+status only fails on a marker regression, so read the report for coverage.
+Keep output and Wine prefixes on disk, not in a RAM-backed `/tmp`.

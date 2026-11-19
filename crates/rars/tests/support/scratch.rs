@@ -7,11 +7,9 @@
 //! which is the whole point of them. Sending that to RAM is the opposite of
 //! what those tests measure, and on a loaded machine it wakes the OOM killer.
 //!
-//! Nor does it leave anything behind. Tests used to remove their directory on
-//! the last line, so every failure and every interrupted run leaked one; a few
-//! thousand of them had piled up by the time anyone looked. [`case`] hands out
-//! a directory that removes itself when the test drops it, which happens on
-//! the way out of a panic too.
+//! Nor does it leave anything behind. [`case`] hands out a directory that
+//! removes itself when the test drops it, which happens on the way out of a
+//! panic too.
 //!
 //! Included with `#[path]` by each test target rather than shared through a
 //! crate boundary, so it stays a test detail and does not become API.
