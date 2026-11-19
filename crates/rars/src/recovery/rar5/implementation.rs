@@ -808,6 +808,98 @@ fn accumulate_scaled(destination: &mut [u8], source: &[u8], coefficient: u16, gf
     }
 }
 
+/// Several tasks per worker, so a slow core holds up a pass by one small task.
+const PARITY_TASKS_PER_WORKER: usize = 4;
+
+/// Parity bytes (source bytes times rows) below which waking another worker costs more than it saves.
+const MIN_PARITY_WORK_PER_WORKER: usize = if cfg!(test) { 64 } else { 16 * 1024 };
+
+/// Returns `(workers, column width)`; `None` keeps the work on this thread.
+fn parity_work_split(
+    rows: usize,
+    threads: usize,
+    span: usize,
+    min_work_per_worker: usize,
+) -> Option<(usize, usize)> {
+    let workers = threads.min(span.saturating_mul(rows) / min_work_per_worker.max(1));
+    if workers <= 1 || rows == 0 {
+        return None;
+    }
+    let chunks = (workers * PARITY_TASKS_PER_WORKER).div_ceil(rows);
+    // Even widths keep every chunk on whole 16-bit symbols.
+    Some((workers, span.div_ceil(chunks).next_multiple_of(2).min(span)))
+}
+
+/// A refused task list leaves the work on this thread rather than failing the write.
+fn accumulate_shard<B: Budget>(
+    parity: &mut [Buffer<u8, B>],
+    offset: usize,
+    source: &[u8],
+    matrix: &[Buffer<u16, B>],
+    shard_index: usize,
+    gf: &GfView<'_>,
+    allowance: &B,
+) {
+    let threads = if crate::parallel::may_nest() {
+        crate::parallel::threads()
+    } else {
+        1
+    };
+    let tasks = parity_work_split(
+        parity.len(),
+        threads,
+        source.len(),
+        MIN_PARITY_WORK_PER_WORKER,
+    )
+    .and_then(|(workers, width)| {
+        let chunks = source.len().div_ceil(width);
+        let tasks = Buffer::with_capacity(parity.len() * chunks, allowance).ok()?;
+        Some((workers, width, tasks))
+    });
+    let Some((workers, width, mut tasks)) = tasks else {
+        for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
+            accumulate_scaled(&mut parity_row[offset..], source, row[shard_index], gf);
+        }
+        return;
+    };
+    for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
+        let mut rest = &mut parity_row[offset..];
+        let mut start = 0;
+        while start < source.len() {
+            let end = (start + width).min(source.len());
+            // The last chunk keeps the rest of the row, where an odd tail's
+            // zero-padded high byte lands.
+            let destination = if end == source.len() {
+                std::mem::take(&mut rest)
+            } else {
+                let (destination, tail) = std::mem::take(&mut rest).split_at_mut(width);
+                rest = tail;
+                destination
+            };
+            tasks.push_admitted(std::sync::Mutex::new((
+                destination,
+                start..end,
+                row[shard_index],
+            )));
+            start = end;
+        }
+    }
+    // Workers stay within the thread cap and pull tasks rather than splitting them up front.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut workers = vec![(); workers.min(tasks.len())];
+    crate::parallel::for_each_mut(&mut workers, |_, _| loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(task) = tasks.get(index) else {
+            return;
+        };
+        let mut task = task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (destination, columns, coefficient) = &mut *task;
+        accumulate_scaled(destination, &source[columns.clone()], *coefficient, gf);
+    });
+}
+
 /// Single forward pass over the body, holding every parity row in memory.
 #[allow(clippy::too_many_arguments)]
 fn encode_parity_resident<B: Budget>(
@@ -848,15 +940,15 @@ fn encode_parity_resident<B: Budget>(
             body.read_exact(&mut buffer[..want])?;
             *state = crc64_update(&buffer[..want], *state);
 
-            let destination_offset = offset as usize;
-            for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
-                accumulate_scaled(
-                    &mut parity_row[destination_offset..],
-                    &buffer[..want],
-                    row[shard_index],
-                    gf,
-                );
-            }
+            accumulate_shard(
+                &mut parity,
+                offset as usize,
+                &buffer[..want],
+                matrix,
+                shard_index,
+                gf,
+                allowance,
+            );
 
             offset += want as u64;
             consumed += want as u64;
@@ -913,9 +1005,15 @@ fn encode_parity_striped<B: Budget>(
             body.read_exact(&mut buffer[..span_usize])?;
             *state = crc64_update(&buffer[..span_usize], *state);
 
-            for (row, stripe_row) in matrix.iter().zip(stripe.iter_mut()) {
-                accumulate_scaled(stripe_row, &buffer[..span_usize], row[shard_index], gf);
-            }
+            accumulate_shard(
+                &mut stripe,
+                0,
+                &buffer[..span_usize],
+                matrix,
+                shard_index,
+                gf,
+                allowance,
+            );
 
             consumed += span;
             report(scaled_progress(consumed, body_len, encode_units))?;
@@ -3151,6 +3249,82 @@ mod tests {
                 assert_eq!(output.payload_crc32, crate::crc32::crc32(&produced));
             }
         }
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn pooled_parity_matches_one_thread_byte_for_byte() {
+        fn streamed(body: &[u8], percent: u64, mode: super::RecoveryMemoryMode) -> Vec<u8> {
+            let plan = plan_inline_recovery(body.len() as u64, percent).unwrap();
+            let mut scratch = std::io::Cursor::new(vec![
+                0u8;
+                (plan.recovery_shards * plan.group_count)
+                    as usize
+            ]);
+            let mut produced = Vec::new();
+            super::build_streamed_inline_recovery(
+                &mut std::io::Cursor::new(body),
+                body.len() as u64,
+                percent,
+                mode,
+                Some(&mut scratch),
+                &mut produced,
+                None,
+                1,
+            )
+            .unwrap();
+            produced
+        }
+        let pool = crate::parallel::private_pool(8);
+        // An odd body leaves the last data shard short and ending mid-symbol.
+        for len in [1025, 3 * 200 * 1024 + 1, 1024 * 1024 + 7] {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x0bad);
+            for percent in [1, 10] {
+                let group_count = plan_inline_recovery(len as u64, percent)
+                    .unwrap()
+                    .group_count as usize;
+                // 998 divides none of these group counts.
+                assert_ne!(group_count % 998, 0);
+                for mode in [
+                    super::RecoveryMemoryMode::Resident,
+                    super::RecoveryMemoryMode::Striped { stripe_len: 998 },
+                ] {
+                    let serial = {
+                        let _one = crate::parallel::ThreadCap::set(Some(1));
+                        streamed(&body, percent, mode)
+                    };
+                    let pooled = pool.install(|| streamed(&body, percent, mode));
+                    assert_eq!(
+                        pooled, serial,
+                        "{mode:?} parity differs for {len} bytes at {percent}%"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parity_work_splits_into_columns_across_the_workers_it_can_feed() {
+        use super::parity_work_split;
+        const MIB: usize = 1024 * 1024;
+        // 1% recovery on 12 threads: 2 rows, each cut into 4 tasks per worker.
+        assert_eq!(parity_work_split(2, 12, 6 * MIB, MIB), Some((12, MIB / 4)));
+        // 5%: 10 rows; 48 tasks need 5 columns per row.
+        assert_eq!(parity_work_split(10, 12, 5 * MIB, MIB), Some((12, MIB)));
+        // Less work than the pool can take: only as many workers as it feeds.
+        assert_eq!(parity_work_split(2, 12, 3 * MIB, MIB), Some((6, MIB / 4)));
+        // Many rows and few workers: rows are not cut at all.
+        assert_eq!(parity_work_split(16, 2, 3, 1), Some((2, 3)));
+        // Chunks stay whole 16-bit symbols even when the span is odd.
+        assert_eq!(parity_work_split(1, 2, 11, 1), Some((2, 2)));
+        assert_eq!(parity_work_split(1, 2, 7, 1), Some((2, 2)));
+        // No pool, no rows, or work for only one worker: serial.
+        assert_eq!(parity_work_split(10, 1, 64 * MIB, 1), None);
+        assert_eq!(parity_work_split(0, 12, 64 * MIB, 1), None);
+        assert_eq!(parity_work_split(2, 12, MIB - 2, MIB), None);
     }
 
     #[test]

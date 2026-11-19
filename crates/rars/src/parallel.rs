@@ -57,11 +57,11 @@ impl Drop for ThreadCap {
 ))]
 mod threaded {
     use rayon::prelude::*;
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(any(test, feature = "write", feature = "recovery"))]
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Windows of several items in the pool, whose items may block on what their siblings hold.
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(any(test, feature = "write", feature = "recovery"))]
     static FANNED_OUT: AtomicUsize = AtomicUsize::new(0);
 
     #[cfg(any(test, feature = "write"))]
@@ -238,7 +238,7 @@ mod threaded {
     }
 
     /// Whether work inside an item may fan out: not while blocking siblings wait in the pool.
-    #[cfg(feature = "write")]
+    #[cfg(any(feature = "write", feature = "recovery"))]
     pub(crate) fn may_nest() -> bool {
         #[cfg(test)]
         if PRIVATE_POOL.get() {
@@ -345,13 +345,13 @@ mod sequential {
         false
     }
 
-    #[cfg(feature = "write")]
+    #[cfg(any(feature = "write", feature = "recovery"))]
     #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
     pub(crate) fn may_nest() -> bool {
         false
     }
 
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(any(test, feature = "write", feature = "recovery"))]
     pub(crate) fn threads() -> usize {
         1
     }

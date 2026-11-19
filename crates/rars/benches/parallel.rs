@@ -305,9 +305,42 @@ fn bench_candidate_pricing(c: &mut Criterion) {
     group.finish();
 }
 
+// A stored member keeps the time on recovery parity rather than compression.
+fn bench_parallel_recovery_record(c: &mut Criterion) {
+    const SIZE: usize = 64 * 1024 * 1024;
+    let resources = WriterResources::new(1024 * 1024 * 1024);
+    let mut group = c.benchmark_group("parallel_rar50_recovery_record");
+    group.throughput(Throughput::Bytes(SIZE as u64));
+    for percent in [0, 1, 5] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .store(true)
+            .recovery_percent((percent != 0).then_some(percent));
+        builder
+            .add_bytes(b"body.bin".to_vec(), payload(SIZE, 7), None, None)
+            .expect("benchmark member should be accepted");
+        for threads in thread_counts() {
+            let pool = thread_pool(threads);
+            group.bench_with_input(
+                BenchmarkId::new(format!("{percent}_percent"), thread_label(threads)),
+                &threads,
+                |b, _| {
+                    b.iter(|| {
+                        pool.install(|| {
+                            builder
+                                .write_to(&mut std::io::sink(), &resources, None)
+                                .expect("benchmark archive writing should succeed");
+                        });
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     name = benches;
     config = Criterion::default().sample_size(10);
-    targets = bench_parallel_compression, bench_parallel_extraction, bench_parallel_encrypted_open, bench_candidate_pricing, bench_setup
+    targets = bench_parallel_compression, bench_parallel_extraction, bench_parallel_encrypted_open, bench_parallel_recovery_record, bench_candidate_pricing, bench_setup
 );
 criterion_main!(benches);
