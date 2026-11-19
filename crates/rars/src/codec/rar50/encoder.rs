@@ -1205,11 +1205,8 @@ fn encode_filter_data<B: Budget>(
 /// transformed alone: the transform reads an absolute file offset, which the
 /// cut does not change.
 ///
-/// Blocks used to be compressed one at a time, each against a fresh copy of
-/// the history behind it and a finder rebuilt from that copy. That is the
-/// cost [`encode_lz_member_inner`] took off the unfiltered path and left
-/// here: at 64 KiB a block, a four-megabyte member re-copied and re-inserted
-/// 126 MiB of history, thirty-one times what it holds.
+/// Compressing each block against a fresh copy of its history would re-copy
+/// and re-insert 126 MiB for a 4 MiB member at 64 KiB a block.
 #[allow(clippy::too_many_arguments)]
 fn filtered_lz_blocks<B: Budget>(
     data: &[u8],
@@ -1470,10 +1467,9 @@ fn encode_member_with_allowance<B: Budget>(
     let (window, start) = member_window_with_allowance(data, history, options, allowance)?;
     let combined = &*window;
     if data.len() > LZ_BLOCK_SIZE {
-        // One search state for the whole member. It used to be built per
-        // block, which meant rehashing a window of history every 64 KiB: on a
-        // 16 MiB member that was half the encode. The optimal parse used to be
-        // worse still, rebuilding per pass; its collector searches each block
+        // One search state for the whole member; building one per block
+        // rehashes a window of history every 64 KiB, half the encode of a
+        // 16 MiB member. The optimal parse's collector searches each block
         // once and lets the passes replay the answers.
         if pipelines::<B>(options) {
             let mut out = Buffer::new(allowance);
@@ -1864,10 +1860,8 @@ struct BlockMatches<B: Budget = Allowance> {
 /// it about each block once.
 ///
 /// The parse prices each block [`OPTIMAL_PARSE_PASSES`] times, but nothing the
-/// finder answers depends on the prices, so it used to be asked the same
-/// questions once per pass, through a finder rebuilt and reseeded once per
-/// pass. Collecting the answers first and replaying them lets every pass after
-/// the first skip the finder entirely.
+/// finder answers depends on the prices. Collecting the answers first and
+/// replaying them lets every pass after the first skip the finder entirely.
 ///
 /// Searching once is also what makes the tree finder affordable, and the tree
 /// is where the speed is: pricing every position means searching at every

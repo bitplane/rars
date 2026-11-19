@@ -3,12 +3,9 @@
 //! The main header carries a locator record holding the offsets of the
 //! quick-open and recovery blocks, and those offsets are stored as variable
 //! length integers. So the main header's own size depends on values that
-//! depend on the main header's size. The writer used to break that circle by
-//! emitting the entire archive up to four times until the offsets stopped
-//! moving, which meant recomputing every recovery record from scratch on each
-//! attempt.
+//! depend on the main header's size.
 //!
-//! It is only a circle over two integers, though. Everything else in the
+//! It is only a circle over two integers. Everything else in the
 //! archive has a size that is already known: block headers are a pure function
 //! of their fields, and the quick-open payload stores offsets *relative* to
 //! itself, so growing the prefix shifts its position and its targets equally

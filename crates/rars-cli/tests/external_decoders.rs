@@ -1,13 +1,8 @@
 //! Hands every archive shape the writers can produce to the decoders people
 //! actually use, and checks the bytes come back.
 //!
-//! Every corruption this project has shipped lived in the same blind spot: our
-//! reader accepted what our writer produced, the suite went green, and nobody
-//! else looked until a user did. The RAR 2.0 checksum bug, the 7-Zip
-//! incompatibility of issue #19, the 0.5.1 `--store` RAR 5 archives, the RAR
-//! 3.0 PPMd streams unrar refuses, the RAR 1.5 flag straddle. Reference tests
-//! existed for some of it, but every one of them was `#[ignore]`, so the gate
-//! never ran a single one.
+//! A round trip through our own reader cannot catch a writer bug the reader
+//! shares, and every corruption rars has shipped was one of those.
 //!
 //! This runs by default and skips only when no decoder can be found. Set
 //! `RARS_REQUIRE_EXTERNAL_DECODERS=1` to turn a skip into a failure; the

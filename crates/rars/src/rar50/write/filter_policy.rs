@@ -160,13 +160,8 @@ pub(super) fn should_store_compressed_payload(
 
 /// How hard each level looks for a match, and where the default sits.
 ///
-/// The ladder used to run 8, 32, 64, 48, 64 with the absent level on 256, so
-/// asking for the most compression got you less of it than asking for nothing:
-/// `--level 5` searched 64 positions where the default searched 256, and level
-/// 4 searched fewer than level 3. On 4 MiB of man pages the default packed
-/// 679,368 bytes and `--level 5` packed 691,274.
-///
-/// Measured on that member, packed bytes against seconds, at lookahead 2:
+/// Each level searches more than the one below. Measured on 4 MiB of man pages,
+/// packed bytes against seconds, at lookahead 2:
 ///
 /// ```text
 /// candidates     64     128     256     512    1024
@@ -210,18 +205,15 @@ pub(super) fn encode_options_for_level(
     })?;
     Ok(EncodeOptions::new(candidates)
         // Looking one byte further ahead before settling for the match at hand
-        // is both smaller and quicker than not: at 64 candidates it took 4,383
-        // bytes off that member and half a second off the encode, because a
+        // is both smaller and quicker than not: at 64 candidates on 4 MiB of
+        // man pages it took 4,383 bytes and half a second off, because a
         // longer match covers ground the finder then does not have to search.
-        // Four is worse than one, which is its own question (#83).
+        // A lookahead of four is worse than one.
         .with_lazy_matching(level >= 2)
         .with_lazy_lookahead(2)
-        // Everything above level 1 parses by shortest path.
-        //
-        // This used to start at level 5, which left three rungs in the middle
-        // doing something that could not close the distance to WinRAR whatever
-        // it was tuned to. Measured over the bench corpus against each level's
-        // own WinRAR, byte weighted, as the parse moved down the ladder:
+        // Everything above level 1 parses by shortest path. Gap to each
+        // level's own WinRAR over the bench corpus, byte weighted, with the
+        // parse starting at each level:
         //
         // ```text
         // parse from   m2       m3       m4       m5
@@ -261,7 +253,7 @@ pub(super) fn encode_options_for_level(
 ///   5    1024       6   8,440,881   75.5s
 /// ```
 ///
-/// Level 3 keeps what it always had. Past it, larger members gain more from
+/// Past level 3, larger members gain more from
 /// the dictionary the level fits than from either of these.
 fn parse_effort_for_level(level: u8) -> (usize, usize) {
     match level {
@@ -274,14 +266,9 @@ fn parse_effort_for_level(level: u8) -> (usize, usize) {
 
 /// The encoder settings to try for a level, smallest output kept.
 ///
-/// One, now. Level 5 used to try levels 4 down to 1 as well, to catch a member
-/// that packs smaller with less search. Over the whole bench corpus it caught
-/// one byte, on one member, for four extra whole-member encodes; dropping it
-/// took 28% off level 5's time and nothing off its output.
-///
-/// The shape stays because the caller still asks a list, and because a future
-/// setting that genuinely competes rather than merely searches less would go
-/// here.
+/// Just one. Retrying a member at lower levels saved one byte over the whole
+/// bench corpus and cost level 5 a quarter of its time. The list stays for a
+/// setting that competes on something other than search depth.
 pub(super) fn encode_option_candidates_for_level(
     level: Option<u8>,
     dictionary_size: u64,

@@ -7,7 +7,7 @@ use crate::codec::rar20::{
     EncodeOptions as Rar20EncodeOptions, Unpack20Encoder,
 };
 use crate::codec::rar29::{
-    unpack29_encode_literals, unpack29_encode_literals_with_options,
+    named_filter_segments, unpack29_encode_literals, unpack29_encode_literals_with_options,
     unpack29_encode_literals_with_options_and_progress, ChainEngine,
     EncodeOptions as Rar29EncodeOptions, Unpack29Encoder,
 };
@@ -1044,16 +1044,12 @@ fn encode_rar29_policy_filtered_payload(
 
 /// Whether this level is willing to encode the member twice to choose an engine.
 ///
-/// Takes the resolved level, not the option. Reading `Option<u8>` meant an
-/// absent level and `--level 3` disagreed, though both write method 0x33: the
-/// default paid for the trial and the level that names the same number did not,
-/// so the two produced archives 24% apart on the same 4 MiB of text.
+/// Takes the resolved level, so an absent level and `--level 3` agree.
 ///
-/// Levels 1 and 2 are the ones asking for speed and still skip it. Level 3 is
-/// the default and where most archives are written, and it is worth about a
-/// fifth of the size on text for roughly twice the encode. WinRAR turns PPMd on
-/// one level later, at m4: on the bench text member WinRAR 3.00 packs 657,294
-/// bytes at m3 and 585,357 at m4, where we now write 540,517 at both.
+/// Levels 1 and 2 ask for speed and skip it. Level 3 is the default, and the
+/// trial is worth about a fifth of the size on text for roughly twice the
+/// encode. WinRAR turns PPMd on one level later, at m4: on 4 MiB of text WinRAR
+/// 3.00 packs 657,294 bytes at m3 and 585,357 at m4, and rars 540,517 at both.
 fn ppmd_trial_pays(level: u8) -> bool {
     level >= 3
 }
@@ -1297,23 +1293,13 @@ fn encode_rar29_text_member(
     lz_method: u8,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    // Whichever engine wins, it wins because it was measured against the other
-    // over the whole member. Size used to decide it instead: under 1 MiB text
-    // was measured, over 16 MiB it went to PPMd unmeasured, and everything
-    // between kept the LZ bytes without ever encoding PPMd to compare. That
-    // middle band cost 24% on 2 MiB of man pages and 12% on 4 MiB, and the
-    // unmeasured end can lose just as badly the other way: 8 MiB of content
-    // that repeats every 4 MiB packs to 843 KB under LZ and 1.44 MB under PPMd.
-    //
-    // Screening on a sample first, the way the filter search earns its
-    // candidates, was tried and does not work here. The two engines are only
-    // comparable once there is enough output to compare: on 128 KiB of one
-    // repeating phrase LZ lands on 213 bytes and PPMd on 118, so the screen
-    // reads a 45% PPMd win off what is almost entirely archive overhead. And
-    // in the case worth catching, repetition further apart than the sample is
-    // wide, the sample cannot see the repetition at all. PPMd costs about
-    // three times LZ on the same bytes, so text at the top two levels pays for
-    // both engines. Levels 1 to 4 skip the trial as they always have.
+    // Encode the whole member with both engines and keep the smaller. Neither
+    // size nor a sample predicts the winner: 8 MiB of content that repeats
+    // every 4 MiB packs to 843 KB under LZ and 1.44 MB under PPMd, and a sample
+    // narrower than the repeat distance cannot see the repetition. On a small
+    // sample archive overhead dominates, so 128 KiB of one phrase reads as a
+    // 45% PPMd win (118 bytes against 213). PPMd costs about three times LZ on
+    // the same bytes; `ppmd_trial_pays` decides which levels pay for both.
     let (_, best) = text_trial(data, options, &|encode| {
         with_codec_progress(progress, |report| encode(report))
     })?;
@@ -1834,7 +1820,7 @@ fn member_header(
     Ok(header)
 }
 
-/// A named filter needs the whole member.
+/// Forced PPMd declares a named filter's records before its first byte, so it needs the whole member.
 fn streams_member(
     member: &Member<'_>,
     options: WriterOptions,
@@ -1852,11 +1838,14 @@ fn streams_member(
                 | ArchiveVersion::Rar30
                 | ArchiveVersion::Rar40
         )
-        || !matches!(
-            coding,
+        || !match coding {
             MemberCoding::Compressed
-                | MemberCoding::Filtered(FilterPolicy::None | FilterPolicy::Auto)
-        )
+            | MemberCoding::Filtered(FilterPolicy::None | FilterPolicy::Auto) => true,
+            MemberCoding::Filtered(FilterPolicy::Explicit(_)) => {
+                options.target != ArchiveVersion::Rar20 && options.method != Rar29Method::Ppmd
+            }
+            MemberCoding::Stored => false,
+        }
     {
         return Ok(false);
     }
@@ -1891,6 +1880,13 @@ fn streamed_engine(
     if options.method == Rar29Method::Ppmd {
         return Ok(StreamedEngine::Ppmd {
             escapes: Some(encode_options.max_match_distance),
+        });
+    }
+    // A named filter in a chain is coded LZ, as it is in memory.
+    let named = matches!(coding, MemberCoding::Filtered(FilterPolicy::Explicit(_)));
+    if named && options.features.solid {
+        return Ok(StreamedEngine::Lz {
+            filter_search: false,
         });
     }
     let text = sampled_text(&member.bytes, len as u64)?;
@@ -1972,8 +1968,12 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     let lz = dictionary
         .saturating_mul(12 + 6)
         .saturating_add(2 * 1024 * 1024);
+    // A named filter is applied in place, with no candidate to hold beside it.
     let searching = options.method != Rar29Method::Ppmd
-        && !matches!(coding, MemberCoding::Filtered(FilterPolicy::None));
+        && matches!(
+            coding,
+            MemberCoding::Compressed | MemberCoding::Filtered(FilterPolicy::Auto)
+        );
     let search = if searching {
         segment.saturating_mul(2)
     } else {
@@ -2226,6 +2226,13 @@ fn stream_member(
                 .map(|(specs, _)| specs)
                 .map_err(|error| crate::codec::Error::Io(Box::new(error)))
             };
+            // A named filter is applied to every segment the search would have chosen for.
+            let mut named = match coding {
+                MemberCoding::Filtered(FilterPolicy::Explicit(filter)) => {
+                    Some(named_filter_segments(len, filter.clone()).map_err(map_codec_cancel)?)
+                }
+                _ => None,
+            };
             let mut own = None;
             let encoder = match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
                 Some(SolidEncoder::Rar29(encoder)) => encoder,
@@ -2235,9 +2242,10 @@ fn stream_member(
                 StreamedEngine::Lz { filter_search } => encoder.encode_lz_streamed(
                     &mut counted,
                     len,
-                    match filter_search {
-                        true => Some(&mut choose),
-                        false => None,
+                    match (named.as_mut(), filter_search) {
+                        (Some(named), _) => Some(named),
+                        (None, true) => Some(&mut choose),
+                        (None, false) => None,
                     },
                     &mut advance,
                     &mut write,
@@ -2637,13 +2645,8 @@ fn rar29_encode_options_for_options(options: WriterOptions) -> Result<Rar29Encod
 
 /// RAR 2.0 levels, as candidates searched per position.
 ///
-/// The ladder used to run 16, 64, 256, 96, 128, so the top two levels searched
-/// less than the middle one and asking for more compression got less of it: on
-/// 4 MiB of man pages level 3 packed 848,854 bytes, level 5 packed 861,371 and
-/// level 4 packed 867,857, which is the candidate order exactly.
-///
-/// Lazy matching was off at every level, which cost more than the ladder did.
-/// Measured on that member, packed bytes and seconds:
+/// Each level searches more than the one below. Measured on 4 MiB of man
+/// pages, packed bytes and seconds:
 ///
 /// ```text
 /// candidates       16       64      256      512     1024
@@ -4448,6 +4451,112 @@ mod tests {
             "{} streamed against {whole} in memory",
             packed.len()
         );
+    }
+
+    fn named(kind: crate::FilterKind) -> crate::MemberCoding {
+        crate::MemberCoding::Filtered(crate::FilterPolicy::explicit(kind))
+    }
+
+    fn pack_size(archive: &[u8], index: usize) -> u64 {
+        let parsed = crate::rar15_40::Archive::parse(archive).unwrap();
+        let size = parsed.files().nth(index).unwrap().pack_size;
+        size
+    }
+
+    #[test]
+    fn a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes() {
+        use crate::FilterKind;
+        let large = binary_member(1024 * 1024 + 4321);
+        let audio = audio();
+        let small: &[u8] = b"small and below the threshold\n";
+        // Several segments a member, so records meet their boundaries.
+        let mut segmented = rar40();
+        segmented.dictionary_size = Some(128 * 1024);
+        for (data, kind) in [
+            (&large, FilterKind::E8),
+            (&large, FilterKind::E8E9),
+            (&audio, FilterKind::Delta { channels: 4 }),
+            (&audio, FilterKind::Audio { channels: 4 }),
+        ] {
+            let members = entries(&[("small.txt", small), ("large.bin", data)]);
+            for (window, options) in [("fitted", rar40()), ("128K", segmented)] {
+                let out = streamed_with(&members, options, named(kind), None).unwrap();
+
+                assert!(out.seeks > 0, "{kind:?} {window}: not streamed");
+                let archive = out.inner.into_inner();
+                assert_eq!(
+                    extracted_set(std::slice::from_ref(&archive), None),
+                    [
+                        (b"small.txt".to_vec(), small.to_vec()),
+                        (b"large.bin".to_vec(), data.to_vec()),
+                    ],
+                    "{kind:?} {window}"
+                );
+                let whole = in_memory_with(&members, options, named(kind));
+                // An x86 record covers 128 KiB, so segment boundaries fall
+                // between records; delta and audio records are cut at them.
+                if matches!(kind, FilterKind::E8 | FilterKind::E8E9) || window == "fitted" {
+                    assert_eq!(archive, whole, "{kind:?} {window}");
+                } else {
+                    let (streamed, whole) = (pack_size(&archive, 1), pack_size(&whole, 1));
+                    assert!(
+                        streamed * 1000 <= whole * 1002,
+                        "{kind:?} {window}: {streamed} streamed against {whole} in memory"
+                    );
+                }
+            }
+        }
+        // The filter was applied, not just named.
+        let members = entries(&[("audio.wav", &audio)]);
+        let unfiltered = streamed_with(
+            &members,
+            segmented,
+            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
+            None,
+        )
+        .unwrap();
+        let filtered = streamed_with(
+            &members,
+            segmented,
+            named(FilterKind::Delta { channels: 4 }),
+            None,
+        )
+        .unwrap();
+        assert!(
+            pack_size(&filtered.inner.into_inner(), 0) * 2
+                < pack_size(&unfiltered.inner.into_inner(), 0)
+        );
+    }
+
+    #[test]
+    fn a_named_filter_streams_on_a_solid_chain_and_through_a_pipe() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let noise = noise(1024 * 1024 + 7);
+        let members = entries(&[
+            ("before.bin", &large[1000..41000]),
+            ("large.bin", &large),
+            ("after.bin", &large[large.len() - 40000..]),
+            ("noise.bin", &noise),
+        ]);
+        let coding = || named(crate::FilterKind::E8E9);
+        let mut solid40 = rar40();
+        solid40.features.solid = true;
+        for (name, options) in [("rar40", rar40()), ("solid rar40", solid40)] {
+            let out = streamed_with(&members, options, coding(), None).unwrap();
+            assert!(out.seeks > 0, "{name}: not streamed");
+            let file = out.inner.into_inner();
+            let (piped, spooled) = piped_with(&members, options, coding());
+            assert!(spooled, "{name}: the large members were not spooled");
+            assert_eq!(piped, file, "{name}");
+            let whole = in_memory_with(&members, options, coding());
+            assert_eq!(extracted_set(&[file], None), extracted_set(&[whole], None));
+        }
+        // Forced PPMd declares every record up front, so it still holds the member.
+        let mut ppmd = rar40();
+        ppmd.method = super::Rar29Method::Ppmd;
+        let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
+        assert!(!super::streams_member(&routed[1], ppmd, &coding(), 256 * 1024).unwrap());
+        assert!(super::streams_member(&routed[1], rar40(), &coding(), 256 * 1024).unwrap());
     }
 
     #[test]
