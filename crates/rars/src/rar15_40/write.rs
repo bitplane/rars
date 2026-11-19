@@ -1783,8 +1783,8 @@ fn member_workspace(
     let level = compression_method_for_level(options).saturating_sub(0x30);
     let ppmd_models = if rar29 && (ppmd_trial_pays(level) || options.method == Rar29Method::Ppmd) {
         // A trial holds two models of one size at a time. A chain keeps its
-        // own beside two copies: the one coded with escapes, kept while the
-        // same member codes again as literals.
+        // own beside two copies: a short member's escaped coding is kept
+        // while the same member codes again as literals.
         let models = if options.features.solid { 3 } else { 2 };
         (models * largest_ppmd_model(options)).saturating_add(
             crate::codec::rar29::ppmd_search_workspace(dictionary as usize),

@@ -5494,6 +5494,44 @@ fn a_chain_starts_its_ppmd_model_at_the_size_its_first_member_codes_smallest() {
 /// A PPMd block codes both ways from the same model and keeps the smaller,
 /// escapes on a tie, with the model the winner leaves behind.
 #[test]
+fn a_long_ppmd_member_codes_once_the_way_its_start_chooses() {
+    let size = super::PpmdModelSize::DEFAULT;
+    let sample = 65_536;
+    let coded = |data: &[u8], escapes: bool| {
+        super::encode_ppmd_block_with_model(data, escapes, None, 1 << 22, None, size, None)
+            .unwrap()
+            .0
+    };
+    // Each member's start and its whole disagree, so only a choice made from
+    // the start codes it the start's way.
+    let rare = phrase_member(sample);
+    let repeated = mixed_member(16_384).repeat(16);
+    let rare_first = [&rare[..], &repeated[..]].concat();
+    let repeated_first = [&repeated[..sample], &phrase_member(4 * sample)[..]].concat();
+    for (data, literals_start) in [(&rare_first, true), (&repeated_first, false)] {
+        let (start_escaped, start_literals) =
+            (coded(&data[..sample], true), coded(&data[..sample], false));
+        assert_eq!(start_literals.len() < start_escaped.len(), literals_start);
+        let (escaped, literals) = (coded(data, true), coded(data, false));
+        assert_eq!(
+            literals.len() < escaped.len(),
+            !literals_start,
+            "the whole member must disagree with its start"
+        );
+        let (packed, _) =
+            super::encode_ppmd_either_way_sampled(data, 1 << 22, None, size, sample, &mut |_| true)
+                .unwrap();
+        let chosen = if literals_start { literals } else { escaped };
+        assert!(
+            packed == chosen,
+            "coded as its whole chooses, not its start"
+        );
+        let decoded = super::Unpack29::new().decode_non_solid_member(&packed, data.len());
+        assert_eq!(&decoded.unwrap(), data);
+    }
+}
+
+#[test]
 fn a_ppmd_member_codes_with_escapes_or_as_literals_whichever_is_smaller() {
     let size = super::PpmdModelSize::DEFAULT;
     // Text that rarely repeats far back codes smaller as literals; a block

@@ -617,14 +617,19 @@ fn encode_ppmd_block_with_model(
     Ok((out, model))
 }
 
-/// Codes a PPMd block with LZ escapes and as plain literals, from the same
-/// model, and keeps the smaller, escapes on a tie.
+/// How much of a member [`encode_ppmd_either_way`] codes both ways to choose.
+const PPMD_EITHER_WAY_SAMPLE: usize = 1 << 20;
+
+/// Codes a PPMd block with LZ escapes or as plain literals, from the same
+/// model, whichever codes the member's start smaller, escapes on a tie.
 ///
 /// An escape prices itself against costs measured off the stream it shapes,
 /// so on text that rarely repeats it can lose to literals: a 4.3 MB source
-/// tar at order 25 packs 1.8% smaller without them. The model each coding
-/// leaves differs, and the winner's is the one returned, since that is what a
-/// reader of the winner holds. The literal coding only polls for cancellation.
+/// tar at order 25 packs 1.8% smaller without them. Coding the whole member
+/// twice to find out costs half as much again on text where escapes win, so
+/// past twice the sample only the sample is coded both ways, from copies of
+/// the model, and the member is coded once the way it chose. The model comes
+/// back from that coding, since that is what its reader holds.
 fn encode_ppmd_either_way(
     input: &[u8],
     max_match_distance: usize,
@@ -632,29 +637,50 @@ fn encode_ppmd_either_way(
     size: PpmdModelSize,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<(Vec<u8>, PpmdModel)> {
-    let escaped = encode_ppmd_block_with_model(
+    encode_ppmd_either_way_sampled(
         input,
-        true,
-        None,
         max_match_distance,
-        model.cloned(),
+        model,
         size,
-        Some(&mut *progress),
-    )?;
-    let literals = encode_ppmd_block_with_model(
-        input,
-        false,
-        None,
-        max_match_distance,
-        model.cloned(),
-        size,
-        Some(&mut |_| progress(input.len())),
-    )?;
-    Ok(if literals.0.len() < escaped.0.len() {
-        literals
-    } else {
-        escaped
-    })
+        PPMD_EITHER_WAY_SAMPLE,
+        progress,
+    )
+}
+
+/// [`encode_ppmd_either_way`] choosing from the first `sample` bytes.
+fn encode_ppmd_either_way_sampled(
+    input: &[u8],
+    max_match_distance: usize,
+    model: Option<&PpmdModel>,
+    size: PpmdModelSize,
+    sample: usize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Vec<u8>, PpmdModel)> {
+    let code = |input: &[u8], escapes: bool, progress: &mut dyn FnMut(usize) -> bool| {
+        encode_ppmd_block_with_model(
+            input,
+            escapes,
+            None,
+            max_match_distance,
+            model.cloned(),
+            size,
+            Some(progress),
+        )
+    };
+    if input.len() <= sample.saturating_mul(2) {
+        let escaped = code(input, true, &mut *progress)?;
+        let literals = code(input, false, &mut |_| progress(input.len()))?;
+        return Ok(if literals.0.len() < escaped.0.len() {
+            literals
+        } else {
+            escaped
+        });
+    }
+    let sample = &input[..sample];
+    let mut poll = |_| progress(0);
+    let escaped = code(sample, true, &mut poll)?.0.len();
+    let literals = code(sample, false, &mut poll)?.0.len();
+    code(input, literals >= escaped, progress)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1043,9 +1069,9 @@ impl Unpack29Encoder {
     ///
     /// A member that starts the model codes under each of the chain's sizes
     /// and keeps the smallest, earlier on a tie. With `either_way`, each size,
-    /// or the model the chain continues, is coded with LZ escapes and as plain
-    /// literals, and the smaller kept, escapes on a tie: the model carries on
-    /// from whichever was written, as the reader's does. Forced PPMd codes with
+    /// or the model the chain continues, codes with LZ escapes or as plain
+    /// literals, whichever [`encode_ppmd_either_way`] chooses: the model
+    /// carries on from the coding written, as the reader's does. Forced PPMd codes with
     /// escapes only, which is what a streamed member can match. Only the first
     /// coding reports progress; the others poll at the end.
     fn encode_ppmd_member(
