@@ -4801,7 +4801,9 @@ fn ppmd_members_code_to_the_bytes_before_the_search_ran_ahead() {
             (230_348, 1_494_863_526),
             (231_226, 2_092_742_637),
             (209_736, 3_414_149_300),
-            (301_487, 2_610_911_824),
+            // Its eleven delta records are declared as the coder reaches each
+            // one now, not all before the first byte; that was 301,487 bytes.
+            (301_429, 2_669_515_988),
             (13_268, 4_063_589_940),
             (60, 1_624_776_514),
             (67_188, 3_120_010_630),
@@ -4881,6 +4883,7 @@ fn a_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes() {
             &mut &text[..],
             text.len(),
             escapes,
+            None,
             &mut |_| true,
             &mut |bytes, _| {
                 writes += 1;
@@ -4912,6 +4915,58 @@ fn stereo_member(len: usize) -> Vec<u8> {
     }
     out.truncate(len);
     out
+}
+
+#[test]
+fn a_filtered_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes() {
+    use crate::{FilterKind, FilterSpec};
+
+    let input = stereo_member(700 * 1024 + 6);
+    for (escapes, filter) in [
+        // 120,000-byte records, so most of them straddle a 256 KiB read.
+        (
+            Some(16 * 1024),
+            FilterSpec::whole(FilterKind::Delta { channels: 4 }),
+        ),
+        (
+            Some(16 * 1024),
+            FilterSpec::range(FilterKind::E8, 1000..600 * 1024),
+        ),
+        (None, FilterSpec::whole(FilterKind::Audio { channels: 2 })),
+    ] {
+        let mut streamed = Vec::new();
+        let mut writes = 0;
+        let flow = super::unpack29_encode_ppmd_streamed(
+            &mut &input[..],
+            input.len(),
+            escapes,
+            Some(filter.clone()),
+            &mut |_| true,
+            &mut |bytes, _| {
+                writes += 1;
+                streamed.extend_from_slice(bytes);
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )
+        .unwrap();
+        let whole = super::unpack29_encode_ppmd_with_progress(
+            &input,
+            escapes.is_some(),
+            Some(filter.clone()),
+            escapes.unwrap_or(0),
+            &mut |_| true,
+        )
+        .unwrap();
+
+        assert_eq!(flow, std::ops::ControlFlow::Continue(()));
+        assert!(writes > 3, "{filter:?}: written in {writes} pieces");
+        assert_eq!(streamed, whole, "{filter:?}");
+        assert_eq!(
+            unpack29_decode(&streamed, input.len()).unwrap(),
+            input,
+            "{filter:?}"
+        );
+    }
 }
 
 #[test]
