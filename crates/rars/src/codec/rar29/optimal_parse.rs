@@ -51,42 +51,82 @@ const MAX_FOUND: usize = 16;
 /// Below 8 the binary gains a little more and text starts to lose, so 8.
 const ABSENT_BITS: u32 = 8;
 
-/// Reparses `start..end` by shortest path, up to `optimal_parse_passes` times,
-/// and returns whichever set of tokens codes smallest.
-pub(super) fn refine<C: Candidates>(
-    data: &[u8],
+/// One block's matches, found once and shared by every range of it priced.
+pub(super) struct Refiner {
     start: usize,
-    end: usize,
-    finder: &C,
-    options: EncodeOptions,
-    tokens: Vec<EncodeToken>,
-) -> Result<Vec<EncodeToken>> {
-    if end <= start || end - start > OPTIMAL_SPAN {
-        return Ok(tokens);
-    }
-    let found = Found::collect(data, start, end, finder, options);
-    let mut best_table = table_lengths_for_tokens(&tokens, 0)?;
-    let mut best_bits = block_bits(&tokens, &best_table)?;
-    let mut best = tokens;
-    for _ in 0..options.optimal_parse_passes {
-        let prices = Prices::new(&best_table);
-        let next = shortest_path(data, start, end, &found, &prices, options);
-        let table = table_lengths_for_tokens(&next, 0)?;
-        let bits = block_bits(&next, &table)?;
-        if bits >= best_bits {
-            break;
+    found: Found,
+}
+
+impl Refiner {
+    /// `None` for a block wider than one parse prices, which keeps the lazy
+    /// parse rather than holding a node per byte of it.
+    pub(super) fn new<C: Candidates>(
+        data: &[u8],
+        start: usize,
+        end: usize,
+        finder: &C,
+        options: EncodeOptions,
+    ) -> Option<Self> {
+        if end <= start || end - start > OPTIMAL_SPAN {
+            return None;
         }
-        best = next;
-        best_table = table;
-        best_bits = bits;
+        Some(Self {
+            start,
+            found: Found::collect(data, start, end, finder, options),
+        })
     }
-    Ok(best)
+
+    /// Reparses `start..end`, a range of the block coming in with the repeat
+    /// offsets of `state`, up to `optimal_parse_passes` times, and returns
+    /// whichever set of tokens codes smallest.
+    ///
+    /// `tokens` were parsed coming in with `parsed_from`. They price the first
+    /// pass, and stay in the running only if they still code from `state`.
+    /// Returns the tokens kept and the bits they code to.
+    pub(super) fn refine(
+        &self,
+        data: &[u8],
+        (start, end): (usize, usize),
+        options: EncodeOptions,
+        tokens: Vec<EncodeToken>,
+        (parsed_from, state): (EncoderMatchState, EncoderMatchState),
+    ) -> Result<(Vec<EncodeToken>, usize)> {
+        let found = self.found.from(start - self.start);
+        let mut best_table = table_lengths_for_tokens(&tokens, parsed_from, 0)?;
+        let mut best_bits = usize::MAX;
+        if let Ok(table) = table_lengths_for_tokens(&tokens, state, 0) {
+            best_bits = block_bits(&tokens, &table, state)?;
+            best_table = table;
+        }
+        let mut best = tokens;
+        for _ in 0..options.optimal_parse_passes {
+            let prices = Prices::new(&best_table);
+            let next = shortest_path(data, start, end, &found, &prices, options, state);
+            let table = table_lengths_for_tokens(&next, state, 0)?;
+            let bits = block_bits(&next, &table, state)?;
+            if bits >= best_bits {
+                break;
+            }
+            best = next;
+            best_table = table;
+            best_bits = bits;
+        }
+        Ok((best, best_bits))
+    }
+}
+
+/// What these tokens code to as a block with tables of their own.
+pub(super) fn priced_bits(tokens: &[EncodeToken], state: EncoderMatchState) -> Result<usize> {
+    block_bits(tokens, &table_lengths_for_tokens(tokens, state, 0)?, state)
 }
 
 /// What a block of these tokens codes to under `table`, header included.
-fn block_bits(tokens: &[EncodeToken], table: &[u8; TABLE_COUNT]) -> Result<usize> {
+fn block_bits(
+    tokens: &[EncodeToken],
+    table: &[u8; TABLE_COUNT],
+    mut state: EncoderMatchState,
+) -> Result<usize> {
     let prices = Prices::new(table);
-    let mut state = EncoderMatchState::default();
     let mut bits = 4 * LEVEL_COUNT + level_tokens_bit_cost(&encode_table_level_tokens(table));
     for token in tokens {
         bits += match *token {
@@ -202,7 +242,21 @@ struct Found {
     runs: Vec<FoundMatch>,
 }
 
+/// The matches from some position of a block on.
+struct FoundFrom<'a> {
+    counts: &'a [u8],
+    runs: &'a [FoundMatch],
+}
+
 impl Found {
+    fn from(&self, skip: usize) -> FoundFrom<'_> {
+        let runs: usize = self.counts[..skip].iter().copied().map(usize::from).sum();
+        FoundFrom {
+            counts: &self.counts[skip..],
+            runs: &self.runs[runs..],
+        }
+    }
+
     fn collect<C: Candidates>(
         data: &[u8],
         start: usize,
@@ -335,13 +389,15 @@ fn shortest_path(
     data: &[u8],
     start: usize,
     end: usize,
-    found: &Found,
+    found: &FoundFrom<'_>,
     prices: &Prices,
     options: EncodeOptions,
+    state: EncoderMatchState,
 ) -> Vec<EncodeToken> {
     let span = end - start;
     let mut nodes = vec![Node::UNREACHED; span + 1];
     nodes[0].cost = 0;
+    nodes[0].state = RouteState::of(&state);
     let mut lengths = Vec::new();
     let mut next_run = 0usize;
     let mut committed_through = 0usize;

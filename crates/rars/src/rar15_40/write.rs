@@ -2833,9 +2833,12 @@ fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOption
             ))
         }
     };
+    // Level 1 is the fast one and keeps one table per block.
+    let split_blocks = level.is_none_or(|level| level >= 2);
     Ok(options
         .with_lazy_lookahead(1)
-        .with_block_size(RAR29_LZ_BLOCK_SIZE))
+        .with_block_size(RAR29_LZ_BLOCK_SIZE)
+        .with_split_blocks(split_blocks))
 }
 
 fn rar29_encode_options_for_options(options: WriterOptions) -> Result<Rar29EncodeOptions> {
@@ -4641,8 +4644,11 @@ mod tests {
         );
         let unfiltered = crate::rar15_40::Archive::parse(&unfiltered).unwrap();
         let unfiltered = unfiltered.files().next().unwrap().pack_size;
+        // Cut into blocks by price, the unfiltered random walk packs a tenth
+        // smaller than in one table per 64 KiB, so the filter's margin is
+        // three fifths rather than a half.
         assert!(
-            (packed.len() as u64) < unfiltered / 2,
+            (packed.len() as u64) * 5 < unfiltered * 3,
             "{} streamed against {unfiltered} unfiltered",
             packed.len()
         );
@@ -4752,8 +4758,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            pack_size(&filtered.inner.into_inner(), 0) * 2
-                < pack_size(&unfiltered.inner.into_inner(), 0)
+            pack_size(&filtered.inner.into_inner(), 0) * 5
+                < pack_size(&unfiltered.inner.into_inner(), 0) * 3
         );
     }
 
@@ -5404,7 +5410,7 @@ mod tests {
             options,
             crate::MemberCoding::Filtered(crate::FilterPolicy::None),
         );
-        assert!(archive.len() < unfiltered.len() / 2);
+        assert!(archive.len() * 5 < unfiltered.len() * 3);
         let expected = [
             (b"before.wav".to_vec(), audio[..80000].to_vec()),
             (b"audio.wav".to_vec(), audio.clone()),
@@ -6830,6 +6836,18 @@ mod tests {
             (default.max_match_candidates, default.lazy_matching),
             (128, true)
         );
+    }
+
+    #[test]
+    fn rar29_levels_from_two_cut_blocks_by_price() {
+        let cuts = |level| {
+            super::rar29_encode_options_for_level(level)
+                .unwrap()
+                .split_blocks
+        };
+        assert!(!cuts(Some(0)) && !cuts(Some(1)));
+        assert!((2..=5u8).all(|level| cuts(Some(level))));
+        assert!(cuts(None));
     }
 
     /// Each level tries every PPMd model the level below does, so text can
