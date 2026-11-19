@@ -1389,16 +1389,19 @@ pub(crate) struct RecordLayout {
     pub(crate) available: u64,
 }
 
-/// Lays out the record in `chunks`, a recovery service's stored payload,
-/// choosing chunks as [`repair_inline_recovery_archive_with_report`] does.
+/// Reads a byte range of whatever holds the chunks.
+pub(crate) type ReadRange<'a> = &'a dyn Fn(std::ops::Range<usize>) -> Result<Vec<u8>>;
+
+/// Lays out the record in the `len` bytes `read` serves (a recovery
+/// service's stored payload, or a whole archive), choosing chunks as
+/// [`repair_inline_recovery_archive_with_report`] does. Holds only the
+/// chunks found.
 pub(crate) fn record_layout(
-    chunks: &[u8],
+    read: ReadRange<'_>,
+    len: usize,
     control: &crate::read_control::ReadControl,
 ) -> Result<RecordLayout> {
-    let found = select_record_chunks(
-        find_inline_recovery_chunks_with_control(chunks, control)?,
-        None,
-    )?;
+    let found = select_record_chunks(find_inline_recovery_chunks_in(read, len, control)?, None)?;
     let first = found.first().ok_or(Error::BadRecoveryChunk)?;
     let plan = first.chunk.plan;
     let protected_size =
@@ -1406,7 +1409,8 @@ pub(crate) fn record_layout(
     let mut recovery_data = Vec::new();
     for chunk in &found {
         check_repair(control)?;
-        append_inline_recovery_chunk(chunks, chunk, &mut recovery_data);
+        let shard_size = chunk.chunk.plan.shard_size as usize;
+        recovery_data.extend_from_slice(&read(chunk.offset..chunk.offset + shard_size)?);
     }
     let mut indices = found
         .iter()
@@ -1512,12 +1516,25 @@ fn find_inline_recovery_chunks_with_control(
     input: &[u8],
     control: &crate::read_control::ReadControl,
 ) -> Result<Vec<FoundInlineRecoveryChunk>> {
+    find_inline_recovery_chunks_in(&|range| Ok(input[range].to_vec()), input.len(), control)
+}
+
+/// Finds every chunk that parses, scanning for `{RB}` and skipping past each
+/// chunk found. Only the scan window and one candidate chunk are read at a
+/// time. A candidate's header fields are checked before the chunk is read
+/// for its CRC, so a stray marker in other data never reads a declared size
+/// it cannot have; that decides nothing differently, as parsing makes the
+/// same checks.
+fn find_inline_recovery_chunks_in(
+    read: ReadRange<'_>,
+    len: usize,
+    control: &crate::read_control::ReadControl,
+) -> Result<Vec<FoundInlineRecoveryChunk>> {
     check_repair(control)?;
     let mut chunks = Vec::new();
     let mut offset = 0usize;
-    while let Some(relative) = repair_marker(&input[offset..], control)? {
-        let start = offset + relative;
-        if let Ok(chunk) = parse_inline_recovery_chunk_with_control(&input[start..], control) {
+    while let Some(start) = next_recovery_marker(read, offset, len, control)? {
+        if let Some(chunk) = recovery_chunk_at(read, start, len, control)? {
             // Parsing already checked that this entire declared shard fits.
             let shard_size = chunk.plan.shard_size as usize;
             chunks.push(FoundInlineRecoveryChunk {
@@ -1534,6 +1551,71 @@ fn find_inline_recovery_chunks_with_control(
         return Err(Error::BadRecoveryChunk);
     }
     Ok(chunks)
+}
+
+/// The next `{RB}` at or after `from`, read in windows that overlap by three
+/// bytes so a marker across two is still found.
+fn next_recovery_marker(
+    read: ReadRange<'_>,
+    from: usize,
+    len: usize,
+    control: &crate::read_control::ReadControl,
+) -> Result<Option<usize>> {
+    let mut start = from;
+    while start < len {
+        check_repair(control)?;
+        let end = (start + 64 * 1024 + 3).min(len);
+        if let Some(offset) = find_recovery_marker(&read(start..end)?) {
+            return Ok(Some(start + offset));
+        }
+        start += 64 * 1024;
+    }
+    Ok(None)
+}
+
+/// The chunk at `start` when it parses; `None` for anything else.
+fn recovery_chunk_at(
+    read: ReadRange<'_>,
+    start: usize,
+    len: usize,
+    control: &crate::read_control::ReadControl,
+) -> Result<Option<InlineRecoveryChunk>> {
+    let remaining = len - start;
+    if remaining < 0x48 {
+        return Ok(None);
+    }
+    let head = read(start..start + 0x48)?;
+    let field = |at: usize, width: usize| {
+        head[at..at + width]
+            .iter()
+            .rev()
+            .fold(0u64, |value, &byte| (value << 8) | u64::from(byte))
+    };
+    let total_size = field(0x0c, 4);
+    let header_size = field(0x10, 4);
+    let data_shards = field(0x3a, 2);
+    let recovery_shards = field(0x3c, 2);
+    let plausible = header_size >= RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE
+        && header_size <= total_size
+        && total_size <= remaining as u64
+        && head[0x14] == 1
+        && head[0x15] == 1
+        && field(0x2a, 8).is_multiple_of(2)
+        && field(0x32, 8) == total_size
+        && data_shards != 0
+        && recovery_shards != 0
+        && data_shards + recovery_shards <= FIELD_SIZE as u64
+        && field(0x3e, 2) < recovery_shards
+        && header_size == 0x48 + data_shards * 8;
+    if !plausible {
+        return Ok(None);
+    }
+    let chunk = read(start..start + total_size as usize)?;
+    match parse_inline_recovery_chunk_with_control(&chunk, control) {
+        Ok(chunk) => Ok(Some(chunk)),
+        Err(Error::Cancelled) => Err(Error::Cancelled),
+        Err(_) => Ok(None),
+    }
 }
 
 fn find_recovery_marker(input: &[u8]) -> Option<usize> {
@@ -4436,6 +4518,7 @@ mod tests {
 fn check_repair(control: &crate::read_control::ReadControl) -> Result<()> {
     control.check().map_err(|_| Error::Cancelled)
 }
+
 fn repair_crc(
     data: &[u8],
     initial: u64,
@@ -4448,23 +4531,34 @@ fn repair_crc(
     }
     Ok(state)
 }
-fn repair_marker(
-    input: &[u8],
-    control: &crate::read_control::ReadControl,
-) -> Result<Option<usize>> {
-    for start in (0..input.len()).step_by(64 * 1024) {
-        check_repair(control)?;
-        let end = (start + 64 * 1024 + 3).min(input.len());
-        if let Some(offset) = find_recovery_marker(&input[start..end]) {
-            return Ok(Some(start + offset));
-        }
-    }
-    Ok(None)
-}
 
 #[cfg(test)]
 mod repair_workspace_tests {
     use super::*;
+
+    #[test]
+    fn a_stray_marker_claiming_a_large_chunk_is_never_read_whole() {
+        // Zeros fail every header check but the declared size, which fits.
+        let mut input = vec![0u8; 4 << 20];
+        input[1000..1004].copy_from_slice(b"{RB}");
+        input[1000 + 0x0c..1000 + 0x10].copy_from_slice(&(3u32 << 20).to_le_bytes());
+        input[1000 + 0x10..1000 + 0x14].copy_from_slice(&0x48u32.to_le_bytes());
+        let largest = std::cell::Cell::new(0usize);
+        let read = |range: std::ops::Range<usize>| {
+            largest.set(largest.get().max(range.len()));
+            Ok(input[range].to_vec())
+        };
+        let control = crate::read_control::ReadControl::default();
+        assert!(matches!(
+            find_inline_recovery_chunks_in(&read, input.len(), &control),
+            Err(Error::BadRecoveryChunk)
+        ));
+        assert!(
+            largest.get() < 1 << 20,
+            "read {} bytes at once",
+            largest.get()
+        );
+    }
 
     #[test]
     fn rar5_repair_admits_discovery_reads_before_calling_range_reader() {

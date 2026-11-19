@@ -98,3 +98,79 @@ fn a_record_that_ends_the_archive_is_still_rebuilt_with_its_end_header() {
     let archive = ArchiveReader::read(cut).unwrap();
     assert_eq!(archive.repair_recovery_with_report(None).unwrap(), whole);
 }
+
+#[path = "support/scratch.rs"]
+mod scratch;
+
+fn with_damaged_header(mut archive: Vec<u8>) -> Vec<u8> {
+    // Main-header CRC: only the raw recovery fallback can read it.
+    archive[8] ^= 1;
+    assert!(ArchiveReader::read(&archive).is_err());
+    archive
+}
+
+#[test]
+fn the_damaged_header_fallback_publishes_what_the_bytes_repair_returns() {
+    let dir = scratch::case("raw-repair-to-path");
+    let (original, lost_chunk) = archive_with_a_lost_chunk();
+    let mut data_only = original.clone();
+    let third = original.len() / 3;
+    data_only[third..third + 64]
+        .iter_mut()
+        .for_each(|byte| *byte ^= 0xff);
+    let cut = lost_chunk[..lost_chunk.len() - 8].to_vec();
+    for (case, archive, streams) in [
+        ("lost chunk", with_damaged_header(lost_chunk), true),
+        ("whole record", with_damaged_header(data_only), true),
+        ("ends at its record", with_damaged_header(cut), false),
+    ] {
+        let expected = rars::rar50::repair_inline_recovery_bytes_with_options(
+            &archive,
+            ArchiveReadOptions::new(),
+        )
+        .unwrap();
+        let largest = Arc::new(AtomicUsize::new(0));
+        let output = dir.join("repaired.rar");
+        let report = rars::rar50::repair_inline_recovery_to_path_with_options(
+            Largest {
+                input: Cursor::new(archive.clone()),
+                largest: largest.clone(),
+            },
+            &output,
+            ArchiveReadOptions::new(),
+        )
+        .unwrap();
+        assert_eq!(report, expected.report, "{case}");
+        assert_eq!(std::fs::read(&output).unwrap(), expected.data, "{case}");
+        let whole = largest.load(Ordering::Relaxed) >= archive.len();
+        assert_eq!(whole, !streams, "{case}");
+        assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 1, "{case}");
+    }
+}
+
+#[test]
+fn the_damaged_header_fallback_leaves_the_destination_alone_when_it_fails() {
+    let dir = scratch::case("raw-repair-refusals");
+    let (_, damaged) = archive_with_a_lost_chunk();
+    let archive = with_damaged_header(damaged);
+    let output = dir.join("existing.rar");
+    std::fs::write(&output, b"keep").unwrap();
+
+    let token = rars::ReadCancellation::new();
+    token.cancel();
+    let cancelled = rars::rar50::repair_inline_recovery_to_path_with_options(
+        Cursor::new(archive.clone()),
+        &output,
+        ArchiveReadOptions::new().with_cancellation(&token),
+    );
+    assert_eq!(cancelled.unwrap_err().kind(), rars::ErrorKind::Cancelled);
+    let not_rar5 = rars::rar50::repair_inline_recovery_to_path_with_options(
+        Cursor::new(b"not an archive at all".to_vec()),
+        &output,
+        ArchiveReadOptions::new(),
+    );
+    assert!(not_rar5.is_err());
+
+    assert_eq!(std::fs::read(&output).unwrap(), b"keep");
+    assert_eq!(std::fs::read_dir(&*dir).unwrap().count(), 1);
+}

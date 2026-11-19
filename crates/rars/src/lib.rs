@@ -1374,10 +1374,10 @@ impl Archive {
     /// is untouched on failure. Only password and cancellation apply from the
     /// read options.
     ///
-    /// A RAR 5 archive whose recovery record is whole, and a RAR 1.5-4.x
-    /// archive, stream through, so an archive opened from a path or reader
-    /// is held neither whole nor as its repaired copy. Rebuilding a RAR 5
-    /// recovery record still reads the archive into memory.
+    /// The repair streams through, so an archive opened from a path or reader
+    /// is held neither whole nor as its repaired copy. A RAR 5 archive that
+    /// ends at its recovery record, whose end-of-archive header has to be
+    /// framed from the repaired bytes, is still read whole.
     pub fn repair_recovery_to_path_with_options(
         &self,
         path: &Path,

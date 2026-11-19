@@ -41,21 +41,23 @@ pub(crate) fn cmd_repair(args: RepairArgs) -> CliResult<()> {
             if !path_starts_with(&paths[0], RAR50_SIGNATURE)? {
                 return Err(parse_error);
             }
-            let bytes = fs::read(&paths[0])?;
             let options = match crate::password::password_bytes(&password) {
                 Some(password) => rars::ArchiveReadOptions::with_password(password),
                 None => rars::ArchiveReadOptions::new(),
             };
-            let repaired = rars::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)
-                .map_err(|repair_error| {
-                    format!(
-                        "failed to parse archive '{}': {}; raw inline recovery repair also failed: {}",
-                        paths[0].display(), parse_error, repair_error
-                    )
-                })?;
-            let report = crate::write_archive_file(&paths[1], |output| {
-                output.write_all(&repaired.data)?;
-                Ok(repaired.report)
+            // Read as needed and published only once the repair parses.
+            let report = rars::rar50::repair_inline_recovery_to_path_with_options(
+                fs::File::open(&paths[0])?,
+                &paths[1],
+                options,
+            )
+            .map_err(|repair_error| {
+                format!(
+                    "failed to parse archive '{}': {}; raw inline recovery repair also failed: {}",
+                    paths[0].display(),
+                    parse_error,
+                    repair_error
+                )
             })?;
             print_repair_report(&paths[1], report);
         }
