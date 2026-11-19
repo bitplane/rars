@@ -15,6 +15,7 @@ use crate::{
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::Arc;
 
 struct ConvertedEntries {
     entries: Vec<rar50::ArchiveEntry>,
@@ -77,14 +78,15 @@ enum EntryAttributes {
 /// A member queued for writing.
 ///
 /// The bytes are either held directly or fetched from an [`EntrySource`] when
-/// the writer reaches the member. Sources are what keep a large archive off the
-/// heap. Legacy single archives pass sources to the per-member writers;
+/// the writer reaches the member. Held bytes are shared with the RAR5/7 writer,
+/// not copied. Sources are what keep a large archive off the heap. Legacy
+/// single archives pass sources to the per-member writers;
 /// legacy volume collection still materializes its one input.
 #[derive(Debug, Clone)]
 struct BuilderEntry {
     id: usize,
     name: Vec<u8>,
-    data: Vec<u8>,
+    data: Arc<Vec<u8>>,
     source: Option<EntrySource>,
     is_directory: bool,
     times: StoredTimes,
@@ -409,7 +411,7 @@ impl Builder {
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
-            data,
+            data: Arc::new(data),
             source: None,
             is_directory: false,
             times,
@@ -439,7 +441,7 @@ impl Builder {
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
-            data: Vec::new(),
+            data: Arc::default(),
             source: Some(source),
             is_directory: false,
             times,
@@ -475,7 +477,7 @@ impl Builder {
                     .at_entry(name.to_vec(), "replacing payload"),
             );
         }
-        entry.data = Vec::new();
+        entry.data = Arc::default();
         entry.source = Some(source);
         Ok(())
     }
@@ -508,7 +510,7 @@ impl Builder {
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
-            data: Vec::new(),
+            data: Arc::default(),
             source: None,
             is_directory: true,
             times,
@@ -571,7 +573,7 @@ impl Builder {
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(name)?,
-            data: Vec::new(),
+            data: Arc::default(),
             source: None,
             is_directory: false,
             times,
@@ -599,7 +601,7 @@ impl Builder {
         self.push(BuilderEntry {
             id: 0,
             name: self.validate_name(meta.name.clone())?,
-            data: Vec::new(),
+            data: Arc::default(),
             source: None,
             is_directory: meta.is_directory,
             times: StoredTimes {
@@ -1550,12 +1552,14 @@ impl Builder {
         let mut owned = self.clone();
         for entry in &mut owned.entries {
             if let Some(source) = entry.source.take() {
-                entry.data = crate::write_stream::MemberBytes::Source(&source)
-                    .load_with_progress(progress)
-                    .map_err(|error| {
-                        crate::write_stream::member_error(error, &entry.name, "reading source")
-                    })?
-                    .into_owned();
+                entry.data = Arc::new(
+                    crate::write_stream::MemberBytes::Source(&source)
+                        .load_with_progress(progress)
+                        .map_err(|error| {
+                            crate::write_stream::member_error(error, &entry.name, "reading source")
+                        })?
+                        .into_owned(),
+                );
                 source.release();
             }
         }
@@ -1666,7 +1670,7 @@ impl Builder {
         for entry in &self.entries {
             let source = match &entry.source {
                 Some(source) => source.clone(),
-                None => EntrySource::copy_for_writer(&entry.data, resources)?,
+                None => EntrySource::share_with_writer(&entry.data, resources)?,
             };
             let built = rar50::ArchiveEntry::new(entry.name.clone(), source)
                 .with_directory(entry.is_directory)
@@ -2101,6 +2105,44 @@ mod tests {
         );
         drop(converted);
         assert_eq!(resources.managed_memory_in_use(), 0);
+    }
+
+    // #337: the writer shares an `add_bytes` payload instead of copying it,
+    // and a memory quota counts it once.
+    #[test]
+    fn converted_rar50_entries_share_in_memory_payloads() {
+        const PAYLOAD: usize = 64 << 10;
+        let builder_with = |payload: Vec<u8>| {
+            let mut builder = crate::Builder::new(crate::ArchiveVersion::Rar50);
+            builder
+                .add_bytes(b"file".to_vec(), payload, None, None)
+                .unwrap();
+            builder
+        };
+        let empty = builder_with(Vec::new());
+        let builder = builder_with(vec![42; PAYLOAD]);
+        let payload = &builder.entries[0].data;
+        for resources in [
+            crate::WriterResources::default(),
+            crate::WriterResources::default().with_max_memory_bytes(1 << 20),
+        ] {
+            let baseline = empty.rar50_entries_with_resources(&resources).unwrap();
+            let baseline_charge = resources.managed_memory_in_use();
+            drop(baseline);
+
+            assert_eq!(Arc::strong_count(payload), 1);
+            let converted = builder.rar50_entries_with_resources(&resources).unwrap();
+            assert_eq!(Arc::strong_count(payload), 2);
+            if resources.max_memory_bytes().is_some() {
+                assert_eq!(
+                    resources.managed_memory_in_use() - baseline_charge,
+                    PAYLOAD as u64
+                );
+            }
+            drop(converted);
+            assert_eq!(Arc::strong_count(payload), 1);
+            assert_eq!(resources.managed_memory_in_use(), 0);
+        }
     }
 
     #[test]

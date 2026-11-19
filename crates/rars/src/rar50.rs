@@ -4941,7 +4941,7 @@ mod tests {
     #[test]
     fn header_budget_refuses_full_reads_after_plain_and_encrypted_prefixes() {
         use crate::parse_budget::{ParseBudget, PrefixReader};
-        let mut plain = vec![0u8; 16];
+        let mut plain = [0u8; 16];
         plain[4] = 60; // 65 plaintext header bytes, larger than the prefix.
         let mut reader = PrefixReader::new(plain[..14].to_vec());
         let options = crate::ArchiveReadOptions::new().with_max_header_bytes(64);

@@ -46,16 +46,14 @@ Pinned by `writer_limits_table_matches_what_each_format_supports`.
 Peak resident memory writing 1 GiB (512 MiB of random bytes, then 512 MiB of
 text) at `--level 3`, on a 32-thread machine. Single archives ran under
 `--memory-limit 256m`. Legacy volume sets refuse that flag, so they ran
-without it. The solid column is two 512 MiB members. The `rar15`, `rar20` and
-`rar40` compressed volume sets gave up compressing after the first volume and
-stored the member (#342), so their peaks cover only that attempt.
+without it. The solid column is two 512 MiB members.
 
 | format | stored | compressed, to a file | compressed, to a pipe | solid | password | encrypted headers | volumes, stored / compressed | recovery |
 |---|---|---|---|---|---|---|---|---|
 | `rar14` | 7 MB | 10 MB | 10 MB | 10 MB | 10 MB | refused | 3.2 GB / 2.3 GB | refused |
 | `rar15` | 6 MB | 10 MB | 10 MB | 10 MB | 11 MB | refused | 6 MB / 10 MB | refused |
-| `rar20` | 6 MB | 27 MB | 28 MB | 25 MB | 31 MB | refused | 6 MB / 27 MB | refused |
-| `rar40` | 6 MB | 144 MB | 145 MB | 181 MB | 146 MB | 145 MB | 6 MB / 144 MB | refused |
+| `rar20` | 6 MB | 27 MB | 28 MB | 25 MB | 31 MB | refused | 6 MB / 28 MB | refused |
+| `rar40` | 6 MB | 144 MB | 145 MB | 181 MB | 146 MB | 145 MB | 6 MB / 193 MB | refused |
 | `rar50` | 6 MB | 219 MB | 221 MB | 222 MB | 214 MB | 222 MB | 221 MB | 220 MB |
 | `rar70` | 6 MB | 222 MB | not run | 223 MB | 221 MB | 222 MB | 219 MB | 225 MB |
 
@@ -81,6 +79,5 @@ What each writer holds, what bounds it, and the tests that pin it:
 
 Some library calls hold the whole archive by design, because they return it:
 `Builder::to_bytes`, `Builder::build_volumes` and `Rar50Writer::finish`.
-`Builder::add_bytes` payloads are copied again for a RAR 5 write (#337). Some
-copies are not counted against the budget (#336). A legacy volume set stores a
-large member whose first volume doesn't compress (#342).
+A RAR 5 write shares `Builder::add_bytes` payloads rather than copying them
+(#337). Some copies are not counted against the budget (#336).
