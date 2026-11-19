@@ -337,13 +337,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
-      # Criterion's alloca dependency builds C even during cargo check.
-      - name: Install PowerPC C compiler
-        run: sudo apt-get update && sudo apt-get install -y gcc-powerpc-linux-gnu
       # Compile the binary and tests on a target that exercises the mutex
-      # fallback, without needing an emulator to run them.
+      # fallback, without needing an emulator to run them. Benches are left
+      # out: criterion is only a dev-dependency where 64-bit atomics exist.
       - name: Check library, CLI and tests
-        run: cargo check -p rars -p rars-cli --all-targets --locked --target powerpc-unknown-linux-gnu
+        run: cargo check -p rars -p rars-cli --lib --bins --tests --locked --target powerpc-unknown-linux-gnu
 
   # Every optional-feature combination of the library, without workspace
   # feature unification. Running the unit tests is most of each set's time, so
