@@ -3100,9 +3100,11 @@ fn repair(
 }
 
 /// Opens the source as `RarFile` does, so a path or seekable file object is
-/// read on demand. Only a source that will not parse is read whole, for the
-/// damaged-header fallback; a parsing cancellation must not start it. With
-/// `output`, the repair goes straight to the file and `None` comes back.
+/// read on demand. With `output`, the repair goes straight to the file and
+/// `None` comes back, a source that will not parse included. Only that
+/// damaged-header fallback without `output` reads the source whole, as it
+/// returns the repaired archive whole. A parsing cancellation must not start
+/// the fallback.
 fn repair_core(
     source: ArchiveInput,
     options: rars_rs::ArchiveReadOptions<'_>,
@@ -3131,6 +3133,33 @@ fn repair_core(
         }
         Err(error) if error.kind() == rars_rs::ErrorKind::Cancelled => {
             return Err(map_error(error))
+        }
+        Err(_) if output.is_some() => {
+            let output = output.expect("checked above");
+            let report = match source {
+                ArchiveInput::Bytes(bytes) => {
+                    rars_rs::rar50::repair_inline_recovery_to_path_with_options(
+                        io::Cursor::new(bytes),
+                        output,
+                        options,
+                    )
+                }
+                ArchiveInput::Path(path) => {
+                    rars_rs::rar50::repair_inline_recovery_to_path_with_options(
+                        fs::File::open(path).map_err(map_io_error)?,
+                        output,
+                        options,
+                    )
+                }
+                ArchiveInput::Reader(PyFileReader(file)) => {
+                    rars_rs::rar50::repair_inline_recovery_to_path_with_options(
+                        PyFileReader(file),
+                        output,
+                        options,
+                    )
+                }
+            };
+            return report.map(|report| (None, report)).map_err(map_error);
         }
         Err(_) => {
             let bytes = match source {

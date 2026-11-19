@@ -1029,73 +1029,34 @@ impl Archive {
         control.check()?;
         let service = self.recovery_service()?;
         let source_len = self.source_len()?;
-        let layout = match recovery::record_layout(stored, control) {
+        let mut layout = match recovery::record_layout(
+            &|range| Ok(stored[range].to_vec()),
+            stored.len(),
+            control,
+        ) {
             Ok(layout) => layout,
             Err(recovery::Error::Cancelled) => return Err(Error::Cancelled),
             Err(_) => return Ok(None),
         };
         let data = service.block.data_range.clone();
-        let record = data.start + layout.record.start..data.start + layout.record.end;
-        let protected = layout.protected_size;
+        layout.record = data.start + layout.record.start..data.start + layout.record.end;
         if self.sfx_offset != 0
             || data.len() != stored.len()
-            || protected != service.block.offset
-            || record.start < protected
-            || record.end >= source_len
+            || layout.protected_size != service.block.offset
+            || layout.record.start < layout.protected_size
+            || layout.record.end >= source_len
             || !self.range_holds(data.clone(), stored, control)?
         {
             return Ok(None);
         }
-
-        let repaired = recovery::repair_inline_recovery_prefix_shards_with_control(
-            protected,
-            &layout.recovery_data,
-            |range| {
-                self.read_range(range)
-                    .map_err(|_| recovery::Error::BadRecoveryChunk)
-            },
+        stream_record_repair(
+            &|range| self.read_range(range),
+            source_len,
+            &layout,
+            writer,
             control,
-        )?;
-        let data_repaired = !repaired.is_empty();
-        // Refused rebuilds keep the incomplete record, as the whole-archive
-        // repair does when its own rebuild is refused.
-        let rebuild =
-            recovery::record_rebuild_admitted(layout.plan, protected as u64, source_len as u64);
-
-        let mut cursor = 0usize;
-        for (range, bytes) in &repaired {
-            control.check()?;
-            self.copy_repair_range(cursor..range.start, writer, control)?;
-            control.finish(control.write_all(writer, bytes).map_err(Error::from))?;
-            cursor = range.end;
-        }
-        self.copy_repair_range(cursor..protected, writer, control)?;
-        if rebuild {
-            self.copy_repair_range(protected..record.start, writer, control)?;
-            let mut body = RepairedPrefix {
-                archive: self,
-                len: protected,
-                shards: &repaired,
-                pos: 0,
-                control,
-            };
-            let written =
-                recovery::write_rebuilt_record(&mut body, protected as u64, layout.plan, writer);
-            control.check()?;
-            written?;
-            self.copy_repair_range(record.end..source_len, writer, control)?;
-        } else {
-            self.copy_repair_range(protected..source_len, writer, control)?;
-        }
-        control.check()?;
-        Ok(Some(crate::RecoveryRepairReport {
-            changed: data_repaired || rebuild,
-            data_repaired,
-            recovery_record_rebuilt: rebuild,
-            end_record_rebuilt: false,
-            available_recovery_shards: Some(layout.available),
-            expected_recovery_shards: Some(layout.plan.recovery_shards),
-        }))
+        )
+        .map(Some)
     }
 
     /// Whether the archive holds `expected` at `range` as it stands, compared
@@ -1125,13 +1086,103 @@ impl Archive {
         writer: &mut dyn Write,
         control: &crate::read_control::ReadControl,
     ) -> Result<()> {
-        for start in (range.start..range.end).step_by(64 * 1024) {
-            control.check()?;
-            let data = self.read_range(start..(start.saturating_add(64 * 1024)).min(range.end))?;
-            control.finish(control.write_all(writer, &data).map_err(Error::from))?;
-        }
-        control.check()
+        copy_source_range(&|range| self.read_range(range), range, writer, control)
     }
+}
+
+/// Reads a byte range of an archive being repaired.
+#[cfg(feature = "recovery")]
+type SourceRead<'a> = &'a dyn Fn(Range<usize>) -> Result<Vec<u8>>;
+
+#[cfg(feature = "recovery")]
+fn copy_source_range(
+    read: SourceRead<'_>,
+    range: Range<usize>,
+    writer: &mut dyn Write,
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    for start in (range.start..range.end).step_by(64 * 1024) {
+        control.check()?;
+        let data = read(start..(start.saturating_add(64 * 1024)).min(range.end))?;
+        control.finish(control.write_all(writer, &data).map_err(Error::from))?;
+    }
+    control.check()
+}
+
+/// A failed read during repair, kept as the error it was.
+#[cfg(feature = "recovery")]
+fn recovery_read_error(error: Error) -> crate::recovery::rar5::Error {
+    match error.kind() {
+        crate::ErrorKind::Cancelled => crate::recovery::rar5::Error::Cancelled,
+        _ => crate::recovery::rar5::Error::TypedIo(Box::new(error)),
+    }
+}
+
+/// Writes the `len`-byte archive `read` serves, repaired against the record
+/// `layout` places in it: damaged shards of the protected prefix repaired,
+/// and a record that lost chunks rebuilt where admitted. Streams as
+/// [`Archive::repair_recovery_to_legacy`] does; only the surviving chunks and
+/// a rebuilt record's parity are held. The output is what
+/// [`crate::recovery::rar5::repair_inline_recovery_archive_with_report`]
+/// writes for an archive whose end-of-archive header needs no framing.
+#[cfg(feature = "recovery")]
+fn stream_record_repair(
+    read: SourceRead<'_>,
+    len: usize,
+    layout: &crate::recovery::rar5::RecordLayout,
+    writer: &mut dyn Write,
+    control: &crate::read_control::ReadControl,
+) -> Result<crate::RecoveryRepairReport> {
+    use crate::recovery::rar5 as recovery;
+    let protected = layout.protected_size;
+    let record = layout.record.clone();
+    let repaired = recovery::repair_inline_recovery_prefix_shards_with_control(
+        protected,
+        &layout.recovery_data,
+        |range| read(range).map_err(recovery_read_error),
+        control,
+    )?;
+    let data_repaired = !repaired.is_empty();
+    let complete = layout.available == layout.plan.recovery_shards && record.end <= len;
+    // Refused rebuilds keep the incomplete record, as the whole-archive
+    // repair does when its own rebuild is refused.
+    let rebuild =
+        !complete && recovery::record_rebuild_admitted(layout.plan, protected as u64, len as u64);
+
+    let mut cursor = 0usize;
+    for (range, bytes) in &repaired {
+        control.check()?;
+        copy_source_range(read, cursor..range.start, writer, control)?;
+        control.finish(control.write_all(writer, bytes).map_err(Error::from))?;
+        cursor = range.end;
+    }
+    copy_source_range(read, cursor..protected, writer, control)?;
+    if rebuild {
+        copy_source_range(read, protected..record.start, writer, control)?;
+        let mut body = RepairedPrefix {
+            read,
+            len: protected,
+            shards: &repaired,
+            pos: 0,
+            control,
+        };
+        let written =
+            recovery::write_rebuilt_record(&mut body, protected as u64, layout.plan, writer);
+        control.check()?;
+        written?;
+        copy_source_range(read, record.end.min(len)..len, writer, control)?;
+    } else {
+        copy_source_range(read, protected..len, writer, control)?;
+    }
+    control.check()?;
+    Ok(crate::RecoveryRepairReport {
+        changed: data_repaired || rebuild,
+        data_repaired,
+        recovery_record_rebuilt: rebuild,
+        end_record_rebuilt: false,
+        available_recovery_shards: Some(layout.available),
+        expected_recovery_shards: Some(layout.plan.recovery_shards),
+    })
 }
 
 /// The protected prefix as it reads once repaired: the archive's bytes, with
@@ -1139,7 +1190,7 @@ impl Archive {
 /// cancellation.
 #[cfg(feature = "recovery")]
 struct RepairedPrefix<'a> {
-    archive: &'a Archive,
+    read: SourceRead<'a>,
     len: usize,
     /// In order, as the repair returns them.
     shards: &'a [(Range<usize>, Vec<u8>)],
@@ -1168,9 +1219,7 @@ impl std::io::Read for RepairedPrefix<'_> {
             _ => {
                 let until = next.map_or(self.len, |(range, _)| range.start);
                 let count = want.min(until - self.pos);
-                let bytes = self
-                    .archive
-                    .read_range(self.pos..self.pos + count)
+                let bytes = (self.read)(self.pos..self.pos + count)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
                 buffer[..count].copy_from_slice(&bytes);
                 count
@@ -1444,6 +1493,85 @@ pub fn repair_inline_recovery_bytes_with_report(
     input: &[u8],
 ) -> Result<crate::RecoveryRepairResult> {
     repair_inline_recovery_bytes_with_options(input, crate::ArchiveReadOptions::new())
+}
+
+/// [`repair_inline_recovery_bytes_with_options`] for an archive read from
+/// `reader` as needed, published to `path` as
+/// [`crate::RecoveryRepairResult::write_to_path`] publishes: written beside
+/// it, checked to parse, and renamed over it only then. The destination is
+/// untouched on failure.
+///
+/// Neither the archive nor its repaired copy is held, only the recovery
+/// chunks and a rebuilt record's parity. An archive that ends at its recovery
+/// record, whose end-of-archive header has to be framed from the repaired
+/// bytes, is still read whole.
+pub fn repair_inline_recovery_to_path_with_options<R: Read + std::io::Seek + Send + 'static>(
+    reader: R,
+    path: &std::path::Path,
+    options: crate::ArchiveReadOptions<'_>,
+) -> Result<crate::RecoveryRepairReport> {
+    #[cfg(not(feature = "recovery"))]
+    {
+        let _ = (reader, path, options);
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
+    }
+    #[cfg(feature = "recovery")]
+    {
+        use crate::recovery::rar5 as recovery;
+        options.check_cancelled()?;
+        let control = crate::read_control::ReadControl::for_options(&options);
+        let source =
+            crate::source::ArchiveSource::Reader(crate::source::ReaderSource::new(reader)?);
+        let len = source.len()?;
+        if len < RAR50_SIGNATURE.len()
+            || source.read_range(0..RAR50_SIGNATURE.len())? != RAR50_SIGNATURE
+        {
+            return Err(Error::UnsupportedSignature);
+        }
+        let read = |range| source.read_range(range);
+        let layout = recovery::record_layout(
+            &|range| read(range).map_err(recovery_read_error),
+            len,
+            &control,
+        )?;
+        // The whole-archive repair refuses these too.
+        if layout.protected_size > len || layout.record.start < layout.protected_size {
+            return Err(recovery::Error::BadRecoveryChunk.into());
+        }
+        let protected = layout.protected_size as u64;
+        let complete = layout.available == layout.plan.recovery_shards && layout.record.end <= len;
+        let rebuild =
+            !complete && recovery::record_rebuild_admitted(layout.plan, protected, len as u64);
+        let frames_end =
+            (complete && len == layout.record.end) || (rebuild && len <= layout.record.end);
+
+        let (mut pending, mut output) = crate::pending_archive::PendingArchive::create(path)?;
+        let report = if frames_end {
+            let repaired = repair_inline_recovery_bytes_with_options(&read(0..len)?, options)?;
+            control.finish(
+                control
+                    .write_all(&mut output, &repaired.data)
+                    .map_err(Error::from),
+            )?;
+            repaired.report
+        } else {
+            stream_record_repair(&read, len, &layout, &mut output, &control)?
+        };
+        output.sync_all()?;
+        drop(output);
+        let written = pending
+            .path
+            .clone()
+            .expect("the pending archive is not yet published");
+        // Published only if it parses, as the in-memory repair returns only then.
+        crate::ArchiveReader::read_path_with_options(&written, options)?;
+        control.check()?;
+        std::fs::rename(&written, path)?;
+        pending.path = None;
+        Ok(report)
+    }
 }
 
 pub fn repair_inline_recovery_bytes_with_options(
