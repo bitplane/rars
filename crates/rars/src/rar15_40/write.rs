@@ -1608,7 +1608,8 @@ fn member_workspace(
     encrypting: bool,
 ) -> u64 {
     if !compressing {
-        // An encrypted stored member is loaded whole and encrypted in place.
+        // An encrypted stored member held in memory is copied and encrypted in
+        // place. One with a source is encrypted as it is copied.
         let held = if encrypting { unpacked } else { 0 };
         return held.saturating_add(1024 * 1024);
     }
@@ -1686,7 +1687,7 @@ fn encode_member<'a>(
             options,
             unpacked_size,
             coding.compresses(),
-            member.password.is_some(),
+            member.password.is_some() && member.bytes.source().is_none(),
         ),
         &|| progress.is_cancelled(),
     )?;
@@ -1703,10 +1704,8 @@ fn encode_member<'a>(
     };
 
     // A stored member never needs to be resident: checksum it from its source
-    // and let the writer copy it straight through.
-    if let (MemberCoding::Stored, None, Some(source)) =
-        (coding, member.password, member.bytes.source())
-    {
+    // and let the writer copy it straight through, encrypting as it goes.
+    if let (MemberCoding::Stored, Some(source)) = (coding, member.bytes.source()) {
         return Ok(EncodedMember {
             payload: MemberPayload::Copied(source),
             method: 0x30,
@@ -2401,11 +2400,21 @@ fn write_member(
             )?;
             (MemberPayload::Packed(packed), salt)
         }
-        // Unencrypted by construction, so the stored bytes are their own
-        // payload and their size is the member's.
         copied => (copied, None),
     };
-    let packed_size = payload.size(encoded.unpacked_size);
+    let cipher =
+        match payload {
+            MemberPayload::Copied(_) if member.password.is_some() => Some(
+                volumes::CipherPlan::new(target, member.password, data_keys)?,
+            ),
+            _ => None,
+        };
+    let salt = salt.or(cipher.as_ref().and_then(volumes::CipherPlan::salt));
+    let packed_size = match &cipher {
+        // Padded to the cipher's block, as the in-memory path pads.
+        Some(cipher) => cipher.packed_len(encoded.unpacked_size)?,
+        None => payload.size(encoded.unpacked_size),
+    };
     let header = member_header(
         member,
         options,
@@ -2422,23 +2431,40 @@ fn write_member(
         Some(key) => write_encrypted_header(output, &header, key)?,
         None => output.write_all(&header)?,
     }
-    if matches!(payload, MemberPayload::Copied(_)) {
-        let mut checksum = Crc32::new();
-        payload.write_to(
-            &mut CrcWriter {
-                inner: output,
-                crc: &mut checksum,
-            },
-            packed_size,
-        )?;
-        if checksum.finish() != encoded.file_crc {
-            return Err(Error::SourceChanged(
-                "entry source contents changed while writing",
-            ));
+    match cipher {
+        Some(cipher) => {
+            let mut stream = volumes::PackedStream::open(
+                &member.bytes,
+                encoded.unpacked_size,
+                &cipher,
+                progress,
+                None,
+            )?;
+            stream.copy(packed_size, output)?;
+            if stream.unpacked_crc() != encoded.file_crc {
+                return Err(Error::SourceChanged(
+                    "entry source contents changed while writing",
+                ));
+            }
+            Ok(())
         }
-        Ok(())
-    } else {
-        payload.write_to(output, packed_size)
+        None if matches!(payload, MemberPayload::Copied(_)) => {
+            let mut checksum = Crc32::new();
+            payload.write_to(
+                &mut CrcWriter {
+                    inner: output,
+                    crc: &mut checksum,
+                },
+                packed_size,
+            )?;
+            if checksum.finish() != encoded.file_crc {
+                return Err(Error::SourceChanged(
+                    "entry source contents changed while writing",
+                ));
+            }
+            Ok(())
+        }
+        None => payload.write_to(output, packed_size),
     }
 }
 
@@ -6319,6 +6345,73 @@ mod tests {
             let options = rar20_encode_options_for_level(Some(level)).unwrap();
             assert!(options.lazy_matching, "level {level} stopped being lazy");
             assert_eq!(options.lazy_lookahead, 2, "level {level}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn an_encrypted_stored_member_is_encrypted_as_it_is_copied() {
+        let data = binary_member(4 * 1024 * 1024 + 7);
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar29,
+            ArchiveVersion::Rar40,
+        ] {
+            let options = super::WriterOptions::new(target, FeatureSet::store_only());
+            let held = super::StoredEntry {
+                name: b"held.bin",
+                data: &data,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: Some(b"password"),
+                file_comment: None,
+            };
+            let (source, watch) = crate::write_stream::watched_source(data.clone());
+            let copied = super::StreamingEntry::new(b"copy.bin".to_vec(), source)
+                .with_password(b"password".to_vec());
+            // One write, so both members are encrypted under the same salt.
+            let members = [
+                super::Member::from_stored(&held),
+                super::Member::from_streaming(&copied),
+            ];
+            let mut archive = Vec::new();
+            super::write_archive_to(
+                &members,
+                options,
+                crate::MemberCoding::Stored,
+                None,
+                &crate::WriterResources::default(),
+                None,
+                super::ArchiveOutput::stream(&mut watch.sink(&mut archive)),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let parsed =
+                crate::rar15_40::Archive::parse_with_password(&archive, Some(b"password")).unwrap();
+            let [held, copied]: [_; 2] = parsed.files().collect::<Vec<_>>().try_into().unwrap();
+            assert_eq!(copied.pack_size, held.pack_size, "{target:?}");
+            assert_eq!(copied.salt, held.salt, "{target:?}");
+            assert_eq!(copied.file_crc, held.file_crc, "{target:?}");
+            assert!(
+                archive[copied.packed_range.clone()] == archive[held.packed_range.clone()],
+                "{target:?}: the copied member's ciphertext differs"
+            );
+            // Read as it was written, so never held whole.
+            let written = watch.written_while_reading();
+            assert!(
+                written + 1024 * 1024 >= data.len() as u64,
+                "{target:?}: only {written} bytes were written while the member was read"
+            );
+            let extracted = extracted(&archive, Some(b"password"));
+            assert_eq!(
+                extracted[1],
+                (b"copy.bin".to_vec(), data.clone()),
+                "{target:?}"
+            );
         }
     }
 }
