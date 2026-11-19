@@ -112,6 +112,8 @@ def main() -> int:
             "crates/rars-python/Cargo.toml",
             "--features",
             "extension-module",
+            "--profile",
+            "dev",
         ],
         env=env,
     )
