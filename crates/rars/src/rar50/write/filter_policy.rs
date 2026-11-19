@@ -1,4 +1,4 @@
-use super::plan::FILTER_SEARCH_BYTES;
+use super::plan::filter_search_bytes;
 use super::*;
 use crate::codec::rar50::EncodeOptions;
 #[cfg(test)]
@@ -714,8 +714,9 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
 /// Chooses a whole member's filters, and returns them with the member packed
 /// under them.
 ///
-/// A member longer than one [`FILTER_SEARCH_BYTES`] piece is searched a piece
-/// at a time, on the grid the block path cuts it into runs and pieces, with
+/// A member longer than one
+/// [`FILTER_SEARCH_BYTES`](super::plan::FILTER_SEARCH_BYTES) piece is
+/// searched a piece at a time, on the grid the block path cuts it into runs and pieces, with
 /// the same search each of those gets. Searched whole, one 32 MiB search had
 /// to pick a handful of x86 regions and samples for the whole member, and it
 /// came out 0.2% to 1.3% larger than the runs' searches on most binaries.
@@ -727,7 +728,8 @@ fn choose_owned_filter<B: Budget>(
     mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
     allowance: &B,
 ) -> Result<crate::filter_search::FilterChoice<B>> {
-    if data.len() <= FILTER_SEARCH_BYTES {
+    let piece = filter_search_bytes();
+    if data.len() <= piece {
         return choose_filter_at(
             data,
             0,
@@ -744,8 +746,8 @@ fn choose_owned_filter<B: Budget>(
     let mut specs = Buffer::new(allowance);
     for run_start in (0..data.len()).step_by(run) {
         let run_end = (run_start + run).min(data.len());
-        for start in (run_start..run_end).step_by(FILTER_SEARCH_BYTES) {
-            let end = (start + FILTER_SEARCH_BYTES).min(run_end);
+        for start in (run_start..run_end).step_by(piece) {
+            let end = (start + piece).min(run_end);
             let found = piece_filters(
                 &data[start..end],
                 start,
@@ -1261,14 +1263,20 @@ mod run_search_tests {
         data
     }
 
+    /// One search covers a run, so a member a little over one run is longer
+    /// than one search, as a member over 4 MiB is.
+    const SEARCH: usize = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
+
     #[test]
     fn a_large_member_is_searched_on_the_block_paths_grid() {
         let dictionary = 128 * 1024;
         let options = encode_options_for_level(Some(2), dictionary).unwrap();
         let run = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
-        let data = scripted_code(FILTER_SEARCH_BYTES + 64 * 1024);
+        let data = scripted_code(SEARCH + 64 * 1024);
         let allowance = Allowance::default();
-        let (specs, _) = choose_owned_filter(&data, 0, options, None, &allowance).unwrap();
+        let (specs, _) = super::super::plan::with_filter_search_bytes(SEARCH, || {
+            choose_owned_filter(&data, 0, options, None, &allowance).unwrap()
+        });
         // What the block path chooses, run by run.
         let mut runs = Vec::new();
         for start in (0..data.len()).step_by(run) {
@@ -1295,6 +1303,67 @@ mod run_search_tests {
         assert!(runs
             .first()
             .is_some_and(|spec| spec.range.as_ref().is_some_and(|range| range.start < run)));
+    }
+
+    /// A member longer than one filter search is filtered as well whole as
+    /// run by run. The member opens with text, as a tar of `/usr` can open
+    /// with a script, which the whole-member search used to read as text and
+    /// give up on, and which kept the first run unsearched. The two paths
+    /// choose the same filters (`a_large_member_is_searched_on_the_block_paths_grid`);
+    /// they code a filtered member a few bytes apart at this level (#383).
+    #[test]
+    fn a_member_too_long_for_one_search_is_filtered_on_both_paths() {
+        use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
+        use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
+        const MIB: u64 = 1024 * 1024;
+        let root = crate::scratch::case("rar50-large-member-filter-paths");
+        let data = scripted_code(SEARCH + 256 * 1024);
+        // Above one run's filter search (169.1 MiB at a 128 KiB dictionary)
+        // and below the 1.25 MiB member's whole-member charge (170.1 MiB), so
+        // the member is coded run by run and each run still searches.
+        let blocks = WriterResources::new(169 * MIB + MIB / 2).with_temp_dir(&*root);
+        let whole = WriterResources::new(1024 * MIB).with_temp_dir(&*root);
+        let write = |policy: FilterPolicy, resources: &WriterResources| {
+            let entries = [ArchiveEntry::new(
+                "code",
+                EntrySource::from_bytes(data.clone()),
+            )];
+            let mut bytes = Vec::new();
+            super::super::plan::with_filter_search_bytes(SEARCH, || {
+                crate::rar50::write_streaming_archive_with_progress(
+                    &entries,
+                    WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                        .with_compression_level(2)
+                        .with_dictionary_size(128 * 1024),
+                    ArchiveExtras::default().with_filter_policy(policy),
+                    resources,
+                    None,
+                    &mut bytes,
+                )
+            })
+            .unwrap();
+            bytes
+        };
+        let plain = write(FilterPolicy::None, &blocks);
+        let by_runs = write(FilterPolicy::Auto, &blocks);
+        let at_once = write(FilterPolicy::Auto, &whole);
+        assert!(
+            by_runs.len().abs_diff(at_once.len()) * 1000 < at_once.len(),
+            "runs packed to {} and the whole member to {}",
+            by_runs.len(),
+            at_once.len()
+        );
+        for filtered in [by_runs, at_once] {
+            let archive = ArchiveReader::read(&filtered).unwrap();
+            archive.test(None).unwrap();
+            assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
+            assert!(
+                filtered.len() * 4 < plain.len() * 3,
+                "filters took {} down only to {}",
+                plain.len(),
+                filtered.len()
+            );
+        }
     }
 
     #[cfg(target_pointer_width = "64")]

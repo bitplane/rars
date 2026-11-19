@@ -221,7 +221,7 @@ pub(super) struct CompressedMember {
 #[cfg(test)]
 use super::plan::whole_member_workspace;
 pub(super) use super::plan::CompressPlan;
-use super::plan::{Execution, ExecutionPlan, MemberPlan, FILTER_SEARCH_BYTES};
+use super::plan::{filter_search_bytes, Execution, ExecutionPlan, MemberPlan};
 
 /// A bounded run of adjacent blocks, sharing one copy of the preceding input.
 struct BlockJob<B: Budget> {
@@ -1542,9 +1542,10 @@ fn explicit_run_range(
 /// the wave that will code them: at most `concurrent` searches at a time,
 /// which is as many as the wave has workspace reserved for.
 ///
-/// A run is searched in pieces of [`FILTER_SEARCH_BYTES`], so one search fits
-/// the budget whatever the dictionary, and the pieces' ranges are offset into
-/// the run.
+/// A run is searched in pieces of
+/// [`FILTER_SEARCH_BYTES`](super::plan::FILTER_SEARCH_BYTES), so one search
+/// fits the budget whatever the dictionary, and the pieces' ranges are offset
+/// into the run.
 fn choose_run_filters<B: Budget + Send + Sync>(
     jobs: &mut Records<BlockJob<B>>,
     concurrent: usize,
@@ -1559,6 +1560,7 @@ where
     // A piece is a stretch of one member: the bytes to search and how far
     // into the member they start. A solid run holds a segment per member; any
     // other run is all one member's.
+    let piece = filter_search_bytes();
     let mut pieces = Records::new(0, resources)?;
     for (index, job) in jobs.iter().enumerate() {
         let whole = [(0..job.data.len(), job.offset)];
@@ -1570,7 +1572,7 @@ where
         for (segment, file_offset) in segments {
             let mut start = segment.start;
             while start < segment.end {
-                let end = (start + FILTER_SEARCH_BYTES).min(segment.end);
+                let end = (start + piece).min(segment.end);
                 pieces.push_growing((index, start..end, file_offset + (start - segment.start)))?;
                 start = end;
             }

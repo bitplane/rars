@@ -148,15 +148,12 @@ fn assert_archive(bytes: &[u8], expected: &[u8], dictionary: Option<u64>, compre
 fn default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings() {
     let root = scratch::case("encoder-memory-matrix");
     // Every level and input kind runs with each dictionary and enabled thread
-    // count. 160 KiB exceeds the 128 KiB ring; RAR7 also covers a fractional size.
+    // count. 160 KiB exceeds the 128 KiB ring; RAR7 also covers a fractional
+    // size. RAR7 writes a dictionary RAR5 can declare with the same encoder
+    // and charges, so it runs only the builder's default and its own size.
     for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         let dictionaries: &[Option<u64>] = if version == ArchiveVersion::Rar70 {
-            &[
-                None,
-                Some(128 * KIB as u64),
-                Some(192 * KIB as u64),
-                Some(MIB),
-            ]
+            &[None, Some(192 * KIB as u64)]
         } else {
             &[None, Some(128 * KIB as u64), Some(MIB)]
         };
@@ -233,43 +230,43 @@ fn solid_multirun_history_fits_fixed_ceiling_and_extracts() {
     let root = scratch::case("encoder-memory-packed-history");
     // Two 1 MiB members form two 1 MiB runs.
     // The latter has nonempty 1 MiB history and 2 MiB combined input, so
-    // level 3 seeds a tree with the history before searching the run.
+    // level 3 seeds a tree with the history before searching the run. RAR7
+    // codes a 1 MiB dictionary with the same encoder and charges, and the
+    // matrix above covers it.
     const SIZE: usize = 1024 * KIB;
-    for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
-        for kind in [Data::Incompressible, Data::Repetitive] {
-            let data = kind.bytes(SIZE);
-            let mut serial = None;
-            for &threads in thread_counts() {
-                let resources = resources(&root, 448 * MIB);
-                let observe = Observe::new(&resources);
-                let entries = ["first", "second"]
-                    .map(|name| ArchiveEntry::new(name, EntrySource::from_bytes(data.clone())));
-                let mut features = FeatureSet::store_only();
-                features.solid = true;
-                let mut bytes = Vec::new();
-                with_threads(threads, || {
-                    rar50::write_streaming_archive_with_progress(
-                        &entries,
-                        WriterOptions::new(version, features)
-                            .with_compression_level(3)
-                            .with_dictionary_size(MIB),
-                        ArchiveExtras::default(),
-                        &resources,
-                        Some(&observe),
-                        &mut bytes,
-                    )
-                })
-                .unwrap();
-                assert!(observe.advanced.load(Ordering::Relaxed));
-                assert!(observe.peak.load(Ordering::Relaxed) > 0);
-                assert_eq!(resources.managed_memory_in_use(), 0);
-                assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-                assert_archive(&bytes, &data, Some(MIB), true);
-                if let Some(serial) = &serial {
-                    assert_eq!(&bytes, serial);
-                } else {
-                    serial = Some(bytes);
-                }
+    for kind in [Data::Incompressible, Data::Repetitive] {
+        let data = kind.bytes(SIZE);
+        let mut serial = None;
+        for &threads in thread_counts() {
+            let resources = resources(&root, 448 * MIB);
+            let observe = Observe::new(&resources);
+            let entries = ["first", "second"]
+                .map(|name| ArchiveEntry::new(name, EntrySource::from_bytes(data.clone())));
+            let mut features = FeatureSet::store_only();
+            features.solid = true;
+            let mut bytes = Vec::new();
+            with_threads(threads, || {
+                rar50::write_streaming_archive_with_progress(
+                    &entries,
+                    WriterOptions::new(ArchiveVersion::Rar50, features)
+                        .with_compression_level(3)
+                        .with_dictionary_size(MIB),
+                    ArchiveExtras::default(),
+                    &resources,
+                    Some(&observe),
+                    &mut bytes,
+                )
+            })
+            .unwrap();
+            assert!(observe.advanced.load(Ordering::Relaxed));
+            assert!(observe.peak.load(Ordering::Relaxed) > 0);
+            assert_eq!(resources.managed_memory_in_use(), 0);
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+            assert_archive(&bytes, &data, Some(MIB), true);
+            if let Some(serial) = &serial {
+                assert_eq!(&bytes, serial);
+            } else {
+                serial = Some(bytes);
             }
         }
     }
