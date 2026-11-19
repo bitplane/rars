@@ -2882,44 +2882,26 @@ fn check_python_cancellation(cancellation: Option<&CancellationToken>) -> PyResu
     Ok(())
 }
 
-fn py_input_bytes_with_cancellation(
-    py: Python<'_>,
-    source: &Bound<'_, PyAny>,
-    cancellation: Option<&CancellationToken>,
-) -> PyResult<Vec<u8>> {
+/// Reads a whole file, polling for cancellation between chunks.
+fn read_path_to_end(path: &Path, cancellation: Option<&CancellationToken>) -> PyResult<Vec<u8>> {
+    use std::io::Read;
     check_python_cancellation(cancellation)?;
-    let path = match archive_input(source, cancellation.map(|token| &token.inner))? {
-        ArchiveInput::Bytes(bytes) => {
-            check_python_cancellation(cancellation)?;
-            return Ok(bytes);
-        }
-        ArchiveInput::Reader(PyFileReader(file)) => {
-            let file = file.bind(py);
-            file.call_method1("seek", (0,))?;
-            return py_read_to_end(file, cancellation.map(|token| &token.inner));
-        }
-        ArchiveInput::Path(path) => path,
-    };
-    py.detach(|| {
-        use std::io::Read;
+    let mut file = fs::File::open(path).map_err(map_io_error)?;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; READ_CHUNK];
+    loop {
         check_python_cancellation(cancellation)?;
-        let mut file = fs::File::open(path).map_err(map_io_error)?;
-        let mut bytes = Vec::new();
-        let mut buffer = [0u8; READ_CHUNK];
-        loop {
-            check_python_cancellation(cancellation)?;
-            let count = match file.read(&mut buffer) {
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                result => result.map_err(map_io_error)?,
-            };
-            if count == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..count]);
+        let count = match file.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result.map_err(map_io_error)?,
+        };
+        if count == 0 {
+            break;
         }
-        check_python_cancellation(cancellation)?;
-        Ok(bytes)
-    })
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    check_python_cancellation(cancellation)?;
+    Ok(bytes)
 }
 
 #[pyclass(frozen, module = "rars")]
@@ -3105,31 +3087,73 @@ fn repair(
         refuse_existing(output, overwrite)?;
     }
     let password = py_password(password)?;
-    let bytes = py_input_bytes_with_cancellation(py, source, cancellation)?;
+    let source = archive_input(source, cancellation.map(|token| &token.inner))?;
+    check_python_cancellation(cancellation)?;
     py.detach(|| {
-        let result = repair_core(&bytes, python_read_options(options, password.as_deref()))?;
-        let report = result.report.into();
-        let data = match output {
-            Some(output) => {
-                result.write_to_path(&output, cancellation.map(|token| &token.inner))?;
-                None
-            }
-            None => Some(result.data),
-        };
-        Ok(RepairResult { data, report })
+        let read_options = python_read_options(options, password.as_deref());
+        let (data, report) = repair_core(source, read_options, output.as_deref(), cancellation)?;
+        Ok(RepairResult {
+            data,
+            report: report.into(),
+        })
     })
-    .map_err(map_error)
 }
 
-/// A parsing cancellation must not start the damaged-header fallback.
+/// Opens the source as `RarFile` does, so a path or seekable file object is
+/// read on demand. Only a source that will not parse is read whole, for the
+/// damaged-header fallback; a parsing cancellation must not start it. With
+/// `output`, the repair goes straight to the file and `None` comes back.
 fn repair_core(
-    bytes: &[u8],
+    source: ArchiveInput,
     options: rars_rs::ArchiveReadOptions<'_>,
-) -> rars_rs::Result<rars_rs::RecoveryRepairResult> {
-    match rars_rs::ArchiveReader::read_with_options(bytes, options) {
-        Ok(archive) => archive.repair_recovery_with_options(options),
-        Err(error) if error.kind() == rars_rs::ErrorKind::Cancelled => Err(error),
-        Err(_) => rars_rs::rar50::repair_inline_recovery_bytes_with_options(bytes, options),
+    output: Option<&Path>,
+    cancellation: Option<&CancellationToken>,
+) -> PyResult<(Option<Vec<u8>>, rars_rs::RecoveryRepairReport)> {
+    let opened = match &source {
+        ArchiveInput::Bytes(bytes) => rars_rs::ArchiveReader::read_with_options(bytes, options),
+        ArchiveInput::Path(path) => rars_rs::ArchiveReader::read_path_with_options(path, options),
+        ArchiveInput::Reader(PyFileReader(file)) => {
+            let reader = PyFileReader(Python::attach(|py| file.clone_ref(py)));
+            rars_rs::ArchiveReader::read_reader_with_options(reader, options)
+        }
+    };
+    let repaired = match opened {
+        Ok(archive) => {
+            return match output {
+                Some(path) => archive
+                    .repair_recovery_to_path_with_options(path, options)
+                    .map(|report| (None, report)),
+                None => archive
+                    .repair_recovery_with_options(options)
+                    .map(|repaired| (Some(repaired.data), repaired.report)),
+            }
+            .map_err(map_error);
+        }
+        Err(error) if error.kind() == rars_rs::ErrorKind::Cancelled => {
+            return Err(map_error(error))
+        }
+        Err(_) => {
+            let bytes = match source {
+                ArchiveInput::Bytes(bytes) => bytes,
+                ArchiveInput::Path(path) => read_path_to_end(&path, cancellation)?,
+                ArchiveInput::Reader(PyFileReader(file)) => Python::attach(|py| {
+                    let file = file.bind(py);
+                    file.call_method1("seek", (0,))?;
+                    py_read_to_end(file, cancellation.map(|token| &token.inner))
+                })?,
+            };
+            rars_rs::rar50::repair_inline_recovery_bytes_with_options(&bytes, options)
+                .map_err(map_error)?
+        }
+    };
+    match output {
+        Some(path) => {
+            repaired
+                .write_to_path(path, cancellation.map(|token| &token.inner))
+                .map_err(map_error)?;
+            Ok((None, repaired.report))
+        }
+        None => Ok((Some(repaired.data), repaired.report)),
     }
 }
 
@@ -5222,8 +5246,10 @@ mod tests {
         let token = CancellationToken::new();
         token.cancel();
         let options = rars_rs::ArchiveReadOptions::default().with_cancellation(&token.inner);
-        let error = repair_core(b"not an archive", options).unwrap_err();
-        assert_eq!(error.kind(), rars_rs::ErrorKind::Cancelled);
+        Python::initialize();
+        let source = ArchiveInput::Bytes(b"not an archive".to_vec());
+        let error = repair_core(source, options, None, Some(&token)).unwrap_err();
+        Python::attach(|py| assert!(error.is_instance_of::<Cancelled>(py)));
     }
 
     #[test]

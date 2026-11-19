@@ -1370,6 +1370,63 @@ impl Archive {
         }
     }
 
+    /// Repairs into `path`, published as [`RecoveryRepairResult::write_to_path`]
+    /// publishes: written beside it, synced, and renamed over it only once the
+    /// repair succeeds and a final cancellation check passes. The destination
+    /// is untouched on failure. Only password and cancellation apply from the
+    /// read options.
+    ///
+    /// A RAR 5 archive whose recovery record is whole streams through, so an
+    /// archive opened from a path or reader is held neither whole nor as its
+    /// repaired copy. Rebuilding a RAR 5 recovery record, and repairing RAR
+    /// 1.5-4.x, still read the archive into memory.
+    pub fn repair_recovery_to_path_with_options(
+        &self,
+        path: &Path,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<RecoveryRepairReport> {
+        #[cfg(not(feature = "recovery"))]
+        {
+            let _ = (self, path, options);
+            Err(Error::FeatureDisabled {
+                feature: "recovery",
+            })
+        }
+        #[cfg(feature = "recovery")]
+        {
+            options.check_cancelled()?;
+            if let Self::Rar13(_) = self {
+                return Err(Error::UnsupportedFamilyFeature {
+                    family: ArchiveFamily::Rar13,
+                    feature: "recovery repair for RAR 1.3/1.4 archives",
+                });
+            }
+            let control = crate::read_control::ReadControl::for_options(&options);
+            let (mut pending, mut output) = crate::pending_archive::PendingArchive::create(path)?;
+            let report = match self {
+                Self::Rar50Plus(archive) => {
+                    archive.repair_recovery_to_with_options(&mut output, options)?
+                }
+                Self::Rar15To40(archive) => {
+                    let repaired = archive.repair_protect_head_with_options(options)?;
+                    control.finish(
+                        control
+                            .write_all(&mut output, &repaired.data)
+                            .map_err(Error::from),
+                    )?;
+                    repaired.report
+                }
+                Self::Rar13(_) => unreachable!("refused above"),
+            };
+            output.sync_all()?;
+            drop(output);
+            control.check()?;
+            std::fs::rename(pending.path.as_ref().unwrap(), path)?;
+            pending.path = None;
+            Ok(report)
+        }
+    }
+
     /// Returns the concrete RAR 1.3/1.4 archive when this archive has that family.
     pub fn as_rar13(&self) -> Option<&rar13::Archive> {
         match self {
