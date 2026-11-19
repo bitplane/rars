@@ -4920,6 +4920,144 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     );
 }
 
+/// A batch of blocks is coded side by side, which only works because each
+/// block's table depends on its own tokens alone. The table before it still
+/// decides how the table is written, so each block has to be coded against its
+/// own predecessor's and not the one the batch started with.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_batch_of_blocks_codes_as_it_does_one_block_at_a_time() {
+    let options = EncodeOptions::new(8).with_max_match_distance(1 << 20);
+    let tokens_of = |data: &[u8]| super::encode_tokens_with_progress(data, &[], options, None);
+    let sources = [
+        mixed_member(20_000),
+        mixed_member(24_000),
+        phrase_member(20_000),
+        phrase_member(16_000),
+        (0..20_000u32).map(|i| (i % 251) as u8).collect(),
+    ];
+    // Every block carries in repeat offsets, as cut pieces do: those its own
+    // tokens leave, so its recurring offsets code as repeats from the start
+    // and a table counted without the state would differ.
+    let states: Vec<super::EncoderMatchState> = sources
+        .iter()
+        .map(|data| {
+            let mut state = super::EncoderMatchState::default();
+            for token in tokens_of(data).unwrap() {
+                if let super::EncodeToken::Match { length, offset } = token {
+                    state.remember(length as usize, offset as usize);
+                }
+            }
+            state
+        })
+        .collect();
+    let blocks = || {
+        sources
+            .iter()
+            .enumerate()
+            .map(|(index, data)| super::BlockToCode {
+                tokens: tokens_of(data).unwrap(),
+                state: states[index],
+                // Filter records only count towards the table and are copied out.
+                filters: match index {
+                    2 => vec![vec![0x12, 0x34, 0x56]],
+                    _ => Vec::new(),
+                },
+                more_blocks_follow: true,
+            })
+            // The state decides this block's table: carried in, every match
+            // repeats the last one; without it the first needs its length and
+            // offset coded.
+            .chain(std::iter::once(super::BlockToCode {
+                tokens: std::iter::once(super::EncodeToken::Literal(b'x'))
+                    .chain(std::iter::repeat_n(
+                        super::EncodeToken::Match {
+                            length: 4,
+                            offset: 1,
+                        },
+                        50,
+                    ))
+                    .collect(),
+                state: {
+                    let mut state = super::EncoderMatchState::default();
+                    state.remember(4, 1);
+                    state
+                },
+                filters: Vec::new(),
+                more_blocks_follow: false,
+            }))
+            .collect::<Vec<_>>()
+    };
+    let mut start = [0; TABLE_COUNT];
+    super::code_block(
+        &tokens_of(&phrase_member(8_000)).unwrap(),
+        super::EncoderMatchState::default(),
+        &[],
+        true,
+        &mut start,
+    )
+    .unwrap();
+
+    let mut levels = start;
+    let one_at_a_time: Vec<Vec<u8>> = blocks()
+        .iter()
+        .map(|block| {
+            super::code_block(
+                &block.tokens,
+                block.state,
+                &block.filters,
+                block.more_blocks_follow,
+                &mut levels,
+            )
+            .unwrap()
+        })
+        .collect();
+    let after_all = levels;
+    // Some block must write its table as a delta, or the predecessor is never read.
+    assert!(one_at_a_time.iter().any(|packed| packed[0] & 0x40 != 0));
+
+    let pool = crate::parallel::private_pool(4);
+    for threads in [Some(1), None] {
+        let (packed, failure, levels) = pool.install(|| {
+            let _cap = crate::parallel::ThreadCap::set(threads);
+            assert_eq!(crate::parallel::may_nest(), threads.is_none());
+            let mut levels = start;
+            let (packed, failure) = super::code_blocks(blocks(), &mut levels);
+            (packed, failure, levels)
+        });
+        assert!(failure.is_none());
+        assert!(packed == one_at_a_time, "threads {threads:?}");
+        assert_eq!(levels, after_all);
+
+        // A block that cannot be coded stops the batch after those before it.
+        let (packed, failure, levels) = pool.install(|| {
+            let _cap = crate::parallel::ThreadCap::set(threads);
+            let mut broken = blocks();
+            broken[3].tokens[0] = super::EncodeToken::Match {
+                length: 1,
+                offset: 5,
+            };
+            let mut levels = start;
+            let (packed, failure) = super::code_blocks(broken, &mut levels);
+            (packed, failure, levels)
+        });
+        assert!(matches!(failure, Some(Error::InvalidData(_))));
+        assert!(packed[..] == one_at_a_time[..3], "threads {threads:?}");
+        let mut third = start;
+        for block in &blocks()[..3] {
+            super::code_block(
+                &block.tokens,
+                block.state,
+                &block.filters,
+                block.more_blocks_follow,
+                &mut third,
+            )
+            .unwrap();
+        }
+        assert_eq!(levels, third);
+    }
+}
+
 fn phrase_member(len: usize) -> Vec<u8> {
     let phrases = [
         &b"the model predicts each byte from the bytes before it, "[..],
