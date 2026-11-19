@@ -424,15 +424,6 @@ impl ArchiveSource {
                 .map_err(|_| Error::InvalidHeader("archive size overflows host address size")),
         }
     }
-
-    #[cfg(feature = "recovery")]
-    pub(crate) fn bytes(&self) -> Result<Vec<u8>> {
-        match self {
-            Self::Reader(source) => self.read_range(0..source.len),
-            Self::Memory(data) => Ok(data.to_vec()),
-            Self::File(_) => self.read_range(0..self.len()?),
-        }
-    }
 }
 
 #[cfg(test)]

@@ -1398,11 +1398,6 @@ impl Archive {
         })
     }
 
-    #[cfg(feature = "recovery")]
-    fn source_bytes(&self) -> Result<Vec<u8>> {
-        self.source.bytes()
-    }
-
     pub fn repair_protect_head(&self) -> Result<Vec<u8>> {
         Ok(self.repair_protect_head_with_report()?.data)
     }
@@ -1417,9 +1412,24 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<crate::RecoveryRepairResult> {
+        let mut data = Vec::new();
+        let report = self.repair_protect_head_to_with_options(&mut data, options)?;
+        Ok(crate::RecoveryRepairResult { data, report })
+    }
+
+    /// Streams the repaired archive to `writer`, reading the archive twice:
+    /// once to find and rebuild damaged sectors, once to copy it with them in
+    /// place. Only the recovery record and one sector per parity group are
+    /// held. Every check is made before anything is written; a cancellation
+    /// while copying can leave partial output.
+    pub fn repair_protect_head_to_with_options(
+        &self,
+        writer: &mut dyn Write,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<crate::RecoveryRepairReport> {
         #[cfg(not(feature = "recovery"))]
         {
-            let _ = (self, options);
+            let _ = (self, writer, options);
             Err(Error::FeatureDisabled {
                 feature: "recovery",
             })
@@ -1428,38 +1438,49 @@ impl Archive {
         {
             options.check_cancelled()?;
             let control = crate::read_control::ReadControl::for_options(&options);
-            let (data, data_repaired) = if let Some(recovery) = self
+            let repaired = if let Some(recovery) = self
                 .new_subs()
                 .find(|sub| sub.kind == NewSubKind::RecoveryRecord)
             {
-                repair_newsub_recovery_bytes(
-                    &self.source_bytes()?,
-                    self.sfx_offset,
-                    self,
-                    recovery,
-                    &control,
-                )?
+                repair_newsub_recovery(self, recovery, &control)?
             } else {
                 let protect = self.protect_records().next().ok_or(Error::InvalidHeader(
                     "RAR 2.x archive does not contain a PROTECT_HEAD recovery record",
                 ))?;
-                repair_protect_head_bytes(
-                    &self.source_bytes()?,
-                    self.sfx_offset,
-                    protect,
-                    &control,
-                )?
+                repair_protect_head(self, protect, &control)?
             };
+            let mut cursor = 0usize;
+            for (offset, bytes) in &repaired {
+                self.copy_source_range(cursor..*offset, writer, &control)?;
+                control.finish(control.write_all(writer, bytes).map_err(Error::from))?;
+                cursor = offset + bytes.len();
+            }
+            self.copy_source_range(cursor..self.source.len()?, writer, &control)?;
             control.check()?;
-            Ok(crate::RecoveryRepairResult {
-                data,
-                report: crate::RecoveryRepairReport {
-                    changed: data_repaired,
-                    data_repaired,
-                    ..Default::default()
-                },
+            let data_repaired = !repaired.is_empty();
+            Ok(crate::RecoveryRepairReport {
+                changed: data_repaired,
+                data_repaired,
+                ..Default::default()
             })
         }
+    }
+
+    #[cfg(feature = "recovery")]
+    fn copy_source_range(
+        &self,
+        range: Range<usize>,
+        writer: &mut dyn Write,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<()> {
+        for start in (range.start..range.end).step_by(SECTOR_READ) {
+            control.check()?;
+            let data = self
+                .source
+                .read_range(start..start.saturating_add(SECTOR_READ).min(range.end))?;
+            control.finish(control.write_all(writer, &data).map_err(Error::from))?;
+        }
+        Ok(())
     }
 
     /// Streams extracted entries to caller-provided writers.
@@ -2091,14 +2112,18 @@ fn parse_protect_header(
     })
 }
 
-/// Repaired bytes plus whether any sector was actually rebuilt.
+/// Bytes read from the archive at a time while repairing: whole sectors.
 #[cfg(feature = "recovery")]
-fn repair_protect_head_bytes(
-    source: &[u8],
-    sfx_offset: usize,
+const SECTOR_READ: usize = 128 * 512;
+
+/// The repaired sectors of a RAR 2.x PROTECT_HEAD record, as byte offsets and
+/// bytes, in order; empty when nothing was damaged.
+#[cfg(feature = "recovery")]
+fn repair_protect_head(
+    archive: &Archive,
     protect: &ProtectHeader,
     control: &crate::read_control::ReadControl,
-) -> Result<(Vec<u8>, bool)> {
+) -> Result<Vec<(usize, Vec<u8>)>> {
     control.check()?;
     if protect.rec_sectors == 0 {
         return Err(Error::InvalidHeader(
@@ -2108,7 +2133,7 @@ fn repair_protect_head_bytes(
     if protect.mark != *b"Protect!" {
         return Err(Error::InvalidHeader("RAR 2.x recovery mark is invalid"));
     }
-    let protected_start = sfx_offset;
+    let protected_start = archive.sfx_offset;
     // A u32 count fits the supported 32/64-bit host address sizes.
     let declared_blocks = protect.total_blocks as usize;
     let protected_len = declared_blocks
@@ -2121,14 +2146,12 @@ fn repair_protect_head_bytes(
         .ok_or(Error::InvalidHeader(
             "RAR 2.x protected sector range overflows",
         ))?;
-    if protected_end > source.len() {
+    if protected_end > archive.source.len()? {
         return Err(Error::InvalidHeader(
             "RAR 2.x protected sector range is invalid",
         ));
     }
-    let recovery_data = source
-        .get(protect.data_range.clone())
-        .ok_or(Error::TooShort)?;
+    let recovery_data = archive.source.read_range(protect.data_range.clone())?;
     // The successful 512-byte sector calculation also bounds two-byte tags.
     let tag_len = declared_blocks * 2;
     // A u16 sector count needs at most 33553920 parity bytes on either host.
@@ -2138,87 +2161,30 @@ fn repair_protect_head_bytes(
             "RAR 2.x recovery data size is invalid",
         ));
     }
-    let tags = &recovery_data[..tag_len];
-    let parity = &recovery_data[tag_len..];
     // RAR 2.50 records may declare a final sector that starts before
     // PROTECT_HEAD but overlaps the recovery block. Only complete sectors
     // before the recovery block are safely repairable.
     let repairable_blocks = declared_blocks.min(protect.block.offset / 512);
-
-    let mut damaged = Vec::new();
-    for index in 0..repairable_blocks {
-        control.check()?;
-        let sector_start = protected_start + index * 512;
-        let sector = &source[sector_start..sector_start + 512];
-        let actual = (!crc32(sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
-        if actual != expected {
-            damaged.push(index);
-        }
+    SectorParity {
+        start: protected_start,
+        len: repairable_blocks * 512,
+        tags: &recovery_data[..tag_len],
+        parity: &recovery_data[tag_len..],
+        slots: usize::from(protect.rec_sectors),
+        too_much_damage: "RAR 2.x recovery damage exceeds parity sector count",
+        shared_group: "RAR 2.x recovery cannot repair multiple sectors in the same parity group",
     }
-    if damaged.is_empty() {
-        return Ok((source.to_vec(), false));
-    }
-    if damaged.len() > usize::from(protect.rec_sectors) {
-        return Err(Error::InvalidHeader(
-            "RAR 2.x recovery damage exceeds parity sector count",
-        ));
-    }
-
-    let mut used_slots = vec![false; usize::from(protect.rec_sectors)];
-    for &index in &damaged {
-        control.check()?;
-        let slot = index % usize::from(protect.rec_sectors);
-        if used_slots[slot] {
-            return Err(Error::InvalidHeader(
-                "RAR 2.x recovery cannot repair multiple sectors in the same parity group",
-            ));
-        }
-        used_slots[slot] = true;
-    }
-
-    let mut repaired = source.to_vec();
-    for &missing_index in &damaged {
-        control.check()?;
-        let slot = missing_index % usize::from(protect.rec_sectors);
-        let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
-        for index in (slot..repairable_blocks).step_by(usize::from(protect.rec_sectors)) {
-            control.check()?;
-            if index == missing_index {
-                continue;
-            }
-            let sector_start = protected_start + index * 512;
-            for (out, byte) in sector
-                .iter_mut()
-                .zip(&repaired[sector_start..sector_start + 512])
-            {
-                *out ^= *byte;
-            }
-        }
-        let sector_start = protected_start + missing_index * 512;
-        repaired[sector_start..sector_start + 512].copy_from_slice(&sector);
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes(
-            tags[missing_index * 2..missing_index * 2 + 2]
-                .try_into()
-                .unwrap(),
-        );
-        if actual != expected {
-            return Err(Error::CrcMismatch { expected, actual });
-        }
-    }
-    Ok((repaired, true))
+    .repair(archive, control)
 }
 
-/// Repaired bytes plus whether any sector was actually rebuilt.
+/// The repaired sectors of a RAR 3.x NEWSUB recovery record, as byte offsets
+/// and bytes, in order; empty when nothing was damaged.
 #[cfg(feature = "recovery")]
-fn repair_newsub_recovery_bytes(
-    source: &[u8],
-    sfx_offset: usize,
+fn repair_newsub_recovery(
     archive: &Archive,
     recovery: &NewSubHeader,
     control: &crate::read_control::ReadControl,
-) -> Result<(Vec<u8>, bool)> {
+) -> Result<Vec<(usize, Vec<u8>)>> {
     control.check()?;
     let recovery_data = newsub_recovery_data(archive, recovery, control)?;
     let expected_unpacked = usize::try_from(recovery.file.unp_size)
@@ -2228,14 +2194,14 @@ fn repair_newsub_recovery_bytes(
             "RAR 3.x recovery data size does not match unpacked size",
         ));
     }
-    let protected_start = sfx_offset;
-    let protected_end =
-        sfx_offset
-            .checked_add(recovery.file.block.offset)
-            .ok_or(Error::InvalidHeader(
-                "RAR 3.x recovery protected range overflows",
-            ))?;
-    if protected_end > source.len() {
+    let protected_start = archive.sfx_offset;
+    let protected_end = archive
+        .sfx_offset
+        .checked_add(recovery.file.block.offset)
+        .ok_or(Error::InvalidHeader(
+            "RAR 3.x recovery protected range overflows",
+        ))?;
+    if protected_end > archive.source.len()? {
         return Err(Error::InvalidHeader(
             "RAR 3.x recovery protected range is invalid",
         ));
@@ -2254,72 +2220,107 @@ fn repair_newsub_recovery_bytes(
             "RAR 3.x recovery data size is invalid",
         ));
     }
-    let parity_sectors = (recovery_data.len() - tag_len) / 512;
-    let tags = &recovery_data[..tag_len];
-    let parity = &recovery_data[tag_len..];
+    SectorParity {
+        start: protected_start,
+        len: protected_len,
+        tags: &recovery_data[..tag_len],
+        parity: &recovery_data[tag_len..],
+        slots: (recovery_data.len() - tag_len) / 512,
+        too_much_damage: "RAR 3.x recovery damage exceeds parity sector count",
+        shared_group: "RAR 3.x recovery cannot repair multiple sectors in the same parity group",
+    }
+    .repair(archive, control)
+}
 
-    let mut damaged = Vec::new();
-    for index in 0..protected_sectors {
-        control.check()?;
-        let sector = protected_sector(source, protected_start, protected_len, index);
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes([tags[index * 2], tags[index * 2 + 1]]);
-        if actual != expected {
-            damaged.push(index);
-        }
-    }
-    if damaged.is_empty() {
-        return Ok((source.to_vec(), false));
-    }
-    if damaged.len() > parity_sectors {
-        return Err(Error::InvalidHeader(
-            "RAR 3.x recovery damage exceeds parity sector count",
-        ));
-    }
+/// XOR parity over 512-byte sectors, as RAR 2.x and 3.x recovery records keep
+/// it: sector `i` belongs to parity group `i % slots`, whose parity sector is
+/// the XOR of its members, and each sector has a two-byte CRC tag. A last
+/// sector shorter than 512 bytes reads zero-padded.
+#[cfg(feature = "recovery")]
+struct SectorParity<'a> {
+    start: usize,
+    len: usize,
+    tags: &'a [u8],
+    parity: &'a [u8],
+    slots: usize,
+    too_much_damage: &'static str,
+    shared_group: &'static str,
+}
 
-    let mut used_slots = vec![false; parity_sectors];
-    for &index in &damaged {
-        control.check()?;
-        let slot = index % parity_sectors;
-        if used_slots[slot] {
-            return Err(Error::InvalidHeader(
-                "RAR 3.x recovery cannot repair multiple sectors in the same parity group",
-            ));
-        }
-        used_slots[slot] = true;
-    }
-
-    let mut repaired = source.to_vec();
-    for &missing_index in &damaged {
-        control.check()?;
-        let slot = missing_index % parity_sectors;
-        let mut sector = parity[slot * 512..slot * 512 + 512].to_vec();
-        for index in (slot..protected_sectors).step_by(parity_sectors) {
+#[cfg(feature = "recovery")]
+impl SectorParity<'_> {
+    /// Finds damaged sectors and rebuilds them in one pass over the archive.
+    ///
+    /// Every sector is XORed into its group as it is read, so a damaged one is
+    /// its parity XOR its group XOR itself, without a second walk of the
+    /// group. Only those running XORs, the size of the parity itself, and
+    /// one damaged sector per group are held. Errors are those, and in the
+    /// order, of checking every sector first: too much damage, then two
+    /// damaged sectors in one group, then a rebuilt sector failing its tag.
+    fn repair(
+        &self,
+        archive: &Archive,
+        control: &crate::read_control::ReadControl,
+    ) -> Result<Vec<(usize, Vec<u8>)>> {
+        let mut groups = vec![0u8; self.slots * 512];
+        let mut damaged: Vec<(usize, [u8; 512])> = Vec::new();
+        let mut shared = false;
+        let mut used = vec![false; self.slots];
+        let mut index = 0usize;
+        for block in (0..self.len).step_by(SECTOR_READ) {
             control.check()?;
-            if index == missing_index {
-                continue;
-            }
-            let other = protected_sector(&repaired, protected_start, protected_len, index);
-            for (out, byte) in sector.iter_mut().zip(other) {
+            let end = (block + SECTOR_READ).min(self.len);
+            let bytes = archive
+                .source
+                .read_range(self.start + block..self.start + end)?;
+            for chunk in bytes.chunks(512) {
                 control.check()?;
-                *out ^= byte;
+                let mut sector = [0u8; 512];
+                sector[..chunk.len()].copy_from_slice(chunk);
+                let actual = (!crc32(&sector) & 0xffff) as u16;
+                let expected = u16::from_le_bytes([self.tags[index * 2], self.tags[index * 2 + 1]]);
+                let slot = index % self.slots;
+                if actual != expected {
+                    if damaged.len() == self.slots {
+                        return Err(Error::InvalidHeader(self.too_much_damage));
+                    }
+                    shared |= std::mem::replace(&mut used[slot], true);
+                    damaged.push((index, sector));
+                }
+                for (group, byte) in groups[slot * 512..slot * 512 + 512].iter_mut().zip(sector) {
+                    *group ^= byte;
+                }
+                index += 1;
             }
         }
-        let actual = (!crc32(&sector) & 0xffff) as u16;
-        let expected = u16::from_le_bytes(
-            tags[missing_index * 2..missing_index * 2 + 2]
-                .try_into()
-                .unwrap(),
-        );
-        if actual != expected {
-            return Err(Error::CrcMismatch { expected, actual });
+        if shared {
+            return Err(Error::InvalidHeader(self.shared_group));
         }
-        let sector_start = protected_start + missing_index * 512;
-        let write_len = 512.min(protected_end - sector_start);
-        repaired[sector_start..sector_start + write_len].copy_from_slice(&sector[..write_len]);
+        let mut repaired = Vec::with_capacity(damaged.len());
+        for (index, own) in damaged {
+            control.check()?;
+            let slot = index % self.slots;
+            let mut sector = [0u8; 512];
+            for (byte, ((parity, group), own)) in sector.iter_mut().zip(
+                self.parity[slot * 512..slot * 512 + 512]
+                    .iter()
+                    .zip(&groups[slot * 512..slot * 512 + 512])
+                    .zip(own),
+            ) {
+                *byte = parity ^ group ^ own;
+            }
+            let actual = (!crc32(&sector) & 0xffff) as u16;
+            let expected =
+                u16::from_le_bytes(self.tags[index * 2..index * 2 + 2].try_into().unwrap());
+            if actual != expected {
+                return Err(Error::CrcMismatch { expected, actual });
+            }
+            let offset = index * 512;
+            let write_len = 512.min(self.len - offset);
+            repaired.push((self.start + offset, sector[..write_len].to_vec()));
+        }
+        Ok(repaired)
     }
-
-    Ok((repaired, true))
 }
 
 #[cfg(feature = "recovery")]
@@ -2345,24 +2346,6 @@ fn newsub_recovery_data(
     let mut session = DecoderSession::new(false);
     session.read_control = control.clone();
     control.finish(session.decode_file_data(archive, &recovery.file))
-}
-
-#[cfg(feature = "recovery")]
-fn protected_sector(
-    source: &[u8],
-    protected_start: usize,
-    protected_len: usize,
-    index: usize,
-) -> [u8; 512] {
-    // Both callers bound index by ceil(protected_len / 512), after validating
-    // the complete protected range against source.
-    let sector_offset = index * 512;
-    debug_assert!(sector_offset < protected_len);
-    let sector_start = protected_start + sector_offset;
-    let available = 512.min(protected_len - sector_offset);
-    let mut sector = [0u8; 512];
-    sector[..available].copy_from_slice(&source[sector_start..sector_start + available]);
-    sector
 }
 
 pub fn repair_rev3_volumes_to<F>(
