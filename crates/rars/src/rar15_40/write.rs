@@ -3,8 +3,8 @@ use crate::codec::rar13::{
     unpack15_encode_with_options_and_progress, EncodeOptions as Rar15EncodeOptions, Unpack15Encoder,
 };
 use crate::codec::rar20::{
-    unpack20_encode_auto_with_options_and_progress, EncodeOptions as Rar20EncodeOptions,
-    Unpack20Encoder,
+    unpack20_encode_auto_with_options_and_progress, unpack20_encode_streamed,
+    EncodeOptions as Rar20EncodeOptions, Unpack20Encoder,
 };
 use crate::codec::rar29::{
     unpack29_encode_literals, unpack29_encode_literals_with_options,
@@ -637,21 +637,11 @@ fn write_archive_to(
         };
         options.dictionary_size = Some(fitted_dictionary_size(options.target, reach));
     }
-    // RAR 2.0 walks a non-solid member twice, once to pick a method and once to
-    // encode it, so its progress total counts every byte twice.
-    let total_work = if options.target == ArchiveVersion::Rar20
-        && !options.features.solid
-        && coding.compresses()
-    {
-        total_bytes.saturating_mul(2)
-    } else {
-        total_bytes
-    };
-    report_compression_operation(reporting, true, total_work, members.len());
+    report_compression_operation(reporting, true, total_bytes, members.len());
     let work = WorkTracker::new(
         Some(ProgressReporter(reporting)),
         WriteOperation::Compression,
-        total_work,
+        total_bytes,
     );
 
     let header_key = header_password.map(HeaderKey::derive).transpose()?;
@@ -670,7 +660,7 @@ fn write_archive_to(
     if !work.finish() {
         return Err(Error::Cancelled);
     }
-    report_compression_operation(reporting, false, total_work, members.len());
+    report_compression_operation(reporting, false, total_bytes, members.len());
     work.check()
 }
 
@@ -1569,33 +1559,30 @@ fn member_workspace(
         .saturating_mul(held_per_byte(options))
         .saturating_add(dictionary.saturating_mul(12))
         .saturating_add(ppmd_models)
+        .saturating_add(rar20_block_workspace(options))
         .saturating_add(2 * 1024 * 1024)
+}
+
+/// RAR 2.0 codes a member a block at a time, so its parse holds one block's
+/// worth whatever the member's size.
+fn rar20_block_workspace(options: WriterOptions) -> u64 {
+    match options.target {
+        ArchiveVersion::Rar20 => crate::codec::rar20::block_workspace(
+            rar20_encode_options_for_options(options).is_ok_and(|options| options.optimal_parse),
+        ),
+        _ => 0,
+    }
 }
 
 /// Bytes held per member byte while it is coded.
 ///
-/// The RAR 2.0 shortest-path parse keeps a 32-byte node and the match list for
-/// every position of the member. Peak RSS of one member at one thread on brett,
-/// in bytes per input byte:
-///
-/// ```text
-///              2 MiB   8 MiB   32 MiB
-/// rar20 m3      9-11     4-5       3
-/// rar20 m4-5   47-50   47-50   45-46
-/// rar15 m3, m5 12-13      12      11
-/// ```
-///
-/// Charged 2 per byte, 32 threads admitted 32 8 MiB RAR 2.0 members at once
-/// against a 5.2 GB budget, and peaked at 9.2 GB.
+/// RAR 1.5 parses the member whole. Peak RSS of one member at one thread on
+/// brett was 11–13 bytes per input byte at levels 3 and 5. RAR 2.0 holds the
+/// member and its packed form, and parses a block at a time, which
+/// [`rar20_block_workspace`] charges.
 fn held_per_byte(options: WriterOptions) -> u64 {
     match options.target {
         ArchiveVersion::Rar15 => 12,
-        ArchiveVersion::Rar20
-            if rar20_encode_options_for_options(options)
-                .is_ok_and(|options| options.optimal_parse) =>
-        {
-            50
-        }
         _ => 2,
     }
 }
@@ -1775,7 +1762,10 @@ fn streams_member(
         || level == 0
         || !matches!(
             options.target,
-            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+            ArchiveVersion::Rar20
+                | ArchiveVersion::Rar29
+                | ArchiveVersion::Rar30
+                | ArchiveVersion::Rar40
         )
         || !matches!(
             coding,
@@ -1886,6 +1876,13 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<bool> {
 fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
+    if options.target == ArchiveVersion::Rar20 {
+        // One window and one block, and a chain's history.
+        return dictionary
+            .saturating_mul(2)
+            .saturating_add(rar20_block_workspace(options))
+            .saturating_add(2 * 1024 * 1024);
+    }
     let segment = engine_sample_len(options) as u64;
     let lz = dictionary
         .saturating_mul(12 + 6)
@@ -2033,12 +2030,19 @@ fn stream_member(
     let unpacked_size = member.unpacked_size()?;
     let len = usize::try_from(unpacked_size)
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
-    let encode_options = rar29_encode_options_for_options(options)?;
     let _permit = resources
         .acquire_serialising_cancellable(streamed_workspace(options, coding), &|| {
             progress.is_cancelled()
         })?;
-    let engine = streamed_engine(member, len, options, coding, encode_options, progress)?;
+    // RAR 2.0 has one engine; RAR 2.9 chooses before coding anything.
+    let rar29 = match options.target {
+        ArchiveVersion::Rar20 => None,
+        _ => {
+            let encode_options = rar29_encode_options_for_options(options)?;
+            let engine = streamed_engine(member, len, options, coding, encode_options, progress)?;
+            Some((encode_options, engine))
+        }
+    };
     let cipher = volumes::CipherPlan::new(options.target, member.password, data_keys)?;
     let mut sizes = HeaderPayload {
         method: compression_method_for_level(options),
@@ -2077,33 +2081,58 @@ fn stream_member(
         sizes.packed_size += size;
         Ok(ControlFlow::Continue(()))
     };
-    let mut choose = |segment: &[u8]| -> crate::codec::Result<Vec<FilterSpec>> {
-        if !crate::filter_search::search_applies(segment) {
-            return Ok(Vec::new());
-        }
-        let mut poll = |_| !progress.is_cancelled();
-        crate::filter_search::choose_filter(&Rar29Search, segment, encode_options, Some(&mut poll))
-            .map(|(specs, _)| specs)
-            .map_err(|error| crate::codec::Error::Io(Box::new(error)))
-    };
-    let mut own = None;
-    let encoder = match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
-        Some(SolidEncoder::Rar29(encoder)) => encoder,
-        _ => own.insert(Box::new(Unpack29Encoder::with_options(encode_options))),
-    };
-    let flow = match engine {
-        StreamedEngine::Lz { filter_search } => encoder.encode_lz_streamed(
-            &mut counted,
-            len,
-            match filter_search {
-                true => Some(&mut choose),
-                false => None,
-            },
-            &mut advance,
-            &mut write,
-        ),
-        StreamedEngine::Ppmd { escapes } => {
-            encoder.encode_ppmd_streamed(&mut counted, len, escapes, &mut advance, &mut write)
+    let flow = match rar29 {
+        None => match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
+            Some(SolidEncoder::Rar20(encoder)) => {
+                encoder.encode_member_streamed(&mut counted, len, &mut advance, &mut write)
+            }
+            _ => unpack20_encode_streamed(
+                &mut counted,
+                len,
+                rar20_encode_options_for_options(options)?,
+                &mut advance,
+                &mut write,
+            ),
+        },
+        Some((encode_options, engine)) => {
+            let mut choose = |segment: &[u8]| -> crate::codec::Result<Vec<FilterSpec>> {
+                if !crate::filter_search::search_applies(segment) {
+                    return Ok(Vec::new());
+                }
+                let mut poll = |_| !progress.is_cancelled();
+                crate::filter_search::choose_filter(
+                    &Rar29Search,
+                    segment,
+                    encode_options,
+                    Some(&mut poll),
+                )
+                .map(|(specs, _)| specs)
+                .map_err(|error| crate::codec::Error::Io(Box::new(error)))
+            };
+            let mut own = None;
+            let encoder = match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
+                Some(SolidEncoder::Rar29(encoder)) => encoder,
+                _ => own.insert(Box::new(Unpack29Encoder::with_options(encode_options))),
+            };
+            match engine {
+                StreamedEngine::Lz { filter_search } => encoder.encode_lz_streamed(
+                    &mut counted,
+                    len,
+                    match filter_search {
+                        true => Some(&mut choose),
+                        false => None,
+                    },
+                    &mut advance,
+                    &mut write,
+                ),
+                StreamedEngine::Ppmd { escapes } => encoder.encode_ppmd_streamed(
+                    &mut counted,
+                    len,
+                    escapes,
+                    &mut advance,
+                    &mut write,
+                ),
+            }
         }
     }
     .map_err(|error| match counted.ended {
@@ -3487,6 +3516,11 @@ const MAX_SHORT_SIZE: u64 = u32::MAX as u64;
 /// RAR 3.0 onwards gives a 2.9-format member past this the high size fields, zero until 4 GiB.
 const RAR29_LARGE_FROM: u64 = 1 << 31;
 
+/// A short unpacked size of all ones reads as unknown to unrar, which then
+/// fails a compressed member of exactly that size on its checksum. RAR 2.0
+/// gives such a member the high size fields, zero, so the size reads as given.
+const RAR20_LARGE_FROM: u64 = u32::MAX as u64;
+
 /// The format spec gives RAR 2.0 members past this UNP_VER 26; RAR 2.9 members keep 29.
 const MAX_RAR20_SIZE: u64 = i32::MAX as u64;
 
@@ -3538,6 +3572,7 @@ fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
     let large = record.packed_size > MAX_SHORT_SIZE
         || record.unpacked_size > MAX_SHORT_SIZE
+        || (record.target == ArchiveVersion::Rar20 && record.unpacked_size >= RAR20_LARGE_FROM)
         || (matches!(
             record.target,
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
@@ -4476,6 +4511,90 @@ mod tests {
         assert!(after.pack_size < 1000, "{} bytes", after.pack_size);
     }
 
+    fn rar20(level: u8, solid: bool) -> super::WriterOptions {
+        let mut options =
+            super::WriterOptions::new(ArchiveVersion::Rar20, FeatureSet::store_only());
+        options.compression_level = Some(level);
+        options.features.solid = solid;
+        options
+    }
+
+    // Decodes each member in turn, as a solid chain if `solid`.
+    fn rar20_members(archive: &[u8], solid: bool, members: &[&[u8]]) {
+        let parsed = crate::rar15_40::Archive::parse(archive).unwrap();
+        let mut decoder = crate::codec::rar20::Unpack20::new();
+        for (file, data) in parsed.files().zip(members) {
+            if !solid {
+                decoder = crate::codec::rar20::Unpack20::new();
+            }
+            let packed = file.packed_data(&parsed).unwrap();
+            if file.method == 0x30 {
+                // A stored member ends a solid chain, as it does on the writer's side.
+                assert_eq!(packed, *data);
+                decoder = crate::codec::rar20::Unpack20::new();
+                continue;
+            }
+            assert_eq!(decoder.decode_member(&packed, data.len()).unwrap(), *data);
+        }
+    }
+
+    #[test]
+    fn a_streamed_rar20_member_writes_the_archive_the_in_memory_writer_does() {
+        // Over two blocks, so its tables change twice.
+        let large = binary_member(2 * 1024 * 1024 + 4321);
+        let small: &[u8] = b"small and below the threshold\n";
+        let members = entries(&[("small.txt", small), ("large.bin", &large)]);
+        let coding = || crate::MemberCoding::Compressed;
+
+        let out = streamed_with(&members, rar20(3, false), coding(), None).unwrap();
+
+        assert!(out.seeks > 0, "the large member was not streamed");
+        let archive = out.inner.into_inner();
+        assert_eq!(archive, in_memory_with(&members, rar20(3, false), coding()));
+        rar20_members(&archive, false, &[small, &large]);
+    }
+
+    #[test]
+    fn solid_rar20_members_stream_on_the_chain_and_leave_it_for_the_next() {
+        let large = binary_member(1024 * 1024 + 4321);
+        let members = [
+            &large[1000..41000],
+            &large[..],
+            &large[large.len() - 40000..],
+            &large[5000..45000],
+        ];
+        let named = entries(&[
+            ("before.bin", members[0]),
+            ("large.bin", members[1]),
+            ("after.bin", members[2]),
+            ("last.bin", members[3]),
+        ]);
+        let coding = || crate::MemberCoding::Compressed;
+
+        let out = streamed_with(&named, rar20(3, true), coding(), None).unwrap();
+
+        assert!(out.seeks > 0, "the large member was not streamed");
+        let archive = out.inner.into_inner();
+        assert_eq!(archive, in_memory_with(&named, rar20(3, true), coding()));
+        rar20_members(&archive, true, &members);
+        let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+        let after = parsed.files().nth(2).unwrap();
+        assert!(after.pack_size < 1000, "{} bytes", after.pack_size);
+    }
+
+    #[test]
+    fn rar20_charges_a_block_whatever_the_member_size() {
+        for level in [3, 5] {
+            let options = rar20(level, false);
+            let small = super::member_workspace(options, 1 << 20, true, false);
+            let large = super::member_workspace(options, 1 << 30, true, false);
+            // Beyond the bytes it holds, a large member costs what a small one does.
+            assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
+            let streamed = super::streamed_workspace(options, &crate::MemberCoding::Compressed);
+            assert!(streamed < 128 * 1024 * 1024, "{streamed}");
+        }
+    }
+
     #[test]
     #[cfg(feature = "encryption")]
     fn solid_text_streams_ppmd_on_the_chain_model() {
@@ -4607,6 +4726,41 @@ mod tests {
         let whole = volume_set(&members, rar40(), coding(), 100_000, u64::MAX, None).unwrap();
         assert!(streamed.len() > 2);
         assert_eq!(streamed, whole);
+    }
+
+    #[test]
+    fn a_streamed_rar20_member_splits_into_the_volumes_the_in_memory_writer_does() {
+        // Over two blocks, so the set carries the table switches too.
+        let large = binary_member(2 * 1024 * 1024 + 4321);
+        let small: &[u8] = b"small and below the threshold\n";
+        let contents = [("small.txt", small), ("large.bin", &large[..])];
+        let (members, opens) = counted_entries(&contents);
+        let coding = || crate::MemberCoding::Compressed;
+        // RAR 2.0 has one engine, so it opens a member once either way.
+        let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
+        let streams = super::streams_member(&routed[1], rar20(3, false), &coding(), 256 * 1024);
+        assert!(streams.unwrap());
+
+        let streamed = volume_set(
+            &members,
+            rar20(3, false),
+            coding(),
+            100_000,
+            256 * 1024,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2);
+        let whole =
+            volume_set(&members, rar20(3, false), coding(), 100_000, u64::MAX, None).unwrap();
+        assert!(streamed.len() > 2);
+        assert_eq!(streamed, whole);
+        let expected: Vec<_> = contents
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect();
+        assert_eq!(extracted_set(&streamed, None), expected);
     }
 
     #[test]
@@ -5060,12 +5214,25 @@ mod tests {
             options.compression_level = Some(level);
             super::member_workspace(options, size, true, false)
         };
-        for level in [4, 5] {
-            assert!(charge(ArchiveVersion::Rar20, level) >= 50 * size);
+        // RAR 2.0 holds the member and its packed form, and parses a block at a time.
+        for level in [3, 4, 5] {
+            let block = crate::codec::rar20::block_workspace(level > 3);
+            assert!(charge(ArchiveVersion::Rar20, level) >= 2 * size + block);
+            assert!(charge(ArchiveVersion::Rar20, level) < 2 * size + block + (16 << 20));
         }
-        assert!(charge(ArchiveVersion::Rar20, 3) < 4 * size);
         assert!(charge(ArchiveVersion::Rar15, 3) >= 12 * size);
         assert!(charge(ArchiveVersion::Rar29, 5) < 50 * size);
+    }
+
+    #[test]
+    fn a_rar20_member_of_all_ones_bytes_gives_its_size_in_full() {
+        let large = |header: &[u8]| u16::from_le_bytes([header[3], header[4]]) & 0x100 != 0;
+        let short = file_header_of_size(ArchiveVersion::Rar20, u64::from(u32::MAX) - 1, None);
+        assert!(!large(&short));
+        let header = file_header_of_size(ArchiveVersion::Rar20, u64::from(u32::MAX), None);
+        assert!(large(&header));
+        assert_eq!(header[7..11], [0xff; 4]);
+        assert_eq!(header[32..40], [0; 8]);
     }
 
     #[test]

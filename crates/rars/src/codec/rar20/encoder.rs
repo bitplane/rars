@@ -2,7 +2,8 @@
 use super::super::workspace::{Allowance, Buffer};
 use super::super::{huffman, match_finder};
 use super::*;
-use std::borrow::Cow;
+use std::io::Read;
+use std::ops::ControlFlow;
 
 const MAX_ENCODER_MATCH_OFFSET: usize = MAX_HISTORY;
 
@@ -12,6 +13,9 @@ const MAX_MATCH_CANDIDATES: usize = 256;
 
 type Rar20MatchFinder = match_finder::MatchFinder<3>;
 
+/// Takes packed bytes and how far into the member they reach; a break stops the coding.
+pub(crate) type PackedOut<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>;
+
 pub fn unpack20_encode_literals(input: &[u8]) -> Result<Vec<u8>> {
     unpack20_encode_literals_with_options(input, EncodeOptions::default())
 }
@@ -20,7 +24,7 @@ pub fn unpack20_encode_literals_with_options(
     input: &[u8],
     options: EncodeOptions,
 ) -> Result<Vec<u8>> {
-    encode_member(input, &[], None, options, None)
+    encode_member(input, &[], None, options, false, None)
 }
 
 pub fn unpack20_encode_auto(input: &[u8]) -> Result<Vec<u8>> {
@@ -28,20 +32,7 @@ pub fn unpack20_encode_auto(input: &[u8]) -> Result<Vec<u8>> {
 }
 
 pub fn unpack20_encode_auto_with_options(input: &[u8], options: EncodeOptions) -> Result<Vec<u8>> {
-    let lz = unpack20_encode_literals_with_options(input, options)?;
-    let mut best = lz;
-    if options.try_audio {
-        for channels in 1..=MAX_CHANNELS {
-            if input.len() < channels * 64 {
-                continue;
-            }
-            let audio = encode_audio_member(input, channels)?;
-            if audio.len() < best.len() {
-                best = audio;
-            }
-        }
-    }
-    Ok(best)
+    encode_member(input, &[], None, options, options.try_audio, None)
 }
 
 pub(crate) fn unpack20_encode_auto_with_options_and_progress(
@@ -49,19 +40,33 @@ pub(crate) fn unpack20_encode_auto_with_options_and_progress(
     options: EncodeOptions,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
-    let mut best = encode_member(input, &[], None, options, Some(progress))?;
-    if options.try_audio {
-        for channels in 1..=MAX_CHANNELS {
-            if input.len() < channels * 64 {
-                continue;
-            }
-            let audio = encode_audio_member(input, channels)?;
-            if audio.len() < best.len() {
-                best = audio;
-            }
-        }
-    }
-    Ok(best)
+    encode_member(input, &[], None, options, options.try_audio, Some(progress))
+}
+
+/// [`unpack20_encode_auto_with_options_and_progress`], reading the member as
+/// it is coded and handing `out` the packed bytes a block at a time, with how
+/// far into the member they reach, so neither the member nor its packed form
+/// is held whole. A break from `out` stops the coding.
+pub(crate) fn unpack20_encode_streamed(
+    input: &mut dyn Read,
+    len: usize,
+    options: EncodeOptions,
+    progress: &mut dyn FnMut(usize) -> bool,
+    out: PackedOut<'_>,
+) -> Result<ControlFlow<()>> {
+    let try_audio = options.try_audio;
+    encode_streamed(
+        input,
+        len,
+        &[],
+        None,
+        options,
+        try_audio,
+        progress,
+        out,
+        BLOCK_SIZE,
+    )
+    .map(|(flow, _)| flow)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +169,48 @@ impl Unpack20Encoder {
         self.encode_member_inner(input, Some(progress))
     }
 
+    /// [`Self::encode_member_with_progress`] read as it is coded; see
+    /// [`unpack20_encode_streamed`]. The chain moves on only if `out` takes
+    /// every byte.
+    pub(crate) fn encode_member_streamed(
+        &mut self,
+        input: &mut dyn Read,
+        len: usize,
+        progress: &mut dyn FnMut(usize) -> bool,
+        out: PackedOut<'_>,
+    ) -> Result<ControlFlow<()>> {
+        if len == 0 {
+            return Ok(ControlFlow::Continue(()));
+        }
+        let table = self.table()?;
+        let (flow, history) = encode_streamed(
+            input,
+            len,
+            &self.history,
+            Some(table),
+            self.options,
+            false,
+            progress,
+            out,
+            BLOCK_SIZE,
+        )?;
+        if flow.is_continue() {
+            self.history = history;
+        }
+        Ok(flow)
+    }
+
+    fn table(&mut self) -> Result<FixedEncodeTable> {
+        match self.table {
+            Some(table) => Ok(table),
+            None => {
+                let table = FixedEncodeTable::new()?;
+                self.table = Some(table);
+                Ok(table)
+            }
+        }
+    }
+
     fn encode_member_inner(
         &mut self,
         input: &[u8],
@@ -172,15 +219,15 @@ impl Unpack20Encoder {
         if input.is_empty() {
             return Ok(Vec::new());
         }
-        let table = match self.table {
-            Some(table) => table,
-            None => {
-                let table = FixedEncodeTable::new()?;
-                self.table = Some(table);
-                table
-            }
-        };
-        let packed = encode_member(input, &self.history, Some(table), self.options, progress)?;
+        let table = self.table()?;
+        let packed = encode_member(
+            input,
+            &self.history,
+            Some(table),
+            self.options,
+            false,
+            progress,
+        )?;
         self.remember(input);
         Ok(packed)
     }
@@ -197,31 +244,284 @@ impl Unpack20Encoder {
     }
 }
 
+/// Bytes coded per block. Each block is parsed against the dictionary before
+/// it and gets tables of its own, so the parse's working set (its tokens, and
+/// at levels 4–5 its nodes and match lists) is sized by the block, not by the
+/// member.
+const BLOCK_SIZE: usize = 1024 * 1024;
+
+/// What coding one block holds beyond the member's own bytes: the window and
+/// block, the match finders, the tokens, and at levels 4–5 the shortest-path
+/// parse's nodes and match lists. Peak RSS on brett, coding 256 MiB streamed
+/// with 1 MiB blocks, was 18–26 MB at level 3 and 73 MB at level 5.
+pub(crate) const fn block_workspace(optimal_parse: bool) -> u64 {
+    if optimal_parse {
+        80 * 1024 * 1024
+    } else {
+        24 * 1024 * 1024
+    }
+}
+
 fn encode_member(
     input: &[u8],
     history: &[u8],
     fixed_table: Option<FixedEncodeTable>,
     options: EncodeOptions,
+    try_audio: bool,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<Vec<u8>> {
+    encode_member_in_blocks(
+        input,
+        history,
+        fixed_table,
+        options,
+        try_audio,
+        progress,
+        BLOCK_SIZE,
+    )
+}
+
+fn encode_member_in_blocks(
+    input: &[u8],
+    history: &[u8],
+    fixed_table: Option<FixedEncodeTable>,
+    options: EncodeOptions,
+    try_audio: bool,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    block_size: usize,
 ) -> Result<Vec<u8>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }
     // The public field can be assigned directly, bypassing the builder clamp.
     let options = options.constrained();
-    // Every pass and the match lists parse this one buffer.
-    let (combined, start) = combined_input(input, history, options);
+    let reach = options.max_match_distance;
+    let history = &history[history.len().saturating_sub(reach)..];
+    let mut coder = BlockCoder::new(options, fixed_table, try_audio, history.is_empty());
+    // Only a block whose reach goes back into the history needs a copy.
+    let mut joined = Vec::new();
+    let mut base = 0;
+    while base < input.len() {
+        let end = (base + block_size).min(input.len());
+        let behind = reach.min(history.len() + base);
+        let window: &[u8] = if behind <= base {
+            &input[base - behind..end]
+        } else {
+            joined.clear();
+            joined.extend_from_slice(&history[history.len() - (behind - base)..]);
+            joined.extend_from_slice(&input[..end]);
+            &joined
+        };
+        coder.code_block(
+            window,
+            behind,
+            end < input.len(),
+            base,
+            again(&mut progress),
+        )?;
+        base = end;
+    }
+    Ok(coder.bits.finish())
+}
 
-    let tokens = match progress.as_mut() {
-        Some(report) => {
-            encode_tokens_with_progress(&combined, start, options, None, None, Some(&mut **report))?
+/// Codes a member read from `input`, holding one reach of history and one
+/// block. Returns the last reach of the member, the history a chain's next
+/// member continues from.
+#[allow(clippy::too_many_arguments)]
+fn encode_streamed(
+    input: &mut dyn Read,
+    len: usize,
+    history: &[u8],
+    fixed_table: Option<FixedEncodeTable>,
+    options: EncodeOptions,
+    try_audio: bool,
+    progress: &mut dyn FnMut(usize) -> bool,
+    out: PackedOut<'_>,
+    block_size: usize,
+) -> Result<(ControlFlow<()>, Vec<u8>)> {
+    let options = options.constrained();
+    let reach = options.max_match_distance;
+    let mut window = history[history.len().saturating_sub(reach)..].to_vec();
+    let mut coder = BlockCoder::new(options, fixed_table, try_audio, window.is_empty());
+    let mut base = 0;
+    while base < len {
+        let end = (base + block_size).min(len);
+        window.drain(..window.len().saturating_sub(reach));
+        let behind = window.len();
+        window.resize(behind + (end - base), 0);
+        input.read_exact(&mut window[behind..])?;
+        coder.code_block(&window, behind, end < len, base, Some(&mut *progress))?;
+        // The last byte may still take bits from the next block.
+        let whole = coder.bits.take_whole_bytes();
+        if !whole.is_empty() && out(&whole, end)?.is_break() {
+            return Ok((ControlFlow::Break(()), Vec::new()));
         }
-        None => encode_tokens_with_progress(&combined, start, options, None, None, None)?,
-    };
-    let table_lengths = table_lengths_for_tokens(&tokens, fixed_table)?;
-    let packed = encode_member_with_tables(&tokens, history, fixed_table, &table_lengths)?;
+        base = end;
+    }
+    let tail = coder.bits.finish();
+    if !tail.is_empty() && out(&tail, len)?.is_break() {
+        return Ok((ControlFlow::Break(()), Vec::new()));
+    }
+    window.drain(..window.len().saturating_sub(reach));
+    Ok((ControlFlow::Continue(()), window))
+}
+
+/// Lends an optional progress callback to one call at a time.
+fn again<'a>(
+    progress: &'a mut Option<&mut dyn FnMut(usize) -> bool>,
+) -> Option<&'a mut dyn FnMut(usize) -> bool> {
+    match progress {
+        Some(report) => Some(&mut **report),
+        None => None,
+    }
+}
+
+/// What a reader carries from one block into the next, so each block's
+/// parse starts where the reader will be.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LzState {
+    old_offsets: [usize; 4],
+    /// The length and offset a repeat-last symbol copies.
+    last_match: Option<(usize, usize)>,
+}
+
+impl LzState {
+    /// Where a reader is after `tokens`.
+    fn after(mut self, tokens: &[EncodeToken]) -> Self {
+        for &token in tokens {
+            let (length, offset) = match token {
+                EncodeToken::Literal(_) => continue,
+                EncodeToken::RepeatLast => self.last_match.expect("a repeat follows a match"),
+                EncodeToken::OldOffset { length, offset, .. }
+                | EncodeToken::Match { length, offset } => (usize::from(length), offset as usize),
+                EncodeToken::ShortOffset { offset } => (2, offset as usize),
+            };
+            push_old_offset(&mut self.old_offsets, offset);
+            self.last_match = Some((length, offset));
+        }
+        self
+    }
+}
+
+/// Codes a member a block at a time into one bit stream. A block ends with the
+/// symbol that makes the reader read new tables, then the next block's.
+struct BlockCoder {
+    options: EncodeOptions,
+    fixed_table: Option<FixedEncodeTable>,
+    try_audio: bool,
+    lz: LzState,
+    audio: AudioCoder,
+    /// False while a solid member continues the fixed table already sent.
+    header: bool,
+    bits: BitWriter,
+}
+
+impl BlockCoder {
+    fn new(
+        options: EncodeOptions,
+        fixed_table: Option<FixedEncodeTable>,
+        try_audio: bool,
+        fresh: bool,
+    ) -> Self {
+        Self {
+            options,
+            fixed_table,
+            try_audio,
+            lz: LzState::default(),
+            audio: AudioCoder::default(),
+            header: fixed_table.is_none() || fresh,
+            bits: BitWriter::default(),
+        }
+    }
+
+    /// Codes `window[start..]`, the reach before it in `window` to match
+    /// against, by LZ or, when it packs smaller, as audio. `base` is the
+    /// block's position in the member, for progress.
+    fn code_block(
+        &mut self,
+        window: &[u8],
+        start: usize,
+        more: bool,
+        base: usize,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<()> {
+        let mut report = progress.map(|report| move |consumed: usize| report(base + consumed));
+        // A fixed table never changes, so its blocks run on without new tables.
+        let ends_table = more && self.fixed_table.is_none();
+        let (mut best, lz) = code_lz_block(
+            window,
+            start,
+            self.options,
+            self.fixed_table,
+            self.header,
+            ends_table,
+            self.lz,
+            report
+                .as_mut()
+                .map(|report| report as &mut dyn FnMut(usize) -> bool),
+        )?;
+        let mut audio = None;
+        let block = &window[start..];
+        if self.try_audio {
+            for channels in 1..=MAX_CHANNELS {
+                if block.len() < channels * 64 {
+                    continue;
+                }
+                let (bits, coder) = code_audio_block(block, channels, self.audio, more)?;
+                if bits.bytes.len() < best.bytes.len() {
+                    best = bits;
+                    audio = Some(coder);
+                }
+            }
+        }
+        // An audio block leaves the LZ state alone, and an LZ block the audio state.
+        match audio {
+            Some(coder) => self.audio = coder,
+            None => self.lz = lz,
+        }
+        self.bits.append(&best);
+        self.header = self.fixed_table.is_none();
+        Ok(())
+    }
+}
+
+/// One block's LZ coding, its tables chosen by up to three parses: a greedy
+/// one, then re-parses priced by the tables the one before implied. Only the
+/// first advances progress, so each byte of the member is counted once; the
+/// re-parses report the block's end, already reached, to stay cancellable.
+#[allow(clippy::too_many_arguments)]
+fn code_lz_block(
+    window: &[u8],
+    start: usize,
+    options: EncodeOptions,
+    fixed_table: Option<FixedEncodeTable>,
+    header: bool,
+    more: bool,
+    state: LzState,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<(BitWriter, LzState)> {
+    let tokens = encode_tokens_with_progress(
+        window,
+        start,
+        options,
+        None,
+        None,
+        state,
+        again(&mut progress),
+    )?;
+    let table_lengths = table_lengths_for_tokens(&tokens, fixed_table, more)?;
+    let mut best = BitWriter::default();
+    write_lz_block(
+        &mut best,
+        &tokens,
+        header,
+        fixed_table,
+        &table_lengths,
+        more,
+    )?;
+    let mut best_state = state.after(&tokens);
     if fixed_table.is_some() {
-        return Ok(packed);
+        return Ok((best, best_state));
     }
     // Each pass's tokens die once packed; a pass that reproduces the last one
     // packs to the same length, which ends the loop.
@@ -234,54 +534,46 @@ fn encode_member(
     let refinements = if options.optimal_parse { 2 } else { 1 };
     // Matches do not depend on prices, so both priced passes share one search.
     let matches = if options.optimal_parse {
-        Some(collect_match_lists(
-            &combined,
-            start,
-            combined.len(),
-            options,
-        ))
+        Some(collect_match_lists(window, start, window.len(), options))
     } else {
         None
     };
+    let span = window.len() - start;
+    let mut poll = progress.map(|report| move |_: usize| report(span));
     let mut best_table = table_lengths;
-    let mut best_packed = packed;
     for _ in 0..refinements {
         let cost_model = CostModel::new(&best_table);
-        let next_tokens = match progress.as_mut() {
-            Some(report) => encode_tokens_with_progress(
-                &combined,
-                start,
-                options,
-                Some(&cost_model),
-                matches.as_ref(),
-                Some(&mut **report),
-            )?,
-            None => encode_tokens_with_progress(
-                &combined,
-                start,
-                options,
-                Some(&cost_model),
-                matches.as_ref(),
-                None,
-            )?,
-        };
-        let next_table = table_lengths_for_tokens(&next_tokens, fixed_table)?;
-        let next_packed =
-            encode_member_with_tables(&next_tokens, history, fixed_table, &next_table)?;
-        if next_packed.len() >= best_packed.len() {
+        let next_tokens = encode_tokens_with_progress(
+            window,
+            start,
+            options,
+            Some(&cost_model),
+            matches.as_ref(),
+            state,
+            poll.as_mut()
+                .map(|poll| poll as &mut dyn FnMut(usize) -> bool),
+        )?;
+        let next_table = table_lengths_for_tokens(&next_tokens, None, more)?;
+        let mut next = BitWriter::default();
+        write_lz_block(&mut next, &next_tokens, header, None, &next_table, more)?;
+        if next.bytes.len() >= best.bytes.len() {
             break;
         }
         best_table = next_table;
-        best_packed = next_packed;
+        best = next;
+        best_state = state.after(&next_tokens);
     }
-    Ok(best_packed)
+    Ok((best, best_state))
 }
 
+/// `more` when another block follows, whose tables symbol 269 announces.
 fn table_lengths_for_tokens(
     tokens: &[EncodeToken],
     fixed_table: Option<FixedEncodeTable>,
+    more: bool,
 ) -> Result<[u8; TABLE_COUNT]> {
     let mut main_frequencies = [0usize; MAIN_COUNT];
+    main_frequencies[269] = usize::from(more);
     let mut offset_frequencies = [0usize; OFFSET_COUNT];
     let mut length_frequencies = [0usize; LENGTH_COUNT];
     for token in tokens {
@@ -360,19 +652,24 @@ fn table_lengths_for_tokens(
     Ok(table_lengths)
 }
 
-fn encode_member_with_tables(
+fn write_lz_block(
+    bits: &mut BitWriter,
     tokens: &[EncodeToken],
-    history: &[u8],
+    header: bool,
     fixed_table: Option<FixedEncodeTable>,
     table_lengths: &[u8; TABLE_COUNT],
-) -> Result<Vec<u8>> {
+    more: bool,
+) -> Result<()> {
     let level_tokens = encode_table_level_tokens(table_lengths);
     let level_lengths = level_code_lengths_for_tokens(&level_tokens);
     let level_codes = canonical_codes(&level_lengths)?;
     let main_codes = canonical_codes(&table_lengths[..MAIN_COUNT])?;
+    debug_assert!(
+        !(more && fixed_table.is_some()),
+        "a fixed table is never replaced"
+    );
 
-    let mut bits = BitWriter::default();
-    if fixed_table.is_none() || history.is_empty() {
+    if header {
         bits.write_bits(0, 2); // LZ block, do not keep previous tables.
         for &len in &level_lengths {
             bits.write_bits(len as u32, 4);
@@ -452,7 +749,13 @@ fn encode_member_with_tables(
             }
         }
     }
-    Ok(bits.finish())
+    if more {
+        let code = main_codes[269].ok_or(Error::InvalidData(
+            "RAR 2.0 encoder missing new-tables Huffman code",
+        ))?;
+        bits.write_bits(code.code as u32, code.len);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -673,6 +976,7 @@ fn encode_tokens_optimal(
     end: usize,
     matches: &MatchLists,
     cost_model: &CostModel<'_>,
+    old_offsets: [usize; 4],
 ) -> Vec<EncodeToken> {
     let span = end - start;
     let mut nodes = vec![ParseNode::UNREACHED; span + 1];
@@ -687,6 +991,7 @@ fn encode_tokens_optimal(
         "lists collected for another buffer"
     );
     nodes[0].cost = 0;
+    nodes[0].reps = old_offsets.map(|offset| offset as u32);
 
     for index in 0..span {
         // Every position is reachable through the one-byte literal edge.
@@ -827,27 +1132,13 @@ fn match_run_length(input: &[u8], pos: usize, offset: usize, cap: usize) -> usiz
     length
 }
 
-fn combined_input<'a>(
-    input: &'a [u8],
-    history: &[u8],
-    options: EncodeOptions,
-) -> (Cow<'a, [u8]>, usize) {
-    let history = &history[history.len().saturating_sub(options.max_match_distance)..];
-    if history.is_empty() {
-        return (Cow::Borrowed(input), 0);
-    }
-    let mut combined = Vec::with_capacity(history.len() + input.len());
-    combined.extend_from_slice(history);
-    combined.extend_from_slice(input);
-    (Cow::Owned(combined), history.len())
-}
-
 fn encode_tokens_with_progress(
     combined: &[u8],
     start: usize,
     options: EncodeOptions,
     cost_model: Option<&CostModel>,
     matches: Option<&MatchLists>,
+    state: LzState,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     if let (Some(cost_model), Some(matches)) = (cost_model, matches) {
@@ -857,6 +1148,7 @@ fn encode_tokens_with_progress(
             combined.len(),
             matches,
             cost_model,
+            state.old_offsets,
         ));
     }
     let mut tokens = Vec::new();
@@ -876,8 +1168,8 @@ fn encode_tokens_with_progress(
 
     let mut pos = start;
     let end = combined.len();
-    let mut last_match = None;
-    let mut old_offsets = [0usize; 4];
+    let mut last_match = state.last_match;
+    let mut old_offsets = state.old_offsets;
     let mut next_report = 0usize;
     while pos < end {
         if let Some(&model) = cost_model {
@@ -1698,16 +1990,49 @@ fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     level_code_lengths_for_used_symbols(used)
 }
 
+/// A whole member coded as one audio block.
+#[cfg(test)]
 fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
+    code_audio_block(input, channels, AudioCoder::default(), false).map(|(bits, _)| bits.finish())
+}
+
+/// The audio predictors, which a reader keeps across blocks of either kind,
+/// and the channel of the next byte.
+#[derive(Debug, Clone, Copy, Default)]
+struct AudioCoder {
+    states: [AudioState; MAX_CHANNELS],
+    channel_delta: i32,
+    channel: usize,
+}
+
+/// One block coded as audio. `more` ends it with the symbol that makes the
+/// reader read new tables, coded for the channel that comes next.
+fn code_audio_block(
+    input: &[u8],
+    channels: usize,
+    mut coder: AudioCoder,
+    more: bool,
+) -> Result<(BitWriter, AudioCoder)> {
     if channels == 0 || channels > MAX_CHANNELS {
         return Err(Error::InvalidData("RAR 2.0 audio channel count is invalid"));
     }
-    let deltas = audio_encode(input, channels);
+    // A reader with fewer channels than before starts again at the first.
+    if coder.channel >= channels {
+        coder.channel = 0;
+    }
+    let first = coder.channel;
+    let deltas = audio_encode(input, channels, &mut coder);
+    let channel_of = |index: usize| (first + index) % channels;
     let mut levels = vec![0u8; AUDIO_COUNT * channels];
     for channel in 0..channels {
         let mut frequencies = [0usize; AUDIO_COUNT];
-        for index in (channel..deltas.len()).step_by(channels) {
-            frequencies[deltas[index] as usize] += 1;
+        for (index, &delta) in deltas.iter().enumerate() {
+            if channel_of(index) == channel {
+                frequencies[delta as usize] += 1;
+            }
+        }
+        if more && channel == coder.channel {
+            frequencies[256] += 1;
         }
         let channel_lengths = huffman::lengths_for_frequency_array(&frequencies, 15);
         for (symbol, len) in channel_lengths.into_iter().enumerate() {
@@ -1736,13 +2061,18 @@ fn encode_audio_member(input: &[u8], channels: usize) -> Result<Vec<u8>> {
         .map(|channel| canonical_codes(&levels[channel * AUDIO_COUNT..(channel + 1) * AUDIO_COUNT]))
         .collect::<Result<Vec<_>>>()?;
     for (index, &delta) in deltas.iter().enumerate() {
-        let channel = index % channels;
-        let code = audio_codes[channel][delta as usize].ok_or(Error::InvalidData(
+        let code = audio_codes[channel_of(index)][delta as usize].ok_or(Error::InvalidData(
             "RAR 2.0 encoder missing audio Huffman code",
         ))?;
         bits.write_bits(code.code as u32, code.len);
     }
-    Ok(bits.finish())
+    if more {
+        let code = audio_codes[coder.channel][256].ok_or(Error::InvalidData(
+            "RAR 2.0 encoder missing audio new-tables Huffman code",
+        ))?;
+        bits.write_bits(code.code as u32, code.len);
+    }
+    Ok((bits, coder))
 }
 
 fn encode_audio_table_level_symbols(levels: &[u8]) -> Vec<usize> {
@@ -1768,12 +2098,16 @@ fn level_code_lengths_for_used_symbols(used: [bool; LEVEL_COUNT]) -> [u8; LEVEL_
     lengths
 }
 
-fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
-    let mut states = [AudioState::default(); MAX_CHANNELS];
-    let mut channel_delta = 0i32;
+fn audio_encode(input: &[u8], channels: usize, coder: &mut AudioCoder) -> Vec<u8> {
+    let AudioCoder {
+        states,
+        channel_delta,
+        channel: next_channel,
+    } = coder;
     let mut deltas = Vec::with_capacity(input.len());
-    for (index, &byte) in input.iter().enumerate() {
-        let channel = index % channels;
+    for &byte in input {
+        let channel = *next_channel;
+        *next_channel = (channel + 1) % channels;
         let state = &mut states[channel];
         state.byte_count = state.byte_count.wrapping_add(1);
         state.d4 = state.d3;
@@ -1786,7 +2120,7 @@ fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
             + state.k[1] * state.d2
             + state.k[2] * state.d3
             + state.k[3] * state.d4
-            + state.k[4] * channel_delta;
+            + state.k[4] * *channel_delta;
         let predicted = (predicted >> 3) & 0xff;
         let delta = (predicted as u8).wrapping_sub(byte);
 
@@ -1800,11 +2134,11 @@ fn audio_encode(input: &[u8], channels: usize) -> Vec<u8> {
         state.dif[6] = state.dif[6].wrapping_add((d + state.d3).unsigned_abs());
         state.dif[7] = state.dif[7].wrapping_add((d - state.d4).unsigned_abs());
         state.dif[8] = state.dif[8].wrapping_add((d + state.d4).unsigned_abs());
-        state.dif[9] = state.dif[9].wrapping_add((d - channel_delta).unsigned_abs());
-        state.dif[10] = state.dif[10].wrapping_add((d + channel_delta).unsigned_abs());
+        state.dif[9] = state.dif[9].wrapping_add((d - *channel_delta).unsigned_abs());
+        state.dif[10] = state.dif[10].wrapping_add((d + *channel_delta).unsigned_abs());
 
-        channel_delta = (byte.wrapping_sub(state.last_char as u8)) as i8 as i32;
-        state.last_delta = channel_delta;
+        *channel_delta = (byte.wrapping_sub(state.last_char as u8)) as i8 as i32;
+        state.last_delta = *channel_delta;
         state.last_char = byte as i32;
 
         if state.byte_count & 0x1f == 0 {
@@ -1896,6 +2230,39 @@ impl BitWriter {
         self.write_bits(u32::from(bit), 1);
     }
 
+    /// Appends `other`'s bits, which need not start on a byte boundary here.
+    fn append(&mut self, other: &BitWriter) {
+        let whole = other.bit_pos / 8;
+        if self.bit_pos.is_multiple_of(8) {
+            self.bytes.extend_from_slice(&other.bytes[..whole]);
+            self.bit_pos += whole * 8;
+        } else {
+            for chunk in other.bytes[..whole].chunks(7) {
+                let value = chunk
+                    .iter()
+                    .fold(0u64, |value, &byte| (value << 8) | u64::from(byte));
+                super::super::fast::write_msb_bits(
+                    &mut self.bytes,
+                    &mut self.bit_pos,
+                    value,
+                    chunk.len() * 8,
+                );
+            }
+        }
+        let tail = other.bit_pos % 8;
+        if tail != 0 {
+            self.write_bits(u32::from(other.bytes[whole] >> (8 - tail)), tail as u8);
+        }
+    }
+
+    /// Takes the bytes no later bit can change, leaving a partial last byte.
+    fn take_whole_bytes(&mut self) -> Vec<u8> {
+        let whole = self.bit_pos / 8;
+        let rest = self.bytes.split_off(whole);
+        self.bit_pos -= whole * 8;
+        std::mem::replace(&mut self.bytes, rest)
+    }
+
     fn finish(self) -> Vec<u8> {
         self.bytes
     }
@@ -1904,3 +2271,7 @@ impl BitWriter {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "block_tests.rs"]
+mod block_tests;

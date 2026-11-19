@@ -192,12 +192,7 @@ pub(super) fn split_members_above(
     } else {
         WriteOperation::Emission
     };
-    // RAR 2.0 walks a non-solid member twice, once to pick a method and once to encode it.
-    let total_work = if compresses && options.target == ArchiveVersion::Rar20 && !solid {
-        total_bytes.saturating_mul(2)
-    } else {
-        total_bytes
-    };
+    let total_work = total_bytes;
     progress.report(WriteProgressEvent::OperationStarted {
         operation,
         total_bytes: Some(total_work),
