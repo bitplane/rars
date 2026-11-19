@@ -23,6 +23,8 @@ use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 
+#[cfg(test)]
+mod builder_path_tests;
 mod volumes;
 pub(crate) use volumes::write_retained_volumes_to;
 pub use volumes::{write_stored_volumes_to, write_volumes_to, write_volumes_with_comment_to};
@@ -479,9 +481,15 @@ impl<'a> ArchiveOutput<'a> {
     }
 
     pub(crate) fn seekable(output: &'a mut dyn SeekWrite) -> Self {
+        // A test lowers the threshold on its own thread, so a member streams
+        // through the builder without coding 64 MiB in a debug build.
+        #[cfg(test)]
+        let stream_above = builder_path_tests::STREAM_ABOVE.get();
+        #[cfg(not(test))]
+        let stream_above = STREAM_MEMBERS_ABOVE;
         Self::Seekable {
             output,
-            stream_above: STREAM_MEMBERS_ABOVE,
+            stream_above,
         }
     }
 }
