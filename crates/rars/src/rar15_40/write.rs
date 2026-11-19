@@ -6020,7 +6020,7 @@ mod tests {
 
     #[test]
     fn an_encrypted_rar20_member_near_4_gib_keeps_its_header_length_when_patched() {
-        let header = |unpacked: u64, packed: u64| {
+        let header_for = |target: ArchiveVersion, unpacked: u64, packed: u64| {
             let mut header = Vec::new();
             super::write_file_header(
                 &mut header,
@@ -6033,7 +6033,7 @@ mod tests {
                     file_time: 0,
                     file_attr: 0x20,
                     host_os: 0,
-                    target: ArchiveVersion::Rar20,
+                    target,
                     method: 0x33,
                     dictionary_flags: 0,
                     flags: super::writer_file_flags(Some(b"secret"), None, false),
@@ -6044,6 +6044,7 @@ mod tests {
             .unwrap();
             header
         };
+        let header = |unpacked, packed| header_for(ArchiveVersion::Rar20, unpacked, packed);
         let large = |header: &[u8]| u16::from_le_bytes([header[3], header[4]]) & 0x0100 != 0;
         let max = u64::from(u32::MAX);
 
@@ -6065,6 +6066,8 @@ mod tests {
             max - 1,
             None
         )));
+        // RAR 1.5 encrypts without padding and has no high fields to take.
+        assert!(!large(&header_for(ArchiveVersion::Rar15, max - 1, max - 1)));
     }
 
     #[test]

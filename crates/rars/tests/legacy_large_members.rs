@@ -203,22 +203,27 @@ fn encrypted_rar20_members_just_under_4_gib_patch_in_place() {
 
 #[cfg(feature = "encryption")]
 #[test]
-#[ignore = "writes two encrypted members of just under 4 GiB, one spooled, one stored"]
-fn encrypted_rar20_members_just_under_4_gib_spool_and_store() {
-    let size = u32::MAX as u64 - 8;
+#[ignore = "compresses an encrypted member of just under 4 GiB into a spool, then stores it"]
+fn an_encrypted_rar20_member_just_under_4_gib_spools() {
     sized_round_trip(
         ArchiveVersion::Rar20,
         MemberCoding::Compressed,
         Some(b"secret"),
-        size,
+        u32::MAX as u64 - 8,
         true,
         false,
     );
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+#[ignore = "stores an encrypted member of just under 4 GiB"]
+fn an_encrypted_rar20_member_just_under_4_gib_stores() {
     sized_round_trip(
         ArchiveVersion::Rar20,
         MemberCoding::Stored,
         Some(b"secret"),
-        size,
+        u32::MAX as u64 - 8,
         true,
         true,
     );
