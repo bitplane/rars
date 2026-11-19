@@ -1,3 +1,4 @@
+use super::plan::FILTER_SEARCH_BYTES;
 use super::*;
 use crate::codec::rar50::EncodeOptions;
 #[cfg(test)]
@@ -120,7 +121,7 @@ pub(super) fn candidates_with_allowance<B: Budget>(
     Ok(best)
 }
 
-use crate::filter_search::search_applies as auto_size_filter_search_applies;
+use crate::filter_search::search_applies_throughout as auto_size_filter_search_applies;
 
 /// How many bytes the encoder will walk while packing this member, for progress
 /// to scale by.
@@ -574,6 +575,7 @@ mod dictionary_encoding_tests {
         let search = Rar50OwnedSearch {
             algorithm_version: 0,
             file_offset: 0,
+            piece: false,
             allowance: Allowance::limited(0),
         };
         let filter = FilterSpec::whole(FilterKind::Delta { channels: 1 });
@@ -623,6 +625,9 @@ struct Rar50OwnedSearch<B: Budget> {
     /// Where the data searched starts in its member. The x86 filters convert
     /// by file position, so a run has to be measured at its own.
     file_offset: usize,
+    /// Whether this is one piece of a larger member, which measures E8 alone
+    /// alongside E8E9 (see `prices_calls_alone`).
+    piece: bool,
     allowance: B,
 }
 impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
@@ -636,6 +641,9 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
     }
     fn detects_x86(&self) -> bool {
         true
+    }
+    fn prices_calls_alone(&self) -> bool {
+        self.piece
     }
     fn max_delta_channels(&self) -> usize {
         crate::codec::rar50::MAX_DELTA_CHANNELS
@@ -703,20 +711,75 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         )?)
     }
 }
+/// Chooses a whole member's filters, and returns them with the member packed
+/// under them.
+///
+/// A member longer than one [`FILTER_SEARCH_BYTES`] piece is searched a piece
+/// at a time, on the grid the block path cuts it into runs and pieces, with
+/// the same search each of those gets. Searched whole, one 32 MiB search had
+/// to pick a handful of x86 regions and samples for the whole member, and it
+/// came out 0.2% to 1.3% larger than the runs' searches on most binaries.
+/// Both paths now pick the same filters for a member.
 fn choose_owned_filter<B: Budget>(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
     allowance: &B,
 ) -> Result<crate::filter_search::FilterChoice<B>> {
-    choose_filter_at(data, 0, algorithm_version, options, progress, allowance)
+    if data.len() <= FILTER_SEARCH_BYTES {
+        return choose_filter_at(
+            data,
+            0,
+            false,
+            algorithm_version,
+            options,
+            progress,
+            allowance,
+        );
+    }
+    let run = options
+        .max_match_distance
+        .max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE);
+    let mut specs = Buffer::new(allowance);
+    for run_start in (0..data.len()).step_by(run) {
+        let run_end = (run_start + run).min(data.len());
+        for start in (run_start..run_end).step_by(FILTER_SEARCH_BYTES) {
+            let end = (start + FILTER_SEARCH_BYTES).min(run_end);
+            let found = piece_filters(
+                &data[start..end],
+                start,
+                algorithm_version,
+                options,
+                borrow_progress(&mut progress),
+                allowance,
+            )?;
+            for spec in found.iter() {
+                let range = spec
+                    .range
+                    .clone()
+                    .map_or(start..end, |range| start + range.start..start + range.end);
+                specs.try_push(FilterSpec::range(spec.kind, range))?;
+            }
+        }
+    }
+    let packed = specs_with_allowance(
+        data,
+        algorithm_version,
+        &specs,
+        options,
+        progress,
+        allowance,
+    )?;
+    Ok((specs, packed))
 }
 
-/// The search over `data`, which starts `file_offset` bytes into its member.
+/// The search over `data`, which starts `file_offset` bytes into its member
+/// and is all of it unless `piece`.
 fn choose_filter_at<B: Budget>(
     data: &[u8],
     file_offset: usize,
+    piece: bool,
     algorithm_version: u8,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
@@ -726,6 +789,7 @@ fn choose_filter_at<B: Budget>(
         &Rar50OwnedSearch {
             algorithm_version,
             file_offset,
+            piece,
             allowance: allowance.clone(),
         },
         data,
@@ -751,19 +815,39 @@ pub(super) fn run_filters_with_allowance<B: Budget>(
     cancelled: &dyn Fn() -> bool,
     allowance: &B,
 ) -> Result<Buffer<FilterSpec, B>> {
+    let mut progress = |_| !cancelled();
+    piece_filters(
+        data,
+        file_offset,
+        algorithm_version,
+        options,
+        Some(&mut progress),
+        allowance,
+    )
+}
+
+/// The search [`run_filters_with_allowance`] makes, reporting to `progress`.
+fn piece_filters<B: Budget>(
+    data: &[u8],
+    file_offset: usize,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<FilterSpec, B>> {
     let past_offsets = file_offset
         .checked_add(data.len())
         .is_none_or(|end| end > FILTER_REACH);
     if past_offsets || !auto_size_filter_search_applies(data) {
         return Ok(Buffer::new(allowance));
     }
-    let mut progress = |_| !cancelled();
     choose_filter_at(
         data,
         file_offset,
+        true,
         algorithm_version,
         run_search_options(options),
-        Some(&mut progress),
+        progress,
         allowance,
     )
     .map(|(specs, _)| specs)
