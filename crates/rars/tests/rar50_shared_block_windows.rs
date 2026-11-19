@@ -1,7 +1,7 @@
 #![cfg(all(feature = "write", feature = "parallel"))]
 
-//! Consecutive runs of a member in one wave share a window and a match index
-//! (#276). At one thread a wave holds one run, so nothing is shared; at
+//! Consecutive runs of a member in one wave share a window, and those that
+//! walk chains a match index (#276). At one thread a wave holds one run, so nothing is shared; at
 //! several, runs of the same member share. The archive must not change.
 
 use rars::rar50::{self, ArchiveEntry, ArchiveExtras, FilterPolicy, WriterOptions};
@@ -47,8 +47,8 @@ fn text(size: usize, seed: u64) -> Vec<u8> {
 }
 
 /// With a 1 MiB dictionary a run is 1 MiB and its window up to 2 MiB, which
-/// the optimal parse searches through a packed index. Two members two runs
-/// long, the second of one cut short. A wave of four takes the first
+/// the optimal parse searches through a tree seeded with the history. Two
+/// members two runs long, the second of one cut short. A wave of four takes the first
 /// member's runs and then the second's, and each member's two share.
 fn members() -> Vec<(&'static str, Vec<u8>)> {
     vec![
