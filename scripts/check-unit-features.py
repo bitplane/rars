@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run isolated library unit tests for all 16 optional-feature combinations.
+"""Lint and test the library units for all 16 optional-feature combinations.
 
 Use --features none or a comma-separated subset for one configuration. This
 selects only rars's library harness, avoiding workspace feature unification.
@@ -45,15 +45,23 @@ def main():
     for features in combinations:
         name = "-".join(features) or "none"
         flags = ["--features", ",".join(features)] if features else []
-        command = ["cargo", "test", "--locked", "-p", "rars", "--lib",
-                   "--no-default-features", *flags]
+        selection = ["--locked", "-p", "rars", "--lib", "--no-default-features", *flags]
+        # The workspace clippy run only sees the unit tests with every feature
+        # on; the test profile lints the unit-test target of this subset.
+        commands = [
+            ["cargo", "clippy", *selection, "--profile", "test", "--", "-D", "warnings"],
+            ["cargo", "test", *selection],
+        ]
         print(f"Testing library units: {name}", flush=True)
         log_path = logs / (name + ".log")
         with log_path.open("w") as log:
-            log.write("$ " + " ".join(command) + "\n")
-            log.flush()
-            result = subprocess.run(command, cwd=ROOT, env=env,
-                                    stdout=log, stderr=subprocess.STDOUT)
+            for command in commands:
+                log.write("$ " + " ".join(command) + "\n")
+                log.flush()
+                result = subprocess.run(command, cwd=ROOT, env=env,
+                                        stdout=log, stderr=subprocess.STDOUT)
+                if result.returncode:
+                    break
         if result.returncode:
             print(log_path.read_text()[-16000:])
             raise SystemExit(result.returncode)
