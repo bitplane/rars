@@ -595,6 +595,7 @@ impl Archive {
             let selected = crate::extraction_control::select(
                 &mut selector,
                 options,
+                &mut budget,
                 || crate::rar13_member(entry),
                 solid,
             )?;
