@@ -747,7 +747,7 @@ fn encoder_rejects_matches_beyond_the_configured_distance() {
 fn missing_literal_code_has_a_nonzero_refinement_cost() {
     let lengths = [0u8; super::TABLE_COUNT];
     let prices = CostModel::new(&lengths);
-    assert_eq!(prices.literal_bits(b"x", 0, 1), super::ABSENT_LITERAL_BITS);
+    assert_eq!(prices.literal_bits(b"x", 0, 1), super::ABSENT_SYMBOL_BITS);
 }
 
 #[test]
@@ -1425,7 +1425,8 @@ fn the_optimal_parse_decodes_whatever_it_is_given() {
 fn solid_encoder_reuses_rar20_tables_at_member_boundary() {
     let first: Vec<_> = (0u8..=255).cycle().take(4096).collect();
     let second = b"short literal member after reused rar20 table boundary\n";
-    let independent = unpack20_encode_literals(second).unwrap();
+    // The same member started afresh, so with the fixed table sent first.
+    let independent = Unpack20Encoder::new().encode_member(second).unwrap();
     let mut encoder = Unpack20Encoder::new();
     let first_packed = encoder.encode_member(&first).unwrap();
     let second_packed = encoder.encode_member(second).unwrap();
@@ -1575,14 +1576,15 @@ fn priced_parses_code_to_the_unpruned_search_bytes() {
         })
         .collect();
 
-    // Captured from the encoder that priced every candidate in full.
+    // Captured from the encoder that priced every candidate in full, then again
+    // once the pre-table was weighted and absent symbols priced (all smaller).
     assert_eq!(
         fingerprints,
         [
-            (32_479, 1_342_981_877),
-            (5_915, 3_334_173_363),
-            (32_596, 1_397_434_958),
-            (5_948, 2_954_067_044),
+            (32_358, 1_534_072_347),
+            (5_515, 1_502_738_075),
+            (32_572, 3_375_507_439),
+            (5_945, 2_977_992_424),
         ]
     );
 }
@@ -1640,25 +1642,93 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
     }
 
     // Captured from master 61e9cbe0: per level, text, random, windowed, then the
-    // second solid member at a full and a 16 KiB window.
+    // second solid member at a full and a 16 KiB window. Captured again once the
+    // pre-table was weighted and absent symbols priced: every size is smaller
+    // or, for the solid members on the fixed table, unchanged.
     assert_eq!(
         fingerprints,
         [
-            (25_867, 375_757_556),
-            (164_043, 1_793_404_310),
-            (103_519, 1_847_793_703),
+            (25_859, 2_641_971_409),
+            (164_029, 839_806_478),
+            (103_480, 2_967_299_663),
             (21_255, 3_686_877_865),
             (31_358, 4_238_223_832),
-            (22_250, 695_168_011),
-            (164_043, 1_793_404_310),
-            (102_295, 2_521_304_095),
+            (22_246, 2_253_461_410),
+            (164_029, 839_806_478),
+            (102_255, 2_444_247_513),
             (16_600, 3_409_808_212),
             (25_963, 4_073_131_303),
-            (21_196, 2_351_889_793),
-            (164_042, 643_216_834),
-            (101_981, 1_052_764_375),
+            (20_086, 1_796_864_836),
+            (164_028, 3_930_170_070),
+            (101_648, 3_016_247_063),
             (15_486, 1_553_409_529),
             (25_937, 4_031_144_444),
         ]
     );
+}
+
+#[test]
+fn a_match_that_copies_the_last_one_becomes_a_repeat() {
+    let mut tokens = [
+        EncodeToken::Match {
+            length: 5,
+            offset: 300,
+        },
+        EncodeToken::Literal(b'x'),
+        EncodeToken::OldOffset {
+            index: 0,
+            length: 5,
+            offset: 300,
+        },
+        EncodeToken::ShortOffset { offset: 4 },
+        EncodeToken::ShortOffset { offset: 4 },
+        EncodeToken::Match {
+            length: 6,
+            offset: 4,
+        },
+    ];
+    assert!(super::use_repeats(&mut tokens, Some((5, 300))));
+    assert_eq!(
+        tokens,
+        [
+            EncodeToken::RepeatLast,
+            EncodeToken::Literal(b'x'),
+            EncodeToken::RepeatLast,
+            EncodeToken::ShortOffset { offset: 4 },
+            EncodeToken::RepeatLast,
+            EncodeToken::Match {
+                length: 6,
+                offset: 4,
+            },
+        ]
+    );
+}
+
+#[test]
+fn the_pre_table_codes_common_levels_shorter() {
+    let mut table = [0u8; super::TABLE_COUNT];
+    for (symbol, length) in table[..256].iter_mut().enumerate() {
+        *length = [8, 8, 8, 9, 10, 11, 12, 13][symbol % 8];
+    }
+    table[256] = 7;
+    let tokens = super::encode_table_level_tokens(&table);
+    let lengths = super::level_code_lengths_for_tokens(&tokens);
+    let mut used = [false; LEVEL_COUNT];
+    for token in &tokens {
+        used[token.symbol] = true;
+    }
+    let flat = level_code_lengths_for_used_symbols(used);
+    let bits = |lengths: &[u8; LEVEL_COUNT]| -> usize {
+        tokens
+            .iter()
+            .map(|token| usize::from(lengths[token.symbol]))
+            .sum()
+    };
+    assert!(bits(&lengths) < bits(&flat), "{lengths:?} against {flat:?}");
+    let kraft: u32 = lengths
+        .iter()
+        .filter(|&&len| len != 0)
+        .map(|&len| 1u32 << (15 - len))
+        .sum();
+    assert_eq!(kraft, 1 << 15, "{lengths:?} leaves part of the code unused");
 }

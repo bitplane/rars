@@ -3139,7 +3139,7 @@ mod tests {
     fn header_budget_refuses_full_reads_after_plain_and_encrypted_prefixes() {
         use crate::parse_budget::{ParseBudget, PrefixReader};
         let options = crate::ArchiveReadOptions::new().with_max_header_bytes(63);
-        let mut plain = vec![0u8; 16];
+        let mut plain = [0u8; 16];
         plain[5] = 64;
         let mut prefix = vec![0; 7]; // skipped marker bytes
         prefix.extend_from_slice(&plain[..7]);
@@ -4083,7 +4083,7 @@ mod tests {
                     bytes.len() as u64,
                     0,
                     ArchiveSource::Memory(Arc::from(bytes.clone())),
-                    cancellation.map_or_else(|| options, |token| options.with_cancellation(token)),
+                    cancellation.map_or(options, |token| options.with_cancellation(token)),
                 )
             };
             let archive = parse(usize::MAX, None).unwrap();
