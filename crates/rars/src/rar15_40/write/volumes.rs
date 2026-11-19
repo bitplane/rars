@@ -201,7 +201,14 @@ pub(super) fn split_members_above(
     });
     let work = WorkTracker::new(Some(progress), operation, total_work);
     let mut solid_encoder = if solid {
-        Some(SolidEncoder::for_target(options)?)
+        Some(SolidEncoder::for_chain(
+            members,
+            options,
+            coding,
+            Some(stream_above),
+            resources,
+            &work,
+        )?)
     } else {
         None
     };

@@ -178,11 +178,15 @@ fn ppmd_progress_preserves_bytes_and_interrupts_both_engines() {
         } else {
             super::unpack29_encode_ppmd_literals(&input).unwrap()
         };
-        let actual =
-            super::unpack29_encode_ppmd_with_progress(&input, escapes, None, 1 << 20, &mut |_| {
-                true
-            })
-            .unwrap();
+        let actual = super::unpack29_encode_ppmd_with_progress(
+            &input,
+            escapes,
+            None,
+            1 << 20,
+            super::PpmdModelSize::DEFAULT,
+            &mut |_| true,
+        )
+        .unwrap();
         assert_eq!(actual, expected);
         let mut stopped_at = 0;
         let result = super::unpack29_encode_ppmd_with_progress(
@@ -190,6 +194,7 @@ fn ppmd_progress_preserves_bytes_and_interrupts_both_engines() {
             escapes,
             None,
             1 << 20,
+            super::PpmdModelSize::DEFAULT,
             &mut |position| {
                 stopped_at = position;
                 position < 4096
@@ -211,6 +216,7 @@ fn ppmd_progress_covers_entry_filtered_preprocessing_and_completion() {
                 escapes,
                 None,
                 1 << 20,
+                super::PpmdModelSize::DEFAULT,
                 &mut |position| {
                     calls.push(position);
                     false
@@ -227,6 +233,7 @@ fn ppmd_progress_covers_entry_filtered_preprocessing_and_completion() {
                 escapes,
                 None,
                 1 << 20,
+                super::PpmdModelSize::DEFAULT,
                 &mut |position| {
                     if position == input.len() {
                         completions += 1;
@@ -243,10 +250,17 @@ fn ppmd_progress_covers_entry_filtered_preprocessing_and_completion() {
     let mut polls = 0;
     let filter = crate::FilterSpec::whole(crate::FilterKind::E8);
     assert_eq!(
-        super::unpack29_encode_ppmd_with_progress(&input, true, Some(filter), 1 << 20, &mut |_| {
-            polls += 1;
-            polls < 3
-        },),
+        super::unpack29_encode_ppmd_with_progress(
+            &input,
+            true,
+            Some(filter),
+            1 << 20,
+            super::PpmdModelSize::DEFAULT,
+            &mut |_| {
+                polls += 1;
+                polls < 3
+            },
+        ),
         Err(super::Error::Cancelled)
     );
     // Entry, the bounded filter record, then the PPMd block itself.
@@ -259,6 +273,7 @@ fn ppmd_progress_covers_entry_filtered_preprocessing_and_completion() {
             true,
             Some(crate::FilterSpec::whole(crate::FilterKind::E8)),
             1 << 20,
+            super::PpmdModelSize::DEFAULT,
             &mut |_| {
                 polls += 1;
                 polls < 2
@@ -5147,6 +5162,7 @@ fn a_filtered_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes() {
             escapes.is_some(),
             Some(filter.clone()),
             escapes.unwrap_or(0),
+            super::PpmdModelSize::DEFAULT,
             &mut |_| true,
         )
         .unwrap();
@@ -5241,5 +5257,59 @@ fn x86_filters_leave_operands_a_decoder_cannot_restore_unfiltered() {
             crate::codec::filters::e8e9_decode(&mut data, offset as u32, false);
         }
         assert_eq!(data, original, "{offset:#x}");
+    }
+}
+
+/// A chain keeps the PPMd model its first PPMd member starts, so the size is
+/// chosen there: whichever codes that member smallest, which every member
+/// after continues.
+#[test]
+fn a_chain_starts_its_ppmd_model_at_the_size_its_first_member_codes_smallest() {
+    use super::PpmdModelSize;
+    static SIZES: [PpmdModelSize; 3] = [
+        PpmdModelSize::DEFAULT,
+        PpmdModelSize {
+            order: 16,
+            memory_mb: 64,
+        },
+        PpmdModelSize {
+            order: 25,
+            memory_mb: 128,
+        },
+    ];
+    let members = [related_text_member(2, 3000), related_text_member(3, 3000)];
+    let alone: Vec<usize> = SIZES
+        .iter()
+        .map(|&size| {
+            super::unpack29_encode_ppmd_with_progress(
+                &members[0],
+                true,
+                None,
+                MAX_HISTORY,
+                size,
+                &mut |_| true,
+            )
+            .unwrap()
+            .len()
+        })
+        .collect();
+    let smallest = *alone.iter().min().unwrap();
+    let winner = SIZES[alone.iter().position(|&len| len == smallest).unwrap()];
+
+    let mut chain = Unpack29Encoder::with_options(EncodeOptions::default()).with_ppmd_sizes(&SIZES);
+    let mut decoder = super::Unpack29::new();
+    for (index, member) in members.iter().enumerate() {
+        let packed = chain
+            .encode_member_with_engine(member, ChainEngine::Ppmd, &[], &mut |_| true)
+            .unwrap();
+        if index == 0 {
+            assert_eq!(packed.len(), smallest);
+            // A reset, then the model's memory in megabytes less one.
+            assert_ne!(packed[0] & 0x20, 0);
+            assert_eq!(packed[1], winner.memory_mb - 1);
+        } else {
+            assert_eq!(packed[0] & 0x20, 0, "the second member restarted the model");
+        }
+        assert!(decoder.decode_member(&packed, member.len()).unwrap() == *member);
     }
 }
