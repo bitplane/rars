@@ -556,7 +556,7 @@ fn code_lz_block(
     for _ in 0..refinements {
         let prices = absent_priced(&best_table);
         let cost_model = CostModel::new(&prices);
-        let next_tokens = encode_tokens_with_progress(
+        let mut next_tokens = encode_tokens_with_progress(
             window,
             start,
             options,
@@ -569,6 +569,24 @@ fn code_lz_block(
         let next_table = table_lengths_for_tokens(&next_tokens, None, more)?;
         let mut next = BitWriter::default();
         write_lz_block(&mut next, &next_tokens, header, None, &next_table, more)?;
+        // The repeats are tried on the packed result only. Prices drawn from a
+        // table with them in would make the next parse shun the very matches
+        // that become repeats, which cost 0.18% on an unstripped binary.
+        if matches.is_some() && use_repeats(&mut next_tokens, state.last_match) {
+            let repeat_table = table_lengths_for_tokens(&next_tokens, None, more)?;
+            let mut repeated = BitWriter::default();
+            write_lz_block(
+                &mut repeated,
+                &next_tokens,
+                header,
+                None,
+                &repeat_table,
+                more,
+            )?;
+            if repeated.bytes.len() < next.bytes.len() {
+                next = repeated;
+            }
+        }
         if next.bytes.len() >= best.bytes.len() {
             break;
         }
@@ -598,8 +616,9 @@ fn absent_priced(table: &[u8; TABLE_COUNT]) -> [u8; TABLE_COUNT] {
 /// offset. The shortest-path parse does not know the symbol, so it is found
 /// after the parse; the greedy one already uses it as it goes. The reader
 /// moves its recent offsets the same way for either, so nothing after the
-/// swap changes.
-fn use_repeats(tokens: &mut [EncodeToken], mut last_match: Option<(usize, usize)>) {
+/// swap changes. Returns whether anything was swapped.
+fn use_repeats(tokens: &mut [EncodeToken], mut last_match: Option<(usize, usize)>) -> bool {
+    let mut swapped = false;
     for token in tokens {
         let this = match *token {
             EncodeToken::Literal(_) => continue,
@@ -608,11 +627,13 @@ fn use_repeats(tokens: &mut [EncodeToken], mut last_match: Option<(usize, usize)
             | EncodeToken::Match { length, offset } => (usize::from(length), offset as usize),
             EncodeToken::ShortOffset { offset } => (2, offset as usize),
         };
-        if last_match == Some(this) {
+        if last_match == Some(this) && *token != EncodeToken::RepeatLast {
             *token = EncodeToken::RepeatLast;
+            swapped = true;
         }
         last_match = Some(this);
     }
+    swapped
 }
 
 /// `more` when another block follows, whose tables symbol 269 announces.
@@ -1191,16 +1212,14 @@ fn encode_tokens_with_progress(
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     if let (Some(cost_model), Some(matches)) = (cost_model, matches) {
-        let mut tokens = encode_tokens_optimal(
+        return Ok(encode_tokens_optimal(
             combined,
             start,
             combined.len(),
             matches,
             cost_model,
             state.old_offsets,
-        );
-        use_repeats(&mut tokens, state.last_match);
-        return Ok(tokens);
+        ));
     }
     let mut tokens = Vec::new();
     // No match reaches past the dictionary, so the finder need not either.

@@ -1425,7 +1425,8 @@ fn the_optimal_parse_decodes_whatever_it_is_given() {
 fn solid_encoder_reuses_rar20_tables_at_member_boundary() {
     let first: Vec<_> = (0u8..=255).cycle().take(4096).collect();
     let second = b"short literal member after reused rar20 table boundary\n";
-    let independent = unpack20_encode_literals(second).unwrap();
+    // The same member started afresh, so with the fixed table sent first.
+    let independent = Unpack20Encoder::new().encode_member(second).unwrap();
     let mut encoder = Unpack20Encoder::new();
     let first_packed = encoder.encode_member(&first).unwrap();
     let second_packed = encoder.encode_member(second).unwrap();
@@ -1575,14 +1576,15 @@ fn priced_parses_code_to_the_unpruned_search_bytes() {
         })
         .collect();
 
-    // Captured from the encoder that priced every candidate in full.
+    // Captured from the encoder that priced every candidate in full, then again
+    // once the pre-table was weighted and absent symbols priced (all smaller).
     assert_eq!(
         fingerprints,
         [
-            (32_479, 1_342_981_877),
-            (5_915, 3_334_173_363),
-            (32_596, 1_397_434_958),
-            (5_948, 2_954_067_044),
+            (32_358, 1_534_072_347),
+            (5_515, 1_502_738_075),
+            (32_572, 3_375_507_439),
+            (5_945, 2_977_992_424),
         ]
     );
 }
@@ -1640,23 +1642,25 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
     }
 
     // Captured from master 61e9cbe0: per level, text, random, windowed, then the
-    // second solid member at a full and a 16 KiB window.
+    // second solid member at a full and a 16 KiB window. Captured again once the
+    // pre-table was weighted and absent symbols priced: every size is smaller
+    // or, for the solid members on the fixed table, unchanged.
     assert_eq!(
         fingerprints,
         [
-            (25_867, 375_757_556),
-            (164_043, 1_793_404_310),
-            (103_519, 1_847_793_703),
+            (25_859, 2_641_971_409),
+            (164_029, 839_806_478),
+            (103_480, 2_967_299_663),
             (21_255, 3_686_877_865),
             (31_358, 4_238_223_832),
-            (22_250, 695_168_011),
-            (164_043, 1_793_404_310),
-            (102_295, 2_521_304_095),
+            (22_246, 2_253_461_410),
+            (164_029, 839_806_478),
+            (102_255, 2_444_247_513),
             (16_600, 3_409_808_212),
             (25_963, 4_073_131_303),
-            (21_196, 2_351_889_793),
-            (164_042, 643_216_834),
-            (101_981, 1_052_764_375),
+            (20_086, 1_796_864_836),
+            (164_028, 3_930_170_070),
+            (101_648, 3_016_247_063),
             (15_486, 1_553_409_529),
             (25_937, 4_031_144_444),
         ]
@@ -1683,7 +1687,7 @@ fn a_match_that_copies_the_last_one_becomes_a_repeat() {
             offset: 4,
         },
     ];
-    super::use_repeats(&mut tokens, Some((5, 300)));
+    assert!(super::use_repeats(&mut tokens, Some((5, 300))));
     assert_eq!(
         tokens,
         [
