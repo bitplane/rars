@@ -955,6 +955,7 @@ fn write_members_to(
 /// The two are separate questions: which engine compresses this content best,
 /// and which transform makes it easier to compress. They used to be one enum,
 /// which meant some combinations simply could not be asked for.
+#[allow(clippy::too_many_arguments)]
 fn encode_rar29_policy_filtered_payload(
     data: &[u8],
     policy: &FilterPolicy,
@@ -963,6 +964,7 @@ fn encode_rar29_policy_filtered_payload(
     lz_method: u8,
     ppmd_trial: bool,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     // An empty member is stored whatever was asked for. A filter over it is a
     // 0..0 range, which the codec refuses, so an archive holding one empty file
@@ -1002,7 +1004,7 @@ fn encode_rar29_policy_filtered_payload(
             encode_rar29_lz_member(data, options, lz_method, progress)
         }
         (Rar29Method::Lz, FilterPolicy::Auto) => encode_rar29_auto_filtered_member_with_progress(
-            data, options, lz_method, false, progress,
+            data, options, lz_method, false, progress, resources,
         ),
         (Rar29Method::Lz, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
             data: with_codec_progress(progress, |report| {
@@ -1015,7 +1017,7 @@ fn encode_rar29_policy_filtered_payload(
             method: lz_method,
         }),
         (Rar29Method::Auto, FilterPolicy::Auto) => encode_rar29_auto_filtered_member_with_progress(
-            data, options, lz_method, ppmd_trial, progress,
+            data, options, lz_method, ppmd_trial, progress, resources,
         ),
         (Rar29Method::Auto, policy) => {
             let mut best = match policy {
@@ -1271,7 +1273,14 @@ fn encode_rar29_auto_filtered_member(
     lz_method: u8,
     include_ppmd: bool,
 ) -> Result<EncodedPayload> {
-    encode_rar29_auto_filtered_member_with_progress(data, options, lz_method, include_ppmd, None)
+    encode_rar29_auto_filtered_member_with_progress(
+        data,
+        options,
+        lz_method,
+        include_ppmd,
+        None,
+        None,
+    )
 }
 
 fn encode_rar29_auto_filtered_member_with_progress(
@@ -1280,6 +1289,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
     lz_method: u8,
     include_ppmd: bool,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     // The search measures the unfiltered member as one of its own candidates
     // and returns the winner's bytes, so encoding the member plainly here as
@@ -1298,22 +1308,21 @@ fn encode_rar29_auto_filtered_member_with_progress(
             // filter suits the member does not depend on how hard the parse
             // tries, and the lazy encode stays in hand in case it codes smaller.
             let lazy = options.with_optimal_parse_passes(0);
-            let mut last = 0usize;
-            let (filters, measured) = crate::filter_search::choose_filter(
+            // The member's own charge holds one finalist's encode. Each one
+            // encoded beside it is charged its own, and only while it runs.
+            let each = crate::codec::rar29::member_encode_workspace(data.len(), lazy);
+            let (filters, measured) = crate::filter_search::choose_filter_side_by_side(
                 &Rar29Search,
                 data,
                 lazy,
-                Some(&mut |event| match event {
-                    crate::filter_search::EncodeProgress::PassStarted => {
-                        last = 0;
+                Some(&|walked| {
+                    if walked == 0 {
                         !progress.is_some_and(WorkTracker::is_cancelled)
-                    }
-                    crate::filter_search::EncodeProgress::Advanced(position) => {
-                        let delta = position.saturating_sub(last);
-                        last = position;
-                        progress.is_none_or(|work| work.advance(delta as u64))
+                    } else {
+                        progress.is_none_or(|work| work.advance(walked as u64))
                     }
                 }),
+                &|| resources.and_then(|resources| resources.try_acquire(each)),
             )?;
             if options.optimal_parse_passes == 0 {
                 measured
@@ -1912,12 +1921,21 @@ fn encode_member<'a>(
             data: data.into_owned(),
             method: 0x30,
         },
-        MemberCoding::Compressed => {
-            encode_or_store_payload(&data, options, solid_encoder, Some(progress))?
-        }
-        MemberCoding::Filtered(policy) => {
-            encode_filtered_payload(&data, policy, options, solid_encoder, Some(progress))?
-        }
+        MemberCoding::Compressed => encode_or_store_payload(
+            &data,
+            options,
+            solid_encoder,
+            Some(progress),
+            Some(resources),
+        )?,
+        MemberCoding::Filtered(policy) => encode_filtered_payload(
+            &data,
+            policy,
+            options,
+            solid_encoder,
+            Some(progress),
+            Some(resources),
+        )?,
     };
     Ok(EncodedMember {
         payload: MemberPayload::Packed(payload.data),
@@ -3374,6 +3392,7 @@ fn encode_filtered_payload(
     options: WriterOptions,
     solid_encoder: &mut Option<SolidEncoder>,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     let lz_method = compression_method_for_level(options);
     // A named filter under forced PPMd is the one request the chain cannot
@@ -3395,6 +3414,7 @@ fn encode_filtered_payload(
                 lz_method,
                 ppmd_trial_pays(lz_method.saturating_sub(0x30)),
                 progress,
+                resources,
             )?;
             return stored_unless_smaller(data, payload, options, solid_encoder);
         }
@@ -3473,6 +3493,7 @@ fn encode_or_store_payload(
     options: WriterOptions,
     solid_encoder: &mut Option<SolidEncoder>,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     let target = options.target;
     if options.compression_level == Some(0) {
@@ -3504,6 +3525,7 @@ fn encode_or_store_payload(
             lz_method,
             ppmd_trial_pays(lz_method.saturating_sub(0x30)),
             progress,
+            resources,
         )?;
         return stored_unless_smaller(data, payload, options, solid_encoder);
     }
@@ -4620,6 +4642,90 @@ mod tests {
         ));
         assert_eq!(callback.0.load(Ordering::Relaxed), 2);
         assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn finalists_run_side_by_side_only_in_room_the_budget_grants() {
+        use crate::atomic64::AtomicU64;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        // Stereo 16-bit samples, so delta reaches the finalists beside the
+        // plain member, and long enough that the plain one runs beside the screens.
+        let mut data = Vec::with_capacity(1 << 20);
+        let mut noise = 0x2545_f491_u32;
+        for frame in 0..(1 << 18) {
+            for channel in 0..2 {
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                let wave = ((frame as f64 / (40.0 + 13.0 * channel as f64)).sin() * 12000.0) as i16;
+                data.extend_from_slice(&wave.wrapping_add((noise % 64) as i16).to_le_bytes());
+            }
+        }
+        let entry = super::FileEntry {
+            name: b"pcm",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        };
+        let mut options =
+            super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
+        options.compression_level = Some(1);
+        let charge = super::member_workspace(options, data.len() as u64, true, false);
+        let lazy = super::rar29_encode_options_for_options(options)
+            .unwrap()
+            .with_optimal_parse_passes(0);
+        let pool = crate::parallel::private_pool(4);
+        let room = pool.install(|| crate::codec::rar29::member_encode_workspace(data.len(), lazy));
+        let encode = |limit: u64| {
+            let resources = crate::WriterResources::new(limit);
+            let peak = Arc::new(AtomicU64::new(0));
+            let watch = {
+                let (resources, peak) = (resources.clone(), peak.clone());
+                move |_: crate::WriteProgressEvent<'_>| {
+                    peak.fetch_max(resources.workspace_in_use(), Ordering::SeqCst);
+                }
+            };
+            let work = super::WorkTracker::new(
+                Some(super::ProgressReporter(&watch)),
+                crate::WriteOperation::Compression,
+                data.len() as u64,
+            );
+            let encoded = pool
+                .install(|| {
+                    super::encode_member(
+                        &super::Member::from_file(&entry),
+                        options,
+                        &crate::MemberCoding::Compressed,
+                        &mut None,
+                        &resources,
+                        &work,
+                    )
+                })
+                .unwrap();
+            assert_eq!(resources.workspace_in_use(), 0, "every room handed back");
+            let super::MemberPayload::Packed(packed) = encoded.payload else {
+                unreachable!("a member held in memory is packed in memory")
+            };
+            (packed, encoded.method, peak.load(Ordering::SeqCst))
+        };
+        // Room for nothing beside the member's own charge runs the finalists in turn.
+        let (in_turn, method, peak) = encode(charge);
+        assert_eq!(peak, charge);
+        assert_eq!(method, 0x31);
+        // Each encode beside the first is charged while it runs, and the
+        // finalists choose and code the same bytes however many run at once.
+        for (limit, most) in [(charge + room, charge + room), (u64::MAX, u64::MAX)] {
+            let (side_by_side, method, peak) = encode(limit);
+            assert!(side_by_side == in_turn, "limit {limit}");
+            assert_eq!(method, 0x31);
+            assert!(peak >= charge + room && peak <= most, "{peak} for {limit}");
+        }
     }
 
     fn binary_member(len: usize) -> Vec<u8> {
@@ -6882,6 +6988,7 @@ mod tests {
             0x35,
             true,
             None,
+            None,
         )
         .unwrap();
         let forced_ppmd = super::encode_rar29_policy_filtered_payload(
@@ -6891,6 +6998,7 @@ mod tests {
             EncodeOptions::default(),
             0x35,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -6923,6 +7031,7 @@ mod tests {
             0x35,
             true,
             None,
+            None,
         )
         .unwrap();
         let plain_lz = super::encode_rar29_policy_filtered_payload(
@@ -6932,6 +7041,7 @@ mod tests {
             options,
             0x35,
             false,
+            None,
             None,
         )
         .unwrap();

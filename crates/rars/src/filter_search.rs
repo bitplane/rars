@@ -1118,6 +1118,260 @@ pub(crate) fn choose_filter<S: FilterSearch>(
     .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
 }
 
+/// [`choose_filter`], with the whole-member encodes run side by side where
+/// there is room for them.
+///
+/// Each finalist's encode fans out inside, but it still fills its match finder
+/// ahead and screens its filters serially, so encoding the finalists one after
+/// another leaves most threads idle for most of the search. Run beside each
+/// other, those serial stretches overlap. The plain member is a finalist the
+/// screen cannot measure on anything but a member one sample long, so beyond
+/// that it is encoded while the screens run.
+///
+/// The choice is [`choose_filter`]'s: the finalists are the same, each is
+/// encoded the same way whatever runs beside it, and they are compared in
+/// order, the smallest winning and a tie going to the earlier. A failure is the
+/// one the earliest failing finalist met, as when they ran in turn.
+///
+/// `admit` is asked for room before each encode beyond the first that would
+/// run at once, and the room it hands back is held until that encode's bytes
+/// have been compared and the losers dropped. When it has none, the search
+/// waits for the encodes in flight instead, so it runs within what `admit`
+/// grants and never waits on it.
+///
+/// `progress` is told how many bytes an encode walked since it last reported,
+/// zero as each encode starts, from whichever thread runs it. False stops the
+/// search with [`crate::Error::Cancelled`].
+pub(crate) fn choose_filter_side_by_side<S, R>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
+    admit: &(dyn Fn() -> Option<R> + Sync),
+) -> Result<(Vec<FilterSpec>, Vec<u8>)>
+where
+    S: FilterSearch + Sync,
+    S::Options: Send + Sync,
+    R: Send,
+{
+    let search = UnlimitedSearch(search, Allowance::default());
+    match progress {
+        Some(progress) => side_by_side(
+            &SharedReporting {
+                search: &search,
+                progress,
+            },
+            data,
+            options,
+            admit,
+        ),
+        None => side_by_side(&search, data, options, admit),
+    }
+    .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
+}
+
+/// Reports every encode of a search to one sink, from whichever thread runs it.
+///
+/// Each encode keeps its own place, so encodes running side by side report
+/// what each of them walked rather than one another's positions.
+struct SharedReporting<'a, S> {
+    search: &'a S,
+    progress: &'a (dyn Fn(usize) -> bool + Sync),
+}
+
+impl<S: OwnedSearch> SharedReporting<'_, S> {
+    fn pass<T>(
+        &self,
+        encode: impl FnOnce(Option<&mut dyn FnMut(usize) -> bool>) -> Result<T>,
+    ) -> Result<T> {
+        if !(self.progress)(0) {
+            return Err(crate::Error::Cancelled);
+        }
+        let mut last = 0usize;
+        encode(Some(&mut |position| {
+            let walked = position.saturating_sub(last);
+            last = position;
+            (self.progress)(walked)
+        }))
+    }
+}
+
+impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
+    type Options = S::Options;
+    type Memory = S::Memory;
+    fn allowance(&self) -> &Self::Memory {
+        self.search.allowance()
+    }
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, S::Memory>> {
+        self.search.screened_kinds(data)
+    }
+    fn detects_x86(&self) -> bool {
+        self.search.detects_x86()
+    }
+    fn max_delta_channels(&self) -> usize {
+        self.search.max_delta_channels()
+    }
+    fn screen_options(&self, options: Self::Options) -> Self::Options {
+        self.search.screen_options(options)
+    }
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
+        self.search.filtered_bytes(data, filters)
+    }
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: Self::Options,
+        _: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.pass(|progress| self.search.encode_plain(data, options, progress))
+    }
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: Self::Options,
+        _: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.pass(|progress| {
+            self.search
+                .encode_filtered(data, filters, options, progress)
+        })
+    }
+}
+
+fn side_by_side<S, R>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    admit: &(dyn Fn() -> Option<R> + Sync),
+) -> Result<FilterChoice<S::Memory>>
+where
+    S: OwnedSearch + Sync,
+    S::Options: Send + Sync,
+    R: Send,
+{
+    let at_once = if crate::parallel::may_nest() {
+        crate::parallel::threads()
+    } else {
+        1
+    };
+    // The screen measures the plain member itself only when the member is no
+    // longer than its sample. Past that the plain encode is always the first
+    // finalist, and nothing the screen decides changes it, so it can start at
+    // once. The room taken for the screens beside it then goes to the
+    // finalists after it, one at a time, for as long as it runs.
+    let early = if at_once > 1 && data.len() > SCREEN_SAMPLE_LEN {
+        admit()
+    } else {
+        None
+    };
+    let Some(room) = early else {
+        let finalists = finalists(search, data, options)?.into_iter();
+        return Ok(smallest(search, data, options, finalists, at_once, admit)?
+            .expect("the unfiltered member is always a finalist"));
+    };
+    let (plain, rest) = crate::parallel::join(
+        || search.encode_plain(data, options, None),
+        || -> Result<Result<_>> {
+            let mut finalists = finalists(search, data, options)?.into_iter();
+            let plain = finalists.next().expect("the plain member is first");
+            debug_assert!(plain.0.is_empty() && plain.1.is_none());
+            let rest = smallest(search, data, options, finalists, at_once - 1, admit);
+            drop(room);
+            Ok(rest)
+        },
+    );
+    // In the order they would have failed in turn: the screens, the plain
+    // member, then the finalists after it.
+    let rest = rest?;
+    let plain = plain?;
+    Ok(match rest? {
+        Some(rest) if rest.1.len() < plain.len() => rest,
+        _ => (Buffer::new(search.allowance()), plain),
+    })
+}
+
+/// The smallest of `finalists`, the earliest on a tie, with up to `at_once` of
+/// them encoded side by side.
+///
+/// One encode at a time, and the smallest so far, are the caller's to cover;
+/// every encode beside that one runs in room `admit` grants, held until its
+/// bytes have been compared and the larger dropped. A failure is the earliest
+/// failing finalist's, and nothing after it is compared.
+fn smallest<S, R>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    finalists: impl Iterator<Item = Finalist<S::Memory>>,
+    at_once: usize,
+    admit: &(dyn Fn() -> Option<R> + Sync),
+) -> Result<Option<FilterChoice<S::Memory>>>
+where
+    S: OwnedSearch + Sync,
+    S::Options: Send + Sync,
+{
+    let encode = |(specs, measured): Finalist<S::Memory>| -> Result<FilterChoice<S::Memory>> {
+        let packed = match measured {
+            Some(packed) => packed,
+            None if specs.is_empty() => search.encode_plain(data, options, None)?,
+            None => search.encode_filtered(data, &specs, options, None)?,
+        };
+        Ok((specs, packed))
+    };
+    let mut finalists = finalists.peekable();
+    let mut best: Option<FilterChoice<S::Memory>> = None;
+    while let Some(first) = finalists.next() {
+        // A finalist the screen measured costs no encode, and so no room.
+        let mut encodes = usize::from(first.1.is_none());
+        let mut window = vec![first];
+        let mut rooms = Vec::new();
+        while let Some((_, measured)) = finalists.peek() {
+            if measured.is_none() {
+                if encodes >= at_once.max(1) {
+                    break;
+                }
+                if encodes > 0 {
+                    match admit() {
+                        Some(room) => rooms.push(room),
+                        None => break,
+                    }
+                }
+                encodes += 1;
+            }
+            window.push(finalists.next().expect("peeked"));
+        }
+        let (packed, failure) = if encodes > 1 {
+            crate::parallel::map_prefix(window, encode)
+        } else {
+            let mut packed = Vec::with_capacity(window.len());
+            let mut failure = None;
+            for finalist in window {
+                match encode(finalist) {
+                    Ok(choice) => packed.push(choice),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                }
+            }
+            (packed, failure)
+        };
+        for (specs, packed) in packed {
+            if best
+                .as_ref()
+                .is_none_or(|(_, best)| packed.len() < best.len())
+            {
+                best = Some((specs, packed));
+            }
+        }
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        drop(rooms);
+    }
+    Ok(best)
+}
+
 pub(crate) fn choose_owned<S: OwnedSearch>(
     search: &S,
     data: &[u8],
@@ -2915,5 +3169,296 @@ mod tests {
             vec![0..200, 400..500]
         );
         assert_eq!(disjoint_filter_ranges(vec![0..100, 100..200]), vec![0..200]);
+    }
+
+    /// A search whose whole-member encodes come out the sizes it is given, and
+    /// take longer the earlier the finalist, so encodes run side by side finish
+    /// out of order.
+    #[cfg(feature = "parallel")]
+    struct Scripted {
+        /// The plain member, then each delta width's whole and ranged encode.
+        sizes: [usize; 7],
+        /// The finalist that fails, by the same index, and how; 7 is the screen.
+        failures: Vec<(usize, &'static str)>,
+        in_flight: std::sync::atomic::AtomicUsize,
+        peak: std::sync::atomic::AtomicUsize,
+        /// Room granted and not yet handed back.
+        rooms: std::sync::atomic::AtomicUsize,
+        /// Set when more encodes ran at once than the room granted covers.
+        overran: std::sync::atomic::AtomicBool,
+        encodes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "parallel")]
+    impl Scripted {
+        const SAMPLE: usize = 8;
+        const SCREEN: usize = 7;
+
+        fn new(sizes: [usize; 7]) -> Self {
+            Self {
+                sizes,
+                failures: Vec::new(),
+                in_flight: 0.into(),
+                peak: 0.into(),
+                rooms: 0.into(),
+                overran: false.into(),
+                encodes: 0.into(),
+            }
+        }
+
+        fn encode(
+            &self,
+            finalist: usize,
+            len: usize,
+            progress: Option<&mut dyn FnMut(usize) -> bool>,
+        ) -> Result<Vec<u8>> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let running = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.encodes.fetch_add(1, SeqCst);
+            self.peak.fetch_max(running, SeqCst);
+            if running > 1 + self.rooms.load(SeqCst) {
+                self.overran.store(true, SeqCst);
+            }
+            let whole = finalist < Self::SCREEN;
+            if whole {
+                std::thread::sleep(std::time::Duration::from_millis(5 * (7 - finalist as u64)));
+            }
+            self.in_flight.fetch_sub(1, SeqCst);
+            if let Some(&(_, error)) = self.failures.iter().find(|&&(at, _)| at == finalist) {
+                return Err(crate::Error::InvalidArgument(error));
+            }
+            if progress.is_some_and(|report| !report(len)) {
+                return Err(crate::Error::Cancelled);
+            }
+            Ok(vec![0; if whole { self.sizes[finalist] } else { 1000 }])
+        }
+    }
+
+    #[cfg(feature = "parallel")]
+    impl FilterSearch for Scripted {
+        type Options = ();
+        fn screened_kinds(&self, _: &[u8]) -> Vec<FilterKind> {
+            (1..=3)
+                .map(|channels| FilterKind::Delta { channels })
+                .collect()
+        }
+        fn detects_x86(&self) -> bool {
+            false
+        }
+        fn max_delta_channels(&self) -> usize {
+            0
+        }
+        // A sample is tagged with the width it was filtered at, and each width
+        // wins its screen by the same margin, so none ranks another out.
+        fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
+            let mut data = data.to_vec();
+            if let [FilterSpec {
+                kind: FilterKind::Delta { channels },
+                ..
+            }] = filters
+            {
+                data[0] = *channels as u8;
+            }
+            Ok(data)
+        }
+        fn encode_plain(
+            &self,
+            data: &[u8],
+            _: (),
+            progress: Option<&mut dyn FnMut(usize) -> bool>,
+        ) -> Result<Vec<u8>> {
+            if data.len() != SCREEN_SAMPLE_LEN {
+                return self.encode(0, data.len(), progress);
+            }
+            let screen = if self.failures.iter().any(|&(at, _)| at == Self::SCREEN) {
+                Self::SCREEN
+            } else {
+                Self::SAMPLE
+            };
+            let packed = self.encode(screen, data.len(), progress)?;
+            Ok(if data[0] == 0 {
+                packed
+            } else {
+                vec![0; packed.len() / 10 * 9]
+            })
+        }
+        fn encode_filtered(
+            &self,
+            data: &[u8],
+            filters: &[FilterSpec],
+            _: (),
+            progress: Option<&mut dyn FnMut(usize) -> bool>,
+        ) -> Result<Vec<u8>> {
+            let [filter] = filters else {
+                unreachable!("one filter per finalist")
+            };
+            let FilterKind::Delta { channels } = filter.kind else {
+                unreachable!("only delta is screened")
+            };
+            let ranged = filter
+                .range
+                .as_ref()
+                .is_some_and(|range| range.len() < data.len());
+            self.encode(2 * channels - 1 + usize::from(ranged), data.len(), progress)
+        }
+    }
+
+    /// Room for one more encode, while `granted` is not all held.
+    #[cfg(feature = "parallel")]
+    struct Room<'a>(&'a std::sync::atomic::AtomicUsize);
+    #[cfg(feature = "parallel")]
+    impl Drop for Room<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[cfg(feature = "parallel")]
+    fn room(search: &Scripted, granted: usize) -> Option<Room<'_>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        // Granted first and handed back if it was one too many, so an encode
+        // can see more room than there is but never less.
+        let room = Room(&search.rooms);
+        (search.rooms.fetch_add(1, SeqCst) < granted).then_some(room)
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn finalists_side_by_side_choose_what_they_choose_in_turn() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let data = vec![0u8; 2 * SCREEN_SAMPLE_LEN];
+        let delta = |channels, ranged: bool| {
+            let kind = FilterKind::Delta { channels };
+            if ranged {
+                FilterSpec::range(kind, auto_delta_filter_range(&data, channels).unwrap())
+            } else {
+                FilterSpec::whole(kind)
+            }
+        };
+        let cases: [([usize; 7], Vec<FilterSpec>); 4] = [
+            // A tie goes to the earlier finalist.
+            ([500, 400, 400, 300, 300, 300, 301], vec![delta(2, false)]),
+            ([500, 400, 399, 300, 301, 300, 299], vec![delta(3, true)]),
+            // The plain member keeps a tie with the best of the rest.
+            ([500, 600, 500, 700, 500, 501, 900], Vec::new()),
+            ([500, 501, 502, 503, 504, 505, 499], vec![delta(3, true)]),
+        ];
+        let pool = crate::parallel::private_pool(4);
+        for (sizes, winner) in cases {
+            let search = Scripted::new(sizes);
+            let (specs, packed) = choose_filter(&search, &data, (), None).unwrap();
+            assert_eq!(
+                (&specs, packed.len()),
+                (&winner, *sizes.iter().min().unwrap())
+            );
+            for granted in [0, 1, 2, 8] {
+                let search = Scripted::new(sizes);
+                let chosen = pool.install(|| {
+                    choose_filter_side_by_side(&search, &data, (), None, &|| room(&search, granted))
+                });
+                assert_eq!(
+                    chosen.unwrap(),
+                    (specs.clone(), packed.clone()),
+                    "{sizes:?} {granted}"
+                );
+                assert!(!search.overran.load(SeqCst), "{sizes:?} {granted}");
+                assert_eq!(search.rooms.load(SeqCst), 0, "room handed back");
+                // Room for one more puts the plain member beside the screens,
+                // and room for more puts the finalists after it side by side.
+                assert_eq!(
+                    search.peak.load(SeqCst).min(3),
+                    granted.min(2) + 1,
+                    "{granted}"
+                );
+            }
+            // Capped to one thread there is nothing to run beside, so no room is asked for.
+            let search = Scripted::new(sizes);
+            let chosen = pool.install(|| {
+                let _cap = crate::parallel::ThreadCap::set(Some(1));
+                choose_filter_side_by_side(&search, &data, (), None, &|| -> Option<()> {
+                    panic!("room asked for at one thread")
+                })
+            });
+            assert_eq!(chosen.unwrap(), (specs.clone(), packed.clone()));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn finalists_side_by_side_fail_and_cancel_as_they_do_in_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let data = vec![0u8; 2 * SCREEN_SAMPLE_LEN];
+        let pool = crate::parallel::private_pool(4);
+        let sizes = [500, 400, 400, 300, 300, 300, 301];
+        for failures in [
+            vec![(3, "delta 2"), (5, "delta 3")],
+            vec![(6, "last")],
+            // The plain member is encoded beside the screens, but in turn the
+            // screens ran first, so theirs is the failure reported.
+            vec![(0, "plain"), (Scripted::SCREEN, "screen")],
+            vec![(0, "plain"), (4, "ranged")],
+        ] {
+            let mut search = Scripted::new(sizes);
+            search.failures = failures.clone();
+            let serial = choose_filter(&search, &data, (), None).unwrap_err();
+            for granted in [0, 1, 8] {
+                let chosen = pool.install(|| {
+                    choose_filter_side_by_side(&search, &data, (), None, &|| room(&search, granted))
+                });
+                assert_eq!(chosen.unwrap_err(), serial, "{failures:?} {granted}");
+                assert_eq!(search.rooms.load(SeqCst), 0);
+            }
+        }
+
+        // Each encode reports its own walk, so the total is the one reported in turn.
+        let search = Scripted::new(sizes);
+        let mut serial = 0;
+        let mut last = 0;
+        choose_filter(
+            &search,
+            &data,
+            (),
+            Some(&mut |event| {
+                match event {
+                    EncodeProgress::PassStarted => last = 0,
+                    EncodeProgress::Advanced(position) => {
+                        serial += position - last;
+                        last = position;
+                    }
+                }
+                true
+            }),
+        )
+        .unwrap();
+        let search = Scripted::new(sizes);
+        let walked = AtomicUsize::new(0);
+        let starts = AtomicUsize::new(0);
+        pool.install(|| {
+            choose_filter_side_by_side(
+                &search,
+                &data,
+                (),
+                Some(&|bytes| {
+                    walked.fetch_add(bytes, SeqCst);
+                    starts.fetch_add(usize::from(bytes == 0), SeqCst);
+                    true
+                }),
+                &|| room(&search, 8),
+            )
+        })
+        .unwrap();
+        assert_eq!(walked.into_inner(), serial);
+        assert_eq!(starts.into_inner(), search.encodes.load(SeqCst));
+
+        // A cancelled search encodes nothing, beside the screens or after them.
+        for granted in [0, 8] {
+            let search = Scripted::new(sizes);
+            let chosen = pool.install(|| {
+                choose_filter_side_by_side(&search, &data, (), Some(&|_| false), &|| {
+                    room(&search, granted)
+                })
+            });
+            assert_eq!(chosen, Err(crate::Error::Cancelled));
+            assert_eq!(search.encodes.load(SeqCst), 0);
+        }
     }
 }
