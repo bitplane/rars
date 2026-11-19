@@ -25,7 +25,6 @@ use super::filter_policy::{
 };
 use super::FilterPolicy;
 use crate::codec::packed_chain::{PackedMatchFinder, SharedPackedIndex};
-#[cfg(test)]
 use crate::codec::rar50::EncodeOptions;
 use crate::codec::rar50::{
     filter_streaming_blocks_in_place, streaming_blocks_in_window, streaming_blocks_with_finder,
@@ -246,14 +245,15 @@ struct BlockJob<B: Budget> {
     shared: Option<SharedRun<B>>,
 }
 
-/// A run's part of its group's window, and a finder over the group's index
-/// standing where the run's own would.
+/// A run's part of its group's window, and for a run that walks chains, a
+/// finder over the group's index standing where the run's own would.
 struct SharedRun<B: Budget> {
     window: std::sync::Arc<Buffer<u8, B>>,
     /// Where the run starts and ends in `window`.
     start: usize,
     end: usize,
-    finder: PackedMatchFinder<B>,
+    /// None for a run that searches a tree, which it builds for itself.
+    finder: Option<PackedMatchFinder<B>>,
     /// For a filtered run, the blocks it is coded in and their records. Its
     /// part of `window` already holds the filtered bytes.
     filtered: Option<crate::codec::rar50::FilteredRunBlocks<B>>,
@@ -264,25 +264,26 @@ struct SharedRun<B: Budget> {
 /// a shared one refuses a window past 1 GiB.
 const SHARED_WINDOW_LIMIT: usize = u32::MAX as usize / 6;
 
-/// Gives each member's consecutive runs in a wave one window and one packed
-/// index between them, where they each held a window and built an index over
-/// it (#276). Neighbouring runs' windows overlap, so a group of
-/// sixteen holds seventeen runs' bytes rather than thirty-two, and indexes
-/// them once.
+/// Gives each member's consecutive runs in a wave one window between them,
+/// and the runs that walk chains one packed index over it, where they each
+/// held a window and built an index over it (#276). Neighbouring runs'
+/// windows overlap, so a group of sixteen holds seventeen runs' bytes rather
+/// than thirty-two, and indexes them once.
 ///
 /// The output does not change. A run joins only when its own window would
-/// have used a packed index; its window is the group's cut off where the run
-/// ends, so positions past it stay out of reach; and its finder stands where
-/// the run's own would. The chains then hold extra positions only from before
-/// the run's own window, which its distance floor stops at, and its distance
-/// limit works out the same: a run whose own window starts at the member's
-/// start is in a group whose window does too, and any other carries a whole
-/// dictionary of history.
+/// have used a packed index or a tree; its window is the group's cut off where
+/// the run ends, so positions past it stay out of reach. A run that searches a
+/// tree trims the window to a dictionary before its start and seeds its tree
+/// from there, as it would its own. A run that walks chains gets a finder
+/// standing where the run's own would. The chains then hold extra positions
+/// only from before the run's own window, which its distance floor stops at,
+/// and its distance limit works out the same: a run whose own window starts
+/// at the member's start is in a group whose window does too, and any other
+/// carries a whole dictionary of history.
 ///
 /// A filtered run's part of the window holds its filtered bytes, which is
 /// what its own window held and what later runs' histories hold. It joins
-/// only when it has history: at its member's start, its own parse searches a
-/// tree.
+/// only when it has history, as it always has.
 ///
 /// In a solid `chain`, the wave's runs are consecutive runs of one stream
 /// that crosses members, so they group as one. A filtered run there already
@@ -305,8 +306,10 @@ where
     let own_window = |job: &BlockJob<B>| job.history.len().min(dictionary) + job.data.len();
     let shareable = |job: &BlockJob<B>| {
         let plain = job.filters.is_empty() && job.records.is_none();
-        (plain || !job.history.is_empty())
-            && crate::codec::rar50::packed_index_fits(own_window(job), options)
+        let (window, start) = (own_window(job), job.history.len().min(dictionary));
+        (plain || start != 0)
+            && (crate::codec::rar50::searches_tree(window, start, options)
+                || crate::codec::rar50::packed_index_fits(window, start, options))
     };
     let next_to = |before: &BlockJob<B>, after: &BlockJob<B>| {
         chain || before.offset + before.data.len() == after.offset
@@ -372,7 +375,7 @@ where
         })
         .collect();
     crate::parallel::for_each_mut(&mut builds, |_, (group, window_len, result)| {
-        *result = share_group(group, *window_len, dictionary, allowance);
+        *result = share_group(group, *window_len, options, allowance);
     });
     builds.into_iter().try_for_each(|(_, _, result)| result)
 }
@@ -380,12 +383,13 @@ where
 fn share_group<B: Budget + Send + Sync>(
     group: &mut [&mut BlockJob<B>],
     window_len: usize,
-    dictionary: usize,
+    options: EncodeOptions,
     allowance: &B,
 ) -> Result<()>
 where
     B::Charge: Send,
 {
+    let dictionary = options.max_match_distance;
     let first = &group[0];
     let history = &first.history[first.history.len().saturating_sub(dictionary)..];
     let mut window = Buffer::with_capacity(window_len, allowance)?;
@@ -400,11 +404,9 @@ where
             .extend_from_slice(&job.data)
             .map_err(Into::<crate::codec::Error>::into)?;
         let end = window.len();
-        // Where the run's own collector would start: at the run, or past its
-        // first block when the run starts the member and that block is
-        // searched on its own; never past where the run's window can insert.
-        let first_block = if start == 0 { job.blocks[0].1 } else { 0 };
-        at.push((start + first_block).min(end.saturating_sub(3)));
+        // Where the run's own collector would start: at the run, never past
+        // where the run's window can insert.
+        at.push(start.min(end.saturating_sub(3)));
         bounds.push((start, end));
         job.data = Buffer::new(allowance);
     }
@@ -453,10 +455,30 @@ where
         );
         job.history = Buffer::new(allowance);
     }
-    let finders = SharedPackedIndex::finders_over(&window, &at, allowance)?;
+    // Only the runs that walk chains want the index; a run that searches a
+    // tree seeds its own from the window.
+    let chains: Vec<bool> = bounds
+        .iter()
+        .map(|&(start, end)| {
+            let skip = start.saturating_sub(dictionary);
+            !crate::codec::rar50::searches_tree(end - skip, start - skip, options)
+        })
+        .collect();
+    let chain_at: Vec<usize> = at
+        .iter()
+        .zip(&chains)
+        .filter_map(|(&at, &chain)| chain.then_some(at))
+        .collect();
+    let mut finders = if chain_at.is_empty() {
+        Buffer::new(allowance)
+    } else {
+        SharedPackedIndex::finders_over(&window, &chain_at, allowance)?
+    }
+    .into_iter();
     let window = std::sync::Arc::new(window);
-    let runs = group.iter_mut().zip(bounds).zip(finders).zip(filtered);
-    for (((job, (start, end)), finder), filtered) in runs {
+    let runs = group.iter_mut().zip(bounds).zip(chains).zip(filtered);
+    for (((job, (start, end)), chain), filtered) in runs {
+        let finder = if chain { finders.next() } else { None };
         job.shared = Some(SharedRun {
             window: std::sync::Arc::clone(&window),
             start,
@@ -1762,17 +1784,29 @@ fn encode_shared_block_job<B: Budget>(
         Some((cuts, records)) => (&cuts[..], Some(&records[..])),
         None => (&boundaries[..], solid_records.as_deref()),
     };
-    let packed = streaming_blocks_with_finder(
-        &window[..end],
-        start,
-        finder,
-        cuts,
-        records,
-        plan.algorithm_version,
-        plan.encode_options,
-        Some(&mut block_done),
-        allowance,
-    )?;
+    let packed = match finder {
+        Some(finder) => streaming_blocks_with_finder(
+            &window[..end],
+            start,
+            finder,
+            cuts,
+            records,
+            plan.algorithm_version,
+            plan.encode_options,
+            Some(&mut block_done),
+            allowance,
+        )?,
+        None => streaming_blocks_in_window(
+            &window[..end],
+            start,
+            cuts,
+            records,
+            plan.algorithm_version,
+            plan.encode_options,
+            Some(&mut block_done),
+            allowance,
+        )?,
+    };
     drop(window);
     if filtered.is_some() {
         // A filtered run is coded as one stream, as `encode_block_job` codes

@@ -166,9 +166,18 @@ impl EntrySource {
         Self::from_factory(MemorySource(data.into()))
     }
 
-    pub(crate) fn copy_for_writer(data: &[u8], resources: &WriterResources) -> Result<Self> {
+    /// Share a builder's in-memory payload with the writer without copying it.
+    ///
+    /// Under a memory quota the payload is charged once, for as long as the
+    /// writer or one of its readers holds it.
+    pub(crate) fn share_with_writer(
+        data: &Arc<Vec<u8>>,
+        resources: &WriterResources,
+    ) -> Result<Self> {
         let Some(mut charge) = resources.execution_charge() else {
-            return Ok(Self::from_bytes(Arc::<[u8]>::from(data)));
+            return Ok(Self::from_factory(MemorySource(SharedBytes(Arc::clone(
+                data,
+            )))));
         };
         let bytes = data
             .len()
@@ -177,7 +186,7 @@ impl EntrySource {
             .ok_or(Error::InvalidArgument("writer source capacity overflows"))?;
         charge.grow_to(bytes as u64)?;
         let data = Arc::new(WriterMemoryData {
-            bytes: data.to_vec(),
+            bytes: Arc::clone(data),
             _charge: charge,
         });
         Ok(Self::from_factory(WriterMemorySource {
@@ -213,22 +222,38 @@ impl EntrySource {
     }
 }
 
-struct MemorySource(Arc<[u8]>);
+struct MemorySource<B>(B);
 
-impl SourceFactory for MemorySource {
+impl<B> SourceFactory for MemorySource<B>
+where
+    B: AsRef<[u8]> + Clone + Send + Sync + 'static,
+{
     fn len(&self) -> Result<u64> {
-        Ok(self.0.len() as u64)
+        Ok(self.0.as_ref().len() as u64)
     }
 
     fn open(&self) -> Result<Box<dyn EntryReader>> {
-        Ok(Box::new(Cursor::new(Arc::clone(&self.0))))
+        Ok(Box::new(Cursor::new(self.0.clone())))
+    }
+}
+
+/// A builder's payload, shared rather than copied. `Cursor` needs
+/// `AsRef<[u8]>`, which `Arc<Vec<u8>>` lacks.
+#[derive(Clone)]
+struct SharedBytes(Arc<Vec<u8>>);
+
+impl AsRef<[u8]> for SharedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0
     }
 }
 
 // The shared owner keeps both its bytes and its charge alive if a reader
 // outlives the converted entry. Reader boxes get separate capacity charges.
+// The bytes are the builder's, shared rather than copied; the charge counts
+// them once while the write can still read them.
 struct WriterMemoryData {
-    bytes: Vec<u8>,
+    bytes: Arc<Vec<u8>>,
     _charge: CapacityCharge,
 }
 struct WriterMemorySource {
@@ -245,7 +270,7 @@ impl SourceFactory for WriterMemorySource {
         Ok(self.data.bytes.len() as u64)
     }
     fn open(&self) -> Result<Box<dyn EntryReader>> {
-        // WriterMemorySource is constructed only after copy_for_writer has
+        // WriterMemorySource is constructed only after share_with_writer has
         // admitted an execution charge from these same resources.
         let mut charge = self
             .resources
@@ -261,7 +286,7 @@ impl SourceFactory for WriterMemorySource {
 }
 impl Read for WriterMemoryReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
-        let mut cursor = Cursor::new(&self.data.bytes);
+        let mut cursor = Cursor::new(self.data.bytes.as_slice());
         cursor.set_position(self.position);
         let count = cursor.read(out)?;
         self.position = cursor.position();
@@ -270,7 +295,7 @@ impl Read for WriterMemoryReader {
 }
 impl Seek for WriterMemoryReader {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
-        let mut cursor = Cursor::new(&self.data.bytes);
+        let mut cursor = Cursor::new(self.data.bytes.as_slice());
         cursor.set_position(self.position);
         self.position = cursor.seek(from)?;
         Ok(self.position)
@@ -1346,17 +1371,40 @@ mod tests {
     fn writer_memory_reader_retains_payload_after_source_drop() {
         use super::*;
         let resources = WriterResources::default().with_max_memory_bytes(8192);
-        let source = EntrySource::copy_for_writer(&[42; 4096], &resources).unwrap();
+        let payload = Arc::new(vec![42; 4096]);
+        let source = EntrySource::share_with_writer(&payload, &resources).unwrap();
         let retained = resources.managed_memory_in_use();
         assert!(retained >= 4096);
         let mut reader = source.open().unwrap();
         drop(source);
         assert!(resources.managed_memory_in_use() > retained);
+        assert_eq!(Arc::strong_count(&payload), 2);
         let mut bytes = [0; 4096];
         reader.read_exact(&mut bytes).unwrap();
         assert_eq!(bytes, [42; 4096]);
         drop(reader);
         assert_eq!(resources.managed_memory_in_use(), 0);
+        assert_eq!(Arc::strong_count(&payload), 1);
+    }
+
+    #[test]
+    fn shared_writer_payload_is_the_callers_buffer_with_or_without_a_quota() {
+        use super::*;
+        for resources in [
+            WriterResources::default(),
+            WriterResources::default().with_max_memory_bytes(8192),
+        ] {
+            let payload = Arc::new((0..4096).map(|byte| byte as u8).collect::<Vec<_>>());
+            let source = EntrySource::share_with_writer(&payload, &resources).unwrap();
+            assert_eq!(Arc::strong_count(&payload), 2);
+            assert_eq!(source.len().unwrap(), 4096);
+            let mut bytes = Vec::new();
+            source.open().unwrap().read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, *payload);
+            drop(source);
+            assert_eq!(Arc::strong_count(&payload), 1);
+            assert_eq!(resources.managed_memory_in_use(), 0);
+        }
     }
 
     use super::*;
