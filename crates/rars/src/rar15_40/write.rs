@@ -4881,7 +4881,10 @@ mod tests {
                     )
                 })
                 .unwrap();
-            assert_eq!(resources.workspace_in_use(), 0, "every room handed back");
+            // Every finalist's room is handed back; the member keeps a charge
+            // for its packed form until it is written.
+            let held = encoded.held.as_ref().map_or(0, |permit| permit.bytes());
+            assert_eq!(resources.workspace_in_use(), held, "every room handed back");
             let super::MemberPayload::Packed(packed) = encoded.payload else {
                 unreachable!("a member held in memory is packed in memory")
             };
