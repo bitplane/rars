@@ -271,6 +271,91 @@ pub(crate) fn check_source_length(
     }
 }
 
+/// Tells a member read as its payload is written from one read whole first.
+#[cfg(all(test, feature = "encryption"))]
+pub(crate) struct Watch {
+    written: std::sync::Arc<crate::atomic64::AtomicU64>,
+    opens: std::sync::Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
+}
+
+#[cfg(all(test, feature = "encryption"))]
+impl Watch {
+    /// The archive output, counted so the source can see how far it has got.
+    pub(crate) fn sink<'a>(&self, inner: &'a mut Vec<u8>) -> impl Write + 'a {
+        struct Sink<'a> {
+            inner: &'a mut Vec<u8>,
+            written: std::sync::Arc<crate::atomic64::AtomicU64>,
+        }
+        impl Write for Sink<'_> {
+            fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+                self.inner.extend_from_slice(buffer);
+                self.written
+                    .fetch_add(buffer.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                Ok(buffer.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        Sink {
+            inner,
+            written: std::sync::Arc::clone(&self.written),
+        }
+    }
+
+    /// How much archive was written between the first and last reads of the
+    /// source's last opening. Nothing, if the member was loaded before writing.
+    pub(crate) fn written_while_reading(&self) -> u64 {
+        let opens = self.opens.lock().unwrap();
+        opens.last().map_or(0, |&(first, last)| last - first)
+    }
+}
+
+/// A source over `data` whose reads note how much archive has been written.
+#[cfg(all(test, feature = "encryption"))]
+pub(crate) fn watched_source(data: Vec<u8>) -> (EntrySource, Watch) {
+    use crate::atomic64::AtomicU64;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+
+    struct Watched {
+        inner: std::io::Cursor<Arc<[u8]>>,
+        written: Arc<AtomicU64>,
+        opens: Arc<Mutex<Vec<(u64, u64)>>>,
+    }
+    impl Read for Watched {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let written = self.written.load(Ordering::Relaxed);
+            self.opens.lock().unwrap().last_mut().unwrap().1 = written;
+            self.inner.read(buffer)
+        }
+    }
+    impl std::io::Seek for Watched {
+        fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(from)
+        }
+    }
+
+    let watch = Watch {
+        written: Arc::new(AtomicU64::new(0)),
+        opens: Arc::new(Mutex::new(Vec::new())),
+    };
+    let len = data.len() as u64;
+    let data: Arc<[u8]> = data.into();
+    let written = Arc::clone(&watch.written);
+    let opens = Arc::clone(&watch.opens);
+    let source = EntrySource::from_opener(len, move || {
+        let now = written.load(Ordering::Relaxed);
+        opens.lock().unwrap().push((now, now));
+        Ok(Box::new(Watched {
+            inner: std::io::Cursor::new(Arc::clone(&data)),
+            written: Arc::clone(&written),
+            opens: Arc::clone(&opens),
+        }))
+    });
+    (source, watch)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
