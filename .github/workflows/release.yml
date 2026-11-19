@@ -353,8 +353,11 @@ jobs:
           retention-days: 7
 
   # ----------------------------------------------------------------------
-  # 4. Build Python wheels and an sdist for PyPI. The Python extension uses
-  #    abi3-py310, so one wheel per OS/architecture covers CPython 3.10+.
+  # 4. Build Python wheels and an sdist for PyPI with cibuildwheel, which
+  #    reads its build list from pyproject.toml. The extension uses
+  #    abi3-py310, so each platform gets one wheel, and every CPython from
+  #    3.10 runs python/tests against it. Linux builds both manylinux and
+  #    musllinux.
   # ----------------------------------------------------------------------
   build-python-wheels:
     name: Build Python ${{ matrix.label }}
@@ -369,39 +372,39 @@ jobs:
         include:
           - label: linux-x86_64
             os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            manylinux: "2014"
+            archs: x86_64
           - label: linux-aarch64
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            manylinux: "2014"
+            os: ubuntu-24.04-arm
+            archs: aarch64
           - label: macos-universal2
             os: macos-latest
-            target: universal2-apple-darwin
-            manylinux: "off"
+            archs: universal2
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
           - label: windows-x86_64
             os: windows-latest
-            target: x86_64-pc-windows-msvc
-            manylinux: "off"
+            archs: AMD64
+            rust-targets: x86_64-pc-windows-msvc
+          - label: windows-arm64
+            os: windows-11-arm
+            archs: ARM64
+            rust-targets: aarch64-pc-windows-msvc
     steps:
       - uses: actions/checkout@v7
         with:
           ref: ${{ env.RELEASE_REF }}
 
-      - uses: actions/setup-python@v7
+      # Linux builds inside the manylinux and musllinux containers, which
+      # install Rust themselves (pyproject.toml's before-all).
+      - uses: dtolnay/rust-toolchain@stable
+        if: runner.os != 'Linux'
         with:
-          python-version: "3.10"
+          targets: ${{ matrix.rust-targets }}
 
-      - uses: PyO3/maturin-action@v1
+      - uses: pypa/cibuildwheel@v4.3.5
+        env:
+          CIBW_ARCHS: ${{ matrix.archs }}
         with:
-          command: build
-          target: ${{ matrix.target }}
-          manylinux: ${{ matrix.manylinux }}
-          args: >-
-            --release
-            --locked
-            --compatibility pypi
-            --out dist
+          output-dir: dist
 
       - name: Upload Python artifacts
         uses: actions/upload-artifact@v7

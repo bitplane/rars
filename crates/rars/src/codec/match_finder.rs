@@ -381,6 +381,16 @@ impl TreeMatchFinder {
 impl<B: Budget> TreeMatchFinder<B> {
     const HASH_BITS: u32 = 17;
     const MIN_MATCH: usize = 4;
+    /// The most runs one position reports: the longest found.
+    ///
+    /// A descent through noise lengthens its match a byte or two at a time,
+    /// reporting each step, where a chain walk in recency order finds few
+    /// improvements. Uncapped, two-symbol noise averaged over twelve runs a
+    /// position, and a block job seeding a tree from a 4 MiB dictionary of it
+    /// counted 229 MiB against the 151 MiB it is charged; at eight it counts
+    /// 133 MiB. On 32 MiB each of text, source and binaries at level 3 the
+    /// cap moves the output by at most five bytes.
+    const MAX_RUNS: usize = 8;
 
     /// Builds a finder that remembers the last `window` positions, at eight
     /// bytes of links per byte of window.
@@ -472,6 +482,7 @@ impl<B: Budget> TreeMatchFinder<B> {
         let mut longest = Self::MIN_MATCH - 1;
         let mut budget = cut;
         let mut floor = pos;
+        let first = out.len();
         loop {
             // A candidate that does not step back is a reused slot or the
             // sentinel; one further back than the window has fallen out of it.
@@ -499,7 +510,16 @@ impl<B: Budget> TreeMatchFinder<B> {
                 }
                 if len > longest {
                     if pos - current <= max_distance {
-                        out.push((len as u32, (pos - current) as u32))?;
+                        let run = (len as u32, (pos - current) as u32);
+                        if out.len() - first == Self::MAX_RUNS {
+                            // Full: the shortest run gives way, and the
+                            // lengths it covered fall to the next one's
+                            // distance.
+                            out[first..].rotate_left(1);
+                            *out.last_mut().expect("a full list holds runs") = run;
+                        } else {
+                            out.push(run)?;
+                        }
                     }
                     longest = len;
                     if len == len_limit {
@@ -875,6 +895,39 @@ mod tests {
         let input = b"abcdeXXXXX_abcdfYYYY__abcdeZZ";
         let all = tree_matches_at_every_position(input, usize::MAX);
         assert_eq!(all[22], [(4, 11), (5, 22)]);
+    }
+
+    #[test]
+    fn a_position_reports_at_most_eight_runs_and_keeps_the_longest() {
+        // Two-symbol noise, where a descent lengthens its match a byte at a
+        // time and would report a run for each step.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let input: Vec<u8> = (0..4096)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b'a' + (state & 1) as u8
+            })
+            .collect();
+        let all = tree_matches_at_every_position(&input, usize::MAX);
+        let mut capped = 0;
+        for (pos, runs) in all.iter().enumerate() {
+            assert!(runs.len() <= TreeMatchFinder::<super::Allowance>::MAX_RUNS);
+            assert!(runs.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            capped += usize::from(runs.len() == TreeMatchFinder::<super::Allowance>::MAX_RUNS);
+            let longest = (1..=pos)
+                .map(|distance| {
+                    (0..input.len() - pos)
+                        .take_while(|&at| input[pos + at] == input[pos + at - distance])
+                        .count()
+                })
+                .max()
+                .unwrap_or(0);
+            let reported = runs.last().map_or(0, |&(length, _)| length as usize);
+            assert_eq!(reported, if longest >= 4 { longest } else { 0 }, "{pos}");
+        }
+        assert!(capped > 0, "the noise never filled a position's runs");
     }
 
     #[test]

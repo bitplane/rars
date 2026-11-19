@@ -602,24 +602,28 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// those with room to spare, and the fifth byte per window position absorbs the
 /// rest rather than pretending to predict it.
 ///
-/// The optimal parse in a block job searches the packed hash chains rather than
-/// a tree, and spends most of its workspace on the match runs it collects for a
-/// block: about six per position on two-symbol noise, the worst found, against
-/// one on real data. Counted allocation peaks per job under `--max-memory`,
-/// level 3, over 16 MiB (4 MiB dictionary) and 64 MiB (16 MiB) members:
+/// The optimal parse in a block job searches a tree seeded with the run's
+/// history, eight bytes of links per byte of dictionary, or the packed hash
+/// chains when the run is shorter than its history. Past the links it spends
+/// most of its workspace on the match runs it collects for a block: up to
+/// eight per position on two-symbol noise, the worst found, against one on
+/// real data. Counted allocation peaks per job under `--max-memory`, level 3,
+/// over 16 MiB (4 MiB dictionary), 32 MiB (8 MiB) and 64 MiB (16 MiB)
+/// members:
 ///
 /// ```text
-/// input                 4 MiB dict   16 MiB dict
-/// text                    36.2 MiB      136.0 MiB
-/// binary                  33.7 MiB      126.1 MiB
-/// random                  47.3 MiB      168.7 MiB
-/// three-symbol noise      96.0 MiB
-/// two-symbol noise       125.2 MiB      199.1 MiB
+/// input                 4 MiB dict    8 MiB dict   16 MiB dict
+/// text                    37.1 MiB                   139.4 MiB
+/// binary                  38.2 MiB                   138.3 MiB
+/// random                  43.1 MiB                   151.1 MiB
+/// three-symbol noise     133.2 MiB
+/// two-symbol noise       132.9 MiB     165.5 MiB     230.6 MiB
 /// ```
 ///
-/// Random data costs the most per window byte, 654 MiB at a 64 MiB dictionary,
-/// because its chain deltas pack worst. Noise costs the most per block byte.
-/// The charge covers both at once: 151 MiB at 4 MiB, 307 MiB at 16 MiB.
+/// Random data costs the most per window byte: 583 MiB through the tree at a
+/// 64 MiB dictionary, and 654 MiB through chains, whose deltas pack worst on
+/// it. Noise costs the most per block byte. The charge covers both at once:
+/// 151 MiB at 4 MiB, 203 MiB at 8 MiB, 307 MiB at 16 MiB.
 ///
 /// `block_size` is the largest block the parse can be holding, not the size the
 /// reader asks for: a block grows past that when the data it covers is not
@@ -1920,12 +1924,13 @@ mod tests {
 
     /// Counted allocation peaks for one block job, from the ledger under
     /// `--max-memory`: the worst input per dictionary from the table on
-    /// [`streaming_lz_workspace`]. A job that outgrows its charge fails there.
+    /// [`streaming_lz_workspace`], through a tree or through chains, whichever
+    /// is larger. A job that outgrows its charge fails there.
     #[test]
     fn the_block_job_charge_covers_its_counted_peaks() {
         const MIB: f64 = 1024.0 * 1024.0;
         let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
-        for (dictionary, peak) in [(4u64, 125.2), (16, 199.1), (64, 654.3)] {
+        for (dictionary, peak) in [(4u64, 133.2), (8, 165.5), (16, 230.6), (64, 654.3)] {
             let charged = streaming_lz_workspace(dictionary << 20, block, true);
             let peak = (peak * MIB) as u64;
             assert!(charged >= peak, "{dictionary} MiB: {charged} < {peak}");

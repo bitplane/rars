@@ -733,9 +733,8 @@ pub(crate) fn encode_lz_streaming_block(
     )
 }
 
-/// Encode adjacent streaming blocks with one seeded chain finder. The first
-/// block without history keeps its existing tree parse; subsequent blocks use
-/// chains just as separately seeded streaming blocks do.
+/// Encode adjacent streaming blocks with one match finder seeded with the
+/// history, chosen as [`searches_tree`] chooses for a member.
 #[cfg(test)]
 pub(crate) fn encode_lz_streaming_blocks(
     data: &[u8],
@@ -875,15 +874,15 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
 /// a group's, with a finder handed out by the group's shared index.
 ///
 /// `window` must end where the run does and start where the group's window
-/// does, and the finder must stand at the run's start, or after its first
-/// block when the run starts the member; nothing is trimmed. The match finder
-/// then collects what the job's own would, which is what keeps the output
-/// unchanged (#276).
+/// does, and the finder must stand at the run's start; nothing is trimmed.
+/// The match finder then collects what the job's own would, which is what
+/// keeps the output unchanged (#276). Only a run whose own window would use a
+/// packed index ([`packed_index_fits`]) shares one, so never a run that starts
+/// its member.
 ///
 /// A filtered run passes the blocks and records [`filter_run_in_place`] gave
 /// it, over a window already holding its filtered bytes. Its own encode,
-/// [`encode_filtered_run`], parses those blocks with the same collector, so
-/// long as the run does not start its member: there it searches a tree.
+/// [`encode_filtered_run`], parses those blocks with the same collector.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn streaming_blocks_with_finder<B: Budget>(
     window: &[u8],
@@ -899,11 +898,6 @@ pub(crate) fn streaming_blocks_with_finder<B: Budget>(
     if start > window.len() || !options.optimal_parse {
         return Err(Error::InvalidData(
             "RAR 5 shared finder needs an optimal parse within its window",
-        ));
-    }
-    if records.is_some() && start == 0 {
-        return Err(Error::InvalidData(
-            "RAR 5 filtered run at its member's start searches a tree",
         ));
     }
     streaming_blocks_from(
@@ -938,7 +932,6 @@ fn streaming_blocks_from<B: Budget>(
 
     let mut at = start;
     let mut output = Buffer::with_capacity(blocks.len(), allowance)?;
-    let mut first = 0;
     // Block ends are offsets into `data`, so the bytes a block covers are the
     // step from the end before it. Reporting them as they land is what keeps a
     // progress bar moving: a whole member can be one run, and a run that
@@ -952,40 +945,18 @@ fn streaming_blocks_from<B: Budget>(
             None => true,
         }
     };
-    if start == 0 && options.optimal_parse && !blocks.is_empty() {
-        let (end, is_last) = blocks[0];
-        output.push_admitted(encode_lz_block_with_allowance(
-            &combined[..end],
-            0..end,
-            MemberSearch::Fresh,
-            algorithm_version,
-            records_of(0),
-            options,
-            is_last,
-            None,
-            allowance,
-        )?);
-        at = end;
-        first = 1;
-        if !report(end, &mut block_done) {
-            return Err(Error::Cancelled);
-        }
-    }
-    if first == blocks.len() {
+    if blocks.is_empty() {
         return Ok(output);
     }
     if pipelines::<B>(options) {
         let mut block_start = at;
         pipelined_optimal_blocks(
             combined,
-            blocks[first..]
-                .iter()
-                .enumerate()
-                .map(|(index, &(end, is_last))| {
-                    let block = block_start..start + end;
-                    block_start = block.end;
-                    (block, records_of(first + index), is_last)
-                }),
+            blocks.iter().enumerate().map(|(index, &(end, is_last))| {
+                let block = block_start..start + end;
+                block_start = block.end;
+                (block, records_of(index), is_last)
+            }),
             collector_at(combined, at, finder.take(), options, allowance)?,
             algorithm_version,
             options,
@@ -1013,14 +984,14 @@ fn streaming_blocks_from<B: Budget>(
             combined, at, options, allowance,
         )?)
     };
-    for (index, &(end, is_last)) in blocks[first..].iter().enumerate() {
+    for (index, &(end, is_last)) in blocks.iter().enumerate() {
         let end = start + end;
         output.push_admitted(encode_lz_block_with_allowance(
             combined,
             at..end,
             search.borrow(),
             algorithm_version,
-            records_of(first + index),
+            records_of(index),
             options,
             is_last,
             None,
@@ -1795,11 +1766,26 @@ enum MemberSearch<'a, B: Budget = Allowance> {
     Optimal(&'a mut OptimalCollector<B>),
 }
 
-/// Whether the optimal parse searches a window this long, past its first
-/// position, through a packed index rather than chains or a tree. Block jobs
-/// that share an index must be ones whose own window would have used one.
-pub(crate) fn packed_index_fits(window: usize, options: EncodeOptions) -> bool {
-    window >= 1024 * 1024
+/// Whether an optimal parse of `window` from `start` searches a binary tree.
+///
+/// A tree finds what a chain walk of the same depth misses. But the only way
+/// into a tree is a descent per position, so bringing in history costs a
+/// search per byte, where a chain takes each byte with one store. A parse at
+/// least as long as the history it carries can afford that. A block job's run
+/// is a dictionary long, with a dictionary of history behind it. On 32 MiB of
+/// man pages and logs at level 3, chains of 128 packed such runs 2.5% larger
+/// than the tree does, for about a quarter less CPU. A short parse behind a
+/// long history, such as the last scrap of a member, keeps the chains.
+pub(crate) fn searches_tree(window: usize, start: usize, options: EncodeOptions) -> bool {
+    start.min(options.max_match_distance) <= window - start
+}
+
+/// Whether the optimal parse of a window this long from `start` searches a
+/// packed index rather than chains or a tree. Block jobs that share an index
+/// must be ones whose own window would have used one.
+pub(crate) fn packed_index_fits(window: usize, start: usize, options: EncodeOptions) -> bool {
+    !searches_tree(window, start, options)
+        && window >= 1024 * 1024
         && window <= options.max_match_distance.saturating_mul(2)
         && window <= u32::MAX as usize / 6
 }
@@ -1866,10 +1852,7 @@ struct BlockMatches<B: Budget = Allowance> {
 /// Searching once is also what makes the tree finder affordable, and the tree
 /// is where the speed is: pricing every position means searching at every
 /// position, which is the load a chain walk carries worst and a tree carries
-/// best. A member that starts with no history gets the tree. One that carries
-/// history keeps the chains, because the only way into a tree is a descent per
-/// position, and paying that across a dictionary of history would cost more
-/// than the chains ever did.
+/// best. See [`searches_tree`] for which parses get one.
 struct OptimalCollector<B: Budget = Allowance> {
     finder: CollectorFinder<B>,
 }
@@ -1884,8 +1867,10 @@ fn packed_collector_preserves_frontiers_across_committed_interiors_and_blocks() 
         state ^= state << 17;
         *byte = state as u8;
     }
-    input.copy_within(0..LZ_BLOCK_SIZE, LZ_BLOCK_SIZE);
-    input.copy_within(0..LZ_BLOCK_SIZE / 2, 2 * LZ_BLOCK_SIZE);
+    // Two blocks behind a long history, which keeps chains rather than a tree.
+    let start = input.len() - 2 * LZ_BLOCK_SIZE;
+    input.copy_within(0..LZ_BLOCK_SIZE, start);
+    input.copy_within(0..LZ_BLOCK_SIZE / 2, start + LZ_BLOCK_SIZE);
     let allowance = Allowance::default();
     let options = EncodeOptions {
         max_match_distance: 4 * 1024 * 1024,
@@ -1893,7 +1878,6 @@ fn packed_collector_preserves_frontiers_across_committed_interiors_and_blocks() 
         optimal_parse: true,
         ..EncodeOptions::default()
     };
-    let start = LZ_BLOCK_SIZE;
     let mut packed = OptimalCollector::with_allowance(&input, start, options, &allowance).unwrap();
     assert!(matches!(&packed.finder, CollectorFinder::Packed(_)));
     let mut ordinary = OptimalCollector {
@@ -1902,8 +1886,8 @@ fn packed_collector_preserves_frontiers_across_committed_interiors_and_blocks() 
         ),
     };
     for block in [
-        start..2 * LZ_BLOCK_SIZE,
-        2 * LZ_BLOCK_SIZE..3 * LZ_BLOCK_SIZE,
+        start..start + LZ_BLOCK_SIZE,
+        start + LZ_BLOCK_SIZE..start + 2 * LZ_BLOCK_SIZE,
     ] {
         let expected = ordinary.collect(&input, block.clone(), options).unwrap();
         let actual = packed.collect(&input, block, options).unwrap();
@@ -1933,9 +1917,66 @@ fn packed_collector_preserves_frontiers_across_committed_interiors_and_blocks() 
         max_match_distance: 128 * 1024,
         ..options
     };
-    let bounded =
-        OptimalCollector::with_allowance(&input, start, short_dictionary, &allowance).unwrap();
+    let bounded = OptimalCollector::with_allowance(
+        &input,
+        input.len() - LZ_BLOCK_SIZE,
+        short_dictionary,
+        &allowance,
+    )
+    .unwrap();
     assert!(matches!(&bounded.finder, CollectorFinder::Chains(_)));
+}
+
+/// A run at least as long as the history behind it searches a tree, seeded
+/// with that history, and the tree then answers what one that had parsed the
+/// history itself would: same matches at every position of the run.
+#[test]
+fn a_seeded_tree_collects_what_a_tree_that_parsed_the_history_does() {
+    let mut state = 0x0b5e_55ed_7ee5_1234u64;
+    let mut input: Vec<u8> = (0..512 * 1024)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Few symbols, so chains and trees both get busy.
+            b"abcd"[(state % 4) as usize]
+        })
+        .collect();
+    // Long copies make the parse commit and step over their interiors, which
+    // the tree must still hold for the third copy to find the second.
+    input.copy_within(0..64 * 1024, 100 * 1024);
+    input.copy_within(100 * 1024..164 * 1024, 300 * 1024);
+    let options = EncodeOptions {
+        max_match_distance: 256 * 1024,
+        max_match_candidates: 32,
+        optimal_parse: true,
+        ..EncodeOptions::default()
+    }
+    .with_nice_match_length(64);
+    let allowance = Allowance::default();
+    let start = 256 * 1024;
+    assert!(searches_tree(input.len(), 0, options));
+    assert!(searches_tree(input.len(), start, options));
+    assert!(!searches_tree(start + 1024, start, options));
+
+    let mut seeded = OptimalCollector::with_allowance(&input, start, options, &allowance).unwrap();
+    assert!(matches!(&seeded.finder, CollectorFinder::Tree(_)));
+    let mut parsed = OptimalCollector::with_allowance(&input, 0, options, &allowance).unwrap();
+    for block in (0..start).step_by(LZ_BLOCK_SIZE) {
+        parsed
+            .collect(&input, block..block + LZ_BLOCK_SIZE, options)
+            .unwrap();
+    }
+    let mut found = 0;
+    for block in (start..input.len()).step_by(LZ_BLOCK_SIZE) {
+        let block = block..block + LZ_BLOCK_SIZE;
+        let expected = parsed.collect(&input, block.clone(), options).unwrap();
+        let actual = seeded.collect(&input, block, options).unwrap();
+        assert!(actual.starts[..] == expected.starts[..]);
+        assert!(actual.runs[..] == expected.runs[..]);
+        found += actual.runs.len();
+    }
+    assert!(found > 0);
 }
 
 enum CollectorFinder<B: Budget = Allowance> {
@@ -1960,7 +2001,34 @@ impl<B: Budget> OptimalCollector<B> {
         options: EncodeOptions,
         allowance: &B,
     ) -> Result<Self> {
-        if start != 0 && packed_index_fits(combined.len(), options) {
+        if searches_tree(combined.len(), start, options) {
+            let mut tree = Rar50TreeMatchFinder::with_allowance(
+                finder_window(options, combined.len()),
+                allowance,
+            )?;
+            // The history goes in as the collector would have put it there had
+            // it parsed it: every position, each with the descent a search
+            // makes. Nothing is reported, so nothing is allocated.
+            let mut nothing = Buffer::new(allowance);
+            for pos in start.saturating_sub(options.max_match_distance)..start {
+                let avail = combined.len() - pos;
+                if avail >= 4 {
+                    tree.matches(
+                        combined,
+                        pos,
+                        avail.min(options.nice()),
+                        0,
+                        options.max_match_candidates,
+                        &mut nothing,
+                    )
+                    .map_err(Into::into)?;
+                }
+            }
+            return Ok(Self {
+                finder: CollectorFinder::Tree(tree),
+            });
+        }
+        if packed_index_fits(combined.len(), start, options) {
             // Captured bounded jobs can store each complete hash chain as a
             // contiguous byte stream. Static input limits select the backend;
             // available memory never changes its candidate quality.
@@ -1974,17 +2042,11 @@ impl<B: Budget> OptimalCollector<B> {
             });
         }
 
-        let finder = if start == 0 {
-            CollectorFinder::Tree(Rar50TreeMatchFinder::with_allowance(
-                finder_window(options, combined.len()),
-                allowance,
-            )?)
-        } else {
-            CollectorFinder::Chains(member_finder_with_allowance(
+        Ok(Self {
+            finder: CollectorFinder::Chains(member_finder_with_allowance(
                 combined, start, options, allowance,
-            )?)
-        };
-        Ok(Self { finder })
+            )?),
+        })
     }
 
     /// Finds the matches the parse will price at each position of `block`,
@@ -2042,13 +2104,8 @@ impl<B: Budget> OptimalCollector<B> {
             match &mut self.finder {
                 CollectorFinder::Packed(_) => unreachable!("packed collector dispatched above"),
                 CollectorFinder::Tree(tree) => {
-                    // Inserting into a tree is the same descent as searching
-                    // it, so a position the parse steps over is stepped over
-                    // here too rather than inserted for nothing. Its bytes are
-                    // a copy of what the match already points at, so the tree
-                    // loses little by not holding them.
                     let avail = combined.len() - pos;
-                    if !searching || avail < 4 {
+                    if avail < 4 {
                         continue;
                     }
                     // Compares stop where the parse stops caring about better
@@ -2056,6 +2113,26 @@ impl<B: Budget> OptimalCollector<B> {
                     // out to its real end, which is the length the parse
                     // commits to and steps over.
                     let len_limit = avail.min(options.nice());
+                    if !searching {
+                        // A position the parse steps over still goes in, with
+                        // a distance limit of zero so nothing is reported.
+                        // Leaving it out would save its descent but leave a
+                        // hole the length of the match, and a third copy of
+                        // something then finds only the first, which may have
+                        // left the window. 32 MiB of C headers and sources,
+                        // many repeated, packs 11.8% larger at an 8 MiB
+                        // dictionary with the holes.
+                        tree.matches(
+                            combined,
+                            pos,
+                            len_limit,
+                            0,
+                            options.max_match_candidates,
+                            &mut matches.runs,
+                        )
+                        .map_err(Into::into)?;
+                        continue;
+                    }
                     tree.matches(
                         combined,
                         pos,
