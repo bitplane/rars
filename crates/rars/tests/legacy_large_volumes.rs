@@ -169,16 +169,31 @@ fn a_stored_member_over_4_gib_splits_across_volumes_with_large_headers() {
 }
 
 /// Half pattern, half noise, so it packs to about half and spans several volumes.
+/// All noise, it doesn't pack at all.
 struct Mixed {
+    size: u64,
     position: u64,
+    noise: bool,
+}
+
+impl Mixed {
+    fn source(size: u64, noise: bool) -> EntrySource {
+        EntrySource::from_opener(size, move || {
+            Ok(Box::new(Mixed {
+                size,
+                position: 0,
+                noise,
+            }))
+        })
+    }
 }
 
 impl Read for Mixed {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let count = (SIZE - self.position).min(buffer.len() as u64) as usize;
+        let count = (self.size - self.position).min(buffer.len() as u64) as usize;
         for (offset, byte) in buffer[..count].iter_mut().enumerate() {
             let at = self.position + offset as u64;
-            *byte = if at >> 16 & 1 == 0 {
+            *byte = if !self.noise && at >> 16 & 1 == 0 {
                 (at ^ (at >> 13)) as u8
             } else {
                 let mut mixed = at.wrapping_add(0x9e37_79b9_7f4a_7c15);
@@ -196,10 +211,10 @@ impl Seek for Mixed {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.position = match position {
             SeekFrom::Start(at) => at,
-            SeekFrom::End(delta) => SIZE.saturating_add_signed(delta),
+            SeekFrom::End(delta) => self.size.saturating_add_signed(delta),
             SeekFrom::Current(delta) => self.position.saturating_add_signed(delta),
         }
-        .min(SIZE);
+        .min(self.size);
         Ok(self.position)
     }
 }
@@ -227,8 +242,7 @@ fn compressed_set_round_trip(password: Option<&[u8]>, header_encryption: bool) {
         dir: dir.to_path_buf(),
         paths: Vec::new(),
     };
-    let source = EntrySource::from_opener(SIZE, || Ok(Box::new(Mixed { position: 0 })));
-    let mut entry = StreamingEntry::new(b"big.bin".to_vec(), source);
+    let mut entry = StreamingEntry::new(b"big.bin".to_vec(), Mixed::source(SIZE, false));
     entry.password = password.map(<[u8]>::to_vec);
     let mut options = WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::default());
     options.features.header_encryption = header_encryption;
@@ -297,4 +311,53 @@ fn a_compressed_member_over_4_gib_streams_into_a_set() {
     compressed_set_round_trip(None, false);
     #[cfg(feature = "encryption")]
     compressed_set_round_trip(Some(b"secret"), true);
+}
+
+/// A volume past 4 GiB holds the whole member in one fragment, and cipher
+/// padding takes its stored copy past `u32::MAX`.
+#[cfg(feature = "encryption")]
+#[test]
+#[ignore = "compresses an encrypted member of just under 4 GiB into one volume, then stores it"]
+fn an_encrypted_rar20_member_just_under_4_gib_fills_one_large_volume() {
+    let size = u32::MAX as u64 - 8;
+    let dir = scratch::case("legacy-near-4-gib-volume");
+    let mut sink = Parts {
+        dir: dir.to_path_buf(),
+        paths: Vec::new(),
+    };
+    let mut entry = StreamingEntry::new(b"big.bin".to_vec(), Mixed::source(size, true));
+    entry.password = Some(b"secret".to_vec());
+    write_volumes_to(
+        &[entry],
+        WriterOptions::new(ArchiveVersion::Rar20, FeatureSet::default()).with_compression_level(1),
+        MemberCoding::Compressed,
+        5 << 30,
+        &mut sink,
+        &WriterResources::default(),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(sink.paths.len(), 1);
+    let options = || ArchiveReadOptions::with_password(b"secret");
+    let archive = ArchiveReader::read_path_with_options(&sink.paths[0], options()).unwrap();
+    let sizes: Vec<_> = archive
+        .members()
+        .map(|member| member.meta.unpacked_size)
+        .collect();
+    assert_eq!(sizes, [size]);
+    rars::test_volumes_with_options(&[archive], options()).unwrap();
+
+    match std::process::Command::new("unrar")
+        .args(["t", "-psecret"])
+        .arg(&sink.paths[0])
+        .output()
+    {
+        Ok(result) => assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stdout)
+        ),
+        Err(error) => eprintln!("skipping unrar check: {error}"),
+    }
 }

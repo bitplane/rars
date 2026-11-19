@@ -51,7 +51,45 @@ pub(super) struct ResolvedLayout {
     pub(super) recovery_prefix_len: Option<u64>,
 }
 
+/// Refused when a recovery record could not cover everything before it.
+const RECOVERY_PREFIX_TOO_LARGE: &str =
+    "RAR 5 recovery record cannot protect more than 858,993,124,400 bytes";
+
+/// Settles the layout, and refuses one whose recovery record could not be
+/// built, so an archive too large for one fails before any of it is written.
 pub(super) fn resolve_layout(
+    inputs: &LayoutInputs<'_>,
+    resources: &WriterResources,
+) -> Result<ResolvedLayout> {
+    let layout = settle_layout(inputs, resources)?;
+    if let (Some(percent), Some(prefix)) = (inputs.recovery_percent, layout.recovery_prefix_len) {
+        if !recovery_covers(prefix, percent) {
+            return Err(Error::InvalidArgument(RECOVERY_PREFIX_TOO_LARGE));
+        }
+    }
+    Ok(layout)
+}
+
+/// Whether a recovery record can be built over `prefix_len` bytes. Its shard
+/// size is a 32-bit field, which caps a record at about 859 GB.
+pub(super) fn recovery_covers(prefix_len: u64, percent: u64) -> bool {
+    #[cfg(feature = "recovery")]
+    {
+        crate::recovery::rar5::plan_inline_recovery(prefix_len, percent)
+            .and_then(crate::recovery::rar5::check_streamable_plan)
+            .is_ok()
+    }
+    #[cfg(not(feature = "recovery"))]
+    {
+        // Writing the record is refused as a disabled feature instead.
+        let _ = (prefix_len, percent);
+        true
+    }
+}
+
+/// The layout [`resolve_layout`] returns, without its recovery check, for a
+/// volume writer that sizes each volume to what its record can cover.
+pub(super) fn settle_layout(
     inputs: &LayoutInputs<'_>,
     resources: &WriterResources,
 ) -> Result<ResolvedLayout> {
@@ -323,7 +361,9 @@ mod tests {
                         let base = boundary.saturating_sub(initial.main_header_len);
                         for delta in -32i64..=32 {
                             inputs.body_len = base.saturating_add_signed(delta);
-                            let layout = resolve_layout(&inputs, &resources).unwrap();
+                            // Past about 859 GB a recovery record is refused,
+                            // so settle without that check to reach every width.
+                            let layout = settle_layout(&inputs, &resources).unwrap();
                             assert_self_consistent(&inputs, &layout);
                         }
                     }
@@ -423,6 +463,39 @@ mod tests {
             stored_service_block_len(b"QO", u64::MAX, &[], false, &resources).unwrap_err(),
             Error::InvalidArgument("RAR 5 service block size overflows")
         );
+    }
+
+    #[cfg(feature = "recovery")]
+    #[test]
+    fn a_layout_whose_recovery_record_cannot_be_built_is_refused() {
+        let resources = crate::WriterResources::default();
+        let largest = crate::recovery::rar5::MAX_STREAMED_RECOVERY_PREFIX;
+        // Find the body that puts the recovery block at the largest prefix a
+        // record covers. Only the main header's vints move it off by a few.
+        let mut body_len = largest;
+        while settle_layout(&inputs(body_len), &resources)
+            .unwrap()
+            .recovery_prefix_len
+            .unwrap()
+            > largest
+        {
+            body_len -= 1;
+        }
+        let layout = resolve_layout(&inputs(body_len), &resources).unwrap();
+        assert_eq!(layout.recovery_prefix_len, Some(largest));
+        assert_self_consistent(&inputs(body_len), &layout);
+        assert!(recovery_covers(largest, 5));
+        assert!(!recovery_covers(largest + 1, 5));
+        for over in [body_len + 1, u64::MAX / 2] {
+            assert_eq!(
+                resolve_layout(&inputs(over), &resources).unwrap_err(),
+                Error::InvalidArgument(RECOVERY_PREFIX_TOO_LARGE)
+            );
+            // Without a recovery record the same body is fine.
+            let mut plain = inputs(over);
+            plain.recovery_percent = None;
+            assert!(resolve_layout(&plain, &resources).is_ok());
+        }
     }
 
     #[test]
