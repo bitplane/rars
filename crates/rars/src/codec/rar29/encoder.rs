@@ -617,6 +617,72 @@ fn encode_ppmd_block_with_model(
     Ok((out, model))
 }
 
+/// How much of a member [`encode_ppmd_either_way`] codes both ways to choose.
+const PPMD_EITHER_WAY_SAMPLE: usize = 1 << 20;
+
+/// Codes a PPMd block with LZ escapes or as plain literals, from the same
+/// model, whichever codes the member's start smaller, escapes on a tie.
+///
+/// An escape prices itself against costs measured off the stream it shapes,
+/// so on text that rarely repeats it can lose to literals: a 4.3 MB source
+/// tar at order 25 packs 1.8% smaller without them. Coding the whole member
+/// twice to find out costs half as much again on text where escapes win, so
+/// past twice the sample only the sample is coded both ways, from copies of
+/// the model, and the member is coded once the way it chose. The model comes
+/// back from that coding, since that is what its reader holds.
+fn encode_ppmd_either_way(
+    input: &[u8],
+    max_match_distance: usize,
+    model: Option<&PpmdModel>,
+    size: PpmdModelSize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Vec<u8>, PpmdModel)> {
+    encode_ppmd_either_way_sampled(
+        input,
+        max_match_distance,
+        model,
+        size,
+        PPMD_EITHER_WAY_SAMPLE,
+        progress,
+    )
+}
+
+/// [`encode_ppmd_either_way`] choosing from the first `sample` bytes.
+fn encode_ppmd_either_way_sampled(
+    input: &[u8],
+    max_match_distance: usize,
+    model: Option<&PpmdModel>,
+    size: PpmdModelSize,
+    sample: usize,
+    progress: &mut dyn FnMut(usize) -> bool,
+) -> Result<(Vec<u8>, PpmdModel)> {
+    let code = |input: &[u8], escapes: bool, progress: &mut dyn FnMut(usize) -> bool| {
+        encode_ppmd_block_with_model(
+            input,
+            escapes,
+            None,
+            max_match_distance,
+            model.cloned(),
+            size,
+            Some(progress),
+        )
+    };
+    if input.len() <= sample.saturating_mul(2) {
+        let escaped = code(input, true, &mut *progress)?;
+        let literals = code(input, false, &mut |_| progress(input.len()))?;
+        return Ok(if literals.0.len() < escaped.0.len() {
+            literals
+        } else {
+            escaped
+        });
+    }
+    let sample = &input[..sample];
+    let mut poll = |_| progress(0);
+    let escaped = code(sample, true, &mut poll)?.0.len();
+    let literals = code(sample, false, &mut poll)?.0.len();
+    code(input, literals >= escaped, progress)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PpmdEncodeToken {
     Literal(u8),
@@ -886,7 +952,7 @@ impl Unpack29Encoder {
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<Vec<u8>> {
         if engine == ChainEngine::Ppmd {
-            let (packed, model) = self.encode_ppmd_member(input, progress)?;
+            let (packed, model) = self.encode_ppmd_member(input, false, progress)?;
             self.ppmd = Some(model);
             self.remember(input);
             return Ok(packed);
@@ -896,7 +962,7 @@ impl Unpack29Encoder {
 
         let ppmd = match engine {
             ChainEngine::Smaller => {
-                Some(self.encode_ppmd_member(input, &mut |_| progress(input.len()))?)
+                Some(self.encode_ppmd_member(input, true, &mut |_| progress(input.len()))?)
             }
             _ => None,
         };
@@ -1002,39 +1068,45 @@ impl Unpack29Encoder {
     /// loses leaves the reader's model where the winning member expects it.
     ///
     /// A member that starts the model codes under each of the chain's sizes
-    /// and keeps the smallest, earlier on a tie, holding two models at a time.
-    /// Only the first size reports progress; the others poll at the end.
+    /// and keeps the smallest, earlier on a tie. With `either_way`, each size,
+    /// or the model the chain continues, codes with LZ escapes or as plain
+    /// literals, whichever [`encode_ppmd_either_way`] chooses: the model
+    /// carries on from the coding written, as the reader's does. Forced PPMd codes with
+    /// escapes only, which is what a streamed member can match. Only the first
+    /// coding reports progress; the others poll at the end.
     fn encode_ppmd_member(
         &self,
         input: &[u8],
+        either_way: bool,
         progress: &mut dyn FnMut(usize) -> bool,
     ) -> Result<(Vec<u8>, (PpmdModel, PpmdModelSize))> {
         let distance = self.options.max_match_distance;
+        let code = |model: Option<&PpmdModel>,
+                    size: PpmdModelSize,
+                    progress: &mut dyn FnMut(usize) -> bool| {
+            if either_way {
+                encode_ppmd_either_way(input, distance, model, size, progress)
+            } else {
+                encode_ppmd_block_with_model(
+                    input,
+                    true,
+                    None,
+                    distance,
+                    model.cloned(),
+                    size,
+                    Some(progress),
+                )
+            }
+        };
         if let Some((model, size)) = &self.ppmd {
-            let (packed, model) = encode_ppmd_block_with_model(
-                input,
-                true,
-                None,
-                distance,
-                Some(model.clone()),
-                *size,
-                Some(progress),
-            )?;
+            let (packed, model) = code(Some(model), *size, progress)?;
             return Ok((packed, (model, *size)));
         }
         let mut best: Option<(Vec<u8>, (PpmdModel, PpmdModelSize))> = None;
         for (index, &size) in self.ppmd_sizes.iter().enumerate() {
             let mut report =
                 |position: usize| progress(if index == 0 { position } else { input.len() });
-            let (packed, model) = encode_ppmd_block_with_model(
-                input,
-                true,
-                None,
-                distance,
-                None,
-                size,
-                Some(&mut report),
-            )?;
+            let (packed, model) = code(None, size, &mut report)?;
             if best
                 .as_ref()
                 .is_none_or(|(best, _)| packed.len() < best.len())
