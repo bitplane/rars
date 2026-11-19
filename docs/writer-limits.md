@@ -50,7 +50,7 @@ without it. The solid column is two 512 MiB members.
 
 | format | stored | compressed, to a file | compressed, to a pipe | solid | password | encrypted headers | volumes, stored / compressed | recovery |
 |---|---|---|---|---|---|---|---|---|
-| `rar14` | 7 MB | 10 MB | 10 MB | 10 MB | 10 MB | refused | 3.2 GB / 2.3 GB | refused |
+| `rar14` | 7 MB | 10 MB | 10 MB | 10 MB | 10 MB | refused | 5 MB / 9 MB | refused |
 | `rar15` | 6 MB | 10 MB | 10 MB | 10 MB | 11 MB | refused | 6 MB / 10 MB | refused |
 | `rar20` | 6 MB | 27 MB | 28 MB | 25 MB | 31 MB | refused | 6 MB / 28 MB | refused |
 | `rar40` | 6 MB | 144 MB | 145 MB | 181 MB | 146 MB | 145 MB | 6 MB / 193 MB | refused |

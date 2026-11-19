@@ -412,6 +412,22 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
             .unwrap();
     }
     assert_eq!(multiple.build_volumes(None).unwrap().len(), 1);
+
+    // A RAR 1.3 set has nowhere to put an archive comment; it used to be dropped.
+    let mut commented = Builder::new(ArchiveVersion::Rar14)
+        .store(true)
+        .comment(Some(b"comment".to_vec()))
+        .volume_size(Some(1024));
+    commented
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    assert!(matches!(
+        commented.build_volumes(None),
+        Err(rars::Error::UnsupportedWriterOption {
+            option: rars::WriterOption::ArchiveComment,
+            ..
+        })
+    ));
 }
 
 #[test]
