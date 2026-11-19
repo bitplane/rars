@@ -393,7 +393,8 @@ fn preserving_builder_refuses_an_sfx_prefix_it_cannot_preserve() {
     let source = ArchiveReader::read_owned(prefixed).unwrap();
     assert!(source
         .rewrite_preservation_issues()
-        .contains(&"SFX executable prefix".to_string()));
+        .iter()
+        .any(|issue| issue == "SFX executable prefix"));
     assert!(matches!(
         source.preserving_builder(None),
         Err(rars::Error::InvalidArgument(

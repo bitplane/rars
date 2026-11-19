@@ -233,7 +233,7 @@ fn solid_multirun_history_fits_fixed_ceiling_and_extracts() {
     let root = scratch::case("encoder-memory-packed-history");
     // Two 1 MiB members form two 1 MiB runs.
     // The latter has nonempty 1 MiB history and 2 MiB combined input, so
-    // level 3 selects the promoted packed collector (1 MiB <= combined <= 2D).
+    // level 3 seeds a tree with the history before searching the run.
     const SIZE: usize = 1024 * KIB;
     for version in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         for kind in [Data::Incompressible, Data::Repetitive] {
