@@ -84,20 +84,15 @@ by default because such programs are arbitrary bytecode from the archive and can
 use a lot of CPU time; a member that needs one fails with `UNSUPPORTED_FEATURE`.
 Current WinRAR does not run them either. Enable it only for archives you trust.
 
-Output limits count logical decoded bytes, including discarded solid-prefix
-output. Reading a volume entry currently decodes the whole volume set, so its
-total-output limit includes other members. Limits are not an aggregate RAM
-ceiling: inputs and returned outputs are materialised, and decoder workspace
-has separate costs. RAR5/7 dictionary and buffered-decoding limits affect those
-formats only. Filesystem scratch decoding is unavailable in the WASM backend.
-Unknown-size RAR5 members are refused under a member-output limit; decode-to-end
-support remains separate work.
+Output limits count decoded bytes, including solid-prefix output that is
+discarded. Reading one entry of a volume set decodes the whole set, so the
+total-output limit covers other members too. Unknown-size RAR 5 members are
+refused under a member-output limit.
 
-`maxReaderWorkspaceBytes` limits aggregate reader allocation capacity per call,
-including decoder state and queued parallel payloads. Source buffers, JavaScript
-objects and returned bytes are outside the quota. Capacity replacement overlap
-counts; this is not a process RAM limit. Refusals retain the resource error code
-and byte details.
+`maxReaderWorkspaceBytes` caps the reader's own allocations per call,
+including decoder state and queued parallel payloads, but not the input,
+returned bytes or JavaScript objects. None of these limits is a process memory
+ceiling.
 
 `isRarFile(input)` says whether the input starts with a RAR signature, and
 `isRarFileSfx(input)` whether an archive starts in it, behind a self-extractor
@@ -181,21 +176,15 @@ Resource-limit details use decimal strings for byte counts, preserving values
 beyond JavaScript’s exact integer range. Node filesystem errors use `IO` with
 the original system code, errno and syscall in `details`.
 
-Aborting queued work rejects it immediately without interrupting the active
-operation. Aborting active work terminates its worker; later operations start
-a fresh worker. This is worker termination, so it does not run cooperative Rust
-cleanup or undo completed filesystem writes. Interrupted Node writes may leave
-staged temporary files. No separate cancellation-token object is needed in JS.
+Aborting queued work rejects it at once. Aborting running work terminates its
+worker, and the next operation starts a fresh one. Rust cleanup doesn't run, so
+an interrupted Node write may leave staged temporary files behind.
 
-`RarWriter` accepts `maxMemoryBytes` as a nonnegative safe integer or a `bigint`
-through `2n ** 64n - 1n`. It caps managed RAR5/7 execution allocation capacity,
-including retained WASM spools, archive/volume output and the final JavaScript
-payload copy. The default is unlimited; zero admits no managed allocation.
-A refusal has code `RESOURCE_LIMIT`; the constructor refuses it for older
-versions with `INVALID_OPTION`, as it does any setting the version can't write.
-Caller inputs, returned caller-owned bytes, JavaScript
-runtime objects, allocator overhead, stacks and OS memory are excluded. This is
-not a process-memory ceiling and does not bound reading or rewrite staging.
+`RarWriter` accepts `maxMemoryBytes` (a safe integer or `bigint`) to cap the
+RAR 5/7 writer's managed allocations, including spools, output and the final
+copy to JavaScript. The default is unlimited. Going over fails with
+`RESOURCE_LIMIT`; other formats refuse the option with `INVALID_OPTION`. It
+doesn't cover your inputs, runtime overhead, reading or rewrite staging.
 
 ## Extract (Node)
 
@@ -257,34 +246,21 @@ Direct cross-origin imports use a small blob worker bootstrap. A restrictive
 Content Security Policy must therefore allow `blob:` in `worker-src`, or the
 package assets should be bundled or served from the page's origin.
 
-The current API materialises input and output bytes. True backpressured stream
-input/output will be added separately rather than presenting a stream that
-secretly buffers an entire archive.
+Input and output are whole byte arrays; there is no streaming API yet.
 
 The same library is available as a [Rust crate][crate], [Python package][pypi]
 and [command-line tool][repo].
 
-## Development validation
+## Development
 
-Run `CARGO_BUILD_JOBS=1 scripts/build-npm.sh --debug` and then
-`node scripts/test-npm-package.js` for focused engine and worker checks.
-The debug build skips LTO and `wasm-opt`. Build release artifacts with
-`scripts/build-npm.sh` without `--debug`. Both modes require a `wasm-bindgen`
+`CARGO_BUILD_JOBS=1 scripts/build-npm.sh --debug` then
+`node scripts/test-npm-package.js` builds and tests quickly (no LTO or
+`wasm-opt`); drop `--debug` for release artifacts. Both need a `wasm-bindgen`
 CLI matching `Cargo.lock`.
 
-## Development coverage
-
-From the repository root, run `python3 scripts/coverage-wasm.py` to measure
-Rust engine coverage under Node. It requires Node, `wasm-bindgen` matching
-`Cargo.lock`, and a Rust nightly using LLVM 23 with `wasm32-unknown-unknown`
-and `llvm-tools-preview` installed. The command uses one build job and at most
-two available CPUs, and saves reports under the ignored
-`target/coverage-wasm-focused` directory.
-
-An independent two-branch probe checks the measurement before testing the
-engine. Private error conversion tests are compiled with `cfg(test)`;
-their exports and the profiling runtime stub are absent from release builds.
-This measures Rust WASM source, separately from JavaScript facade coverage.
+`python3 scripts/coverage-wasm.py` measures Rust coverage under Node. It
+also needs nightly Rust on LLVM 23 with `wasm32-unknown-unknown` and
+`llvm-tools-preview`, and writes to `target/coverage-wasm-focused`.
 
 [crate]: https://crates.io/crates/rars
 [pypi]: https://pypi.org/project/rars/

@@ -316,16 +316,38 @@ fn split_large_filter(
     filter: crate::FilterSpec,
 ) -> Result<Vec<crate::FilterSpec>> {
     let range = checked_filter_range(input_len, &filter)?;
+    let (unit, chunk_size) = filter_chunking(filter.kind)?;
+    if range.len() <= chunk_size {
+        return Ok(vec![filter]);
+    }
 
+    let mut filters = Vec::new();
+    let mut start = range.start;
+    while start < range.end {
+        let end = (start + chunk_size).min(range.end);
+        // Chunking can leave a remainder the filter has no way to transform.
+        // Those bytes stay as they are; a filter covering part of a member is
+        // exactly what a range is for.
+        if end - start < unit {
+            break;
+        }
+        filters.push(crate::FilterSpec::range(filter.kind, start..end));
+        start = end;
+    }
+    Ok(filters)
+}
+
+/// The fewest bytes a filter of `kind` transforms, and the most one record covers.
+fn filter_chunking(kind: crate::FilterKind) -> Result<(usize, usize)> {
     // The smallest run of bytes each filter can still transform. A trailing
     // chunk shorter than this is left unfiltered rather than handed to a filter
     // that cannot process it.
-    let unit = match rar29_filter(filter.kind)? {
+    let unit = match rar29_filter(kind)? {
         Rar29Filter::Delta { channels } | Rar29Filter::Audio { channels } => channels,
         Rar29Filter::Rgb { width, .. } => width.max(3),
         Rar29Filter::E8 | Rar29Filter::E8E9 | Rar29Filter::Itanium => 4,
     };
-    let chunk_size = match rar29_filter(filter.kind)? {
+    let chunk_size = match rar29_filter(kind)? {
         Rar29Filter::Delta { channels } => {
             if channels == 0 || channels > MAX_VM_DELTA_FILTER_BLOCK_SIZE {
                 return Err(Error::InvalidData(
@@ -352,24 +374,47 @@ fn split_large_filter(
         }
         Rar29Filter::E8 | Rar29Filter::E8E9 | Rar29Filter::Itanium => MAX_VM_FILTER_BLOCK_SIZE,
     };
-    if range.len() <= chunk_size {
-        return Ok(vec![filter]);
-    }
+    Ok((unit, chunk_size))
+}
 
-    let mut filters = Vec::new();
-    let mut start = range.start;
-    while start < range.end {
-        let end = (start + chunk_size).min(range.end);
-        // Chunking can leave a remainder the filter has no way to transform.
-        // Those bytes stay as they are; a filter covering part of a member is
-        // exactly what a range is for.
-        if end - start < unit {
-            break;
+/// A named filter's share of each streamed segment in turn, for [`Unpack29Encoder::encode_lz_streamed`].
+///
+/// Records are cut where [`split_large_filter`] cuts the whole member, so a
+/// member streams the records it would code in memory. A record a segment
+/// boundary falls inside is cut there too, since a segment is filtered before
+/// the next one is read, and a piece too short to transform stays as it is.
+pub(crate) fn named_filter_segments(
+    len: usize,
+    filter: crate::FilterSpec,
+) -> Result<impl FnMut(&[u8]) -> Result<Vec<crate::FilterSpec>>> {
+    let range = checked_filter_range(len, &filter)?;
+    let (unit, chunk_size) = filter_chunking(filter.kind)?;
+    let (step, end) = match range.len() <= chunk_size {
+        true => (range.len(), range.end),
+        false => match range.len() % chunk_size {
+            tail if tail < unit => (chunk_size, range.end - tail),
+            _ => (chunk_size, range.end),
+        },
+    };
+    let mut at = 0;
+    Ok(move |segment: &[u8]| {
+        let (start, stop) = (at, at + segment.len());
+        at = stop;
+        let mut pieces = Vec::new();
+        let mut from = range.start + start.saturating_sub(range.start) / step * step;
+        while from < end.min(stop) {
+            let to = (from + step).min(end);
+            let (lo, hi) = (from.max(start), to.min(stop));
+            if (lo, hi) == (from, to) || hi - lo >= unit {
+                pieces.push(crate::FilterSpec::range(
+                    filter.kind,
+                    lo - start..hi - start,
+                ));
+            }
+            from = to;
         }
-        filters.push(crate::FilterSpec::range(filter.kind, start..end));
-        start = end;
-    }
-    Ok(filters)
+        Ok(pieces)
+    })
 }
 
 /// Whether a decoder can undo the x86 filter on every operand in `range`.

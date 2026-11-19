@@ -145,18 +145,9 @@ pub(crate) trait FilterSearch {
     ///
     /// This is how a screen prices a filter it can only afford to try on a slice
     /// of the member: compress the transformed bytes and compare against the
-    /// unfiltered ones. Comparing a filtered *encode* with an unfiltered one used
-    /// to measure something else entirely. On a 396 KB binary the 128 KiB sample
-    /// said the E8E9 filter cost 10% (74322 plain against 81744 filtered) while
-    /// the same filter was worth 7.4% of the finished archive, so every x86
-    /// member was screened out before anything measured it.
-    ///
-    /// That gap was the two paths cutting blocks at different sizes, fixed in
-    /// 6ce759c: they now agree to within a filter token per block. So a screen
-    /// that can encode the whole member goes straight to
-    /// [`FilterSearch::encode_filtered`] and keeps the result, and this stays for
-    /// the case it was written for, where the sample is a slice and there is
-    /// nothing to keep.
+    /// unfiltered ones. A screen that can encode the whole member uses
+    /// [`FilterSearch::encode_filtered`] instead and keeps the result; this is
+    /// for a sample slice, where there is nothing to keep.
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>>;
 
     /// Encode without filters.
@@ -497,10 +488,9 @@ fn x86_code_regions<B: Budget>(data: &[u8], allowance: &B) -> Result<Buffer<Rang
 /// whole-member encode costs.
 ///
 /// Every region gets its own sample, because on an unstripped binary the biggest
-/// region is the debug data rather than the code. Screening only the largest, as
-/// this did, declined the filter on every unstripped binary measured: it read
-/// DWARF, saw no win, and stopped before anything measured the member. Regions
-/// are disjoint, so the samples together never come to more than the member.
+/// region is the debug data rather than the code; screening only that one reads
+/// DWARF, sees no win, and declines the filter. Regions are disjoint, so the
+/// samples together never come to more than the member.
 ///
 /// A region the filter makes bigger is dropped rather than counted against the
 /// rest, which is what keeps the debug data out of the ranged candidate. On a
@@ -620,10 +610,9 @@ struct X86Screen<B: Budget> {
 /// The x86 filter specs worth measuring against the whole member, given what the
 /// screen made of the regions the scanner proposed.
 ///
-/// The scanner proposes overlapping regions at several clustering distances, and
-/// the search this replaced priced every one of them with its own whole-member
-/// encode. Measured at full effort the whole spread is worth about a third of a
-/// percent, so this keeps the two that are structurally different: filter
+/// The scanner proposes overlapping regions at several clustering distances.
+/// Pricing each with a whole-member encode is worth about a third of a percent
+/// at full effort, so this keeps the two that are structurally different: filter
 /// everything, or filter only where the screen saw code.
 ///
 /// Which of the two is worth an encode is mostly already known. Filtering
@@ -2635,10 +2624,9 @@ mod tests {
         assert_eq!(graft_tables(code_only.clone(), &[], 1000), code_only);
     }
 
-    /// The member this change exists for: an unstripped binary with a
-    /// relocation table in it. The bundled candidate this replaces lost to the
-    /// x86-only finalist here, because it carried the tables and the trimmed
-    /// code coverage as one bet, and the table went unfiltered with it.
+    /// An unstripped binary with a relocation table in it. A candidate that
+    /// bundles the table delta with the trimmed code coverage as one bet loses
+    /// to the x86-only finalist here, and the table goes unfiltered.
     #[test]
     fn the_winner_filters_the_code_and_deltas_the_table_in_one_member() {
         let (mut data, code_len) = code_then_debug();

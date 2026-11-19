@@ -1,13 +1,6 @@
 //! What each format's writer can be asked for, and one place that says no.
 //!
-//! Every writer used to answer this for itself, in about thirty functions that
-//! nearly all ended the same way: build the set of features this shape of
-//! archive is allowed, compare it with what the caller asked for, and on a
-//! mismatch return a fixed string that never said which option was the problem.
-//! A caller who asked for two things and could only have one was told "writer
-//! feature is not supported" and left to work out which.
-//!
-//! So capability is data here, keyed by format and by the shape of the archive
+//! Capability is data here, keyed by format and by the shape of the archive
 //! being built, and a refusal names the option, the format, and why.
 
 use crate::error::{Error, Result};
@@ -18,8 +11,7 @@ use crate::version::{ArchiveFamily, ArchiveVersion};
 /// How the members of an archive are coded.
 ///
 /// The three arms are the three questions a writer has to answer before it
-/// touches a member, and they used to be three entry points per format that
-/// differed in a handful of lines each.
+/// touches a member.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MemberCoding {
