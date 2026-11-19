@@ -1641,9 +1641,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     features.solid = solid;
     features.header_encryption = header_encryption;
     let password = password_bytes(&password);
-    let mut resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
-        rars::WriterResources::new(limit as u64)
-    });
+    let mut resources = writer_resources(memory_limit);
     if let Some(directory) = temp_dir {
         resources = resources.with_temp_dir(directory);
     }
@@ -2024,9 +2022,7 @@ fn write_plain_rar50_streaming(
     let default_temp = archive_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty());
-    let mut resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
-        rars::WriterResources::new(limit as u64)
-    });
+    let mut resources = writer_resources(memory_limit);
     if let Some(limit) = max_memory {
         resources = resources.with_max_memory_bytes(limit as u64);
     }
@@ -2441,6 +2437,21 @@ pub(crate) fn parse_thread_count(input: &str) -> Result<usize, String> {
 
 pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Password>> {
     resolve_password(args.password.as_deref(), args.password_file.as_deref())
+}
+
+/// The writer's resources under `--memory-limit`, which sets working memory.
+///
+/// Each job stays planned within the default limit, or within `limit` when
+/// that is lower, so raising it only lets more jobs run at once and never
+/// changes the archive. Planning a member within a raised limit codes it
+/// whole: on 256 MiB of binaries at level 5 that was 6.4% smaller but took
+/// 4.6 times as long, and at level 3 it was no smaller (#316).
+fn writer_resources(memory_limit: Option<usize>) -> rars::WriterResources {
+    let resources = rars::WriterResources::default();
+    match memory_limit {
+        Some(limit) => resources.with_memory_limit(limit as u64),
+        None => resources,
+    }
 }
 
 #[cfg(test)]
