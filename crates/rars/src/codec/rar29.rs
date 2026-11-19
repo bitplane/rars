@@ -3,8 +3,9 @@ mod encoder;
 #[cfg(feature = "write")]
 pub(crate) use encoder::{
     filtered_members, named_filter_segments, ppmd_search_workspace,
-    unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd_with_progress,
-    MAX_VM_DELTA_FILTER_BLOCK_SIZE, PPMD_MODEL_BYTES,
+    unpack29_encode_literals_with_options_and_progress, unpack29_encode_ppmd_sized_with_progress,
+    unpack29_encode_ppmd_with_progress, PpmdModelSize, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
+    OPTIMAL_PARSE_WORKSPACE, PPMD_MODEL_BYTES,
 };
 #[cfg(feature = "write")]
 pub use encoder::{
