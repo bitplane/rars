@@ -1181,9 +1181,11 @@ fn encode_member_blocks(
         &mut InMemory::new(input, history, &[], options),
         options,
         block_size,
+        levels,
         progress,
-        |_, end, tokens, state, _| {
-            out.extend_from_slice(&code_block(tokens, state, &[], end < input.len(), levels)?);
+        |_, _, _| Ok(Vec::new()),
+        |packed, _| {
+            out.extend_from_slice(packed);
             Ok(ControlFlow::Continue(()))
         },
     )?
@@ -1294,17 +1296,13 @@ impl Unpack29Encoder {
             &mut segments,
             options,
             block_size,
+            &mut levels,
             Some(progress),
-            |base, end, tokens, state, records| {
-                let records = match filtering {
-                    true => block_filter_records(records, base, end, window, &mut programs)?,
-                    false => Vec::new(),
-                };
-                out(
-                    &code_block(tokens, state, &records, end < len, &mut levels)?,
-                    end,
-                )
+            |base, end, records| match filtering {
+                true => block_filter_records(records, base, end, window, &mut programs),
+                false => Ok(Vec::new()),
             },
+            out,
         )?;
         if flow.is_continue() {
             // Every parse reads one reach of history, which the window still holds.
@@ -1584,18 +1582,21 @@ impl Segments for ReadSegments<'_, '_> {
     }
 }
 
+/// Parses and codes `input` a block at a time, handing each coded piece to `out` in order.
+///
+/// `filters_for` gives the coded filter records a piece declares, from its
+/// start and end and the segment's records. It is called once per piece, in
+/// order, so it may carry state from one piece to the next. `levels` is the
+/// table the reader holds before the first piece, as for [`code_block`], and
+/// is left holding the last coded piece's.
 fn for_each_block(
     input: &mut dyn Segments,
     options: EncodeOptions,
     block_size: usize,
+    levels: &mut [u8; TABLE_COUNT],
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    mut code: impl FnMut(
-        usize,
-        usize,
-        &[EncodeToken],
-        EncoderMatchState,
-        &[OwnedVmFilterRecord],
-    ) -> Result<ControlFlow<()>>,
+    mut filters_for: impl FnMut(usize, usize, &[OwnedVmFilterRecord]) -> Result<Vec<Vec<u8>>>,
+    mut out: impl FnMut(&[u8], usize) -> Result<ControlFlow<()>>,
 ) -> Result<ControlFlow<()>> {
     let block_size = block_size.max(1);
     let reach = options.max_match_distance.min(MAX_HISTORY);
@@ -1620,32 +1621,144 @@ fn for_each_block(
         let base = combined.len() - (segment_end - block_start);
         let mut parser = LzParser::new(&combined, base, options, block_size);
         let origin = block_start;
-        for batch in segment.chunks(per_batch) {
+        let local = |end: usize| base + end - origin;
+        let batches: Vec<&[usize]> = segment.chunks(per_batch).collect();
+        parser.fill_to(local(*batches[0].last().expect("chunks are never empty")));
+        for (index, &batch) in batches.iter().enumerate() {
             if progress
                 .as_deref_mut()
                 .is_some_and(|report| !report(block_start))
             {
                 return Err(Error::Cancelled);
             }
-            let local: Vec<usize> = batch.iter().map(|&end| base + end - origin).collect();
-            for (pieces, &end) in parser.parse_blocks(&local)?.iter().zip(batch) {
-                for piece in pieces {
+            let ends: Vec<usize> = batch.iter().map(|&end| local(end)).collect();
+            // Each piece in order, with the end of its block if it is the last.
+            let mut pieces = Vec::new();
+            let mut filter_failure = None;
+            let mut start = block_start;
+            'blocks: for (block, &end) in parser.parse_filled(&ends)?.into_iter().zip(batch) {
+                let count = block.len();
+                for (at, piece) in block.into_iter().enumerate() {
                     let piece_end = origin + piece.end - base;
-                    if code(block_start, piece_end, &piece.tokens, piece.state, &records)?
-                        .is_break()
-                    {
-                        return Ok(ControlFlow::Break(()));
+                    match filters_for(start, piece_end, &records) {
+                        Ok(filters) => pieces.push((
+                            BlockToCode {
+                                tokens: piece.tokens,
+                                state: piece.state,
+                                filters,
+                                more_blocks_follow: piece_end < len,
+                            },
+                            piece_end,
+                            (at + 1 == count).then_some(end),
+                        )),
+                        Err(error) => {
+                            filter_failure = Some(error);
+                            break 'blocks;
+                        }
                     }
-                    block_start = piece_end;
+                    start = piece_end;
                 }
-                debug_assert_eq!(block_start, end);
-                if progress.as_deref_mut().is_some_and(|report| !report(end)) {
-                    return Err(Error::Cancelled);
+            }
+            let (blocks, places): (Vec<_>, Vec<_>) = pieces
+                .into_iter()
+                .map(|(block, piece_end, block_end)| (block, (piece_end, block_end)))
+                .unzip();
+            // Filling ahead is serial, so the next batch fills while this one
+            // codes. Nothing in this batch reads the finder any more.
+            let next = batches
+                .get(index + 1)
+                .map(|next| local(next[next.len() - 1]));
+            let ((), (packed, coding_failure)) = crate::parallel::join(
+                || {
+                    if let Some(last) = next {
+                        parser.fill_to(last);
+                    }
+                },
+                || code_blocks(blocks, &mut *levels),
+            );
+            // What coded before a failure is still handed on, as it was when
+            // each piece was coded as soon as it parsed.
+            for (packed, &(piece_end, block_end)) in packed.iter().zip(&places) {
+                if out(packed, piece_end)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
                 }
+                block_start = piece_end;
+                if let Some(end) = block_end {
+                    debug_assert_eq!(block_start, end);
+                    if progress.as_deref_mut().is_some_and(|report| !report(end)) {
+                        return Err(Error::Cancelled);
+                    }
+                }
+            }
+            if let Some(error) = coding_failure.or(filter_failure) {
+                return Err(error);
             }
         }
     }
     Ok(ControlFlow::Continue(()))
+}
+
+/// One parsed piece and what [`code_block`] needs besides the reader's table.
+struct BlockToCode {
+    tokens: Vec<EncodeToken>,
+    state: EncoderMatchState,
+    filters: Vec<Vec<u8>>,
+    more_blocks_follow: bool,
+}
+
+/// Codes consecutive pieces side by side, to the bytes [`code_block`] gives coding them in turn.
+///
+/// A piece's table is counted from its own tokens alone. The previous piece
+/// only decides how that table is written, outright or as a delta against the
+/// one before, so every table is counted first and then each piece is coded
+/// against its predecessor's, with `levels` standing in before the first.
+///
+/// Returns the packed pieces before the first failure and that failure.
+/// `levels` is left holding the last table counted.
+fn code_blocks(
+    blocks: Vec<BlockToCode>,
+    levels: &mut [u8; TABLE_COUNT],
+) -> (Vec<Vec<u8>>, Option<Error>) {
+    let (tables, table_failure) = map_blocks(blocks.iter().collect(), |block: &BlockToCode| {
+        table_lengths_for_tokens(&block.tokens, block.state, block.filters.len())
+    });
+    let mut previous = *levels;
+    let jobs: Vec<_> = blocks
+        .into_iter()
+        .zip(&tables)
+        .map(|(block, table)| (block, std::mem::replace(&mut previous, *table), table))
+        .collect();
+    *levels = previous;
+    let (packed, coding_failure) = map_blocks(jobs, |(block, previous, table)| {
+        code_block_with_table(
+            &block.tokens,
+            block.state,
+            &block.filters,
+            block.more_blocks_follow,
+            &previous,
+            table,
+        )
+    });
+    // A piece that coded did so after every table before it counted.
+    (packed, coding_failure.or(table_failure))
+}
+
+/// Maps items in order, side by side when this thread may fan out; the outputs before the first failure, and that failure.
+fn map_blocks<T: Send, O: Send>(
+    items: Vec<T>,
+    map: impl Fn(T) -> Result<O> + Sync + Send,
+) -> (Vec<O>, Option<Error>) {
+    if crate::parallel::may_nest() {
+        return crate::parallel::map_prefix(items, map);
+    }
+    let mut outputs = Vec::with_capacity(items.len());
+    for item in items {
+        match map(item) {
+            Ok(output) => outputs.push(output),
+            Err(error) => return (outputs, Some(error)),
+        }
+    }
+    (outputs, None)
 }
 
 /// `more_blocks_follow` is what the block's terminator says.
@@ -1770,6 +1883,28 @@ fn code_block(
     previous_levels: &mut [u8; TABLE_COUNT],
 ) -> Result<Vec<u8>> {
     let table_lengths = table_lengths_for_tokens(tokens, state, initial_filters.len())?;
+    let packed = code_block_with_table(
+        tokens,
+        state,
+        initial_filters,
+        more_blocks_follow,
+        previous_levels,
+        &table_lengths,
+    )?;
+    *previous_levels = table_lengths;
+    Ok(packed)
+}
+
+/// [`code_block`] with the block's table already counted by [`table_lengths_for_tokens`].
+fn code_block_with_table(
+    tokens: &[EncodeToken],
+    state: EncoderMatchState,
+    initial_filters: &[Vec<u8>],
+    more_blocks_follow: bool,
+    previous_levels: &[u8; TABLE_COUNT],
+    table_lengths: &[u8; TABLE_COUNT],
+) -> Result<Vec<u8>> {
+    let table_lengths = *table_lengths;
 
     // Two ways to say the same table: outright, or as a delta against the one
     // the reader already holds. Neither wins everywhere, so code both and take
@@ -1783,7 +1918,6 @@ fn code_block(
         true => against_previous,
         false => outright,
     };
-    *previous_levels = table_lengths;
 
     let level_lengths = level_code_lengths(&level_tokens);
     let level_codes = canonical_codes(&level_lengths);
@@ -1991,16 +2125,11 @@ fn encode_filtered_member_blocks(
         &mut InMemory::new(data, history, filters, inner),
         inner,
         block_size,
+        levels,
         progress,
-        |base, end, tokens, state, records| {
-            let records = block_filter_records(records, base, end, window, &mut programs)?;
-            out.extend_from_slice(&code_block(
-                tokens,
-                state,
-                &records,
-                end < data.len(),
-                levels,
-            )?);
+        |base, end, records| block_filter_records(records, base, end, window, &mut programs),
+        |packed, _| {
+            out.extend_from_slice(packed);
             Ok(ControlFlow::Continue(()))
         },
     )?
@@ -2407,6 +2536,8 @@ fn with_history<'a>(
 /// Blocks start with no repeat offsets, so a batch parses in parallel against a finder filled ahead.
 struct LzParser<'a> {
     data: &'a [u8],
+    /// Where the next block parsed starts.
+    parsed: usize,
     filled: usize,
     batch_bytes: usize,
     finder: Rar29MatchFinder,
@@ -2435,6 +2566,7 @@ impl<'a> LzParser<'a> {
         }
         Self {
             data,
+            parsed: start,
             filled: start,
             batch_bytes,
             finder,
@@ -2443,16 +2575,34 @@ impl<'a> LzParser<'a> {
     }
 
     /// `ends` must stay within one batch of where the last call ended.
+    #[cfg(test)]
     fn parse_blocks(&mut self, ends: &[usize]) -> Result<Vec<Vec<Piece>>> {
-        let Some(&last) = ends.last() else {
-            return Ok(Vec::new());
-        };
+        if let Some(&last) = ends.last() {
+            self.fill_to(last);
+        }
+        self.parse_filled(ends)
+    }
+
+    /// Inserts every position before `last`, for the batch that ends there.
+    ///
+    /// Only once every block before has parsed: filling overwrites links a
+    /// batch further back than the reach, which those blocks may still read.
+    fn fill_to(&mut self, last: usize) {
+        debug_assert!(self.filled == self.parsed);
         debug_assert!(last - self.filled <= self.batch_bytes);
-        let first = self.filled;
         for pos in self.filled..last {
             self.finder.insert(self.data, pos);
         }
         self.filled = last;
+    }
+
+    /// Parses the blocks ending at `ends`, from where the last call ended, which must already be filled.
+    fn parse_filled(&mut self, ends: &[usize]) -> Result<Vec<Vec<Piece>>> {
+        let Some(&last) = ends.last() else {
+            return Ok(Vec::new());
+        };
+        debug_assert!(last <= self.filled);
+        let first = std::mem::replace(&mut self.parsed, last);
         let ranges: Vec<(usize, usize)> = std::iter::once(first)
             .chain(ends[..ends.len() - 1].iter().copied())
             .zip(ends.iter().copied())
