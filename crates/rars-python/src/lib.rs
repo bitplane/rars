@@ -2177,22 +2177,156 @@ struct RarBuilder {
     resources: rars_rs::WriterResources,
 }
 
-enum PythonVolumes {
-    Tracked(rars_rs::WriterVolumes),
-    Untracked(Vec<Vec<u8>>),
+/// Writes each volume of a set to a file beside it as the volume fills, then
+/// names the parts once the count is known, since that decides how they are
+/// numbered. Only the volume being written is open; nothing is held.
+struct PythonVolumeSink<'a> {
+    first_path: &'a Path,
+    rar50: bool,
+    /// Staged volumes not yet published, in order.
+    temporaries: Vec<PathBuf>,
+    /// A part name that cannot exist, raised as Python sees it rather than as I/O.
+    naming: Option<PyErr>,
 }
-impl PythonVolumes {
-    fn len(&self) -> usize {
-        match self {
-            Self::Tracked(v) => v.volumes().len(),
-            Self::Untracked(v) => v.len(),
+
+impl<'a> PythonVolumeSink<'a> {
+    fn new(first_path: &'a Path, rar50: bool) -> Self {
+        Self {
+            first_path,
+            rar50,
+            temporaries: Vec::new(),
+            naming: None,
         }
     }
-    fn part(&self, index: usize) -> &[u8] {
-        match self {
-            Self::Tracked(v) => v.volumes()[index].as_bytes(),
-            Self::Untracked(v) => &v[index],
+
+    fn part_path(&self, index: usize, total: usize) -> PyResult<PathBuf> {
+        if self.rar50 {
+            rar50_volume_part_path(self.first_path, index, total)
+        } else {
+            legacy_volume_part_path(self.first_path, index)
         }
+    }
+
+    fn check_name(&mut self, index: usize, total: usize) -> rars_rs::Result<()> {
+        self.part_path(index, total).map(drop).map_err(|error| {
+            let message = error.to_string();
+            self.naming = Some(error);
+            io::Error::other(message).into()
+        })
+    }
+
+    /// Moves the staged volumes to their names. Every name is checked before
+    /// any is used, so a refusal leaves existing files as they were.
+    fn publish(
+        mut self,
+        overwrite: bool,
+        cancellation: Option<&CancellationToken>,
+    ) -> PyResult<Vec<PathBuf>> {
+        let total = self.temporaries.len();
+        let paths = (0..total)
+            .map(|index| self.part_path(index, total))
+            .collect::<PyResult<Vec<_>>>()?;
+        for path in &paths {
+            refuse_existing(path, overwrite)?;
+            if fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
+                return Err(PyIsADirectoryError::new_err(format!(
+                    "{} is a directory",
+                    path.display()
+                )));
+            }
+        }
+        let staged = std::mem::take(&mut self.temporaries);
+        let mut remaining = staged.iter();
+        for (temporary, path) in remaining.by_ref().zip(&paths) {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                self.temporaries = std::iter::once(temporary.clone())
+                    .chain(remaining.cloned())
+                    .collect();
+                return Err(map_error(rars_rs::Error::Cancelled));
+            }
+            if let Err(error) = publish_volume(temporary, path, overwrite) {
+                self.temporaries = std::iter::once(temporary.clone())
+                    .chain(remaining.cloned())
+                    .collect();
+                return Err(match error.kind() {
+                    io::ErrorKind::AlreadyExists => exists_error(path),
+                    _ => map_io_error(error),
+                });
+            }
+        }
+        Ok(paths)
+    }
+}
+
+/// Names a staged volume. Without `overwrite` a link cannot replace a file that
+/// appeared since the names were checked; a file system without links renames.
+fn publish_volume(temporary: &Path, path: &Path, overwrite: bool) -> io::Result<()> {
+    if overwrite {
+        return fs::rename(temporary, path);
+    }
+    match fs::hard_link(temporary, path) {
+        Ok(()) => fs::remove_file(temporary),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Err(error),
+        Err(_) => {
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(io::ErrorKind::AlreadyExists.into());
+            }
+            fs::rename(temporary, path)
+        }
+    }
+}
+
+impl Drop for PythonVolumeSink<'_> {
+    fn drop(&mut self) {
+        for temporary in &self.temporaries {
+            let _ = fs::remove_file(temporary);
+        }
+    }
+}
+
+impl rars_rs::rar50::VolumeSink for PythonVolumeSink<'_> {
+    fn expect_volumes(&mut self, total: u64) -> rars_rs::Result<()> {
+        // Names only get harder to form as the index grows.
+        let total = usize::try_from(total).unwrap_or(usize::MAX);
+        for index in [0, total.saturating_sub(1)] {
+            self.check_name(index, total)?;
+        }
+        Ok(())
+    }
+
+    fn start_volume(
+        &mut self,
+        index: u64,
+    ) -> rars_rs::Result<Box<dyn rars_rs::rar50::VolumeOutput>> {
+        // Refuse a name that cannot exist before writing a volume that would need it.
+        let part = usize::try_from(index).unwrap_or(usize::MAX);
+        self.check_name(part, part.saturating_add(1))?;
+        let file_name = self
+            .first_path
+            .file_name()
+            .ok_or_else(|| io::Error::other("volume path needs a file name"))?;
+        for sequence in 0..128u8 {
+            let mut name = std::ffi::OsString::from(".");
+            name.push(file_name);
+            name.push(format!(
+                ".rars-volume-{}-{index:06}-{sequence:02x}",
+                std::process::id()
+            ));
+            let temporary = self.first_path.with_file_name(name);
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temporary)
+            {
+                Ok(file) => {
+                    self.temporaries.push(temporary);
+                    return Ok(Box::new(file));
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(io::Error::other("could not allocate a unique temporary volume file").into())
     }
 }
 
@@ -2687,8 +2821,9 @@ impl RarBuilder {
 
     /// Writes the archive to `path` and returns the files written: `path` alone, or with
     /// `volume_size` set, every part of the set, named from `path`.
-    /// An existing file is refused unless `overwrite=True`; a set checks every part before
-    /// writing any.
+    /// An existing file is refused unless `overwrite=True`. A set is written a volume at a
+    /// time beside its first part and every part's name is checked before any is moved into
+    /// place, so a refusal leaves existing files as they were.
     #[pyo3(signature = (path, *, overwrite = false, progress = None, cancellation = None))]
     fn write(
         &self,
@@ -2730,65 +2865,34 @@ impl RarBuilder {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<PathBuf>> {
-        let parts = self.detached(
+        let rar50 = matches!(
+            self.format,
+            rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
+        );
+        // Volumes stream to files beside the set, so none is held in memory
+        // and the budget only charges the coding, as for one archive.
+        let (sink, result) = self.detached(
             py,
             progress,
             cancellation,
             output_directory(&first_path),
             |builder, progress| {
-                if self.resources.max_memory_bytes().is_some() {
-                    builder
-                        .to_volume_output(
-                            &self
-                                .resources
-                                .clone()
-                                .with_temp_dir(output_directory(&first_path)),
-                            progress,
-                        )
-                        .map(PythonVolumes::Tracked)
-                } else {
-                    builder
-                        .build_volumes_with_resources(&self.resources, progress)
-                        .map(PythonVolumes::Untracked)
-                }
+                // Spools go beside the set, as a single archive's do.
+                let resources = self
+                    .resources
+                    .clone()
+                    .with_temp_dir(output_directory(&first_path));
+                let mut sink = PythonVolumeSink::new(&first_path, rar50);
+                let result = builder.write_volumes_to(&mut sink, &resources, progress);
+                Ok((sink, result))
             },
         )?;
         py.detach(|| {
-            // A naming refusal must precede any replacement of existing parts.
-            let paths = (0..parts.len())
-                .map(|index| {
-                    if matches!(
-                        self.format,
-                        rars_rs::ArchiveVersion::Rar50 | rars_rs::ArchiveVersion::Rar70
-                    ) {
-                        rar50_volume_part_path(&first_path, index, parts.len())
-                    } else {
-                        legacy_volume_part_path(&first_path, index)
-                    }
-                })
-                .collect::<PyResult<Vec<_>>>()?;
-            for path in &paths {
-                refuse_existing(path, overwrite)?;
+            let mut sink = sink;
+            if let Err(error) = result {
+                return Err(sink.naming.take().unwrap_or_else(|| map_error(error)));
             }
-            for (index, path) in paths.iter().enumerate() {
-                if cancellation.is_some_and(CancellationToken::is_cancelled) {
-                    return Err(map_error(rars_rs::Error::Cancelled));
-                }
-                let mut file = fs::OpenOptions::new();
-                file.write(true);
-                if overwrite {
-                    file.create(true).truncate(true);
-                } else {
-                    file.create_new(true);
-                }
-                file.open(path)
-                    .and_then(|mut file| file.write_all(parts.part(index)))
-                    .map_err(|error| match error.kind() {
-                        io::ErrorKind::AlreadyExists => exists_error(path),
-                        _ => map_io_error(error),
-                    })?;
-            }
-            Ok(paths)
+            sink.publish(overwrite, cancellation)
         })
     }
 

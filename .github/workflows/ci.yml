@@ -105,13 +105,15 @@ jobs:
           cargo nextest run --workspace --locked --no-fail-fast
           cargo test --workspace --locked --doc
 
-      # The tests already built the CLI with the workspace's features; building
-      # it alone would rebuild rars with a different feature set.
+      # The tests already built the CLI. `cargo build` would build rars and the
+      # CLI again, since the test build's dev-dependencies change the features
+      # of shared dependencies; asking for the test build again only confirms
+      # that target/debug/rars is current.
       - name: Frozen runner real-binary smoke and portable checks
         env:
           RARS_SMOKE_BINARY: ${{ github.workspace }}/target/debug/rars
         run: |
-          cargo build --workspace --bins --locked
+          cargo test --workspace --locked --no-run
           python3 -m unittest discover -s scripts/hybrid -v
 
   python:
@@ -362,20 +364,20 @@ jobs:
           - group: write
             features: write
             memory: write
-          - group: write,parallel
+          - group: write+parallel
             features: write,parallel
             memory: write,parallel
-          - group: write,encryption
+          - group: write+encryption
             features: write,encryption
-          - group: write,encryption,parallel
+          - group: write+encryption+parallel
             features: write,encryption,parallel
-          - group: write,recovery
+          - group: write+recovery
             features: write,recovery
-          - group: write,recovery,parallel
+          - group: write+recovery+parallel
             features: write,recovery,parallel
-          - group: write,recovery,encryption
+          - group: write+recovery+encryption
             features: write,recovery,encryption
-          - group: write,recovery,encryption,parallel
+          - group: write+recovery+encryption+parallel
             features: write,recovery,encryption,parallel
     env:
       CARGO_BUILD_JOBS: 4
@@ -389,10 +391,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # The group names the cache, and cache keys cannot contain commas.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/master' }}
           key: ${{ matrix.group }}
+      # As in Rust checks: unoptimised rars spends test runs decoding. The plain
+      # write group stays at opt-level 0, where the 1 MiB-stack test
+      # (a_solid_ppmd_chain_codes_on_a_1_mib_stack) can still catch a large
+      # stack frame that optimisation would hide.
+      - name: Optimise the rars crate in test builds
+        if: matrix.group != 'write'
+        shell: bash
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[profile.dev.package.rars]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
       - name: Lint and test the library without workspace feature unification
         env:
           SETS: ${{ matrix.features }}

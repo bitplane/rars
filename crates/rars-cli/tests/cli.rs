@@ -740,14 +740,16 @@ fn legacy_volume_output_creation_failure_has_context_and_leaves_no_archive() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
+    // Each volume is staged beside the set as it is written.
     let text = stderr(&output);
     assert!(
-        text.contains("failed to write volume set starting at"),
+        text.contains("failed to create temporary archive"),
         "{text}"
     );
-    assert!(text.contains(&archive.display().to_string()), "{text}");
+    let missing = root.join("missing");
+    assert!(text.contains(&missing.display().to_string()), "{text}");
     assert!(!archive.exists());
-    assert!(!root.join("missing").exists());
+    assert!(!missing.exists());
 }
 
 #[test]
@@ -6818,8 +6820,8 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
     ),
     (
         &["--format", "rar15", "--volume-size", "1m", "--temp-dir", "."],
-        "error: --temp-dir is not supported by --format rar15 (in a volume set); use --format rar50 \
-         or --format rar70",
+        "error: --temp-dir is not supported by --format rar15 (in a volume set); use --format rar14, \
+         --format rar50 or --format rar70",
     ),
     // Two filters have to be reported as the conflict they are. Asking which
     // one the format supports has no answer, and the two checks rank the flags

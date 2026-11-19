@@ -4920,6 +4920,182 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     );
 }
 
+/// A member's encode is charged its finder, a batch of tokens, a filtered copy
+/// of the member, its packed bytes and the best packed bytes before it, at
+/// every thread count the batch follows.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_member_encode_is_charged_for_what_its_parser_holds() {
+    let block_size = 64 * 1024;
+    let pool = crate::parallel::private_pool(16);
+    for (len, reach, split) in [
+        (5000, 4 << 20, false),
+        (8 << 20, 4 << 20, false),
+        (8 << 20, 4 << 20, true),
+        (8 << 20, 128 << 10, true),
+    ] {
+        let input = vec![0u8; len];
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(reach)
+            .with_block_size(block_size)
+            .with_split_blocks(split);
+        for threads in [1, 4, 16] {
+            let (charge, finder, batch) = pool.install(|| {
+                let _cap = crate::parallel::ThreadCap::set(Some(threads));
+                let parser = super::LzParser::new(&input, 0, options, block_size);
+                (
+                    super::member_encode_workspace(len, options),
+                    super::Rar29MatchFinder::bytes_for_reach(parser.finder.window(), reach),
+                    super::LzParser::batch_bytes(block_size).min(len),
+                )
+            });
+            // Cutting a block holds its tokens twice over for a moment.
+            let tokens =
+                batch * std::mem::size_of::<super::EncodeToken>() * (1 + usize::from(split));
+            let held = finder + (tokens + 3 * len) as u64;
+            assert!(charge >= held, "{len} {reach} {threads}: {charge} < {held}");
+        }
+    }
+}
+
+/// A batch of blocks is coded side by side, which only works because each
+/// block's table depends on its own tokens alone. The table before it still
+/// decides how the table is written, so each block has to be coded against its
+/// own predecessor's and not the one the batch started with.
+#[test]
+#[cfg(feature = "parallel")]
+fn a_batch_of_blocks_codes_as_it_does_one_block_at_a_time() {
+    let options = EncodeOptions::new(8).with_max_match_distance(1 << 20);
+    let tokens_of = |data: &[u8]| super::encode_tokens_with_progress(data, &[], options, None);
+    let sources = [
+        mixed_member(20_000),
+        mixed_member(24_000),
+        phrase_member(20_000),
+        phrase_member(16_000),
+        (0..20_000u32).map(|i| (i % 251) as u8).collect(),
+    ];
+    // Every block carries in repeat offsets, as cut pieces do: those its own
+    // tokens leave, so its recurring offsets code as repeats from the start
+    // and a table counted without the state would differ.
+    let states: Vec<super::EncoderMatchState> = sources
+        .iter()
+        .map(|data| {
+            let mut state = super::EncoderMatchState::default();
+            for token in tokens_of(data).unwrap() {
+                if let super::EncodeToken::Match { length, offset } = token {
+                    state.remember(length as usize, offset as usize);
+                }
+            }
+            state
+        })
+        .collect();
+    let blocks = || {
+        sources
+            .iter()
+            .enumerate()
+            .map(|(index, data)| super::BlockToCode {
+                tokens: tokens_of(data).unwrap(),
+                state: states[index],
+                // Filter records only count towards the table and are copied out.
+                filters: match index {
+                    2 => vec![vec![0x12, 0x34, 0x56]],
+                    _ => Vec::new(),
+                },
+                more_blocks_follow: true,
+            })
+            // The state decides this block's table: carried in, every match
+            // repeats the last one; without it the first needs its length and
+            // offset coded.
+            .chain(std::iter::once(super::BlockToCode {
+                tokens: std::iter::once(super::EncodeToken::Literal(b'x'))
+                    .chain(std::iter::repeat_n(
+                        super::EncodeToken::Match {
+                            length: 4,
+                            offset: 1,
+                        },
+                        50,
+                    ))
+                    .collect(),
+                state: {
+                    let mut state = super::EncoderMatchState::default();
+                    state.remember(4, 1);
+                    state
+                },
+                filters: Vec::new(),
+                more_blocks_follow: false,
+            }))
+            .collect::<Vec<_>>()
+    };
+    let mut start = [0; TABLE_COUNT];
+    super::code_block(
+        &tokens_of(&phrase_member(8_000)).unwrap(),
+        super::EncoderMatchState::default(),
+        &[],
+        true,
+        &mut start,
+    )
+    .unwrap();
+
+    let mut levels = start;
+    let one_at_a_time: Vec<Vec<u8>> = blocks()
+        .iter()
+        .map(|block| {
+            super::code_block(
+                &block.tokens,
+                block.state,
+                &block.filters,
+                block.more_blocks_follow,
+                &mut levels,
+            )
+            .unwrap()
+        })
+        .collect();
+    let after_all = levels;
+    // Some block must write its table as a delta, or the predecessor is never read.
+    assert!(one_at_a_time.iter().any(|packed| packed[0] & 0x40 != 0));
+
+    let pool = crate::parallel::private_pool(4);
+    for threads in [Some(1), None] {
+        let (packed, failure, levels) = pool.install(|| {
+            let _cap = crate::parallel::ThreadCap::set(threads);
+            assert_eq!(crate::parallel::may_nest(), threads.is_none());
+            let mut levels = start;
+            let (packed, failure) = super::code_blocks(blocks(), &mut levels);
+            (packed, failure, levels)
+        });
+        assert!(failure.is_none());
+        assert!(packed == one_at_a_time, "threads {threads:?}");
+        assert_eq!(levels, after_all);
+
+        // A block that cannot be coded stops the batch after those before it.
+        let (packed, failure, levels) = pool.install(|| {
+            let _cap = crate::parallel::ThreadCap::set(threads);
+            let mut broken = blocks();
+            broken[3].tokens[0] = super::EncodeToken::Match {
+                length: 1,
+                offset: 5,
+            };
+            let mut levels = start;
+            let (packed, failure) = super::code_blocks(broken, &mut levels);
+            (packed, failure, levels)
+        });
+        assert!(matches!(failure, Some(Error::InvalidData(_))));
+        assert!(packed[..] == one_at_a_time[..3], "threads {threads:?}");
+        let mut third = start;
+        for block in &blocks()[..3] {
+            super::code_block(
+                &block.tokens,
+                block.state,
+                &block.filters,
+                block.more_blocks_follow,
+                &mut third,
+            )
+            .unwrap();
+        }
+        assert_eq!(levels, third);
+    }
+}
+
 fn phrase_member(len: usize) -> Vec<u8> {
     let phrases = [
         &b"the model predicts each byte from the bytes before it, "[..],
@@ -5312,5 +5488,104 @@ fn a_chain_starts_its_ppmd_model_at_the_size_its_first_member_codes_smallest() {
             assert_eq!(packed[0] & 0x20, 0, "the second member restarted the model");
         }
         assert!(decoder.decode_member(&packed, member.len()).unwrap() == *member);
+    }
+}
+
+/// A PPMd block codes both ways from the same model and keeps the smaller,
+/// escapes on a tie, with the model the winner leaves behind.
+#[test]
+fn a_long_ppmd_member_codes_once_the_way_its_start_chooses() {
+    let size = super::PpmdModelSize::DEFAULT;
+    let sample = 65_536;
+    let coded = |data: &[u8], escapes: bool| {
+        super::encode_ppmd_block_with_model(data, escapes, None, 1 << 22, None, size, None)
+            .unwrap()
+            .0
+    };
+    // Each member's start and its whole disagree, so only a choice made from
+    // the start codes it the start's way.
+    let rare = phrase_member(sample);
+    let repeated = mixed_member(16_384).repeat(16);
+    let rare_first = [&rare[..], &repeated[..]].concat();
+    let repeated_first = [&repeated[..sample], &phrase_member(4 * sample)[..]].concat();
+    for (data, literals_start) in [(&rare_first, true), (&repeated_first, false)] {
+        let (start_escaped, start_literals) =
+            (coded(&data[..sample], true), coded(&data[..sample], false));
+        assert_eq!(start_literals.len() < start_escaped.len(), literals_start);
+        let (escaped, literals) = (coded(data, true), coded(data, false));
+        assert_eq!(
+            literals.len() < escaped.len(),
+            !literals_start,
+            "the whole member must disagree with its start"
+        );
+        let (packed, _) =
+            super::encode_ppmd_either_way_sampled(data, 1 << 22, None, size, sample, &mut |_| true)
+                .unwrap();
+        let chosen = if literals_start { literals } else { escaped };
+        assert!(
+            packed == chosen,
+            "coded as its whole chooses, not its start"
+        );
+        let decoded = super::Unpack29::new().decode_non_solid_member(&packed, data.len());
+        assert_eq!(&decoded.unwrap(), data);
+    }
+}
+
+#[test]
+fn a_ppmd_member_codes_with_escapes_or_as_literals_whichever_is_smaller() {
+    let size = super::PpmdModelSize::DEFAULT;
+    // Text that rarely repeats far back codes smaller as literals; a block
+    // repeated whole codes smaller with matches.
+    let rare = phrase_member(65_536);
+    let repeated = mixed_member(16_384).repeat(4);
+    let coded = |data: &[u8], escapes: bool| {
+        super::encode_ppmd_block_with_model(data, escapes, None, 1 << 22, None, size, None)
+            .unwrap()
+            .0
+    };
+    let mut winners = Vec::new();
+    for data in [&rare, &repeated] {
+        let (escaped, literals) = (coded(data, true), coded(data, false));
+        let (packed, _) =
+            super::encode_ppmd_either_way(data, 1 << 22, None, size, &mut |_| true).unwrap();
+        let literals_win = literals.len() < escaped.len();
+        assert_eq!(packed, if literals_win { literals } else { escaped });
+        winners.push(literals_win);
+    }
+    assert_eq!(winners, [true, false], "each case must exercise its side");
+
+    // A chain carries the winner's model on, and the reader agrees with it.
+    let members = [
+        phrase_member(98_304)[..65_536].to_vec(),
+        repeated.clone(),
+        phrase_member(98_304)[32_768..].to_vec(),
+    ];
+    // The chain's own engine trial codes both ways; forced PPMd, which a
+    // streamed member must match, keeps escapes.
+    let mut encoder = super::Unpack29Encoder::new();
+    let packed: Vec<Vec<u8>> = members
+        .iter()
+        .map(|member| {
+            let (packed, model) = encoder
+                .encode_ppmd_member(member, true, &mut |_| true)
+                .unwrap();
+            encoder.ppmd = Some(model);
+            encoder.remember(member);
+            packed
+        })
+        .collect();
+    let forced = super::Unpack29Encoder::new()
+        .encode_member_with_engine(&members[0], super::ChainEngine::Ppmd, &[], &mut |_| true)
+        .unwrap();
+    assert_eq!(forced, coded(&members[0], true));
+    // The first member starts the model and codes as literals here.
+    assert_eq!(packed[0].len(), coded(&members[0], false).len());
+    let mut decoder = super::Unpack29::new();
+    for (index, (member, packed)) in members.iter().zip(&packed).enumerate() {
+        let decoded = match index {
+            0 => decoder.decode_non_solid_member(packed, member.len()),
+            _ => decoder.decode_member(packed, member.len()),
+        };
+        assert_eq!(&decoded.unwrap(), member, "member {index}");
     }
 }

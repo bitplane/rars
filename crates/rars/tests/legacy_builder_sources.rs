@@ -146,24 +146,106 @@ fn stored_source_changes_are_detected_during_verified_emission() {
     }
 }
 
+/// Counts every byte handed to a volume, header patches included.
+struct CountingVolume {
+    inner: Cursor<Vec<u8>>,
+    written: Arc<AtomicUsize>,
+}
+
+impl std::io::Write for CountingVolume {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.written.fetch_add(bytes.len(), Ordering::Relaxed);
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Seek for CountingVolume {
+    fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+struct CountingVolumes(Arc<AtomicUsize>);
+
+impl rars::rar50::VolumeSink for CountingVolumes {
+    fn start_volume(&mut self, _index: u64) -> rars::Result<Box<dyn rars::rar50::VolumeOutput>> {
+        Ok(Box::new(CountingVolume {
+            inner: Cursor::new(Vec::new()),
+            written: self.0.clone(),
+        }))
+    }
+}
+
+/// RAR 1.3 splits one payload, so it refuses a second input before opening
+/// either; RAR 1.5 to 4.x take both and open each only when its turn comes.
 #[test]
-fn multiple_legacy_volume_inputs_are_refused_without_opening_them() {
+fn legacy_volume_inputs_are_opened_only_when_their_member_is_written() {
+    const LEN: usize = 3000;
     for format in FORMATS {
-        let mut builder = Builder::new(format).store(true).volume_size(Some(64));
-        for name in [b"first", b"other"] {
-            builder
-                .add_source(
-                    name.to_vec(),
-                    EntrySource::from_opener(1, || panic!("invalid volume plan opened a source")),
-                    None,
-                    None,
-                )
-                .unwrap();
+        let mut builder = Builder::new(format).store(true).volume_size(Some(1024));
+        if matches!(format, ArchiveVersion::Rar13 | ArchiveVersion::Rar14) {
+            for name in [b"first", b"other"] {
+                builder
+                    .add_source(
+                        name.to_vec(),
+                        EntrySource::from_opener(1, || {
+                            panic!("invalid volume plan opened a source")
+                        }),
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(
+                builder.build_volumes(None).unwrap_err().kind(),
+                ErrorKind::InvalidArgument
+            );
+            continue;
         }
-        assert_eq!(
-            builder.build_volumes(None).unwrap_err().kind(),
-            ErrorKind::InvalidArgument
-        );
+        let written = Arc::new(AtomicUsize::new(0));
+        let first_opened = Arc::new(AtomicBool::new(false));
+        let opened = first_opened.clone();
+        builder
+            .add_source(
+                b"first".to_vec(),
+                EntrySource::from_opener(LEN as u64, move || {
+                    opened.store(true, Ordering::Relaxed);
+                    Ok(Box::new(Cursor::new(vec![b'a'; LEN])))
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        let seen = written.clone();
+        let first_seen = first_opened.clone();
+        builder
+            .add_source(
+                b"other".to_vec(),
+                EntrySource::from_opener(LEN as u64, move || {
+                    assert!(first_seen.load(Ordering::Relaxed));
+                    let so_far = seen.load(Ordering::Relaxed);
+                    assert!(
+                        so_far >= LEN,
+                        "{format:?}: second source opened after {so_far} bytes"
+                    );
+                    Ok(Box::new(Cursor::new(vec![b'b'; LEN])))
+                }),
+                None,
+                None,
+            )
+            .unwrap();
+        builder
+            .write_volumes_to(
+                &mut CountingVolumes(written.clone()),
+                &WriterResources::default(),
+                None,
+            )
+            .unwrap();
+        assert!(written.load(Ordering::Relaxed) > 2 * LEN, "{format:?}");
     }
 }
 

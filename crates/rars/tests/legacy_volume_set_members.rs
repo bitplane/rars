@@ -274,3 +274,77 @@ fn old_volumes_end_mid_member_so_readers_move_on() {
         }
     }
 }
+
+/// The Builder takes any number of members into a legacy set, reads each as
+/// it is packed, and writes the set the streaming writer the CLI uses does.
+#[test]
+fn the_builder_writes_the_set_the_streaming_writer_does() {
+    const MODE: u32 = 0o100644;
+    let members = [
+        ("a.bin", bytes(7_000, 1)),
+        ("b.nfo", bytes(300, 2)),
+        ("c.bin", bytes(5_000, 3)),
+    ];
+    let wanted: Vec<_> = members
+        .iter()
+        .map(|(name, data)| (*name, Some(data.clone())))
+        .collect();
+    for target in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+    ] {
+        for (coding, solid) in [
+            (MemberCoding::Stored, false),
+            (MemberCoding::Compressed, false),
+            (MemberCoding::Compressed, true),
+        ] {
+            let case = format!("{target:?} {coding:?} solid {solid}");
+            let mut builder = rars::Builder::new(target)
+                .store(coding == MemberCoding::Stored)
+                .solid(solid)
+                .volume_size(Some(3000));
+            for (index, (name, data)) in members.iter().enumerate() {
+                let name = name.as_bytes().to_vec();
+                if index == 0 {
+                    builder
+                        .add_bytes(name, data.clone(), None, Some(MODE))
+                        .unwrap();
+                } else {
+                    let source = EntrySource::from_bytes(data.clone());
+                    builder.add_source(name, source, None, Some(MODE)).unwrap();
+                }
+            }
+            let mut sink = CollectedVolumes::new();
+            builder
+                .write_volumes_to(&mut sink, &WriterResources::default(), None)
+                .unwrap();
+            let built = sink.take();
+            assert!(built.len() > 1, "{case}");
+            assert!(builder.build_volumes(None).unwrap() == built, "{case}");
+
+            let entries: Vec<_> = members
+                .iter()
+                .map(|(name, data)| {
+                    StreamingEntry::new(
+                        name.as_bytes().to_vec(),
+                        EntrySource::from_bytes(data.clone()),
+                    )
+                    .with_file_attr(MODE)
+                })
+                .collect();
+            let mut features = FeatureSet::store_only();
+            features.solid = solid;
+            let streamed = write(
+                &entries,
+                WriterOptions::new(target, features),
+                coding.clone(),
+                3000,
+            )
+            .unwrap();
+            assert!(built == streamed, "{case}");
+            assert_eq!(extract(&built, None), expected(&wanted), "{case}");
+        }
+    }
+}

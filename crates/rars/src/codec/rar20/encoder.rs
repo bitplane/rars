@@ -510,12 +510,16 @@ fn code_lz_block(
     state: LzState,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<(BitWriter, LzState)> {
+    // Matches do not depend on prices, so every pass shares one search. A
+    // fixed table is never re-parsed, so its greedy pass searches as it goes.
+    let matches = (options.optimal_parse && fixed_table.is_none())
+        .then(|| collect_match_lists(window, start, window.len(), options));
     let tokens = encode_tokens_with_progress(
         window,
         start,
         options,
         None,
-        None,
+        matches.as_ref(),
         state,
         again(&mut progress),
     )?;
@@ -544,12 +548,6 @@ fn code_lz_block(
     // and fourth buy another 0.06% on the bench's small members and 0.03% on its
     // 4 MiB text and binaries, which is what level 5 is for.
     let refinements = if options.optimal_parse { 2 } else { 1 } + options.extra_priced_passes;
-    // Matches do not depend on prices, so both priced passes share one search.
-    let matches = if options.optimal_parse {
-        Some(collect_match_lists(window, start, window.len(), options))
-    } else {
-        None
-    };
     let span = window.len() - start;
     let mut poll = progress.map(|report| move |_: usize| report(span));
     let mut best_table = table_lengths;
@@ -895,9 +893,9 @@ impl EncodeToken {
 /// So the parse only needs the longest length in each slot, plus the longest
 /// match found. That is at most twenty-nine candidates where trying every
 /// length is up to two hundred and fifty-six, for 0.03% of packed size.
-fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
+fn candidate_lengths(best_length: usize, adjustment: usize, out: &mut Vec<usize>) {
     out.clear();
-    let adjustment = match_length_adjustment(offset);
+    // Slot tops rise with the slot, so the list comes out sorted.
     for slot in 0..LENGTH_COUNT {
         let widest = LENGTH_BASES[slot] + (1usize << LENGTH_BITS[slot]) - 1;
         let length = widest + 3 + adjustment;
@@ -906,9 +904,58 @@ fn candidate_lengths(best_length: usize, offset: usize, out: &mut Vec<usize>) {
         }
     }
     // Callers only pass matches of at least three bytes.
-    out.push(best_length);
-    out.sort_unstable();
-    out.dedup();
+    if out.last() != Some(&best_length) {
+        out.push(best_length);
+    }
+}
+
+/// Built once per pass, so pricing an edge is a lookup rather than a slot search.
+struct EdgePrices {
+    /// By length adjustment, then length; `None` where the length has no code.
+    fresh: [[Option<u16>; MAX_ENCODER_MATCH_LENGTH + 1]; 3],
+    offsets: [u16; OFFSET_COUNT],
+    /// By recent-offset index, length adjustment, then length.
+    old: [[[Option<u16>; MAX_ENCODER_MATCH_LENGTH + 1]; 4]; 4],
+}
+
+/// The nearest offset taking each old-offset length adjustment.
+const OLD_ADJUSTMENT_OFFSETS: [usize; 4] = [1, 0x101, 0x2000, 0x40000];
+
+impl EdgePrices {
+    fn new(model: &CostModel<'_>) -> Box<Self> {
+        let mut prices = Box::new(Self {
+            fresh: [[None; MAX_ENCODER_MATCH_LENGTH + 1]; 3],
+            offsets: [0; OFFSET_COUNT],
+            old: [[[None; MAX_ENCODER_MATCH_LENGTH + 1]; 4]; 4],
+        });
+        for (adjustment, row) in prices.fresh.iter_mut().enumerate() {
+            for (length, price) in row.iter_mut().enumerate().skip(adjustment) {
+                if let Ok((slot, _)) = length_slot_for_match(length - adjustment) {
+                    *price = Some(u16::from(model.main[270 + slot]) + u16::from(LENGTH_BITS[slot]));
+                }
+            }
+        }
+        for (slot, price) in prices.offsets.iter_mut().enumerate() {
+            *price = u16::from(model.offsets[slot]) + u16::from(OFFSET_BITS[slot]);
+        }
+        for (index, rows) in prices.old.iter_mut().enumerate() {
+            for (adjustment, row) in rows.iter_mut().enumerate() {
+                let offset = OLD_ADJUSTMENT_OFFSETS[adjustment];
+                debug_assert_eq!(old_length_adjustment(offset), adjustment);
+                for (length, price) in row.iter_mut().enumerate() {
+                    let Ok((slot, _)) = old_length_slot_for_match(length, offset) else {
+                        continue;
+                    };
+                    *price = Some(
+                        u16::from(model.main[257 + index])
+                            + u16::from(model.lengths[slot])
+                            + u16::from(LENGTH_BITS[slot]),
+                    );
+                }
+            }
+        }
+        prices
+    }
 }
 
 /// The nearest match per length at each position, so the parse can trade length against offset.
@@ -1055,6 +1102,7 @@ fn encode_tokens_optimal(
     // Positions inside a match long enough to take outright relax nothing.
     let mut committed_through = 0usize;
     let mut pairs = PairTable::new(input, start);
+    let prices = EdgePrices::new(cost_model);
     debug_assert_eq!(
         matches.counts.len(),
         span,
@@ -1101,13 +1149,15 @@ fn encode_tokens_optimal(
             let (reach, offset) = (run.length().min(cap), run.offset());
             let mut pushed = node_reps;
             push_old_offset(&mut pushed, offset);
-            candidate_lengths(reach, offset, &mut lengths);
+            let adjustment = match_length_adjustment(offset);
+            let fresh = &prices.fresh[adjustment];
+            let offset_price = prices.offsets[offset_slot_index(offset)];
+            candidate_lengths(reach, adjustment, &mut lengths);
             for &length in lengths.iter().filter(|&&length| length > covered) {
-                let candidate = SelectedMatch::Fresh { length, offset };
-                if let Some(price) = cost_model.selected_cost(candidate) {
+                if let Some(price) = fresh[length] {
                     relax(
                         index + length,
-                        price as u64,
+                        u64::from(price + offset_price),
                         EncodeToken::fresh(length, offset),
                         pushed,
                     );
@@ -1124,17 +1174,13 @@ fn encode_tokens_optimal(
             }
             let mut pushed = node_reps;
             push_old_offset(&mut pushed, offset);
-            candidate_lengths(reach, offset, &mut lengths);
+            let old = &prices.old[rep_index][old_length_adjustment(offset)];
+            candidate_lengths(reach, match_length_adjustment(offset), &mut lengths);
             for &length in &lengths {
-                let candidate = SelectedMatch::OldOffset {
-                    index: rep_index,
-                    length,
-                    offset,
-                };
-                if let Some(price) = cost_model.selected_cost(candidate) {
+                if let Some(price) = old[length] {
                     relax(
                         index + length,
-                        price as u64,
+                        u64::from(price),
                         EncodeToken::old_offset(rep_index, length, offset),
                         pushed,
                     );
@@ -1222,12 +1268,18 @@ fn encode_tokens_with_progress(
         ));
     }
     let mut tokens = Vec::new();
-    // No match reaches past the dictionary, so the finder need not either.
-    let reach = options.max_match_distance.max(1).min(combined.len());
-    let mut finder = Rar20MatchFinder::for_reach(reach, reach);
-    for history_pos in 0..start {
-        finder.insert(combined, history_pos);
-    }
+    let mut finder = match matches {
+        Some(lists) => FreshMatches::Listed(ListCursor::new(lists, start)),
+        None => {
+            // No match reaches past the dictionary, so the finder need not either.
+            let reach = options.max_match_distance.max(1).min(combined.len());
+            let mut finder = Rar20MatchFinder::for_reach(reach, reach);
+            for history_pos in 0..start {
+                finder.insert(combined, history_pos);
+            }
+            FreshMatches::Chain(finder)
+        }
+    };
     let mut pairs = PairTable::new(combined, start);
     let mut literal_totals = LiteralTotals::default();
     // A lazy look ahead prices a whole match from each position it tries.
@@ -1577,7 +1629,7 @@ fn select_match(context: &SearchContext<'_>, pos: usize) -> Option<SelectedMatch
 struct SearchContext<'a> {
     input: &'a [u8],
     end: usize,
-    finder: &'a Rar20MatchFinder,
+    finder: &'a FreshMatches<'a>,
     pairs: &'a PairTable,
     options: EncodeOptions,
     old_offsets: &'a [usize; 4],
@@ -1617,14 +1669,81 @@ fn should_lazy_emit_literal(
         })
 }
 
+/// Lists collected for the shortest-path parse spare its greedy seed a search of its own.
+enum FreshMatches<'a> {
+    Chain(Rar20MatchFinder),
+    Listed(ListCursor<'a>),
+}
+
+impl FreshMatches<'_> {
+    /// Takes positions in order, each once, from the block's start.
+    fn insert(&mut self, input: &[u8], pos: usize) {
+        match self {
+            Self::Chain(finder) => finder.insert(input, pos),
+            Self::Listed(cursor) => cursor.step(pos),
+        }
+    }
+}
+
+struct ListCursor<'a> {
+    lists: &'a MatchLists,
+    start: usize,
+    inserted: usize,
+    next_run: usize,
+}
+
+impl<'a> ListCursor<'a> {
+    fn new(lists: &'a MatchLists, start: usize) -> Self {
+        Self {
+            lists,
+            start,
+            inserted: 0,
+            next_run: 0,
+        }
+    }
+
+    fn step(&mut self, pos: usize) {
+        debug_assert_eq!(
+            pos,
+            self.start + self.inserted,
+            "list positions taken out of order"
+        );
+        self.next_run += usize::from(self.lists.counts[self.inserted]);
+        self.inserted += 1;
+    }
+
+    /// The last run at a position is its longest, at the nearest offset reaching it.
+    fn longest(&self, pos: usize) -> Option<(usize, usize)> {
+        let counts = &self.lists.counts[self.inserted..];
+        let ahead = pos - (self.start + self.inserted);
+        let first = self.next_run
+            + counts[..ahead]
+                .iter()
+                .map(|&count| usize::from(count))
+                .sum::<usize>();
+        let count = usize::from(counts[ahead]);
+        (count != 0).then(|| {
+            let found = self.lists.runs[first + count - 1];
+            (found.length(), found.offset())
+        })
+    }
+}
+
 fn best_match(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar20MatchFinder,
+    finder: &FreshMatches<'_>,
     options: EncodeOptions,
     cost_model: Option<&CostModel<'_>>,
 ) -> Option<(usize, usize)> {
+    let finder = match finder {
+        FreshMatches::Chain(finder) => finder,
+        FreshMatches::Listed(cursor) => {
+            debug_assert!(cost_model.is_none(), "listed matches are not priced");
+            return cursor.longest(pos);
+        }
+    };
     let max_offset = pos.min(options.max_match_distance);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
     if options.max_match_candidates == 0 || max_offset == 0 || max_length < 3 {

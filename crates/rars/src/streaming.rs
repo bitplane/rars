@@ -691,6 +691,16 @@ impl WriterResources {
             })
     }
 
+    /// Reserves `required` if the budget has that much free now, and never
+    /// waits for it.
+    ///
+    /// For work that can run in the time it is admitted or wait for work in
+    /// flight instead: a member asking for more beside what it already holds
+    /// must not queue behind members waiting for what it holds.
+    pub(crate) fn try_acquire(&self, required: u64) -> Option<MemoryPermit> {
+        self.budget.try_acquire(required)
+    }
+
     /// [`Self::acquire_serialising_cancellable`] without the wait: `None` when
     /// the budget has no room for it yet.
     pub(crate) fn try_acquire_serialising(&self, required: u64) -> Result<Option<MemoryPermit>> {

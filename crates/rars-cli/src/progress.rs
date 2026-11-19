@@ -139,12 +139,6 @@ impl CliProgress {
         self.bar.set_message(message);
     }
 
-    pub(crate) fn advance(&self, bytes: u64) {
-        if self.mode == RenderMode::Terminal {
-            self.bar.inc(bytes);
-        }
-    }
-
     pub(crate) fn set_message(&self, message: impl Into<String>) {
         let message = message.into();
         self.set_plain_state(true, &message);
@@ -378,7 +372,7 @@ mod tests {
         let mut progress = CliProgress::new(ProgressMode::Never);
         progress.mode = RenderMode::Terminal;
         progress.bar("reading", 100);
-        progress.advance(30);
+        progress.bar.inc(30);
         assert_eq!(progress.bar.position(), 30);
         progress.set_message("source");
         assert_eq!(progress.bar.message(), "source");
@@ -536,8 +530,6 @@ mod tests {
     #[test]
     fn hidden_progress_and_standalone_recovery_do_not_invent_emission_work() {
         let progress = CliProgress::new(ProgressMode::Never);
-        progress.advance(999);
-        assert_eq!(progress.bar.position(), 0);
         progress.report(WriteProgressEvent::OperationStarted {
             operation: WriteOperation::Recovery,
             total_bytes: None,

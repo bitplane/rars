@@ -13,6 +13,7 @@ use crate::write_progress::{ProgressReporter, WorkTracker};
 use crate::write_stream::{MemberBytes, MemberPayload};
 use crate::ArchiveVersion;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
+use std::io::{Seek, SeekFrom};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -929,45 +930,18 @@ pub fn write_stored_volumes(
     options: WriterOptions,
     volume_size: usize,
 ) -> Result<Vec<Vec<u8>>> {
-    write_stored_volumes_with_progress(entry, options, volume_size, None)
-}
-
-pub(crate) fn write_stored_volumes_with_progress(
-    entry: StoredEntry<'_>,
-    options: WriterOptions,
-    volume_size: usize,
-    progress: Option<&dyn WriteProgress>,
-) -> Result<Vec<Vec<u8>>> {
-    let resources = WriterResources::default();
-    let control =
-        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
-    let progress = Some(&control as &dyn WriteProgress);
-    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
-    if !options.target.is_rar13_family() {
-        return Err(Error::UnsupportedVersion(options.target));
-    }
-    validate_plan(options, PlanShape::new())?;
-    validate_volume_writer_inputs(
-        entry.name,
-        entry.data,
-        entry.password,
-        entry.file_comment,
+    let mut sink = crate::volume_sink::CollectedVolumes::new();
+    split_member(
+        &Member::from_stored(&entry),
         options,
-    )?;
-
-    let body = entry.data.to_vec();
-    write_split_volumes(SplitVolumeRecord {
-        name: entry.name,
-        unpacked: entry.data,
-        packed: &body,
-        progress: ProgressReporter(&control),
-        file_time: entry.file_time,
-        file_attr: entry.file_attr,
-        method: METHOD_STORE,
-        base_flags: 0,
-        features: options.features,
+        &MemberCoding::Stored,
         volume_size,
-    })
+        &mut sink,
+        &WriterResources::default(),
+        None,
+        STREAM_MEMBERS_ABOVE,
+    )?;
+    Ok(sink.take())
 }
 
 /// Splits one member across a volume set. No volume is longer than
@@ -987,77 +961,503 @@ pub fn write_compressed_volumes_with_progress(
     volume_size: usize,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<Vec<Vec<u8>>> {
-    let resources = WriterResources::default();
+    let mut sink = crate::volume_sink::CollectedVolumes::new();
+    split_member(
+        &Member::from_file(&entry),
+        options,
+        &MemberCoding::Compressed,
+        volume_size,
+        &mut sink,
+        &WriterResources::default(),
+        progress,
+        STREAM_MEMBERS_ABOVE,
+    )?;
+    Ok(sink.take())
+}
+
+/// Splits one member across a volume set, handing each volume to `sink` as it
+/// fills. A RAR 1.3 set holds one member.
+///
+/// A stored member is copied from its source as the volumes are written. A
+/// compressed one is packed first, in memory or, over 64 MiB, into a spool in
+/// `resources`' temp directory: packing is checked by decoding it and can fall
+/// back to other settings or to storing, which cannot be taken back once a
+/// volume has gone out, and the packed size gives the number of volumes
+/// before the first one is written.
+pub fn write_volumes_to(
+    entry: &StreamingEntry,
+    options: WriterOptions,
+    coding: MemberCoding,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
+    split_member(
+        &Member::from_streaming(entry),
+        options,
+        &coding,
+        volume_size,
+        sink,
+        resources,
+        progress,
+        STREAM_MEMBERS_ABOVE,
+    )
+}
+
+/// [`write_volumes_to`] for a Builder entry, which borrows its bytes or a source.
+pub(crate) fn write_volumes_with_source_to(
+    entry: &BorrowedFileEntry<'_>,
+    options: WriterOptions,
+    coding: MemberCoding,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
+    let mut member = Member::from_file(&entry.file);
+    if let Some(source) = entry.source {
+        member.bytes = MemberBytes::NamedSource(source, entry.file.name);
+    }
+    split_member(
+        &member,
+        options,
+        &coding,
+        volume_size,
+        sink,
+        resources,
+        progress,
+        STREAM_MEMBERS_ABOVE,
+    )
+}
+
+/// A volume member's bytes as they go into the set.
+enum VolumePayload {
+    /// The member itself, stored.
+    Member,
+    Packed(Vec<u8>),
+    Spooled(crate::streaming::Spool),
+}
+
+struct PackedVolumeMember {
+    payload: VolumePayload,
+    len: u64,
+    method: u8,
+    /// Known once the member has been packed; a stored one is summed as it is copied.
+    file_crc: Option<u16>,
+}
+
+/// A member larger than `stream_above` and read from a source is packed into a spool.
+#[allow(clippy::too_many_arguments)]
+fn split_member(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    stream_above: u64,
+) -> Result<()> {
+    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
+        return Err(Error::UnsupportedFamilyFeature {
+            family: options.target.family(),
+            feature: if resources.max_memory_bytes().is_some() {
+                "aggregate managed-memory limit"
+            } else {
+                "preparation memory quota"
+            },
+        });
+    }
     let control =
-        crate::write_progress::ResourceProgress::new(&resources, progress.map(ProgressReporter));
-    let progress = Some(&control as &dyn WriteProgress);
-    crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
+        crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
+    let reporting = &control as &dyn WriteProgress;
+    crate::write_progress::check_cancelled(Some(ProgressReporter(reporting)))?;
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
-    validate_plan(options, PlanShape::new().compressed(true))?;
-    validate_volume_writer_inputs(
-        entry.name,
-        entry.data,
-        entry.password,
-        entry.file_comment,
-        options,
-    )?;
+    validate_plan(options, coding.shape())?;
+    if coding.is_filtered() {
+        return Err(Error::UnsupportedWriterOption {
+            target: options.target,
+            option: WriterOption::Filter,
+            because: None,
+        });
+    }
+    let unpacked_size = member
+        .unpacked_size()
+        .and_then(|size| validate_member(member.name, size).map(|()| size))
+        .map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "preparing volume member")
+        })?;
+    validate_volume_writer_inputs(member, options)?;
+    if unpacked_size == 0 {
+        return Err(Error::InvalidArgument(
+            "RAR 1.3 volume writer needs a non-empty packed payload",
+        )
+        .at_entry(member.name.to_vec(), "preparing volume member"));
+    }
+    let mut head = Vec::new();
+    write_main_header_with_flags(&mut head, options.features, None, MHD_VOLUME)?;
+    // Every volume repeats the same main header and a fragment header of the same length.
+    let header_len = FILE_HEAD_BASE_SIZE + member.name.len();
+    if volume_size == 0 {
+        return Err(Error::InvalidArgument("volume size must be non-zero"));
+    }
+    let payload = volume_size
+        .checked_sub(head.len() + header_len)
+        .filter(|&payload| payload > 0)
+        .ok_or(Error::InvalidArgument(
+            "volume size is too small to hold the volume headers",
+        ))? as u64;
 
+    let compresses = coding.compresses();
     let encode_options = rar15_encode_options_for_level(options.compression_level);
-    let total_work = (entry.data.len() as u64)
-        .saturating_mul(rar15_encode_fallback_options(encode_options).len() as u64);
-    let reporting = &control as &dyn WriteProgress;
-    report_compression_operation(reporting, true, total_work, 1);
-    let work = WorkTracker::new(
-        progress.map(ProgressReporter),
-        WriteOperation::Compression,
-        total_work,
-    );
-    report_compression_entry(
-        reporting,
-        true,
-        0,
-        1,
-        &Member::from_file(&entry),
-        entry.data.len(),
-    );
-    let mut last = 0usize;
-    let mut advance = |position: usize| advance_rar15_attempt(&mut last, &work, position);
-    let packed =
-        encode_verified_rar15_payload_with_progress(entry.data, encode_options, &mut advance)
-            .map_err(|error| {
-                crate::write_stream::member_error(error, entry.name, "compressing volume member")
-            })?;
-    let (packed, method) =
-        select_verified_payload(std::borrow::Cow::Borrowed(entry.data), packed, false);
-    let result = write_split_volumes(SplitVolumeRecord {
-        name: entry.name,
-        unpacked: entry.data,
-        packed: &packed,
-        progress: ProgressReporter(&control),
-        file_time: entry.file_time,
-        file_attr: entry.file_attr,
-        method,
-        base_flags: 0,
-        features: options.features,
-        volume_size,
+    let (operation, total_work) = if compresses {
+        (
+            WriteOperation::Compression,
+            (unpacked_size as u64)
+                .saturating_mul(rar15_encode_fallback_options(encode_options).len() as u64),
+        )
+    } else {
+        (WriteOperation::Emission, unpacked_size as u64)
+    };
+    report_volume_operation(reporting, operation, true, total_work);
+    let work = WorkTracker::new(Some(ProgressReporter(reporting)), operation, total_work);
+    report_volume_entry(reporting, operation, true, member, unpacked_size);
+    let packed = if compresses {
+        pack_volume_member(
+            member,
+            unpacked_size,
+            encode_options,
+            resources,
+            &work,
+            stream_above,
+        )
+        .map_err(|error| {
+            crate::write_stream::member_error(error, member.name, "compressing volume member")
+        })?
+    } else {
+        PackedVolumeMember {
+            payload: VolumePayload::Member,
+            len: unpacked_size as u64,
+            method: METHOD_STORE,
+            file_crc: None,
+        }
+    };
+    let result = write_volume_set(
+        member,
+        packed,
+        VolumeLayout {
+            head: &head,
+            header_len,
+            payload,
+            unpacked_size: unpacked_size as u32,
+            features: options.features,
+        },
+        sink,
+        (!compresses).then_some(&work),
+        ProgressReporter(reporting),
+    )
+    .map_err(|error| {
+        crate::write_stream::member_error(error, member.name, "writing volume member")
     });
-    report_compression_entry(
-        reporting,
-        false,
-        0,
-        1,
-        &Member::from_file(&entry),
-        entry.data.len(),
-    );
-    let result = result?;
+    report_volume_entry(reporting, operation, false, member, unpacked_size);
+    result?;
+    member.bytes.release();
     if !work.finish() {
         return Err(Error::Cancelled);
     }
-    report_compression_operation(reporting, false, total_work, 1);
+    report_volume_operation(reporting, operation, false, total_work);
+    work.check()
+}
+
+/// Packs a volume member as the in-memory volume writer always did: on its
+/// own even in a solid set, verified, and stored if packing did not help.
+fn pack_volume_member(
+    member: &Member<'_>,
+    unpacked_size: usize,
+    encode_options: Rar15EncodeOptions,
+    resources: &WriterResources,
+    work: &WorkTracker<'_>,
+    stream_above: u64,
+) -> Result<PackedVolumeMember> {
     work.check()?;
-    Ok(result)
+    if let (true, Some(source)) = (unpacked_size as u64 > stream_above, member.bytes.source()) {
+        let _permit = resources
+            .acquire_serialising_cancellable(streamed_workspace(), &|| work.is_cancelled())?;
+        let encoded = encode_spooled_member(
+            member,
+            source,
+            unpacked_size,
+            encode_options,
+            None,
+            resources,
+            work,
+        )?;
+        let (payload, len) = match encoded.payload {
+            Payload::Spooled(spool) => {
+                let len = spool.len();
+                (VolumePayload::Spooled(spool), len)
+            }
+            Payload::Shared(MemberPayload::Copied(_) | MemberPayload::Borrowed(_)) => {
+                (VolumePayload::Member, unpacked_size as u64)
+            }
+            Payload::Shared(MemberPayload::Packed(packed)) => {
+                let len = packed.len() as u64;
+                (VolumePayload::Packed(packed), len)
+            }
+        };
+        return Ok(PackedVolumeMember {
+            payload,
+            len,
+            method: encoded.method,
+            file_crc: Some(encoded.file_crc),
+        });
+    }
+    let _permit = resources
+        .acquire_serialising_cancellable(member_workspace(unpacked_size as u64, true), &|| {
+            work.is_cancelled()
+        })?;
+    let data = member
+        .bytes
+        .load_exact_with_progress(unpacked_size as u64, work.reporter())?;
+    let file_crc = file_checksum(&data);
+    let mut last = 0usize;
+    let mut advance = |position: usize| advance_rar15_attempt(&mut last, work, position);
+    let packed = encode_verified_rar15_payload_with_progress(&data, encode_options, &mut advance)?;
+    Ok(match packed {
+        Some(packed)
+            if !crate::write_plan::StoreFallback::new().applies(
+                false,
+                data.len(),
+                packed.len(),
+            ) =>
+        {
+            PackedVolumeMember {
+                len: packed.len() as u64,
+                payload: VolumePayload::Packed(packed),
+                method: METHOD_BEST,
+                file_crc: Some(file_crc),
+            }
+        }
+        // Stored: copied from the member again rather than from a copy of it.
+        _ => PackedVolumeMember {
+            payload: VolumePayload::Member,
+            len: unpacked_size as u64,
+            method: METHOD_STORE,
+            file_crc: Some(file_crc),
+        },
+    })
+}
+
+/// What every volume of a set repeats around its slice of the member.
+struct VolumeLayout<'a> {
+    head: &'a [u8],
+    header_len: usize,
+    /// Packed bytes in each volume but the last.
+    payload: u64,
+    unpacked_size: u32,
+    features: FeatureSet,
+}
+
+/// Writes the volumes, patching each fragment header once the bytes behind it
+/// have been copied and summed. `stored_work` counts a stored member's bytes.
+fn write_volume_set(
+    member: &Member<'_>,
+    packed: PackedVolumeMember,
+    layout: VolumeLayout<'_>,
+    sink: &mut dyn VolumeSink,
+    stored_work: Option<&WorkTracker<'_>>,
+    progress: ProgressReporter<'_>,
+) -> Result<()> {
+    let PackedVolumeMember {
+        payload,
+        len: packed_len,
+        method,
+        file_crc,
+    } = packed;
+    u32::try_from(packed_len)
+        .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))?;
+    let total = packed_len.div_ceil(layout.payload);
+    // Told before the first volume, so a set that cannot be named is refused
+    // before anything is written.
+    sink.expect_volumes(total)?;
+
+    let copies_member = matches!(payload, VolumePayload::Member);
+    let mut member_reader;
+    let mut packed_reader;
+    let mut spool;
+    let reader: &mut dyn Read = match payload {
+        VolumePayload::Member => {
+            member_reader = member.bytes.open()?;
+            &mut member_reader
+        }
+        VolumePayload::Packed(packed) => {
+            packed_reader = std::io::Cursor::new(packed);
+            &mut packed_reader
+        }
+        VolumePayload::Spooled(spooled) => {
+            spool = spooled;
+            spool.rewind()?;
+            &mut spool
+        }
+    };
+    let mut whole = Rar13Checksum::new();
+    let mut buffer = vec![0; 64 * 1024];
+    let mut start = 0u64;
+    for index in 0..total {
+        crate::write_progress::check_cancelled(Some(progress))?;
+        let len = layout.payload.min(packed_len - start);
+        let split_after = index + 1 < total;
+        let bytes = layout.head.len() as u64 + layout.header_len as u64 + len;
+        let mut out = sink.start_volume(index)?;
+        out.write_all(layout.head)?;
+        // A placeholder: the header gives the checksum of what follows it.
+        out.write_all(&vec![0; layout.header_len])?;
+        let mut fragment = Rar13Checksum::new();
+        let mut left = len;
+        while left > 0 {
+            let take = left.min(buffer.len() as u64) as usize;
+            let chunk = &mut buffer[..take];
+            reader.read_exact(chunk).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::UnexpectedEof {
+                    Error::SourceChanged("entry source size changed while writing")
+                } else {
+                    error.into()
+                }
+            })?;
+            fragment.update(chunk);
+            whole.update(chunk);
+            out.write_all(chunk)?;
+            left -= take as u64;
+            match stored_work {
+                Some(work) if !work.advance(take as u64) => return Err(Error::Cancelled),
+                Some(_) => {}
+                None => crate::write_progress::check_cancelled(Some(progress))?,
+            }
+        }
+        if !split_after && copies_member {
+            crate::write_stream::check_source_length(
+                reader,
+                packed_len,
+                packed_len,
+                "entry source size changed while writing",
+            )?;
+        }
+        // The last fragment's header gives the whole member's checksum.
+        let checksum = if split_after {
+            fragment.finish()
+        } else {
+            let copied = std::mem::replace(&mut whole, Rar13Checksum::new()).finish();
+            match file_crc {
+                Some(crc) if copies_member && copied != crc => {
+                    return Err(Error::SourceChanged(
+                        "entry source contents changed while writing",
+                    ))
+                }
+                Some(crc) => crc,
+                None => copied,
+            }
+        };
+        let mut flags = 0u8;
+        if index > 0 {
+            flags |= LHD_SPLIT_BEFORE;
+        }
+        if split_after {
+            flags |= LHD_SPLIT_AFTER;
+        }
+        if layout.features.solid {
+            flags |= LHD_SOLID;
+        }
+        let mut header = Vec::with_capacity(layout.header_len);
+        write_file_header(
+            &mut header,
+            FileEntryRecord {
+                name: member.name,
+                unpacked_size: layout.unpacked_size,
+                file_crc: checksum,
+                packed_size: len as u32,
+                file_time: member.file_time,
+                file_attr: member.file_attr,
+                flags,
+                unp_ver: DEFAULT_UNP_VER,
+                method,
+                extra: &[],
+            },
+        )?;
+        if header.len() != layout.header_len {
+            return Err(Error::WriterFailure(
+                "RAR 1.3 volume header changed length when patched",
+            ));
+        }
+        let back = (layout.header_len as u64 + len) as i64;
+        out.seek(SeekFrom::Current(-back))?;
+        out.write_all(&header)?;
+        out.seek(SeekFrom::Current(len as i64))?;
+        out.flush()?;
+        drop(out);
+        sink.finish_volume(index, bytes)?;
+        progress.report(WriteProgressEvent::VolumeFinished {
+            volume_index: index as usize,
+            total_volumes: usize::try_from(total).ok(),
+            bytes,
+        });
+        crate::write_progress::check_cancelled(Some(progress))?;
+        start += len;
+    }
+    Ok(())
+}
+
+fn report_volume_operation(
+    progress: &dyn WriteProgress,
+    operation: WriteOperation,
+    started: bool,
+    total_bytes: u64,
+) {
+    let (total_bytes, total_entries) = (Some(total_bytes), Some(1));
+    progress.report(if started {
+        WriteProgressEvent::OperationStarted {
+            operation,
+            total_bytes,
+            total_entries,
+            pass: 1,
+        }
+    } else {
+        WriteProgressEvent::OperationFinished {
+            operation,
+            total_bytes,
+            total_entries,
+            pass: 1,
+        }
+    });
+}
+
+fn report_volume_entry(
+    progress: &dyn WriteProgress,
+    operation: WriteOperation,
+    started: bool,
+    member: &Member<'_>,
+    input_bytes: usize,
+) {
+    let (name, input_bytes) = (member.name, input_bytes as u64);
+    progress.report(if started {
+        WriteProgressEvent::EntryStarted {
+            operation,
+            index: 0,
+            total_entries: 1,
+            name,
+            input_bytes,
+        }
+    } else {
+        WriteProgressEvent::EntryFinished {
+            operation,
+            index: 0,
+            total_entries: 1,
+            name,
+            input_bytes,
+        }
+    });
 }
 
 fn report_compression_operation(
@@ -1118,24 +1518,15 @@ fn validate_plan(options: WriterOptions, shape: PlanShape) -> Result<()> {
     crate::write_plan::validate_compression_level(options.target, options.compression_level)
 }
 
-fn validate_volume_writer_inputs(
-    name: &[u8],
-    data: &[u8],
-    password: Option<&[u8]>,
-    file_comment: Option<&[u8]>,
-    options: WriterOptions,
-) -> Result<()> {
-    validate_file_entry(name, data).map_err(|error| {
-        crate::write_stream::member_error(error, name, "preparing volume member")
-    })?;
-    if password.is_some() {
+fn validate_volume_writer_inputs(member: &Member<'_>, options: WriterOptions) -> Result<()> {
+    if member.password.is_some() {
         return Err(Error::UnsupportedWriterOption {
             target: options.target,
             option: WriterOption::Password,
             because: Some("in a volume set"),
         });
     }
-    if file_comment.is_some() {
+    if member.file_comment.is_some() {
         return Err(Error::UnsupportedWriterOption {
             target: options.target,
             option: WriterOption::FileComment,
@@ -1375,77 +1766,6 @@ fn write_file_header(out: &mut Vec<u8>, entry: FileEntryRecord<'_>) -> Result<()
     Ok(())
 }
 
-struct SplitVolumeRecord<'a> {
-    progress: ProgressReporter<'a>,
-    name: &'a [u8],
-    unpacked: &'a [u8],
-    packed: &'a [u8],
-    file_time: u32,
-    file_attr: u8,
-    method: u8,
-    base_flags: u8,
-    features: FeatureSet,
-    volume_size: usize,
-}
-
-fn write_split_volumes(entry: SplitVolumeRecord<'_>) -> Result<Vec<Vec<u8>>> {
-    crate::write_progress::check_cancelled(Some(entry.progress))?;
-    if entry.packed.is_empty() {
-        return Err(Error::InvalidArgument(
-            "RAR 1.3 volume writer needs a non-empty packed payload",
-        )
-        .at_entry(entry.name.to_vec(), "preparing volume member"));
-    }
-
-    let render = |index: usize, split_after: bool, chunk: &[u8]| -> Result<Vec<u8>> {
-        let mut flags = entry.base_flags;
-        if index > 0 {
-            flags |= LHD_SPLIT_BEFORE;
-        }
-        if split_after {
-            flags |= LHD_SPLIT_AFTER;
-        }
-        if entry.features.solid {
-            flags |= LHD_SOLID;
-        }
-
-        let mut out = Vec::new();
-        write_main_header_with_flags(&mut out, entry.features, None, MHD_VOLUME)?;
-        let checksum_data = if split_after { chunk } else { entry.unpacked };
-        // Both public callers validate the 255-byte name limit and forbid
-        // comments, so this header is at most 21 + 255 bytes.
-        write_file_header(
-            &mut out,
-            FileEntryRecord {
-                name: entry.name,
-                unpacked_size: entry.unpacked.len() as u32,
-                file_crc: file_checksum(checksum_data),
-                packed_size: chunk.len() as u32,
-                file_time: entry.file_time,
-                file_attr: entry.file_attr,
-                flags,
-                unp_ver: DEFAULT_UNP_VER,
-                method: entry.method,
-                extra: &[],
-            },
-        )
-        .expect("validated legacy volume header fits the u16 size field");
-        out.extend_from_slice(chunk);
-        Ok(out)
-    };
-    let payload =
-        crate::rar15_40::legacy_volume_payload(entry.volume_size, entry.packed, |probe| {
-            render(0, true, probe)
-        })?;
-    crate::rar15_40::render_legacy_volumes(
-        entry.packed,
-        payload,
-        entry.volume_size,
-        entry.progress,
-        render,
-    )
-}
-
 fn encode_archive_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
     let Some(comment) = comment else {
         return Ok(Vec::new());
@@ -1488,10 +1808,6 @@ fn encode_file_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-fn validate_file_entry(name: &[u8], data: &[u8]) -> Result<()> {
-    validate_member(name, data.len())
-}
-
 fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
     if name.is_empty() {
         return Err(Error::InvalidArgument("RAR 1.3 file name is empty"));
@@ -1511,6 +1827,62 @@ fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    /// The volume writer before it streamed, kept to check the streamed sets
+    /// against: the member and its packed form whole in memory, cut into
+    /// slices of what fits beside the headers.
+    struct InMemorySet<'a> {
+        name: &'a [u8],
+        unpacked: &'a [u8],
+        packed: &'a [u8],
+        method: u8,
+        features: FeatureSet,
+        volume_size: usize,
+    }
+
+    fn in_memory_volumes(set: InMemorySet<'_>) -> Vec<Vec<u8>> {
+        let render = |index: usize, split_after: bool, chunk: &[u8]| -> Vec<u8> {
+            let mut flags = 0;
+            if index > 0 {
+                flags |= LHD_SPLIT_BEFORE;
+            }
+            if split_after {
+                flags |= LHD_SPLIT_AFTER;
+            }
+            if set.features.solid {
+                flags |= LHD_SOLID;
+            }
+            let mut out = Vec::new();
+            write_main_header_with_flags(&mut out, set.features, None, MHD_VOLUME).unwrap();
+            let checksum_data = if split_after { chunk } else { set.unpacked };
+            write_file_header(
+                &mut out,
+                FileEntryRecord {
+                    name: set.name,
+                    unpacked_size: set.unpacked.len() as u32,
+                    file_crc: file_checksum(checksum_data),
+                    packed_size: chunk.len() as u32,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    flags,
+                    unp_ver: DEFAULT_UNP_VER,
+                    method: set.method,
+                    extra: &[],
+                },
+            )
+            .unwrap();
+            out.extend_from_slice(chunk);
+            out
+        };
+        let probe = &set.packed[..set.packed.len().min(set.volume_size)];
+        let payload = set.volume_size - (render(0, true, probe).len() - probe.len());
+        let chunks: Vec<&[u8]> = set.packed.chunks(payload).collect();
+        chunks
+            .iter()
+            .enumerate()
+            .map(|(index, chunk)| render(index, index + 1 < chunks.len(), chunk))
+            .collect()
+    }
+
     #[test]
     fn a_compressed_member_is_charged_itself_its_packed_form_and_a_fixed_index() {
         let small = super::member_workspace(1 << 20, true);
@@ -4411,5 +4783,226 @@ mod tests {
             written + 1024 * 1024 >= data.len() as u64,
             "only {written} bytes were written while the member was read"
         );
+    }
+
+    fn volume_noise(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(2_654_435_761) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn volume_text(len: usize) -> Vec<u8> {
+        let mut text = Vec::with_capacity(len + 64);
+        let mut line = 0u32;
+        while text.len() < len {
+            text.extend_from_slice(
+                format!("line {line} of a set, {}\n", line.wrapping_mul(7919) % 613).as_bytes(),
+            );
+            line += 1;
+        }
+        text.truncate(len);
+        text
+    }
+
+    #[test]
+    fn streamed_volume_sets_are_the_sets_the_in_memory_writer_built() {
+        let text = volume_text(96 * 1024);
+        let noise = volume_noise(40 * 1024, 11);
+        for data in [&text[..], &noise[..]] {
+            for (solid, level) in [(false, None), (true, Some(2))] {
+                let mut features = FeatureSet::store_only();
+                features.solid = solid;
+                let options = WriterOptions {
+                    target: ArchiveVersion::Rar14,
+                    features,
+                    compression_level: level,
+                };
+                let packed = encode_verified_rar15_payload_with_progress(
+                    data,
+                    rar15_encode_options_for_level(level),
+                    &mut |_| true,
+                )
+                .unwrap();
+                let (packed, method) =
+                    select_verified_payload(std::borrow::Cow::Borrowed(data), packed, false);
+                let entry = StreamingEntry::new(
+                    b"SET.BIN".to_vec(),
+                    EntrySource::from_bytes(data.to_vec()),
+                )
+                .with_file_attr(0x20);
+                for volume_size in [3000, 1 << 20] {
+                    let set = |packed: &[u8], method| {
+                        in_memory_volumes(InMemorySet {
+                            name: b"SET.BIN",
+                            unpacked: data,
+                            packed,
+                            method,
+                            features,
+                            volume_size,
+                        })
+                    };
+                    let case = format!("{} bytes, solid {solid}, {volume_size}", data.len());
+
+                    let compressed = set(&packed, method);
+                    let file = FileEntry {
+                        name: b"SET.BIN",
+                        data,
+                        file_time: 0,
+                        file_attr: 0x20,
+                        password: None,
+                        file_comment: None,
+                    };
+                    assert!(
+                        write_compressed_volumes(file, options, volume_size).unwrap() == compressed,
+                        "{case}"
+                    );
+                    // From a source, in memory and packed into a spool.
+                    for stream_above in [u64::MAX, 1024] {
+                        let mut sink = CollectedVolumes::new();
+                        split_member(
+                            &Member::from_streaming(&entry),
+                            options,
+                            &MemberCoding::Compressed,
+                            volume_size,
+                            &mut sink,
+                            &WriterResources::default(),
+                            None,
+                            stream_above,
+                        )
+                        .unwrap();
+                        assert!(sink.take() == compressed, "{case}, {stream_above}");
+                    }
+
+                    // A stored set cannot be solid.
+                    if solid {
+                        continue;
+                    }
+                    let stored = set(data, METHOD_STORE);
+                    let file = StoredEntry {
+                        name: b"SET.BIN",
+                        data,
+                        file_time: 0,
+                        file_attr: 0x20,
+                        password: None,
+                        file_comment: None,
+                    };
+                    assert!(
+                        write_stored_volumes(file, options, volume_size).unwrap() == stored,
+                        "{case}"
+                    );
+                    let mut sink = CollectedVolumes::new();
+                    write_volumes_to(
+                        &entry,
+                        options,
+                        MemberCoding::Stored,
+                        volume_size,
+                        &mut sink,
+                        &WriterResources::default(),
+                        None,
+                    )
+                    .unwrap();
+                    let volumes = sink.take();
+                    assert!(volumes == stored, "{case}");
+                    let archives = parse_volumes(&volumes);
+                    let extracted = collect_extract_volumes(&archives, None).unwrap();
+                    assert!(extracted[0].data == data, "{case}");
+                }
+            }
+        }
+    }
+
+    /// Refuses a set longer than the 901 volumes old-style names reach.
+    struct NamedSet {
+        started: usize,
+    }
+
+    impl VolumeSink for NamedSet {
+        fn expect_volumes(&mut self, total: u64) -> Result<()> {
+            if total > 901 {
+                return Err(Error::InvalidArgument(
+                    "old-style volume names run out after .z99",
+                ));
+            }
+            Ok(())
+        }
+
+        fn start_volume(&mut self, _index: u64) -> Result<Box<dyn VolumeOutput>> {
+            self.started += 1;
+            Ok(Box::new(std::io::Cursor::new(Vec::new())))
+        }
+    }
+
+    #[test]
+    fn a_set_too_long_to_name_is_refused_before_a_volume_is_written() {
+        let entry = StreamingEntry::new(
+            b"LONG.BIN".to_vec(),
+            EntrySource::from_bytes(volume_noise(64 * 1024, 5)),
+        )
+        .with_file_attr(0x20);
+        // Noise is stored whichever way it is asked for, so both need over
+        // a thousand 100-byte volumes.
+        for coding in [MemberCoding::Stored, MemberCoding::Compressed] {
+            let mut sink = NamedSet { started: 0 };
+            let error = write_volumes_to(
+                &entry,
+                WriterOptions::default(),
+                coding.clone(),
+                100,
+                &mut sink,
+                &WriterResources::default(),
+                None,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.root_cause(),
+                &Error::InvalidArgument("old-style volume names run out after .z99")
+            );
+            assert_eq!(sink.started, 0, "{coding:?}");
+        }
+        let mut sink = NamedSet { started: 0 };
+        write_volumes_to(
+            &entry,
+            WriterOptions::default(),
+            MemberCoding::Stored,
+            1000,
+            &mut sink,
+            &WriterResources::default(),
+            None,
+        )
+        .unwrap();
+        assert!((2..=901).contains(&sink.started), "{}", sink.started);
+    }
+
+    #[test]
+    fn a_source_that_changes_size_under_a_streamed_set_is_refused() {
+        for actual in [4000usize, 4200] {
+            let entry = StreamingEntry::new(
+                b"MOVING.BIN".to_vec(),
+                EntrySource::from_opener(4096, move || {
+                    Ok(Box::new(std::io::Cursor::new(vec![1u8; actual])))
+                }),
+            );
+            let mut sink = CollectedVolumes::new();
+            let error = write_volumes_to(
+                &entry,
+                WriterOptions::default(),
+                MemberCoding::Stored,
+                1024,
+                &mut sink,
+                &WriterResources::default(),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error.root_cause(), Error::SourceChanged(_)),
+                "{actual}: {error:?}"
+            );
+        }
     }
 }

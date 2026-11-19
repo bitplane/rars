@@ -1345,25 +1345,11 @@ impl Builder {
         if self.format.family() == ArchiveFamily::Rar50Plus {
             return self.to_volume_output(resources, progress)?.into_vec();
         }
-        if resources.max_memory_bytes().is_some() || resources.max_preparation_bytes().is_some() {
-            return Err(Error::UnsupportedFamilyFeature {
-                family: self.format.family(),
-                feature: "managed writer memory policy",
-            });
-        }
-        let volume_size = self.volume_payload_size()?;
-        let control = ResourceProgress::new(resources, progress.map(ProgressReporter));
-        let progress = Some(&control as &dyn WriteProgress);
-        check_cancelled(progress.map(ProgressReporter))?;
-        self.single_volume_entry()?;
-        let this = self.materialized_volume_input(progress.map(ProgressReporter))?;
-        let result = match self.format.family() {
-            ArchiveFamily::Rar15To40 => this.build_rar15_volumes(volume_size, progress),
-            ArchiveFamily::Rar13 => this.build_rar13_volumes(volume_size, progress),
-            ArchiveFamily::Rar50Plus => unreachable!("modern volume output handled above"),
-        }?;
-        check_cancelled(progress.map(ProgressReporter))?;
-        Ok(result)
+        // Members are read from their sources as the set is written; only the
+        // set itself is held, because it is what this returns.
+        let mut sink = rar50::CollectedVolumes::new();
+        self.write_volumes_to(&mut sink, resources, progress)?;
+        Ok(sink.take())
     }
 
     /// Collect modern volumes, retaining their charges for a binding handoff.
@@ -1383,7 +1369,12 @@ impl Builder {
         sink.finish()
     }
 
-    /// Stream RAR5/7 volumes to a caller-owned sink under the resource policy.
+    /// Stream volumes to a caller-owned sink, each as it fills.
+    ///
+    /// Members are read from their sources as they are packed, so neither
+    /// the input nor the set is held. A RAR 5/7 set runs under the resource
+    /// policy; a legacy one refuses the managed-memory quotas. RAR 1.5-4.x
+    /// sets hold any number of members, a RAR 1.3 set one.
     pub fn write_volumes_to(
         &self,
         sink: &mut dyn rar50::VolumeSink,
@@ -1391,10 +1382,7 @@ impl Builder {
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
         if self.format.family() != ArchiveFamily::Rar50Plus {
-            return Err(Error::UnsupportedFamilyFeature {
-                family: self.format.family(),
-                feature: "streaming managed volume output",
-            });
+            return self.write_legacy_volumes_to(sink, resources, progress);
         }
         let volume_size = self.volume_payload_size()?;
         if self.comment.is_some() {
@@ -1538,32 +1526,61 @@ impl Builder {
         Ok(())
     }
 
-    /// Legacy volume collection needs its one input as a slice. Borrow an
-    /// inline input; read a source without copying any other member payloads.
-    fn materialized_volume_input(
+    /// Legacy sets go through the writers the CLI uses, reading each member
+    /// from its source as it is packed into the volumes.
+    fn write_legacy_volumes_to(
         &self,
-        progress: Option<ProgressReporter<'_>>,
-    ) -> Result<std::borrow::Cow<'_, Self>> {
-        check_cancelled(progress)?;
-        // The caller has validated the legacy volume path and its one input.
-        if !self.entries.iter().any(|entry| entry.source.is_some()) {
-            return Ok(std::borrow::Cow::Borrowed(self));
+        sink: &mut dyn rar50::VolumeSink,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
+        if resources.max_memory_bytes().is_some() || resources.max_preparation_bytes().is_some() {
+            return Err(Error::UnsupportedFamilyFeature {
+                family: self.format.family(),
+                feature: "managed writer memory policy",
+            });
         }
-        let mut owned = self.clone();
-        for entry in &mut owned.entries {
-            if let Some(source) = entry.source.take() {
-                entry.data = Arc::new(
-                    crate::write_stream::MemberBytes::Source(&source)
-                        .load_with_progress(progress)
-                        .map_err(|error| {
-                            crate::write_stream::member_error(error, &entry.name, "reading source")
-                        })?
-                        .into_owned(),
-                );
-                source.release();
+        let volume_size = self.volume_payload_size()?;
+        let coding = self.coding();
+        match self.format.family() {
+            ArchiveFamily::Rar15To40 => {
+                if self.comment_password.is_some() {
+                    return Err(Error::InvalidArgument(
+                        "encrypted legacy archive comments are unsupported in volume output",
+                    ));
+                }
+                rar15_40::write_retained_volumes_to(
+                    &self.rar15_entries(),
+                    self.rar15_options(),
+                    coding,
+                    self.comment.as_deref(),
+                    volume_size,
+                    sink,
+                    resources,
+                    progress,
+                )
             }
+            ArchiveFamily::Rar13 => {
+                if self.comment.is_some() {
+                    crate::write_plan::validate_option(
+                        self.format,
+                        crate::write_plan::WriterOption::ArchiveComment,
+                        crate::write_plan::PlanShape::new().volumes(true),
+                    )?;
+                }
+                let entry = self.single_volume_entry()?;
+                rar13::write_volumes_with_source_to(
+                    &self.rar13_entry(entry),
+                    self.rar13_options(),
+                    coding,
+                    volume_size,
+                    sink,
+                    resources,
+                    progress,
+                )
+            }
+            ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 volumes have their own writer"),
         }
-        Ok(std::borrow::Cow::Owned(owned))
     }
 
     fn write_legacy_to(
@@ -1757,14 +1774,25 @@ impl Builder {
         options
     }
 
-    fn write_rar15_single(
-        &self,
-        output: rar15_40::ArchiveOutput<'_>,
-        resources: &WriterResources,
-        progress: Option<&dyn WriteProgress>,
-    ) -> Result<()> {
-        let entries: Vec<_> = self
-            .entries
+    fn coding(&self) -> crate::write_plan::MemberCoding {
+        if self.store {
+            crate::write_plan::MemberCoding::Stored
+        } else {
+            crate::write_plan::MemberCoding::Compressed
+        }
+    }
+
+    fn data_password<'a>(&'a self, entry: &'a BuilderEntry) -> Option<&'a [u8]> {
+        entry
+            .encryption
+            .as_ref()
+            .map_or(self.password.as_deref(), |encryption| {
+                encryption.data_password.as_deref()
+            })
+    }
+
+    fn rar15_entries(&self) -> Vec<rar15_40::RetainedFileEntry<'_>> {
+        self.entries
             .iter()
             .map(|entry| rar15_40::RetainedFileEntry {
                 source: entry.source.as_ref(),
@@ -1774,12 +1802,7 @@ impl Builder {
                     file_time: entry.times.mtime.unwrap_or(0),
                     file_attr: entry.rar15_attr(),
                     host_os: entry.rar15_host_os(),
-                    password: entry
-                        .encryption
-                        .as_ref()
-                        .map_or(self.password.as_deref(), |encryption| {
-                            encryption.data_password.as_deref()
-                        }),
+                    password: self.data_password(entry),
                     file_comment: entry.file_comment.as_deref(),
                 },
                 metadata: rar15_40::RetainedMemberMetadata {
@@ -1790,15 +1813,19 @@ impl Builder {
                     is_symlink: matches!(entry.attributes, EntryAttributes::Unix(mode) if mode & 0o170000 == 0o120000),
                 },
             })
-            .collect();
+            .collect()
+    }
+
+    fn write_rar15_single(
+        &self,
+        output: rar15_40::ArchiveOutput<'_>,
+        resources: &WriterResources,
+        progress: Option<&dyn WriteProgress>,
+    ) -> Result<()> {
         rar15_40::write_archive_with_retained_metadata(
-            &entries,
+            &self.rar15_entries(),
             self.rar15_options(),
-            if self.store {
-                crate::write_plan::MemberCoding::Stored
-            } else {
-                crate::write_plan::MemberCoding::Compressed
-            },
+            self.coding(),
             self.comment.as_deref(),
             resources,
             progress,
@@ -1818,6 +1845,20 @@ impl Builder {
         options
     }
 
+    fn rar13_entry<'a>(&'a self, entry: &'a BuilderEntry) -> rar13::BorrowedFileEntry<'a> {
+        rar13::BorrowedFileEntry {
+            file: rar13::FileEntry {
+                name: &entry.name,
+                data: &entry.data,
+                file_time: entry.times.mtime.unwrap_or(0),
+                file_attr: entry.rar13_attr(),
+                password: self.data_password(entry),
+                file_comment: entry.file_comment.as_deref(),
+            },
+            source: entry.source.as_ref(),
+        }
+    }
+
     fn write_rar13_single(
         &self,
         output: &mut dyn Write,
@@ -1827,31 +1868,12 @@ impl Builder {
         let entries: Vec<_> = self
             .entries
             .iter()
-            .map(|entry| rar13::BorrowedFileEntry {
-                file: rar13::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.times.mtime.unwrap_or(0),
-                    file_attr: entry.rar13_attr(),
-                    password: entry
-                        .encryption
-                        .as_ref()
-                        .map_or(self.password.as_deref(), |encryption| {
-                            encryption.data_password.as_deref()
-                        }),
-                    file_comment: entry.file_comment.as_deref(),
-                },
-                source: entry.source.as_ref(),
-            })
+            .map(|entry| self.rar13_entry(entry))
             .collect();
         rar13::write_archive_with_sources(
             &entries,
             self.rar13_options(),
-            if self.store {
-                crate::write_plan::MemberCoding::Stored
-            } else {
-                crate::write_plan::MemberCoding::Compressed
-            },
+            self.coding(),
             self.comment.as_deref(),
             resources,
             progress,
@@ -1859,96 +1881,11 @@ impl Builder {
         )
     }
 
+    /// The RAR 1.3 writer splits one packed payload, so its sets hold one member.
     fn single_volume_entry(&self) -> Result<&BuilderEntry> {
         match self.entries.as_slice() {
             [entry] => Ok(entry),
             _ => Err(Error::InvalidArgument("legacy volumes support one input")),
-        }
-    }
-
-    fn build_rar15_volumes(
-        &self,
-        volume_size: usize,
-        progress: Option<&dyn WriteProgress>,
-    ) -> Result<Vec<Vec<u8>>> {
-        let entry = self.single_volume_entry()?;
-        let options = self.rar15_options();
-        if self.comment_password.is_some() {
-            return Err(Error::InvalidArgument(
-                "encrypted legacy archive comments are unsupported in volume output",
-            ));
-        }
-        let comment = self.comment.as_deref();
-        if self.store {
-            rar15_40::write_stored_volumes_with_progress(
-                rar15_40::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.times.mtime.unwrap_or(0),
-                    file_attr: entry.rar15_attr(),
-                    host_os: entry.rar15_host_os(),
-                    password: self.password.as_deref(),
-                    file_comment: entry.file_comment.as_deref(),
-                },
-                options,
-                comment,
-                volume_size,
-                progress,
-            )
-        } else {
-            rar15_40::write_compressed_volumes_with_comment_and_progress(
-                rar15_40::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.times.mtime.unwrap_or(0),
-                    file_attr: entry.rar15_attr(),
-                    host_os: entry.rar15_host_os(),
-                    password: self.password.as_deref(),
-                    file_comment: entry.file_comment.as_deref(),
-                },
-                options,
-                comment,
-                volume_size,
-                progress,
-            )
-        }
-    }
-
-    fn build_rar13_volumes(
-        &self,
-        volume_size: usize,
-        progress: Option<&dyn WriteProgress>,
-    ) -> Result<Vec<Vec<u8>>> {
-        let entry = self.single_volume_entry()?;
-        let options = self.rar13_options();
-        if self.store {
-            rar13::write_stored_volumes_with_progress(
-                rar13::StoredEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.times.mtime.unwrap_or(0),
-                    file_attr: entry.rar13_attr(),
-                    password: self.password.as_deref(),
-                    file_comment: entry.file_comment.as_deref(),
-                },
-                options,
-                volume_size,
-                progress,
-            )
-        } else {
-            rar13::write_compressed_volumes_with_progress(
-                rar13::FileEntry {
-                    name: &entry.name,
-                    data: &entry.data,
-                    file_time: entry.times.mtime.unwrap_or(0),
-                    file_attr: entry.rar13_attr(),
-                    password: self.password.as_deref(),
-                    file_comment: entry.file_comment.as_deref(),
-                },
-                options,
-                volume_size,
-                progress,
-            )
         }
     }
 }

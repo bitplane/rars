@@ -6,8 +6,10 @@ mod volumes;
 #[cfg(feature = "write")]
 pub(crate) mod write;
 #[cfg(feature = "write")]
+pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
+#[cfg(feature = "write")]
 pub(crate) use write::{
-    write_archive_with_sources, write_stored_volumes_with_progress, BorrowedFileEntry,
+    write_archive_with_sources, write_volumes_with_source_to, BorrowedFileEntry,
 };
 #[cfg(feature = "write")]
 pub use write::{
@@ -15,8 +17,8 @@ pub use write::{
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
     write_compressed_volumes_with_progress, write_stored_archive,
     write_stored_archive_with_comment, write_stored_volumes, write_streaming_archive_to,
-    EntrySource, FileEntry, MemberCoding, StoredEntry, StreamingEntry, WriterOptions,
-    WriterResources,
+    write_volumes_to, EntrySource, FileEntry, MemberCoding, StoredEntry, StreamingEntry,
+    WriterOptions, WriterResources,
 };
 
 use crate::codec::rar13::Reader15State;

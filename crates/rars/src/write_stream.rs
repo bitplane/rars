@@ -57,15 +57,7 @@ impl<'a> MemberBytes<'a> {
     /// The whole member, borrowed when the caller already had it.
     #[cfg(test)]
     pub(crate) fn load(&self) -> Result<Cow<'_, [u8]>> {
-        self.load_with_progress(None)
-    }
-
-    pub(crate) fn load_with_progress(
-        &self,
-        progress: Option<crate::write_progress::ProgressReporter<'_>>,
-    ) -> Result<Cow<'_, [u8]>> {
-        crate::write_progress::check_cancelled(progress)?;
-        self.load_exact_with_progress(self.len()?, progress)
+        self.load_exact_with_progress(self.len()?, None)
     }
 
     /// Use the source size already captured for the header and workspace.

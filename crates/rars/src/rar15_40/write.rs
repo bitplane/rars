@@ -23,7 +23,10 @@ use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::ControlFlow;
 
+#[cfg(test)]
+mod builder_path_tests;
 mod volumes;
+pub(crate) use volumes::write_retained_volumes_to;
 pub use volumes::{write_stored_volumes_to, write_volumes_to, write_volumes_with_comment_to};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,9 +481,15 @@ impl<'a> ArchiveOutput<'a> {
     }
 
     pub(crate) fn seekable(output: &'a mut dyn SeekWrite) -> Self {
+        // A test lowers the threshold on its own thread, so a member streams
+        // through the builder without coding 64 MiB in a debug build.
+        #[cfg(test)]
+        let stream_above = builder_path_tests::STREAM_ABOVE.get();
+        #[cfg(not(test))]
+        let stream_above = STREAM_MEMBERS_ABOVE;
         Self::Seekable {
             output,
-            stream_above: STREAM_MEMBERS_ABOVE,
+            stream_above,
         }
     }
 }
@@ -915,6 +924,7 @@ fn write_members_to(
                         &mut None,
                         unpacked_size,
                         admitted.permit,
+                        resources,
                         progress,
                     )
                     .map(Prepared::Coded),
@@ -1034,6 +1044,7 @@ fn admit_to_window(
 /// The two are separate questions: which engine compresses this content best,
 /// and which transform makes it easier to compress. They used to be one enum,
 /// which meant some combinations simply could not be asked for.
+#[allow(clippy::too_many_arguments)]
 fn encode_rar29_policy_filtered_payload(
     data: &[u8],
     policy: &FilterPolicy,
@@ -1042,6 +1053,7 @@ fn encode_rar29_policy_filtered_payload(
     lz_method: u8,
     ppmd_trial: bool,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     // An empty member is stored whatever was asked for. A filter over it is a
     // 0..0 range, which the codec refuses, so an archive holding one empty file
@@ -1081,7 +1093,7 @@ fn encode_rar29_policy_filtered_payload(
             encode_rar29_lz_member(data, options, lz_method, progress)
         }
         (Rar29Method::Lz, FilterPolicy::Auto) => encode_rar29_auto_filtered_member_with_progress(
-            data, options, lz_method, false, progress,
+            data, options, lz_method, false, progress, resources,
         ),
         (Rar29Method::Lz, FilterPolicy::Explicit(filter)) => Ok(EncodedPayload {
             data: with_codec_progress(progress, |report| {
@@ -1094,7 +1106,7 @@ fn encode_rar29_policy_filtered_payload(
             method: lz_method,
         }),
         (Rar29Method::Auto, FilterPolicy::Auto) => encode_rar29_auto_filtered_member_with_progress(
-            data, options, lz_method, ppmd_trial, progress,
+            data, options, lz_method, ppmd_trial, progress, resources,
         ),
         (Rar29Method::Auto, policy) => {
             let mut best = match policy {
@@ -1350,7 +1362,14 @@ fn encode_rar29_auto_filtered_member(
     lz_method: u8,
     include_ppmd: bool,
 ) -> Result<EncodedPayload> {
-    encode_rar29_auto_filtered_member_with_progress(data, options, lz_method, include_ppmd, None)
+    encode_rar29_auto_filtered_member_with_progress(
+        data,
+        options,
+        lz_method,
+        include_ppmd,
+        None,
+        None,
+    )
 }
 
 fn encode_rar29_auto_filtered_member_with_progress(
@@ -1359,6 +1378,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
     lz_method: u8,
     include_ppmd: bool,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     // The search measures the unfiltered member as one of its own candidates
     // and returns the winner's bytes, so encoding the member plainly here as
@@ -1377,22 +1397,21 @@ fn encode_rar29_auto_filtered_member_with_progress(
             // filter suits the member does not depend on how hard the parse
             // tries, and the lazy encode stays in hand in case it codes smaller.
             let lazy = options.with_optimal_parse_passes(0);
-            let mut last = 0usize;
-            let (filters, measured) = crate::filter_search::choose_filter(
+            // The member's own charge holds one finalist's encode. Each one
+            // encoded beside it is charged its own, and only while it runs.
+            let each = crate::codec::rar29::member_encode_workspace(data.len(), lazy);
+            let (filters, measured) = crate::filter_search::choose_filter_side_by_side(
                 &Rar29Search,
                 data,
                 lazy,
-                Some(&mut |event| match event {
-                    crate::filter_search::EncodeProgress::PassStarted => {
-                        last = 0;
+                Some(&|walked| {
+                    if walked == 0 {
                         !progress.is_some_and(WorkTracker::is_cancelled)
-                    }
-                    crate::filter_search::EncodeProgress::Advanced(position) => {
-                        let delta = position.saturating_sub(last);
-                        last = position;
-                        progress.is_none_or(|work| work.advance(delta as u64))
+                    } else {
+                        progress.is_none_or(|work| work.advance(walked as u64))
                     }
                 }),
+                &|| resources.and_then(|resources| resources.try_acquire(each)),
             )?;
             if options.optimal_parse_passes == 0 {
                 measured
@@ -1853,9 +1872,11 @@ fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) ->
     );
     let level = compression_method_for_level(options).saturating_sub(0x30);
     let ppmd_models = if rar29 && (ppmd_trial_pays(level) || options.method == Rar29Method::Ppmd) {
-        // A trial holds two models of one size at a time, and so does a chain
-        // coding against a copy of the model it keeps.
-        (2 * largest_ppmd_model(options)).saturating_add(
+        // A trial holds two models of one size at a time. A chain keeps its
+        // own beside two copies: a short member's escaped coding is kept
+        // while the same member codes again as literals.
+        let models = if options.features.solid { 3 } else { 2 };
+        (models * largest_ppmd_model(options)).saturating_add(
             crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
         )
     } else {
@@ -1930,6 +1951,7 @@ fn encode_member<'a>(
         solid_encoder,
         unpacked_size,
         permit,
+        resources,
         progress,
     )
 }
@@ -1961,6 +1983,7 @@ fn member_charge(
 
 /// [`encode_member`] once the member is measured and charged for. The charge
 /// goes with the coded member and is cut to what it holds once coding is done.
+#[allow(clippy::too_many_arguments)]
 fn encode_measured<'a>(
     member: &Member<'a>,
     options: WriterOptions,
@@ -1968,6 +1991,7 @@ fn encode_measured<'a>(
     solid_encoder: &mut Option<SolidEncoder>,
     unpacked_size: u64,
     mut held: Option<MemoryPermit>,
+    resources: &WriterResources,
     progress: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
     if member.is_directory {
@@ -2039,12 +2063,21 @@ fn encode_measured<'a>(
                 held,
             })
         }
-        MemberCoding::Compressed => {
-            encode_or_store_payload(&data, options, solid_encoder, Some(progress))?
-        }
-        MemberCoding::Filtered(policy) => {
-            encode_filtered_payload(&data, policy, options, solid_encoder, Some(progress))?
-        }
+        MemberCoding::Compressed => encode_or_store_payload(
+            &data,
+            options,
+            solid_encoder,
+            Some(progress),
+            Some(resources),
+        )?,
+        MemberCoding::Filtered(policy) => encode_filtered_payload(
+            &data,
+            policy,
+            options,
+            solid_encoder,
+            Some(progress),
+            Some(resources),
+        )?,
     };
     drop(data);
     let mut packed = payload.data;
@@ -3532,6 +3565,7 @@ fn encode_filtered_payload(
     options: WriterOptions,
     solid_encoder: &mut Option<SolidEncoder>,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     let lz_method = compression_method_for_level(options);
     // A named filter under forced PPMd is the one request the chain cannot
@@ -3553,6 +3587,7 @@ fn encode_filtered_payload(
                 lz_method,
                 ppmd_trial_pays(lz_method.saturating_sub(0x30)),
                 progress,
+                resources,
             )?;
             return stored_unless_smaller(data, payload, options, solid_encoder);
         }
@@ -3631,6 +3666,7 @@ fn encode_or_store_payload(
     options: WriterOptions,
     solid_encoder: &mut Option<SolidEncoder>,
     progress: Option<&WorkTracker<'_>>,
+    resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     let target = options.target;
     if options.compression_level == Some(0) {
@@ -3662,6 +3698,7 @@ fn encode_or_store_payload(
             lz_method,
             ppmd_trial_pays(lz_method.saturating_sub(0x30)),
             progress,
+            resources,
         )?;
         return stored_unless_smaller(data, payload, options, solid_encoder);
     }
@@ -4441,74 +4478,6 @@ fn dictionary_flags_for_target(target: ArchiveVersion) -> u16 {
     ((rar29_default_dictionary_size(target).trailing_zeros() - 16) as u16) << 5
 }
 
-fn report_volume(
-    progress: ProgressReporter<'_>,
-    index: usize,
-    total: usize,
-    bytes: usize,
-) -> Result<()> {
-    progress.report(WriteProgressEvent::VolumeFinished {
-        volume_index: index,
-        total_volumes: Some(total),
-        bytes: bytes as u64,
-    });
-    crate::write_progress::check_cancelled(Some(progress))
-}
-
-/// How many packed bytes fit in each volume of `volume_size` bytes.
-///
-/// Every volume repeats the same headers around its slice of the payload, and
-/// no header field grows as the slice shrinks, so measuring one volume around
-/// the largest slice any volume could hold gives an overhead that holds for
-/// all of them. RAR 1.3 volumes are framed the same way and share this.
-pub(crate) fn legacy_volume_payload(
-    volume_size: usize,
-    packed: &[u8],
-    render: impl Fn(&[u8]) -> Result<Vec<u8>>,
-) -> Result<usize> {
-    if volume_size == 0 {
-        return Err(Error::InvalidArgument("volume size must be non-zero"));
-    }
-    let probe = &packed[..packed.len().min(volume_size)];
-    let overhead = render(probe)?.len() - probe.len();
-    match volume_size.checked_sub(overhead) {
-        Some(payload) if payload > 0 => Ok(payload),
-        _ => Err(Error::InvalidArgument(
-            "volume size is too small to hold the volume headers",
-        )),
-    }
-}
-
-/// Cuts `packed` into `payload`-byte slices and renders a volume around each,
-/// checking that none came out longer than `volume_size`.
-pub(crate) fn render_legacy_volumes(
-    packed: &[u8],
-    payload: usize,
-    volume_size: usize,
-    progress: ProgressReporter<'_>,
-    render: impl Fn(usize, bool, &[u8]) -> Result<Vec<u8>>,
-) -> Result<Vec<Vec<u8>>> {
-    // Packing well enough to need only one volume is not an error. With one
-    // chunk neither split flag is set, so the member is an ordinary unsplit
-    // file inside a volume set of one, which is what WinRAR writes. Refusing
-    // it meant a fixed `--volume-size` in a script could start failing because
-    // compression improved, which is how it was found.
-    let chunks: Vec<&[u8]> = packed.chunks(payload).collect();
-    let mut volumes = Vec::with_capacity(chunks.len());
-    for (index, chunk) in chunks.iter().enumerate() {
-        crate::write_progress::check_cancelled(Some(progress))?;
-        let out = render(index, index + 1 < chunks.len(), chunk)?;
-        if out.len() > volume_size {
-            return Err(Error::WriterFailure(
-                "legacy volume came out longer than the volume size",
-            ));
-        }
-        report_volume(progress, index, chunks.len(), out.len())?;
-        volumes.push(out);
-    }
-    Ok(volumes)
-}
-
 fn write_header_crc(out: &mut [u8], start: usize) {
     let crc = (crc32(&out[start + 2..]) & 0xffff) as u16;
     out[start..start + 2].copy_from_slice(&crc.to_le_bytes());
@@ -4846,6 +4815,90 @@ mod tests {
         ));
         assert_eq!(callback.0.load(Ordering::Relaxed), 2);
         assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn finalists_run_side_by_side_only_in_room_the_budget_grants() {
+        use crate::atomic64::AtomicU64;
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        // Stereo 16-bit samples, so delta reaches the finalists beside the
+        // plain member, and long enough that the plain one runs beside the screens.
+        let mut data = Vec::with_capacity(1 << 20);
+        let mut noise = 0x2545_f491_u32;
+        for frame in 0..(1 << 18) {
+            for channel in 0..2 {
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                let wave = ((frame as f64 / (40.0 + 13.0 * channel as f64)).sin() * 12000.0) as i16;
+                data.extend_from_slice(&wave.wrapping_add((noise % 64) as i16).to_le_bytes());
+            }
+        }
+        let entry = super::FileEntry {
+            name: b"pcm",
+            data: &data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        };
+        let mut options =
+            super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
+        options.compression_level = Some(1);
+        let charge = super::member_workspace(options, data.len() as u64, true);
+        let lazy = super::rar29_encode_options_for_options(options)
+            .unwrap()
+            .with_optimal_parse_passes(0);
+        let pool = crate::parallel::private_pool(4);
+        let room = pool.install(|| crate::codec::rar29::member_encode_workspace(data.len(), lazy));
+        let encode = |limit: u64| {
+            let resources = crate::WriterResources::new(limit);
+            let peak = Arc::new(AtomicU64::new(0));
+            let watch = {
+                let (resources, peak) = (resources.clone(), peak.clone());
+                move |_: crate::WriteProgressEvent<'_>| {
+                    peak.fetch_max(resources.workspace_in_use(), Ordering::SeqCst);
+                }
+            };
+            let work = super::WorkTracker::new(
+                Some(super::ProgressReporter(&watch)),
+                crate::WriteOperation::Compression,
+                data.len() as u64,
+            );
+            let encoded = pool
+                .install(|| {
+                    super::encode_member(
+                        &super::Member::from_file(&entry),
+                        options,
+                        &crate::MemberCoding::Compressed,
+                        &mut None,
+                        &resources,
+                        &work,
+                    )
+                })
+                .unwrap();
+            assert_eq!(resources.workspace_in_use(), 0, "every room handed back");
+            let super::MemberPayload::Packed(packed) = encoded.payload else {
+                unreachable!("a member held in memory is packed in memory")
+            };
+            (packed, encoded.method, peak.load(Ordering::SeqCst))
+        };
+        // Room for nothing beside the member's own charge runs the finalists in turn.
+        let (in_turn, method, peak) = encode(charge);
+        assert_eq!(peak, charge);
+        assert_eq!(method, 0x31);
+        // Each encode beside the first is charged while it runs, and the
+        // finalists choose and code the same bytes however many run at once.
+        for (limit, most) in [(charge + room, charge + room), (u64::MAX, u64::MAX)] {
+            let (side_by_side, method, peak) = encode(limit);
+            assert!(side_by_side == in_turn, "limit {limit}");
+            assert_eq!(method, 0x31);
+            assert!(peak >= charge + room && peak <= most, "{peak} for {limit}");
+        }
     }
 
     fn binary_member(len: usize) -> Vec<u8> {
@@ -6069,12 +6122,14 @@ mod tests {
     #[test]
     fn a_member_whose_first_volume_does_not_compress_still_compresses_in_a_set() {
         // The noise fills the volume the member starts in, so it is all the member is judged by.
-        let mut mixed = noise(300_000);
+        // RAR 1.5 hands its packed bytes on a 1 MiB window at a time, so it needs more.
+        let mut mixed = noise(1_200_000);
         mixed.extend_from_slice(&word_text(1024 * 1024));
         let contents = [("mixed.bin", &mixed[..])];
         let (members, _) = counted_entries(&contents);
         let coding = || crate::MemberCoding::Compressed;
-        for options in [rar40(), rar20(3, false)] {
+        // RAR 1.5 grows noise by about 1% at level 3, past the margin RAR 2.0 on gets.
+        for options in [rar40(), rar20(3, false), rar15(3, false)] {
             let streamed =
                 volume_set(&members, options, coding(), 100_000, 256 * 1024, None).unwrap();
 
@@ -6091,7 +6146,11 @@ mod tests {
     fn an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin() {
         let noise = noise(1024 * 1024 + 7);
         let total = |set: &[Vec<u8>]| set.iter().map(Vec::len).sum::<usize>();
-        for options in [rar40(), rar20(3, false)] {
+        for (options, margin) in [
+            (rar40(), 128),
+            (rar20(3, false), 128),
+            (rar15(3, false), 48),
+        ] {
             // The noise starts with most of a volume, or a few bytes, to be judged by.
             for lead_len in [100, 99_800] {
                 let lead = super::tests::noise(lead_len);
@@ -6104,7 +6163,7 @@ mod tests {
                 let stored = set(crate::MemberCoding::Stored).unwrap();
                 let case = format!("{:?}, a {lead_len} byte lead", options.target);
                 assert!(
-                    total(&compressed) <= total(&stored) + noise.len() / 128,
+                    total(&compressed) <= total(&stored) + noise.len() / margin,
                     "{case}: {} bytes against {} stored",
                     total(&compressed),
                     total(&stored)
@@ -7464,6 +7523,7 @@ mod tests {
             0x35,
             true,
             None,
+            None,
         )
         .unwrap();
         let forced_ppmd = super::encode_rar29_policy_filtered_payload(
@@ -7473,6 +7533,7 @@ mod tests {
             EncodeOptions::default(),
             0x35,
             false,
+            None,
             None,
         )
         .unwrap();
@@ -7505,6 +7566,7 @@ mod tests {
             0x35,
             true,
             None,
+            None,
         )
         .unwrap();
         let plain_lz = super::encode_rar29_policy_filtered_payload(
@@ -7514,6 +7576,7 @@ mod tests {
             options,
             0x35,
             false,
+            None,
             None,
         )
         .unwrap();

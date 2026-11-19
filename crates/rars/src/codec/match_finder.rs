@@ -87,13 +87,29 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     /// More heads keep a long reach from crowding each chain with collisions.
     #[cfg(feature = "write")]
     pub(crate) fn for_reach(window: usize, reach: usize) -> Self {
-        // Heads follow the reach, not the window, so filling ahead offers the same candidates.
-        let hash_bits = reach
+        Self::build(window, Self::reach_hash_bits(reach), &Allowance::default())
+            .expect("unlimited finder allocation")
+    }
+
+    /// What [`MatchFinder::for_reach`] allocates for this window and reach.
+    #[cfg(feature = "write")]
+    pub(crate) fn bytes_for_reach(window: usize, reach: usize) -> u64 {
+        let links = window
+            .max(1)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX) as u64;
+        let heads = 1u64 << Self::reach_hash_bits(reach);
+        links.saturating_add(heads).saturating_mul(4)
+    }
+
+    /// Heads follow the reach, not the window, so filling ahead offers the same candidates.
+    #[cfg(feature = "write")]
+    fn reach_hash_bits(reach: usize) -> u32 {
+        reach
             .max(1)
             .next_power_of_two()
             .trailing_zeros()
-            .clamp(Self::HASH_BITS, 20);
-        Self::build(window, hash_bits, &Allowance::default()).expect("unlimited finder allocation")
+            .clamp(Self::HASH_BITS, 20)
     }
 }
 
@@ -968,6 +984,19 @@ mod tests {
         assert_eq!(heads(1 << 20), 1 << 20);
         assert_eq!(heads(4 << 20), 1 << 20);
         assert_eq!(MatchFinder::<4>::for_reach(1000, 1000).head.len(), 1 << 17);
+    }
+
+    #[test]
+    #[cfg(feature = "write")]
+    fn a_finder_for_a_reach_is_priced_at_what_it_allocates() {
+        for (window, reach) in [(1, 1), (1000, 1000), (5000, 4 << 20), (6 << 20, 4 << 20)] {
+            let finder = MatchFinder::<4>::for_reach(window, reach);
+            assert_eq!(
+                MatchFinder::<4>::bytes_for_reach(window, reach),
+                4 * (finder.head.len() + finder.prev.len()) as u64,
+                "window {window}, reach {reach}"
+            );
+        }
     }
 
     #[test]
