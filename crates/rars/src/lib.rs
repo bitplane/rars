@@ -1769,10 +1769,12 @@ impl ArchiveReader {
                     key_cache,
                 )?,
             )),
+            // The legacy parsers bound headers by the source length; RAR 5
+            // bounds them by the archive's own length, past any SFX prefix.
             ArchiveFamily::Rar50Plus => Ok(Archive::Rar50Plus(
                 rar50::Archive::parse_file_backed_cached(
                     &mut cursor,
-                    len,
+                    len.checked_sub(signature.offset).ok_or(Error::TooShort)?,
                     signature.offset,
                     source,
                     options,
