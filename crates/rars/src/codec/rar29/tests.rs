@@ -1255,6 +1255,199 @@ fn a_solid_follower_of_an_lz_member_ended_on_padding_keeps_its_tables() {
     );
 }
 
+/// The second member of the pending-filter tests: E8 operands an x86 filter
+/// would rewrite if it reached them.
+const PAST_THE_BOUNDARY: &[u8] =
+    b"MARKER-E8-\xe8\x10\x00\x00\x00-PAYLOAD-\xe8\x20\x00\x00\x00-END\n";
+
+/// An E8 record for `PAST_THE_BOUNDARY.len()` bytes `block_start` bytes ahead.
+fn e8_record_for_the_next_member(block_start: usize) -> Vec<u8> {
+    super::encode_vm_filter_record_inner(
+        super::VmFilterRecord {
+            block_start,
+            block_size: PAST_THE_BOUNDARY.len(),
+            init_regs: &[],
+            code: super::RAR3_E8_FILTER_BYTECODE,
+            global_data: &[],
+        },
+        0,
+        true,
+    )
+    .unwrap()
+}
+
+/// Every literal, the end of block and a filter record, with the tables kept
+/// across the member boundary.
+fn every_literal_levels() -> [u8; TABLE_COUNT] {
+    let mut levels = [0; TABLE_COUNT];
+    levels[..256].fill(9);
+    levels[256] = 2;
+    levels[257] = 2;
+    levels
+}
+
+/// Writes main-table symbols: a byte, the end of block or a filter record.
+enum LzSymbol<'a> {
+    Literals(&'a [u8]),
+    Filter(&'a [u8]),
+    EndOfFileKeepTables,
+}
+
+fn write_lz_symbols(bits: &mut BitWriter, symbols: &[LzSymbol<'_>]) {
+    let codes = canonical_codes(&every_literal_levels()[..MAIN_COUNT]);
+    let write = |bits: &mut BitWriter, symbol: usize| {
+        let code = codes[symbol].unwrap();
+        bits.write_bits(u32::from(code.code), code.len);
+    };
+    for symbol in symbols {
+        match symbol {
+            LzSymbol::Literals(literals) => {
+                for &literal in *literals {
+                    write(bits, literal.into());
+                }
+            }
+            LzSymbol::Filter(record) => {
+                write(bits, 257);
+                for &byte in *record {
+                    bits.write_bits(byte.into(), 8);
+                }
+            }
+            LzSymbol::EndOfFileKeepTables => {
+                write(bits, 256);
+                bits.write_bit(false);
+                bits.write_bit(false);
+            }
+        }
+    }
+}
+
+/// A solid member may declare a filter in its last tokens for bytes past its
+/// own end, which no encoder of ours writes. Filters never span members, so
+/// the record is read and its filter dropped: both members extract, the second
+/// untouched by the filter.
+#[test]
+fn a_filter_pending_at_the_end_of_a_solid_lz_member_does_not_reach_the_next() {
+    let first = b"benign first entry\n";
+    let mut filtered = PAST_THE_BOUNDARY.to_vec();
+    apply_standard_filter(StandardFilter::E8, &mut filtered, 0, &[0; 7]).unwrap();
+    assert_ne!(
+        filtered, PAST_THE_BOUNDARY,
+        "the filter must change the bytes"
+    );
+
+    let (last, head) = first.split_last().unwrap();
+    let after_last_byte = e8_record_for_the_next_member(0);
+    let before_last_byte = e8_record_for_the_next_member(1);
+    let layouts: [&[LzSymbol<'_>]; 2] = [
+        // The record follows the member's last byte, after its output is complete.
+        &[
+            LzSymbol::Literals(first),
+            LzSymbol::Filter(&after_last_byte),
+            LzSymbol::EndOfFileKeepTables,
+        ],
+        // The record precedes the last byte and starts just past it.
+        &[
+            LzSymbol::Literals(head),
+            LzSymbol::Filter(&before_last_byte),
+            LzSymbol::Literals(std::slice::from_ref(last)),
+            LzSymbol::EndOfFileKeepTables,
+        ],
+    ];
+    for (layout, symbols) in layouts.iter().enumerate() {
+        let tokens = encode_table_level_tokens(&every_literal_levels());
+        let mut packed_first = BitWriter::default();
+        write_table_description(&mut packed_first, &level_code_lengths(&tokens), &tokens);
+        write_lz_symbols(&mut packed_first, symbols);
+        let packed_first = packed_first.finish();
+        let mut packed_second = BitWriter::default();
+        write_lz_symbols(
+            &mut packed_second,
+            &[
+                LzSymbol::Literals(PAST_THE_BOUNDARY),
+                LzSymbol::EndOfFileKeepTables,
+            ],
+        );
+        let packed_second = packed_second.finish();
+
+        let mut whole = Unpack29::new();
+        assert_eq!(
+            whole.decode_member(&packed_first, first.len()).unwrap(),
+            first,
+            "layout {layout}"
+        );
+        assert_eq!(
+            whole
+                .decode_member(&packed_second, PAST_THE_BOUNDARY.len())
+                .unwrap(),
+            PAST_THE_BOUNDARY,
+            "layout {layout}"
+        );
+
+        let mut streamed = Unpack29::new();
+        let mut out = Vec::new();
+        streamed
+            .decode_member_from_reader(&mut &packed_first[..], first.len(), &mut out)
+            .unwrap();
+        assert_eq!(out, first, "layout {layout}");
+        out.clear();
+        streamed
+            .decode_member_from_reader(&mut &packed_second[..], PAST_THE_BOUNDARY.len(), &mut out)
+            .unwrap();
+        assert_eq!(out, PAST_THE_BOUNDARY, "layout {layout}");
+    }
+}
+
+/// The PPMd form of the test above: the record follows the last byte.
+#[test]
+fn a_filter_pending_at_the_end_of_a_solid_ppmd_member_does_not_reach_the_next() {
+    let first = b"benign first entry\n";
+    let mut packed_first = vec![
+        0x80 | 0x20 | ((PPMD_ORDER as u8) - 1),
+        PPMD_DICTIONARY_MB - 1,
+    ];
+    let mut encoder =
+        PpmdEncoder::new(PPMD_ORDER, PPMD_ESC, usize::from(PPMD_DICTIONARY_MB)).unwrap();
+    for &byte in first {
+        encoder.encode_literal(byte).unwrap();
+    }
+    encoder
+        .encode_vm_filter_record(&e8_record_for_the_next_member(0))
+        .unwrap();
+    let (block, model) = encoder.finish_keeping_model().unwrap();
+    packed_first.extend_from_slice(&block);
+    // The follower keeps the model, so its block header has no reset flag.
+    let mut packed_second = vec![0x80 | ((PPMD_ORDER as u8) - 1)];
+    let mut encoder = PpmdEncoder::continuing(model, PPMD_ESC);
+    for &byte in PAST_THE_BOUNDARY {
+        encoder.encode_literal(byte).unwrap();
+    }
+    packed_second.extend_from_slice(&encoder.finish_keeping_model().unwrap().0);
+
+    let mut whole = Unpack29::new();
+    assert_eq!(
+        whole.decode_member(&packed_first, first.len()).unwrap(),
+        first
+    );
+    assert_eq!(
+        whole
+            .decode_member(&packed_second, PAST_THE_BOUNDARY.len())
+            .unwrap(),
+        PAST_THE_BOUNDARY
+    );
+
+    let mut streamed = Unpack29::new();
+    let mut out = Vec::new();
+    streamed
+        .decode_member_from_reader(&mut &packed_first[..], first.len(), &mut out)
+        .unwrap();
+    assert_eq!(out, first);
+    out.clear();
+    streamed
+        .decode_member_from_reader(&mut &packed_second[..], PAST_THE_BOUNDARY.len(), &mut out)
+        .unwrap();
+    assert_eq!(out, PAST_THE_BOUNDARY);
+}
+
 #[test]
 fn an_lz_match_crossing_the_declared_size_truncates_and_keeps_the_overrun() {
     let first = b"repeated tail ".repeat(256);

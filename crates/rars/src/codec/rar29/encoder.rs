@@ -2968,8 +2968,16 @@ fn best_match_before<C: Candidates>(
     }
     let mut best = None;
     let mut checked = 0usize;
+    // A match shorter than four bytes is never taken, so a candidate that
+    // differs anywhere in the first four is not measured at all. On data with
+    // nothing to find that is nearly every candidate: the old offsets at every
+    // position, and the collisions every chain is made of.
+    let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
+    let shares_prefix = |candidate: usize| {
+        u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap()) == prefix
+    };
     for offset in state.old_offsets {
-        if offset == 0 || offset > max_offset {
+        if offset == 0 || offset > max_offset || !shares_prefix(pos - offset) {
             continue;
         }
         let length = match_length(input, pos, offset, max_length);
@@ -2992,7 +3000,7 @@ fn best_match_before<C: Candidates>(
         // A candidate can only improve on the current best when it matches at
         // least one byte past the best length, so probe that byte first.
         let best_length = best.map_or(0, |best: MatchCandidate| best.length);
-        if best_length == 0 || input[candidate + best_length] == input[pos + best_length] {
+        if input[candidate + best_length] == input[pos + best_length] && shares_prefix(candidate) {
             let length = match_length(input, pos, offset, max_length);
             consider_match_candidate(&mut best, state, length, offset);
         }

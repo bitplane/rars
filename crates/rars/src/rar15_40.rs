@@ -557,6 +557,7 @@ impl FileHeader {
             | Error::CannotSkipSolidMember
             | Error::BrokenSolidChain
             | Error::MemberOutputLimitExceeded { .. }
+            | Error::SolidSkipBudgetExceeded { .. }
             | Error::HeaderCountLimitExceeded { .. }
             | Error::HeaderBytesLimitExceeded { .. }
             | Error::TotalOutputLimitExceeded { .. }
@@ -1562,6 +1563,7 @@ impl Archive {
             let selected = crate::extraction_control::select(
                 &mut selector,
                 options,
+                &mut budget,
                 || crate::rar15_40_member(file),
                 solid,
             )?;

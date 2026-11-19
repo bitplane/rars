@@ -132,6 +132,12 @@ pub enum Error {
         limit: u64,
         required: u64,
     },
+    /// Skipped solid members, decoded only to be discarded, would need
+    /// `required` bytes in all, above `ArchiveReadOptions::solid_skip_budget`.
+    SolidSkipBudgetExceeded {
+        limit: u64,
+        required: u64,
+    },
     /// Cumulative top-level headers required; diagnostic sums saturate at u64::MAX.
     HeaderCountLimitExceeded {
         limit: u64,
@@ -295,6 +301,8 @@ impl std::fmt::Display for Error {
             },
             Self::MemberOutputLimitExceeded { limit, required } => write!(f,
                 "member requires {required} output bytes, above the configured limit of {limit} bytes"),
+            Self::SolidSkipBudgetExceeded { limit, required } => write!(f,
+                "skipping solid members requires decoding {required} bytes, above the solid skip budget of {limit} bytes"),
             Self::HeaderCountLimitExceeded { limit, required } => write!(f,
                 "parsing requires at least {required} headers, above the configured limit of {limit} headers"),
             Self::HeaderBytesLimitExceeded { limit, required } => write!(f,
@@ -506,6 +514,7 @@ impl Error {
             | Self::WriterPreparedHeaderLimitExceeded { .. }
             | Self::WriterPreparationLimitExceeded { .. }
             | Self::MemberOutputLimitExceeded { .. }
+            | Self::SolidSkipBudgetExceeded { .. }
             | Self::HeaderCountLimitExceeded { .. }
             | Self::HeaderBytesLimitExceeded { .. }
             | Self::TotalOutputLimitExceeded { .. }

@@ -6258,7 +6258,20 @@ mod tests {
             assert!(charge(ArchiveVersion::Rar15, level) >= 2 * size + index);
             assert!(charge(ArchiveVersion::Rar15, level) < 2 * size + index + (16 << 20));
         }
-        assert!(charge(ArchiveVersion::Rar29, 5) < 50 * size);
+        // RAR 2.9 holds the member, its packed form and its window, and level 5
+        // one shortest-path parse per block it parses at once: one per thread,
+        // up to sixteen. Pin one thread for the per-byte bound, so it holds on
+        // any machine.
+        let one = {
+            let _cap = crate::parallel::ThreadCap::set(Some(1));
+            charge(ArchiveVersion::Rar29, 5)
+        };
+        assert!(one < 50 * size, "{one}");
+        let parses = crate::parallel::threads().clamp(1, 16) as u64;
+        assert_eq!(
+            charge(ArchiveVersion::Rar29, 5) - one,
+            (parses - 1) * crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE
+        );
     }
 
     #[test]

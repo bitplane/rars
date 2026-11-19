@@ -440,6 +440,7 @@ fn screen_kinds<S: OwnedSearch>(
     // something else and keeps the two-encode path.
     let measures_the_member = sample.len() == data.len() && screen_options == options;
     let baseline = search.encode_plain(sample, screen_options, None)?;
+    let mut sampled = Buffer::new(search.allowance());
     for kind in search.screened_kinds(data)? {
         let filters = [FilterSpec::whole(kind)];
         let packed = if measures_the_member {
@@ -459,11 +460,32 @@ fn screen_kinds<S: OwnedSearch>(
             // The screen measured the transform, not the encode the writer
             // would emit, so this is evidence for a finalist rather than a
             // measurement the search can reuse.
-            outcome.kinds.try_push(ScreenedKind {
-                kind,
-                measured: None,
-                worth_a_range,
-            })?;
+            sampled.try_push((
+                ScreenedKind {
+                    kind,
+                    measured: None,
+                    worth_a_range,
+                },
+                packed.len(),
+            ))?;
+        }
+    }
+    // A kind the sample shows losing to another by the same margin it has to
+    // beat the plain member by is not worth a whole-member encode either. On
+    // 16-bit stereo audio delta 2 and delta 4 both clear the screen, and delta
+    // 2 then cost two whole encodes, its own and its ranged one, to come out
+    // 6% behind delta 4 as the sample already said it would.
+    //
+    // Only when the screen ran at the finalists' own settings. A screen at
+    // reduced effort, as RAR 2.9 runs above its lowest level, is fit to say
+    // whether a kind helps at all but not which of two helps more: on a few
+    // hundred bytes of stereo samples it ranked another kind 1% ahead of the
+    // delta that won the real encode.
+    let ranks = screen_options == options;
+    let best = sampled.iter().map(|&(_, packed)| packed).min();
+    for (kind, packed) in sampled {
+        if !ranks || best.is_none_or(|best| !screen_wins(best, packed)) {
+            outcome.kinds.try_push(kind)?;
         }
     }
     if measures_the_member {
@@ -974,6 +996,28 @@ fn finalists<S: OwnedSearch>(
         }
     }
 
+    // The table scanner can find a table the length of the member, and then
+    // offers the same filter over the same bytes as a screened kind does,
+    // ranged where the other is whole. That is one transform encoded twice.
+    // Keep the first of each: a later equal one could only tie, and a tie
+    // never displaces the first.
+    let member = 0..data.len();
+    let same = |left: &[FilterSpec], right: &[FilterSpec]| {
+        left.len() == right.len()
+            && left.iter().zip(right).all(|(left, right)| {
+                left.kind == right.kind
+                    && left.range.as_ref().unwrap_or(&member)
+                        == right.range.as_ref().unwrap_or(&member)
+            })
+    };
+    let mut kept: Buffer<Finalist<S::Memory>, S::Memory> = Buffer::new(allowance);
+    for (specs, measured) in finalists {
+        if kept.iter().any(|(earlier, _)| same(earlier, &specs)) {
+            continue;
+        }
+        kept.try_push((specs, measured))?;
+    }
+    let finalists = kept;
     Ok(finalists)
 }
 
@@ -1419,6 +1463,95 @@ mod tests {
         })
         .take(len)
         .collect()
+    }
+
+    /// Two channels of 16-bit samples, a slow wave each with a little noise.
+    /// Delta at width 4 takes each channel's sample from the last; width 2
+    /// helps too, but less.
+    fn stereo_samples(len: usize) -> Vec<u8> {
+        let mut noise = 0x2545_f491u32;
+        let mut data = Vec::with_capacity(len + 4);
+        let mut phase = 0f64;
+        while data.len() < len {
+            phase += 0.013;
+            for (scale, rate) in [(12_000.0, 1.0), (9_000.0, 1.5)] {
+                noise = noise.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let jitter = f64::from((noise >> 24) as u8) - 128.0;
+                let sample = (scale * (phase * rate).sin() + jitter) as i16;
+                data.extend_from_slice(&sample.to_le_bytes());
+            }
+        }
+        data.truncate(len);
+        data
+    }
+
+    fn finalist_specs(search: &TestSearch, data: &[u8]) -> Vec<Vec<FilterSpec>> {
+        super::finalists(
+            &UnlimitedSearch(search, Allowance::default()),
+            data,
+            options(),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|(specs, _)| specs.into_vec())
+        .collect()
+    }
+
+    /// A screen at the finalists' own settings ranks the kinds as they will
+    /// be measured, so one that loses by the margin is not encoded whole.
+    /// Nor is the same filter twice, once whole from the screen and once over
+    /// the whole member from the table scanner.
+    #[test]
+    fn only_kinds_the_screen_cannot_rank_apart_are_encoded_whole() {
+        let data = stereo_samples(SCREEN_SAMPLE_LEN * 2);
+        let finalists = finalist_specs(&FULL, &data);
+        let member = 0..data.len();
+        let widths: Vec<usize> = finalists
+            .iter()
+            .flatten()
+            .filter_map(|spec| match spec.kind {
+                FilterKind::Delta { channels } => Some(channels),
+                _ => None,
+            })
+            .collect();
+        assert!(widths.contains(&4), "{finalists:?}");
+        assert!(
+            !widths.contains(&2),
+            "delta 2 lost on the sample: {finalists:?}"
+        );
+        for (index, specs) in finalists.iter().enumerate() {
+            for later in &finalists[index + 1..] {
+                let effective = |specs: &[FilterSpec]| {
+                    specs
+                        .iter()
+                        .map(|spec| (spec.kind, spec.range.clone().unwrap_or(member.clone())))
+                        .collect::<Vec<_>>()
+                };
+                assert_ne!(effective(specs), effective(later), "{finalists:?}");
+            }
+        }
+        let (specs, _) = choose_filter(&FULL, &data, options(), None).unwrap();
+        assert!(
+            specs
+                .iter()
+                .all(|spec| spec.kind == FilterKind::Delta { channels: 4 }),
+            "{specs:?}"
+        );
+
+        // A screen at reduced effort can tell a kind helps, not which of two
+        // helps more, so both stay.
+        let cheap = TestSearch {
+            cheap_screens: true,
+        };
+        let widths: Vec<usize> = finalist_specs(&cheap, &data)
+            .iter()
+            .flatten()
+            .filter_map(|spec| match spec.kind {
+                FilterKind::Delta { channels } => Some(channels),
+                _ => None,
+            })
+            .collect();
+        assert!(widths.contains(&2) && widths.contains(&4), "{widths:?}");
     }
 
     #[test]
