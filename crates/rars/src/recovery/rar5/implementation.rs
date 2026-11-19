@@ -1330,6 +1330,28 @@ fn rebuild_inline_recovery_record_with_control(
     control: &crate::read_control::ReadControl,
 ) -> Result<Vec<u8>> {
     check_repair(control)?;
+    admit_record_rebuild(plan, input.len() as u64)?;
+    let rebuilt = build_inline_recovery_data_for_plan_with_control(repaired_prefix, plan, control)?;
+    if rebuilt.len() != record.len() {
+        return Err(Error::BadRecoveryChunk);
+    }
+    // record.start came from a parsed chunk within input, and the prefix
+    // boundary was checked above.
+    let gap = &input[repaired_prefix.len()..record.start];
+    let mut out = Vec::with_capacity(input.len().max(record.end));
+    out.extend_from_slice(repaired_prefix);
+    out.extend_from_slice(gap);
+    out.extend_from_slice(&rebuilt);
+    if let Some(tail) = input.get(record.end..) {
+        out.extend_from_slice(tail);
+    }
+    Ok(out)
+}
+
+/// Whether rebuilding a record of this geometry fits the repair workspace,
+/// scaled by an archive of `input_len` bytes. The in-memory rebuild and the
+/// streamed one both ask, so they refuse the same records.
+fn admit_record_rebuild(plan: InlineRecoveryPlan, input_len: u64) -> Result<()> {
     let parity_bytes = plan
         .recovery_shards
         .checked_mul(plan.group_count)
@@ -1351,23 +1373,110 @@ fn rebuild_inline_recovery_record_with_control(
             plan.group_count.max(1).min(RECOVERY_IO_BLOCK as u64),
             plan.header_size,
         ])?,
-        input.len() as u64,
+        input_len,
+    )
+}
+
+/// Where a recovery record lies within the chunks that hold it, found as the
+/// whole-archive repair finds them.
+pub(crate) struct RecordLayout {
+    pub(crate) plan: InlineRecoveryPlan,
+    pub(crate) protected_size: usize,
+    /// The record's payload, relative to the start of the chunks searched.
+    pub(crate) record: std::ops::Range<usize>,
+    /// The chunks belonging to the record, as the prefix repair takes them.
+    pub(crate) recovery_data: Vec<u8>,
+    pub(crate) available: u64,
+}
+
+/// Lays out the record in `chunks`, a recovery service's stored payload,
+/// choosing chunks as [`repair_inline_recovery_archive_with_report`] does.
+pub(crate) fn record_layout(
+    chunks: &[u8],
+    control: &crate::read_control::ReadControl,
+) -> Result<RecordLayout> {
+    let found = select_record_chunks(
+        find_inline_recovery_chunks_with_control(chunks, control)?,
+        None,
     )?;
-    let rebuilt = build_inline_recovery_data_for_plan_with_control(repaired_prefix, plan, control)?;
-    if rebuilt.len() != record.len() {
-        return Err(Error::BadRecoveryChunk);
+    let first = found.first().ok_or(Error::BadRecoveryChunk)?;
+    let plan = first.chunk.plan;
+    let protected_size =
+        usize::try_from(first.chunk.protected_size).map_err(|_| Error::PlanOverflow)?;
+    let mut recovery_data = Vec::new();
+    for chunk in &found {
+        check_repair(control)?;
+        append_inline_recovery_chunk(chunks, chunk, &mut recovery_data);
     }
-    // record.start came from a parsed chunk within input, and the prefix
-    // boundary was checked above.
-    let gap = &input[repaired_prefix.len()..record.start];
-    let mut out = Vec::with_capacity(input.len().max(record.end));
-    out.extend_from_slice(repaired_prefix);
-    out.extend_from_slice(gap);
-    out.extend_from_slice(&rebuilt);
-    if let Some(tail) = input.get(record.end..) {
-        out.extend_from_slice(tail);
-    }
-    Ok(out)
+    let mut indices = found
+        .iter()
+        .map(|chunk| chunk.chunk.shard_index)
+        .collect::<Vec<_>>();
+    indices.sort_unstable();
+    indices.dedup();
+    let start = found
+        .iter()
+        .filter_map(|chunk| {
+            let distance = chunk
+                .chunk
+                .shard_index
+                .checked_mul(plan.shard_size as usize)?;
+            chunk.offset.checked_sub(distance)
+        })
+        .min()
+        .ok_or(Error::BadRecoveryChunk)?;
+    let payload_len = usize::try_from(plan.payload_size()?).map_err(|_| Error::PlanOverflow)?;
+    let end = start.checked_add(payload_len).ok_or(Error::PlanOverflow)?;
+    Ok(RecordLayout {
+        plan,
+        protected_size,
+        record: start..end,
+        recovery_data,
+        available: indices.len() as u64,
+    })
+}
+
+/// Whether [`write_rebuilt_record`] can rebuild this record for a prefix of
+/// `body_len` bytes in an archive of `input_len`, decided before anything is
+/// written: the workspace the in-memory rebuild is admitted to, and the
+/// geometry the streamed builder checks.
+pub(crate) fn record_rebuild_admitted(
+    plan: InlineRecoveryPlan,
+    body_len: u64,
+    input_len: u64,
+) -> bool {
+    admit_record_rebuild(plan, input_len).is_ok()
+        && plan
+            .data_shards
+            .checked_mul(8)
+            .and_then(|bytes| RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE.checked_add(bytes))
+            == Some(plan.header_size)
+        && plan.header_size.checked_add(plan.group_count) == Some(plan.shard_size)
+        && u32::try_from(plan.shard_size).is_ok()
+        && u16::try_from(plan.data_shards).is_ok()
+        && u16::try_from(plan.recovery_shards).is_ok()
+        && body_len <= plan.group_count.saturating_mul(plan.data_shards)
+}
+
+/// Writes the record rebuilt from `body`, the repaired protected prefix, read
+/// once. Parity is held, the prefix is not.
+pub(crate) fn write_rebuilt_record(
+    body: &mut dyn ReadSeek,
+    body_len: u64,
+    plan: InlineRecoveryPlan,
+    sink: &mut dyn std::io::Write,
+) -> Result<()> {
+    build_streamed_inline_recovery_for_plan(
+        body,
+        body_len,
+        plan,
+        RecoveryMemoryMode::Resident,
+        None,
+        sink,
+        None,
+        0,
+    )
+    .map(drop)
 }
 
 /// Narrows found chunks down to the ones belonging to this archive's own
