@@ -3690,9 +3690,16 @@ struct FileRecord<'a> {
 
 fn write_file_header(out: &mut Vec<u8>, record: &FileRecord<'_>) -> Result<()> {
     let start = out.len();
+    // A streamed member's header goes out before its packed size is known and
+    // must keep its length when patched. Cipher padding can take an encrypted
+    // RAR 2.0 member just under 4 GiB past `u32::MAX` once stored, so it takes
+    // the high fields from the unpacked size alone.
+    let sealed_past_short = record.flags & FHD_PASSWORD != 0
+        && (record.unpacked_size.saturating_add(15) & !15) > MAX_SHORT_SIZE;
     let large = record.packed_size > MAX_SHORT_SIZE
         || record.unpacked_size > MAX_SHORT_SIZE
-        || (record.target == ArchiveVersion::Rar20 && record.unpacked_size >= RAR20_LARGE_FROM)
+        || (record.target == ArchiveVersion::Rar20
+            && (record.unpacked_size >= RAR20_LARGE_FROM || sealed_past_short))
         || (matches!(
             record.target,
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
@@ -5536,6 +5543,55 @@ mod tests {
             let stored = file_header_of_sizes(target, size, size.next_multiple_of(16), None);
             assert_eq!(compressed.len(), stored.len(), "{target}");
         }
+    }
+
+    #[test]
+    fn an_encrypted_rar20_member_near_4_gib_keeps_its_header_length_when_patched() {
+        let header = |unpacked: u64, packed: u64| {
+            let mut header = Vec::new();
+            super::write_file_header(
+                &mut header,
+                &super::FileRecord {
+                    head_type: super::FILE_HEAD,
+                    name: b"big.bin",
+                    unpacked_size: unpacked,
+                    file_crc: 0,
+                    packed_size: packed,
+                    file_time: 0,
+                    file_attr: 0x20,
+                    host_os: 0,
+                    target: ArchiveVersion::Rar20,
+                    method: 0x33,
+                    dictionary_flags: 0,
+                    flags: super::writer_file_flags(Some(b"secret"), None, false),
+                    salt: None,
+                    extra: &[],
+                },
+            )
+            .unwrap();
+            header
+        };
+        let large = |header: &[u8]| u16::from_le_bytes([header[3], header[4]]) & 0x0100 != 0;
+        let max = u64::from(u32::MAX);
+
+        // Begun with no packed size, then patched with a padded compressed or stored one.
+        for size in max - 20..max {
+            let begun = header(size, 0);
+            for packed in [(size - 1).next_multiple_of(16), size.next_multiple_of(16)] {
+                assert_eq!(header(size, packed).len(), begun.len(), "{size}: {packed}");
+            }
+            assert_eq!(large(&begun), size.next_multiple_of(16) > max, "{size}");
+        }
+        assert!(!large(&header(max - 15, 0)));
+        assert!(large(&header(max - 14, 0)));
+
+        // Unencrypted, nothing pads, so the short fields last up to `u32::MAX - 1`.
+        assert!(!large(&file_header_of_sizes(
+            ArchiveVersion::Rar20,
+            max - 1,
+            max - 1,
+            None
+        )));
     }
 
     #[test]
