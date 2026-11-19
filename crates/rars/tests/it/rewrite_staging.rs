@@ -1,0 +1,935 @@
+use rars::atomic64::AtomicU64;
+use rars::{
+    ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error, ErrorKind,
+    ExtractionDecision, RewriteStaging,
+};
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::sync::{atomic::Ordering, Arc};
+
+use crate::scratch;
+
+#[test]
+fn staging_finished_events_require_verified_payloads() {
+    use rars::{WriteOperation, WriteProgressEvent};
+    use std::sync::Mutex;
+    let root = scratch::case("rewrite-progress-integrity");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"fault".to_vec(), b"fault payload".to_vec(), None, None)
+        .unwrap();
+    let mut bytes = builder.to_bytes().unwrap();
+    let offset = bytes
+        .windows(13)
+        .position(|bytes| bytes == b"fault payload")
+        .unwrap();
+    bytes[offset] ^= 1;
+    let archive = ArchiveReader::read_owned(bytes).unwrap();
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    let recorded = finished.clone();
+    let progress = Arc::new(move |event: WriteProgressEvent<'_>| match event {
+        WriteProgressEvent::EntryFinished {
+            operation: WriteOperation::Staging,
+            name,
+            ..
+        } => {
+            recorded.lock().unwrap().push(name.to_vec());
+        }
+        WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Staging,
+            ..
+        } => {
+            panic!("failed staging must not finish");
+        }
+        _ => {}
+    });
+    let error = archive
+        .stage_rewrite_sources_with_progress(
+            &[0, 1],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 26,
+            },
+            Some(progress),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ChecksumMismatch);
+    assert_eq!(*finished.lock().unwrap(), vec![b"first".to_vec()]);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn staging_finishes_selected_member_before_a_trailing_archive_member() {
+    use rars::{WriteOperation, WriteProgressEvent};
+    use std::sync::Mutex;
+
+    let root = scratch::case("rewrite-progress-trailing");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    for name in [b"selected".as_slice(), b"trailing".as_slice()] {
+        builder
+            .add_bytes(name.to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let recorded = events.clone();
+    let progress = Arc::new(move |event: WriteProgressEvent<'_>| match event {
+        WriteProgressEvent::EntryFinished {
+            operation: WriteOperation::Staging,
+            name,
+            ..
+        } => recorded.lock().unwrap().push(name.to_vec()),
+        WriteProgressEvent::OperationFinished {
+            operation: WriteOperation::Staging,
+            ..
+        } => recorded.lock().unwrap().push(b"finished".to_vec()),
+        _ => {}
+    });
+    let sources = archive
+        .stage_rewrite_sources_with_progress(
+            &[0],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 7,
+            },
+            Some(progress),
+        )
+        .unwrap();
+    assert_eq!(
+        &*events.lock().unwrap(),
+        &[b"selected".to_vec(), b"finished".to_vec()]
+    );
+    assert_eq!(sources.len(), 1);
+}
+
+#[test]
+fn staging_progress_cancellation_prevents_source_creation() {
+    use rars::{WriteProgress, WriteProgressEvent};
+    use std::sync::atomic::AtomicBool;
+
+    struct CancelAtStart {
+        cancelled: AtomicBool,
+        cancel_on_report: bool,
+    }
+    impl WriteProgress for CancelAtStart {
+        fn report(&self, _: WriteProgressEvent<'_>) {
+            if self.cancel_on_report {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+        }
+        fn is_cancelled(&self) -> bool {
+            self.cancelled.load(Ordering::SeqCst)
+        }
+    }
+
+    let root = scratch::case("rewrite-progress-cancel");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 7,
+    };
+    for cancel_on_report in [false, true] {
+        let progress: Arc<dyn WriteProgress> = Arc::new(CancelAtStart {
+            cancelled: AtomicBool::new(!cancel_on_report),
+            cancel_on_report,
+        });
+        assert_eq!(
+            archive
+                .stage_rewrite_sources_with_progress(
+                    &[0],
+                    ArchiveReadOptions::default(),
+                    &staging,
+                    Some(progress),
+                )
+                .unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}
+
+struct Counted {
+    data: Cursor<Vec<u8>>,
+    count: Arc<AtomicU64>,
+}
+
+impl Read for Counted {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.data.read(bytes)?;
+        self.count.fetch_add(read as u64, Ordering::Relaxed);
+        Ok(read)
+    }
+}
+
+impl Seek for Counted {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.data.seek(from)
+    }
+}
+
+#[test]
+fn solid_staging_reads_once_and_reopens_without_touching_archive() {
+    let root = scratch::case("rewrite-once");
+    for format in ArchiveVersion::ALL {
+        let mut builder = Builder::new(format).solid(true);
+        for index in 0..3 {
+            builder
+                .add_bytes(
+                    format!("file{index}").into_bytes(),
+                    vec![b'a' + index; 2048],
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        let count = Arc::new(AtomicU64::new(0));
+        let archive = ArchiveReader::read_reader(Counted {
+            data: Cursor::new(builder.to_bytes().unwrap()),
+            count: count.clone(),
+        })
+        .unwrap();
+        count.store(0, Ordering::Relaxed);
+        archive
+            .extract_with_control(ArchiveReadOptions::default(), |_| {
+                Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+            })
+            .unwrap();
+        let one_pass = count.swap(0, Ordering::Relaxed);
+        let sources = archive
+            .stage_rewrite_sources(
+                &[2, 0],
+                ArchiveReadOptions::default(),
+                &RewriteStaging {
+                    directory: root.to_path_buf(),
+                    max_staged_bytes: 4096,
+                },
+            )
+            .unwrap();
+        assert_eq!(count.load(Ordering::Relaxed), one_pass, "{format}");
+        for _ in 0..2 {
+            for (source, expected) in sources.iter().zip(*b"ca") {
+                let mut data = Vec::new();
+                source.open().unwrap().read_to_end(&mut data).unwrap();
+                assert_eq!(data, vec![expected; 2048]);
+            }
+        }
+        assert_eq!(count.load(Ordering::Relaxed), one_pass);
+        drop(sources);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn sources_and_independent_readers_own_the_staged_files() {
+    let root = scratch::case("rewrite-lifetime");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"abcdef".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let sources = archive
+        .stage_rewrite_sources(
+            &[0],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 6,
+            },
+        )
+        .unwrap();
+    let clone = sources[0].clone();
+    let mut a = clone.open().unwrap();
+    let mut b = clone.open().unwrap();
+    a.seek(SeekFrom::Start(3)).unwrap();
+    drop(sources);
+    drop(clone);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    let mut data = Vec::new();
+    a.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"def");
+    data.clear();
+    b.read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"abcdef");
+    drop(a);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    drop(b);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn encrypted_sources_require_password_and_respect_cancellation() {
+    let root = scratch::case("rewrite-password");
+    for format in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+        ArchiveVersion::Rar70,
+    ] {
+        let mut builder = Builder::new(format)
+            .store(true)
+            .password(Some(b"secret".to_vec()));
+        builder
+            .add_bytes(b"file".to_vec(), b"secret content".to_vec(), None, None)
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let staging = RewriteStaging {
+            directory: root.to_path_buf(),
+            max_staged_bytes: 14,
+        };
+        assert!(archive
+            .stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging)
+            .is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let options = ArchiveReadOptions::with_password(b"secret");
+        let sources = archive
+            .stage_rewrite_sources(&[0], options, &staging)
+            .unwrap();
+        let mut data = Vec::new();
+        sources[0].open().unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"secret content");
+        drop(sources);
+        let token = rars::ReadCancellation::new();
+        token.cancel();
+        assert_eq!(
+            archive
+                .stage_rewrite_sources(&[0], options.with_cancellation(&token), &staging)
+                .unwrap_err(),
+            Error::Cancelled
+        );
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn admission_fails_before_io_and_indices_include_directories() {
+    let root = scratch::case("rewrite-admission");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+    builder
+        .add_bytes(b"file".to_vec(), b"abc".to_vec(), None, None)
+        .unwrap();
+    let count = Arc::new(AtomicU64::new(0));
+    let archive = ArchiveReader::read_reader(Counted {
+        data: Cursor::new(builder.to_bytes().unwrap()),
+        count: count.clone(),
+    })
+    .unwrap();
+    count.store(0, Ordering::Relaxed);
+    let staging = RewriteStaging {
+        directory: root.join("does-not-exist"),
+        max_staged_bytes: 2,
+    };
+    assert!(matches!(
+        archive.stage_rewrite_sources(&[1], ArchiveReadOptions::default(), &staging),
+        Err(Error::RewriteStagingLimitExceeded {
+            limit: 2,
+            required: 3
+        })
+    ));
+    assert!(matches!(
+        archive.stage_rewrite_sources(&[1, 1], ArchiveReadOptions::default(), &staging),
+        Err(Error::DuplicateEntry)
+    ));
+    assert!(matches!(
+        archive.stage_rewrite_sources(&[2], ArchiveReadOptions::default(), &staging),
+        Err(Error::EntryNotFound)
+    ));
+    assert!(matches!(
+        archive.stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(archive
+        .stage_rewrite_sources(&[], ArchiveReadOptions::default(), &staging)
+        .unwrap()
+        .is_empty());
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    let sources = archive
+        .stage_rewrite_sources(
+            &[1],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 3,
+            },
+        )
+        .unwrap();
+    let mut output = Builder::new(ArchiveVersion::Rar50).store(true);
+    output
+        .add_source(b"renamed".to_vec(), sources[0].clone(), None, None)
+        .unwrap();
+    let path = root.join("output.rar");
+    output.write_to_path(&path, None).unwrap();
+    let rewritten = ArchiveReader::read_owned(std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(
+        rewritten.read_member(b"renamed", None).unwrap().unwrap(),
+        b"abc"
+    );
+}
+
+#[test]
+fn staging_rejects_redirections_and_split_volume_fragments() {
+    let root = scratch::case("rewrite-special-admission");
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 1024,
+    };
+    let mut link = Builder::new(ArchiveVersion::Rar50).store(true);
+    link.add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(link.to_bytes().unwrap()).unwrap();
+    assert!(archive.members().next().unwrap().meta.is_redirection);
+    assert!(matches!(
+        archive.stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging),
+        Err(Error::InvalidArgument(_))
+    ));
+
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .volume_size(Some(512));
+    builder
+        .add_bytes(b"file".to_vec(), b"a split payload".repeat(64), None, None)
+        .unwrap();
+    let volumes = builder.build_volumes(None).unwrap();
+    assert!(volumes.len() >= 2);
+    for (index, bytes) in volumes.iter().take(2).enumerate() {
+        let archive = ArchiveReader::read_owned(bytes.clone()).unwrap();
+        let member = archive.members().next().unwrap();
+        assert!(if index == 0 {
+            member.meta.is_split_after
+        } else {
+            member.meta.is_split_before
+        });
+        assert!(matches!(
+            archive.stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging),
+            Err(Error::InvalidArgument(_))
+        ));
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn solid_staging_skips_directory_and_link_between_payload_dependencies() {
+    let root = scratch::case("rewrite-solid-special-dependencies");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).solid(true);
+    builder
+        .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+        .unwrap();
+    builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"first".to_vec(), false, None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"last".to_vec(), b"last payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let members: Vec<_> = archive.members().collect();
+    assert!(members[1].meta.is_directory);
+    assert!(members[2].meta.is_redirection);
+
+    let sources = archive
+        .stage_rewrite_sources(
+            &[3],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 64,
+            },
+        )
+        .unwrap();
+    let mut data = Vec::new();
+    sources[0].open().unwrap().read_to_end(&mut data).unwrap();
+    assert_eq!(data, b"last payload");
+    drop(sources);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn corrupt_dependencies_fail_cleanly_but_independent_omissions_are_skipped() {
+    let root = scratch::case("rewrite-corruption");
+    for solid in [false, true] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true).solid(solid);
+        for name in [b"first", b"fault", b"final"] {
+            builder
+                .add_bytes(name.to_vec(), name.repeat(5), None, None)
+                .unwrap();
+        }
+        let mut bytes = builder.to_bytes().unwrap();
+        let offset = bytes
+            .windows(25)
+            .position(|bytes| bytes == b"fault".repeat(5))
+            .unwrap();
+        bytes[offset] ^= 1;
+        let archive = ArchiveReader::read_owned(bytes).unwrap();
+        let staging = RewriteStaging {
+            directory: root.to_path_buf(),
+            max_staged_bytes: 75,
+        };
+        let error = archive
+            .stage_rewrite_sources(&[0, 1], ArchiveReadOptions::default(), &staging)
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::ChecksumMismatch);
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        let prefix = archive
+            .stage_rewrite_sources(&[0], ArchiveReadOptions::default(), &staging)
+            .unwrap();
+        drop(prefix);
+        let suffix = archive.stage_rewrite_sources(&[2], ArchiveReadOptions::default(), &staging);
+        if solid {
+            assert_eq!(suffix.unwrap_err().kind(), ErrorKind::ChecksumMismatch);
+        } else {
+            drop(suffix.unwrap());
+        }
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn incremental_legacy_sources_fit_staging_preparation_windows() {
+    let run = || {
+        let root = scratch::case("rewrite-incremental-legacy");
+        for sizes in [[2048, 2048, 2048], [512, 2048, 1024]] {
+            let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
+            for (index, size) in sizes.into_iter().enumerate() {
+                original
+                    .add_bytes(
+                        format!("f{index}").into_bytes(),
+                        vec![b'a' + index as u8; size],
+                        None,
+                        None,
+                    )
+                    .unwrap();
+            }
+            let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
+            for format in [
+                ArchiveVersion::Rar13,
+                ArchiveVersion::Rar14,
+                ArchiveVersion::Rar15,
+                ArchiveVersion::Rar20,
+                ArchiveVersion::Rar29,
+                ArchiveVersion::Rar30,
+                ArchiveVersion::Rar40,
+            ] {
+                for (store, solid, encrypted) in [
+                    (true, false, false),
+                    (false, false, false),
+                    (false, true, false),
+                    (true, false, true),
+                ] {
+                    if encrypted && !cfg!(feature = "encryption") {
+                        continue;
+                    }
+                    let password = encrypted.then_some(b"secret".as_slice());
+                    for max_staged_bytes in [2048, 4096] {
+                        let bytes = archive.with_rewrite_sources(&[0, 1, 2], ArchiveReadOptions::default(),
+                            &RewriteStaging { directory: root.to_path_buf(), max_staged_bytes }, None,
+                            |sources| {
+                                let mut output = Builder::new(format).store(store).solid(solid).password(password.map(<[u8]>::to_vec));
+                                for (index, source) in sources.into_iter().enumerate() {
+                                    output.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                                }
+                                output.to_bytes()
+                            }).unwrap_or_else(|error| panic!("{format:?} store={store} solid={solid} encrypted={encrypted} quota={max_staged_bytes}: {error}"));
+                        let output = ArchiveReader::read_owned(bytes).unwrap();
+                        for (index, size) in sizes.into_iter().enumerate() {
+                            assert_eq!(
+                                output.read_member_at(index, password).unwrap().unwrap(),
+                                vec![b'a' + index as u8; size]
+                            );
+                        }
+                        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+                    }
+                }
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap()
+        .install(run);
+    #[cfg(not(feature = "parallel"))]
+    run();
+}
+
+#[test]
+fn incremental_streaming_fallback_fits_one_payload_of_staging() {
+    let root = scratch::case("rewrite-incremental-stream");
+    let size = 2 * 1024 * 1024;
+    let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
+    for index in 0..3 {
+        original
+            .add_bytes(
+                format!("f{index}").into_bytes(),
+                vec![b'a' + index; size],
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
+    let bytes = archive
+        .with_rewrite_sources(
+            &[0, 1, 2],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: size as u64,
+            },
+            None,
+            |sources| {
+                let mut output = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
+                for (index, source) in sources.into_iter().enumerate() {
+                    output.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                }
+                let mut bytes = Vec::new();
+                output.write_to(
+                    &mut bytes,
+                    &rars::WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*root),
+                    None,
+                )?;
+                Ok(bytes)
+            },
+        )
+        .unwrap();
+    let output = ArchiveReader::read_owned(bytes).unwrap();
+    for index in 0..3 {
+        assert_eq!(
+            output.read_member_at(index, None).unwrap().unwrap(),
+            vec![b'a' + index as u8; size]
+        );
+    }
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_sources_decode_once_and_join_on_early_failure_or_panic() {
+    let root = scratch::case("rewrite-incremental-once");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).solid(true);
+    for index in 0..3 {
+        builder
+            .add_bytes(
+                format!("f{index}").into_bytes(),
+                vec![b'a' + index; 2048],
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let count = Arc::new(AtomicU64::new(0));
+    let archive = ArchiveReader::read_reader(Counted {
+        data: Cursor::new(builder.to_bytes().unwrap()),
+        count: count.clone(),
+    })
+    .unwrap();
+    count.store(0, Ordering::Relaxed);
+    archive
+        .extract_with_control(ArchiveReadOptions::default(), |_| {
+            Ok(ExtractionDecision::Extract(Box::new(std::io::sink())))
+        })
+        .unwrap();
+    let one_pass = count.swap(0, Ordering::Relaxed);
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 4096,
+    };
+    archive
+        .with_rewrite_sources(
+            &[2, 0],
+            ArchiveReadOptions::default(),
+            &staging,
+            None,
+            |sources| {
+                // Out-of-order requests retain required earlier payloads without replaying decoding.
+                for _ in 0..2 {
+                    for (source, byte) in sources.iter().zip(*b"ca") {
+                        let mut bytes = Vec::new();
+                        source.open()?.read_to_end(&mut bytes)?;
+                        assert_eq!(bytes, vec![byte; 2048]);
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), one_pass);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+    let token = rars::ReadCancellation::new();
+    let result: rars::Result<()> = archive.with_rewrite_sources(
+        &[0, 2],
+        ArchiveReadOptions::default().with_cancellation(&token),
+        &staging,
+        None,
+        |sources| {
+            let _reader = sources[0].open()?;
+            Err(Error::InvalidArgument("writer stopped"))
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(Error::InvalidArgument("writer stopped"))
+    ));
+    assert!(!token.is_cancelled());
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _: rars::Result<()> = archive.with_rewrite_sources(
+            &[0, 2],
+            ArchiveReadOptions::default(),
+            &staging,
+            None,
+            |sources| {
+                let _reader = sources[0].open()?;
+                panic!("writer panic");
+            },
+        );
+    }));
+    assert!(panic.is_err());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_decoder_callback_panic_wakes_the_consumer() {
+    let root = scratch::case("rewrite-decoder-panic");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let error = archive
+        .with_rewrite_sources(
+            &[0],
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 7,
+            },
+            Some(Arc::new(|_: rars::WriteProgressEvent<'_>| {
+                panic!("decoder callback")
+            })),
+            |sources| {
+                sources[0].open()?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        error,
+        Error::WriterFailure("rewrite decoder thread panicked")
+    );
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+}
+
+#[test]
+fn incremental_rewrites_match_eager_staging_bytes() {
+    let root = scratch::case("rewrite-incremental-bytes");
+    let mut input = Builder::new(ArchiveVersion::Rar50).store(true);
+    input
+        .add_bytes(
+            b"a".to_vec(),
+            b"compressible text\n".repeat(1000),
+            None,
+            None,
+        )
+        .unwrap();
+    input
+        .add_bytes(b"b".to_vec(), b"small".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(input.to_bytes().unwrap()).unwrap();
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: 20000,
+    };
+    for format in [
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+        ArchiveVersion::Rar70,
+    ] {
+        for solid in [false, true] {
+            let encode = |sources: Vec<rars::EntrySource>| {
+                let mut builder = Builder::new(format).solid(solid).compression_level(Some(1));
+                for (index, source) in sources.into_iter().enumerate() {
+                    builder.add_source(format!("f{index}").into_bytes(), source, None, None)?;
+                }
+                builder.to_bytes()
+            };
+            let eager = encode(
+                archive
+                    .stage_rewrite_sources(&[0, 1], ArchiveReadOptions::default(), &staging)
+                    .unwrap(),
+            )
+            .unwrap();
+            let incremental = archive
+                .with_rewrite_sources(
+                    &[0, 1],
+                    ArchiveReadOptions::default(),
+                    &staging,
+                    None,
+                    encode,
+                )
+                .unwrap();
+            assert_eq!(incremental, eager, "{format:?}, solid={solid}");
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+    }
+}
+
+fn stage_from_set(
+    first: &rars::Archive,
+    later: &[rars::Archive],
+    indices: &[usize],
+) -> Vec<Vec<u8>> {
+    let root = scratch::case("rewrite-volume-set");
+    first
+        .with_rewrite_sources_from_volumes(
+            later,
+            indices,
+            ArchiveReadOptions::default(),
+            &RewriteStaging {
+                directory: root.to_path_buf(),
+                max_staged_bytes: 1 << 24,
+            },
+            None,
+            |sources| {
+                sources
+                    .iter()
+                    .map(|source| {
+                        let mut data = Vec::new();
+                        source.open()?.read_to_end(&mut data)?;
+                        Ok(data)
+                    })
+                    .collect::<rars::Result<Vec<_>>>()
+            },
+        )
+        .unwrap()
+}
+
+#[test]
+fn volume_set_staging_follows_split_members_into_later_volumes() {
+    let mut state = 0x9e37_79b9u32;
+    let large: Vec<u8> = (0..20_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    for solid in [false, true] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .solid(solid)
+            .volume_size(Some(8192));
+        builder
+            .add_bytes(b"first".to_vec(), b"first payload".to_vec(), None, None)
+            .unwrap();
+        builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+        builder
+            .add_bytes(b"large".to_vec(), large.clone(), None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"last".to_vec(), b"last payload".to_vec(), None, None)
+            .unwrap();
+        let mut volumes = builder
+            .build_volumes(None)
+            .unwrap()
+            .into_iter()
+            .map(|bytes| ArchiveReader::read_owned(bytes).unwrap());
+        let first = volumes.next().unwrap();
+        let later: Vec<_> = volumes.collect();
+        assert!(later.len() >= 2);
+
+        let members = first.volume_set_members(&later).unwrap();
+        let names: Vec<_> = members.iter().map(|m| m.member.meta.name.clone()).collect();
+        assert_eq!(names, [&b"first"[..], b"dir", b"large", b"last"]);
+        assert_eq!(members[2].member.meta.unpacked_size, large.len() as u64);
+        assert_eq!(members[3].volume_index, later.len());
+
+        let staged = stage_from_set(&first, &later, &[3, 0, 2]);
+        assert_eq!(
+            staged,
+            [
+                b"last payload".to_vec(),
+                b"first payload".to_vec(),
+                large.clone()
+            ],
+            "solid={solid}"
+        );
+
+        let missing = first.volume_set_members(&later[..later.len() - 1]);
+        assert_eq!(*missing.unwrap_err().root_cause(), Error::MissingVolume);
+    }
+}
+
+#[test]
+fn volume_set_staging_matches_extraction_of_winrar_legacy_sets() {
+    let fixtures =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar15_40/rar300");
+    for names in [
+        &[
+            "multivol_newnaming_rar300.part01.rar",
+            "multivol_newnaming_rar300.part02.rar",
+        ][..],
+        &[
+            "compressed_multivol_prng_rar300.rar",
+            "compressed_multivol_prng_rar300.r00",
+            "compressed_multivol_prng_rar300.r01",
+            "compressed_multivol_prng_rar300.r02",
+            "compressed_multivol_prng_rar300.r03",
+        ],
+    ] {
+        let mut volumes = names
+            .iter()
+            .map(|name| ArchiveReader::read_path(fixtures.join(name)).unwrap());
+        let first = volumes.next().unwrap();
+        let later: Vec<_> = volumes.collect();
+        let members = first.volume_set_members(&later).unwrap();
+        assert!(
+            members.iter().any(|m| m.member.meta.is_split_after),
+            "{names:?}"
+        );
+
+        let expected = std::cell::RefCell::new(Vec::<Arc<std::sync::Mutex<Vec<u8>>>>::new());
+        first
+            .extract_with_volumes(
+                later.iter().cloned().map(Ok),
+                ArchiveReadOptions::default(),
+                |_| {
+                    let buffer = Arc::new(std::sync::Mutex::new(Vec::new()));
+                    expected.borrow_mut().push(buffer.clone());
+                    Ok(Box::new(Shared(buffer)))
+                },
+            )
+            .unwrap();
+        let expected: Vec<_> = expected
+            .into_inner()
+            .iter()
+            .map(|b| b.lock().unwrap().clone())
+            .collect();
+        let indices: Vec<_> = (0..members.len()).collect();
+        assert_eq!(
+            stage_from_set(&first, &later, &indices),
+            expected,
+            "{names:?}"
+        );
+    }
+}
+
+struct Shared(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Shared {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}

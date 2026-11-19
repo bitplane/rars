@@ -1,0 +1,509 @@
+use rars::{
+    ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind, ReadCancellation,
+};
+
+#[test]
+fn unix_symlinks_round_trip_without_resolving_targets() {
+    for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
+        for stored in [false, true] {
+            let mut builder = Builder::new(format).store(stored);
+            builder
+                .add_unix_symlink(
+                    b"link".to_vec(),
+                    b"../missing".to_vec(),
+                    false,
+                    Some(rars::Timestamp::from_unix_seconds(123)),
+                    Some(0o750),
+                )
+                .unwrap();
+            builder
+                .set_file_comment(b"link", Some(b"note".to_vec()))
+                .unwrap();
+            builder
+                .add_unix_symlink(
+                    b"directory-link".to_vec(),
+                    b"missing-dir".to_vec(),
+                    true,
+                    None,
+                    None,
+                )
+                .unwrap();
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            builder.rename(b"link", b"renamed".to_vec()).unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert!(archive.rewrite_preservation_issues().is_empty());
+            let members: Vec<_> = archive.members().collect();
+            assert_eq!(
+                members[0].unix_symlink().unwrap().target_name,
+                b"../missing"
+            );
+            assert_eq!(members[0].meta.file_attr, 0o120750);
+            assert_eq!(
+                members[0].meta.modification_time(),
+                Some(rars::Timestamp::from_unix_seconds(123))
+            );
+            assert_eq!(members[1].unix_symlink().unwrap().flags, 1);
+            assert!(!members[1].meta.is_directory);
+            assert_eq!(archive.read_member_at(0, None).unwrap(), None);
+            assert_eq!(
+                archive.read_member_at(2, None).unwrap().unwrap(),
+                b"payload"
+            );
+            assert_eq!(
+                archive.member_comment_at(0, None).unwrap(),
+                Some(b"note".to_vec())
+            );
+            assert_eq!(
+                archive.read_member(b"file", None).unwrap().unwrap(),
+                b"payload"
+            );
+        }
+    }
+}
+
+#[test]
+fn archive_redirection_retains_unix_symlink_attributes() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(
+        b"link".to_vec(),
+        b"missing".to_vec(),
+        false,
+        Some(rars::Timestamp::from_unix_seconds(123)),
+        Some(0o750),
+    )
+    .unwrap();
+    let source = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let member = source.members().next().unwrap();
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder.add_archive_redirection(&member).unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let link = archive.members().next().unwrap();
+    assert_eq!(link.unix_symlink().unwrap().target_name, b"missing");
+    assert_eq!(link.meta.host_os, Some(1));
+    assert_eq!(link.meta.file_attr, 0o120750);
+    assert_eq!(
+        link.meta.modification_time(),
+        Some(rars::Timestamp::from_unix_seconds(123))
+    );
+}
+
+#[test]
+fn unsupported_link_options_leave_entries_unchanged() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    for target in [b"".as_slice(), b"bad\0target", b"\xff"] {
+        assert!(builder
+            .add_unix_symlink(b"link".to_vec(), target.to_vec(), false, None, None)
+            .is_err());
+        assert!(builder.is_empty());
+    }
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    assert!(builder.set_dos_attributes(b"link", 0x20).is_err());
+    assert!(builder.volume_size(Some(4096)).build_volumes(None).is_err());
+    let mut volume = Builder::new(ArchiveVersion::Rar50).volume_size(Some(4096));
+    assert!(volume
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .is_err());
+    assert!(volume.is_empty());
+    let mut legacy = Builder::new(ArchiveVersion::Rar15);
+    assert!(legacy
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .is_err());
+    assert!(legacy.is_empty());
+}
+
+#[test]
+fn preflight_rejects_unsupported_redirections_and_inconsistent_link_headers() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let original = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    for damage in 0..6 {
+        let mut archive = original.clone();
+        let rars::Archive::Rar50Plus(a) = &mut archive else {
+            unreachable!()
+        };
+        let file = a
+            .blocks
+            .iter_mut()
+            .find_map(|block| match block {
+                rars::rar50::Block::File(file) => Some(file),
+                _ => None,
+            })
+            .unwrap();
+        match damage {
+            0 => file.redirection.as_mut().unwrap().redirection_type = 4,
+            1 => file.redirection.as_mut().unwrap().flags = 2,
+            2 => file.host_os = 0,
+            3 => file.attributes = 0o100644,
+            4 => file.unpacked_size = 1,
+            _ => file.file_flags |= 1,
+        }
+        assert!(archive.members().next().unwrap().unix_symlink().is_none());
+        assert!(!archive.rewrite_preservation_issues().is_empty());
+    }
+}
+
+#[test]
+fn zero_size_rar5_unix_link_header_preserves_its_target() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let mut source = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let rars::Archive::Rar50Plus(archive) = &mut source else {
+        unreachable!()
+    };
+    let file = archive
+        .blocks
+        .iter_mut()
+        .find_map(|block| match block {
+            rars::rar50::Block::File(file) => Some(file),
+            _ => None,
+        })
+        .unwrap();
+    file.unpacked_size = 0;
+
+    let member = source.members().next().unwrap();
+    assert_eq!(member.unix_symlink().unwrap().target_name, b"target");
+    assert!(source.rewrite_preservation_issues().is_empty());
+    let mut rewritten = source.preserving_builder(None).unwrap();
+    rewritten.add_archive_redirection(&member).unwrap();
+    let output = ArchiveReader::read_owned(rewritten.to_bytes().unwrap()).unwrap();
+    assert_eq!(
+        output
+            .members()
+            .next()
+            .unwrap()
+            .unix_symlink()
+            .unwrap()
+            .target_name,
+        b"target"
+    );
+}
+
+#[test]
+fn links_survive_solid_and_encrypted_output_and_unix_byte_mapping() {
+    for solid in [false, true] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .solid(solid)
+            .password(Some(b"secret".to_vec()));
+        let target = rars::filename::encode_rar50(b"native-\xff").into_owned();
+        builder
+            .add_unix_symlink(b"link".to_vec(), target.clone(), false, None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".repeat(100), None, None)
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let member = archive.members().next().unwrap();
+        assert_eq!(member.unix_symlink().unwrap().target_name, target);
+        assert_eq!(member.meta.unpacked_size, 8);
+        assert_eq!(
+            archive.read_member_at(1, Some(b"secret")).unwrap().unwrap(),
+            b"payload".repeat(100)
+        );
+    }
+}
+
+#[test]
+fn retains_windows_links_and_file_copy_records() {
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let seed = ArchiveReader::read_owned(seed.to_bytes().unwrap())
+        .unwrap()
+        .members()
+        .next()
+        .unwrap();
+    for kind in [2, 3, 4, 5] {
+        let mut member = seed.clone();
+        member.meta.host_os = Some(0);
+        member.meta.is_directory = kind == 3;
+        member.meta.file_attr = match kind {
+            2 => 0x400,
+            3 => 0x410,
+            _ => 0x20,
+        };
+        member.meta.unpacked_size = if kind >= 4 { 7 } else { 0 };
+        if let rars::ArchiveMemberDetail::Rar50Plus {
+            redirection: Some(link),
+            ..
+        } = &mut member.detail
+        {
+            link.redirection_type = kind;
+            link.flags = u64::from(kind == 3);
+        }
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(b"target".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder.add_archive_redirection(&member).unwrap();
+        let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(
+            output.rewrite_preservation_issues().is_empty(),
+            "{kind}: {:?}",
+            output.rewrite_preservation_issues()
+        );
+        let actual = output.members().nth(1).unwrap();
+        assert_eq!(
+            actual.supported_redirection(),
+            member.supported_redirection()
+        );
+        assert_eq!(actual.meta.unpacked_size, member.meta.unpacked_size);
+        assert_eq!(actual.meta.file_attr, member.meta.file_attr);
+        if kind >= 4 {
+            let mut broken = output.clone();
+            if let rars::Archive::Rar50Plus(archive) = &mut broken {
+                if let rars::rar50::Block::File(file) = archive
+                    .blocks
+                    .iter_mut()
+                    .filter(|block| matches!(block, rars::rar50::Block::File(_)))
+                    .nth(1)
+                    .unwrap()
+                {
+                    file.redirection.as_mut().unwrap().target_name = b"missing".to_vec();
+                }
+            }
+            assert!(
+                broken
+                    .rewrite_preservation_issues()
+                    .iter()
+                    .any(|issue| issue
+                        .contains("missing, forward or inconsistent redirection target"))
+            );
+            builder.rename(b"target", b"renamed".to_vec()).unwrap();
+            let output = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                output
+                    .members()
+                    .nth(1)
+                    .unwrap()
+                    .supported_redirection()
+                    .unwrap()
+                    .target_name,
+                b"renamed"
+            );
+            builder.remove(b"renamed").unwrap();
+            assert!(builder.to_bytes().is_err());
+        }
+    }
+}
+
+#[test]
+fn link_setters_refuse_shapes_the_target_format_cannot_write() {
+    for (volume, directory_target, target) in [
+        (true, false, b"target".as_slice()),
+        (false, true, b"target".as_slice()),
+        (false, false, b"".as_slice()),
+        (false, false, b"bad\0target".as_slice()),
+    ] {
+        let mut builder = Builder::new(ArchiveVersion::Rar20).volume_size(volume.then_some(1024));
+        assert!(builder
+            .add_unix_symlink(
+                b"link".to_vec(),
+                target.to_vec(),
+                directory_target,
+                None,
+                None,
+            )
+            .is_err());
+        assert!(builder.is_empty());
+    }
+
+    let mut seed = Builder::new(ArchiveVersion::Rar50).store(true);
+    seed.add_unix_symlink(b"link".to_vec(), b"target".to_vec(), false, None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(seed.to_bytes().unwrap()).unwrap();
+    let member = archive.members().next().unwrap();
+    for format in [ArchiveVersion::Rar20, ArchiveVersion::Rar50] {
+        let mut builder =
+            Builder::new(format).volume_size((format == ArchiveVersion::Rar50).then_some(1024));
+        assert!(builder.add_archive_redirection(&member).is_err());
+        assert!(builder.is_empty());
+    }
+}
+
+#[test]
+fn legacy_link_payloads_are_decoded_with_integrity_and_password_checks() {
+    for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar40] {
+        let mut builder = Builder::new(format).password(Some(b"secret".to_vec()));
+        builder
+            .add_bytes(
+                b"link".to_vec(),
+                b"missing-\xff".to_vec(),
+                None,
+                Some(0o120750),
+            )
+            .unwrap();
+        builder
+            .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, Some(0o100644))
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        assert!(archive.legacy_symlink_targets(None).is_err());
+        assert_eq!(
+            archive.legacy_symlink_targets(Some(b"secret")).unwrap(),
+            vec![Some(b"missing-\xff".to_vec()), None]
+        );
+        assert!(archive.legacy_symlink_target_at(0, None).is_err());
+        assert_eq!(
+            archive
+                .legacy_symlink_target_at(0, Some(b"secret"))
+                .unwrap(),
+            Some(b"missing-\xff".to_vec())
+        );
+        assert_eq!(
+            archive
+                .legacy_symlink_target_at(1, Some(b"secret"))
+                .unwrap(),
+            None
+        );
+        assert!(archive
+            .legacy_symlink_target_at(2, Some(b"secret"))
+            .is_err());
+    }
+}
+
+#[test]
+fn batch_link_targets_keep_member_order_and_raw_bytes() {
+    for format in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+    ] {
+        for solid in [false, true] {
+            let mut builder = Builder::new(format).solid(solid);
+            builder
+                .add_directory(b"directory".to_vec(), None, None)
+                .unwrap();
+            builder
+                .add_unix_symlink(
+                    b"link1".to_vec(),
+                    b"../raw-\xff".to_vec(),
+                    false,
+                    None,
+                    None,
+                )
+                .unwrap();
+            builder
+                .add_bytes(b"file".to_vec(), b"payload".to_vec(), None, None)
+                .unwrap();
+            builder
+                .add_unix_symlink(b"link2".to_vec(), b"/absolute".to_vec(), false, None, None)
+                .unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            assert_eq!(
+                archive.legacy_symlink_targets(None).unwrap(),
+                vec![
+                    None,
+                    Some(b"../raw-\xff".to_vec()),
+                    None,
+                    Some(b"/absolute".to_vec())
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn batch_link_targets_reject_invalid_targets_and_corrupt_dependencies() {
+    use rars::ErrorKind;
+    for target in [b"".as_slice(), b"bad\0target"] {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+        builder
+            .add_bytes(b"link".to_vec(), target.to_vec(), None, Some(0o120777))
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let error = archive.legacy_symlink_targets(None).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+        assert_eq!(error.entry_context().unwrap().0, b"link");
+    }
+    // These ordinary data entries intentionally carry native Unix link modes,
+    // exercising compressed solid links from existing archives too.
+    for solid in [false, true] {
+        let mut builder = Builder::new(ArchiveVersion::Rar29).solid(solid);
+        builder
+            .add_bytes(b"first".to_vec(), b"prefix".repeat(100), None, None)
+            .unwrap();
+        builder
+            .add_bytes(
+                b"link1".to_vec(),
+                b"target one".to_vec(),
+                None,
+                Some(0o120777),
+            )
+            .unwrap();
+        builder
+            .add_bytes(
+                b"link2".to_vec(),
+                b"target two".to_vec(),
+                None,
+                Some(0o120777),
+            )
+            .unwrap();
+        let data = builder.to_bytes().unwrap();
+        let mut archive = ArchiveReader::read_owned(data).unwrap();
+        // Alter the parsed expected CRC to isolate integrity failure from decoding.
+        if let rars::Archive::Rar15To40(legacy) = &mut archive {
+            if let rars::rar15_40::Block::File(file) = legacy
+                .blocks
+                .iter_mut()
+                .find(|block| matches!(block, rars::rar15_40::Block::File(_)))
+                .unwrap()
+            {
+                file.file_crc ^= 1;
+            } else {
+                panic!("expected first file");
+            }
+        }
+        let result = archive.legacy_symlink_targets(None);
+        if solid {
+            assert_eq!(result.unwrap_err().kind(), ErrorKind::ChecksumMismatch);
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                vec![
+                    None,
+                    Some(b"target one".to_vec()),
+                    Some(b"target two".to_vec())
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn legacy_link_targets_apply_per_call_password_limits_and_cancellation() {
+    let mut builder = Builder::new(ArchiveVersion::Rar40).password(Some(b"secret".to_vec()));
+    builder
+        .add_bytes(b"link".to_vec(), b"target".to_vec(), None, Some(0o120750))
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let password = ArchiveReadOptions::with_password(b"secret");
+    assert_eq!(
+        archive
+            .legacy_symlink_target_at_with_options(0, password.with_max_member_output_bytes(6))
+            .unwrap(),
+        Some(b"target".to_vec())
+    );
+    assert_eq!(
+        archive
+            .legacy_symlink_target_at_with_options(0, password.with_max_member_output_bytes(5))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::ResourceLimit
+    );
+    let token = ReadCancellation::new();
+    token.cancel();
+    assert_eq!(
+        archive
+            .legacy_symlink_target_at_with_options(0, password.with_cancellation(&token))
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Cancelled
+    );
+}

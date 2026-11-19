@@ -17,7 +17,7 @@ Formats go by their `--format` names. `rar14` writes RAR 1.3 archives, and
 | `rar50`, `rar70` | 2⁶⁴ − 1; a named filter covers the first 4 GiB, as automatic filters do | no limit; a recovery record covers at most 858,993,124,400 bytes, so a larger archive is refused before writing and volumes close at that size | `rar5_members_over_4_gib_round_trip`*, `explicit_filter_runs_past_4_gib_are_coded_unfiltered`, `a_layout_whose_recovery_record_cannot_be_built_is_refused`, `a_volume_closes_before_its_recovery_record_stops_covering_it`, `compression_dictionary_fields_obey_version_and_wire_limits`, `encode_options_refuse_a_valid_dictionary_above_the_host_limit` |
 
 \* Ignored by default, because they write archives over 4 GiB; run with
-`cargo test --release -p rars --test legacy_large_members --test legacy_large_volumes -- --ignored`.
+`cargo test --release -p rars --test it -- --ignored legacy_large_members:: legacy_large_volumes::`.
 
 A legacy compressed member held in memory, rather than streamed, is capped at
 4 GiB in a volume set ("compressed legacy volume sets cannot hold a member
