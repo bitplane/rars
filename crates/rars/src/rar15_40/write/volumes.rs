@@ -77,6 +77,42 @@ pub fn write_volumes_with_comment_to(
     )
 }
 
+/// The Builder's members, each read from its source as it is packed, as the
+/// CLI's are. The Builder refuses retained metadata in a volume set, as the
+/// fragment headers have nowhere to carry it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn write_retained_volumes_to(
+    entries: &[RetainedFileEntry<'_>],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    volume_size: usize,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+) -> Result<()> {
+    let members: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            let mut member = Member::from_file(&entry.file);
+            if let Some(source) = entry.source {
+                member.bytes = MemberBytes::NamedSource(source, entry.file.name);
+            }
+            member
+        })
+        .collect();
+    split_members(
+        &members,
+        options,
+        &coding,
+        archive_comment,
+        volume_size,
+        sink,
+        resources,
+        progress,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn split_members(
     members: &[Member<'_>],

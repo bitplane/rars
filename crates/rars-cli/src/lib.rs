@@ -21,7 +21,7 @@ mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
-use input::{collect_inputs, rar15_file_attr, read_inputs_with_progress, StoredTime};
+use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
     create_link_output, open_output_writer, print_ok_entry, rar50_output_relative_path,
     restore_output_metadata, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
@@ -34,9 +34,7 @@ use password::{
 };
 use progress::CliProgress;
 use rars::output_staging::{failed_entry_name, refused_output};
-use rars::rar13::{
-    self, FileEntry, StoredEntry as Rar13StoredEntry, WriterOptions as Rar13WriterOptions,
-};
+use rars::rar13::{self, WriterOptions as Rar13WriterOptions};
 use rars::rar15_40::WriterOptions as Rar15WriterOptions;
 use rars::{
     extract_volumes_with_links, test_volumes_with_options_and_callback, Archive as DetectedArchive,
@@ -1576,9 +1574,18 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     }
     let write_plan = AddWritePlan::for_target(target)?;
 
-    // RAR 1.5 to 4.x sets write each volume as it fills; RAR 1.3 sets are still
-    // built in memory.
+    // A large member written to a pipe, or into a RAR 1.3 set, is spooled;
+    // like RAR 5, beside the archive.
+    let default_temp = archive_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    let temp_dir = temp_dir.as_deref().or(default_temp);
+    // Every legacy set is written a volume at a time.
     if let Some(volume_size) = volume_size {
+        let resources = match temp_dir {
+            Some(directory) => rars::WriterResources::default().with_temp_dir(directory),
+            None => rars::WriterResources::default(),
+        };
         return write_legacy_volumes(
             LegacyVolumeWrite {
                 write_plan,
@@ -1594,6 +1601,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 file_comment: file_comment.as_deref(),
                 volume_size,
                 compress,
+                resources,
             },
             &progress,
         );
@@ -1636,11 +1644,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     let mut resources = memory_limit.map_or_else(rars::WriterResources::default, |limit| {
         rars::WriterResources::new(limit as u64)
     });
-    // A large member written to a pipe is spooled; like RAR 5, beside the archive.
-    let default_temp = archive_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty());
-    if let Some(directory) = temp_dir.as_deref().or(default_temp) {
+    if let Some(directory) = temp_dir {
         resources = resources.with_temp_dir(directory);
     }
     progress.bar("Compressing archive", total);
@@ -1793,8 +1797,12 @@ struct LegacyVolumeWrite<'a> {
     file_comment: Option<&'a [u8]>,
     volume_size: usize,
     compress: bool,
+    /// Where a large compressed RAR 1.3 member is packed before it is split.
+    resources: rars::WriterResources,
 }
 
+/// Every legacy set is written a volume at a time; members are read from
+/// their files as they are packed.
 fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
     progress.spinner("Scanning inputs");
     let inputs = collect_inputs(plan.input_paths)?;
@@ -1807,74 +1815,38 @@ fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> 
     if input.is_directory {
         return Err(RAR13_VOLUME_INPUTS.into());
     }
-    warn_if_buffered_write_is_large(plan.input_paths, plan.target);
-    let owned = read_inputs_with_progress(
-        plan.input_paths,
-        plan.password,
-        |files, bytes| progress.bar(format!("Reading {files} files"), bytes),
-        |bytes, name| {
-            progress.set_message(format!("Reading {}", display_bytes_lossy(name)));
-            progress.advance(bytes);
-        },
-    )?;
-    // Collection runs again while reading; check it too so an input tree that
-    // changed since preflight cannot silently lose every member after the first.
-    let [entry] = owned.as_slice() else {
-        return Err(RAR13_VOLUME_INPUTS.into());
-    };
-    if entry.file_attr & 0x10 != 0 {
-        return Err(RAR13_VOLUME_INPUTS.into());
-    }
     progress.finish(format!(
-        "Read 1 file ({})",
-        indicatif::HumanBytes(entry.data.len() as u64)
+        "Found 1 entry ({})",
+        indicatif::HumanBytes(input.size)
     ));
-    progress.spinner(if plan.compress {
-        "Preparing compression"
-    } else {
-        "Preparing archive"
-    });
-
-    let password = entry.password.as_deref().map(Vec::as_slice);
+    let entry = rar13::StreamingEntry::new(input.name.clone(), input.source())
+        .with_file_time(input.dos_time())
+        .with_file_attr(input.file_attr);
+    // The plan has already refused both of these for a RAR 1.3 set; passing
+    // them on leaves the writer's own refusal as the backstop.
+    let entry = match plan.file_comment {
+        Some(comment) => entry.with_file_comment(comment.to_vec()),
+        None => entry,
+    };
+    let entry = match plan.password {
+        Some(password) => entry.with_password(password.to_vec()),
+        None => entry,
+    };
     let mut options = Rar13WriterOptions::new(plan.target, plan.features());
     if let Some(level) = plan.compression_level {
         options = options.with_compression_level(level);
     }
-    let parts = if plan.compress {
-        rar13::write_compressed_volumes_with_progress(
-            FileEntry {
-                name: &entry.name,
-                data: &entry.data,
-                file_time: entry.dos_time(),
-                file_attr: entry.file_attr,
-                password,
-                file_comment: plan.file_comment,
-            },
+    plan.write_volume_set(progress, input.size, |sink| {
+        rar13::write_volumes_to(
+            &entry,
             options,
+            plan.coding(),
             plan.volume_size,
+            sink,
+            &plan.resources,
             Some(progress),
-        )?
-    } else {
-        rar13::write_stored_volumes(
-            Rar13StoredEntry {
-                name: &entry.name,
-                data: &entry.data,
-                file_time: entry.dos_time(),
-                file_attr: entry.file_attr,
-                password,
-                file_comment: plan.file_comment,
-            },
-            options,
-            plan.volume_size,
-        )?
-    };
-    write_volume_parts(plan.archive_path, &parts, progress).map_err(|err| {
-        format!(
-            "failed to write volume set starting at '{}': {err}",
-            plan.archive_path.display()
         )
-    })?;
-    Ok(())
+    })
 }
 
 /// Stored members copy straight from their sources; a compressed one is held only while it is coded.
@@ -1883,9 +1855,6 @@ fn write_rar15_legacy_volumes(
     inputs: &[input::LazyInput],
     progress: &CliProgress,
 ) -> CliResult<()> {
-    if plan.compress {
-        warn_if_buffered_write_is_large(plan.input_paths, plan.target);
-    }
     let total: u64 = inputs.iter().map(|input| input.size).sum();
     progress.finish(format!(
         "Found {} entries ({})",
@@ -1896,28 +1865,22 @@ fn write_rar15_legacy_volumes(
         .iter()
         .map(|input| rar15_streaming_entry(input, plan.file_comment, plan.password))
         .collect();
-    let coding = if plan.compress {
-        rars::rar15_40::MemberCoding::Compressed
-    } else {
-        rars::rar15_40::MemberCoding::Stored
-    };
-    progress.bar(
-        if plan.compress {
-            "Compressing volumes"
-        } else {
-            "Writing volumes"
-        },
-        total,
-    );
-    plan.write_rar15_volumes(progress, |options, sink| {
+    let mut options = Rar15WriterOptions::new(plan.target, plan.features());
+    if let Some(level) = plan.compression_level {
+        options = options.with_compression_level(level);
+    }
+    if let Some(size) = plan.dictionary_size {
+        options = options.with_dictionary_size(size);
+    }
+    plan.write_volume_set(progress, total, |sink| {
         rars::rar15_40::write_volumes_with_comment_to(
             &entries,
             options,
-            coding,
+            plan.coding(),
             plan.archive_comment,
             plan.volume_size,
             sink,
-            &rars::WriterResources::default(),
+            &plan.resources,
             Some(progress),
         )
     })
@@ -1950,23 +1913,34 @@ impl LegacyVolumeWrite<'_> {
         features
     }
 
-    /// Hands RAR 1.5 to 4.x volumes to disk as `write` finishes each one.
-    fn write_rar15_volumes(
+    fn coding(&self) -> MemberCoding {
+        if self.compress {
+            MemberCoding::Compressed
+        } else {
+            MemberCoding::Stored
+        }
+    }
+
+    /// Hands volumes to disk as `write` finishes each one, and names the set
+    /// once it is complete.
+    fn write_volume_set(
         &self,
         progress: &CliProgress,
-        write: impl FnOnce(Rar15WriterOptions, &mut CliVolumeSink<'_>) -> rars::Result<()>,
+        total: u64,
+        write: impl FnOnce(&mut CliVolumeSink<'_>) -> rars::Result<()>,
     ) -> CliResult<()> {
-        let mut options = Rar15WriterOptions::new(self.target, self.features());
-        if let Some(level) = self.compression_level {
-            options = options.with_compression_level(level);
-        }
-        if let Some(size) = self.dictionary_size {
-            options = options.with_dictionary_size(size);
-        }
+        progress.bar(
+            if self.compress {
+                "Compressing volumes"
+            } else {
+                "Writing volumes"
+            },
+            total,
+        );
         let mut sink = CliVolumeSink::new(self.archive_path, |first, index, _| {
             volume_part_path(first, index)
         });
-        let result = write(options, &mut sink);
+        let result = write(&mut sink);
         let paths = sink.finish(result)?;
         progress.finish("Volumes written");
         print_created_volumes(&paths);
@@ -2102,49 +2076,6 @@ fn write_plain_rar50_streaming(
     progress.finish("Archive written");
     eprintln!("created {}", archive_path.display());
     Ok(())
-}
-
-/// RAR 1.3 and 1.5 hold each member whole to pack it; RAR 2.0 to 4.x stream any member big enough to matter.
-fn warn_if_buffered_write_is_large(input_paths: &[PathBuf], target: ArchiveVersion) {
-    const WARN_THRESHOLD: u64 = 256 * 1024 * 1024;
-
-    if target.family() == rars::version::ArchiveFamily::Rar50Plus
-        || matches!(
-            target,
-            ArchiveVersion::Rar20
-                | ArchiveVersion::Rar29
-                | ArchiveVersion::Rar30
-                | ArchiveVersion::Rar40
-        )
-    {
-        return;
-    }
-    let Ok(inputs) = collect_inputs(input_paths) else {
-        return;
-    };
-    // RAR 1.3 holds the whole set; later formats hold one member at a time.
-    let held = if target == ArchiveVersion::Rar14 {
-        inputs.iter().map(|entry| entry.size).sum()
-    } else {
-        inputs.iter().map(|entry| entry.size).max().unwrap_or(0)
-    };
-    if held < WARN_THRESHOLD {
-        return;
-    }
-
-    let held = indicatif::HumanBytes(held);
-    if target == ArchiveVersion::Rar14 {
-        eprintln!(
-            "warning: --format {target} builds a volume set in memory, so this write needs \
-             several times the {held} of input and may run out; --format rar50 splits as it goes"
-        );
-    } else {
-        eprintln!(
-            "warning: --format {target} compresses each member in memory, so this write holds \
-             the largest, its packed form and the encoder's working memory, several times its \
-             {held}, and may run out; --format rar50 splits as it goes"
-        );
-    }
 }
 
 /// Writes each volume to a temporary file, then renames the set once the
@@ -2465,39 +2396,6 @@ fn has_trailing_path_separator(path: &Path) -> bool {
         .is_some_and(|ch| ch == b'/' as u16 || ch == b'\\' as u16)
 }
 
-fn write_bytes_with_progress(
-    writer: &mut impl Write,
-    bytes: &[u8],
-    progress: &CliProgress,
-) -> std::io::Result<()> {
-    for chunk in bytes.chunks(1024 * 1024) {
-        writer.write_all(chunk)?;
-        progress.advance(chunk.len() as u64);
-    }
-    Ok(())
-}
-
-fn write_volume_parts(
-    first_path: &Path,
-    parts: &[Vec<u8>],
-    progress: &CliProgress,
-) -> CliResult<()> {
-    // Naming can fail before any filesystem work (for example after .z99).
-    // Plan the complete set first so that refusal cannot overwrite old parts.
-    let paths = (0..parts.len())
-        .map(|index| volume_part_path(first_path, index))
-        .collect::<CliResult<Vec<_>>>()?;
-    let total = parts.iter().map(|part| part.len() as u64).sum();
-    progress.bar(format!("Writing {} volumes", parts.len()), total);
-    for (path, bytes) in paths.iter().zip(parts) {
-        let mut file = fs::File::create(path)?;
-        write_bytes_with_progress(&mut file, bytes, progress)?;
-    }
-    progress.finish("Volumes written");
-    print_created_volumes(&paths);
-    Ok(())
-}
-
 fn print_created_volumes(paths: &[PathBuf]) {
     println!("created {} volumes:", paths.len());
     for path in paths {
@@ -2732,80 +2630,6 @@ mod tests {
         assert!(error
             .to_string()
             .contains("failed to configure parallel workers"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn buffered_volume_warning_uses_file_sizes_without_reading_payloads() {
-        const CHILD_INPUT: &str = "RARS_CLI_TEST_BUFFER_WARNING_INPUT";
-        if let Some(path) = std::env::var_os(CHILD_INPUT) {
-            let path = std::path::PathBuf::from(path);
-            super::warn_if_buffered_write_is_large(
-                std::slice::from_ref(&path),
-                super::ArchiveVersion::Rar50,
-            );
-            super::warn_if_buffered_write_is_large(
-                &[path.with_file_name("missing")],
-                super::ArchiveVersion::Rar14,
-            );
-            super::warn_if_buffered_write_is_large(
-                std::slice::from_ref(&path),
-                super::ArchiveVersion::Rar14,
-            );
-            super::warn_if_buffered_write_is_large(
-                std::slice::from_ref(&path),
-                super::ArchiveVersion::Rar40,
-            );
-            super::warn_if_buffered_write_is_large(
-                std::slice::from_ref(&path),
-                super::ArchiveVersion::Rar20,
-            );
-            super::warn_if_buffered_write_is_large(&[path], super::ArchiveVersion::Rar15);
-            return;
-        }
-        let root = crate::scratch::case("buffered-volume-warning");
-        let path = root.join("sparse.bin");
-        let file = std::fs::File::create(&path).unwrap();
-        for (size, expected_warnings) in [(0, 0), (256 * 1024 * 1024, 2)] {
-            // A sparse file exercises the real metadata threshold without
-            // allocating or decoding hundreds of megabytes.
-            file.set_len(size).unwrap();
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::buffered_volume_warning_uses_file_sizes_without_reading_payloads",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD_INPUT, &path)
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stdout)
-            );
-            let stderr = String::from_utf8(output.stderr).unwrap();
-            assert_eq!(
-                stderr.matches("warning:").count(),
-                expected_warnings,
-                "{stderr}"
-            );
-            if expected_warnings != 0 {
-                assert!(stderr.contains("--format rar14 builds a volume set in memory"));
-                assert!(stderr.contains(
-                    "--format rar15 compresses each member in memory, so this write holds \
-                     the largest, its packed form and the encoder's working memory"
-                ));
-                assert!(!stderr.contains("--format rar40"), "{stderr}");
-                assert!(!stderr.contains("--format rar20"), "{stderr}");
-                assert_eq!(
-                    stderr.matches("--format rar50 splits as it goes").count(),
-                    2
-                );
-            }
-            assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
-        }
     }
 
     #[cfg(unix)]

@@ -388,7 +388,8 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
         ))
     ));
 
-    let mut multiple = Builder::new(ArchiveVersion::Rar20)
+    // The RAR 1.3 writer splits one packed payload; later formats take any number.
+    let mut multiple = Builder::new(ArchiveVersion::Rar14)
         .store(true)
         .volume_size(Some(1024));
     for name in [b"first".as_slice(), b"second".as_slice()] {
@@ -402,6 +403,15 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
             "legacy volumes support one input"
         ))
     ));
+    let mut multiple = Builder::new(ArchiveVersion::Rar20)
+        .store(true)
+        .volume_size(Some(1024));
+    for name in [b"first".as_slice(), b"second".as_slice()] {
+        multiple
+            .add_bytes(name.to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+    }
+    assert_eq!(multiple.build_volumes(None).unwrap().len(), 1);
 }
 
 #[test]
@@ -423,11 +433,19 @@ fn legacy_builder_rejects_modern_streaming_outputs_before_creating_files() {
             ..
         })
     ));
+    // A legacy set streams to a sink too, but only as a volume set.
     let mut sink = rars::rar50::CollectedVolumes::new();
     assert!(matches!(
         builder.write_volumes_to(&mut sink, &resources, None),
+        Err(rars::Error::InvalidArgument("volume_size is required"))
+    ));
+    assert!(sink.take().is_empty());
+    let quota = resources.clone().with_max_memory_bytes(1024);
+    let builder = builder.volume_size(Some(1024));
+    assert!(matches!(
+        builder.write_volumes_to(&mut sink, &quota, None),
         Err(rars::Error::UnsupportedFamilyFeature {
-            feature: "streaming managed volume output",
+            feature: "managed writer memory policy",
             ..
         })
     ));
