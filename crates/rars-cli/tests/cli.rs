@@ -856,6 +856,51 @@ fn modern_writer_memory_limit_is_forwarded_for_success_and_refusal() {
 }
 
 #[test]
+fn raising_the_memory_limit_never_changes_the_archive() {
+    // A member too large to code whole in the default limit is coded in
+    // blocks. A raised limit used to code it whole, several times slower.
+    let root = scratch("raised-memory-limit");
+    let source = root.join("payload.bin");
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut payload = Vec::with_capacity(8 << 20);
+    while payload.len() < 8 << 20 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        // Calls and short runs of a few symbols, as in machine code.
+        let call = (state >> 40) as u32 & 0xffff;
+        payload.push(0xe8);
+        payload.extend_from_slice(&call.to_le_bytes());
+        payload.extend((0..(state & 15)).map(|i| b"\x48\x89\xc7\x00"[(i as usize) & 3]));
+    }
+    fs::write(&source, &payload).unwrap();
+    let archives = [&[][..], &["--memory-limit", "8G"][..]].map(|extra| {
+        let archive = root.join(format!("limit{}.rar", extra.len()));
+        let output = rars()
+            .args([
+                "a",
+                "--progress",
+                "never",
+                "--format",
+                "rar50",
+                "--level",
+                "5",
+            ])
+            .args(extra)
+            .arg(&archive)
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        fs::read(&archive).unwrap()
+    });
+    assert!(
+        archives[0] == archives[1],
+        "the raised limit changed the archive"
+    );
+}
+
+#[test]
 fn coding_conflict_diagnostics_refuse_before_replacing_an_archive() {
     let root = scratch("coding-conflict-diagnostics");
     let source = root.join("payload.txt");
