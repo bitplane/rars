@@ -942,6 +942,10 @@ impl StreamedOut for StreamedFragments<'_, '_, '_> {
         self.committed
     }
 
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+
     fn write_packed(&mut self, bytes: &[u8]) -> Result<()> {
         if !self.committed && (!self.held.is_empty() || self.room() < bytes.len() as u64) {
             self.held.extend_from_slice(bytes);

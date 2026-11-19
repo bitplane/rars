@@ -2,8 +2,8 @@
 
 use super::*;
 use crate::codec::rar13::{
-    unpack15_decode, unpack15_encode, unpack15_encode_with_options_and_progress,
-    EncodeOptions as Rar15EncodeOptions, Unpack15Encoder,
+    unpack15_encode, unpack15_encode_with_options_and_progress,
+    EncodeOptions as Rar15EncodeOptions, Unpack15, Unpack15Encoder,
 };
 use crate::features::FeatureSet;
 pub use crate::streaming::{EntrySource, WriterResources};
@@ -438,11 +438,16 @@ struct EncodedMember<'a> {
 
 /// Working memory one member needs while it is coded. This is the admission
 /// weight that keeps concurrent writers from piling up, not a prediction.
+///
+/// A compressed member is held with its packed form. The encoder's match
+/// index and the verifying decoder are a fixed size whatever the member's.
 fn member_workspace(unpacked: u64, compressing: bool) -> u64 {
     if !compressing {
         return 1024 * 1024;
     }
-    unpacked.saturating_mul(4).saturating_add(2 * 1024 * 1024)
+    unpacked
+        .saturating_mul(2)
+        .saturating_add(crate::codec::rar13::ENCODER_WORKSPACE)
 }
 
 /// Codes one member, holding its bytes only while it is being coded.
@@ -948,10 +953,42 @@ fn rar15_encode_fallback_options(options: Rar15EncodeOptions) -> Vec<Rar15Encode
     candidates
 }
 
+/// Decodes `packed` and checks it against `data` as it comes out, so the check
+/// holds a decoder window rather than a second copy of the member.
 fn unpack15_payload_matches(packed: &[u8], data: &[u8]) -> Result<bool> {
-    match unpack15_decode(packed, data.len()) {
-        Ok(decoded) => Ok(decoded == data),
-        Err(_) => Ok(false),
+    let mut decoded = MatchesMember {
+        member: data,
+        at: 0,
+    };
+    let result = Unpack15::new().decode_member_from_reader(
+        &mut &packed[..],
+        data.len(),
+        false,
+        &mut decoded,
+    );
+    Ok(result.is_ok() && decoded.at == data.len())
+}
+
+/// Takes decoded bytes only while they are the member's, from its start.
+struct MatchesMember<'a> {
+    member: &'a [u8],
+    at: usize,
+}
+
+impl std::io::Write for MatchesMember<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let end = self.at + buf.len();
+        if self.member.get(self.at..end) != Some(buf) {
+            return Err(std::io::Error::other(
+                "decoded bytes differ from the member",
+            ));
+        }
+        self.at = end;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -1172,6 +1209,28 @@ fn validate_member(name: &[u8], unpacked_size: usize) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_compressed_member_is_charged_itself_its_packed_form_and_a_fixed_index() {
+        let small = super::member_workspace(1 << 20, true);
+        let large = super::member_workspace(1 << 30, true);
+        // Beyond the bytes it holds, a large member costs what a small one does.
+        assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
+        assert!(small < 16 << 20, "{small}");
+    }
+
+    #[test]
+    fn verification_decodes_against_the_member_without_a_copy() {
+        let data = b"verification compares as it decodes, verification compares".repeat(40);
+        let packed = super::unpack15_encode(&data).unwrap();
+        assert!(super::unpack15_payload_matches(&packed, &data).unwrap());
+        let mut changed = data.clone();
+        *changed.last_mut().unwrap() ^= 1;
+        assert!(!super::unpack15_payload_matches(&packed, &changed).unwrap());
+        changed = data.clone();
+        changed[0] ^= 1;
+        assert!(!super::unpack15_payload_matches(&packed, &changed).unwrap());
+    }
+
     #[test]
     fn writer_cancellation_during_workspace_admission_is_preserved() {
         use std::sync::atomic::{AtomicUsize, Ordering};
