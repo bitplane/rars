@@ -7282,6 +7282,47 @@ mod tests {
         assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
     }
 
+    /// A chain's PPMd member used to move its model's 19 KB of tables through
+    /// each call by value, and unoptimised that outgrew the 1 MiB main thread
+    /// Windows gives the CLI, on two lines of text in a solid archive.
+    #[test]
+    fn a_solid_ppmd_chain_codes_on_a_1_mib_stack() {
+        let text = word_text(48 * 1024);
+        std::thread::Builder::new()
+            .stack_size(1 << 20)
+            .spawn(move || {
+                let files: [(&str, &[u8]); 2] = [
+                    ("one.txt", &text[..16 * 1024]),
+                    ("two.txt", &text[16 * 1024..]),
+                ];
+                let members = entries(&files);
+                let expected: Vec<_> = files
+                    .iter()
+                    .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+                    .collect();
+                for (level, method) in [
+                    (None, super::Rar29Method::Auto),
+                    (Some(5), super::Rar29Method::Auto),
+                    (Some(5), super::Rar29Method::Ppmd),
+                ] {
+                    let mut options = rar40();
+                    options.features.solid = true;
+                    options.compression_level = level;
+                    options.method = method;
+                    let archive =
+                        in_memory_with(&members, options, crate::MemberCoding::Compressed);
+                    assert_eq!(
+                        extracted_set(std::slice::from_ref(&archive), None),
+                        expected,
+                        "{level:?} {method:?}"
+                    );
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
     /// Solid chains, forced PPMd and streamed members try the level's PPMd
     /// models too, so none of them packs text larger a level up.
     #[test]

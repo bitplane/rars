@@ -1446,10 +1446,15 @@ impl RangeEncoder {
 }
 
 /// A PPMd model handed from one block to the next in a solid chain.
+///
+/// The state is boxed. Its tables come to about 19 KB, and a chain moves the
+/// model through several calls and holds a trial's best beside the current
+/// one; unoptimised, each move took its own copy on the stack, and a solid
+/// archive overflowed the 1 MiB main thread Windows gives the CLI.
 #[derive(Debug, Clone)]
 #[cfg(any(test, feature = "write"))]
 pub struct PpmdModel {
-    state: Ppmd7<Allowance>,
+    state: Box<Ppmd7<Allowance>>,
 }
 
 /// Codes one RAR 2.9 PPMd block: literals and the escape commands the
@@ -1467,7 +1472,7 @@ impl PpmdEncoder {
     pub fn new(max_order: usize, esc_char: u8, dictionary_mb: usize) -> Result<Self> {
         Ok(Self {
             model: PpmdModel {
-                state: Ppmd7::for_encoding(max_order, dictionary_mb)?,
+                state: Box::new(Ppmd7::for_encoding(max_order, dictionary_mb)?),
             },
             range: RangeEncoder::new(),
             esc_char,
