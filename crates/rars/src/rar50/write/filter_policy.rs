@@ -741,8 +741,8 @@ fn choose_filter_at<B: Budget>(
 /// past the run's start.
 ///
 /// The decoder converts x86 and ARM addresses from a 32-bit file offset, and
-/// the encoder refuses one past that, so a run reaching beyond 4 GiB stays
-/// unfiltered.
+/// the encoder refuses one past that, so a run reaching beyond
+/// [`FILTER_REACH`] stays unfiltered.
 pub(super) fn run_filters_with_allowance<B: Budget>(
     data: &[u8],
     file_offset: usize,
@@ -753,7 +753,7 @@ pub(super) fn run_filters_with_allowance<B: Budget>(
 ) -> Result<Buffer<FilterSpec, B>> {
     let past_offsets = file_offset
         .checked_add(data.len())
-        .is_none_or(|end| end > u32::MAX as usize);
+        .is_none_or(|end| end > FILTER_REACH);
     if past_offsets || !auto_size_filter_search_applies(data) {
         return Ok(Buffer::new(allowance));
     }
@@ -819,6 +819,34 @@ fn specs_with_allowance<B: Budget>(
         )?)
     })
 }
+
+/// How far into a member a RAR 5 filter reaches.
+///
+/// x86 and ARM filters convert addresses from a 32-bit file offset, and the
+/// encoder refuses a filter that starts past one. Automatic filters stop here
+/// (see [`run_filters_with_allowance`]), and an explicit filter is cut here
+/// too, rather than refused partway through writing a member that runs past
+/// it. A member's first 4 GiB is still filtered as asked.
+pub(super) const FILTER_REACH: usize = u32::MAX as usize;
+
+/// `range`, in bytes of its member, cut to [`FILTER_REACH`].
+pub(super) fn within_filter_reach(range: std::ops::Range<usize>) -> std::ops::Range<usize> {
+    range.start.min(FILTER_REACH)..range.end.min(FILTER_REACH)
+}
+
+/// An explicit filter over a whole member of `len` bytes, cut to
+/// [`FILTER_REACH`], or `None` when nothing of it is left. A range the member
+/// cannot hold is passed on unchanged, for the encoder to refuse as it always
+/// has.
+pub(super) fn explicit_member_filter(spec: &FilterSpec, len: usize) -> Option<FilterSpec> {
+    let range = spec.range.clone().unwrap_or(0..len);
+    if range.end <= FILTER_REACH || range.start >= range.end || range.end > len {
+        return Some(spec.clone());
+    }
+    let range = within_filter_reach(range);
+    (range.start < range.end).then(|| FilterSpec::range(spec.kind, range))
+}
+
 fn policy_with_allowance<B: Budget>(
     data: &[u8],
     algorithm_version: u8,
@@ -835,7 +863,7 @@ fn policy_with_allowance<B: Budget>(
         FilterPolicy::Explicit(filter) => specs_with_allowance(
             data,
             algorithm_version,
-            std::slice::from_ref(filter),
+            explicit_member_filter(filter, data.len()).as_slice(),
             options,
             progress,
             allowance,
@@ -1129,6 +1157,46 @@ mod allowance_tests {
 #[cfg(test)]
 mod run_search_tests {
     use super::*;
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn an_explicit_filter_over_a_member_stops_at_4_gib() {
+        let e8 = FilterKind::E8;
+        let reach = FILTER_REACH;
+        let large = reach + 4096;
+        // Within reach, the filter is passed on as asked.
+        let whole = FilterSpec::whole(e8);
+        assert_eq!(explicit_member_filter(&whole, reach), Some(whole));
+        let ranged = FilterSpec::range(e8, 10..reach);
+        assert_eq!(explicit_member_filter(&ranged, large), Some(ranged));
+        // Past it, the filter is cut at 4 GiB.
+        for spec in [
+            FilterSpec::whole(e8),
+            FilterSpec::range(e8, 0..large),
+            FilterSpec::range(e8, 0..reach + 1),
+        ] {
+            assert_eq!(
+                explicit_member_filter(&spec, large),
+                Some(FilterSpec::range(e8, 0..reach))
+            );
+        }
+        assert_eq!(
+            explicit_member_filter(&FilterSpec::range(e8, 100..large), large),
+            Some(FilterSpec::range(e8, 100..reach))
+        );
+        // A range wholly past it leaves nothing to filter.
+        assert_eq!(
+            explicit_member_filter(&FilterSpec::range(e8, reach..large), large),
+            None
+        );
+        // A range the member cannot hold is the encoder's to refuse.
+        for spec in [
+            FilterSpec::range(e8, 0..large + 1),
+            FilterSpec::range(e8, large..large),
+        ] {
+            assert_eq!(explicit_member_filter(&spec, large), Some(spec.clone()));
+        }
+    }
 
     #[test]
     fn run_searches_parse_no_harder_than_level_two() {

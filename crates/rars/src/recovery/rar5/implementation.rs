@@ -440,19 +440,14 @@ pub(crate) fn build_streamed_inline_recovery_for_plan(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
-    body: &mut dyn ReadSeek,
-    body_len: u64,
-    plan: InlineRecoveryPlan,
-    mode: RecoveryMemoryMode,
-    parity_scratch: Option<&mut dyn ReadWriteSeek>,
-    sink: &mut dyn std::io::Write,
-    progress: Option<ProgressReporter<'_>>,
-    pass: usize,
-    allowance: &B,
-) -> Result<StreamedRecoveryOutput> {
-    check_recovery_cancelled(progress)?;
+/// Checks that [`streamed_recovery_with_allowance`] can write `plan`, and
+/// returns its payload size.
+///
+/// A chunk header stores the shard size in 32 bits and the shard counts in
+/// 16. With 200 data shards, the shard size caps what one record protects at
+/// 858,993,124,400 bytes. A writer checks this when it lays out the archive,
+/// before any of it is written.
+pub(crate) fn check_streamable_plan(plan: InlineRecoveryPlan) -> Result<u64> {
     let payload_len = plan.payload_size()?;
     if plan.header_size
         != RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE
@@ -469,14 +464,40 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     {
         return Err(Error::PlanOverflow);
     }
+    u32::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
+    u16::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
+    u16::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    Ok(payload_len)
+}
 
+/// The most bytes one streamed recovery record protects: 200 data shards of
+/// `u32::MAX` bytes less the chunk header, with the group count kept even.
+#[cfg(test)]
+pub(crate) const MAX_STREAMED_RECOVERY_PREFIX: u64 = MAX_WINRAR602_DATA_SHARDS
+    * ((u32::MAX as u64 - (RAR5_RECOVERY_CHUNK_FIXED_HEADER_SIZE + 8 * MAX_WINRAR602_DATA_SHARDS))
+        & !1);
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
+    body: &mut dyn ReadSeek,
+    body_len: u64,
+    plan: InlineRecoveryPlan,
+    mode: RecoveryMemoryMode,
+    parity_scratch: Option<&mut dyn ReadWriteSeek>,
+    sink: &mut dyn std::io::Write,
+    progress: Option<ProgressReporter<'_>>,
+    pass: usize,
+    allowance: &B,
+) -> Result<StreamedRecoveryOutput> {
+    check_recovery_cancelled(progress)?;
     // Fail on unrepresentable geometry before doing any work.
-    let total_size = u32::try_from(plan.shard_size).map_err(|_| Error::PlanOverflow)?;
-    // shard_size >= header_size was checked above, and shard_size fits u32.
+    let payload_len = check_streamable_plan(plan)?;
+    // The check admitted every one of these narrowings, and shard_size >=
+    // header_size.
+    let total_size = plan.shard_size as u32;
     let header_size_u32 = plan.header_size as u32;
-    let data_shards_u16 = u16::try_from(plan.data_shards).map_err(|_| Error::PlanOverflow)?;
-    let recovery_shards_u16 =
-        u16::try_from(plan.recovery_shards).map_err(|_| Error::PlanOverflow)?;
+    let data_shards_u16 = plan.data_shards as u16;
+    let recovery_shards_u16 = plan.recovery_shards as u16;
     // Both shard counts fit u16; group_count and header_size are bounded by
     // the admitted u32 shard_size. All four fit native usize, including i386.
     let data_shards = plan.data_shards as usize;
@@ -2284,12 +2305,13 @@ mod legacy_reference {
 mod tests {
     use super::{
         apply_inverse_matrix, build_inline_recovery_data_for_plan,
-        build_structural_inline_recovery_data, crc64_rar_state, crc64_xz,
+        build_structural_inline_recovery_data, check_streamable_plan, crc64_rar_state, crc64_xz,
         encode_inline_recovery_parity, encode_parity_shards, invert_linear_system_matrix,
         make_encoder_matrix, plan_inline_recovery, reconstruct_data_shards, recovery_equations,
         repair_inline_recovery_archive, repair_inline_recovery_prefix,
         repair_inline_recovery_prefix_shards, shared_gf16, split_prefix_shard_ranges,
-        split_prefix_shards, Error, Gf16, InlineRecoveryPlan, MAX_WINRAR602_DATA_SHARDS,
+        split_prefix_shards, Error, Gf16, InlineRecoveryPlan, MAX_STREAMED_RECOVERY_PREFIX,
+        MAX_WINRAR602_DATA_SHARDS,
     };
 
     fn recovery_test_bytes(len: usize, seed: u32) -> Vec<u8> {
@@ -3199,6 +3221,26 @@ mod tests {
                 header_size: 592,
                 shard_size: 1604,
             }
+        );
+    }
+
+    #[test]
+    fn the_streamed_plan_check_stops_where_the_shard_size_outgrows_32_bits() {
+        assert_eq!(MAX_STREAMED_RECOVERY_PREFIX, 858_993_124_400);
+        for percent in [1, 5, 100] {
+            let largest = plan_inline_recovery(MAX_STREAMED_RECOVERY_PREFIX, percent).unwrap();
+            assert_eq!(largest.shard_size, u64::from(u32::MAX) - 1);
+            assert_eq!(
+                check_streamable_plan(largest),
+                Ok(largest.payload_size().unwrap())
+            );
+            let over = plan_inline_recovery(MAX_STREAMED_RECOVERY_PREFIX + 1, percent).unwrap();
+            assert_eq!(over.shard_size, u64::from(u32::MAX) + 1);
+            assert_eq!(check_streamable_plan(over), Err(Error::PlanOverflow));
+        }
+        assert_eq!(
+            check_streamable_plan(plan_inline_recovery(u64::MAX, 5).unwrap()),
+            Err(Error::PlanOverflow)
         );
     }
 

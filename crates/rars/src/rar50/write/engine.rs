@@ -20,7 +20,7 @@ use super::headers::{
     write_hash_record_with_value, write_head_crypt, write_main_header, HeaderEncryptionKeys,
     PreparedHeader, WriteKeys,
 };
-use super::layout::{resolve_layout, LayoutInputs};
+use super::layout::{recovery_covers, resolve_layout, settle_layout, LayoutInputs};
 use super::{encrypt_reader_to, ArchiveEntry};
 use crate::crypto::rar50::Rar50Keys;
 use crate::detect::RAR50_SIGNATURE;
@@ -1639,7 +1639,7 @@ impl VolumeWriter<'_> {
     /// Everything this volume adds around a body of `body_len` bytes: the
     /// fixed blocks, the main header and the recovery record.
     fn volume_overhead(&self, body_len: u64) -> Result<u64> {
-        let layout = resolve_layout(
+        let layout = settle_layout(
             &self.layout_inputs(self.volume_index, self.head_crypt_len, body_len),
             self.resources,
         )?;
@@ -1648,6 +1648,11 @@ impl VolumeWriter<'_> {
             .checked_add(layout.main_header_len)
             .ok_or(Error::InvalidArgument("RAR 5 volume layout overflows"))?;
         if let (Some(percent), Some(prefix)) = (self.recovery_percent, layout.recovery_prefix_len) {
+            // A volume its recovery record cannot cover fits no volume size,
+            // so a volume closes before it grows that large.
+            if !recovery_covers(prefix, percent) {
+                return Ok(u64::MAX);
+            }
             len = len
                 .checked_add(recovery_block_len(
                     prefix,
@@ -2558,6 +2563,57 @@ mod emission_ledger_tests {
         }
         assert!(member_failure);
         assert!(archive_failure);
+    }
+
+    #[cfg(feature = "recovery")]
+    #[test]
+    fn a_volume_closes_before_its_recovery_record_stops_covering_it() {
+        struct Unused;
+        impl super::super::VolumeSink for Unused {
+            fn start_volume(&mut self, _: u64) -> Result<Box<dyn super::super::VolumeOutput>> {
+                unreachable!("sizing a volume writes nothing")
+            }
+            fn finish_volume(&mut self, _: u64, _: u64) -> Result<()> {
+                unreachable!("sizing a volume writes nothing")
+            }
+        }
+        let resources = WriterResources::default();
+        let largest = crate::recovery::rar5::MAX_STREAMED_RECOVERY_PREFIX;
+        for (volume_size, capped) in [(largest / 2, false), (2 * largest, true), (1 << 50, true)] {
+            let mut sink = Unused;
+            let mut writer = VolumeWriter {
+                volume_size,
+                solid: false,
+                recovery_percent: Some(5),
+                header_keys: None,
+                progress: None,
+                resources: &resources,
+                sink: &mut sink,
+                body: None,
+                head_crypt_len: 0,
+                fixed_len: 0,
+                body_budget: None,
+                fragments_in_volume: 0,
+                volume_index: 0,
+                trailing_producer: None,
+                trailing_len: 0,
+            };
+            writer.start_volume().unwrap();
+            let budget = writer.body_budget().unwrap();
+            assert!(writer.fits(budget).unwrap());
+            assert!(!writer.fits(budget + 1).unwrap());
+            // The volume this budget closes is one the layout accepts.
+            let inputs = writer.layout_inputs(0, 0, budget);
+            let prefix = resolve_layout(&inputs, &resources)
+                .unwrap()
+                .recovery_prefix_len
+                .unwrap();
+            if capped {
+                assert_eq!(prefix, largest, "volume size {volume_size}");
+            } else {
+                assert!(prefix < largest);
+            }
+        }
     }
 
     #[test]
