@@ -184,6 +184,13 @@ fn a_block_of_two_byte_matches_decodes() {
             offset: offset as u32,
         });
     }
-    let packed = code_block(&tokens, &[], false, &mut [0; TABLE_COUNT]).unwrap();
+    let packed = code_block(
+        &tokens,
+        EncoderMatchState::default(),
+        &[],
+        false,
+        &mut [0; TABLE_COUNT],
+    )
+    .unwrap();
     assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
 }

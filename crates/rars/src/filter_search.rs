@@ -185,6 +185,12 @@ pub(crate) trait OwnedSearch {
     fn allowance(&self) -> &Self::Memory;
     fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>>;
     fn detects_x86(&self) -> bool;
+    /// Whether to measure the E8-only filter wherever the x86 screen keeps
+    /// code, rather than only where a sample says the jumps cost more. See
+    /// [`x86_screened_regions`].
+    fn prices_calls_alone(&self) -> bool {
+        false
+    }
     fn max_delta_channels(&self) -> usize;
     fn screen_options(&self, options: Self::Options) -> Self::Options;
     fn filtered_bytes(
@@ -295,6 +301,9 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     fn detects_x86(&self) -> bool {
         self.search.detects_x86()
     }
+    fn prices_calls_alone(&self) -> bool {
+        self.search.prices_calls_alone()
+    }
     fn max_delta_channels(&self) -> usize {
         self.search.max_delta_channels()
     }
@@ -337,14 +346,44 @@ pub(crate) fn search_applies(data: &[u8]) -> bool {
 }
 
 fn is_text_like(data: &[u8]) -> bool {
-    let sample_len = data.len().min(8192);
+    let sample_len = data.len().min(TEXT_SAMPLE_LEN);
     // `search_applies` screens empty members before calling this helper.
-    let sample = &data[..sample_len];
-    let text_bytes = sample
+    text_byte_count(&data[..sample_len]) * 100 / sample_len >= 95
+}
+
+/// How much of a member [`search_applies_throughout`] reads at each place.
+const TEXT_SAMPLE_LEN: usize = 8192;
+
+/// How many places across a member [`search_applies_throughout`] reads.
+const TEXT_SAMPLES: usize = 16;
+
+/// [`search_applies`], judged from samples spread across the whole of `data`
+/// rather than from its start.
+///
+/// A member's first bytes need not say what the rest is. A tar of `/usr`
+/// can open with a script and go on to megabytes of ELF code, and judged by
+/// its first 8 KiB the whole member was taken for text and never searched.
+/// Cut into runs, the same bytes were searched wherever a run did not open
+/// with text, so the two paths came out 7% apart. Sixteen samples cost
+/// nothing next to one encode, and the whole member and each of its runs are
+/// then judged by what they hold.
+pub(crate) fn search_applies_throughout(data: &[u8]) -> bool {
+    if data.len() <= TEXT_SAMPLE_LEN * 2 {
+        return search_applies(data);
+    }
+    let samples = TEXT_SAMPLES.min(data.len() / TEXT_SAMPLE_LEN);
+    let stride = data.len() / samples;
+    let text_bytes: usize = (0..samples)
+        .map(|sample| text_byte_count(&data[sample * stride..][..TEXT_SAMPLE_LEN]))
+        .sum();
+    text_bytes * 100 / (samples * TEXT_SAMPLE_LEN) < 95
+}
+
+fn text_byte_count(sample: &[u8]) -> usize {
+    sample
         .iter()
         .filter(|&&byte| matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
-        .count();
-    text_bytes * 100 / sample_len >= 95
+        .count()
 }
 
 fn screen_wins(filtered: usize, baseline: usize) -> bool {
@@ -527,6 +566,13 @@ fn x86_code_regions<B: Budget>(data: &[u8], allowance: &B) -> Result<Buffer<Rang
 /// no. Over twenty-four members it won seven times and never by more than
 /// 0.21%, while carrying the pair cost a third of the search; screening it here
 /// keeps the wins and spends the encode only where a sample gives a reason to.
+///
+/// A search that [`OwnedSearch::prices_calls_alone`] skips that question and
+/// measures both. RAR 5 searches a large member in 4 MiB pieces, where one
+/// sample per region often has to stand for a whole piece, and there it
+/// guessed wrong: on a 32 MiB slice of ELF binaries E8 alone came out 0.9%
+/// smaller over the member, and the samples priced it in four pieces of
+/// eight.
 fn x86_screened_regions<S: OwnedSearch>(
     search: &S,
     data: &[u8],
@@ -595,6 +641,10 @@ fn x86_screened_regions<S: OwnedSearch>(
             continue;
         };
         jumps_pay = true;
+        if search.prices_calls_alone() {
+            jumps_cost_more = true;
+            continue;
+        }
         let e8_only = filtered_sample(search, data, within.clone(), FilterKind::E8)?;
         let e8_only = search.encode_plain(&e8_only, options, None)?;
         jumps_cost_more |= e8_only.len() < *pair;
@@ -1263,6 +1313,33 @@ mod tests {
         graft_owned(Buffer::from_vec(specs), tables, member)
             .unwrap()
             .into_vec()
+    }
+
+    #[test]
+    fn a_member_is_judged_text_by_what_it_holds_not_how_it_opens() {
+        let text = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n".repeat(1200);
+        let mut state = 0x9e37_79b9u32;
+        let noise: Vec<u8> = (0..1 << 20)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect();
+        // Text in front of a megabyte of binary.
+        let opens_with_text = [&text[..], &noise[..]].concat();
+        assert!(!search_applies(&opens_with_text));
+        assert!(search_applies_throughout(&opens_with_text));
+        // A binary header in front of a megabyte of text.
+        let text_body = text.repeat(16);
+        let opens_with_binary = [&noise[..2048], &text_body[..]].concat();
+        assert!(search_applies(&opens_with_binary));
+        assert!(!search_applies_throughout(&opens_with_binary));
+        // A member of up to two samples is judged as it always was.
+        for len in [0, 1, TEXT_SAMPLE_LEN, 2 * TEXT_SAMPLE_LEN] {
+            for data in [&opens_with_text[..len], &opens_with_binary[..len]] {
+                assert_eq!(search_applies_throughout(data), search_applies(data));
+            }
+        }
     }
 
     #[test]
