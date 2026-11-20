@@ -1,4 +1,4 @@
-use super::support::CollectWriter;
+use super::support::{rar50_entry, CollectWriter};
 use rars::rar50::{
     write_streaming_archive_to, Archive, ArchiveEntry, ArchiveExtras, FilterPolicy, Rar50Writer,
     WriterOptions,
@@ -187,7 +187,7 @@ fn stored_writer_does_not_require_lz_workspace() {
             WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
                 .with_compression_level(0),
         )
-        .entries(vec![entry(b"payload", &data)])
+        .entries(vec![rar50_entry(b"payload", &data)])
         .write_to(&mut out, &WriterResources::new(limit))?;
         Ok(out)
     };
@@ -200,20 +200,12 @@ fn stored_writer_does_not_require_lz_workspace() {
     );
 }
 
-/// Builds a member from bytes the test already holds.
-fn entry(name: &[u8], data: &[u8]) -> ArchiveEntry {
-    ArchiveEntry::new(
-        name.to_vec(),
-        EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
-    )
-}
-
 #[test]
 fn compressed_writer_reports_determinate_progress() {
     let data: Vec<u8> = (0usize..128 * 1024)
         .map(|i| (i.wrapping_mul(37) % 251) as u8)
         .collect();
-    let entry = entry(b"payload.bin", &data)
+    let entry = rar50_entry(b"payload.bin", &data)
         .with_attributes(0x20)
         .with_host_os(1);
     let last = rars::atomic64::AtomicU64::new(0);
@@ -256,7 +248,7 @@ fn compressed_writer_reports_determinate_progress() {
 #[test]
 #[cfg(feature = "recovery")]
 fn recovery_writer_reports_determinate_pass_progress() {
-    let entry = entry(b"payload.bin", b"recovery progress payload")
+    let entry = rar50_entry(b"payload.bin", b"recovery progress payload")
         .with_attributes(0x20)
         .with_host_os(1);
     let starts = AtomicUsize::new(0);
@@ -478,7 +470,7 @@ fn writer_stamps_requested_rar50_dictionary_size() {
     let data = b"RAR5 dictionary-size writer option fixture".repeat(64);
     let options = WriterOptions::new(rars::ArchiveVersion::Rar50, rars::FeatureSet::default())
         .with_dictionary_size(512 * 1024);
-    let entries = [entry(b"dict.bin", &data)
+    let entries = [rar50_entry(b"dict.bin", &data)
         .with_attributes(0x20)
         .with_host_os(3)];
     let archive = Rar50Writer::new(options)
@@ -505,7 +497,7 @@ fn writer_uses_rar7_dictionary_fields_when_size_needs_v1_encoding() {
     let data = b"RAR7 dictionary-size writer option fixture".repeat(64);
     let options = WriterOptions::new(rars::ArchiveVersion::Rar70, rars::FeatureSet::default())
         .with_dictionary_size(192 * 1024);
-    let entries = [entry(b"dict7.bin", &data)
+    let entries = [rar50_entry(b"dict7.bin", &data)
         .with_attributes(0x20)
         .with_host_os(3)];
     let archive = Rar50Writer::new(options)
@@ -531,7 +523,7 @@ fn writer_uses_rar7_dictionary_fields_when_size_needs_v1_encoding() {
 fn writer_rejects_unencodable_rar50_dictionary_size() {
     let options = WriterOptions::new(rars::ArchiveVersion::Rar50, rars::FeatureSet::default())
         .with_dictionary_size(192 * 1024);
-    let entries = [entry(b"bad.bin", b"data data data data")
+    let entries = [rar50_entry(b"bad.bin", b"data data data data")
         .with_attributes(0x20)
         .with_host_os(3)];
 

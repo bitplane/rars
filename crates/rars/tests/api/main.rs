@@ -23,6 +23,12 @@ mod legacy_writer;
 mod rar13_writer;
 
 #[cfg(feature = "write")]
+mod rar50_extract;
+
+#[cfg(feature = "write")]
+mod rar50_reader;
+
+#[cfg(feature = "write")]
 mod rar50_writer;
 
 #[cfg(feature = "write")]

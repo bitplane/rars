@@ -1,4 +1,4 @@
-use super::support::CollectWriter;
+use super::support::{rar50_entry, CollectWriter};
 use rars::*;
 use std::{
     cell::RefCell,
@@ -67,14 +67,6 @@ fn rar50_options_with_features(
     features: FeatureSet,
 ) -> rar50::WriterOptions {
     rar50::WriterOptions::new(target, features)
-}
-
-/// Builds a member from bytes the test already holds.
-fn rar50_entry(name: &[u8], data: &[u8]) -> rar50::ArchiveEntry {
-    rar50::ArchiveEntry::new(
-        name.to_vec(),
-        EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
-    )
 }
 
 fn write_rar29_filter(

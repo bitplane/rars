@@ -2073,64 +2073,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parallel_extraction_emits_a_bounded_batch_before_decoding_the_next() {
-        let bytes = Rar50Writer::new(
-            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
-                .with_compression_level(0),
-        )
-        .entries([entry(b"first", &[1; 64]), entry(b"second", &[2; 64])])
-        .finish()
-        .unwrap();
-        let mut archive = Archive::parse_owned(bytes).unwrap();
-        for block in &mut archive.blocks {
-            if let super::super::Block::File(file) = block {
-                if file.name == b"second" {
-                    file.hash = None;
-                    file.data_crc32 = Some(0);
-                }
-            }
-        }
-        let mut opened = Vec::new();
-        let error = archive
-            .extract_to_parallel_buffered(
-                crate::ArchiveReadOptions::default().with_rar50_buffered_decode_limit(64),
-                |meta| {
-                    opened.push(meta.name.clone());
-                    Ok(Box::new(std::io::sink()))
-                },
-            )
-            .unwrap_err();
-        assert!(matches!(error, Error::AtEntry { source, .. }
-            if matches!(*source, Error::Crc32Mismatch { .. })));
-        assert_eq!(opened, vec![b"first".to_vec()]);
-    }
-
-    #[test]
-    fn parallel_extraction_handles_empty_entries_and_small_limits() {
-        let bytes = Rar50Writer::new(
-            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
-                .with_compression_level(0),
-        )
-        .entries([entry(b"empty", &[]), entry(b"data", &[1; 64])])
-        .finish()
-        .unwrap();
-        let archive = Archive::parse_owned(bytes).unwrap();
-        for limit in [0, 32, 64, 128] {
-            let mut opened = Vec::new();
-            archive
-                .extract_to_parallel_buffered(
-                    crate::ArchiveReadOptions::default().with_rar50_buffered_decode_limit(limit),
-                    |meta| {
-                        opened.push(meta.name.clone());
-                        Ok(Box::new(std::io::sink()))
-                    },
-                )
-                .unwrap();
-            assert_eq!(opened, vec![b"empty".to_vec(), b"data".to_vec()]);
-        }
-    }
-
     fn plain_file(name: &[u8], data: &[u8], hash: Option<FileHash>) -> FileHeader {
         FileHeader {
             block: empty_block(HEAD_FILE, 0, 0..0),
@@ -2196,40 +2138,6 @@ mod tests {
             .unwrap();
         assert_eq!(seen, [(b"dir".to_vec(), true), (b"file".to_vec(), false)]);
         assert_eq!(&*output.borrow(), b"payload");
-    }
-
-    #[test]
-    fn direct_streaming_extracts_compressed_zero_run() {
-        struct Capture(Rc<RefCell<Vec<u8>>>);
-        impl Write for Capture {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0.borrow_mut().extend_from_slice(bytes);
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        let data = vec![0; 16 * 1024];
-        let bytes = Rar50Writer::new(WriterOptions::new(
-            ArchiveVersion::Rar50,
-            FeatureSet::store_only(),
-        ))
-        .entries([entry(b"zeroes", &data)])
-        .finish()
-        .unwrap();
-        let archive = Archive::parse_owned(bytes).unwrap();
-        assert!(!archive.files().next().unwrap().is_stored());
-        let output = Rc::new(RefCell::new(Vec::new()));
-        archive
-            .extract_to(
-                crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0),
-                |_| Ok(Box::new(Capture(output.clone()))),
-            )
-            .unwrap();
-        assert_eq!(*output.borrow(), data);
     }
 
     #[test]
@@ -2664,17 +2572,6 @@ mod tests {
 
             assert_eq!(out, data);
         }
-    }
-
-    #[test]
-    fn streaming_crc32_zero_advance_matches_byte_update() {
-        let mut bytewise = Crc32::new();
-        bytewise.update(&vec![0; 100_000]);
-
-        let mut skipped = Crc32::new();
-        skipped.update_zeroes(100_000);
-
-        assert_eq!(skipped.finish(), bytewise.finish());
     }
 
     #[test]
