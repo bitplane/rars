@@ -148,12 +148,276 @@ fn truncated_archive_tests_and_extracts_its_members_then_fails() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
 
-    // A cut through member data is an error, not a warning.
-    let last = archive.files().last().unwrap().block.data_range.end;
-    fs::write(&path, &bytes[..last - 10]).unwrap();
+    // A cut through member data loses that member, and the one before it still tests.
+    let last = archive.files().last().unwrap().block.clone();
+    fs::write(&path, &bytes[..last.data_range.end - 10]).unwrap();
     let output = rars().arg("test").arg(&path).output().unwrap();
     assert!(!output.status.success());
-    assert!(!stderr(&output).contains("warning"), "{}", stderr(&output));
+    let warning = format!(
+        "warning: {}: archive is truncated inside member 'second.bin', which starts at offset {}",
+        path.display(),
+        last.offset
+    );
+    assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "OK first.txt\n");
+}
+
+/// Members by name, in archive order.
+type Members = Vec<(String, Vec<u8>)>;
+
+/// Five text members from one vocabulary, so solid ones refer back.
+fn salvage_members() -> Members {
+    let words: Vec<String> = (0..300)
+        .map(|index| format!("w{}x{}", index * 7 % 113, index % 17))
+        .collect();
+    let noise = deterministic_noise(5 * 1200);
+    (0..5)
+        .map(|member| {
+            let picks = &noise[member * 1200..(member + 1) * 1200];
+            let text = picks
+                .iter()
+                .map(|&pick| words[pick as usize % words.len()].as_str())
+                .collect::<Vec<_>>()
+                .join(" ");
+            (format!("m{member}.txt"), text.into_bytes())
+        })
+        .collect()
+}
+
+/// Writes [`salvage_members`] to `path`, returning them and where each one's
+/// packed data is in the archive.
+fn salvage_fixture(
+    path: &Path,
+    version: rars::ArchiveVersion,
+    solid: bool,
+) -> (Members, Vec<std::ops::Range<usize>>) {
+    let members = salvage_members();
+    let mut builder = rars::Builder::new(version).solid(solid);
+    for (name, data) in &members {
+        builder
+            .add_bytes(name.as_bytes().to_vec(), data.clone(), None, None)
+            .unwrap();
+    }
+    builder.write_to_path(path, None).unwrap();
+    let ranges = match rars::ArchiveReader::read_path(path).unwrap() {
+        rars::Archive::Rar15To40(archive) => archive
+            .files()
+            .map(|file| file.packed_range.clone())
+            .collect(),
+        rars::Archive::Rar50Plus(archive) => archive
+            .files()
+            .map(|file| file.block.data_range.clone())
+            .collect(),
+        _ => unreachable!("only RAR 2.9 and 5 are written here"),
+    };
+    (members, ranges)
+}
+
+/// Issue #436: a damaged member is reported, every other member is still
+/// tested and extracted, and the command fails at the end.
+#[test]
+fn a_damaged_member_is_reported_and_the_others_test_and_extract() {
+    let dir = scratch("damaged-member");
+    for (version, solid) in [
+        (rars::ArchiveVersion::Rar29, false),
+        (rars::ArchiveVersion::Rar29, true),
+        (rars::ArchiveVersion::Rar50, false),
+        (rars::ArchiveVersion::Rar50, true),
+    ] {
+        let case = format!("{version:?} solid={solid}");
+        let path = dir.join(format!("{version:?}-{solid}.rar"));
+        let (members, ranges) = salvage_fixture(&path, version, solid);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[ranges[2].start + ranges[2].len() / 2] ^= 0x55;
+        fs::write(&path, &bytes).unwrap();
+
+        let output = rars().arg("test").arg(&path).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{case}: {}", stderr(&output));
+        let errors = stderr(&output);
+        let warning = format!("warning: {}: while ", path.display());
+        assert!(errors.contains(&warning), "{case}: {errors}");
+        assert!(errors.contains("entry 'm2.txt'"), "{case}: {errors}");
+        assert!(errors.contains("damaged member(s)"), "{case}: {errors}");
+        let tested = stdout(&output);
+        let tested: Vec<_> = tested.lines().collect();
+        if solid {
+            // Later members need the damaged one's output, so they may fail too.
+            assert_eq!(tested[..2], ["OK m0.txt", "OK m1.txt"], "{case}");
+            assert!(!tested.contains(&"OK m2.txt"), "{case}");
+        } else {
+            assert_eq!(
+                tested,
+                ["OK m0.txt", "OK m1.txt", "OK m3.txt", "OK m4.txt"],
+                "{case}"
+            );
+        }
+
+        let out = dir.join(format!("out-{version:?}-{solid}"));
+        let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "{case}: {}", stderr(&output));
+        assert!(stderr(&output).contains("entry 'm2.txt'"), "{case}");
+        assert!(!out.join("m2.txt").exists(), "{case}");
+        for (index, (name, data)) in members.iter().enumerate() {
+            match fs::read(out.join(name)) {
+                Ok(written) => assert_eq!(&written, data, "{case}: {name}"),
+                Err(_) => assert!(index == 2 || solid && index > 2, "{case}: {name} missing"),
+            }
+        }
+    }
+}
+
+/// Issue #436: in a volume set, a damaged member that sits in one volume is
+/// reported and the members around it, split ones included, still read.
+#[test]
+fn a_damaged_member_in_a_volume_set_is_reported_and_the_others_read() {
+    for format in ["rar29", "rar50"] {
+        let dir = scratch(&format!("damaged-volume-member-{format}"));
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let members = salvage_members();
+        for (name, data) in &members {
+            fs::write(tree.join(name), data).unwrap();
+        }
+        let set = dir.join("set").join("set.rar");
+        fs::create_dir_all(set.parent().unwrap()).unwrap();
+        let mut add = rars();
+        add.args(["a", "--format", format, "--volume-size", "3k"])
+            .arg(&set)
+            .current_dir(&tree);
+        for (name, _) in &members {
+            add.arg(name);
+        }
+        let output = add.output().unwrap();
+        assert!(output.status.success(), "{format}: {}", stderr(&output));
+        // The first member that starts and ends in one volume, and where its data is.
+        let mut volumes: Vec<_> = fs::read_dir(set.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        volumes.sort();
+        let damaged = volumes
+            .iter()
+            .find_map(|volume| {
+                let whole = match rars::ArchiveReader::read_path(volume).unwrap() {
+                    rars::Archive::Rar15To40(archive) => archive
+                        .files()
+                        .find(|file| !file.is_split_before() && !file.is_split_after())
+                        .map(|file| (file.name.clone(), file.packed_range.clone())),
+                    rars::Archive::Rar50Plus(archive) => archive
+                        .files()
+                        .find(|file| !file.is_split_before() && !file.is_split_after())
+                        .map(|file| (file.name.clone(), file.block.data_range.clone())),
+                    _ => unreachable!("only RAR 2.9 and 5 are written here"),
+                };
+                whole.map(|(name, range)| (volume.clone(), name, range))
+            })
+            .unwrap_or_else(|| panic!("{format}: no member fits in one volume"));
+        let (volume, name, range) = damaged;
+        let name = String::from_utf8(name).unwrap();
+        let mut bytes = fs::read(&volume).unwrap();
+        bytes[range.start + range.len() / 2] ^= 0x55;
+        fs::write(&volume, &bytes).unwrap();
+
+        let first = volumes[0].clone();
+        let output = rars().arg("test").arg(&first).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{format}: {}",
+            stderr(&output)
+        );
+        assert!(
+            stderr(&output).contains(&format!("entry '{name}'")),
+            "{format}: {}",
+            stderr(&output)
+        );
+        let expected: Vec<_> = members
+            .iter()
+            .filter(|(member, _)| *member != name)
+            .map(|(member, _)| format!("OK {member}"))
+            .collect();
+        assert_eq!(
+            stdout(&output).lines().collect::<Vec<_>>(),
+            expected,
+            "{format}"
+        );
+
+        let out = dir.join("out");
+        let output = rars().arg("x").arg(&first).arg(&out).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{format}: {}",
+            stderr(&output)
+        );
+        for (member, data) in &members {
+            if *member == name {
+                assert!(!out.join(member).exists(), "{format}: {member}");
+            } else {
+                assert_eq!(
+                    &fs::read(out.join(member)).unwrap(),
+                    data,
+                    "{format}: {member}"
+                );
+            }
+        }
+    }
+}
+
+/// Issue #436: a file cut through a member's data or its file header keeps
+/// every member before it, reports the cut and fails at the end.
+#[test]
+fn an_archive_cut_through_a_member_tests_and_extracts_what_is_before_it() {
+    let dir = scratch("cut-member");
+    for (version, solid) in [
+        (rars::ArchiveVersion::Rar29, true),
+        (rars::ArchiveVersion::Rar50, false),
+    ] {
+        let whole = dir.join("whole.rar");
+        let (members, ranges) = salvage_fixture(&whole, version, solid);
+        let bytes = fs::read(&whole).unwrap();
+        // Nothing sits between one member's data and the next header.
+        let header = ranges[1].end;
+        for (cut, block) in [
+            (ranges[2].start + ranges[2].len() / 2, "member 'm2.txt'"),
+            (ranges[2].start - 1, ""),
+        ] {
+            let case = format!("{version:?} solid={solid} cut at {cut}");
+            let path = dir.join(format!("cut-{version:?}-{cut}.rar"));
+            fs::write(&path, &bytes[..cut]).unwrap();
+            let warning = format!(
+                "warning: {}: archive is truncated inside {block}",
+                path.display()
+            );
+            let offset = format!("which starts at offset {header}");
+
+            let output = rars().arg("test").arg(&path).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{case}");
+            let errors = stderr(&output);
+            assert!(errors.contains(&warning), "{case}: {errors}");
+            assert!(errors.contains(&offset), "{case}: {errors}");
+            assert!(errors.contains("is truncated"), "{case}: {errors}");
+            assert_eq!(stdout(&output), "OK m0.txt\nOK m1.txt\n", "{case}");
+
+            let out = dir.join(format!("out-{version:?}-{cut}"));
+            let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{case}");
+            assert!(stderr(&output).contains(&warning), "{case}");
+            let mut written: Vec<_> = fs::read_dir(&out)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect();
+            written.sort();
+            assert_eq!(written, ["m0.txt", "m1.txt"], "{case}");
+            for (name, data) in &members[..2] {
+                assert_eq!(&fs::read(out.join(name)).unwrap(), data, "{case}");
+            }
+
+            let output = rars().arg("info").arg(&path).output().unwrap();
+            assert!(output.status.success(), "{case}: {}", stderr(&output));
+            assert!(stderr(&output).contains(&warning), "{case}");
+        }
+    }
 }
 
 #[test]

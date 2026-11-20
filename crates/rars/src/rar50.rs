@@ -2509,12 +2509,15 @@ where
                 Err(Error::TooShort) if header_keys.is_none() => {
                     let rest = peek(pos).map_err(|error| at_offset(error, pos))?;
                     match cut_header_block(&rest, archive_len - pos) {
-                        Some(Some(block)) => {
+                        // A file header: its member is lost.
+                        Some(TruncatedBlock::Member(_)) if !options.salvages() => {
+                            return Err(at_offset(Error::TooShort, pos))
+                        }
+                        Some(block) => {
                             truncation = Some(Truncation::new(sfx_offset + pos, block, true));
                             break;
                         }
-                        // A file header: its member is lost.
-                        Some(None) | None => return Err(at_offset(Error::TooShort, pos)),
+                        None => return Err(at_offset(Error::TooShort, pos)),
                     }
                 }
                 parsed => parsed.map_err(|error| at_offset(error, pos))?,
@@ -2530,6 +2533,11 @@ where
                         TruncatedBlock::service(&service.name)
                     }
                     HEAD_END => TruncatedBlock::End,
+                    HEAD_FILE if options.salvages() => {
+                        let file = parse_file_header_bytes(&parsed)
+                            .map_err(|error| at_offset(error, pos))?;
+                        TruncatedBlock::Member(file.name)
+                    }
                     HEAD_FILE | HEAD_MAIN | HEAD_CRYPT => {
                         return Err(at_offset(Error::TooShort, pos))
                     }
@@ -2618,11 +2626,11 @@ const CUT_HEADER_PEEK: usize = 256;
 /// What the block header at the start of `rest` is, when the end of the file
 /// cuts it short. `rest` holds up to [`CUT_HEADER_PEEK`] of the `remaining`
 /// bytes before the end. `None` when the header is whole, so its error is not a
-/// cut; `Some(None)` for a cut file header, whose member is lost.
+/// cut. A cut file header is a [`TruncatedBlock::Member`]: its member is lost.
 ///
 /// The header CRC can't be checked, so the type and name are a best reading.
-fn cut_header_block(rest: &[u8], remaining: usize) -> Option<Option<TruncatedBlock>> {
-    let unknown = Some(Some(TruncatedBlock::Unknown));
+fn cut_header_block(rest: &[u8], remaining: usize) -> Option<TruncatedBlock> {
+    let unknown = Some(TruncatedBlock::Unknown);
     let whole = rest.len() == remaining;
     let Ok((size, size_len)) = read_vint_at(rest, 4, rest.len()) else {
         return if whole { unknown } else { None };
@@ -2641,12 +2649,11 @@ fn cut_header_block(rest: &[u8], remaining: usize) -> Option<Option<TruncatedBlo
         return unknown;
     };
     match header_type {
-        HEAD_FILE => return Some(None),
-        HEAD_END => return Some(Some(TruncatedBlock::End)),
-        HEAD_SERVICE => {}
+        HEAD_END => return Some(TruncatedBlock::End),
+        HEAD_FILE | HEAD_SERVICE => {}
         _ => return unknown,
     }
-    // The fields before a service header's name, as parse_file_header_bytes reads them.
+    // The fields before a file or service header's name, as parse_file_header_bytes reads them.
     let mut name = || {
         let flags = vint(&mut pos)?;
         for present in [flags & HFL_EXTRA != 0, flags & HFL_DATA != 0] {
@@ -2667,8 +2674,12 @@ fn cut_header_block(rest: &[u8], remaining: usize) -> Option<Option<TruncatedBlo
         let len = usize::try_from(vint(&mut pos)?).ok()?;
         rest.get(pos..pos.checked_add(len)?)
     };
-    let name = name();
-    Some(Some(TruncatedBlock::service(name.unwrap_or_default())))
+    let name = name().unwrap_or_default();
+    Some(if header_type == HEAD_FILE {
+        TruncatedBlock::Member(name.to_vec())
+    } else {
+        TruncatedBlock::service(name)
+    })
 }
 
 /// Walks the records of a RAR 5 extra area, handing each one to `handle`.

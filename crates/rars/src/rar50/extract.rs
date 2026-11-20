@@ -12,6 +12,7 @@ use crate::crc32::{crc32, Crc32};
 use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 use crate::error::{Error, Result};
+use crate::extraction_control::{finish_independent, holds_for_handler};
 use crate::member_batches::{self, Plan};
 use crate::output_pipeline::{self, PipeError};
 use crate::volume_extract::VolumeFeed;
@@ -937,8 +938,9 @@ impl Archive {
             DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
         session.decoder.read_control = budget.control.clone();
         session.scratch = options.rar50_scratch;
-        let solid = selector.is_some()
-            && (self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0));
+        let archive_solid =
+            self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0);
+        let solid = selector.is_some() && archive_solid;
         for file in self.files() {
             let selected = crate::extraction_control::select(
                 &mut selector,
@@ -982,20 +984,24 @@ impl Archive {
                     }
                 })
             })();
-            if crate::extraction_control::finish_member(
+            match crate::extraction_control::finish_member(
                 &mut on_error,
                 options,
                 || crate::rar50_member(file),
-                solid,
+                archive_solid,
                 result,
             )? {
-                session = DecoderSession::with_allowance(
-                    options.password,
-                    buffered_decode_limit,
-                    allowance,
-                );
-                session.decoder.read_control = budget.control.clone();
-                session.scratch = options.rar50_scratch;
+                Some(crate::extraction_control::Resume::Fresh) => {
+                    session = DecoderSession::with_allowance(
+                        options.password,
+                        buffered_decode_limit,
+                        allowance,
+                    );
+                    session.decoder.read_control = budget.control.clone();
+                    session.scratch = options.rar50_scratch;
+                }
+                Some(crate::extraction_control::Resume::Solid) => session.passed_over(),
+                None => {}
             }
         }
         options.check_cancelled()?;
@@ -1165,27 +1171,38 @@ impl Archive {
                     hint,
                     || options.check_cancelled(),
                     |file, local| {
-                        decode_parallel_entry(
+                        let decoded = decode_parallel_entry(
                             self,
                             file,
                             buffered_decode_limit,
                             options,
                             verification,
                             local,
-                        )
+                        );
+                        match decoded {
+                            Err(error) if !holds_for_handler(&options, &error) => Err(error),
+                            decoded => Ok((file, decoded)),
+                        }
                     },
-                    |open, entry| {
-                        member_batches::publish(
-                            entry,
-                            open,
-                            &publication,
-                            |meta| meta.name.clone(),
-                            |_, _| Ok(false),
-                        )
+                    |open, (file, entry)| {
+                        let published = entry.and_then(|entry| {
+                            member_batches::publish(
+                                entry,
+                                open,
+                                &publication,
+                                |meta| meta.name.clone(),
+                                |_, _| Ok(false),
+                            )
+                        });
+                        finish_independent(options, || crate::rar50_member(file), published)
                     },
                 )
             },
-            |open, file| self.extract_inline(file, options, buffered_decode_limit, allowance, open),
+            |open, file| {
+                let extracted =
+                    self.extract_inline(file, options, buffered_decode_limit, allowance, open);
+                finish_independent(options, || crate::rar50_member(file), extracted)
+            },
         )
     }
 }
@@ -1284,6 +1301,12 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         }
     }
 
+    /// Carries on past a failed member: a solid successor continues from the
+    /// history it left.
+    fn passed_over(&mut self) {
+        self.solid_chain_broken = false;
+    }
+
     fn guard_solid_chain<T>(
         &mut self,
         file: &FileHeader,
@@ -1357,7 +1380,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
                 &self.allowance,
             )
             .map_err(|error| file.entry_error("reading", error))?;
-        file.stream_packed_with_crc_policy::<true, _, _>(
+        let result = file.stream_packed_with_crc_policy::<true, _, _>(
             &mut packed,
             keys.as_ref(),
             &mut streaming_decoder,
@@ -1365,10 +1388,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             self.scratch,
             None,
             writer,
-        )
-        .map_err(|error| file.entry_error("decoding", error))?;
+        );
+        // A failed member's history is kept for a caller that goes past it.
         self.decoder = streaming_decoder;
-        Ok(())
+        result.map_err(|error| file.entry_error("decoding", error))
     }
 
     fn decoded_file_data(

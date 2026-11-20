@@ -32,39 +32,92 @@ pub enum ExtractionErrorAction {
 pub(crate) type ErrorHandler<'a> =
     dyn FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction> + 'a;
 
-/// Returns true only when an independent member failure was explicitly accepted.
+/// The handler [`ArchiveReadOptions::with_member_error_handler`] sets.
+#[derive(Clone, Copy)]
+pub(crate) struct MemberErrorHandler<'a>(
+    pub(crate) &'a (dyn Fn(&ArchiveMember, &Error) -> Result<ExtractionErrorAction> + Sync),
+);
+
+impl std::fmt::Debug for MemberErrorHandler<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MemberErrorHandler(..)")
+    }
+}
+
+/// How the next member starts after a failed one the caller chose to pass over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// From fresh decoder state.
+    Fresh,
+    /// From the decoder state the failed member left, as unrar does, so a
+    /// solid successor keeps what history there is.
+    Solid,
+}
+
+/// `None` when the member succeeded. Otherwise asks a handler whether to carry
+/// on past it: the one passed to [`crate::Archive::extract_with_control_and_errors`],
+/// which refuses solid members, or else the one in the read options. With
+/// neither, or when the handler aborts, returns the error.
 pub(crate) fn finish_member(
     handler: &mut Option<&mut ErrorHandler<'_>>,
     options: ArchiveReadOptions<'_>,
     member: impl FnOnce() -> ArchiveMember,
     solid: bool,
     result: Result<()>,
-) -> Result<bool> {
+) -> Result<Option<Resume>> {
     let Err(error) = result else {
-        return Ok(false);
+        return Ok(None);
     };
-    if solid
-        || matches!(
-            error.kind(),
-            crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
-        )
-    {
+    if matches!(
+        error.kind(),
+        crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+    ) {
         return Err(error);
     }
-    let Some(handler) = handler.as_mut() else {
+    let explicit = handler.is_some();
+    if explicit && solid {
         return Err(error);
-    };
+    }
+    if !explicit && options.member_errors.is_none() {
+        return Err(error);
+    }
     options.check_cancelled()?;
     let member = member();
     if member.meta.is_split_before || member.meta.is_split_after {
         return Err(error);
     }
-    let action = handler(&member, &error)?;
+    let action = match (handler.as_mut(), options.member_errors) {
+        (Some(handler), _) => handler(&member, &error)?,
+        (None, Some(MemberErrorHandler(handler))) => handler(&member, &error)?,
+        (None, None) => unreachable!("checked above"),
+    };
     options.check_cancelled()?;
     match action {
         ExtractionErrorAction::Abort => Err(error),
-        ExtractionErrorAction::Continue => Ok(true),
+        ExtractionErrorAction::Continue if solid => Ok(Some(Resume::Solid)),
+        ExtractionErrorAction::Continue => Ok(Some(Resume::Fresh)),
     }
+}
+
+/// [`finish_member`] for an independent member, decoded with state of its
+/// own, so nothing carries over to the next one.
+pub(crate) fn finish_independent(
+    options: ArchiveReadOptions<'_>,
+    member: impl FnOnce() -> ArchiveMember,
+    result: Result<()>,
+) -> Result<()> {
+    finish_member(&mut None, options, member, false, result).map(|_| ())
+}
+
+/// Whether a worker's error is held for the member error handler, to be
+/// raised in archive order, instead of stopping the batch. Cancellation and
+/// resource limits always stop it.
+pub(crate) fn holds_for_handler(options: &ArchiveReadOptions<'_>, error: &Error) -> bool {
+    options.member_errors.is_some()
+        && !matches!(
+            error.kind(),
+            crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
+        )
 }
 
 pub(crate) type Selector<'a> = dyn FnMut(&ArchiveMember) -> Result<ExtractionDecision> + 'a;

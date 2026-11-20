@@ -5,7 +5,10 @@ use std::fmt;
 /// Where an archive's file was cut short, found while reading its blocks.
 ///
 /// Every member listed before the cut is whole and can be tested and
-/// extracted. A cut through a file header or member data is an error instead.
+/// extracted. A cut through a file header or member data is an error instead,
+/// unless the archive was read with a member error handler (see
+/// [`crate::ArchiveReadOptions::with_member_error_handler`]); then it ends the
+/// archive here as [`TruncatedBlock::Member`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Truncation {
@@ -21,6 +24,9 @@ pub struct Truncation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TruncatedBlock {
+    /// A member whose file header or data the cut goes through, by stored
+    /// name. Empty when the cut leaves no name.
+    Member(Vec<u8>),
     /// The recovery record.
     RecoveryRecord,
     /// A service block other than the recovery record, by stored name, such
@@ -59,6 +65,14 @@ impl TruncatedBlock {
 impl fmt::Display for TruncatedBlock {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Member(name) if name.is_empty() => f.write_str("a file header"),
+            Self::Member(name) => {
+                write!(
+                    f,
+                    "member '{}'",
+                    String::from_utf8_lossy(name).escape_debug()
+                )
+            }
             Self::RecoveryRecord => f.write_str("the recovery record"),
             Self::Service(name) if name.is_empty() => f.write_str("a service block"),
             Self::Service(name) => {
