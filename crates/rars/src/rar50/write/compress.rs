@@ -625,6 +625,7 @@ pub(super) fn compress_members_with_context(
         }
         ExecutionPlan::Blocks {
             workspace,
+            admission,
             run_filters,
         } => compress_streaming_members(
             sources,
@@ -632,6 +633,7 @@ pub(super) fn compress_members_with_context(
             plan,
             run_filters,
             workspace,
+            admission,
             resources,
             advance,
             error_context,
@@ -674,17 +676,29 @@ fn compress_streaming_members(
     plan: &CompressPlan,
     run_filters: bool,
     required: u64,
+    admission: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<Records<Spool>> {
-    let max_jobs_by_memory = resources.memory_limit() / required;
-    if max_jobs_by_memory == 0 {
+    if resources.memory_limit() < required {
         resources
             .acquire_cancellable(required, plan.dictionary_size, &|| advance.is_cancelled())?;
         unreachable!("oversized workspace acquisition must fail");
     }
-    let batch_capacity = usize::try_from(max_jobs_by_memory)
+    // `required` decided the route and stays the floor for the budget, so a
+    // write fails or succeeds as before. How many jobs run at once never
+    // changes the archive, so a wave reserves what each job holds instead.
+    // A budget set with `max_memory_bytes` keeps its own ledger and per-job
+    // windows, charged the planning workspace as before.
+    let required = if resources.execution.is_some() {
+        required
+    } else {
+        // Admission can be above the planning charge, as at level 5. When it
+        // is above the whole budget, one job at a time takes all of it.
+        admission.min(resources.memory_limit())
+    };
+    let batch_capacity = usize::try_from(resources.memory_limit() / required)
         .unwrap_or(usize::MAX)
         .min(crate::parallel::threads())
         .max(1);
@@ -803,6 +817,11 @@ fn compress_members_whole(
                 .map(|member| member.workspace)
                 .max()
                 .unwrap_or(0);
+            let admission = members[start..end]
+                .iter()
+                .map(|member| member.admission)
+                .max()
+                .unwrap_or(0);
             for member in compress_fallback_members(
                 start,
                 &sources[start..end],
@@ -810,6 +829,7 @@ fn compress_members_whole(
                 plan,
                 run_filters,
                 required,
+                admission,
                 resources,
                 advance,
                 error_context,
@@ -1050,6 +1070,7 @@ fn compress_fallback_members(
     plan: &CompressPlan,
     run_filters: bool,
     required: u64,
+    admission: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
@@ -1082,6 +1103,7 @@ fn compress_fallback_members(
         plan,
         run_filters,
         required,
+        admission,
         resources,
         &Remapped {
             first,
@@ -2513,6 +2535,7 @@ mod tests {
                     &plan,
                     false,
                     0,
+                    0,
                     &resources,
                     progress,
                     &|_, error| error,
@@ -2529,6 +2552,7 @@ mod tests {
         let whole = |workspace| MemberPlan {
             execution: Execution::WholeMember,
             workspace,
+            admission: workspace,
         };
         let members = [whole(60), whole(40), whole(1), whole(u64::MAX)];
         assert_eq!(whole_member_wave(&members, 0, 4, 100), (2, 100));
@@ -2544,6 +2568,7 @@ mod tests {
                 run_filters: false,
             },
             workspace: 10,
+            admission: 10,
         };
         assert_eq!(
             whole_member_wave(&[whole(0), fallback, whole(0)], 0, 4, 0),
@@ -4018,5 +4043,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A filtered run's filter search was charged as if it coded a member
+    /// whole, which took a wave of them below the jobs the budget had room
+    /// for (#315). Here a run is 1 MiB and its search 168 MiB as planned,
+    /// while a job is admitted for 119 MiB: a 360 MiB budget runs three at
+    /// once rather than two. The first wave has read its jobs' runs before
+    /// any of them reports coding progress, so its size shows in the reads.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn filtered_runs_are_admitted_for_what_they_hold_not_their_planning_charge() {
+        use std::sync::{atomic::AtomicUsize, Arc};
+        struct Counted(std::io::Cursor<Arc<[u8]>>, Arc<AtomicUsize>);
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let read = self.0.read(buf)?;
+                self.1.fetch_add(read, Ordering::SeqCst);
+                Ok(read)
+            }
+        }
+        impl std::io::Seek for Counted {
+            fn seek(&mut self, to: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.0.seek(to)
+            }
+        }
+        const MIB: u64 = 1024 * 1024;
+        let scratch = crate::scratch::case("filtered-run-admission");
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(65536)
+            .with_optimal_parse(true);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options].into(),
+        };
+        let run = run_size(&plan);
+        assert_eq!(run as u64, MIB);
+        // Not text, so every run is searched.
+        let data: Arc<[u8]> = (0..3 * run).map(|i| (i * 71 % 251) as u8).collect();
+        let read = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<_> = (0..2)
+            .map(|_| {
+                let (data, read) = (data.clone(), read.clone());
+                EntrySource::from_opener(data.len() as u64, move || {
+                    Ok(Box::new(Counted(
+                        std::io::Cursor::new(data.clone()),
+                        read.clone(),
+                    )))
+                })
+            })
+            .collect();
+        // Too large to code whole, small enough to search each run.
+        let resources = WriterResources::new(170 * MIB)
+            .with_memory_limit(360 * MIB)
+            .with_temp_dir(&*scratch);
+        let ExecutionPlan::IndependentMembers(members) =
+            ExecutionPlan::with_resources(&plan, [data.len() as u64].into_iter(), &resources)
+                .unwrap()
+        else {
+            panic!("independent members are planned one by one");
+        };
+        assert!(matches!(
+            members[0].execution,
+            Execution::Blocks {
+                run_filters: true,
+                ..
+            }
+        ));
+        assert_eq!(360 * MIB / members[0].workspace, 2);
+        let first_wave = AtomicUsize::new(0);
+        let progress = |bytes: u64| {
+            if bytes > 0 && first_wave.load(Ordering::SeqCst) == 0 {
+                first_wave.store(read.load(Ordering::SeqCst), Ordering::SeqCst);
+            }
+            true
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            compress_members_with_context(&sources, &plan, &resources, &progress, &|_, e| e)
+        })
+        .unwrap();
+        assert_eq!(first_wave.load(Ordering::SeqCst) / run, 3);
+        assert_eq!(resources.workspace_in_use(), 0);
     }
 }

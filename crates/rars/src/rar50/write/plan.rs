@@ -86,6 +86,9 @@ pub(super) struct MemberPlan {
     pub(super) execution: Execution,
     /// Whole-member workspace or one streaming job's workspace, never both.
     pub(super) workspace: u64,
+    /// What one of its block jobs is admitted for: see [`block_admission`].
+    /// A whole member is admitted for its `workspace`.
+    pub(super) admission: u64,
 }
 
 pub(super) enum ExecutionPlan {
@@ -94,6 +97,8 @@ pub(super) enum ExecutionPlan {
     /// filter search fits the budget beside it.
     Blocks {
         workspace: u64,
+        /// What each job is admitted for: see [`block_admission`].
+        admission: u64,
         run_filters: bool,
     },
     IndependentMembers(Records<MemberPlan>),
@@ -143,6 +148,7 @@ impl ExecutionPlan {
                 } else {
                     workspace
                 },
+                admission: block_admission(settings, true, largest, run_filters),
                 run_filters,
             });
         }
@@ -169,6 +175,7 @@ impl ExecutionPlan {
                     return Ok(MemberPlan {
                         execution: Execution::WholeMember,
                         workspace: required,
+                        admission: required,
                     });
                 };
                 let blocks = streaming_workspace(settings, false, size);
@@ -189,6 +196,7 @@ impl ExecutionPlan {
                     } else {
                         blocks
                     },
+                    admission: block_admission(settings, false, size, run_filters),
                 })
             }),
             resources,
@@ -223,6 +231,78 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
         input.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
         optimal,
     )
+}
+
+/// What one block job is admitted for when the writer decides how many run at
+/// once: the budget divided by this, up to the thread count. Unlike the
+/// planning charges above, it decides nothing about the output, so it can
+/// follow what a job holds rather than what a member would hold coded whole.
+///
+/// A job's peak is the larger of its two phases, plus what the coordinator
+/// keeps for it through both:
+///
+/// - **Coding the run.** The streaming charge, which #407 measured job by job:
+///   finder links over the window, the window itself and up to a block's
+///   worth of match runs, worst on noise of two to four symbols.
+/// - **Searching its filters.** One search at a time per job, over a piece of
+///   at most [`FILTER_SEARCH_BYTES`] coded without history: the same parts
+///   over the piece, plus its filtered copy and the packed finalists. The
+///   planning charge prices this search as a whole member, with the tree's
+///   coefficients and four copies of the piece, which is why a filtered job
+///   was charged 247 MiB at a 4 MiB dictionary while peaking near 130.
+/// - **Held by the coordinator.** The member's history kept for its next run,
+///   and the run's bytes while its filters are searched. The planning charge
+///   leaves these out, and at 16 MiB they took a single job past it.
+///
+/// Live allocation peaks in MiB, counted by a global allocator over a whole
+/// write at one thread, where each wave holds one job, on members two and a
+/// half runs long:
+///
+/// ```text
+/// input                level 3, 4 MiB   level 4, 8 MiB   level 5, 16 MiB
+/// text                       55.5                            188.1
+/// shared libraries           57.3                            221.2
+/// random                     54.2                            198.2
+/// all zeros                  68.7                            200.7
+/// eight-symbol noise         57.2                            200.9
+/// four-symbol noise         128.3                            260.3
+/// two-symbol noise          130.9            174.9           263.0
+/// three-symbol noise        133.7            178.4           268.2
+/// filter search alone       133.4            143.3           167.3
+/// charged here           159 (151 unfiltered)  195           283
+/// planning charge        247 (143 unfiltered)  247 (179)     251
+/// ```
+///
+/// Several jobs of one member share a window, so a wave of them peaks below
+/// as many lone jobs: at four threads, two-symbol noise peaked at 117.8 MiB a
+/// job at level 3, and 225.7 at level 5. A wave still reserves this for every
+/// job it could hold.
+///
+/// At level 5 this is above the planning charge. One thread's default budget,
+/// 256 MiB, is below it, so a lone job is given the whole budget there, and
+/// on noise peaks past it as it did before. What glibc keeps after a free is
+/// not counted here, as in the other charges.
+pub(super) fn block_admission(
+    settings: &CompressPlan,
+    include_candidates: bool,
+    input: u64,
+    run_filters: bool,
+) -> u64 {
+    let code = streaming_workspace(settings, include_candidates, input);
+    let search = if run_filters {
+        let piece = input.min(search_piece(settings));
+        super::streaming_lz_workspace(
+            piece,
+            piece.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
+            settings.encode_options.optimal_parse,
+        )
+        .saturating_add(piece.saturating_mul(2))
+    } else {
+        0
+    };
+    let history = (settings.encode_options.max_match_distance as u64).min(input);
+    let run = (super::compress::run_size(settings) as u64).min(input);
+    code.max(search).saturating_add(history).saturating_add(run)
 }
 
 #[derive(Debug)]
@@ -401,12 +481,12 @@ mod tests {
         let roomy = ExecutionPlan::new(&settings, sizes(), search);
         assert!(matches!(
             roomy,
-            ExecutionPlan::Blocks { workspace, run_filters: true } if workspace == search
+            ExecutionPlan::Blocks { workspace, run_filters: true, .. } if workspace == search
         ));
         let tight = ExecutionPlan::new(&settings, sizes(), search - 1);
         assert!(matches!(
             tight,
-            ExecutionPlan::Blocks { workspace, run_filters: false } if workspace == streaming
+            ExecutionPlan::Blocks { workspace, run_filters: false, .. } if workspace == streaming
         ));
 
         // Only the automatic policy searches. A chain has nowhere to put a
@@ -415,7 +495,7 @@ mod tests {
         let unfiltered = ExecutionPlan::new(&settings, sizes(), u64::MAX);
         assert!(matches!(
             unfiltered,
-            ExecutionPlan::Blocks { workspace, run_filters: false } if workspace == streaming
+            ExecutionPlan::Blocks { workspace, run_filters: false, .. } if workspace == streaming
         ));
 
         // Members that do not share a window are planned one by one, and
@@ -444,6 +524,48 @@ mod tests {
         settings.solid = true;
         let solid = ExecutionPlan::new(&settings, [16, u64::MAX].into_iter(), u64::MAX);
         assert!(matches!(solid, ExecutionPlan::Blocks { workspace, .. } if workspace > 0));
+    }
+
+    /// #315's acceptance: with automatic filters at level 3, the default
+    /// budget admits a job per thread at every thread count, where the
+    /// planning charge admitted 5 of 8 and 21 of 32.
+    #[test]
+    fn filtered_jobs_fill_every_thread_of_the_default_budget() {
+        use crate::streaming::{DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_MEMORY_PER_THREAD};
+        let dictionary = 4 * 1024 * 1024;
+        let options =
+            super::super::filter_policy::encode_options_for_level(Some(3), dictionary).unwrap();
+        let settings = CompressPlan {
+            encode_options: options,
+            dictionary_size: dictionary,
+            candidates: vec![options].into(),
+            ..settings()
+        };
+        let size = 256 * 1024 * 1024;
+        for threads in 1..=32u64 {
+            let budget =
+                DEFAULT_WRITER_MEMORY_LIMIT + (threads - 1) * DEFAULT_WRITER_MEMORY_PER_THREAD;
+            let resources = WriterResources::default().with_memory_limit(budget);
+            let plan =
+                ExecutionPlan::with_resources(&settings, [size].into_iter(), &resources).unwrap();
+            let member = plan.members()[0];
+            assert_eq!(
+                member.execution,
+                Execution::Blocks {
+                    fallback: FallbackReason::AutomaticFilterWorkspace {
+                        required: whole_member_workspace(size, &settings),
+                        limit: DEFAULT_WRITER_MEMORY_LIMIT,
+                    },
+                    run_filters: true,
+                }
+            );
+            assert!(budget / member.admission >= threads);
+            match threads {
+                8 => assert_eq!(budget / member.workspace, 5),
+                32 => assert_eq!(budget / member.workspace, 21),
+                _ => {}
+            }
+        }
     }
 
     #[test]
