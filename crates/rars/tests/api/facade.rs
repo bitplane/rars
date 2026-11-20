@@ -1,3 +1,4 @@
+use super::support::CollectWriter;
 use rars::*;
 use std::{
     cell::RefCell,
@@ -5,10 +6,6 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
 };
-
-struct CollectWriter {
-    data: Rc<RefCell<Vec<u8>>>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 // Historical numeric snapshots; timestamp presence has dedicated regression tests.
@@ -26,23 +23,12 @@ fn rar15_40_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-impl Write for CollectWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.data.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn collect_extract(archive: &Archive, password: Option<&[u8]>) -> Result<Vec<CollectedEntry>> {
     let entries = RefCell::new(Vec::new());
     archive.extract_to(password, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
-        Ok(Box::new(CollectWriter { data }))
+        Ok(Box::new(CollectWriter(data)))
     })?;
     Ok(entries
         .into_inner()

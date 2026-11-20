@@ -1,3 +1,4 @@
+use super::support::CollectWriter;
 use rars::rar50::{
     write_streaming_archive_to, Archive, ArchiveEntry, ArchiveExtras, FilterPolicy, Rar50Writer,
     WriterOptions,
@@ -10,7 +11,7 @@ use rars::{
 };
 use std::{
     cell::RefCell,
-    io::{Cursor, Result as IoResult, Write},
+    io::{Cursor, Write},
     rc::Rc,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -177,8 +178,6 @@ fn empty_volume_set_is_rejected_before_opening_a_sink() {
     assert!(sink.take().is_empty());
 }
 
-struct CollectWriter(Rc<RefCell<Vec<u8>>>);
-
 #[test]
 fn stored_writer_does_not_require_lz_workspace() {
     let data = b"stored payload".repeat(1024);
@@ -304,17 +303,6 @@ fn recovery_writer_reports_determinate_pass_progress() {
         starts.load(Ordering::Relaxed),
         finishes.load(Ordering::Relaxed)
     );
-}
-
-impl Write for CollectWriter {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.0.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        Ok(())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
