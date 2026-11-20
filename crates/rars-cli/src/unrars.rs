@@ -286,7 +286,10 @@ fn run(invocation: &Invocation) -> i32 {
         password = prompt_password();
     }
     match invocation.command {
-        Command::List { bare } => list(&path, &archive, bare),
+        Command::List { bare } => match list(&path, &archive, bare) {
+            OK if report_truncation(out, archive.truncation()) => WARNING,
+            code => code,
+        },
         _ => run_members(
             invocation,
             out,
@@ -534,6 +537,9 @@ fn run_members(
     };
     announce(path);
     let mut index = 1;
+    // The first volume that ends early, of those after the first.
+    let truncated = std::sync::Mutex::new(None);
+    let later_truncation = &truncated;
     let volumes = std::iter::from_fn(move || {
         let next = archive.volume_path(path, index)?;
         if !next.exists() {
@@ -541,10 +547,16 @@ fn run_members(
         }
         index += 1;
         announce(&next);
-        Some(ArchiveReader::read_path_with_options(
+        let volume = ArchiveReader::read_path_with_options(
             &next,
             ArchiveReadOptions::with_optional_password(password),
-        ))
+        );
+        if let Some(truncation) = volume.as_ref().ok().and_then(Archive::truncation) {
+            if let Ok(mut truncated) = later_truncation.lock() {
+                truncated.get_or_insert_with(|| truncation.clone());
+            }
+        }
+        Some(volume)
     });
     let matched = Cell::new(0usize);
     let select = |meta: &rars::ExtractedEntryMeta| {
@@ -567,7 +579,14 @@ fn run_members(
                 out.info("No files to extract");
                 return NO_FILES;
             }
-            if warnings {
+            let later = truncated
+                .lock()
+                .ok()
+                .and_then(|mut truncated| truncated.take());
+            if report_truncation(out, archive.truncation().or(later.as_ref())) {
+                out.info("Total errors: 1");
+                WARNING
+            } else if warnings {
                 WARNING
             } else {
                 OK
@@ -690,6 +709,27 @@ where
     )?;
     passed();
     Ok(false)
+}
+
+/// Says that an archive ends early, as unrar does, after its members are done.
+fn report_truncation(out: Out, truncation: Option<&rars::Truncation>) -> bool {
+    let Some(truncation) = truncation else {
+        return false;
+    };
+    out.error("Unexpected end of archive");
+    match &truncation.block {
+        rars::TruncatedBlock::RecoveryRecord => {
+            out.error("Truncated at the service block: recovery record");
+        }
+        rars::TruncatedBlock::Service(name) if !name.is_empty() => {
+            out.error(&format!(
+                "Truncated at the service block: {}",
+                display_name(name)
+            ));
+        }
+        _ => {}
+    }
+    true
 }
 
 fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error) -> i32 {

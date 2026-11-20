@@ -192,6 +192,10 @@ pub(crate) fn incomplete_member_warning(volume: &Path, member: &rars::Incomplete
     )
 }
 
+pub(crate) fn truncation_warning(path: &Path, truncation: &rars::Truncation) -> String {
+    format!("warning: {}: archive is {truncation}", path.display())
+}
+
 pub(crate) fn skipped_link_warning(name: &[u8], target: &[u8]) -> String {
     format!(
         "warning: skipping link '{}' -> '{}': it would point outside the output directory",

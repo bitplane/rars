@@ -6865,6 +6865,126 @@ fn sfx_cut_inside_trailing_recovery_record_still_tests() {
     ));
 }
 
+/// Issue #433: a RAR 1.5-4 archive cut after its last member, inside a
+/// trailing recovery record or end block, still reads every member, from
+/// memory and from a path, and says where it ends. A file that stops at a
+/// block boundary is not counted as cut, since RAR 1.5 to 2.x wrote no end
+/// block. A cut through a member's header or data is still an error.
+#[test]
+#[cfg(feature = "write")]
+fn cut_after_the_last_member_reads_it_and_says_where() {
+    use rars::{TruncatedBlock, Truncation};
+
+    let first = b"issue 433 synthetic payload, first member\n".repeat(128);
+    let second: Vec<u8> = (0..4000u32).map(|i| (i * 7 + i / 13) as u8).collect();
+    let entry = |name, data| FileEntry {
+        name,
+        data,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 2,
+        password: None,
+        file_comment: None,
+    };
+    let entries = [
+        entry(&b"first.txt"[..], &first[..]),
+        entry(b"second.bin", &second),
+    ];
+    // An "RR" service header declaring 4 KiB of data, as #429's test builds it.
+    let mut recovery = vec![0u8; 34];
+    recovery[2] = 0x7a;
+    recovery[3..5].copy_from_slice(&0xc000u16.to_le_bytes());
+    recovery[5..7].copy_from_slice(&34u16.to_le_bytes());
+    recovery[7..11].copy_from_slice(&4096u32.to_le_bytes());
+    recovery[11..15].copy_from_slice(&4096u32.to_le_bytes());
+    recovery[15] = 2;
+    recovery[24] = 29;
+    recovery[25] = 0x30;
+    recovery[26..28].copy_from_slice(&2u16.to_le_bytes());
+    recovery[32..34].copy_from_slice(b"RR");
+    let header_crc = (crc32(&recovery[2..]) & 0xffff) as u16;
+    recovery[..2].copy_from_slice(&header_crc.to_le_bytes());
+
+    let root = scratch::case("rar15-cut-after-members");
+    let path = root.join("cut.rar");
+    let read = |bytes: &[u8]| {
+        std::fs::write(&path, bytes).unwrap();
+        [Archive::parse(bytes), Archive::parse_path(&path)]
+    };
+    for version in [ArchiveVersion::Rar15, ArchiveVersion::Rar29] {
+        let written = write_compressed_archive(
+            &entries,
+            WriterOptions::new(version, FeatureSet::store_only()),
+        )
+        .unwrap();
+        let whole = Archive::parse(&written).unwrap();
+        assert_eq!(whole.truncation(), None);
+        let end = whole.blocks.iter().find_map(|block| match block {
+            Block::End(end) => Some(end.block.offset),
+            _ => None,
+        });
+        let members_end = end.unwrap_or(written.len());
+        // The recovery record goes where WinRAR puts it, before the end block.
+        let mut with_recovery = written[..members_end].to_vec();
+        with_recovery.extend_from_slice(&recovery);
+        with_recovery.resize(with_recovery.len() + 4096, 0xa5);
+        with_recovery.extend_from_slice(&written[members_end..]);
+        let rr = members_end;
+
+        // The bytes, where to cut them, and the block and offset that reports.
+        type Case<'a> = (&'a [u8], usize, Option<(TruncatedBlock, usize)>);
+        let mut cases: Vec<Case> = vec![
+            (
+                &with_recovery,
+                rr + 34 + 100,
+                Some((TruncatedBlock::RecoveryRecord, rr)),
+            ),
+            // Too little of the header is left to read the name.
+            (
+                &with_recovery,
+                rr + 20,
+                Some((TruncatedBlock::Service(Vec::new()), rr)),
+            ),
+            // Under seven bytes, too few to trust the type.
+            (&with_recovery, rr + 4, Some((TruncatedBlock::Unknown, rr))),
+            // At a block boundary, as an archive with no end block ends.
+            (&with_recovery, rr, None),
+        ];
+        if let Some(end) = end {
+            cases.push((&written, end + 3, Some((TruncatedBlock::End, end))));
+            // Six bytes of the seven-byte end block, as some old self-extractors end.
+            cases.push((&written, end + 6, Some((TruncatedBlock::End, end))));
+            cases.push((&written, end, None));
+        }
+        for (bytes, cut, expected) in cases {
+            let context = format!("{version:?} cut at {cut} of {}", bytes.len());
+            for archive in read(&bytes[..cut]) {
+                let archive = archive.expect(&context);
+                let truncation = archive.truncation().map(|truncation: &Truncation| {
+                    assert!(truncation.started, "{context}");
+                    (truncation.block.clone(), truncation.offset as usize)
+                });
+                assert_eq!(truncation, expected, "{context}");
+                let extracted = collect_extract(&archive).unwrap();
+                assert_eq!(extracted.len(), 2, "{context}");
+                assert_eq!(extracted[0].data, first, "{context}");
+                assert_eq!(extracted[1].data, second, "{context}");
+            }
+        }
+
+        // Cuts through the last member's data and header lose it, so they fail.
+        let last = whole.files().last().unwrap();
+        for cut in [last.packed_range.end - 10, last.block.offset + 12] {
+            for result in read(&written[..cut]) {
+                assert!(
+                    matches!(result, Err(Error::TooShort)),
+                    "{version:?} cut at {cut}: {result:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[cfg(feature = "recovery")]
 fn intact_rar300_recovery_record_leaves_archive_unchanged() {

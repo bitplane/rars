@@ -11,6 +11,7 @@ use crate::io_util::align16 as checked_align16;
 use crate::io_util::read_exact_at;
 use crate::key_cache::KeyCache;
 pub(crate) use crate::source::ArchiveSource;
+use crate::truncation::{TruncatedBlock, Truncation};
 use crate::version::ArchiveFamily;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -91,6 +92,7 @@ pub struct Archive {
     source: ArchiveSource,
     // Shared with later volumes parsed in the same session, so keys outlive one call.
     pub(crate) key_cache: Arc<KeyCache>,
+    truncation: Option<Truncation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -677,23 +679,34 @@ impl Archive {
         options.check_cancelled()?;
         // parse_shared supplies the exact signature found in this buffer.
         let archive_len = input.len();
-        let (main, blocks) = parse_archive_blocks(
+        let data_limit = usize::MAX - sfx_offset;
+        let (main, blocks, truncation) = parse_archive_blocks(
             archive_len,
+            sfx_offset,
             options,
             &key_cache,
             |offset, budget| {
-                parse_block_header_bytes(input, offset, archive_len, sfx_offset, budget)
+                parse_block_header_bytes_to(
+                    input,
+                    offset,
+                    archive_len,
+                    sfx_offset,
+                    budget,
+                    data_limit,
+                )
             },
             |offset, keys, budget| {
-                parse_encrypted_block_header_bytes(
+                parse_encrypted_block_header_bytes_to(
                     input,
                     offset,
                     archive_len,
                     sfx_offset,
                     keys,
                     budget,
+                    data_limit,
                 )
             },
+            |offset| Ok(input[offset..archive_len.min(offset + CUT_HEADER_PEEK)].to_vec()),
         )?;
 
         options.check_cancelled()?;
@@ -703,6 +716,7 @@ impl Archive {
             blocks,
             source,
             key_cache,
+            truncation,
         })
     }
 
@@ -739,28 +753,36 @@ impl Archive {
 
         let control = crate::read_control::ReadControl::for_options(&options);
         let file_cell = std::cell::RefCell::new(control.reader(file));
-        let (main, blocks) = parse_archive_blocks(
+        let data_limit = usize::MAX - sfx_offset;
+        let (main, blocks, truncation) = parse_archive_blocks(
             archive_len,
+            sfx_offset,
             options,
             &key_cache,
             |offset, budget| {
-                read_block_header_at(
+                read_block_header_at_to(
                     &mut *file_cell.borrow_mut(),
                     offset,
                     archive_len,
                     sfx_offset,
                     budget,
+                    data_limit,
                 )
             },
             |offset, keys, budget| {
-                read_encrypted_block_header_at(
+                read_encrypted_block_header_at_to(
                     &mut *file_cell.borrow_mut(),
                     offset,
                     archive_len,
                     sfx_offset,
                     keys,
                     budget,
+                    data_limit,
                 )
+            },
+            |offset| {
+                let len = archive_len.saturating_sub(offset).min(CUT_HEADER_PEEK);
+                read_exact_at(&mut *file_cell.borrow_mut(), sfx_offset + offset, len)
             },
         )?;
 
@@ -771,6 +793,7 @@ impl Archive {
             blocks,
             source,
             key_cache,
+            truncation,
         })
     }
 
@@ -785,6 +808,12 @@ impl Archive {
 
     fn range_reader(&self, range: Range<usize>) -> Result<crate::source::RangeReader<'_>> {
         self.source.range_reader(range)
+    }
+
+    /// Where the file ends early, when it is cut short after its last whole
+    /// member, such as inside the recovery record or before the end block.
+    pub fn truncation(&self) -> Option<&Truncation> {
+        self.truncation.as_ref()
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
@@ -899,7 +928,28 @@ impl Archive {
             options.check_cancelled()?;
             let password = options.password;
             let control = crate::read_control::ReadControl::for_options(&options);
-            let recovery = self.recovery_service()?;
+            let recovery = match self.recovery_service() {
+                Ok(recovery) => recovery,
+                // The end of the file cut the record short, so its header is
+                // gone from the walk. Find its chunks in the raw bytes, as for
+                // an archive that doesn't parse.
+                Err(_) if self.truncation.is_some() && self.sfx_offset == 0 => {
+                    let bytes = self.read_range(0..self.source_len()?)?;
+                    let options = crate::recovery::rar5::InlineRepairOptions {
+                        password,
+                        control: control.clone(),
+                        record_range: None,
+                    };
+                    let (data, report) =
+                        crate::recovery::rar5::repair_inline_recovery_archive_with_report(
+                            &bytes, &options,
+                        )?;
+                    control.finish(control.write_all(writer, &data).map_err(Error::from))?;
+                    control.check()?;
+                    return Ok(report);
+                }
+                Err(error) => return Err(error),
+            };
             let recovery_data = recovery.decoded_recovery_data(self, password, &control)?;
             let (available, expected) =
                 crate::recovery::rar5::inline_recovery_chunk_counts_with_control(
@@ -2372,16 +2422,24 @@ fn read_array_at<const N: usize>(input: &[u8], pos: &mut usize, end: usize) -> R
     Ok(out)
 }
 
-fn parse_archive_blocks<F, G>(
+/// Reads the blocks of an archive `archive_len` bytes long that starts at file
+/// offset `sfx_offset`. `read_block` and `read_encrypted_block` read one block
+/// header without checking that its data fits, and `peek` returns up to
+/// [`CUT_HEADER_PEEK`] bytes from an offset, so a block cut short by the end of
+/// the file can be told apart from a damaged one.
+fn parse_archive_blocks<F, G, H>(
     archive_len: usize,
+    sfx_offset: usize,
     options: crate::ArchiveReadOptions<'_>,
     key_cache: &KeyCache,
     mut read_block: F,
     mut read_encrypted_block: G,
-) -> Result<(MainHeader, Vec<Block>)>
+    mut peek: H,
+) -> Result<(MainHeader, Vec<Block>, Option<Truncation>)>
 where
     F: FnMut(usize, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
     G: FnMut(usize, &Rar50Keys, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
+    H: FnMut(usize) -> Result<Vec<u8>>,
 {
     options.check_cancelled()?;
     // Budget refusals already identify the header; do not duplicate its context.
@@ -2416,25 +2474,26 @@ where
     let mut main = parse_main_header_bytes(first).map_err(|error| at_offset(error, main_pos))?;
     main.encrypted_headers = header_keys.is_some();
     main.rewrite_metadata_complete &= header_metadata_complete;
-    // A file cut exactly at a block boundary otherwise parses as a smaller, sound archive.
-    if let Some(locator) = main.locator() {
-        let past_end = |offset: Option<u64>| {
-            offset.is_some_and(|offset| {
-                (main_pos as u64).saturating_add(offset) >= archive_len as u64
-            })
-        };
-        if past_end(locator.quick_open_offset) || past_end(locator.recovery_record_offset) {
-            return Err(at_offset(
-                Error::InvalidHeader(
-                    "RAR 5 main header locator points past the end of the archive",
-                ),
-                main_pos,
-            ));
-        }
+    if first.next_offset > archive_len {
+        return Err(at_offset(Error::TooShort, main_pos));
     }
+    // Where the locator says the quick-open and recovery blocks start, when
+    // that is at or past the end of the file.
+    let located_past_end = |offset: Option<u64>| {
+        offset
+            .map(|offset| (main_pos as u64).saturating_add(offset))
+            .filter(|&offset| offset >= archive_len as u64)
+    };
+    let (quick_open_due, recovery_due) = main.locator().map_or((None, None), |locator| {
+        (
+            located_past_end(locator.quick_open_offset),
+            located_past_end(locator.recovery_record_offset),
+        )
+    });
     pos = first.next_offset;
 
     let mut blocks = Vec::new();
+    let mut truncation = None;
     // Keys attach after the walk so distinct salts can derive side by side; a
     // header error found later still loses to an earlier member's key error.
     let mut crypto_headers = Vec::new();
@@ -2442,11 +2501,43 @@ where
         while pos < archive_len {
             let parsed = if let Some(keys) = &header_keys {
                 read_encrypted_block(pos, keys, &mut budget)
-                    .map_err(|error| at_offset(error, pos))?
             } else {
-                read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?
+                read_block(pos, &mut budget)
+            };
+            let parsed = match parsed {
+                // Only plaintext headers can be read when cut short.
+                Err(Error::TooShort) if header_keys.is_none() => {
+                    let rest = peek(pos).map_err(|error| at_offset(error, pos))?;
+                    match cut_header_block(&rest, archive_len - pos) {
+                        Some(Some(block)) => {
+                            truncation = Some(Truncation::new(sfx_offset + pos, block, true));
+                            break;
+                        }
+                        // A file header: its member is lost.
+                        Some(None) | None => return Err(at_offset(Error::TooShort, pos)),
+                    }
+                }
+                parsed => parsed.map_err(|error| at_offset(error, pos))?,
             };
             let next = parsed.next_offset;
+            if next > archive_len {
+                // The header is whole but its data is cut. A recovery record or
+                // other service block isn't needed to read the members before it.
+                let block = match parsed.block.header_type {
+                    HEAD_SERVICE => {
+                        let service = parse_file_header_bytes(&parsed)
+                            .map_err(|error| at_offset(error, pos))?;
+                        TruncatedBlock::service(&service.name)
+                    }
+                    HEAD_END => TruncatedBlock::End,
+                    HEAD_FILE | HEAD_MAIN | HEAD_CRYPT => {
+                        return Err(at_offset(Error::TooShort, pos))
+                    }
+                    _ => TruncatedBlock::Unknown,
+                };
+                truncation = Some(Truncation::new(sfx_offset + pos, block, true));
+                break;
+            }
             match parsed.block.header_type {
                 HEAD_FILE => {
                     let file =
@@ -2494,8 +2585,90 @@ where
     attach_crypto(&mut blocks, &crypto_headers, options, key_cache)?;
     walked?;
 
+    if truncation.is_none() && !matches!(blocks.last(), Some(Block::End(_))) {
+        // Every RAR 5 archive ends in an end block, so the file stops at a
+        // block boundary before it. When the locator puts a quick-open or
+        // recovery block exactly there, that block is what is missing. When it
+        // puts one further on, blocks in between are lost too, and they may be
+        // members, so the archive is refused.
+        let due = |located: Option<u64>| located == Some(pos as u64);
+        let block = if due(recovery_due) {
+            TruncatedBlock::RecoveryRecord
+        } else if due(quick_open_due) {
+            TruncatedBlock::service(b"QO")
+        } else if recovery_due.is_some() || quick_open_due.is_some() {
+            return Err(at_offset(
+                Error::InvalidHeader(
+                    "RAR 5 main header locator points past the end of the archive",
+                ),
+                main_pos,
+            ));
+        } else {
+            TruncatedBlock::End
+        };
+        truncation = Some(Truncation::new(sfx_offset + pos, block, false));
+    }
     main.rewrite_metadata_complete &= matches!(blocks.last(), Some(Block::End(_)));
-    Ok((main, blocks))
+    Ok((main, blocks, truncation))
+}
+
+/// How many bytes [`cut_header_block`] reads to name a block cut short.
+const CUT_HEADER_PEEK: usize = 256;
+
+/// What the block header at the start of `rest` is, when the end of the file
+/// cuts it short. `rest` holds up to [`CUT_HEADER_PEEK`] of the `remaining`
+/// bytes before the end. `None` when the header is whole, so its error is not a
+/// cut; `Some(None)` for a cut file header, whose member is lost.
+///
+/// The header CRC can't be checked, so the type and name are a best reading.
+fn cut_header_block(rest: &[u8], remaining: usize) -> Option<Option<TruncatedBlock>> {
+    let unknown = Some(Some(TruncatedBlock::Unknown));
+    let whole = rest.len() == remaining;
+    let Ok((size, size_len)) = read_vint_at(rest, 4, rest.len()) else {
+        return if whole { unknown } else { None };
+    };
+    let header_total = (4 + size_len) as u64 + size;
+    if header_total <= remaining as u64 {
+        return None;
+    }
+    let mut pos = 4 + size_len;
+    let vint = |pos: &mut usize| {
+        let (value, len) = read_vint_at(rest, *pos, rest.len()).ok()?;
+        *pos += len;
+        Some(value)
+    };
+    let Some(header_type) = vint(&mut pos) else {
+        return unknown;
+    };
+    match header_type {
+        HEAD_FILE => return Some(None),
+        HEAD_END => return Some(Some(TruncatedBlock::End)),
+        HEAD_SERVICE => {}
+        _ => return unknown,
+    }
+    // The fields before a service header's name, as parse_file_header_bytes reads them.
+    let mut name = || {
+        let flags = vint(&mut pos)?;
+        for present in [flags & HFL_EXTRA != 0, flags & HFL_DATA != 0] {
+            if present {
+                vint(&mut pos)?;
+            }
+        }
+        let file_flags = vint(&mut pos)?;
+        vint(&mut pos)?;
+        vint(&mut pos)?;
+        for flag in [FHFL_MTIME, FHFL_CRC32] {
+            if file_flags & flag != 0 {
+                pos += 4;
+            }
+        }
+        vint(&mut pos)?;
+        vint(&mut pos)?;
+        let len = usize::try_from(vint(&mut pos)?).ok()?;
+        rest.get(pos..pos.checked_add(len)?)
+    };
+    let name = name();
+    Some(Some(TruncatedBlock::service(name.unwrap_or_default())))
 }
 
 /// Walks the records of a RAR 5 extra area, handing each one to `handle`.
@@ -2575,6 +2748,17 @@ fn parse_block_header_bytes(
     sfx_offset: usize,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
+    parse_block_header_bytes_to(input, offset, archive_len, sfx_offset, budget, archive_len)
+}
+
+fn parse_block_header_bytes_to(
+    input: &[u8],
+    offset: usize,
+    archive_len: usize,
+    sfx_offset: usize,
+    budget: &mut crate::parse_budget::ParseBudget,
+    data_limit: usize,
+) -> Result<ParsedBlockHeader> {
     let remaining = archive_len.saturating_sub(offset);
     if remaining < 5 {
         return Err(Error::TooShort);
@@ -2603,7 +2787,7 @@ fn parse_block_header_bytes(
     parse_block_header_image(
         header,
         offset,
-        archive_len,
+        data_limit,
         sfx_offset,
         HeaderPrefix {
             crc: header_crc,
@@ -2615,6 +2799,7 @@ fn parse_block_header_bytes(
     )
 }
 
+#[cfg(feature = "encryption")]
 fn parse_encrypted_block_header_bytes(
     input: &[u8],
     offset: usize,
@@ -2623,9 +2808,37 @@ fn parse_encrypted_block_header_bytes(
     keys: &Rar50Keys,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
+    parse_encrypted_block_header_bytes_to(
+        input,
+        offset,
+        archive_len,
+        sfx_offset,
+        keys,
+        budget,
+        archive_len,
+    )
+}
+
+fn parse_encrypted_block_header_bytes_to(
+    input: &[u8],
+    offset: usize,
+    archive_len: usize,
+    sfx_offset: usize,
+    keys: &Rar50Keys,
+    budget: &mut crate::parse_budget::ParseBudget,
+    data_limit: usize,
+) -> Result<ParsedBlockHeader> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (input, offset, archive_len, sfx_offset, keys, budget);
+        let _ = (
+            input,
+            offset,
+            archive_len,
+            sfx_offset,
+            keys,
+            budget,
+            data_limit,
+        );
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
@@ -2677,7 +2890,7 @@ fn parse_encrypted_block_header_bytes(
         parse_block_header_image(
             header,
             offset,
-            archive_len,
+            data_limit,
             sfx_offset,
             HeaderPrefix {
                 crc: header_crc,
@@ -2690,12 +2903,24 @@ fn parse_encrypted_block_header_bytes(
     }
 }
 
+#[cfg(all(test, feature = "write"))]
 fn read_block_header_at(
     file: &mut (impl Read + std::io::Seek),
     offset: usize,
     archive_len: usize,
     sfx_offset: usize,
     budget: &mut crate::parse_budget::ParseBudget,
+) -> Result<ParsedBlockHeader> {
+    read_block_header_at_to(file, offset, archive_len, sfx_offset, budget, archive_len)
+}
+
+fn read_block_header_at_to(
+    file: &mut (impl Read + std::io::Seek),
+    offset: usize,
+    archive_len: usize,
+    sfx_offset: usize,
+    budget: &mut crate::parse_budget::ParseBudget,
+    data_limit: usize,
 ) -> Result<ParsedBlockHeader> {
     let remaining = archive_len.saturating_sub(offset);
     if remaining < 5 {
@@ -2720,7 +2945,7 @@ fn read_block_header_at(
     parse_block_header_image(
         header,
         offset,
-        archive_len,
+        data_limit,
         sfx_offset,
         HeaderPrefix {
             crc: header_crc,
@@ -2732,6 +2957,7 @@ fn read_block_header_at(
     )
 }
 
+#[cfg(all(test, feature = "write", feature = "encryption"))]
 fn read_encrypted_block_header_at(
     file: &mut (impl Read + std::io::Seek),
     offset: usize,
@@ -2740,9 +2966,37 @@ fn read_encrypted_block_header_at(
     keys: &Rar50Keys,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<ParsedBlockHeader> {
+    read_encrypted_block_header_at_to(
+        file,
+        offset,
+        archive_len,
+        sfx_offset,
+        keys,
+        budget,
+        archive_len,
+    )
+}
+
+fn read_encrypted_block_header_at_to(
+    file: &mut (impl Read + std::io::Seek),
+    offset: usize,
+    archive_len: usize,
+    sfx_offset: usize,
+    keys: &Rar50Keys,
+    budget: &mut crate::parse_budget::ParseBudget,
+    data_limit: usize,
+) -> Result<ParsedBlockHeader> {
     #[cfg(not(feature = "encryption"))]
     {
-        let _ = (file, offset, archive_len, sfx_offset, keys, budget);
+        let _ = (
+            file,
+            offset,
+            archive_len,
+            sfx_offset,
+            keys,
+            budget,
+            data_limit,
+        );
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
@@ -2792,7 +3046,7 @@ fn read_encrypted_block_header_at(
         parse_block_header_image(
             header,
             offset,
-            archive_len,
+            data_limit,
             sfx_offset,
             HeaderPrefix {
                 crc: header_crc,
@@ -2808,7 +3062,7 @@ fn read_encrypted_block_header_at(
 fn parse_block_header_image(
     header: Vec<u8>,
     offset: usize,
-    archive_len: usize,
+    data_limit: usize,
     sfx_offset: usize,
     prefix: HeaderPrefix,
     disk_header_len: usize,
@@ -2849,12 +3103,13 @@ fn parse_block_header_image(
         .checked_add(disk_header_len)
         .and_then(|pos| pos.checked_add(data_len))
         .ok_or(Error::InvalidHeader("RAR 5 data size overflows usize"))?;
-    if next_offset > archive_len {
+    if next_offset > data_limit {
         return Err(Error::TooShort);
     }
     let type_specific_start = reader.pos;
-    // Both source adapters set archive_len = source_len-sfx_offset. Since
-    // next_offset <= archive_len, these absolute positions fit the source.
+    // Both source adapters set archive_len = source_len-sfx_offset, and pass
+    // it or at most usize::MAX-sfx_offset as data_limit. Since next_offset <=
+    // data_limit, these absolute positions fit a usize.
     let data_start = sfx_offset + offset + disk_header_len;
     let data_end = data_start + data_len;
 
