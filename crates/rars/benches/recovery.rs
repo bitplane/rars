@@ -61,18 +61,22 @@ fn bench_recovery_record(c: &mut Criterion) {
         .expect("benchmark archive should hold the member")
         .block
         .offset;
-    let mut damaged = archive.clone();
-    damaged[header] ^= 0xff;
-    damaged[header + SIZE / 2] ^= 0xff;
-    group.bench_function("repair_5_percent", |b| {
-        b.iter(|| {
-            pool.install(|| {
-                let repaired = repair_inline_recovery_bytes(black_box(&damaged))
-                    .expect("benchmark archive should repair");
-                assert_eq!(repaired.len(), archive.len());
+    // Hits a quarter of the body apart land in separate shards.
+    for (name, hits) in [("repair_one_shard", 1), ("repair_four_shards", 4)] {
+        let mut damaged = archive.clone();
+        for hit in 0..hits {
+            damaged[header + hit * SIZE / 4] ^= 0xff;
+        }
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                pool.install(|| {
+                    let repaired = repair_inline_recovery_bytes(black_box(&damaged))
+                        .expect("benchmark archive should repair");
+                    assert_eq!(repaired, archive);
+                });
             });
         });
-    });
+    }
     group.finish();
 }
 

@@ -51,8 +51,8 @@ fn admit_repair_workspace_with_limit(required: u64, limit: u64) -> Result<()> {
 
 /// Count a conservative sum, rather than requiring individual vectors to fit.
 /// Inversion holds the original equations, a working copy and the inverse at
-/// once. RHS rows, pivot copies and per-word scratch are counted too, together
-/// with returned shard buffers and their descriptors. Metadata is small but
+/// once. RHS rows and pivot copies are counted too, together with returned
+/// shard buffers and their descriptors. Metadata is small but
 /// counted using the maximum growth of the damaged-index vector.
 fn repair_solve_workspace_required(
     data_count: usize,
@@ -72,11 +72,6 @@ fn repair_solve_workspace_required(
         + std::mem::size_of::<bool>()) as u64;
     repair_workspace_sum(&[
         repair_workspace_product(matrix_cells, 3 * std::mem::size_of::<u16>() as u64)?,
-        // Per-row coefficients against every data column.
-        repair_workspace_product(
-            repair_workspace_product(damaged_count, data_count)?,
-            std::mem::size_of::<u16>() as u64,
-        )?,
         repair_workspace_product(damaged_count, shard_len as u64)?,
         repair_workspace_product(damaged_count, row_descriptors)?,
         repair_workspace_product(data_count, metadata)?,
@@ -1207,7 +1202,7 @@ where
 
     let output_bytes = damaged.iter().try_fold(0u64, |bytes, &index| {
         bytes
-            .checked_add(shard_ranges[index].len() as u64)
+            .checked_add(shard_ranges[index].len().next_multiple_of(2) as u64)
             .ok_or(Error::PlanOverflow)
     })?;
     admit_repair_workspace_with_limit(
@@ -1230,15 +1225,12 @@ where
     // high row index is an index, not a request to allocate preceding rows.
     let equations = recovery_equations(gf, shard_ranges.len(), &damaged, &recovery_rows, control)?;
     let inverse = invert_linear_system_matrix_with_control(gf, &equations, control)?;
-    let word_count = shard_len / 2;
-    let mut rhs_by_row = Vec::with_capacity(recovery_rows.len());
+    // Each row's right-hand side starts as its parity and has every surviving
+    // shard folded out of it, leaving only the damaged shards' terms.
+    let mut rhs = Vec::with_capacity(recovery_rows.len());
     for (_, parity) in &recovery_rows {
-        let mut rhs = Vec::with_capacity(word_count);
-        for word in parity.as_chunks::<2>().0 {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            rhs.push(u16::from_le_bytes([word[0], word[1]]));
-        }
-        rhs_by_row.push(rhs);
+        check_repair(control)?;
+        rhs.push(parity.to_vec());
     }
     let mut damaged_lookup = vec![false; shard_ranges.len()];
     for &index in &damaged {
@@ -1246,51 +1238,37 @@ where
     }
 
     for (data_index, range) in shard_ranges.iter().enumerate() {
-        poller.check(0).map_err(|_| Error::Cancelled)?;
         if damaged_lookup[data_index] || range.is_empty() {
             continue;
         }
+        check_repair(control)?;
         let shard = read_range(range.clone())?;
         if shard.len() != range.len() {
             return Err(Error::ShardSizeMismatch);
         }
-        for (row_index, rhs) in rhs_by_row.iter_mut().enumerate() {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            let coeff = recovery_coefficient(
-                gf,
-                shard_ranges.len(),
-                recovery_rows[row_index].0,
-                data_index,
-            )?;
-            // Omitted bytes are zero padding, so they contribute no RHS terms.
-            for (word_index, word) in shard.chunks(2).enumerate() {
-                poller.check(0).map_err(|_| Error::Cancelled)?;
-                let data_symbol = u16::from_le_bytes([word[0], word.get(1).copied().unwrap_or(0)]);
-                rhs[word_index] ^= gf.mul(coeff, data_symbol);
-            }
+        for (&(row, _), rhs) in recovery_rows.iter().zip(&mut rhs) {
+            check_repair(control)?;
+            let coefficient = recovery_coefficient(gf, shard_ranges.len(), row, data_index)?;
+            accumulate_scaled(rhs, &shard, coefficient);
         }
     }
 
+    // Whole words, so the folds never split one; the padding byte is dropped after.
     let mut repaired = damaged
         .iter()
-        .map(|&index| vec![0; shard_ranges[index].len()])
+        .map(|&index| vec![0; shard_ranges[index].len().next_multiple_of(2)])
         .collect::<Vec<_>>();
-    for word_index in 0..word_count {
-        poller.check(0).map_err(|_| Error::Cancelled)?;
-        let rhs = rhs_by_row
-            .iter()
-            .map(|row| row[word_index])
-            .collect::<Vec<_>>();
-        let solved = apply_inverse_matrix_with_control(gf, &inverse, &rhs, control)?;
-        for (output, &symbol) in repaired.iter_mut().zip(&solved) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            let byte_offset = word_index * 2;
-            if byte_offset < output.len() {
-                let bytes = symbol.to_le_bytes();
-                let take = (output.len() - byte_offset).min(2);
-                output[byte_offset..byte_offset + take].copy_from_slice(&bytes[..take]);
-            }
-        }
+    fold_inverse(
+        &inverse,
+        &rhs,
+        &mut repaired
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>(),
+        control,
+    )?;
+    for (output, &index) in repaired.iter_mut().zip(&damaged) {
+        output.truncate(shard_ranges[index].len());
     }
 
     Ok(damaged
@@ -2001,42 +1979,61 @@ fn recover_damaged_shards_with_control(
     let equations = recovery_equations(gf, data_count, damaged, recovery_shards, control)?;
     let inverse = invert_linear_system_matrix_with_control(gf, &equations, control)?;
 
-    // Coefficients for each supplied row against every column, hoisted out of
-    // the per-word loop. Damaged columns are skipped there, so they stay zero.
-    let mut coefficients = Vec::with_capacity(recovery_shards.len());
-    for &(row_index, _) in recovery_shards {
-        let mut row = vec![0; data_count];
-        for (data_index, coefficient) in row.iter_mut().enumerate() {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            if !damaged_lookup[data_index] {
-                *coefficient = recovery_coefficient(gf, data_count, row_index, data_index)?;
-            }
+    let shard_len = data_shards.first().ok_or(Error::TooManyShards)?.len();
+    let mut rhs = Vec::with_capacity(recovery_shards.len());
+    for &(_, parity) in recovery_shards {
+        check_repair(control)?;
+        rhs.push(
+            parity
+                .get(..shard_len)
+                .ok_or(Error::ShardSizeMismatch)?
+                .to_vec(),
+        );
+    }
+    for (data_index, shard) in data_shards.iter().enumerate() {
+        if damaged_lookup[data_index] {
+            continue;
         }
-        coefficients.push(row);
+        for (&(row, _), rhs) in recovery_shards.iter().zip(&mut rhs) {
+            check_repair(control)?;
+            let coefficient = recovery_coefficient(gf, data_count, row, data_index)?;
+            accumulate_scaled(rhs, shard, coefficient);
+        }
     }
 
-    let shard_len = data_shards.first().ok_or(Error::TooManyShards)?.len();
-    for word_offset in (0..shard_len).step_by(2) {
-        poller.check(0).map_err(|_| Error::Cancelled)?;
-        let mut rhs = Vec::with_capacity(recovery_shards.len());
-        for (&(_, parity), coefficients) in recovery_shards.iter().zip(&coefficients) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            let mut value = u16::from_le_bytes([parity[word_offset], parity[word_offset + 1]]);
-            for (data_index, shard) in data_shards.iter().enumerate() {
-                poller.check(0).map_err(|_| Error::Cancelled)?;
-                if damaged_lookup[data_index] {
-                    continue;
-                }
-                let data_symbol = u16::from_le_bytes([shard[word_offset], shard[word_offset + 1]]);
-                value ^= gf.mul(coefficients[data_index], data_symbol);
-            }
-            rhs.push(value);
-        }
-        let solved = apply_inverse_matrix_with_control(gf, &inverse, &rhs, control)?;
-        for (&data_index, &symbol) in damaged.iter().zip(&solved) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            data_shards[data_index][word_offset..word_offset + 2]
-                .copy_from_slice(&symbol.to_le_bytes());
+    let mut slots: Vec<_> = data_shards
+        .iter_mut()
+        .map(|shard| Some(shard.as_mut_slice()))
+        .collect();
+    let mut repaired = damaged
+        .iter()
+        .map(|&index| slots[index].take().ok_or(Error::BadRecoveryChunk))
+        .collect::<Result<Vec<_>>>()?;
+    for output in &mut repaired {
+        output.fill(0);
+    }
+    fold_inverse(&inverse, &rhs, &mut repaired, control)
+}
+
+/// Whole-buffer folds keep the inverse on the same kernel as the parity encoder.
+fn fold_inverse(
+    inverse: &[Vec<u16>],
+    rhs: &[Vec<u8>],
+    repaired: &mut [&mut [u8]],
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    if inverse.len() != rhs.len()
+        || repaired.len() != rhs.len()
+        || inverse.iter().any(|row| row.len() != rhs.len())
+    {
+        return Err(Error::BadRecoveryChunk);
+    }
+    for (output, row) in repaired.iter_mut().zip(inverse) {
+        debug_assert!(output.len().is_multiple_of(2));
+        for (&coefficient, source) in row.iter().zip(rhs) {
+            check_repair(control)?;
+            let source = source.get(..output.len()).ok_or(Error::ShardSizeMismatch)?;
+            accumulate_scaled(output, source, coefficient);
         }
     }
     Ok(())
@@ -2149,39 +2146,6 @@ fn invert_linear_system_matrix_with_control(
         }
     }
     Ok(inverse)
-}
-
-#[cfg(test)]
-fn apply_inverse_matrix(gf: &Gf16, inverse: &[Vec<u16>], rhs: &[u16]) -> Result<Vec<u16>> {
-    apply_inverse_matrix_with_control(
-        gf,
-        inverse,
-        rhs,
-        &crate::read_control::ReadControl::default(),
-    )
-}
-
-fn apply_inverse_matrix_with_control(
-    gf: &Gf16,
-    inverse: &[Vec<u16>],
-    rhs: &[u16],
-    control: &crate::read_control::ReadControl,
-) -> Result<Vec<u16>> {
-    check_repair(control)?;
-    if inverse.len() != rhs.len() || inverse.iter().any(|row| row.len() != rhs.len()) {
-        return Err(Error::BadRecoveryChunk);
-    }
-    let mut output = Vec::with_capacity(rhs.len());
-    let mut poller = control.poller();
-    for row in inverse {
-        let mut sum = 0;
-        for (&coefficient, &value) in row.iter().zip(rhs) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            sum ^= gf.mul(coefficient, value);
-        }
-        output.push(sum);
-    }
-    Ok(output)
 }
 
 #[derive(Debug, Clone)]
@@ -2417,10 +2381,10 @@ mod legacy_reference {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inverse_matrix, build_inline_recovery_data_for_plan,
-        build_structural_inline_recovery_data, check_streamable_plan, crc64_rar_state, crc64_xz,
-        encode_inline_recovery_parity, encode_parity_shards, invert_linear_system_matrix,
-        make_encoder_matrix, plan_inline_recovery, reconstruct_data_shards, recovery_equations,
+        build_inline_recovery_data_for_plan, build_structural_inline_recovery_data,
+        check_streamable_plan, crc64_rar_state, crc64_xz, encode_inline_recovery_parity,
+        encode_parity_shards, fold_inverse, invert_linear_system_matrix, make_encoder_matrix,
+        plan_inline_recovery, reconstruct_data_shards, recovery_equations,
         repair_inline_recovery_archive, repair_inline_recovery_prefix,
         repair_inline_recovery_prefix_shards, shared_gf16, split_prefix_shard_ranges,
         split_prefix_shards, Error, Gf16, InlineRecoveryPlan, MAX_STREAMED_RECOVERY_PREFIX,
@@ -3892,10 +3856,22 @@ mod tests {
             .map(|row| gf.mul(row[0], expected[0]) ^ gf.mul(row[1], expected[1]))
             .collect::<Vec<_>>();
 
+        let rhs: Vec<_> = rhs
+            .iter()
+            .map(|value: &u16| value.to_le_bytes().to_vec())
+            .collect();
         let inverse = invert_linear_system_matrix(gf, &equations).unwrap();
-        let solved = apply_inverse_matrix(gf, &inverse, &rhs).unwrap();
+        let mut solved = [[0u8; 2]; 2];
+        let [first, second] = &mut solved;
+        fold_inverse(
+            &inverse,
+            &rhs,
+            &mut [first, second],
+            &crate::read_control::ReadControl::default(),
+        )
+        .unwrap();
 
-        assert_eq!(solved, expected);
+        assert_eq!(solved.map(u16::from_le_bytes), expected);
     }
 
     #[test]
@@ -3905,12 +3881,24 @@ mod tests {
             invert_linear_system_matrix(gf, &[vec![1], vec![1]]),
             Err(Error::BadRecoveryChunk)
         );
+        let rhs = [vec![1, 0], vec![2, 0]];
+        let [mut first, mut second] = [[0u8; 2]; 2];
         assert_eq!(
-            apply_inverse_matrix(gf, &[vec![1]], &[1, 2]),
+            fold_inverse(
+                &[vec![1]],
+                &rhs,
+                &mut [&mut first, &mut second],
+                &crate::read_control::ReadControl::default()
+            ),
             Err(Error::BadRecoveryChunk)
         );
         assert_eq!(
-            apply_inverse_matrix(gf, &[vec![1], vec![1]], &[1, 2]),
+            fold_inverse(
+                &[vec![1], vec![1]],
+                &rhs,
+                &mut [&mut first, &mut second],
+                &crate::read_control::ReadControl::default()
+            ),
             Err(Error::BadRecoveryChunk)
         );
     }
@@ -4771,6 +4759,50 @@ mod tests {
     }
 
     #[test]
+    fn repair_restores_one_and_several_damaged_shards_byte_for_byte() {
+        // Odd length, so the last shard is short and ends mid-word.
+        let body = recovery_test_bytes(300_001, 7);
+        let plan = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        let ranges = split_prefix_shard_ranges(body.len(), plan).unwrap();
+        let last = ranges.iter().rposition(|range| !range.is_empty()).unwrap();
+        assert_eq!(ranges[last].len() % 2, 1);
+        let record = build_inline_recovery_data_for_plan(&body, plan).unwrap();
+        let shards = split_prefix_shards(&body, plan).unwrap();
+        let refs: Vec<_> = shards.iter().map(Vec::as_slice).collect();
+        let parity = encode_parity_shards(&refs, plan.recovery_shards as usize).unwrap();
+
+        for damaged in [vec![last], vec![0, last], vec![1, 4, 9, last]] {
+            assert!(damaged.len() <= plan.recovery_shards as usize);
+            let mut broken = body.clone();
+            for &index in &damaged {
+                for byte in &mut broken[ranges[index].clone()] {
+                    *byte ^= 0x5a;
+                }
+            }
+            assert_eq!(
+                repair_inline_recovery_prefix(&broken, &record),
+                Ok(body.clone()),
+                "streamed repair of {damaged:?}"
+            );
+
+            let available: Vec<_> = refs
+                .iter()
+                .enumerate()
+                .map(|(index, shard)| (!damaged.contains(&index)).then_some(*shard))
+                .collect();
+            let rows: Vec<_> = (0..damaged.len())
+                .rev()
+                .map(|row| (row, parity[row].as_slice()))
+                .collect();
+            assert_eq!(
+                reconstruct_data_shards(&available, &rows),
+                Ok(shards.clone()),
+                "in-memory repair of {damaged:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rar5_reconstruct_data_shards_validates_shapes_and_missing_count() {
         assert_eq!(reconstruct_data_shards(&[], &[]), Err(Error::TooManyShards));
         assert_eq!(
@@ -5222,9 +5254,11 @@ mod cancellation_tests {
             Error::Cancelled
         );
         let inverse = vec![vec![1; 128]; 128];
+        let rhs = vec![vec![1; 2]; 128];
+        let mut outputs = vec![[0u8; 2]; 128];
+        let mut repaired: Vec<_> = outputs.iter_mut().map(|output| &mut output[..]).collect();
         assert_eq!(
-            apply_inverse_matrix_with_control(shared_gf16(), &inverse, &[1; 128], &scheduled(2))
-                .unwrap_err(),
+            fold_inverse(&inverse, &rhs, &mut repaired, &scheduled(2)).unwrap_err(),
             Error::Cancelled
         );
     }
