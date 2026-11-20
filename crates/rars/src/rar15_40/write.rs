@@ -1401,7 +1401,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
     if include_ppmd && text {
         return encode_rar29_text_member(data, options, lz_method, progress);
     }
-    let searching = !text && crate::filter_search::search_applies(data);
+    let searching = !text && crate::filter_search::search_applies_throughout(data);
     let best = EncodedPayload {
         data: if searching {
             // Every finalist is a full encode, so at the levels with a
@@ -2682,7 +2682,7 @@ fn stream_member_admitted(
         Some((encode_options, engine)) => {
             let mut choose =
                 |segment: &[u8], start: usize| -> crate::codec::Result<Vec<FilterSpec>> {
-                    if !crate::filter_search::search_applies(segment) {
+                    if !crate::filter_search::search_applies_throughout(segment) {
                         return Ok(Vec::new());
                     }
                     let mut poll = |_| !progress.is_cancelled();
@@ -3767,16 +3767,18 @@ fn encode_rar29_chain_member(
         }
         Rar29Method::Auto => ChainEngine::Lz,
     };
-    let candidates =
-        if search && engine != ChainEngine::Ppmd && crate::filter_search::search_applies(data) {
-            crate::filter_search::filter_candidates(
-                &Rar29Search::MEMBER,
-                data,
-                rar29_encode_options_for_options(options)?,
-            )?
-        } else {
-            Vec::new()
-        };
+    let candidates = if search
+        && engine != ChainEngine::Ppmd
+        && crate::filter_search::search_applies_throughout(data)
+    {
+        crate::filter_search::filter_candidates(
+            &Rar29Search::MEMBER,
+            data,
+            rar29_encode_options_for_options(options)?,
+        )?
+    } else {
+        Vec::new()
+    };
     encoder
         .encode_member_with_engine(data, engine, &candidates, progress)
         .map_err(map_codec_cancel)
@@ -5280,6 +5282,101 @@ mod tests {
                 .iter()
                 .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)),
             "the calls went unfiltered: {specs:?}"
+        );
+    }
+
+    /// A script that carries its own machine code: 16 KiB of text, then x86
+    /// calls for the rest of `size`.
+    fn script_then_code(size: usize) -> Vec<u8> {
+        let mut data = word_text(16 * 1024);
+        let code = x86_calls(size - data.len());
+        data.extend_from_slice(&code);
+        data
+    }
+
+    fn total_pack_size(archive: &[u8]) -> u64 {
+        let parsed = crate::rar15_40::Archive::parse(archive).unwrap();
+        let total = parsed.files().map(|file| file.pack_size).sum();
+        total
+    }
+
+    fn assert_holds(archive: &[u8], members: &[(&str, &[u8])]) {
+        let reader = crate::ArchiveReader::read(archive).unwrap();
+        for (name, data) in members {
+            let read = reader.read_member(name.as_bytes(), None).unwrap();
+            assert_eq!(read.as_deref(), Some(*data), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_member_that_opens_with_text_is_searched_for_the_code_after_it() {
+        let data = script_then_code(1024 * 1024);
+        let members = entries(&[("tool", &data)]);
+        let options = rar40().with_compression_level(3);
+
+        let searched = in_memory_with(&members, options, crate::MemberCoding::Compressed);
+        let unfiltered = in_memory_with(
+            &members,
+            options,
+            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
+        );
+
+        assert_holds(&searched, &[("tool", &data)]);
+        let (searched, unfiltered) = (total_pack_size(&searched), total_pack_size(&unfiltered));
+        assert!(
+            searched * 2 < unfiltered,
+            "{searched} searched against {unfiltered} unfiltered"
+        );
+    }
+
+    #[test]
+    fn a_solid_member_that_opens_with_text_is_searched_for_the_code_after_it() {
+        let notes = word_text(20_000);
+        let data = script_then_code(1024 * 1024);
+        let members = entries(&[("notes.txt", &notes), ("tool", &data)]);
+        let mut options = rar40().with_compression_level(3);
+        options.features.solid = true;
+
+        let searched = in_memory_with(&members, options, crate::MemberCoding::Compressed);
+        let unfiltered = in_memory_with(
+            &members,
+            options,
+            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
+        );
+
+        assert_holds(&searched, &[("notes.txt", &notes), ("tool", &data)]);
+        let (searched, unfiltered) = (total_pack_size(&searched), total_pack_size(&unfiltered));
+        assert!(
+            searched * 2 < unfiltered,
+            "{searched} searched against {unfiltered} unfiltered"
+        );
+    }
+
+    #[test]
+    fn a_streamed_segment_that_opens_with_text_is_searched_for_the_code_after_it() {
+        // With a 64 KiB window a segment is at most 2 MiB, so the text opens
+        // the first segment and the code fills the rest of it.
+        let data = script_then_code(2 * 1024 * 1024);
+        let members = entries(&[("tool", &data)]);
+        let options = rar40()
+            .with_compression_level(3)
+            .with_dictionary_size(64 * 1024);
+
+        let out = streamed_with(&members, options, crate::MemberCoding::Compressed, None).unwrap();
+        assert!(out.seeks > 0, "the member was not streamed");
+        let searched = streamed_member(&out.inner.into_inner(), 0, &data).len() as u64;
+        let unfiltered = streamed_with(
+            &members,
+            options,
+            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
+            None,
+        )
+        .unwrap();
+        let unfiltered = pack_size(&unfiltered.inner.into_inner(), 0);
+
+        assert!(
+            searched * 2 < unfiltered,
+            "{searched} searched against {unfiltered} unfiltered"
         );
     }
 
