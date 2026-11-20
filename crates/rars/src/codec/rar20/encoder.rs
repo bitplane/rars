@@ -256,17 +256,18 @@ impl Unpack20Encoder {
 
 /// Bytes coded per block. Each block is parsed against the dictionary before
 /// it and gets tables of its own, so the parse's working set (its tokens, and
-/// at levels 4–5 its nodes and match lists) is sized by the block, not by the
+/// at levels 4–5 its steps and match lists) is sized by the block, not by the
 /// member.
 const BLOCK_SIZE: usize = 1024 * 1024;
 
 /// What coding one block holds beyond the member's own bytes: the window and
 /// block, the match finders, the tokens, and at levels 4–5 the shortest-path
-/// parse's nodes and match lists. Peak RSS on brett, coding 256 MiB streamed
-/// with 1 MiB blocks, was 18–26 MB at level 3 and 73 MB at level 5.
+/// parse's steps and match lists. Peak RSS on brett, coding 256 MiB streamed
+/// with 1 MiB blocks, was 18–26 MB at level 3. Level 5's live heap per block,
+/// at most 45 MiB on source, word text, random and zeros, gets the same headroom.
 const fn block_workspace(optimal_parse: bool) -> u64 {
     if optimal_parse {
-        80 * 1024 * 1024
+        64 * 1024 * 1024
     } else {
         24 * 1024 * 1024
     }
@@ -982,7 +983,8 @@ impl EdgePrices {
 
 /// The nearest match per length at each position, so the parse can trade length against offset.
 struct MatchLists {
-    counts: Vec<u16>,
+    /// The tree reports at most `MAX_RUNS` and the chain one more.
+    counts: Vec<u8>,
     /// Lengths and offsets both rise within a position, so a longer match is never also nearer.
     runs: Vec<FoundMatch>,
 }
@@ -1028,7 +1030,9 @@ fn collect_match_lists(
     let window = options.max_match_distance.saturating_add(1).min(end.max(1));
     let mut tree = match_finder::TreeMatchFinder::with_allowance(window, &allowance)
         .expect("unlimited finder allocation");
-    let mut chain = Rar20MatchFinder::for_reach(window, window.min(LONGER_FRESH_OFFSET));
+    // The chain only offers three-byte matches nearer than LONGER_FRESH_OFFSET.
+    let near = window.min(LONGER_FRESH_OFFSET);
+    let mut chain = Rar20MatchFinder::for_reach(near, near);
     let mut found: Buffer<(u32, u32), Allowance> = Buffer::new(&allowance);
     let candidates = options.max_match_candidates;
     let mut lists = MatchLists {
@@ -1071,7 +1075,8 @@ fn collect_match_lists(
                     })
                     .map(|(length, offset)| FoundMatch::new(length, offset)),
             );
-            lists.counts.push((lists.runs.len() - before) as u16);
+            debug_assert!(lists.runs.len() - before <= usize::from(u8::MAX));
+            lists.counts.push((lists.runs.len() - before) as u8);
         }
         chain.insert(input, pos);
     }
@@ -1117,7 +1122,10 @@ fn encode_tokens_optimal(
     cost_model: &CostModel<'_>,
 ) -> Vec<EncodeToken> {
     let span = end - start;
-    let mut nodes = vec![ParseNode::UNREACHED; span + 1];
+    let mut ahead = [Reached::UNREACHED; REACHED_RING];
+    // The edge chosen into each position; the walk back reads only these. The
+    // repeat stands in for "no edge yet", since every reached position replaces it.
+    let mut steps = vec![EncodeToken::RepeatLast; span + 1];
     let mut lengths = Vec::new();
     let mut next_run = 0usize;
     // Positions inside a match long enough to take outright relax nothing.
@@ -1130,28 +1138,30 @@ fn encode_tokens_optimal(
         "lists collected for another buffer"
     );
     // A block starts with no recent offsets, which UNREACHED already holds.
-    nodes[0].cost = 0;
+    ahead[0].cost = 0;
 
     for index in 0..span {
         // Every position is reachable through the one-byte literal edge.
         let runs = &matches.runs[next_run..next_run + usize::from(matches.counts[index])];
         next_run += runs.len();
+        // Settled once read, so its slot is free for the position a ring ahead.
+        let reached = std::mem::replace(&mut ahead[index % REACHED_RING], Reached::UNREACHED);
         if index < committed_through {
             continue;
         }
         let pos = start + index;
-        let here = nodes[index].cost;
-        let node_reps = nodes[index].reps.map(|offset| offset as usize);
+        let here = reached.cost;
+        let node_reps = reached.reps.map(|offset| offset as usize);
         let cap = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
         let nice = NICE_MATCH_LENGTH.min(cap);
 
         let mut relax = |next: usize, price: u64, what: EncodeToken, next_reps: [usize; 4]| {
             // Literal, fresh, old-offset and short-match edges all end within span.
-            let node = &mut nodes[next];
+            let node = &mut ahead[next % REACHED_RING];
             if here + price < node.cost {
                 node.cost = here + price;
-                node.token = what;
                 node.reps = next_reps.map(|offset| offset as u32);
+                steps[next] = what;
             }
         };
 
@@ -1229,30 +1239,34 @@ fn encode_tokens_optimal(
         }
     }
 
-    let mut out = Vec::new();
+    // The route fills `steps` from the back: each write lands at or past
+    // the position just read, which the walk never reads again.
+    let mut first = span + 1;
     let mut at = span;
     while at > 0 {
-        let what = nodes[at].token;
-        out.push(what);
+        let what = steps[at];
+        first -= 1;
+        steps[first] = what;
         at -= what.parsed_length();
     }
-    out.reverse();
-    out
+    steps.copy_within(first.., 0);
+    steps.truncate(span + 1 - first);
+    steps
 }
 
-/// Thirty-two bytes per input byte, where separate cost, link, token and rep arrays took eighty.
+/// Positions the parse keeps cost and recent offsets for: no edge reaches further ahead.
+const REACHED_RING: usize = (MAX_ENCODER_MATCH_LENGTH + 1).next_power_of_two();
+
+/// The cheapest route into a position not yet parsed.
 #[derive(Debug, Clone, Copy)]
-struct ParseNode {
+struct Reached {
     cost: u64,
-    token: EncodeToken,
     reps: [u32; 4],
 }
 
-impl ParseNode {
-    // The repeat stands in for "no edge yet"; every reached node replaces it.
+impl Reached {
     const UNREACHED: Self = Self {
         cost: u64::MAX / 4,
-        token: EncodeToken::RepeatLast,
         reps: [0; 4],
     };
 }
