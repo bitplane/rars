@@ -1099,6 +1099,7 @@ fn encode_rar29_policy_filtered_payload(
             data: with_codec_progress(progress, |report| {
                 Unpack29Encoder::with_options(options).encode_member_with_filters_and_progress(
                     data,
+                    0,
                     std::slice::from_ref(filter),
                     Some(report),
                 )
@@ -1115,6 +1116,7 @@ fn encode_rar29_policy_filtered_payload(
                         Unpack29Encoder::with_options(options)
                             .encode_member_with_filters_and_progress(
                                 data,
+                                0,
                                 std::slice::from_ref(filter),
                                 Some(report),
                             )
@@ -1277,7 +1279,18 @@ fn encode_rar29_filtered_members(
 
 /// How the RAR 2.9 family measures a filter candidate, for the shared search.
 #[derive(Clone, Copy)]
-struct Rar29Search;
+struct Rar29Search {
+    /// Where the data searched starts in its member. The x86 filters convert
+    /// a call by its position in the file, so a streamed segment has to be
+    /// measured at its own: from 0, every call in a later segment looks
+    /// convertible and every call back into the file's start looks not.
+    file_offset: usize,
+}
+
+impl Rar29Search {
+    /// The search over a whole member.
+    const MEMBER: Self = Self { file_offset: 0 };
+}
 
 impl crate::filter_search::FilterSearch for Rar29Search {
     type Options = Rar29EncodeOptions;
@@ -1322,7 +1335,7 @@ impl crate::filter_search::FilterSearch for Rar29Search {
     }
 
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
-        crate::codec::rar29::filtered_members(data, filters)
+        crate::codec::rar29::filtered_members(data, self.file_offset, filters)
             .map(|filtered| filtered.data)
             .map_err(Error::from)
     }
@@ -1350,7 +1363,7 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Vec<u8>> {
         Unpack29Encoder::with_options(options)
-            .encode_member_with_filters_and_progress(data, filters, progress)
+            .encode_member_with_filters_and_progress(data, self.file_offset, filters, progress)
             .map_err(map_codec_cancel)
     }
 }
@@ -1401,7 +1414,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
             // encoded beside it is charged its own, and only while it runs.
             let each = crate::codec::rar29::member_encode_workspace(data.len(), lazy);
             let (filters, measured) = crate::filter_search::choose_filter_side_by_side(
-                &Rar29Search,
+                &Rar29Search::MEMBER,
                 data,
                 lazy,
                 Some(&|walked| {
@@ -1419,9 +1432,9 @@ fn encode_rar29_auto_filtered_member_with_progress(
                 use crate::filter_search::FilterSearch;
                 let mut poll = |_| !progress.is_some_and(WorkTracker::is_cancelled);
                 let parsed = if filters.is_empty() {
-                    Rar29Search.encode_plain(data, options, Some(&mut poll))?
+                    Rar29Search::MEMBER.encode_plain(data, options, Some(&mut poll))?
                 } else {
-                    Rar29Search.encode_filtered(data, &filters, options, Some(&mut poll))?
+                    Rar29Search::MEMBER.encode_filtered(data, &filters, options, Some(&mut poll))?
                 };
                 if parsed.len() < measured.len() {
                     parsed
@@ -2667,21 +2680,22 @@ fn stream_member_admitted(
             ),
         },
         Some((encode_options, engine)) => {
-            let mut choose = |segment: &[u8]| -> crate::codec::Result<Vec<FilterSpec>> {
-                if !crate::filter_search::search_applies(segment) {
-                    return Ok(Vec::new());
-                }
-                let mut poll = |_| !progress.is_cancelled();
-                // Only the choice is kept, so the lazy parse measures it.
-                crate::filter_search::choose_filter(
-                    &Rar29Search,
-                    segment,
-                    encode_options.with_optimal_parse_passes(0),
-                    Some(&mut poll),
-                )
-                .map(|(specs, _)| specs)
-                .map_err(|error| crate::codec::Error::Io(Box::new(error)))
-            };
+            let mut choose =
+                |segment: &[u8], start: usize| -> crate::codec::Result<Vec<FilterSpec>> {
+                    if !crate::filter_search::search_applies(segment) {
+                        return Ok(Vec::new());
+                    }
+                    let mut poll = |_| !progress.is_cancelled();
+                    // Only the choice is kept, so the lazy parse measures it.
+                    crate::filter_search::choose_filter(
+                        &Rar29Search { file_offset: start },
+                        segment,
+                        encode_options.with_optimal_parse_passes(0),
+                        Some(&mut poll),
+                    )
+                    .map(|(specs, _)| specs)
+                    .map_err(|error| crate::codec::Error::Io(Box::new(error)))
+                };
             let explicit = match coding {
                 MemberCoding::Filtered(FilterPolicy::Explicit(filter)) => Some(filter),
                 _ => None,
@@ -3613,6 +3627,7 @@ fn encode_filtered_payload(
         FilterPolicy::Explicit(filter) if !data.is_empty() => encoder
             .encode_member_with_filters_and_progress(
                 data,
+                0,
                 std::slice::from_ref(filter),
                 Some(&mut advance),
             )
@@ -3755,7 +3770,7 @@ fn encode_rar29_chain_member(
     let candidates =
         if search && engine != ChainEngine::Ppmd && crate::filter_search::search_applies(data) {
             crate::filter_search::filter_candidates(
-                &Rar29Search,
+                &Rar29Search::MEMBER,
                 data,
                 rar29_encode_options_for_options(options)?,
             )?
@@ -5182,6 +5197,89 @@ mod tests {
             (packed.len() as u64) * 100 <= whole * 102,
             "{} streamed against {whole} in memory",
             packed.len()
+        );
+    }
+
+    /// x86 code calling the same eight targets near the start of the member
+    /// from everywhere in it. The E8 filter turns each call into the target
+    /// it reaches, converting from where the call lies in the file, so the
+    /// whole member filters to a handful of repeated instructions.
+    fn x86_calls(size: usize) -> Vec<u8> {
+        const FILLER: [u8; 11] = [
+            0x48, 0x89, 0x8b, 0xc3, 0x83, 0x0f, 0x85, 0x31, 0xff, 0x74, 0x41,
+        ];
+        const TARGETS: [u32; 8] = [0x100, 0x340, 0x800, 0x1000, 0x2345, 0x4000, 0x7f00, 0xf000];
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut data = Vec::with_capacity(size);
+        while data.len() + 16 <= size {
+            data.extend_from_slice(&FILLER);
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let target = TARGETS[(state >> 33) as usize % TARGETS.len()];
+            let at = data.len();
+            data.push(0xe8);
+            data.extend_from_slice(&target.wrapping_sub(at as u32 + 5).to_le_bytes());
+        }
+        data.resize(size, 0x90);
+        data
+    }
+
+    #[test]
+    fn x86_code_past_the_first_segment_streams_close_to_the_in_memory_ratio() {
+        // With a 64 KiB window a segment is at most 2 MiB, at any thread
+        // count, so every segment after the first starts past the targets.
+        // Searched as if it began the file, a later segment saw calls back
+        // to before its start as calls the filter cannot convert, and left
+        // them unfiltered: 387,556 bytes against 247,304 in memory.
+        let code = x86_calls(6 * 1024 * 1024);
+        let members = entries(&[("code.bin", &code)]);
+        let options = rar40().with_dictionary_size(64 * 1024);
+
+        let out = streamed_with(&members, options, crate::MemberCoding::Compressed, None).unwrap();
+
+        assert!(out.seeks > 0, "the code member was not streamed");
+        let packed = streamed_member(&out.inner.into_inner(), 0, &code);
+        let whole = pack_size(
+            &in_memory_with(&members, options, crate::MemberCoding::Compressed),
+            0,
+        );
+        assert!(
+            (packed.len() as u64) * 100 <= whole * 102,
+            "{} streamed against {whole} in memory",
+            packed.len()
+        );
+    }
+
+    #[test]
+    fn a_segment_is_searched_where_it_lies_in_the_member() {
+        use crate::filter_search::FilterSearch;
+
+        let code = x86_calls(2 * 1024 * 1024);
+        let start = 1024 * 1024;
+        let at = super::Rar29Search { file_offset: start };
+        let whole = [FilterSpec::whole(FilterKind::E8)];
+        let in_member = super::Rar29Search::MEMBER
+            .filtered_bytes(
+                &code,
+                &[FilterSpec::range(FilterKind::E8, start..code.len())],
+            )
+            .unwrap();
+        assert_eq!(
+            at.filtered_bytes(&code[start..], &whole).unwrap(),
+            in_member[start..]
+        );
+
+        let options = super::rar29_encode_options_for_options(rar40())
+            .unwrap()
+            .with_optimal_parse_passes(0);
+        let (specs, _) =
+            crate::filter_search::choose_filter(&at, &code[start..], options, None).unwrap();
+        assert!(
+            specs
+                .iter()
+                .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)),
+            "the calls went unfiltered: {specs:?}"
         );
     }
 
