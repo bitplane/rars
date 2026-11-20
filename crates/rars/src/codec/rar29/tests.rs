@@ -2902,6 +2902,7 @@ fn filtered_progress_polls_preprocessing_and_keeps_cancelled_state_transactional
     assert_eq!(
         at_entry.encode_member_with_filters_and_progress(
             &input,
+            0,
             std::slice::from_ref(&filter),
             Some(&mut |_| false),
         ),
@@ -2914,6 +2915,7 @@ fn filtered_progress_polls_preprocessing_and_keeps_cancelled_state_transactional
     let mut polls = 0;
     let result = preprocessing.encode_member_with_filters_and_progress(
         &input,
+        0,
         std::slice::from_ref(&filter),
         Some(&mut |_| {
             polls += 1;
@@ -2931,6 +2933,7 @@ fn filtered_progress_polls_preprocessing_and_keeps_cancelled_state_transactional
     let original_levels = between_blocks.levels;
     let result = between_blocks.encode_member_with_filters_and_progress(
         &input[..8192],
+        0,
         &[filter],
         Some(&mut |position| position <= 4096),
     );
@@ -5363,20 +5366,19 @@ fn a_member_filtered_a_segment_at_a_time_codes_to_the_in_memory_bytes() {
     let options = EncodeOptions::new(16)
         .with_max_match_distance(64 * 1024)
         .with_block_size(16 * 1024);
-    let (mut chosen, mut read) = (Vec::new(), 0);
+    let mut chosen = Vec::new();
     let mut streamed = Vec::new();
     let flow = super::unpack29_encode_literals_streamed(
         &mut &input[..],
         input.len(),
         options,
-        Some(&mut |segment: &[u8]| {
+        Some(&mut |segment: &[u8], start: usize| {
             // E8 on every other segment, so its file offset has to be the member's.
             let kind = match chosen.len() % 2 {
                 0 => FilterKind::Delta { channels: 4 },
                 _ => FilterKind::E8,
             };
-            chosen.push(FilterSpec::range(kind, read..read + segment.len()));
-            read += segment.len();
+            chosen.push(FilterSpec::range(kind, start..start + segment.len()));
             Ok(vec![FilterSpec::whole(kind)])
         }),
         &mut |_| true,

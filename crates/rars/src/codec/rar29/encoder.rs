@@ -220,7 +220,8 @@ pub(crate) fn unpack29_encode_ppmd_with_progress(
     let (filtered, mut declared) = match filter {
         Some(filter) => {
             let filters = split_large_filter(input.len(), filter)?;
-            let filtered = filtered_members_with_progress(input, &filters, Some(&mut *progress))?;
+            let filtered =
+                filtered_members_with_progress(input, 0, &filters, Some(&mut *progress))?;
             (
                 Some(filtered.data),
                 Some(PpmdFilters::applied(filtered.records)),
@@ -263,7 +264,7 @@ fn encode_ppmd_filtered_member(
     max_match_distance: usize,
 ) -> Result<Vec<u8>> {
     let filters = split_large_filter(input.len(), filter)?;
-    let filtered = filtered_members(input, &filters)?;
+    let filtered = filtered_members(input, 0, &filters)?;
     let mut declared = PpmdFilters::applied(filtered.records);
     encode_ppmd_member(
         &filtered.data,
@@ -273,20 +274,40 @@ fn encode_ppmd_filtered_member(
     )
 }
 
+/// A filtered copy of `input`, which lies `offset` bytes into its member.
+///
+/// `filters` are ranged over `input`, and so are the records that come back.
+/// The offset is where the x86 filters convert calls from, so a search over one
+/// streamed segment measures them as the segment will be written.
 pub(crate) fn filtered_members(
     input: &[u8],
+    offset: usize,
     filters: &[crate::FilterSpec],
 ) -> Result<FilteredMembers> {
-    filtered_members_with_progress(input, filters, None)
+    filtered_members_with_progress(input, offset, filters, None)
 }
 
 fn filtered_members_with_progress(
     input: &[u8],
+    offset: usize,
     filters: &[crate::FilterSpec],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<FilteredMembers> {
+    let moved = filters
+        .iter()
+        .map(|filter| {
+            let range = checked_filter_range(input.len(), filter)?;
+            Ok(crate::FilterSpec::range(
+                filter.kind,
+                offset + range.start..offset + range.end,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     let mut data = input.to_vec();
-    let records = filter_window(&mut data, 0, filters, progress)?;
+    let mut records = filter_window(&mut data, offset, &moved, progress)?;
+    for record in &mut records {
+        record.block_start -= offset;
+    }
     Ok(FilteredMembers { data, records })
 }
 
@@ -453,7 +474,7 @@ fn filter_chunking(kind: crate::FilterKind) -> Result<(usize, usize)> {
 pub(crate) fn named_filter_segments(
     len: usize,
     filter: crate::FilterSpec,
-) -> Result<impl FnMut(&[u8]) -> Result<Vec<crate::FilterSpec>>> {
+) -> Result<impl FnMut(&[u8], usize) -> Result<Vec<crate::FilterSpec>>> {
     let range = checked_filter_range(len, &filter)?;
     let (unit, chunk_size) = filter_chunking(filter.kind)?;
     let (step, end) = match range.len() <= chunk_size {
@@ -463,10 +484,8 @@ pub(crate) fn named_filter_segments(
             _ => (chunk_size, range.end),
         },
     };
-    let mut at = 0;
-    Ok(move |segment: &[u8]| {
-        let (start, stop) = (at, at + segment.len());
-        at = stop;
+    Ok(move |segment: &[u8], start: usize| {
+        let stop = start + segment.len();
         let mut pieces = Vec::new();
         let mut from = range.start + start.saturating_sub(range.start) / step * step;
         while from < end.min(stop) {
@@ -1034,7 +1053,7 @@ impl Unpack29Encoder {
                 for filter in filters {
                     split.extend(split_large_filter(input.len(), filter.clone())?);
                 }
-                let filtered = filtered_members_with_progress(input, &split, Some(&mut report))?;
+                let filtered = filtered_members_with_progress(input, 0, &split, Some(&mut report))?;
                 let packed = encode_filtered_member_blocks(
                     &filtered.data,
                     &self.history,
@@ -1128,7 +1147,7 @@ impl Unpack29Encoder {
         filter: crate::FilterSpec,
     ) -> Result<Vec<u8>> {
         let filters = split_large_filter(input.len(), filter)?;
-        let filtered = filtered_members(input, &filters)?;
+        let filtered = filtered_members(input, 0, &filters)?;
         let mut levels = self.levels;
         let packed = encode_filtered_member_blocks(
             &filtered.data,
@@ -1152,12 +1171,15 @@ impl Unpack29Encoder {
         input: &[u8],
         filters: &[crate::FilterSpec],
     ) -> Result<Vec<u8>> {
-        self.encode_member_with_filters_and_progress(input, filters, None)
+        self.encode_member_with_filters_and_progress(input, 0, filters, None)
     }
 
+    /// `input` lies `offset` bytes into its member, as for [`filtered_members`];
+    /// a member coded whole starts at 0.
     pub(crate) fn encode_member_with_filters_and_progress(
         &mut self,
         input: &[u8],
+        offset: usize,
         filters: &[crate::FilterSpec],
         mut progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Vec<u8>> {
@@ -1170,9 +1192,9 @@ impl Unpack29Encoder {
         }
         let filtered = match progress.as_mut() {
             Some(report) => {
-                filtered_members_with_progress(input, &split_filters, Some(&mut **report))?
+                filtered_members_with_progress(input, offset, &split_filters, Some(&mut **report))?
             }
-            None => filtered_members(input, &split_filters)?,
+            None => filtered_members(input, offset, &split_filters)?,
         };
         let mut levels = self.levels;
         let packed = encode_filtered_member_blocks(
@@ -1269,8 +1291,11 @@ fn encode_member_blocks(
 /// Takes packed bytes as they are coded, with how far into the member they code through.
 pub(crate) type PackedOut<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>;
 
-/// Ranges are the segment's own, so a chooser needs no member to measure against.
-pub(crate) type SegmentFilters<'a> = &'a mut dyn FnMut(&[u8]) -> Result<Vec<crate::FilterSpec>>;
+/// Takes a segment and where it starts in the member. Ranges are the segment's
+/// own, so a chooser needs no member to measure against, but the x86 filters
+/// convert from the segment's place in the member, so a chooser measures there.
+pub(crate) type SegmentFilters<'a> =
+    &'a mut dyn FnMut(&[u8], usize) -> Result<Vec<crate::FilterSpec>>;
 
 /// The bytes of [`unpack29_encode_literals_with_options`], or with `filters` of [`Unpack29Encoder::encode_member_with_filters`], without holding the member.
 #[cfg(test)]
@@ -1639,7 +1664,7 @@ impl Segments for ReadSegments<'_, '_> {
         if let Some(choose) = self.filters.as_mut() {
             let fresh = &mut self.window[kept..];
             let mut split = Vec::new();
-            for filter in choose(fresh)? {
+            for filter in choose(fresh, start)? {
                 let range = checked_filter_range(fresh.len(), &filter)?;
                 let moved =
                     crate::FilterSpec::range(filter.kind, start + range.start..start + range.end);
