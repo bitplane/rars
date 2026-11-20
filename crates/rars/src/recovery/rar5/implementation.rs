@@ -51,8 +51,8 @@ fn admit_repair_workspace_with_limit(required: u64, limit: u64) -> Result<()> {
 
 /// Count a conservative sum, rather than requiring individual vectors to fit.
 /// Inversion holds the original equations, a working copy and the inverse at
-/// once. RHS rows, pivot copies and per-word scratch are counted too, together
-/// with returned shard buffers and their descriptors. Metadata is small but
+/// once. RHS rows and pivot copies are counted too, together with returned
+/// shard buffers and their descriptors. Metadata is small but
 /// counted using the maximum growth of the damaged-index vector.
 fn repair_solve_workspace_required(
     data_count: usize,
@@ -72,11 +72,6 @@ fn repair_solve_workspace_required(
         + std::mem::size_of::<bool>()) as u64;
     repair_workspace_sum(&[
         repair_workspace_product(matrix_cells, 3 * std::mem::size_of::<u16>() as u64)?,
-        // Per-row coefficients against every data column.
-        repair_workspace_product(
-            repair_workspace_product(damaged_count, data_count)?,
-            std::mem::size_of::<u16>() as u64,
-        )?,
         repair_workspace_product(damaged_count, shard_len as u64)?,
         repair_workspace_product(damaged_count, row_descriptors)?,
         repair_workspace_product(data_count, metadata)?,
@@ -550,7 +545,6 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
                 &mut shard_states,
                 encode_units,
                 &report,
-                &gf,
                 allowance,
             )?;
             ParityRows::Resident(parity)
@@ -567,7 +561,6 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
                 scratch,
                 encode_units,
                 &report,
-                &gf,
                 allowance,
             )?;
             ParityRows::Spooled {
@@ -785,27 +778,134 @@ impl<B: Budget> ParityRows<'_, B> {
 ///
 /// A trailing odd byte is treated as the low half of a word whose high half is
 /// the zero padding every shard carries.
-fn accumulate_scaled(destination: &mut [u8], source: &[u8], coefficient: u16, gf: &GfView<'_>) {
-    let words = source.len() / 2;
-    for word in 0..words {
-        let offset = word * 2;
-        let value = u16::from_le_bytes([source[offset], source[offset + 1]]);
-        let scaled = gf.mul(coefficient, value);
-        if scaled == 0 {
-            continue;
-        }
-        let current = u16::from_le_bytes([destination[offset], destination[offset + 1]]);
-        destination[offset..offset + 2].copy_from_slice(&(current ^ scaled).to_le_bytes());
+fn accumulate_scaled(destination: &mut [u8], source: &[u8], coefficient: u16) {
+    if coefficient == 0 {
+        return;
     }
-    if !source.len().is_multiple_of(2) {
-        let offset = words * 2;
-        let value = u16::from_le_bytes([source[offset], 0]);
-        let scaled = gf.mul(coefficient, value);
-        if scaled != 0 {
-            let current = u16::from_le_bytes([destination[offset], destination[offset + 1]]);
-            destination[offset..offset + 2].copy_from_slice(&(current ^ scaled).to_le_bytes());
+    debug_assert!(destination.len() >= source.len().next_multiple_of(2));
+    let mut tables = [[0u16; 256]; 2];
+    fill_scale_tables(&mut tables, coefficient);
+    let [low, high] = &tables;
+    let (words, tail) = source.as_chunks::<2>();
+    for (target, word) in destination.as_chunks_mut::<2>().0.iter_mut().zip(words) {
+        let product = low[word[0] as usize] ^ high[word[1] as usize];
+        target[0] ^= product as u8;
+        target[1] ^= (product >> 8) as u8;
+    }
+    if let [tail] = tail {
+        let product = low[*tail as usize];
+        let offset = source.len() - 1;
+        destination[offset] ^= product as u8;
+        destination[offset + 1] ^= (product >> 8) as u8;
+    }
+}
+
+/// Two byte-indexed tables replace a log and exp lookup per word: `c * x == lo[x & 0xff] ^ hi[x >> 8]`.
+fn fill_scale_tables(tables: &mut [[u16; 256]; 2], coefficient: u16) {
+    let mut product = u32::from(coefficient);
+    for table in tables.iter_mut() {
+        table[0] = 0;
+        for bit in 0..8 {
+            // Multiplication is linear over GF(2), so setting `bit` adds its
+            // product to every entry below it.
+            let (lower, upper) = table.split_at_mut(1 << bit);
+            for (entry, base) in upper[..lower.len()].iter_mut().zip(lower.iter()) {
+                *entry = base ^ product as u16;
+            }
+            product = times_x(product);
         }
     }
+}
+
+/// Several tasks per worker, so a slow core holds up a pass by one small task.
+const PARITY_TASKS_PER_WORKER: usize = 4;
+
+/// Parity bytes (source bytes times rows) below which waking another worker costs more than it saves.
+const MIN_PARITY_WORK_PER_WORKER: usize = if cfg!(test) { 64 } else { 16 * 1024 };
+
+/// Returns `(workers, column width)`; `None` keeps the work on this thread.
+fn parity_work_split(
+    rows: usize,
+    threads: usize,
+    span: usize,
+    min_work_per_worker: usize,
+) -> Option<(usize, usize)> {
+    let workers = threads.min(span.saturating_mul(rows) / min_work_per_worker.max(1));
+    if workers <= 1 || rows == 0 {
+        return None;
+    }
+    let chunks = (workers * PARITY_TASKS_PER_WORKER).div_ceil(rows);
+    // Even widths keep every chunk on whole 16-bit symbols.
+    Some((workers, span.div_ceil(chunks).next_multiple_of(2).min(span)))
+}
+
+/// A refused task list leaves the work on this thread rather than failing the write.
+fn accumulate_shard<B: Budget>(
+    parity: &mut [Buffer<u8, B>],
+    offset: usize,
+    source: &[u8],
+    matrix: &[Buffer<u16, B>],
+    shard_index: usize,
+    allowance: &B,
+) {
+    let threads = if crate::parallel::may_nest() {
+        crate::parallel::threads()
+    } else {
+        1
+    };
+    let tasks = parity_work_split(
+        parity.len(),
+        threads,
+        source.len(),
+        MIN_PARITY_WORK_PER_WORKER,
+    )
+    .and_then(|(workers, width)| {
+        let chunks = source.len().div_ceil(width);
+        let tasks = Buffer::with_capacity(parity.len() * chunks, allowance).ok()?;
+        Some((workers, width, tasks))
+    });
+    let Some((workers, width, mut tasks)) = tasks else {
+        for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
+            accumulate_scaled(&mut parity_row[offset..], source, row[shard_index]);
+        }
+        return;
+    };
+    for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
+        let mut rest = &mut parity_row[offset..];
+        let mut start = 0;
+        while start < source.len() {
+            let end = (start + width).min(source.len());
+            // The last chunk keeps the rest of the row, where an odd tail's
+            // zero-padded high byte lands.
+            let destination = if end == source.len() {
+                std::mem::take(&mut rest)
+            } else {
+                let (destination, tail) = std::mem::take(&mut rest).split_at_mut(width);
+                rest = tail;
+                destination
+            };
+            tasks.push_admitted(std::sync::Mutex::new((
+                destination,
+                start..end,
+                row[shard_index],
+            )));
+            start = end;
+        }
+    }
+    // Workers stay within the thread cap and pull tasks rather than splitting them up front.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut workers = vec![(); workers.min(tasks.len())];
+    crate::parallel::for_each_mut(&mut workers, |_, _| loop {
+        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(task) = tasks.get(index) else {
+            return;
+        };
+        let mut task = task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (destination, columns, coefficient) = &mut *task;
+        accumulate_scaled(destination, &source[columns.clone()], *coefficient);
+    });
 }
 
 /// Single forward pass over the body, holding every parity row in memory.
@@ -818,7 +918,6 @@ fn encode_parity_resident<B: Budget>(
     shard_states: &mut [u64],
     encode_units: u64,
     report: &dyn Fn(u64) -> Result<()>,
-    gf: &GfView<'_>,
     allowance: &B,
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
     // The streaming entry point admitted these as native-size values.
@@ -848,15 +947,14 @@ fn encode_parity_resident<B: Budget>(
             body.read_exact(&mut buffer[..want])?;
             *state = crc64_update(&buffer[..want], *state);
 
-            let destination_offset = offset as usize;
-            for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
-                accumulate_scaled(
-                    &mut parity_row[destination_offset..],
-                    &buffer[..want],
-                    row[shard_index],
-                    gf,
-                );
-            }
+            accumulate_shard(
+                &mut parity,
+                offset as usize,
+                &buffer[..want],
+                matrix,
+                shard_index,
+                allowance,
+            );
 
             offset += want as u64;
             consumed += want as u64;
@@ -880,7 +978,6 @@ fn encode_parity_striped<B: Budget>(
     scratch: &mut dyn ReadWriteSeek,
     encode_units: u64,
     report: &dyn Fn(u64) -> Result<()>,
-    gf: &GfView<'_>,
     allowance: &B,
 ) -> Result<()> {
     let recovery_shards = plan.recovery_shards as usize;
@@ -913,9 +1010,14 @@ fn encode_parity_striped<B: Budget>(
             body.read_exact(&mut buffer[..span_usize])?;
             *state = crc64_update(&buffer[..span_usize], *state);
 
-            for (row, stripe_row) in matrix.iter().zip(stripe.iter_mut()) {
-                accumulate_scaled(stripe_row, &buffer[..span_usize], row[shard_index], gf);
-            }
+            accumulate_shard(
+                &mut stripe,
+                0,
+                &buffer[..span_usize],
+                matrix,
+                shard_index,
+                allowance,
+            );
 
             consumed += span;
             report(scaled_progress(consumed, body_len, encode_units))?;
@@ -1100,7 +1202,7 @@ where
 
     let output_bytes = damaged.iter().try_fold(0u64, |bytes, &index| {
         bytes
-            .checked_add(shard_ranges[index].len() as u64)
+            .checked_add(shard_ranges[index].len().next_multiple_of(2) as u64)
             .ok_or(Error::PlanOverflow)
     })?;
     admit_repair_workspace_with_limit(
@@ -1123,15 +1225,12 @@ where
     // high row index is an index, not a request to allocate preceding rows.
     let equations = recovery_equations(gf, shard_ranges.len(), &damaged, &recovery_rows, control)?;
     let inverse = invert_linear_system_matrix_with_control(gf, &equations, control)?;
-    let word_count = shard_len / 2;
-    let mut rhs_by_row = Vec::with_capacity(recovery_rows.len());
+    // Each row's right-hand side starts as its parity and has every surviving
+    // shard folded out of it, leaving only the damaged shards' terms.
+    let mut rhs = Vec::with_capacity(recovery_rows.len());
     for (_, parity) in &recovery_rows {
-        let mut rhs = Vec::with_capacity(word_count);
-        for word in parity.as_chunks::<2>().0 {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            rhs.push(u16::from_le_bytes([word[0], word[1]]));
-        }
-        rhs_by_row.push(rhs);
+        check_repair(control)?;
+        rhs.push(parity.to_vec());
     }
     let mut damaged_lookup = vec![false; shard_ranges.len()];
     for &index in &damaged {
@@ -1139,51 +1238,37 @@ where
     }
 
     for (data_index, range) in shard_ranges.iter().enumerate() {
-        poller.check(0).map_err(|_| Error::Cancelled)?;
         if damaged_lookup[data_index] || range.is_empty() {
             continue;
         }
+        check_repair(control)?;
         let shard = read_range(range.clone())?;
         if shard.len() != range.len() {
             return Err(Error::ShardSizeMismatch);
         }
-        for (row_index, rhs) in rhs_by_row.iter_mut().enumerate() {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            let coeff = recovery_coefficient(
-                gf,
-                shard_ranges.len(),
-                recovery_rows[row_index].0,
-                data_index,
-            )?;
-            // Omitted bytes are zero padding, so they contribute no RHS terms.
-            for (word_index, word) in shard.chunks(2).enumerate() {
-                poller.check(0).map_err(|_| Error::Cancelled)?;
-                let data_symbol = u16::from_le_bytes([word[0], word.get(1).copied().unwrap_or(0)]);
-                rhs[word_index] ^= gf.mul(coeff, data_symbol);
-            }
+        for (&(row, _), rhs) in recovery_rows.iter().zip(&mut rhs) {
+            check_repair(control)?;
+            let coefficient = recovery_coefficient(gf, shard_ranges.len(), row, data_index)?;
+            accumulate_scaled(rhs, &shard, coefficient);
         }
     }
 
+    // Whole words, so the folds never split one; the padding byte is dropped after.
     let mut repaired = damaged
         .iter()
-        .map(|&index| vec![0; shard_ranges[index].len()])
+        .map(|&index| vec![0; shard_ranges[index].len().next_multiple_of(2)])
         .collect::<Vec<_>>();
-    for word_index in 0..word_count {
-        poller.check(0).map_err(|_| Error::Cancelled)?;
-        let rhs = rhs_by_row
-            .iter()
-            .map(|row| row[word_index])
-            .collect::<Vec<_>>();
-        let solved = apply_inverse_matrix_with_control(gf, &inverse, &rhs, control)?;
-        for (output, &symbol) in repaired.iter_mut().zip(&solved) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            let byte_offset = word_index * 2;
-            if byte_offset < output.len() {
-                let bytes = symbol.to_le_bytes();
-                let take = (output.len() - byte_offset).min(2);
-                output[byte_offset..byte_offset + take].copy_from_slice(&bytes[..take]);
-            }
-        }
+    fold_inverse(
+        &inverse,
+        &rhs,
+        &mut repaired
+            .iter_mut()
+            .map(Vec::as_mut_slice)
+            .collect::<Vec<_>>(),
+        control,
+    )?;
+    for (output, &index) in repaired.iter_mut().zip(&damaged) {
+        output.truncate(shard_ranges[index].len());
     }
 
     Ok(damaged
@@ -1894,42 +1979,61 @@ fn recover_damaged_shards_with_control(
     let equations = recovery_equations(gf, data_count, damaged, recovery_shards, control)?;
     let inverse = invert_linear_system_matrix_with_control(gf, &equations, control)?;
 
-    // Coefficients for each supplied row against every column, hoisted out of
-    // the per-word loop. Damaged columns are skipped there, so they stay zero.
-    let mut coefficients = Vec::with_capacity(recovery_shards.len());
-    for &(row_index, _) in recovery_shards {
-        let mut row = vec![0; data_count];
-        for (data_index, coefficient) in row.iter_mut().enumerate() {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            if !damaged_lookup[data_index] {
-                *coefficient = recovery_coefficient(gf, data_count, row_index, data_index)?;
-            }
+    let shard_len = data_shards.first().ok_or(Error::TooManyShards)?.len();
+    let mut rhs = Vec::with_capacity(recovery_shards.len());
+    for &(_, parity) in recovery_shards {
+        check_repair(control)?;
+        rhs.push(
+            parity
+                .get(..shard_len)
+                .ok_or(Error::ShardSizeMismatch)?
+                .to_vec(),
+        );
+    }
+    for (data_index, shard) in data_shards.iter().enumerate() {
+        if damaged_lookup[data_index] {
+            continue;
         }
-        coefficients.push(row);
+        for (&(row, _), rhs) in recovery_shards.iter().zip(&mut rhs) {
+            check_repair(control)?;
+            let coefficient = recovery_coefficient(gf, data_count, row, data_index)?;
+            accumulate_scaled(rhs, shard, coefficient);
+        }
     }
 
-    let shard_len = data_shards.first().ok_or(Error::TooManyShards)?.len();
-    for word_offset in (0..shard_len).step_by(2) {
-        poller.check(0).map_err(|_| Error::Cancelled)?;
-        let mut rhs = Vec::with_capacity(recovery_shards.len());
-        for (&(_, parity), coefficients) in recovery_shards.iter().zip(&coefficients) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            let mut value = u16::from_le_bytes([parity[word_offset], parity[word_offset + 1]]);
-            for (data_index, shard) in data_shards.iter().enumerate() {
-                poller.check(0).map_err(|_| Error::Cancelled)?;
-                if damaged_lookup[data_index] {
-                    continue;
-                }
-                let data_symbol = u16::from_le_bytes([shard[word_offset], shard[word_offset + 1]]);
-                value ^= gf.mul(coefficients[data_index], data_symbol);
-            }
-            rhs.push(value);
-        }
-        let solved = apply_inverse_matrix_with_control(gf, &inverse, &rhs, control)?;
-        for (&data_index, &symbol) in damaged.iter().zip(&solved) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            data_shards[data_index][word_offset..word_offset + 2]
-                .copy_from_slice(&symbol.to_le_bytes());
+    let mut slots: Vec<_> = data_shards
+        .iter_mut()
+        .map(|shard| Some(shard.as_mut_slice()))
+        .collect();
+    let mut repaired = damaged
+        .iter()
+        .map(|&index| slots[index].take().ok_or(Error::BadRecoveryChunk))
+        .collect::<Result<Vec<_>>>()?;
+    for output in &mut repaired {
+        output.fill(0);
+    }
+    fold_inverse(&inverse, &rhs, &mut repaired, control)
+}
+
+/// Whole-buffer folds keep the inverse on the same kernel as the parity encoder.
+fn fold_inverse(
+    inverse: &[Vec<u16>],
+    rhs: &[Vec<u8>],
+    repaired: &mut [&mut [u8]],
+    control: &crate::read_control::ReadControl,
+) -> Result<()> {
+    if inverse.len() != rhs.len()
+        || repaired.len() != rhs.len()
+        || inverse.iter().any(|row| row.len() != rhs.len())
+    {
+        return Err(Error::BadRecoveryChunk);
+    }
+    for (output, row) in repaired.iter_mut().zip(inverse) {
+        debug_assert!(output.len().is_multiple_of(2));
+        for (&coefficient, source) in row.iter().zip(rhs) {
+            check_repair(control)?;
+            let source = source.get(..output.len()).ok_or(Error::ShardSizeMismatch)?;
+            accumulate_scaled(output, source, coefficient);
         }
     }
     Ok(())
@@ -2044,39 +2148,6 @@ fn invert_linear_system_matrix_with_control(
     Ok(inverse)
 }
 
-#[cfg(test)]
-fn apply_inverse_matrix(gf: &Gf16, inverse: &[Vec<u16>], rhs: &[u16]) -> Result<Vec<u16>> {
-    apply_inverse_matrix_with_control(
-        gf,
-        inverse,
-        rhs,
-        &crate::read_control::ReadControl::default(),
-    )
-}
-
-fn apply_inverse_matrix_with_control(
-    gf: &Gf16,
-    inverse: &[Vec<u16>],
-    rhs: &[u16],
-    control: &crate::read_control::ReadControl,
-) -> Result<Vec<u16>> {
-    check_repair(control)?;
-    if inverse.len() != rhs.len() || inverse.iter().any(|row| row.len() != rhs.len()) {
-        return Err(Error::BadRecoveryChunk);
-    }
-    let mut output = Vec::with_capacity(rhs.len());
-    let mut poller = control.poller();
-    for row in inverse {
-        let mut sum = 0;
-        for (&coefficient, &value) in row.iter().zip(rhs) {
-            poller.check(0).map_err(|_| Error::Cancelled)?;
-            sum ^= gf.mul(coefficient, value);
-        }
-        output.push(sum);
-    }
-    Ok(output)
-}
-
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Gf16 {
@@ -2117,16 +2188,22 @@ impl Gf16 {
     }
 }
 
+fn times_x(value: u32) -> u32 {
+    let doubled = value << 1;
+    if doubled > FIELD_MASK {
+        doubled ^ PRIMITIVE_POLYNOMIAL
+    } else {
+        doubled
+    }
+}
+
 fn initialize_field(exp: &mut [u16], log: &mut [u32]) {
     let mut value = 1u32;
     for power in 0..FIELD_SIZE {
         log[value as usize] = power as u32;
         exp[power] = value as u16;
         exp[power + FIELD_SIZE] = value as u16;
-        value <<= 1;
-        if value > FIELD_MASK {
-            value ^= PRIMITIVE_POLYNOMIAL;
-        }
+        value = times_x(value);
     }
     log[0] = ZERO_LOG_SENTINEL;
 }
@@ -2304,10 +2381,10 @@ mod legacy_reference {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_inverse_matrix, build_inline_recovery_data_for_plan,
-        build_structural_inline_recovery_data, check_streamable_plan, crc64_rar_state, crc64_xz,
-        encode_inline_recovery_parity, encode_parity_shards, invert_linear_system_matrix,
-        make_encoder_matrix, plan_inline_recovery, reconstruct_data_shards, recovery_equations,
+        build_inline_recovery_data_for_plan, build_structural_inline_recovery_data,
+        check_streamable_plan, crc64_rar_state, crc64_xz, encode_inline_recovery_parity,
+        encode_parity_shards, fold_inverse, invert_linear_system_matrix, make_encoder_matrix,
+        plan_inline_recovery, reconstruct_data_shards, recovery_equations,
         repair_inline_recovery_archive, repair_inline_recovery_prefix,
         repair_inline_recovery_prefix_shards, shared_gf16, split_prefix_shard_ranges,
         split_prefix_shards, Error, Gf16, InlineRecoveryPlan, MAX_STREAMED_RECOVERY_PREFIX,
@@ -3153,6 +3230,161 @@ mod tests {
         }
     }
 
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn pooled_parity_matches_one_thread_byte_for_byte() {
+        fn streamed(body: &[u8], percent: u64, mode: super::RecoveryMemoryMode) -> Vec<u8> {
+            let plan = plan_inline_recovery(body.len() as u64, percent).unwrap();
+            let mut scratch = std::io::Cursor::new(vec![
+                0u8;
+                (plan.recovery_shards * plan.group_count)
+                    as usize
+            ]);
+            let mut produced = Vec::new();
+            super::build_streamed_inline_recovery(
+                &mut std::io::Cursor::new(body),
+                body.len() as u64,
+                percent,
+                mode,
+                Some(&mut scratch),
+                &mut produced,
+                None,
+                1,
+            )
+            .unwrap();
+            produced
+        }
+        let pool = crate::parallel::private_pool(8);
+        // An odd body leaves the last data shard short and ending mid-symbol.
+        for len in [1025, 3 * 200 * 1024 + 1, 1024 * 1024 + 7] {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x0bad);
+            for percent in [1, 10] {
+                let group_count = plan_inline_recovery(len as u64, percent)
+                    .unwrap()
+                    .group_count as usize;
+                // 998 divides none of these group counts.
+                assert_ne!(group_count % 998, 0);
+                for mode in [
+                    super::RecoveryMemoryMode::Resident,
+                    super::RecoveryMemoryMode::Striped { stripe_len: 998 },
+                ] {
+                    let serial = {
+                        let _one = crate::parallel::ThreadCap::set(Some(1));
+                        streamed(&body, percent, mode)
+                    };
+                    let pooled = pool.install(|| streamed(&body, percent, mode));
+                    assert_eq!(
+                        pooled, serial,
+                        "{mode:?} parity differs for {len} bytes at {percent}%"
+                    );
+                }
+            }
+        }
+    }
+
+    fn accumulate_scaled_by_log_exp(destination: &mut [u8], source: &[u8], coefficient: u16) {
+        let gf = shared_gf16();
+        for (offset, pair) in source.chunks(2).enumerate() {
+            let value = u16::from_le_bytes([pair[0], pair.get(1).copied().unwrap_or(0)]);
+            let at = offset * 2;
+            let current = u16::from_le_bytes([destination[at], destination[at + 1]]);
+            destination[at..at + 2]
+                .copy_from_slice(&(current ^ gf.mul(coefficient, value)).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn accumulate_scaled_matches_log_exp_multiplication() {
+        use super::accumulate_scaled;
+        let mut source = recovery_test_bytes(1031, 7);
+        source[100..140].fill(0);
+        for coefficient in [0, 1, 2, 0x00ff, 0x0100, 0x8000, 0xbeef, 0xffff] {
+            for len in [0usize, 1, 2, 3, 40, 101, 1030, 1031] {
+                let start = recovery_test_bytes(len.next_multiple_of(2), coefficient.into());
+                let mut expected = start.clone();
+                accumulate_scaled_by_log_exp(&mut expected, &source[..len], coefficient);
+                let mut actual = start;
+                accumulate_scaled(&mut actual, &source[..len], coefficient);
+                assert_eq!(
+                    actual, expected,
+                    "coefficient {coefficient:#x}, {len} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_parity_fingerprints_are_unchanged() {
+        // Lengths and CRC32s of records written before the table kernel.
+        let mut found = Vec::new();
+        for len in [1025usize, 3 * 200 * 1024 + 1] {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x5eed);
+            for percent in [1u64, 10] {
+                for mode in [
+                    super::RecoveryMemoryMode::Resident,
+                    super::RecoveryMemoryMode::Striped { stripe_len: 998 },
+                ] {
+                    let plan = plan_inline_recovery(len as u64, percent).unwrap();
+                    let mut scratch = std::io::Cursor::new(vec![
+                        0u8;
+                        (plan.recovery_shards * plan.group_count)
+                            as usize
+                    ]);
+                    let mut produced = Vec::new();
+                    super::build_streamed_inline_recovery(
+                        &mut std::io::Cursor::new(&body),
+                        len as u64,
+                        percent,
+                        mode,
+                        Some(&mut scratch),
+                        &mut produced,
+                        None,
+                        1,
+                    )
+                    .unwrap();
+                    found.push((produced.len(), crc32fast::hash(&produced)));
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            [
+                (602, 3_644_122_705),
+                (602, 3_644_122_705),
+                (602, 3_644_122_705),
+                (602, 3_644_122_705),
+                (9_492, 2_548_288_029),
+                (9_492, 2_548_288_029),
+                (94_920, 1_590_988_677),
+                (94_920, 1_590_988_677),
+            ]
+        );
+    }
+
+    #[test]
+    fn parity_work_splits_into_columns_across_the_workers_it_can_feed() {
+        use super::parity_work_split;
+        const MIB: usize = 1024 * 1024;
+        // 1% recovery on 12 threads: 2 rows, each cut into 4 tasks per worker.
+        assert_eq!(parity_work_split(2, 12, 6 * MIB, MIB), Some((12, MIB / 4)));
+        // 5%: 10 rows; 48 tasks need 5 columns per row.
+        assert_eq!(parity_work_split(10, 12, 5 * MIB, MIB), Some((12, MIB)));
+        // Less work than the pool can take: only as many workers as it feeds.
+        assert_eq!(parity_work_split(2, 12, 3 * MIB, MIB), Some((6, MIB / 4)));
+        // Many rows and few workers: rows are not cut at all.
+        assert_eq!(parity_work_split(16, 2, 3, 1), Some((2, 3)));
+        // Chunks stay whole 16-bit symbols even when the span is odd.
+        assert_eq!(parity_work_split(1, 2, 11, 1), Some((2, 2)));
+        assert_eq!(parity_work_split(1, 2, 7, 1), Some((2, 2)));
+        // No pool, no rows, or work for only one worker: serial.
+        assert_eq!(parity_work_split(10, 1, 64 * MIB, 1), None);
+        assert_eq!(parity_work_split(0, 12, 64 * MIB, 1), None);
+        assert_eq!(parity_work_split(2, 12, MIB - 2, MIB), None);
+    }
+
     #[test]
     fn recovery_memory_mode_switches_to_striping_under_pressure() {
         let plan = plan_inline_recovery(4 * 1024 * 1024, 10).unwrap();
@@ -3344,6 +3576,25 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(shared_gf16().mul(0x8000, 2), 0x100b);
+    }
+
+    #[test]
+    fn recovery_output_matches_fingerprints_from_the_bitwise_crc64() {
+        let cases: &[(usize, u64, usize, u32)] = &[
+            (1025, 10, 602, 2224291460),
+            (200 * 1024 + 1, 1, 5396, 1605562733),
+            (1024 * 1024 + 7, 10, 138320, 4006196453),
+        ];
+        for &(len, percent, output_len, fingerprint) in cases {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x5555);
+            let output = build_structural_inline_recovery_data(&body, percent).unwrap();
+            assert_eq!(output.len(), output_len, "{len} bytes at {percent}%");
+            assert_eq!(
+                crate::crc32::crc32(&output),
+                fingerprint,
+                "{len} bytes at {percent}%"
+            );
+        }
     }
 
     #[test]
@@ -3605,10 +3856,22 @@ mod tests {
             .map(|row| gf.mul(row[0], expected[0]) ^ gf.mul(row[1], expected[1]))
             .collect::<Vec<_>>();
 
+        let rhs: Vec<_> = rhs
+            .iter()
+            .map(|value: &u16| value.to_le_bytes().to_vec())
+            .collect();
         let inverse = invert_linear_system_matrix(gf, &equations).unwrap();
-        let solved = apply_inverse_matrix(gf, &inverse, &rhs).unwrap();
+        let mut solved = [[0u8; 2]; 2];
+        let [first, second] = &mut solved;
+        fold_inverse(
+            &inverse,
+            &rhs,
+            &mut [first, second],
+            &crate::read_control::ReadControl::default(),
+        )
+        .unwrap();
 
-        assert_eq!(solved, expected);
+        assert_eq!(solved.map(u16::from_le_bytes), expected);
     }
 
     #[test]
@@ -3618,12 +3881,24 @@ mod tests {
             invert_linear_system_matrix(gf, &[vec![1], vec![1]]),
             Err(Error::BadRecoveryChunk)
         );
+        let rhs = [vec![1, 0], vec![2, 0]];
+        let [mut first, mut second] = [[0u8; 2]; 2];
         assert_eq!(
-            apply_inverse_matrix(gf, &[vec![1]], &[1, 2]),
+            fold_inverse(
+                &[vec![1]],
+                &rhs,
+                &mut [&mut first, &mut second],
+                &crate::read_control::ReadControl::default()
+            ),
             Err(Error::BadRecoveryChunk)
         );
         assert_eq!(
-            apply_inverse_matrix(gf, &[vec![1], vec![1]], &[1, 2]),
+            fold_inverse(
+                &[vec![1], vec![1]],
+                &rhs,
+                &mut [&mut first, &mut second],
+                &crate::read_control::ReadControl::default()
+            ),
             Err(Error::BadRecoveryChunk)
         );
     }
@@ -4484,6 +4759,50 @@ mod tests {
     }
 
     #[test]
+    fn repair_restores_one_and_several_damaged_shards_byte_for_byte() {
+        // Odd length, so the last shard is short and ends mid-word.
+        let body = recovery_test_bytes(300_001, 7);
+        let plan = plan_inline_recovery(body.len() as u64, 10).unwrap();
+        let ranges = split_prefix_shard_ranges(body.len(), plan).unwrap();
+        let last = ranges.iter().rposition(|range| !range.is_empty()).unwrap();
+        assert_eq!(ranges[last].len() % 2, 1);
+        let record = build_inline_recovery_data_for_plan(&body, plan).unwrap();
+        let shards = split_prefix_shards(&body, plan).unwrap();
+        let refs: Vec<_> = shards.iter().map(Vec::as_slice).collect();
+        let parity = encode_parity_shards(&refs, plan.recovery_shards as usize).unwrap();
+
+        for damaged in [vec![last], vec![0, last], vec![1, 4, 9, last]] {
+            assert!(damaged.len() <= plan.recovery_shards as usize);
+            let mut broken = body.clone();
+            for &index in &damaged {
+                for byte in &mut broken[ranges[index].clone()] {
+                    *byte ^= 0x5a;
+                }
+            }
+            assert_eq!(
+                repair_inline_recovery_prefix(&broken, &record),
+                Ok(body.clone()),
+                "streamed repair of {damaged:?}"
+            );
+
+            let available: Vec<_> = refs
+                .iter()
+                .enumerate()
+                .map(|(index, shard)| (!damaged.contains(&index)).then_some(*shard))
+                .collect();
+            let rows: Vec<_> = (0..damaged.len())
+                .rev()
+                .map(|row| (row, parity[row].as_slice()))
+                .collect();
+            assert_eq!(
+                reconstruct_data_shards(&available, &rows),
+                Ok(shards.clone()),
+                "in-memory repair of {damaged:?}"
+            );
+        }
+    }
+
+    #[test]
     fn rar5_reconstruct_data_shards_validates_shapes_and_missing_count() {
         assert_eq!(reconstruct_data_shards(&[], &[]), Err(Error::TooManyShards));
         assert_eq!(
@@ -4935,9 +5254,11 @@ mod cancellation_tests {
             Error::Cancelled
         );
         let inverse = vec![vec![1; 128]; 128];
+        let rhs = vec![vec![1; 2]; 128];
+        let mut outputs = vec![[0u8; 2]; 128];
+        let mut repaired: Vec<_> = outputs.iter_mut().map(|output| &mut output[..]).collect();
         assert_eq!(
-            apply_inverse_matrix_with_control(shared_gf16(), &inverse, &[1; 128], &scheduled(2))
-                .unwrap_err(),
+            fold_inverse(&inverse, &rhs, &mut repaired, &scheduled(2)).unwrap_err(),
             Error::Cancelled
         );
     }

@@ -2514,6 +2514,43 @@ fn repairs_sfx_prefixed_rar50_data_with_a_missing_recovery_row() {
 
 #[test]
 #[cfg(all(feature = "write", feature = "recovery"))]
+fn repairs_rar50_inline_recovery_with_one_and_several_damaged_shards() {
+    let mut state = 0x2545_f491_u32;
+    let payload: Vec<u8> = (0..1024 * 1024 + 1)
+        .map(|_| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (state >> 24) as u8
+        })
+        .collect();
+    let bytes = write_stored_archive_with_recovery(
+        &[entry(b"several.bin", &payload)],
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        20,
+    )
+    .unwrap();
+    let start = Archive::parse(&bytes)
+        .unwrap()
+        .files()
+        .next()
+        .unwrap()
+        .block
+        .offset;
+
+    for hits in [1, 4] {
+        let mut damaged = bytes.clone();
+        for hit in 0..hits {
+            damaged[start + hit * payload.len() / 4] ^= 0xff;
+        }
+        assert_eq!(
+            repair_inline_recovery_bytes(&damaged).unwrap(),
+            bytes,
+            "{hits} damaged shards"
+        );
+    }
+}
+
+#[test]
+#[cfg(all(feature = "write", feature = "recovery"))]
 fn repairs_rar50_inline_recovery_header_damage_without_parsing() {
     let payload = b"payload protected by raw inline recovery fallback\n".repeat(64);
     let entries = [entry(b"header-damaged.txt", &payload)

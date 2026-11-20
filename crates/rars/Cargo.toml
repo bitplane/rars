@@ -100,3 +100,8 @@ required-features = ["write"]
 name = "rar20_decode"
 harness = false
 required-features = ["write"]
+
+[[bench]]
+name = "recovery"
+harness = false
+required-features = ["write", "recovery", "parallel"]
