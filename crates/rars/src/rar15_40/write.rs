@@ -4709,32 +4709,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_directory_sources_cannot_discard_payloads() {
-        for (host_os, attributes) in [(3, 0o040750), (2, 0x10)] {
-            let entry = super::StreamingEntry::new(
-                b"directory".to_vec(),
-                crate::EntrySource::from_bytes(b"must not be discarded".to_vec()),
-            )
-            .with_host_os(host_os)
-            .with_file_attr(attributes);
-            let error = super::write_streaming_archive_to(
-                &[entry],
-                super::WriterOptions::new(
-                    crate::ArchiveVersion::Rar30,
-                    crate::FeatureSet::store_only(),
-                ),
-                crate::MemberCoding::Stored,
-                None,
-                &crate::WriterResources::default(),
-                None,
-                &mut Vec::new(),
-            )
-            .unwrap_err();
-            assert!(error.to_string().contains("directory source must be empty"));
-        }
-    }
-
-    #[test]
     #[cfg(feature = "encryption")]
     fn encrypted_payload_padding_preserves_cipher_state_across_chunks() {
         for target in [crate::ArchiveVersion::Rar20, crate::ArchiveVersion::Rar30] {
@@ -5351,53 +5325,6 @@ mod tests {
             }
             assert_eq!(extracted_set(&[file], None), expected, "{name}");
             assert_eq!(extracted_set(&[whole], None), expected, "{name}");
-        }
-    }
-
-    #[test]
-    fn a_member_that_does_not_shrink_is_stored_whatever_codes_it() {
-        use super::Rar29Method;
-        use crate::FilterKind;
-        let text = word_text(40_000);
-        let noise = noise(20_000);
-        let files: [(&str, &[u8]); 3] = [
-            ("before.txt", &text),
-            ("noise.bin", &noise),
-            ("after.txt", &text),
-        ];
-        let members = entries(&files);
-        let expected: Vec<_> = files
-            .iter()
-            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
-            .collect();
-        for solid in [false, true] {
-            for method in [Rar29Method::Auto, Rar29Method::Lz, Rar29Method::Ppmd] {
-                for coding in [
-                    crate::MemberCoding::Compressed,
-                    named(FilterKind::E8E9),
-                    named(FilterKind::Delta { channels: 4 }),
-                ] {
-                    let mut options = rar40();
-                    options.features.solid = solid;
-                    options.method = method;
-                    let case = format!("solid {solid}, {method:?}, {coding:?}");
-
-                    let archive = in_memory_with(&members, options, coding);
-
-                    let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
-                    let headers: Vec<_> = parsed.files().collect();
-                    assert_eq!(headers[1].method, 0x30, "{case}");
-                    assert_eq!(headers[1].pack_size, noise.len() as u64, "{case}");
-                    // Storing ends a chain, so the member after it starts another.
-                    assert!(!headers[2].is_solid(), "{case}");
-                    assert_ne!(headers[2].method, 0x30, "{case}");
-                    assert_eq!(
-                        extracted_set(std::slice::from_ref(&archive), None),
-                        expected,
-                        "{case}"
-                    );
-                }
-            }
         }
     }
 
@@ -7873,39 +7800,6 @@ mod tests {
         );
     }
 
-    /// Level 2 used to be a deeper greedy search than level 1, and on runs of
-    /// zeroes between a repeating phrase it found far matches that displaced
-    /// the repeat offset and packed larger than level 1 did.
-    #[test]
-    fn each_rar29_level_packs_no_larger_than_the_one_below() {
-        let mut period = vec![0u8; 4096];
-        for _ in 0..91 {
-            period.extend_from_slice(b"the quick brown fox jumps over the lazy dog. ");
-        }
-        let runs: Vec<u8> = period.iter().copied().cycle().take(160 * 1024).collect();
-        let samples = [
-            ("binary", binary_member(96 * 1024)),
-            ("text", word_text(96 * 1024)),
-            ("runs", runs),
-        ];
-        for (name, data) in samples {
-            let members = entries(&[(name, &data)]);
-            let mut below = usize::MAX;
-            for level in 1..=5u8 {
-                let mut options =
-                    super::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
-                options.compression_level = Some(level);
-                let archive = in_memory_with(&members, options, crate::MemberCoding::Compressed);
-                assert!(
-                    archive.len() <= below,
-                    "{name}: level {level} packed {} bytes, the level below {below}",
-                    archive.len()
-                );
-                below = archive.len();
-            }
-        }
-    }
-
     #[test]
     fn rar29_levels_are_charged_for_the_models_and_parse_they_hold() {
         const MIB: u64 = 1024 * 1024;
@@ -7949,47 +7843,6 @@ mod tests {
         assert!(super::member_workspace(forced(1), 8 * MIB, true) >= charge(1) + 2 * 25 * MIB);
         assert!(super::member_workspace(forced(5), 8 * MIB, true) >= charge(1) + 2 * 128 * MIB);
         assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
-    }
-
-    /// A chain's PPMd member used to move its model's 19 KB of tables through
-    /// each call by value, and unoptimised that outgrew the 1 MiB main thread
-    /// Windows gives the CLI, on two lines of text in a solid archive.
-    #[test]
-    fn a_solid_ppmd_chain_codes_on_a_1_mib_stack() {
-        let text = word_text(48 * 1024);
-        std::thread::Builder::new()
-            .stack_size(1 << 20)
-            .spawn(move || {
-                let files: [(&str, &[u8]); 2] = [
-                    ("one.txt", &text[..16 * 1024]),
-                    ("two.txt", &text[16 * 1024..]),
-                ];
-                let members = entries(&files);
-                let expected: Vec<_> = files
-                    .iter()
-                    .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
-                    .collect();
-                for (level, method) in [
-                    (None, super::Rar29Method::Auto),
-                    (Some(5), super::Rar29Method::Auto),
-                    (Some(5), super::Rar29Method::Ppmd),
-                ] {
-                    let mut options = rar40();
-                    options.features.solid = true;
-                    options.compression_level = level;
-                    options.method = method;
-                    let archive =
-                        in_memory_with(&members, options, crate::MemberCoding::Compressed);
-                    assert_eq!(
-                        extracted_set(std::slice::from_ref(&archive), None),
-                        expected,
-                        "{level:?} {method:?}"
-                    );
-                }
-            })
-            .unwrap()
-            .join()
-            .unwrap();
     }
 
     /// Solid chains, forced PPMd and streamed members try the level's PPMd

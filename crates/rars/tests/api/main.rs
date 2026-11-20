@@ -14,6 +14,12 @@ mod codec_rar50;
 mod facade;
 
 #[cfg(feature = "write")]
+mod legacy_reader;
+
+#[cfg(feature = "write")]
+mod legacy_writer;
+
+#[cfg(feature = "write")]
 mod rar13_writer;
 
 #[cfg(feature = "write")]
