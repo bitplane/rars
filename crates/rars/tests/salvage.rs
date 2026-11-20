@@ -5,9 +5,10 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
+use rars::rar15_40::{write_compressed_archive, FileEntry, Rar29Method, WriterOptions};
 use rars::{
     Archive, ArchiveMember, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error,
-    ExtractionErrorAction, TruncatedBlock,
+    ExtractionErrorAction, FeatureSet, TruncatedBlock,
 };
 use std::io::{self, Write};
 use std::ops::Range;
@@ -261,6 +262,96 @@ fn a_file_cut_through_a_member_reads_the_members_before_it() {
                 header,
                 &dir,
             );
+        }
+    }
+}
+
+/// `members()` with m3's text in capitals added to m2, and m4's in capitals
+/// as m3. The capitals' statistics differ enough that the LZ coder starts new
+/// tables partway through m2.
+fn rar29_members() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut members = members();
+    let capitals = |index: usize| members[index].1.to_ascii_uppercase();
+    let (three, four) = (capitals(3), capitals(4));
+    members[2].1.extend_from_slice(&three);
+    members[3].1 = four;
+    members
+}
+
+/// A solid RAR 2.9 archive of `rar29_members()` written with `method`.
+fn build_rar29(method: Rar29Method) -> Vec<u8> {
+    let members = rar29_members();
+    let entries: Vec<_> = members
+        .iter()
+        .map(|(name, data)| FileEntry {
+            name,
+            data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        })
+        .collect();
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar29, features).with_method(method);
+    write_compressed_archive(&entries, options).unwrap()
+}
+
+/// Moves member `index`'s declared unpacked size by `delta` and reseals its
+/// header.
+fn shift_declared_size(bytes: &mut [u8], index: usize, delta: i64) {
+    let Archive::Rar15To40(archive) = ArchiveReader::read(bytes).unwrap() else {
+        unreachable!("a RAR 2.9 archive");
+    };
+    let file = archive.files().nth(index).unwrap();
+    let header = file.block.offset..file.block.offset + usize::from(file.block.head_size);
+    let size = u32::try_from(file.unp_size as i64 + delta).unwrap();
+    bytes[header.start + 11..header.start + 15].copy_from_slice(&size.to_le_bytes());
+    let crc = rars::crc32::crc32(&bytes[header.start + 2..header.end]) as u16;
+    bytes[header.start..header.start + 2].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// Damage in a solid RAR 2.9 member can leave its stream decoding to more
+/// bytes than it declares, or fewer. The member fails, and the next one starts
+/// from the tables, PPMd model and window at the stream's end-of-file marker,
+/// as with unrar. Editing the declared size gives the same mismatch
+/// without depending on where a flipped byte lands.
+#[test]
+fn a_solid_rar29_member_that_ends_away_from_its_declared_size_leaves_the_next_in_step() {
+    let expected = rar29_members();
+    // Cut to a quarter, the stream runs on past the capitals' new tables.
+    let len = expected[2].1.len() as i64;
+    for method in [Rar29Method::Lz, Rar29Method::Ppmd] {
+        let whole = build_rar29(method);
+        for delta in [-1, -len * 3 / 4, 1, len / 2] {
+            let case = format!("{method:?} declared size {delta:+}");
+            let mut bytes = whole.clone();
+            shift_declared_size(&mut bytes, 2, delta);
+            let archive = ArchiveReader::read_owned(bytes).unwrap();
+            for read in ["test", "extract"] {
+                let failures = Failures::default();
+                let handler =
+                    |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+                let options = ArchiveReadOptions::new().with_member_error_handler(&handler);
+                if read == "test" {
+                    let tested = test(&archive, options).unwrap();
+                    for (name, _) in &expected {
+                        assert!(tested.contains(name), "{case} {read}: {name:?} missing");
+                    }
+                } else {
+                    let outputs = extract(&archive, options).unwrap();
+                    for (name, data) in &expected {
+                        let output = outputs.iter().find(|(seen, _)| seen == name);
+                        let output = output.unwrap_or_else(|| panic!("{case}: {name:?} missing"));
+                        if name != b"m2.txt" {
+                            assert_eq!(&output.1, data, "{case} {read}: {name:?}");
+                        }
+                    }
+                }
+                assert_eq!(failures.names(), [b"m2.txt"], "{case} {read}");
+            }
         }
     }
 }
