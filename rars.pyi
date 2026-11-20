@@ -23,6 +23,10 @@ __all__ = [
     "RepairReport",
     "RepairResult",
     "PasswordCheck",
+    "Truncation",
+    "TruncatedBlock",
+    "IncompleteMember",
+    "MissingPart",
     "check_password",
     "is_rarfile",
     "is_rarfile_sfx",
@@ -52,6 +56,7 @@ _Member: TypeAlias = RarInfo | str | bytes
 _NewName: TypeAlias = str | bytes
 _Overwrite: TypeAlias = bool | Literal["rename"]
 _Progress: TypeAlias = Callable[[ProgressEvent], object]
+_MemberErrorHandler: TypeAlias = Callable[[Exception], object]
 
 class ArchiveVersion(str, Enum):
     def __new__(cls, value: str) -> Self: ...
@@ -94,8 +99,25 @@ class ProgressPhase(str, Enum):
     """Adding a recovery record."""
     WRITING = "writing"
 
+class TruncatedBlock(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    MEMBER = "member"
+    RECOVERY_RECORD = "recovery_record"
+    SERVICE = "service"
+    COMMENT = "comment"
+    END = "end"
+    UNKNOWN = "unknown"
 
-class Error(Exception): ...
+class MissingPart(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    START = "start"
+    END = "end"
+    BOTH = "both"
+
+
+class Error(Exception):
+    member: str | None
+    """The member the error is about, when known; set on every error `on_member_error` is given."""
 
 class BadRarFile(Error):
     """The archive is damaged or malformed."""
@@ -263,7 +285,11 @@ class RarFile:
         cancellation: CancellationToken | None = None,
         first_volume_only: bool = False,
         volumes: list[_Source] | tuple[_Source, ...] | None = None,
-    ) -> Self: ...
+        salvage: bool = False,
+    ) -> Self:
+        """`salvage=True` reads what survives: a file cut short inside a member up to that
+        member (see `truncation`), and a volume set that begins late or ends early, leaving
+        out the split members it holds only part of (see `incomplete_members`)."""
     def namelist(self) -> list[str]: ...
     def infolist(self) -> list[RarInfo]: ...
     def getinfo(self, member: _Member) -> RarInfo: ...
@@ -326,7 +352,9 @@ class RarFile:
         restore_times: bool = True,
         in_place: bool = False,
         flatten: bool = False,
-    ) -> list[Path]: ...
+        on_member_error: _MemberErrorHandler | None = None,
+    ) -> list[Path]:
+        """`on_member_error` works as in `testrar`, and no output of a failed member is kept."""
     def testrar(
         self,
         *,
@@ -335,7 +363,17 @@ class RarFile:
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
-    ) -> None: ...
+        on_member_error: _MemberErrorHandler | None = None,
+    ) -> None:
+        """`on_member_error` carries on past each member that fails, calling it with the
+        error, whose `member` names it; raise from it to stop. A wrong password or an
+        I/O error still raises."""
+    @property
+    def truncation(self) -> Truncation | None:
+        """Where the file ends early, or None. With `salvage=True`, the first volume read that does."""
+    @property
+    def incomplete_members(self) -> list[IncompleteMember]:
+        """The split members `salvage=True` left out of a volume set."""
     @property
     def comment(self) -> bytes | None: ...
     def read_comment(
@@ -507,6 +545,36 @@ class PasswordCheck:
     def archive(self) -> RarFile | None: ...
     @property
     def needs_password(self) -> bool: ...
+
+@final
+class Truncation:
+    """Where an archive's file ends early; every member listed before it is whole.
+    `str()` describes it."""
+    @property
+    def block(self) -> TruncatedBlock: ...
+    @property
+    def name(self) -> bytes | None:
+        """The stored name of a cut member or service block."""
+    @property
+    def offset(self) -> int: ...
+    @property
+    def started(self) -> bool:
+        """Whether any of the block is in the file."""
+    @property
+    def volume_index(self) -> int: ...
+
+@final
+class IncompleteMember:
+    """A split member left out because part of it is in a volume not given."""
+    @property
+    def filename(self) -> str: ...
+    @property
+    def orig_filename_bytes(self) -> bytes: ...
+    @property
+    def volume_index(self) -> int:
+        """The first volume holding part of it, counting the one opened as 0."""
+    @property
+    def missing(self) -> MissingPart: ...
 
 def is_rarfile(source: _Source) -> bool: ...
 def is_rarfile_sfx(source: _Source) -> bool: ...
