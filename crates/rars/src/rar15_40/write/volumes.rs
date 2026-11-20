@@ -164,6 +164,10 @@ pub(super) fn split_members_above(
         validate_rar29_filter_policy(policy, options.method)?;
     }
     let compresses = coding.compresses();
+    // Level 0 stores every member, so each is written from its own bytes as a
+    // stored one is, rather than loaded and handed back as a copy of itself.
+    // The set is still a compressed one: its headers are unchanged.
+    let codes = level_coding(options, coding).compresses();
     let mut total_bytes = 0u64;
     let mut largest_member = 0u64;
     for member in members {
@@ -171,7 +175,7 @@ pub(super) fn split_members_above(
             crate::write_stream::member_error(error, member.name, "reading source")
         })?;
         // A member coded in memory keeps to 32-bit sizes; one that streams holds neither copy.
-        let in_memory = compresses
+        let in_memory = codes
             && !streams_member(member, options, coding, stream_above).map_err(|error| {
                 crate::write_stream::member_error(error, member.name, "preparing volume member")
             })?;
@@ -236,7 +240,7 @@ pub(super) fn split_members_above(
         pass: 1,
     });
     let work = WorkTracker::new(Some(progress), operation, total_work);
-    let mut solid_encoder = if solid {
+    let mut solid_encoder = if solid && codes {
         Some(SolidEncoder::for_chain(
             members,
             options,
@@ -283,7 +287,7 @@ pub(super) fn split_members_above(
     };
     for (member, &reserve) in members.iter().zip(&reserves) {
         let name = member.name;
-        let streams = compresses
+        let streams = codes
             && streams_member(member, options, coding, stream_above).map_err(|error| {
                 crate::write_stream::member_error(error, name, "preparing volume member")
             })?;
@@ -312,7 +316,7 @@ pub(super) fn split_members_above(
             solid_run_has_member = method != 0x30;
             continue;
         }
-        let encoded = if compresses && !member.is_directory {
+        let encoded = if codes && !member.is_directory {
             Some(
                 encode_member(
                     member,
@@ -329,14 +333,15 @@ pub(super) fn split_members_above(
         } else {
             None
         };
-        let (packed, unpacked_size, method, final_crc) = match encoded {
+        // The member's charge goes once its last fragment is written.
+        let (packed, unpacked_size, method, final_crc, _held) = match encoded {
             Some(EncodedMember {
                 payload: MemberPayload::Packed(packed),
                 method,
                 unpacked_size,
                 file_crc,
-                ..
-            }) => (Some(packed), unpacked_size, method, Some(file_crc)),
+                held,
+            }) => (Some(packed), unpacked_size, method, Some(file_crc), held),
             Some(_) => {
                 return Err(Error::WriterFailure(
                     "compressed volume member came back uncoded",
@@ -351,7 +356,7 @@ pub(super) fn split_members_above(
                         "preparing volume member",
                     ));
                 }
-                (None, len, 0x30, None)
+                (None, len, 0x30, None, None)
             }
         };
         let packed_bytes = packed.as_deref().map(MemberBytes::Borrowed);
@@ -372,7 +377,7 @@ pub(super) fn split_members_above(
             })?;
         let packed_source_len = bytes.len()?;
         let packed_len = cipher.packed_len(packed_source_len)?;
-        let stored_work = (!compresses).then_some(&work);
+        let stored_work = (!codes).then_some(&work);
         let payload = PackedStream::open(
             bytes,
             packed_source_len,

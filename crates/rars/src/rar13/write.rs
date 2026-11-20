@@ -1045,6 +1045,23 @@ struct PackedVolumeMember {
     method: u8,
     /// Known once the member has been packed; a stored one is summed as it is copied.
     file_crc: Option<u16>,
+    /// The budget's charge for what waits to be written, released once the
+    /// last fragment has been. A stored member packs nothing and has none.
+    held: Option<crate::streaming::MemoryPermit>,
+}
+
+impl PackedVolumeMember {
+    /// Keeps `permit` until the set is written, cut to what the member then
+    /// holds, as [`EncodedMember::holding`] does.
+    fn holding(mut self, mut permit: crate::streaming::MemoryPermit) -> Self {
+        let waiting = match &self.payload {
+            VolumePayload::Packed(packed) => packed.capacity() as u64,
+            VolumePayload::Member | VolumePayload::Spooled(_) => 0,
+        };
+        permit.shrink_to(waiting.saturating_add(WRITE_WORKSPACE));
+        self.held = Some(permit);
+        self
+    }
 }
 
 /// A member larger than `stream_above` and read from a source is packed into a spool.
@@ -1143,6 +1160,7 @@ fn split_member(
             len: unpacked_size as u64,
             method: METHOD_STORE,
             file_crc: None,
+            held: None,
         }
     };
     let result = write_volume_set(
@@ -1184,7 +1202,7 @@ fn pack_volume_member(
 ) -> Result<PackedVolumeMember> {
     work.check()?;
     if let (true, Some(source)) = (unpacked_size as u64 > stream_above, member.bytes.source()) {
-        let _permit = resources
+        let permit = resources
             .acquire_serialising_cancellable(streamed_workspace(), &|| work.is_cancelled())?;
         let encoded = encode_spooled_member(
             member,
@@ -1213,9 +1231,11 @@ fn pack_volume_member(
             len,
             method: encoded.method,
             file_crc: Some(encoded.file_crc),
-        });
+            held: None,
+        }
+        .holding(permit));
     }
-    let _permit = resources
+    let permit = resources
         .acquire_serialising_cancellable(member_workspace(unpacked_size as u64, true), &|| {
             work.is_cancelled()
         })?;
@@ -1226,7 +1246,7 @@ fn pack_volume_member(
     let mut last = 0usize;
     let mut advance = |position: usize| advance_rar15_attempt(&mut last, work, position);
     let packed = encode_verified_rar15_payload_with_progress(&data, encode_options, &mut advance)?;
-    Ok(match packed {
+    let packed = match packed {
         Some(packed)
             if !crate::write_plan::StoreFallback::new().applies(
                 false,
@@ -1239,6 +1259,7 @@ fn pack_volume_member(
                 payload: VolumePayload::Packed(packed),
                 method: METHOD_BEST,
                 file_crc: Some(file_crc),
+                held: None,
             }
         }
         // Stored: copied from the member again rather than from a copy of it.
@@ -1247,8 +1268,12 @@ fn pack_volume_member(
             len: unpacked_size as u64,
             method: METHOD_STORE,
             file_crc: Some(file_crc),
+            held: None,
         },
-    })
+    };
+    // The member is let go before the charge is cut to what is left.
+    drop(data);
+    Ok(packed.holding(permit))
 }
 
 /// What every volume of a set repeats around its slice of the member.
@@ -1276,7 +1301,10 @@ fn write_volume_set(
         len: packed_len,
         method,
         file_crc,
+        held,
     } = packed;
+    // The member's charge goes once its last fragment is written.
+    let _held = held;
     u32::try_from(packed_len)
         .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))?;
     let total = packed_len.div_ceil(layout.payload);
@@ -1952,6 +1980,45 @@ mod tests {
                     collect_extract(&Archive::parse(&archive).unwrap(), password).unwrap();
                 assert!(extracted.len() == 1 && extracted[0].data == data, "{case}");
             }
+        }
+    }
+
+    #[test]
+    fn a_volume_member_is_charged_for_what_it_holds_until_its_last_fragment_is_written() {
+        let data: Vec<u8> = (0..300_000u32)
+            .map(|index| ((index * 7 / 5) ^ (index >> 9)) as u8)
+            .collect();
+        let entry = StreamingEntry::new(
+            b"member.bin".to_vec(),
+            EntrySource::from_bytes(data.clone()),
+        )
+        .with_file_attr(0x20);
+        let options = WriterOptions::default();
+        // Packed in memory, and packed into a spool.
+        for stream_above in [u64::MAX, 1024] {
+            let resources = WriterResources::default();
+            let mut sink = crate::volume_sink::ChargedVolumes::new(&resources);
+            split_member(
+                &Member::from_streaming(&entry),
+                options,
+                &MemberCoding::Compressed,
+                20_000,
+                &mut sink,
+                &resources,
+                None,
+                stream_above,
+            )
+            .unwrap();
+            // Every fragment's payload went out while the member was charged.
+            assert!(sink.payload_writes() > 2, "{stream_above}");
+            assert_eq!(resources.workspace_in_use(), 0, "{stream_above}");
+
+            let volumes = sink.collected.take();
+            let extracted = collect_extract_volumes(&parse_volumes(&volumes), None).unwrap();
+            assert!(
+                extracted.len() == 1 && extracted[0].data == data,
+                "{stream_above}"
+            );
         }
     }
 
