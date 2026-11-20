@@ -1,10 +1,11 @@
 use rars::crc32::crc32;
 use rars::rar15_40::Archive;
-use rars::{ArchiveReadOptions, Result};
+use rars::{ArchiveMember, ArchiveReadOptions, ArchiveReader, ExtractionErrorAction, Result};
 use std::cell::RefCell;
 use std::io::{Result as IoResult, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Mutex;
 
 fn fixture(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -90,4 +91,53 @@ fn ppmd_block_can_emit_embedded_one_byte_lz_repeats() {
     assert_eq!(extracted.len(), 2);
     assert_eq!(crc32(&extracted[0].data), 0xda70b16c);
     assert_eq!(crc32(&extracted[1].data), 0xafb0ac62);
+}
+
+/// Fuzzed solid archives whose first member fails partway through a PPMd
+/// symbol. Reading on past it with a member error handler, the later member
+/// continues the model, which the failed symbol left half-updated. It must
+/// fail as a missing model; it used to panic indexing the model's memory.
+#[test]
+fn a_member_continuing_a_failed_ppmd_model_fails_cleanly() {
+    for (name, first) in [
+        (
+            "salvage_cut_mid_symbol.rar",
+            "RAR 2.9 bitstream is truncated",
+        ),
+        (
+            "salvage_escape_past_root.rar",
+            "RAR 2.9 PPMd model is corrupt",
+        ),
+    ] {
+        let data = std::fs::read(fixture(name)).unwrap();
+        let failures = Mutex::new(Vec::new());
+        let handler = |member: &ArchiveMember, error: &rars::Error| {
+            failures
+                .lock()
+                .unwrap()
+                .push((member.meta.name_lossy(), error.to_string()));
+            Ok(ExtractionErrorAction::Continue)
+        };
+        let options = ArchiveReadOptions::new().with_member_error_handler(&handler);
+        let archive = ArchiveReader::read_with_options(&data, options).unwrap();
+        let names: Vec<_> = archive.members().map(|m| m.meta.name_lossy()).collect();
+        assert_eq!(names.len(), 2, "{name}");
+
+        archive.test_with_options(options).unwrap();
+        let expected: Vec<_> = [first, "RAR PPMd block reuses missing model"]
+            .into_iter()
+            .zip(&names)
+            .map(|(error, name)| {
+                let error = format!("while extracting entry '{name}': {error}");
+                (name.clone(), error)
+            })
+            .collect();
+        assert_eq!(*failures.lock().unwrap(), expected, "{name}");
+
+        failures.lock().unwrap().clear();
+        archive
+            .extract_to_with_options(options, |_| Ok(Box::new(std::io::sink())))
+            .unwrap();
+        assert_eq!(*failures.lock().unwrap(), expected, "{name}");
+    }
 }

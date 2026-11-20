@@ -538,6 +538,50 @@ fn decoding_reports_impossible_ranges_and_ends_at_a_root_escape() {
     );
 }
 
+// A failed symbol can stop partway through an escape, in a state only that
+// call's masks made consistent, so nothing may continue the model after it.
+#[test]
+fn a_failed_symbol_leaves_no_model_to_continue() {
+    let missing = |outcome: Result<Option<u8>>| {
+        matches!(
+            outcome,
+            Err(Error::InvalidData("RAR PPMd block reuses missing model"))
+        )
+    };
+    let mut escape = ESCAPE;
+    let continuing = |model: &mut Ppmd7<Allowance>, escape: &mut u8| {
+        model.decode_init(0x05, &mut Bytes { input: &[0; 8] }, escape)
+    };
+
+    // Escaping past the root context ends with no symbol.
+    let mut model = fresh(256 * (u32::MAX / 257));
+    assert_eq!(
+        model.decode_symbol(&mut Bytes { input: &[0; 8] }).unwrap(),
+        None
+    );
+    assert!(missing(model.decode_symbol(&mut Bytes { input: &[0; 8] })));
+    assert!(matches!(
+        continuing(&mut model, &mut escape),
+        Err(Error::InvalidData("RAR PPMd block reuses missing model"))
+    ));
+
+    // Input that runs out partway through a symbol.
+    let (first, input, symbols) = encode(&text(4_000, 9), 6, 1);
+    let cut = &input[..input.len() / 2];
+    let mut model = Ppmd7::with_allowance(&Allowance::default());
+    let mut bytes = Bytes { input: cut };
+    model.decode_init(first, &mut bytes, &mut escape).unwrap();
+    let outcome = (0..symbols.len()).try_for_each(|_| model.decode_symbol(&mut bytes).map(drop));
+    assert!(matches!(outcome, Err(Error::NeedMoreInput)));
+    assert!(missing(model.decode_symbol(&mut Bytes { input: &[0; 8] })));
+    assert!(continuing(&mut model, &mut escape).is_err());
+
+    // A block that resets the model starts afresh.
+    let mut bytes = Bytes { input: &input };
+    model.decode_init(first, &mut bytes, &mut escape).unwrap();
+    assert_eq!(decode_all(&mut model, &mut bytes, symbols.len()), symbols);
+}
+
 #[test]
 fn see_estimates_slow_their_adaptation_to_a_limit() {
     let mut see = See {

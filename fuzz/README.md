@@ -36,6 +36,24 @@ RAM-backed `/tmp`. After a rars version or dependency change, refresh
 - `rar3_recovery`, `rar5_recovery`: recovery records and reconstruction.
 - `rar30_crypto`, `rar50_crypto`: crypto primitives. The RAR5 target limits KDF
   rounds to keep individual cases useful for fuzzing throughput.
+- `salvage_extract`: parse, test (on two threads) and extract a single archive
+  with a member error handler that always carries on, as `rars test` and `rars x`
+  do. A file cut through a member parses up to the cut, and a solid member after
+  a failed one decodes from the state the failed one left.
+- `salvage_volumes`: the same for one to three volumes taken from the input,
+  after `drop_incomplete_members`. The input layout is in the target's header.
+
+`salvage_seeds.py` writes seed corpora for the two salvage targets with a rars
+binary, and `salvage.dict` is a dictionary for them:
+
+```sh
+cargo build --release -p rars-cli
+python3 fuzz/salvage_seeds.py target/release/rars fuzz/corpus
+cargo +nightly fuzz run salvage_extract -- -dict=fuzz/salvage.dict -timeout=10 -rss_limit_mb=2048
+```
+
+Set `RAYON_NUM_THREADS` to a small number when running many jobs, since each
+process starts a thread pool the size of the machine.
 
 ## Smoke checks and longer runs
 

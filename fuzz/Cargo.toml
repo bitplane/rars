@@ -96,3 +96,17 @@ path = "fuzz_targets/unpack50_workers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "salvage_extract"
+path = "fuzz_targets/salvage_extract.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "salvage_volumes"
+path = "fuzz_targets/salvage_volumes.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,38 @@
+# libFuzzer dictionary for the salvage_* targets: signatures, block header
+# type and flag bytes, end blocks and service block names.
+
+# Signatures: RAR 1.3, RAR 1.5-4, RAR 5.
+"RE~^"
+"Rar!\x1a\x07\x00"
+"Rar!\x1a\x07\x01\x00"
+
+# RAR 1.5-4 block type followed by flags (little-endian; 0x8000 = long block).
+# Main header: volume, solid.
+"\x73\x00\x00"
+"\x73\x01\x00"
+"\x73\x08\x00"
+"\x73\x09\x00"
+# File header: plain, split before, split after, both, solid.
+"\x74\x00\x80"
+"\x74\x01\x80"
+"\x74\x02\x80"
+"\x74\x03\x80"
+"\x74\x10\x80"
+# Comment, old service, protect, new service.
+"\x75\x00\x00"
+"\x77\x00\x80"
+"\x78\x00\x80"
+"\x7a\x00\x80"
+# End of archive block, whole.
+"\xc4\x3d\x7b\x00\x40\x07\x00"
+
+# RAR 5 end of archive block, and its volume flag.
+"\x1d\x77\x56\x51\x03\x05\x04\x00"
+"\x03\x05\x04\x01"
+
+# Service block names.
+"CMT"
+"QO"
+"RR"
+"ACL"
+"STM"
