@@ -2746,7 +2746,36 @@ mod tests {
     }
 
     #[test]
-    fn only_the_bottom_of_the_ladder_settles_for_a_greedy_parse() {
+    fn level_one_looks_ahead_before_taking_a_match() {
+        // Level 1 is the only rung that does not parse by shortest path, so
+        // it is the only one where lazy matching does anything. Without it,
+        // level 1 left about 3% of the bench corpus on the table.
+        let level_one = encode_options_for_level(Some(1), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+        assert!(
+            level_one.lazy_matching,
+            "level 1 took the first match it found"
+        );
+        assert_eq!(level_one.lazy_lookahead, 2);
+
+        // Source code, the kind of input the bench corpus's text and source
+        // classes hold: it came out about 3% smaller looking ahead, as they did.
+        // Lazy matching does not win everywhere. Words from a dozen-word
+        // vocabulary in a jumbled order packed 10% larger with it, so this
+        // checks real text rather than a synthetic one.
+        let data = include_bytes!("../../codec/rar50/encoder.rs");
+        let lazy = encode_lz_member_with_options(data, 0, level_one).unwrap();
+        let greedy =
+            encode_lz_member_with_options(data, 0, level_one.with_lazy_matching(false)).unwrap();
+        assert!(
+            lazy.len() < greedy.len(),
+            "level 1 packed {} looking ahead against {} without",
+            lazy.len(),
+            greedy.len(),
+        );
+    }
+
+    #[test]
+    fn only_the_bottom_of_the_ladder_settles_for_a_lazy_parse() {
         // Level 1 is the rung that exists to be quick. Everything above it
         // parses by shortest path, because on this corpus nothing else closes
         // the distance to WinRAR at any rung: the parse is worth several
@@ -2759,7 +2788,7 @@ mod tests {
         for level in 2..=5u8 {
             let options =
                 encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
-            assert!(options.optimal_parse, "level {level} settled for greedy");
+            assert!(options.optimal_parse, "level {level} settled for lazy");
         }
         assert!(
             encode_options_for_level(None, DEFAULT_RAR50_DICTIONARY_SIZE)
