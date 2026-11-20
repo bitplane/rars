@@ -118,6 +118,7 @@ fn streaming_match_crosses_both_wrapped_history_slices_and_multiple_flushes() {
         bytes: Buffer::from_vec(ring),
         end: 8,
         len: 12,
+        zeros: 0,
     };
     assert!(!ring.as_slices().1.is_empty());
     let history = ring.to_vec();
@@ -301,6 +302,30 @@ fn streamed_output_matches_byte_model_across_wraps_growth_and_chained_members() 
                 model[model.len() - kept..],
                 "seed={seed}, dictionary={dictionary}"
             );
+        }
+    }
+}
+
+#[test]
+fn streamed_output_matches_byte_model_after_a_leading_zero_run() {
+    for (seed, dictionary) in [(5, 64), (6, 4096), (7, 100_003)] {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15 ^ seed);
+        // A literal zero and a distance-one match: the ring stores one byte.
+        let mut model = vec![0; 70_000];
+        let mut zeros = StreamingOutput::new(
+            Buffer::new(&Allowance::default()),
+            model.len(),
+            dictionary,
+            dictionary,
+        )
+        .unwrap();
+        let mut sink = |_: DecodedChunk<'_>| Ok::<(), Infallible>(());
+        zeros.push(0, &mut sink).unwrap();
+        zeros.copy_match(1, model.len() - 1, &mut sink).unwrap();
+        zeros.finish(&mut sink).unwrap();
+        let mut history = zeros.into_history();
+        for size in [300_000, 17, 250_000] {
+            history = stream_against_model(&mut rng, &mut model, history, size, dictionary);
         }
     }
 }

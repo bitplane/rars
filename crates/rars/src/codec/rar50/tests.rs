@@ -2883,6 +2883,37 @@ fn streaming_decode_applies_each_filter_kind() {
     }
 }
 
+/// Bytes with no repeats short enough for the encoder to find.
+fn noise(len: usize, seed: u32) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn streaming_match_from_leading_zeros_into_data_copies_the_data() {
+    // The leading zeros encode as a literal and a distance-one match, so the
+    // streaming decoder emits them as a run it never stores. The later copy
+    // of the first 16 bytes starts in that run and ends in the stored data,
+    // the shape of a pak index entry repeating its zeroed header.
+    let mut data = vec![0; 8];
+    data.extend(noise(1_242, 0x428));
+    data.extend_from_within(..16);
+    data.extend(noise(64, 0x429));
+    let packed = Unpack50Encoder::new().encode_member(&data, 0).unwrap();
+    assert_eq!(decode_lz(&packed, 0, data.len()).unwrap(), data);
+
+    let output = stream_without_filter_records(&packed, data.len()).unwrap();
+
+    assert!(output == data, "the streamed bytes differ");
+}
+
 /// x86-like code: calls to a few functions from successive addresses.
 fn x86_calls(len: usize) -> Vec<u8> {
     let mut out = Vec::with_capacity(len + 16);
@@ -5791,7 +5822,7 @@ fn streaming_output_rejects_overruns_without_partial_emission() {
     assert!(emitted.borrow().is_empty());
     zeroes.push_zeroes(1, &mut sink).unwrap();
     assert_eq!(&*emitted.borrow(), &[0]);
-    assert_eq!(zeroes.into_history().into_buffer().into_vec(), [0]);
+    assert_eq!(zeroes.into_history().into_buffer().unwrap().into_vec(), [0]);
 }
 
 #[test]
@@ -5966,6 +5997,39 @@ fn zero_literal_and_initialized_matches_stream_virtual_zero_history() {
 }
 
 #[test]
+fn unstored_zeros_stay_in_the_window_for_the_next_solid_member() {
+    let mut decoded = Vec::new();
+    let mut sink = |chunk: DecodedChunk<'_>| {
+        match chunk {
+            DecodedChunk::Bytes(bytes) => decoded.extend_from_slice(bytes),
+            DecodedChunk::Repeated { byte, len } => decoded.extend(std::iter::repeat_n(byte, len)),
+        }
+        Ok::<(), std::convert::Infallible>(())
+    };
+    // One stored zero and seven the ring never holds.
+    let mut first = StreamingOutput::new(Buffer::new(&Allowance::default()), 8, 64, 64).unwrap();
+    first.push(0, &mut sink).unwrap();
+    first.copy_match(1, 7, &mut sink).unwrap();
+    first.finish(&mut sink).unwrap();
+    let history = first.into_history();
+    assert_eq!(history.window(), 8);
+
+    let mut second = StreamingOutput::new(history, 8, 64, 64).unwrap();
+    second.push_literals(b"ABCD", &mut sink).unwrap();
+    // Starts three zeros back from the data and runs into it.
+    second.copy_match(7, 4, &mut sink).unwrap();
+    second.finish(&mut sink).unwrap();
+
+    assert_eq!(decoded, b"\0\0\0\0\0\0\0\0ABCD\0\0\0A");
+    let mut window = vec![0; 8];
+    window.extend_from_slice(b"ABCD\0\0\0A");
+    assert_eq!(
+        second.into_history().into_buffer().unwrap().into_vec(),
+        window
+    );
+}
+
+#[test]
 fn streaming_zero_history_emits_large_match_without_materializing_it() {
     let mut output = StreamingOutput::new(Buffer::from_vec(vec![0, 0]), 100_000, 2, 2).unwrap();
     let mut chunks = Vec::new();
@@ -5980,7 +6044,10 @@ fn streaming_zero_history_emits_large_match_without_materializing_it() {
         .unwrap();
     assert_eq!(chunks, [(0, 100_000)]);
     assert_eq!(output.written(), 100_000);
-    assert_eq!(output.into_history().into_buffer().into_vec(), [0, 0]);
+    assert_eq!(
+        output.into_history().into_buffer().unwrap().into_vec(),
+        [0, 0]
+    );
 }
 
 #[test]
@@ -6009,7 +6076,10 @@ fn streaming_match_keeps_its_window_across_flushes() {
             .collect::<Vec<_>>()
     );
     assert!(output.ring.capacity() <= 3 + STREAM_SLACK);
-    assert_eq!(output.into_history().into_buffer().into_vec(), b"abc");
+    assert_eq!(
+        output.into_history().into_buffer().unwrap().into_vec(),
+        b"abc"
+    );
 }
 
 #[test]
