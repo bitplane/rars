@@ -619,7 +619,7 @@ impl<B: Budget> ReaderState<B> {
 
     fn flatten_streamed_history(&mut self, dictionary_size: usize) -> Result<()> {
         if let Some(history) = self.streamed_history.take() {
-            self.history = history.into_buffer();
+            self.history = history.into_buffer()?;
             // Bounded readers give back the ring's flush slack.
             let limit = reader_history_limit::<B>(dictionary_size).max(self.history.len());
             if B::LIMITED && self.history.capacity() > limit {
@@ -638,7 +638,7 @@ impl<B: Budget> ReaderState<B> {
     #[cfg(all(test, feature = "write"))]
     fn history_bytes(&self) -> Vec<u8> {
         match &self.streamed_history {
-            Some(history) => history.to_vec(),
+            Some(history) => [vec![0; history.zeros], history.to_vec()].concat(),
             None => self.reachable_history().to_vec(),
         }
     }
@@ -672,7 +672,9 @@ impl<B: Budget> ReaderState<B> {
             history: match &self.streamed_history {
                 Some(streamed) => {
                     let (front, back) = streamed.as_slices();
-                    let mut history = Buffer::with_capacity(streamed.len, &streamed.allowance())?;
+                    let mut history =
+                        Buffer::with_capacity(streamed.window(), &streamed.allowance())?;
+                    history.resize(streamed.zeros, 0)?;
                     history.extend_from_slice(front).map_err(Into::into)?;
                     history.extend_from_slice(back).map_err(Into::into)?;
                     history
@@ -1106,7 +1108,7 @@ impl<B: Budget> ReaderState<B> {
         if output.written() == output.output_limit {
             output.finish(sink)?;
             let history = output.into_history();
-            self.history_window = history.len;
+            self.history_window = history.window();
             self.streamed_history = Some(history);
             Ok(())
         } else {
@@ -1428,12 +1430,15 @@ fn reader_history_capacity<B: Budget>(
     }
 }
 
-/// A streamed member's window: the newest `len` bytes of a ring end before `end`.
+/// A streamed member's window: the newest `len` bytes of a ring end before `end`,
+/// after `zeros` older zero bytes that a run of zeros left out of the ring.
 #[derive(Debug)]
 pub(crate) struct StreamedHistory<B: Budget = Allowance> {
     bytes: Buffer<u8, B>,
     end: usize,
     len: usize,
+    // Only an all-zero window gains these, so they all precede the stored bytes.
+    zeros: usize,
 }
 
 impl<B: Budget> StreamedHistory<B> {
@@ -1461,6 +1466,11 @@ impl<B: Budget> StreamedHistory<B> {
         self.len += count;
     }
 
+    /// Bytes a match can reach: the stored ones and the zeros before them.
+    fn window(&self) -> usize {
+        self.len + self.zeros
+    }
+
     fn allowance(&self) -> B {
         self.bytes.allowance()
     }
@@ -1483,14 +1493,19 @@ impl<B: Budget> StreamedHistory<B> {
 
     fn keep_newest(&mut self, count: usize) {
         self.len = self.len.min(count);
+        self.zeros = self.zeros.min(count - self.len);
     }
 
-    /// Flattens in place, oldest byte first, without allocating.
-    fn into_buffer(mut self) -> Buffer<u8, B> {
+    /// Flattens in place, oldest byte first. Only unstored zeros allocate.
+    fn into_buffer(mut self) -> Result<Buffer<u8, B>> {
         let start = self.back(self.len);
         self.bytes.rotate_left(start);
         self.bytes.truncate(self.len);
-        self.bytes
+        if self.zeros != 0 {
+            self.bytes.resize(self.window(), 0)?;
+            self.bytes.rotate_right(self.zeros);
+        }
+        Ok(self.bytes)
     }
 
     /// Grows the allocation itself so no second copy is resident; true if it moved.
@@ -1533,6 +1548,7 @@ impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
             end: history.len(),
             len: history.len(),
             bytes: history,
+            zeros: 0,
         }
     }
 }
@@ -1754,7 +1770,16 @@ impl<B: Budget> StreamingOutput<B> {
             sink,
         )?;
         self.written += count;
+        self.imply_zeroes(count);
         Ok(())
+    }
+
+    /// Widens the window by zeros that are not stored. Every byte in it is
+    /// zero, so they can sit before the stored ones.
+    fn imply_zeroes(&mut self, count: usize) {
+        debug_assert!(self.all_zero);
+        let room = self.history_limit.saturating_sub(self.ring.window());
+        self.ring.zeros += count.min(room);
     }
 
     /// The usual match needs no flush, growth or sink call; false leaves it to the general copy.
@@ -1799,11 +1824,14 @@ impl<B: Budget> StreamingOutput<B> {
         let visible = length.min(self.output_limit - self.written);
         if self.all_zero && distance <= self.written + self.ring.len - self.pending {
             // Zeroes that never reach the ring are implied by its zero fill.
-            return self.push_zeroes(visible, sink);
+            self.push_zeroes(visible, sink)?;
+            // An overrun stays in the window for the next solid member.
+            self.imply_zeroes(length - visible);
+            return Ok(());
         }
         // Zero-fill out-of-window matches, as the buffered decoder does.
         let zero_fill =
-            distance == 0 || distance > self.dictionary_size || distance > self.ring.len;
+            distance == 0 || distance > self.dictionary_size || distance > self.ring.window();
         let overrun = Overrun::of(distance, zero_fill, length - visible);
         self.copy_visible(distance, visible, zero_fill, sink)?;
         if let Some(overrun) = overrun {
@@ -1821,8 +1849,10 @@ impl<B: Budget> StreamingOutput<B> {
         self.flush(sink)?;
         for _ in 0..overrun.len {
             self.make_room(1)?;
+            // A source before the stored bytes is in the unstored zeros.
             let byte = overrun
                 .distance
+                .filter(|&distance| distance <= self.ring.len)
                 .map_or(0, |distance| self.ring.bytes[self.ring.back(distance)]);
             if byte != 0 {
                 self.all_zero = false;
@@ -1841,7 +1871,7 @@ impl<B: Budget> StreamingOutput<B> {
     fn copy_visible<E>(
         &mut self,
         distance: usize,
-        length: usize,
+        mut length: usize,
         zero_fill: bool,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
@@ -1849,6 +1879,18 @@ impl<B: Budget> StreamingOutput<B> {
             return self.push_repeated(0, length, sink);
         }
         self.check_limit(length)?;
+        if distance > self.ring.len {
+            // The match starts in the unstored zeros and may run on into the
+            // stored bytes. Writing the zeros first brings its source to the
+            // oldest stored byte, at the same distance.
+            let zeros = (distance - self.ring.len).min(length);
+            self.push_repeated(0, zeros, sink)?;
+            length -= zeros;
+            if length == 0 {
+                return Ok(());
+            }
+            debug_assert!(distance <= self.ring.len);
+        }
         if distance == 1 {
             let byte = self.ring.bytes[self.ring.back(1)];
             return self.push_repeated(byte, length, sink);
