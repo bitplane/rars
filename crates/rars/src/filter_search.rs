@@ -341,7 +341,7 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
 ///
 /// An empty member has nothing to filter, and text does not benefit from any of
 /// them, so neither should cost a single encode to find that out.
-pub(crate) fn search_applies(data: &[u8]) -> bool {
+fn search_applies(data: &[u8]) -> bool {
     !data.is_empty() && !is_text_like(data)
 }
 
@@ -367,6 +367,11 @@ const TEXT_SAMPLES: usize = 16;
 /// with text, so the two paths came out 7% apart. Sixteen samples cost
 /// nothing next to one encode, and the whole member and each of its runs are
 /// then judged by what they hold.
+///
+/// The RAR 1.5 to 4 writer asks the same question of a whole member, of each
+/// segment of a streamed one and of each member of a solid chain, and gets the
+/// same answer. A shell script carrying an ELF payload had gone unsearched
+/// there too, and came out 4% to 5% larger at every level.
 pub(crate) fn search_applies_throughout(data: &[u8]) -> bool {
     if data.len() <= TEXT_SAMPLE_LEN * 2 {
         return search_applies(data);
