@@ -85,7 +85,30 @@ class ProgressPhase(str, enum.Enum):
     WRITING = 'writing'
 
 
-ENUMS = (ArchiveVersion, ArchiveFamily, VolumeNaming, AttributeKind, ProgressPhase)
+class TruncatedBlock(str, enum.Enum):
+    MEMBER = 'member'
+    RECOVERY_RECORD = 'recovery_record'
+    SERVICE = 'service'
+    COMMENT = 'comment'
+    END = 'end'
+    UNKNOWN = 'unknown'
+
+
+class MissingPart(str, enum.Enum):
+    START = 'start'
+    END = 'end'
+    BOTH = 'both'
+
+
+ENUMS = (
+    ArchiveVersion,
+    ArchiveFamily,
+    VolumeNaming,
+    AttributeKind,
+    ProgressPhase,
+    TruncatedBlock,
+    MissingPart,
+)
 for cls in ENUMS:
     cls.__str__ = str.__str__
     cls.__format__ = str.__format__
@@ -96,6 +119,8 @@ static ARCHIVE_FAMILY: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static VOLUME_NAMING: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static PROGRESS_PHASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static ATTRIBUTE_KIND: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static TRUNCATED_BLOCK: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static MISSING_PART: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 fn enum_member<'py>(
     py: Python<'py>,
@@ -166,6 +191,104 @@ struct RepairResult {
     data: Option<Vec<u8>>,
     #[pyo3(get)]
     report: RepairReport,
+}
+
+/// Where an archive's file ends early. Every member listed is whole.
+#[pyclass(frozen, module = "rars")]
+#[derive(Debug, Clone)]
+struct Truncation {
+    /// File offset of the block the file ends in, or where the next block was due.
+    #[pyo3(get)]
+    offset: u64,
+    block: &'static str,
+    name: Option<Vec<u8>>,
+    /// Whether any of that block is in the file.
+    #[pyo3(get)]
+    started: bool,
+    /// The volume cut short, counting the one opened as 0.
+    #[pyo3(get)]
+    volume_index: usize,
+    text: String,
+}
+
+impl Truncation {
+    fn new(truncation: &rars_rs::Truncation, volume_index: usize) -> Self {
+        use rars_rs::TruncatedBlock as Block;
+        let (block, name) = match &truncation.block {
+            Block::Member(name) => ("member", Some(name.clone())),
+            Block::RecoveryRecord => ("recovery_record", None),
+            Block::Service(name) => ("service", Some(name.clone())),
+            Block::Comment => ("comment", None),
+            Block::End => ("end", None),
+            _ => ("unknown", None),
+        };
+        Self {
+            offset: truncation.offset,
+            block,
+            name,
+            started: truncation.started,
+            volume_index,
+            text: truncation.to_string(),
+        }
+    }
+}
+
+#[pymethods]
+impl Truncation {
+    #[getter]
+    fn block<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        enum_member(py, &TRUNCATED_BLOCK, "TruncatedBlock", self.block)
+    }
+
+    /// The stored name of a cut member or service block, or None for other blocks.
+    #[getter]
+    fn name<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.name.as_deref().map(|name| PyBytes::new(py, name))
+    }
+
+    fn __str__(&self) -> &str {
+        &self.text
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Truncation(block={:?}, offset={}, started={}, volume_index={})",
+            self.block, self.offset, self.started, self.volume_index
+        )
+    }
+}
+
+/// A split member a salvaged volume set leaves out, as part of it is in a volume not given.
+#[pyclass(frozen, module = "rars")]
+#[derive(Debug, Clone)]
+struct IncompleteMember {
+    #[pyo3(get)]
+    filename: String,
+    orig_filename_bytes: Vec<u8>,
+    /// The first volume holding part of it, counting the one opened as 0.
+    #[pyo3(get)]
+    volume_index: usize,
+    missing: &'static str,
+}
+
+#[pymethods]
+impl IncompleteMember {
+    #[getter]
+    fn orig_filename_bytes<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.orig_filename_bytes)
+    }
+
+    #[getter]
+    fn missing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        enum_member(py, &MISSING_PART, "MissingPart", self.missing)
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "IncompleteMember(filename={:?}, volume_index={}, missing={:?})",
+            self.filename, self.volume_index, self.missing
+        )
+    }
 }
 
 #[pymethods]
@@ -294,6 +417,8 @@ struct ReadOptions {
     /// Set per call from `progress=`, beside `cancellation` because a callback
     /// that raises cancels the read the same way.
     progress: Option<Arc<Py<PyAny>>>,
+    /// Set by `RarFile(salvage=True)` for the parsing it does while opening, and never kept.
+    salvage: bool,
 }
 
 #[pymethods]
@@ -332,6 +457,7 @@ impl ReadOptions {
             allow_rar3_vm_programs,
             threads,
             progress: None,
+            salvage: false,
         })
     }
 }
@@ -366,9 +492,18 @@ impl ReadOptions {
         Self {
             cancellation: None,
             progress: None,
+            salvage: false,
             ..self.clone()
         }
     }
+}
+
+/// The member error handler parsing with `salvage` needs; parsing never calls it.
+fn carry_on(
+    _: &rars_rs::ArchiveMember,
+    _: &rars_rs::Error,
+) -> rars_rs::Result<rars_rs::ExtractionErrorAction> {
+    Ok(rars_rs::ExtractionErrorAction::Continue)
 }
 
 fn python_read_options<'a>(
@@ -388,8 +523,90 @@ fn python_read_options<'a>(
         options.rar50_buffered_decode_limit = settings.max_rar50_buffered_member_bytes;
         options.allow_rar3_vm_programs = settings.allow_rar3_vm_programs;
         options.threads = settings.threads;
+        if settings.salvage {
+            options = options.with_member_error_handler(&carry_on);
+        }
     }
     options
+}
+
+/// A call's `on_member_error`, which the library asks about each member it fails on.
+struct MemberErrors {
+    callback: Py<PyAny>,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    /// What the callback raised, which the call raises instead.
+    raised: Mutex<Option<PyErr>>,
+    /// Members gone past, whose output is not to be published.
+    failed: Mutex<Vec<Vec<u8>>>,
+}
+
+impl MemberErrors {
+    fn new(
+        callback: Option<&Bound<'_, PyAny>>,
+        encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    ) -> PyResult<Option<Self>> {
+        let Some(callback) = callback else {
+            return Ok(None);
+        };
+        if !callback.is_callable() {
+            return Err(PyValueError::new_err("on_member_error must be callable"));
+        }
+        Ok(Some(Self {
+            callback: callback.clone().unbind(),
+            encoding,
+            raised: Mutex::new(None),
+            failed: Mutex::new(Vec::new()),
+        }))
+    }
+
+    /// Gives the callback the error, naming the member, and carries on unless it raises.
+    fn handle(
+        &self,
+        member: &rars_rs::ArchiveMember,
+        error: &rars_rs::Error,
+    ) -> rars_rs::Result<rars_rs::ExtractionErrorAction> {
+        // A wrong password or an I/O error, our own output included, ends the call, as in the CLI.
+        if matches!(
+            error.kind(),
+            rars_rs::ErrorKind::BadPassword | rars_rs::ErrorKind::Io
+        ) {
+            return Ok(rars_rs::ExtractionErrorAction::Abort);
+        }
+        let name = match member.decoded_name(self.encoding) {
+            Ok(name) => String::from_utf8_lossy(&name).into_owned(),
+            Err(_) => String::from_utf8_lossy(&member.meta.name).into_owned(),
+        };
+        let called = Python::attach(|py| {
+            let exception = with_attribute(py, map_error(error.clone()), "member", name);
+            self.callback.call1(py, (exception.value(py),)).map(drop)
+        });
+        match called {
+            Ok(()) => {
+                lock(&self.failed).push(member.meta.name.clone());
+                Ok(rars_rs::ExtractionErrorAction::Continue)
+            }
+            Err(raised) => {
+                *lock(&self.raised) = Some(raised);
+                Ok(rars_rs::ExtractionErrorAction::Abort)
+            }
+        }
+    }
+
+    fn finish<T>(errors: &Option<Self>, result: PyResult<T>) -> PyResult<T> {
+        match errors
+            .as_ref()
+            .and_then(|errors| lock(&errors.raised).take())
+        {
+            Some(raised) => Err(raised),
+            None => result,
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 struct PythonProgress {
@@ -959,6 +1176,10 @@ struct RarFile {
     /// The whole set, listed the first time a call needs a member past the first volume.
     whole: OnceLock<SetListing>,
     closed: AtomicBool,
+    /// A set opened with `salvage=True`: its later volumes, read once at opening.
+    salvaged: Option<Vec<rars_rs::Archive>>,
+    incomplete: Vec<IncompleteMember>,
+    truncation: Option<Truncation>,
 }
 
 struct SetListing {
@@ -1038,8 +1259,14 @@ impl RarFile {
     ///
     /// `options` cover opening and are the defaults for every later call; a call's own
     /// `options` replace them whole. `cancellation` covers opening alone.
+    ///
+    /// `salvage=True` reads what survives: a file cut short inside a member is read
+    /// up to that member, as `truncation` says, and a volume set may begin late or
+    /// end early, its later volumes read now, from `volumes` or found by name until
+    /// one is missing. Split members with a part outside them are left out and
+    /// listed in `incomplete_members`.
     #[new]
-    #[pyo3(signature = (source, *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None))]
+    #[pyo3(signature = (source, *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None, salvage = false))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn new(
         py: Python<'_>,
@@ -1049,8 +1276,14 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         first_volume_only: bool,
         volumes: Option<&Bound<'_, PyAny>>,
+        salvage: bool,
     ) -> PyResult<Self> {
-        let call_options = ReadOptions::for_call(options, None, cancellation)?;
+        let mut call_options = ReadOptions::for_call(options, None, cancellation)?;
+        if salvage {
+            call_options
+                .get_or_insert_with(ReadOptions::default)
+                .salvage = true;
+        }
         let options = call_options.as_ref();
         let password = py_password(password)?;
         let volumes = stored_volumes(
@@ -1065,7 +1298,11 @@ impl RarFile {
                 rars_rs::ArchiveReader::read_reader_with_options(reader, options)
             })?,
         };
-        Ok(file.with_set(first_volume_only, volumes))
+        let mut file = file.with_set(first_volume_only, volumes);
+        if salvage {
+            file.salvage_set(py, options)?;
+        }
+        Ok(file)
     }
 
     fn namelist(&self, py: Python<'_>) -> PyResult<Vec<String>> {
@@ -1213,6 +1450,7 @@ impl RarFile {
                 &out_dir,
                 mode,
                 progress.as_ref(),
+                None,
             )
         } else {
             if let Some(progress) = &progress {
@@ -1226,6 +1464,7 @@ impl RarFile {
                     options,
                     mode,
                     progress.clone(),
+                    None,
                 )
             })
             .map_err(map_error)
@@ -1263,7 +1502,10 @@ impl RarFile {
     /// or `"rename"` to write beside it as `name(N).ext`. `flatten=True` writes
     /// every file straight into `path` under its base name and creates no
     /// directories; symlinks are kept only when they point at a bare name.
-    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    ///
+    /// `on_member_error` carries on past members that fail, as `testrar` does,
+    /// and none of their output is kept. It can't be combined with `members`.
+    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false, on_member_error = None))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1279,8 +1521,15 @@ impl RarFile {
         restore_times: bool,
         in_place: bool,
         flatten: bool,
+        on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<PathBuf>> {
         self.check_open()?;
+        if members.is_some() && on_member_error.is_some() {
+            // Selection counts the outputs opened, which a member failing before its output would upset.
+            return Err(PyValueError::new_err(
+                "on_member_error reads every member, so it can't be combined with members",
+            ));
+        }
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
@@ -1305,8 +1554,21 @@ impl RarFile {
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
+        let member_errors = MemberErrors::new(on_member_error, options.legacy_name_encoding)?;
+        let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
+            member_errors
+                .as_ref()
+                .map_or(Ok(rars_rs::ExtractionErrorAction::Abort), |errors| {
+                    errors.handle(member, error)
+                })
+        };
+        let options = match &member_errors {
+            Some(_) => options.with_member_error_handler(&handler),
+            None => options,
+        };
+        let failed = member_errors.as_ref().map(|errors| &errors.failed);
         let in_set = match &selected {
-            None => volumes.is_some() || self.archive.is_volume(),
+            None => volumes.is_some() || self.archive.is_volume() && !self.salvaged_alone(),
             Some(selected) => selected
                 .iter()
                 .any(|&index| self.needs_later_volumes(index)),
@@ -1320,6 +1582,7 @@ impl RarFile {
                 &out_dir,
                 mode,
                 progress.as_ref(),
+                failed,
             )
         } else {
             if let Some(progress) = &progress {
@@ -1334,15 +1597,22 @@ impl RarFile {
                     options,
                     mode,
                     progress.clone(),
+                    failed,
                 )
             })
             .map_err(map_error)
         };
-        finished(&progress, extracted)?.warn(py)
+        finished(&progress, MemberErrors::finish(&member_errors, extracted))?.warn(py)
     }
 
     /// `volumes` works as in `extractall`.
-    #[pyo3(signature = (*, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    ///
+    /// `on_member_error` carries on past members that fail, calling it with each
+    /// error, its `member` set to the member's name. Raise from it to stop
+    /// instead. A wrong password or an I/O error still stops the call, as do
+    /// split members of a set with a volume missing; see `salvage`.
+    #[pyo3(signature = (*, password = None, options = None, progress = None, cancellation = None, volumes = None, on_member_error = None))]
+    #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn testrar(
         &self,
         py: Python<'_>,
@@ -1351,6 +1621,7 @@ impl RarFile {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
+        on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
@@ -1361,8 +1632,20 @@ impl RarFile {
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
+        let member_errors = MemberErrors::new(on_member_error, options.legacy_name_encoding)?;
+        let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
+            member_errors
+                .as_ref()
+                .map_or(Ok(rars_rs::ExtractionErrorAction::Abort), |errors| {
+                    errors.handle(member, error)
+                })
+        };
+        let options = match &member_errors {
+            Some(_) => options.with_member_error_handler(&handler),
+            None => options,
+        };
         let first = &self.archive;
-        let alone = volumes.is_none() && !first.is_volume();
+        let alone = volumes.is_none() && (!first.is_volume() || self.salvaged_alone());
         if let Some(progress) = &progress {
             if alone {
                 progress.begin(first, &|_| true, true);
@@ -1377,19 +1660,39 @@ impl RarFile {
             })
             .map_err(map_error)
         } else {
-            self.extract_set(py, volumes, options, |volumes| {
-                let all = |_: usize| true;
-                let volumes = tracked(progress.as_deref(), volumes, &all);
-                first.extract_with_volumes(volumes, options, |meta| {
-                    let sink = Box::new(io::sink()) as Box<dyn Write>;
-                    Ok(match &progress {
-                        Some(progress) if !meta.is_directory => progress.counted(&meta.name, sink),
-                        _ => sink,
-                    })
+            let sink = |meta: &rars_rs::ExtractedEntryMeta| {
+                let sink = Box::new(io::sink()) as Box<dyn Write>;
+                Ok(match &progress {
+                    Some(progress) if !meta.is_directory => progress.counted(&meta.name, sink),
+                    _ => sink,
                 })
-            })
+            };
+            // Given `volumes`, `extract_set` refuses them.
+            match self.salvaged_run().filter(|_| volumes.is_none()) {
+                Some(run) => py
+                    .detach(|| rars_rs::extract_volumes_to_with_options(&run, options, sink))
+                    .map_err(map_error),
+                None => self.extract_set(py, volumes, options, |volumes| {
+                    let all = |_: usize| true;
+                    let volumes = tracked(progress.as_deref(), volumes, &all);
+                    first.extract_with_volumes(volumes, options, sink)
+                }),
+            }
         };
-        finished(&progress, result)
+        finished(&progress, MemberErrors::finish(&member_errors, result))
+    }
+
+    /// Where the file ends early, or None. In a set opened with `salvage=True`,
+    /// the first volume that does.
+    #[getter]
+    fn truncation(&self) -> Option<Truncation> {
+        self.truncation.clone()
+    }
+
+    /// The split members `salvage=True` left out of a volume set, in archive order.
+    #[getter]
+    fn incomplete_members(&self) -> Vec<IncompleteMember> {
+        self.incomplete.clone()
     }
 
     #[getter]
@@ -1520,7 +1823,7 @@ impl RarFile {
                 Ok(path.map(ArchiveInput::Path))
             },
             |volumes| {
-                Ok(1 + volumes_to_last(&self.archive, volumes)
+                Ok(1 + volumes_to_last(&self.archive, volumes, false)
                     .take_while(Result::is_ok)
                     .count())
             },
@@ -1671,6 +1974,15 @@ impl RarFile {
             ) -> rars_rs::Result<T>
             + Send,
     ) -> PyResult<T> {
+        if let Some(salvaged) = &self.salvaged {
+            if volumes.is_some() {
+                return Err(PyValueError::new_err(
+                    "a RarFile opened with salvage=True reads the volumes it read at opening; pass volumes= when opening it",
+                ));
+            }
+            let mut later = salvaged.iter().cloned().map(Ok);
+            return py.detach(|| run(&mut later)).map_err(map_error);
+        }
         let stored = self
             .volumes
             .as_ref()
@@ -1768,6 +2080,7 @@ impl RarFile {
                         later,
                         self.encoding,
                         &self.identity,
+                        false,
                     )
                 });
                 if let Ok(listing) = listing {
@@ -1798,8 +2111,9 @@ impl RarFile {
         let options = self.extraction_options(self.options.as_ref(), self.password.as_deref());
         let (first, archive, identity, encoding) =
             (&self.first, &self.archive, &self.identity, self.encoding);
+        let partial = self.salvaged.is_some();
         let whole = self.extract_set(py, None, options, |volumes| {
-            list_later_volumes(archive, first, volumes, encoding, identity)
+            list_later_volumes(archive, first, volumes, encoding, identity, partial)
         })?;
         Ok(self.whole.get_or_init(|| whole))
     }
@@ -1821,16 +2135,89 @@ impl RarFile {
             ))
         } else {
             self.extract_set(py, volumes, options, |volumes| {
-                volumes_to_last(&self.archive, volumes).collect()
+                volumes_to_last(&self.archive, volumes, false).collect()
             })
         }
     }
 
     /// Only a set's first volume knows where the set starts, and bytes alone can't find the rest.
+    /// A salvaged set lists the volumes it read at opening.
     fn lists_later_volumes(&self) -> bool {
         self.archive.is_volume()
-            && starts_set(&self.archive)
-            && (self.path.is_some() || self.volumes.is_some())
+            && (self.salvaged.is_some()
+                || starts_set(&self.archive) && (self.path.is_some() || self.volumes.is_some()))
+    }
+
+    /// A salvaged volume on its own, which reads as a lone archive once its split members are gone.
+    fn salvaged_alone(&self) -> bool {
+        self.salvaged.as_ref().is_some_and(Vec::is_empty)
+    }
+
+    /// A salvaged set's volumes, read whole: one that ends early is not to wait for the rest.
+    fn salvaged_run(&self) -> Option<Vec<rars_rs::Archive>> {
+        let later = self.salvaged.as_ref().filter(|later| !later.is_empty())?;
+        Some(
+            std::iter::once(&self.archive)
+                .chain(later)
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// For `salvage=True`: reads the set's later volumes, those given or found by
+    /// name, and leaves out the members they hold only part of.
+    fn salvage_set(&mut self, py: Python<'_>, settings: Option<&ReadOptions>) -> PyResult<()> {
+        if !self.archive.is_volume() {
+            return Ok(());
+        }
+        let mut run = vec![self.archive.clone()];
+        // A later volume would find the set's earlier ones by name as if it were the first.
+        let finds_later =
+            self.volumes.is_some() || self.path.is_some() && starts_set(&self.archive);
+        if finds_later && !self.first_volume_only {
+            let options = self.extraction_options(settings, self.password.as_deref());
+            run.extend(self.extract_set(py, None, options, |volumes| {
+                volumes.collect::<rars_rs::Result<Vec<_>>>()
+            })?);
+        }
+        // Only a volume's first or last member can be incomplete; name it as `RarInfo` would.
+        let mut names = HashMap::new();
+        for (index, volume) in run.iter().enumerate() {
+            for member in volume.members().take(1).chain(volume.members().last()) {
+                let filename = String::from_utf8_lossy(
+                    &member.decoded_name(self.encoding).map_err(map_error)?,
+                )
+                .into_owned();
+                names.insert((index, member.meta.name.clone()), filename);
+            }
+        }
+        self.incomplete = rars_rs::drop_incomplete_members(&mut run)
+            .into_iter()
+            .map(|member| IncompleteMember {
+                filename: names
+                    .remove(&(member.volume, member.name.clone()))
+                    .unwrap_or_else(|| String::from_utf8_lossy(&member.name).into_owned()),
+                orig_filename_bytes: member.name,
+                volume_index: member.volume,
+                missing: match member.missing {
+                    rars_rs::MissingPart::Start => "start",
+                    rars_rs::MissingPart::End => "end",
+                    _ => "both",
+                },
+            })
+            .collect();
+        self.truncation = run.iter().enumerate().find_map(|(index, volume)| {
+            volume
+                .truncation()
+                .map(|truncation| Truncation::new(truncation, index))
+        });
+        let mut run = run.into_iter();
+        self.archive = run.next().expect("the opened volume leads the run");
+        self.first = SetListing::new(
+            member_infos(&self.archive, self.encoding, &self.identity).map_err(map_error)?,
+        );
+        self.salvaged = Some(run.collect());
+        Ok(())
     }
 
     /// Headers of later volumes aren't kept, so a later member's metadata reparses its volume.
@@ -1887,6 +2274,7 @@ impl RarFile {
         out_dir: &Path,
         mode: OutputMode,
         progress: Option<&Arc<ReadProgress>>,
+        failed: Option<&Mutex<Vec<Vec<u8>>>>,
     ) -> PyResult<Extracted> {
         let first = &self.archive;
         let chosen = |index: usize| selected.is_none_or(|selected| selected.contains(&index));
@@ -1901,6 +2289,7 @@ impl RarFile {
                 options,
                 mode,
                 progress.cloned(),
+                failed,
             ));
             let open = |meta: &rars_rs::ExtractedEntryMeta| outputs.borrow_mut().open(meta);
             let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
@@ -1916,9 +2305,12 @@ impl RarFile {
                     |_, meta| open(meta),
                     link,
                 ),
-                None => rars_rs::output_links::extract_arriving_with_links(
-                    first, volumes, options, open, link,
-                ),
+                None => match self.salvaged_run() {
+                    Some(run) => rars_rs::extract_volumes_with_links(&run, options, open, link),
+                    None => rars_rs::output_links::extract_arriving_with_links(
+                        first, volumes, options, open, link,
+                    ),
+                },
             };
             outputs.into_inner().finish(result)
         })
@@ -2135,33 +2527,49 @@ impl RarFile {
             .map_err(map_open_error)?;
         let encoding = options.and_then(|settings| settings.encoding);
         let identity = Arc::new(());
-        let infos = archive
-            .members()
-            .enumerate()
-            .map(|(index, member)| {
-                let filename =
-                    String::from_utf8_lossy(&member.decoded_name(encoding)?).into_owned();
-                let mut info = info_from_member_named(member, filename);
-                info.member_index = index;
-                info.archive_identity = Some(identity.clone());
-                Ok(info)
-            })
-            .collect::<rars_rs::Result<Vec<_>>>()
-            .map_err(map_error)?;
+        let infos = member_infos(&archive, encoding, &identity).map_err(map_error)?;
+        let truncation = archive
+            .truncation()
+            .map(|truncation| Truncation::new(truncation, 0));
         Ok(Self {
             identity,
             encoding,
             archive,
             path: None,
             password,
-            options: options.cloned(),
+            options: options.map(|options| ReadOptions {
+                salvage: false,
+                ..options.clone()
+            }),
             volumes: None,
             first_volume_only: false,
             first: SetListing::new(infos),
             whole: OnceLock::new(),
             closed: AtomicBool::new(false),
+            salvaged: None,
+            incomplete: Vec::new(),
+            truncation,
         })
     }
+}
+
+/// The members of one parsed volume, as `RarFile` lists them.
+fn member_infos(
+    archive: &rars_rs::Archive,
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+    identity: &Arc<()>,
+) -> rars_rs::Result<Vec<RarInfo>> {
+    archive
+        .members()
+        .enumerate()
+        .map(|(index, member)| {
+            let filename = String::from_utf8_lossy(&member.decoded_name(encoding)?).into_owned();
+            let mut info = info_from_member_named(member, filename);
+            info.member_index = index;
+            info.archive_identity = Some(identity.clone());
+            Ok(info)
+        })
+        .collect()
 }
 
 /// The Python face of [`rars_rs::Builder`]. Everything about choosing a writer,
@@ -2597,8 +3005,20 @@ impl RarBuilder {
                 first: SetListing::new(archive.first.infos.clone()),
                 whole: OnceLock::new(),
                 closed: AtomicBool::new(false),
+                salvaged: archive.salvaged.clone(),
+                incomplete: archive.incomplete.clone(),
+                truncation: archive.truncation.clone(),
             },
-            Err(_) => RarFile::new(py, source, password, options, cancellation, false, None)?,
+            Err(_) => RarFile::new(
+                py,
+                source,
+                password,
+                options,
+                cancellation,
+                false,
+                None,
+                false,
+            )?,
         };
         let password = archive.password.clone();
         if preserve {
@@ -3302,11 +3722,16 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RepairReport>()?;
     m.add_class::<RepairResult>()?;
     m.add_class::<PasswordCheck>()?;
+    m.add_class::<Truncation>()?;
+    m.add_class::<IncompleteMember>()?;
     m.add_function(wrap_pyfunction!(check_password, m)?)?;
     m.add_function(wrap_pyfunction!(is_rarfile, m)?)?;
     m.add_function(wrap_pyfunction!(is_rarfile_sfx, m)?)?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
-    m.add("Error", py.get_type::<Error>())?;
+    let error = py.get_type::<Error>();
+    // Set on the errors `on_member_error` is given; None elsewhere unless a subclass says.
+    error.setattr("member", py.None())?;
+    m.add("Error", error)?;
     m.add("BadRarFile", py.get_type::<BadRarFile>())?;
     m.add("BadPassword", py.get_type::<BadPassword>())?;
     m.add("PasswordRequired", py.get_type::<PasswordRequired>())?;
@@ -3337,6 +3762,8 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "VolumeNaming",
         "AttributeKind",
         "ProgressPhase",
+        "TruncatedBlock",
+        "MissingPart",
     ] {
         m.add(name, enums.getattr(name)?)?;
     }
@@ -3728,6 +4155,8 @@ struct ExtractOutputs<'a> {
     created: HashMap<PathBuf, PathBuf>,
     skipped_links: Vec<SkippedLink>,
     progress: Option<Arc<ReadProgress>>,
+    /// Members `on_member_error` went past, whose pending output is dropped.
+    failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
 }
 
 struct PendingOutput {
@@ -3790,6 +4219,7 @@ impl<'a> ExtractOutputs<'a> {
         options: rars_rs::ArchiveReadOptions<'_>,
         mode: OutputMode,
         progress: Option<Arc<ReadProgress>>,
+        failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
     ) -> Self {
         Self {
             out_dir,
@@ -3811,6 +4241,7 @@ impl<'a> ExtractOutputs<'a> {
             created: HashMap::new(),
             skipped_links: Vec::new(),
             progress,
+            failed,
         }
     }
 
@@ -3933,6 +4364,19 @@ impl<'a> ExtractOutputs<'a> {
         let Some(pending) = self.pending.take() else {
             return Ok(());
         };
+        // The library reports a failed member before it asks for the next output.
+        let failed = self.failed.is_some_and(|failed| {
+            let mut failed = lock(failed);
+            let gone_past = failed.contains(&pending.meta.name);
+            failed.clear();
+            gone_past
+        });
+        if failed {
+            if let Some(staged) = &pending.staged {
+                let _ = fs::remove_file(staged);
+            }
+            return Ok(());
+        }
         if let Some(target) = pending.link_target {
             let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
             rars_rs::output_links::check_legacy_symlink_target(
@@ -4134,6 +4578,7 @@ fn extract_archive<S: Selection>(
     options: rars_rs::ArchiveReadOptions<'_>,
     mode: OutputMode,
     progress: Option<Arc<ReadProgress>>,
+    failed: Option<&Mutex<Vec<Vec<u8>>>>,
 ) -> rars_rs::Result<Extracted> {
     if options
         .cancellation
@@ -4147,6 +4592,7 @@ fn extract_archive<S: Selection>(
         options,
         mode,
         progress,
+        failed,
     ));
     let result = extract_selected(archive, selected, options, &outputs);
     outputs.into_inner().finish(result)
@@ -4600,9 +5046,11 @@ enum VolumeEnd {
 }
 
 /// Volumes marked with no end run until the caller's run out, so only a marked set can report one missing.
+/// A `partial` set, salvaged, may end early.
 fn volumes_to_last<'a>(
     first: &rars_rs::Archive,
     volumes: &'a mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+    partial: bool,
 ) -> impl Iterator<Item = rars_rs::Result<rars_rs::Archive>> + 'a {
     let mut end = volume_end(first);
     let mut order = rars_rs::volume_order::VolumeOrder::after(first);
@@ -4614,7 +5062,7 @@ fn volumes_to_last<'a>(
         index += 1;
         let volume = match volumes.next() {
             Some(volume) => volume,
-            None if end == VolumeEnd::More => Err(rars_rs::Error::MissingVolume),
+            None if end == VolumeEnd::More && !partial => Err(rars_rs::Error::MissingVolume),
             None => return None,
         };
         let volume = volume.and_then(|volume| order.next(&volume).map(|()| volume));
@@ -4659,6 +5107,7 @@ fn list_later_volumes(
     volumes: &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
     encoding: Option<rars_rs::filename::LegacyNameEncoding>,
     identity: &Arc<()>,
+    partial: bool,
 ) -> rars_rs::Result<SetListing> {
     let in_volume = |index: usize, error: rars_rs::Error| rars_rs::Error::InVolume {
         index,
@@ -4671,7 +5120,7 @@ fn list_later_volumes(
     let mut places = listing.places.clone();
     let mut pending = infos.last().is_some_and(|info| info.is_split_after);
     let mut pulled = 0;
-    for volume in volumes_to_last(first, volumes) {
+    for volume in volumes_to_last(first, volumes, partial) {
         pulled += 1;
         let index = pulled;
         let volume = volume?;
@@ -5025,7 +5474,7 @@ mod tests {
                 Some(&options),
             )
             .unwrap();
-            file.testrar(py, None, Some(&options), None, None, None)
+            file.testrar(py, None, Some(&options), None, None, None, None)
                 .unwrap();
             let first = PyString::new(py, &file.first.infos[0].filename);
             for _ in 0..2 {
@@ -5059,6 +5508,7 @@ mod tests {
                     true,
                     false,
                     false,
+                    None,
                 )
                 .unwrap();
             }
@@ -5112,7 +5562,7 @@ mod tests {
                 }),
             )
             .unwrap();
-            file.testrar(py, None, Some(&options), None, None, Some(&later))
+            file.testrar(py, None, Some(&options), None, None, Some(&later), None)
                 .unwrap();
             assert_eq!(rars_rs::crypto::rar50_key_derivations() - before, 1);
         });
@@ -5179,6 +5629,7 @@ mod tests {
                     true,
                     false,
                     false,
+                    None,
                 )
                 .unwrap();
             }
@@ -5204,7 +5655,7 @@ mod tests {
             .unwrap();
             let first = PyString::new(py, &file.first.infos[0].filename);
             for _ in 0..2 {
-                file.testrar(py, None, Some(&options), None, None, None)
+                file.testrar(py, None, Some(&options), None, None, None, None)
                     .unwrap();
                 file.read(py, &first, None, Some(&options), None, None, None)
                     .unwrap();
@@ -5482,6 +5933,9 @@ mod tests {
                     archive,
                     path: None,
                     password: None,
+                    salvaged: None,
+                    incomplete: Vec::new(),
+                    truncation: None,
                 };
                 let token = CancellationToken::new();
                 let options =
@@ -5552,6 +6006,7 @@ mod tests {
                     flatten: false,
                 },
                 None,
+                None,
             )
             .unwrap()
             .paths;
@@ -5569,6 +6024,7 @@ mod tests {
                     flatten: false,
                 },
                 None,
+                None,
             )
             .map(|extracted| extracted.paths)
             .unwrap_err();
@@ -5585,6 +6041,7 @@ mod tests {
                     restore_times: true,
                     flatten: false,
                 },
+                None,
                 None,
             )
             .unwrap()
@@ -5711,6 +6168,9 @@ mod tests {
                             first: SetListing::new(Vec::new()),
                             whole: OnceLock::new(),
                             closed: AtomicBool::new(false),
+                            salvaged: None,
+                            incomplete: Vec::new(),
+                            truncation: None,
                         },
                     )
                     .unwrap();
