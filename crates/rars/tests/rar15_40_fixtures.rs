@@ -5635,7 +5635,7 @@ fn extracts_rars_generated_rar15_writer_oracles() {
 /// The other oracles in that directory are pinned by size and CRC alone. This
 /// one is pinned byte for byte, because the file comment inside it is the one
 /// piece of the RAR 1.5 header layout the writer got wrong for six releases.
-#[cfg(all(feature = "write", feature = "encryption"))]
+#[cfg(feature = "write")]
 fn rars_generated_comments_archive() -> Vec<u8> {
     let entries = [FileEntry {
         name: b"payload.txt",
@@ -5652,8 +5652,7 @@ fn rars_generated_comments_archive() -> Vec<u8> {
 }
 
 #[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
+fn extracts_rars_generated_rar15_comment_oracle() {
     let comment_bytes = std::fs::read(fixture("rars_generated/comments.rar")).unwrap();
     let comment_archive = Archive::parse(&comment_bytes).unwrap();
     assert_eq!(
@@ -5669,6 +5668,12 @@ fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
         collect_extract(&comment_archive).unwrap()[0].data,
         RARS_GENERATED_PAYLOAD
     );
+}
+
+#[test]
+#[cfg(feature = "write")]
+fn writer_matches_rars_generated_rar15_comment_oracle() {
+    let comment_bytes = std::fs::read(fixture("rars_generated/comments.rar")).unwrap();
     let mut generated = rars_generated_comments_archive();
     let generated_archive = Archive::parse(&generated).unwrap();
     let producer = generated_archive.new_subs().next().unwrap();
@@ -5678,7 +5683,11 @@ fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
     // producer record, the archive and file comment bytes must stay identical.
     generated.drain(producer.file.block.offset..producer.file.packed_range.end);
     assert_eq!(comment_bytes, generated);
+}
 
+#[test]
+#[cfg(feature = "encryption")]
+fn extracts_rars_generated_rar15_encryption_oracle() {
     let encrypted_bytes = std::fs::read(fixture("rars_generated/encrypted.rar")).unwrap();
     let encrypted_archive = Archive::parse(&encrypted_bytes).unwrap();
     assert!(matches!(
@@ -5692,8 +5701,7 @@ fn extracts_rars_generated_rar15_comments_and_encryption_oracles() {
 }
 
 #[test]
-#[cfg(feature = "encryption")]
-fn extracts_rars_generated_rar15_writer_volume_oracles() {
+fn extracts_rars_generated_rar15_stored_volume_oracle() {
     let stored_archives: Vec<_> = [
         "rars_generated/split-store.rar",
         "rars_generated/split-store.r00",
@@ -5705,7 +5713,11 @@ fn extracts_rars_generated_rar15_writer_volume_oracles() {
     let stored = collect_extract_volumes(&stored_archives).unwrap();
     assert_eq!(stored[0].name, b"payload.txt");
     assert_eq!(stored[0].data, RARS_GENERATED_PAYLOAD);
+}
 
+#[test]
+#[cfg(feature = "encryption")]
+fn extracts_rars_generated_rar15_encrypted_volume_oracle() {
     let encrypted_archives: Vec<_> = [
         "rars_generated/split-encrypted.rar",
         "rars_generated/split-encrypted.r00",
