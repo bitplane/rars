@@ -427,8 +427,11 @@ impl<'a> ArchiveReadOptions<'a> {
     ///
     /// In a solid archive the members after a failed one need its output.
     /// They are still decoded, from the decoder state the failed member left,
-    /// as unrar does, and may fail too. Cancellation, resource limits and
-    /// members split across volumes still stop the call.
+    /// as unrar does, and may fail too. A non-solid member's output, dictionary,
+    /// buffered-decode, scratch, filter-memory or reader-workspace limit is
+    /// offered to the handler. Cancellation, operation-wide or unknown limits,
+    /// every solid-member limit and members split across volumes still stop the
+    /// call.
     ///
     /// Parsing with a handler also reads an archive whose file is cut short
     /// inside a member's data or file header, up to that member, and records

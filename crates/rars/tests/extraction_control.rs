@@ -4,6 +4,7 @@ use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error,
     ExtractionDecision as Decision, ExtractionOutcome as Outcome,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{cell::RefCell, io, io::Write, rc::Rc};
 
 const VERSIONS: [ArchiveVersion; 8] = [
@@ -84,6 +85,263 @@ fn skip_precedes_limits_and_stop_precedes_later_members() {
 }
 
 #[test]
+fn member_handler_can_continue_after_a_member_output_limit() {
+    for version in VERSIONS {
+        let archive = archive(version, false, false);
+
+        let error = archive
+            .extract_with_control(
+                ArchiveReadOptions::new().with_max_member_output_bytes(64),
+                |_| Ok(Decision::Extract(Box::new(io::sink()))),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                error.root_cause(),
+                Error::MemberOutputLimitExceeded {
+                    limit: 64,
+                    required: 4096
+                }
+            ),
+            "{version:?}: {error}"
+        );
+
+        let explicit_calls = AtomicUsize::new(0);
+        let error = archive
+            .extract_with_control_and_errors(
+                ArchiveReadOptions::new().with_max_member_output_bytes(64),
+                |_| Ok(Decision::Extract(Box::new(io::sink()))),
+                |_, _| {
+                    explicit_calls.fetch_add(1, Ordering::Relaxed);
+                    Ok(rars::ExtractionErrorAction::Continue)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::ResourceLimit);
+        assert_eq!(explicit_calls.load(Ordering::Relaxed), 0);
+
+        let handler_calls = AtomicUsize::new(0);
+        let handler = |member: &rars::ArchiveMember, error: &Error| {
+            assert_eq!(member.meta.name, b"first");
+            assert!(matches!(
+                error.root_cause(),
+                Error::MemberOutputLimitExceeded {
+                    limit: 64,
+                    required: 4096
+                }
+            ));
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let output = Rc::new(RefCell::new(Vec::new()));
+        let outcome = archive
+            .extract_with_control(
+                ArchiveReadOptions::new()
+                    .with_max_member_output_bytes(64)
+                    .with_member_error_handler(&handler),
+                |_| Ok(Decision::Extract(Box::new(Capture(output.clone())))),
+            )
+            .unwrap();
+        assert_eq!(outcome, Outcome::Complete);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*output.borrow(), vec![42; 96]);
+    }
+}
+
+#[test]
+fn volume_api_member_handler_can_continue_after_a_member_output_limit() {
+    for version in [ArchiveVersion::Rar14, ArchiveVersion::Rar50] {
+        let archive = archive(version, false, false);
+        let handler_calls = AtomicUsize::new(0);
+        let handler = |member: &rars::ArchiveMember, error: &Error| {
+            assert_eq!(member.meta.name, b"first");
+            assert!(matches!(
+                error.root_cause(),
+                Error::MemberOutputLimitExceeded {
+                    limit: 64,
+                    required: 4096
+                }
+            ));
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let output = Rc::new(RefCell::new(Vec::new()));
+        rars::extract_volumes_to_with_options(
+            std::slice::from_ref(&archive),
+            ArchiveReadOptions::new()
+                .with_max_member_output_bytes(64)
+                .with_member_error_handler(&handler),
+            |_| Ok(Box::new(Capture(output.clone()))),
+        )
+        .unwrap();
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(*output.borrow(), vec![42; 96]);
+    }
+}
+
+#[test]
+fn volume_api_member_handler_can_continue_after_a_dictionary_limit() {
+    let archive = archive(ArchiveVersion::Rar50, false, false);
+    let failed = std::sync::Mutex::new(Vec::new());
+    let handler = |member: &rars::ArchiveMember, error: &Error| {
+        assert!(matches!(
+            error.root_cause(),
+            Error::Rar50DictionaryLimitExceeded { limit: 0, .. }
+        ));
+        failed.lock().unwrap().push(member.meta.name.clone());
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let mut opened = 0;
+    rars::extract_volumes_to_with_options(
+        std::slice::from_ref(&archive),
+        ArchiveReadOptions::new()
+            .with_rar50_dictionary_size_limit(0)
+            .with_member_error_handler(&handler),
+        |_| {
+            opened += 1;
+            Ok(Box::new(io::sink()))
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        *failed.lock().unwrap(),
+        [b"first".to_vec(), b"second".to_vec(), b"third".to_vec()]
+    );
+    assert_eq!(opened, 0);
+}
+
+#[test]
+fn volume_api_split_member_limits_remain_terminal() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .volume_size(Some(512));
+    builder
+        .add_bytes(b"split".to_vec(), vec![42; 4096], None, None)
+        .unwrap();
+    let volumes: Vec<_> = builder
+        .build_volumes(None)
+        .unwrap()
+        .into_iter()
+        .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
+        .collect();
+    assert!(volumes.len() > 1);
+
+    let handler_calls = AtomicUsize::new(0);
+    let handler = |_: &rars::ArchiveMember, _: &Error| {
+        handler_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let error = rars::extract_volumes_to_with_options(
+        &volumes,
+        ArchiveReadOptions::new()
+            .with_max_member_output_bytes(64)
+            .with_member_error_handler(&handler),
+        |_| Ok(Box::new(io::sink())),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::MemberOutputLimitExceeded {
+            limit: 64,
+            required: 4096
+        }
+    ));
+    assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn operation_wide_and_solid_member_limits_remain_terminal() {
+    let handler_calls = AtomicUsize::new(0);
+    let handler = |_: &rars::ArchiveMember, _: &Error| {
+        handler_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+
+    let independent = archive(ArchiveVersion::Rar50, false, false);
+    let error = independent
+        .extract_with_control(
+            ArchiveReadOptions::new()
+                .with_max_total_output_bytes(64)
+                .with_member_error_handler(&handler),
+            |_| Ok(Decision::Extract(Box::new(io::sink()))),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::TotalOutputLimitExceeded { .. }
+    ));
+    assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
+
+    let solid_archive = archive(ArchiveVersion::Rar50, true, false);
+    let error = solid_archive
+        .extract_with_control(
+            ArchiveReadOptions::new()
+                .with_max_member_output_bytes(64)
+                .with_member_error_handler(&handler),
+            |_| Ok(Decision::Extract(Box::new(io::sink()))),
+        )
+        .unwrap_err();
+    assert!(matches!(
+        error.root_cause(),
+        Error::MemberOutputLimitExceeded { .. }
+    ));
+    assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+#[cfg(feature = "parallel")]
+fn parallel_member_handler_can_continue_after_a_member_output_limit() {
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let archive = archive(version, false, false);
+        let handler_calls = AtomicUsize::new(0);
+        let handler = |member: &rars::ArchiveMember, error: &Error| {
+            assert_eq!(member.meta.name, b"first");
+            assert!(matches!(
+                error.root_cause(),
+                Error::MemberOutputLimitExceeded { .. }
+            ));
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let mut opened = Vec::new();
+        archive
+            .extract_to_parallel_buffered_with_options(
+                ArchiveReadOptions::new()
+                    .with_threads(2)
+                    .with_max_member_output_bytes(64)
+                    .with_member_error_handler(&handler),
+                |member| {
+                    opened.push(member.name.clone());
+                    Ok(Box::new(io::sink()))
+                },
+            )
+            .unwrap();
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(opened, [b"second".to_vec(), b"third".to_vec()]);
+
+        let terminal_handler_calls = AtomicUsize::new(0);
+        let terminal_handler = |_: &rars::ArchiveMember, _: &Error| {
+            terminal_handler_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let error = archive
+            .extract_to_parallel_buffered_with_options(
+                ArchiveReadOptions::new()
+                    .with_threads(2)
+                    .with_max_total_output_bytes(64)
+                    .with_member_error_handler(&terminal_handler),
+                |_| Ok(Box::new(io::sink())),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error.root_cause(),
+            Error::TotalOutputLimitExceeded { .. }
+        ));
+        assert_eq!(terminal_handler_calls.load(Ordering::Relaxed), 0);
+    }
+}
+
+#[test]
 #[cfg(feature = "encryption")]
 fn encrypted_members_can_be_skipped_without_a_password() {
     for version in VERSIONS.into_iter().filter(|v| *v != ArchiveVersion::Rar14) {
@@ -139,13 +397,24 @@ fn solid_skipping_is_refused_but_discarding_preserves_history_and_accounting() {
 fn callback_cancellation_and_errors_do_not_become_successful_stops() {
     let archive = archive(ArchiveVersion::Rar50, false, false);
     let token = rars::ReadCancellation::new();
+    let member_error_calls = AtomicUsize::new(0);
+    let member_error_handler = |_: &rars::ArchiveMember, _: &Error| {
+        member_error_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
     let error = archive
-        .extract_with_control(ArchiveReadOptions::new().with_cancellation(&token), |_| {
-            token.cancel();
-            Ok(Decision::Stop)
-        })
+        .extract_with_control(
+            ArchiveReadOptions::new()
+                .with_cancellation(&token)
+                .with_member_error_handler(&member_error_handler),
+            |_| {
+                token.cancel();
+                Ok(Decision::Stop)
+            },
+        )
         .unwrap_err();
     assert_eq!(error.kind(), rars::ErrorKind::Cancelled);
+    assert_eq!(member_error_calls.load(Ordering::Relaxed), 0);
     let mut calls = 0;
     let error = archive
         .extract_with_control(ArchiveReadOptions::new(), |_| {
@@ -351,6 +620,20 @@ fn split_members_never_offer_independent_error_recovery() {
             .unwrap_err();
         assert_eq!(error.kind(), rars::ErrorKind::InvalidArchive);
         assert_eq!(selected, 1);
+
+        let handler_calls = AtomicUsize::new(0);
+        let handler = |_: &rars::ArchiveMember, _: &Error| {
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let error = archive
+            .extract_with_control(
+                ArchiveReadOptions::new().with_member_error_handler(&handler),
+                |_| Ok(Decision::Extract(Box::new(io::sink()))),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), rars::ErrorKind::InvalidArchive);
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
     }
 }
 
