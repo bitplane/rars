@@ -192,6 +192,23 @@ pub(crate) fn incomplete_member_warning(volume: &Path, member: &rars::Incomplete
     )
 }
 
+/// A member `test` or `x` failed on and went past. `hint` follows the error.
+pub(crate) fn damaged_member_warning(
+    path: &Path,
+    name: &[u8],
+    error: &rars::Error,
+    hint: &str,
+) -> String {
+    match error.entry_context() {
+        Some(_) => format!("warning: {}: {error}{hint}", path.display()),
+        None => format!(
+            "warning: {}: '{}': {error}{hint}",
+            path.display(),
+            display_archive_bytes(name)
+        ),
+    }
+}
+
 pub(crate) fn truncation_warning(path: &Path, truncation: &rars::Truncation) -> String {
     format!("warning: {}: archive is {truncation}", path.display())
 }

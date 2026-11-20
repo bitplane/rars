@@ -1,4 +1,5 @@
 use super::*;
+use crate::extraction_control::{finish_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::source::RangeReader;
 use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
@@ -57,36 +58,54 @@ where
                 options.check_cancelled()?;
                 continue;
             }
-            budget.check(file.unp_size, &file.name)?;
-            options.check_cancelled()?;
-            check_legacy_size(&meta, file.unp_size, links.is_some())?;
-            let control = budget.control.clone();
-            legacy_output(
-                &meta,
-                allowance,
-                &control,
-                &mut links,
-                || open(&meta),
-                |writer| {
-                    budget.run(&file.name, writer, |mut writer| {
-                        if file.is_stored() {
-                            file.write_stored_with_allowance(
-                                &volume,
-                                password,
-                                &mut writer,
-                                allowance,
-                            )
-                            .map_err(|error| file.entry_error("extracting", error))?;
-                        } else {
-                            session
-                                .write_file_to(&volume, file, &mut writer)
+            let result = (|| {
+                budget.check(file.unp_size, &file.name)?;
+                options.check_cancelled()?;
+                check_legacy_size(&meta, file.unp_size, links.is_some())?;
+                let control = budget.control.clone();
+                legacy_output(
+                    &meta,
+                    allowance,
+                    &control,
+                    &mut links,
+                    || open(&meta),
+                    |writer| {
+                        budget.run(&file.name, writer, |mut writer| {
+                            if file.is_stored() {
+                                file.write_stored_with_allowance(
+                                    &volume,
+                                    password,
+                                    &mut writer,
+                                    allowance,
+                                )
                                 .map_err(|error| file.entry_error("extracting", error))?;
-                        }
-                        options.check_cancelled()?;
-                        Ok(())
-                    })
-                },
-            )?;
+                            } else {
+                                session
+                                    .write_file_to(&volume, file, &mut writer)
+                                    .map_err(|error| file.entry_error("extracting", error))?;
+                            }
+                            options.check_cancelled()?;
+                            Ok(())
+                        })
+                    },
+                )
+            })();
+            let solid = volume.main.is_solid() || file.is_solid();
+            match finish_member(
+                &mut None,
+                options,
+                || crate::rar15_40_member(file),
+                solid,
+                result,
+            )? {
+                Some(Resume::Fresh) => {
+                    session =
+                        DecoderSession::with_allowance(volume.main.is_solid(), password, allowance);
+                    session.read_control = budget.control.clone();
+                }
+                Some(Resume::Solid) => session.passed_over(),
+                None => {}
+            }
         }
         if let Some(last) = resume {
             // A continuation is always the first file of its volume.

@@ -138,8 +138,19 @@ impl ReadOptionsArgs {
         options.rar50_decode_workers = self.rar50_decode_workers;
         options.rar50_scratch = scratch;
         options.allow_rar3_vm_programs = self.allow_rar3_vm;
-        options
+        options.with_member_error_handler(&stop_at_damaged_member)
     }
+}
+
+/// With a member error handler set, the library reads an archive cut short
+/// inside a member up to that member, so `info`, `test` and `x` can still list
+/// and read what is before it. This one stops at the first damaged member, as
+/// no handler would; `test` and `x` swap in one that carries on.
+fn stop_at_damaged_member(
+    _: &rars::ArchiveMember,
+    _: &rars::Error,
+) -> rars::Result<rars::ExtractionErrorAction> {
+    Ok(rars::ExtractionErrorAction::Abort)
 }
 
 #[derive(Args)]

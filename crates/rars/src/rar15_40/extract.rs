@@ -163,6 +163,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         Ok(())
     }
 
+    /// Carries on past a failed member: a solid successor continues from the
+    /// state it left.
+    pub(super) fn passed_over(&mut self) {
+        if self.codec.is_some() {
+            self.decoded_files += 1;
+        }
+    }
+
     fn decode_split_to(
         &mut self,
         input: &mut impl Read,

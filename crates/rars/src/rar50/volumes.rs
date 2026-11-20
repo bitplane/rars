@@ -1,4 +1,5 @@
 use super::*;
+use crate::extraction_control::{finish_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::rar50::{Block, FHFL_UNP_SIZE_UNKNOWN};
 use crate::source::{ArchiveSource, RangeReader};
@@ -71,12 +72,37 @@ where
             file.check_output_limit(&budget)?;
             let meta = file.metadata();
             options.check_cancelled()?;
-            let mut writer = open(&meta)?;
-            options.check_cancelled()?;
-            if !meta.is_directory {
+            if meta.is_directory {
+                open(&meta)?;
+                options.check_cancelled()?;
+                continue;
+            }
+            let result = (|| {
+                let mut writer = open(&meta)?;
+                options.check_cancelled()?;
                 budget.run(&file.name, &mut writer, |writer| {
                     session.write_file_to(&volume, file, writer)
-                })?;
+                })
+            })();
+            let solid = volume.main.is_solid() || file.compression_info & 0x40 != 0;
+            match finish_member(
+                &mut None,
+                options,
+                || crate::rar50_member(file),
+                solid,
+                result,
+            )? {
+                Some(Resume::Fresh) => {
+                    session = DecoderSession::with_allowance(
+                        options.password,
+                        buffered_decode_limit,
+                        allowance,
+                    );
+                    session.decoder.read_control = budget.control.clone();
+                    session.scratch = options.rar50_scratch;
+                }
+                Some(Resume::Solid) => session.passed_over(),
+                None => {}
             }
         }
         if let Some(last) = resume {

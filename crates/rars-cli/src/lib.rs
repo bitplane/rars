@@ -23,8 +23,8 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
-    create_link_output, incomplete_member_warning, open_output_writer, print_ok_entry,
-    rar50_output_relative_path, restore_output_metadata, truncation_warning,
+    create_link_output, damaged_member_warning, incomplete_member_warning, open_output_writer,
+    print_ok_entry, rar50_output_relative_path, restore_output_metadata, truncation_warning,
     warn_rar50_redirections, ExtractedOutput, ExtractionStaging, OverwritePolicy,
 };
 use password::{
@@ -46,6 +46,8 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use time::{current_filetime, format_filetime_utc};
 use volumes::{
     discover_sibling_volumes, rar50_volume_part_path, sort_volume_paths, split_at_gaps,
@@ -613,11 +615,12 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
     };
     let truncated = warn_truncated(&paths, &archives);
     let mut skipped = 0;
+    let mut passed_over = PassedOver::default();
     for run in runs {
         let paths = &paths[run.clone()];
         let archives = &mut archives[run];
         skipped += skip_incomplete_members(paths, archives);
-        test_volume_run(
+        passed_over += test_volume_run(
             paths,
             archives,
             &mut password,
@@ -626,7 +629,145 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
         )?;
     }
     incomplete_set_result(gaps.len(), skipped)?;
+    passed_over.result(&paths)?;
     truncated_result(&truncated)
+}
+
+/// Members a command went past: damaged, or locked without a password.
+#[derive(Default, Clone, Copy)]
+struct PassedOver {
+    damaged: usize,
+    locked: usize,
+}
+
+impl std::ops::AddAssign for PassedOver {
+    fn add_assign(&mut self, other: Self) {
+        self.damaged += other.damaged;
+        self.locked += other.locked;
+    }
+}
+
+impl PassedOver {
+    /// Fails a command that went past members, after it has done what it
+    /// could. A missing password keeps its own exit status.
+    fn result(self, paths: &[PathBuf]) -> CliResult<()> {
+        let paths = display_paths(paths);
+        if self.locked > 0 {
+            return Err(CliError::password(format!(
+                "a password is required for {} member(s) in '{paths}'",
+                self.locked
+            )));
+        }
+        if self.damaged > 0 {
+            return Err(CliError::general(format!(
+                "{} damaged member(s) in '{paths}'",
+                self.damaged
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// The members `test` or `x` fails on, as the library reports them: it warns
+/// about each and carries on with the next, unless the error says nothing
+/// about the member itself. `test` also prints each member that passes, in
+/// archive order: one has passed once the next one starts, or the run ends,
+/// with no error for it.
+struct DamagedMembers<'p> {
+    path: &'p Path,
+    count: AtomicUsize,
+    /// Members that need the password no one gave.
+    locked: AtomicUsize,
+    /// Names of members gone past whose output `x` has yet to drop.
+    failed: Mutex<Vec<Vec<u8>>>,
+    /// The member `test` last started, not yet known to pass.
+    testing: Mutex<Option<rars::ExtractedEntryMeta>>,
+    /// One of our own callbacks failed, and its error ends the run.
+    callback_failed: AtomicBool,
+}
+
+impl<'p> DamagedMembers<'p> {
+    fn new(path: &'p Path) -> Self {
+        Self {
+            path,
+            count: AtomicUsize::new(0),
+            locked: AtomicUsize::new(0),
+            failed: Mutex::new(Vec::new()),
+            testing: Mutex::new(None),
+            callback_failed: AtomicBool::new(false),
+        }
+    }
+
+    /// The library's member error handler.
+    fn handle(
+        &self,
+        member: &rars::ArchiveMember,
+        error: &rars::Error,
+    ) -> rars::Result<rars::ExtractionErrorAction> {
+        self.settle(Some(&member.meta.name));
+        // A wrong password, an I/O error or our own output failing ends the run.
+        if self.callback_failed.load(Ordering::Relaxed)
+            || matches!(
+                error.kind(),
+                rars::ErrorKind::BadPassword | rars::ErrorKind::Io
+            )
+        {
+            return Ok(rars::ExtractionErrorAction::Abort);
+        }
+        eprintln!(
+            "{}",
+            damaged_member_warning(self.path, &member.meta.name, error, &retry_hint(error))
+        );
+        let count = if error_is_password_class(error) {
+            &self.locked
+        } else {
+            &self.count
+        };
+        count.fetch_add(1, Ordering::Relaxed);
+        lock(&self.failed).push(member.meta.name.clone());
+        Ok(rars::ExtractionErrorAction::Continue)
+    }
+
+    /// `test`'s callback, as each member starts.
+    fn testing(&self, meta: &rars::ExtractedEntryMeta) {
+        self.settle(None);
+        *lock(&self.testing) = Some(meta.clone());
+    }
+
+    /// Prints the member being tested as passed, unless it is the one named as failed.
+    fn settle(&self, failed: Option<&[u8]>) {
+        if let Some(entry) = lock(&self.testing).take() {
+            if failed != Some(entry.name.as_slice()) {
+                print_ok_entry(&entry);
+            }
+        }
+    }
+
+    fn take_failed(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *lock(&self.failed))
+    }
+
+    /// Notes that one of our callbacks failed, so its error is not gone past.
+    fn callback<T>(&self, result: rars::Result<T>) -> rars::Result<T> {
+        if result.is_err() {
+            self.callback_failed.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn passed_over(&self) -> PassedOver {
+        PassedOver {
+            damaged: self.count.load(Ordering::Relaxed),
+            locked: self.locked.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    // Nothing panics while holding these locks except printing.
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Warns about each archive whose file ends early, returning their paths.
@@ -657,24 +798,29 @@ fn truncated_result(truncated: &[PathBuf]) -> CliResult<()> {
     }
 }
 
-/// Tests one archive, or one run of consecutive volumes.
+/// Tests one archive, or one run of consecutive volumes, printing each
+/// member's result as it goes. Returns the members it went past.
 fn test_volume_run(
     paths: &[PathBuf],
     archives: &[DetectedArchive],
     password: &mut Option<Password>,
     read_options: &cli::ReadOptionsArgs,
     scratch: Option<&rars::Rar50Scratch>,
-) -> CliResult<()> {
+) -> CliResult<PassedOver> {
+    let damaged = DamagedMembers::new(&paths[0]);
+    let handler = |member: &rars::ArchiveMember, error: &rars::Error| damaged.handle(member, error);
+    let tested = |meta: &rars::ExtractedEntryMeta| {
+        damaged.testing(meta);
+        Ok(())
+    };
     if let [archive] = archives {
         ensure_password_for_extract(archive, password)?;
         warn_rar50_redirections(archive);
-        let mut entries = Vec::new();
-        let options = read_options.options(password_bytes(password), scratch);
+        let options = read_options
+            .options(password_bytes(password), scratch)
+            .with_member_error_handler(&handler);
         archive
-            .test_with_options_and_callback(options, |meta| {
-                entries.push(meta.clone());
-                Ok(())
-            })
+            .test_with_options_and_callback(options, tested)
             .map_err(|err| {
                 classify_rars_error(err, |err| {
                     format!(
@@ -684,21 +830,15 @@ fn test_volume_run(
                     )
                 })
             })?;
-        for entry in &entries {
-            print_ok_entry(entry);
-        }
     } else {
         ensure_password_for_archives_extract(archives, password)?;
         for archive in archives {
             warn_rar50_redirections(archive);
         }
-        let mut entries = Vec::new();
-        let options = read_options.options(password_bytes(password), scratch);
-        test_volumes_with_options_and_callback(archives, options, |meta| {
-            entries.push(meta.clone());
-            Ok(())
-        })
-        .map_err(|err| {
+        let options = read_options
+            .options(password_bytes(password), scratch)
+            .with_member_error_handler(&handler);
+        test_volumes_with_options_and_callback(archives, options, tested).map_err(|err| {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to test volume set '{}': {err}{}",
@@ -707,11 +847,9 @@ fn test_volume_run(
                 )
             })
         })?;
-        for entry in &entries {
-            print_ok_entry(entry);
-        }
     }
-    Ok(())
+    damaged.settle(None);
+    Ok(damaged.passed_over())
 }
 
 /// The volumes `test` and `x` read: the named archive's whole set, or the paths given, in volume order.
@@ -821,13 +959,20 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let options = args
         .read_options
         .options(password_bytes(&password), scratch.as_ref());
+    let mut passed_over = PassedOver::default();
     for run in runs {
         let (paths, archives) = (&paths[run.clone()], &archives[run]);
+        let damaged = DamagedMembers::new(&paths[0]);
+        let handler =
+            |member: &rars::ArchiveMember, error: &rars::Error| damaged.handle(member, error);
+        let options = options.with_member_error_handler(&handler);
         let result = if archives.len() == 1 {
-            extract_single_archive(&archives[0], options, &state)
+            extract_single_archive(&archives[0], options, &state, &damaged)
         } else {
-            extract_volume_archives(archives, options, &state)
+            extract_volume_archives(archives, options, &state, &damaged)
         };
+        state.borrow_mut().discard_failed(&damaged.take_failed());
+        passed_over += damaged.passed_over();
         result
             .inspect_err(|err| {
                 // Keep verified predecessors; retain the extraction error if publication fails.
@@ -877,6 +1022,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         )));
     }
     incomplete_set_result(gaps.len(), skipped)?;
+    passed_over.result(&paths)?;
     truncated_result(&truncated)
 }
 
@@ -1313,6 +1459,29 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
+    /// Drops the output of members the library failed on and went past. It
+    /// reports a failure before it opens the next output, so only the last
+    /// output staged can be such a member's. In place, what it wrote stays.
+    fn discard_failed(&mut self, failed: &[Vec<u8>]) {
+        for name in failed {
+            if self.outputs.len() == self.published || self.archive_names.last() != Some(name) {
+                continue;
+            }
+            self.outputs.pop();
+            self.archive_names.pop();
+            let staged = self
+                .staged_paths
+                .pop()
+                .expect("every output has a staged path");
+            self.hardlink_targets.remove(&staged);
+            self.staged_redirections.remove(&staged);
+            self.created_paths.retain(|_, path| *path != staged);
+            if !self.in_place {
+                let _ = fs::remove_file(&staged);
+            }
+        }
+    }
+
     /// Keep what verified before `error`. The library reports a failure before
     /// asking for another output, so the last staged member is verified only
     /// when the error names a different entry. Without a name it is discarded.
@@ -1341,12 +1510,13 @@ fn extract_single_archive(
     archive: &DetectedArchive,
     options: ArchiveReadOptions<'_>,
     state: &RefCell<ExtractOutputState<'_>>,
+    damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
     state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
     archive.extract_with_links(
         options,
-        |meta| state.borrow_mut().open_entry(meta),
-        |meta, link| state.borrow_mut().create_link(meta, link),
+        |meta| open_after_damage(state, damaged, meta),
+        |meta, link| link_after_damage(state, damaged, meta, link),
     )
 }
 
@@ -1354,14 +1524,37 @@ fn extract_volume_archives(
     archives: &[DetectedArchive],
     options: ArchiveReadOptions<'_>,
     state: &RefCell<ExtractOutputState<'_>>,
+    damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
     state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
     extract_volumes_with_links(
         archives,
         options,
-        |meta| state.borrow_mut().open_entry(meta),
-        |meta, link| state.borrow_mut().create_link(meta, link),
+        |meta| open_after_damage(state, damaged, meta),
+        |meta, link| link_after_damage(state, damaged, meta, link),
     )
+}
+
+/// Opens a member's output once any failed member before it is dropped.
+fn open_after_damage(
+    state: &RefCell<ExtractOutputState<'_>>,
+    damaged: &DamagedMembers<'_>,
+    meta: &rars::ExtractedEntryMeta,
+) -> rars::Result<Box<dyn Write>> {
+    let mut state = state.borrow_mut();
+    state.discard_failed(&damaged.take_failed());
+    damaged.callback(state.open_entry(meta))
+}
+
+fn link_after_damage(
+    state: &RefCell<ExtractOutputState<'_>>,
+    damaged: &DamagedMembers<'_>,
+    meta: &rars::ExtractedEntryMeta,
+    link: rars::ExtractedLink<'_>,
+) -> rars::Result<()> {
+    let mut state = state.borrow_mut();
+    state.discard_failed(&damaged.take_failed());
+    damaged.callback(state.create_link(meta, link))
 }
 
 fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {
@@ -2683,6 +2876,7 @@ mod tests {
             &[super::DetectedArchive::Rar50Plus(archive)],
             super::ArchiveReadOptions::new(),
             &state,
+            &super::DamagedMembers::new(&root),
         )
         .unwrap();
         state.into_inner().publish().unwrap();
@@ -2710,7 +2904,8 @@ mod tests {
         assert!(super::extract_volume_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
             super::ArchiveReadOptions::new(),
-            &state
+            &state,
+            &super::DamagedMembers::new(&root),
         )
         .is_err());
         assert_eq!(
@@ -2736,6 +2931,7 @@ mod tests {
             &[super::DetectedArchive::Rar15To40(archive)],
             options,
             &state,
+            &super::DamagedMembers::new(&root),
         )
         .unwrap();
         state.into_inner().publish().unwrap();

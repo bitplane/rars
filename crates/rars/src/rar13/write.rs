@@ -2824,6 +2824,7 @@ mod tests {
             },
             entries: Vec::new(),
             source: ArchiveSource::Memory(Arc::new([])),
+            truncation: None,
         };
         assert_eq!(
             packed_too_short.archive_comment(),
@@ -2841,6 +2842,7 @@ mod tests {
             },
             entries: Vec::new(),
             source: ArchiveSource::Memory(Arc::new([])),
+            truncation: None,
         };
         assert_eq!(unpacked_too_short.archive_comment(), Err(Error::TooShort));
     }
@@ -2856,6 +2858,7 @@ mod tests {
             },
             entries: Vec::new(),
             source: ArchiveSource::Memory(Arc::new([])),
+            truncation: None,
         };
         assert_eq!(
             too_short.authenticity_verification(),
@@ -2875,6 +2878,7 @@ mod tests {
             },
             entries: Vec::new(),
             source: ArchiveSource::Memory(Arc::new([])),
+            truncation: None,
         };
         assert_eq!(
             bad_prefix.authenticity_verification(),

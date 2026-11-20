@@ -12,6 +12,7 @@ use crate::crypto::rar30::Error as Rar30Error;
 use crate::crypto::rar30::Rar30Cipher;
 use crate::detect::{find_archive_start, ArchiveSignature, RAR15_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
+use crate::extraction_control::{finish_independent, holds_for_handler, Resume};
 use crate::io_util::{read_exact_at, read_u32};
 use crate::key_cache::KeyCache;
 use crate::member_batches::{self, Plan};
@@ -903,7 +904,11 @@ impl Archive {
                     .and_then(|()| parse_block_header(archive, pos));
                 let block = match block {
                     Err(Error::TooShort) => {
-                        truncation = Some(cut_block_header(&archive[pos..], sig.offset + pos)?);
+                        truncation = Some(cut_block_header(
+                            &archive[pos..],
+                            sig.offset + pos,
+                            options.salvages(),
+                        )?);
                         break;
                     }
                     block => block?,
@@ -916,7 +921,15 @@ impl Archive {
                 FILE_HEAD => {
                     let mut file = parse_file_like_header(&header, relative_block(&block), 0)?;
                     let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = checked_block_next(&block, total, archive.len())?;
+                    let next = match checked_block_next(&block, total, archive.len()) {
+                        Err(Error::TooShort) if options.salvages() => {
+                            let cut = TruncatedBlock::Member(file.name);
+                            truncation =
+                                Some(Truncation::new(sig.offset + block.offset, cut, true));
+                            break;
+                        }
+                        next => next?,
+                    };
                     file.block.offset = block.offset;
                     file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     blocks.push(Block::File(file));
@@ -1086,7 +1099,11 @@ impl Archive {
                             // A header cut short is under 64 KiB, as HEAD_SIZE is a u16.
                             let rest =
                                 read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
-                            truncation = Some(cut_block_header(&rest, sfx_offset + pos)?);
+                            truncation = Some(cut_block_header(
+                                &rest,
+                                sfx_offset + pos,
+                                options.salvages(),
+                            )?);
                             break;
                         }
                         block => block?,
@@ -1100,7 +1117,15 @@ impl Archive {
                     let mut file_header =
                         parse_file_like_header(&header, relative_block(&block), 0)?;
                     let total = file_block_total_size(&block, total, file_header.pack_size)?;
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
+                    let next = match checked_file_block_next(sfx_offset, &block, total, file_len) {
+                        Err(Error::TooShort) if options.salvages() => {
+                            let cut = TruncatedBlock::Member(file_header.name);
+                            truncation =
+                                Some(Truncation::new(sfx_offset + block.offset, cut, true));
+                            break;
+                        }
+                        next => next?,
+                    };
                     file_header.block.offset = block.offset;
                     file_header.packed_range =
                         packed_range(sfx_offset, next, file_header.pack_size);
@@ -1647,8 +1672,8 @@ impl Archive {
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session = DecoderSession::with_allowance(self.main.is_solid(), password, allowance);
         session.read_control = budget.control.clone();
-        let solid = selector.is_some()
-            && (self.main.is_solid() || self.files().any(|file| file.is_solid()));
+        let archive_solid = self.main.is_solid() || self.files().any(|file| file.is_solid());
+        let solid = selector.is_some() && archive_solid;
         for file in self.files() {
             let selected = crate::extraction_control::select(
                 &mut selector,
@@ -1677,15 +1702,20 @@ impl Archive {
                     None => open(meta),
                 },
             );
-            if crate::extraction_control::finish_member(
+            match crate::extraction_control::finish_member(
                 &mut on_error,
                 options,
                 || crate::rar15_40_member(file),
-                solid,
+                archive_solid,
                 result,
             )? {
-                session = DecoderSession::with_allowance(false, password, allowance);
-                session.read_control = budget.control.clone();
+                Some(Resume::Fresh) => {
+                    session =
+                        DecoderSession::with_allowance(self.main.is_solid(), password, allowance);
+                    session.read_control = budget.control.clone();
+                }
+                Some(Resume::Solid) => session.passed_over(),
+                None => {}
             }
         }
         options.check_cancelled()?;
@@ -1882,20 +1912,37 @@ impl Archive {
                     |file| parallel_hint(file, verification),
                     || options.check_cancelled(),
                     |file, local| {
-                        decode_parallel_entry(self, file, options, local, emit_links, verification)
+                        let decoded = decode_parallel_entry(
+                            self,
+                            file,
+                            options,
+                            local,
+                            emit_links,
+                            verification,
+                        );
+                        match decoded {
+                            Err(error) if !holds_for_handler(&options, &error) => Err(error),
+                            decoded => Ok((file, decoded)),
+                        }
                     },
-                    |(open, links), entry| {
-                        member_batches::publish(
-                            entry,
-                            &mut **open,
-                            &publication,
-                            |meta| meta.name.clone(),
-                            |meta, data| emit_legacy_link(meta, data, links, &publication),
-                        )
+                    |(open, links), (file, entry)| {
+                        let published = entry.and_then(|entry| {
+                            member_batches::publish(
+                                entry,
+                                &mut **open,
+                                &publication,
+                                |meta| meta.name.clone(),
+                                |meta, data| emit_legacy_link(meta, data, links, &publication),
+                            )
+                        });
+                        finish_independent(options, || crate::rar15_40_member(file), published)
                     },
                 )
             },
-            |(open, links), file| self.extract_inline(file, options, allowance, *open, links),
+            |(open, links), file| {
+                let extracted = self.extract_inline(file, options, allowance, *open, links);
+                finish_independent(options, || crate::rar15_40_member(file), extracted)
+            },
         )
     }
 
@@ -3213,13 +3260,13 @@ fn service_block_next(block: &BlockHeader, next: Result<usize>) -> Result<Option
 
 /// The block whose header the end of the file cuts short, read from the bytes
 /// left at its start, `rest`, which begins at file offset `offset`. A file
-/// header whose member is lost, and a header that does fit, so failed for
-/// another reason, stay `TooShort`.
+/// header whose member is lost stays `TooShort` unless `salvage` is set, and a
+/// header that does fit, so failed for another reason, stays `TooShort`.
 ///
 /// Fewer than seven bytes is a cut too, but too few to trust the type byte:
 /// old self-extractors often end in a few bytes that are no header at all. Only
 /// an end block is named then, and nothing is an error.
-fn cut_block_header(rest: &[u8], offset: usize) -> Result<Truncation> {
+fn cut_block_header(rest: &[u8], offset: usize, salvage: bool) -> Result<Truncation> {
     let Some(&[size_low, size_high]) = rest.get(5..7) else {
         let block = match rest.get(2) {
             Some(&ENDARC_HEAD) => TruncatedBlock::End,
@@ -3230,15 +3277,22 @@ fn cut_block_header(rest: &[u8], offset: usize) -> Result<Truncation> {
     if usize::from(u16::from_le_bytes([size_low, size_high])) <= rest.len() {
         return Err(Error::TooShort);
     }
+    let name = || {
+        // LHD_LARGE, 0x100, puts the high halves of both sizes before the name.
+        let large = rest.get(4).is_some_and(|flags| flags & 1 != 0);
+        let start = if large { 40 } else { 32 };
+        let name = rest.get(26..28).and_then(|size| {
+            let size = usize::from(u16::from_le_bytes([size[0], size[1]]));
+            rest.get(start..start + size)
+        });
+        // A Unicode name follows the legacy one after a NUL.
+        let name = name.unwrap_or_default();
+        name.split(|&byte| byte == 0).next().unwrap_or_default()
+    };
     let block = match rest[2] {
+        FILE_HEAD if salvage => TruncatedBlock::Member(name().to_vec()),
         FILE_HEAD => return Err(Error::TooShort),
-        NEWSUB_HEAD => {
-            let name = rest.get(26..28).and_then(|size| {
-                let size = usize::from(u16::from_le_bytes([size[0], size[1]]));
-                rest.get(32..32 + size)
-            });
-            TruncatedBlock::service(name.unwrap_or_default())
-        }
+        NEWSUB_HEAD => TruncatedBlock::service(name()),
         PROTECT_HEAD => TruncatedBlock::RecoveryRecord,
         COMM_HEAD => TruncatedBlock::Comment,
         ENDARC_HEAD => TruncatedBlock::End,

@@ -307,6 +307,8 @@ pub struct ArchiveReadOptions<'a> {
     /// run these programs either; WinRAR 3.x did. Enable this for trusted
     /// archives that need them. Parsing does not retain it.
     pub allow_rar3_vm_programs: bool,
+    /// Set by [`Self::with_member_error_handler`].
+    pub(crate) member_errors: Option<extraction_control::MemberErrorHandler<'a>>,
 }
 
 impl<'a> ArchiveReadOptions<'a> {
@@ -411,6 +413,38 @@ impl<'a> ArchiveReadOptions<'a> {
     pub fn with_rar50_scratch(mut self, scratch: &'a Rar50Scratch) -> Self {
         self.rar50_scratch = Some(scratch);
         self
+    }
+
+    /// Reads past damaged members instead of stopping at the first one.
+    ///
+    /// When a test or extraction fails on a member, `handler` is called with
+    /// the member and the error, on the calling thread and in archive order,
+    /// before any later member is opened. [`ExtractionErrorAction::Continue`]
+    /// carries on with the next member and `Abort` returns the error. The
+    /// call then succeeds once it has been through every member, so the
+    /// handler is the only record of which ones failed. The failed member's
+    /// writer may already hold some of its bytes.
+    ///
+    /// In a solid archive the members after a failed one need its output.
+    /// They are still decoded, from the decoder state the failed member left,
+    /// as unrar does, and may fail too. Cancellation, resource limits and
+    /// members split across volumes still stop the call.
+    ///
+    /// Parsing with a handler also reads an archive whose file is cut short
+    /// inside a member's data or file header, up to that member, and records
+    /// the cut in [`Archive::truncation`] as [`TruncatedBlock::Member`]
+    /// where it would otherwise fail with [`Error::TooShort`].
+    pub fn with_member_error_handler<F>(mut self, handler: &'a F) -> Self
+    where
+        F: Fn(&ArchiveMember, &Error) -> Result<ExtractionErrorAction> + Sync,
+    {
+        self.member_errors = Some(extraction_control::MemberErrorHandler(handler));
+        self
+    }
+
+    /// Whether a member error handler is set, so parsing reads up to a cut member.
+    pub(crate) fn salvages(&self) -> bool {
+        self.member_errors.is_some()
     }
 
     /// Allows RAR 2.9-4.x filter programs other than the six standard ones to
@@ -757,11 +791,12 @@ impl Archive {
 
     /// Where the file ends early, when it is cut short after its last whole
     /// member, such as inside the recovery record. The members before the cut
-    /// still test and extract. Always `None` for RAR 1.3, which has no blocks
-    /// after its members.
+    /// still test and extract. For RAR 1.3, which has no blocks after its
+    /// members, only a cut member is recorded, and only when parsing with a
+    /// member error handler.
     pub fn truncation(&self) -> Option<&Truncation> {
         match self {
-            Self::Rar13(_) => None,
+            Self::Rar13(archive) => archive.truncation(),
             Self::Rar15To40(archive) => archive.truncation(),
             Self::Rar50Plus(archive) => archive.truncation(),
         }

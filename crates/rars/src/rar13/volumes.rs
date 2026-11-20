@@ -1,4 +1,5 @@
 use super::*;
+use crate::extraction_control::{finish_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::source::RangeReader;
 use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
@@ -62,16 +63,32 @@ where
             }
             budget.check(u64::from(entry.header.unp_size), &meta.name)?;
             options.check_cancelled()?;
-            let mut writer = open(&meta)?;
-            options.check_cancelled()?;
-            budget.run(&meta.name, &mut writer, |mut writer| {
-                entry
-                    .write_compressed_to(&volume, password, &mut unpack15, solid, &mut writer)
-                    .map_err(|error| entry.entry_error("extracting", error))?;
+            let result = (|| {
+                let mut writer = open(&meta)?;
                 options.check_cancelled()?;
-                Ok(())
-            })?;
-            extracted_count += 1;
+                budget.run(&meta.name, &mut writer, |mut writer| {
+                    entry
+                        .write_compressed_to(&volume, password, &mut unpack15, solid, &mut writer)
+                        .map_err(|error| entry.entry_error("extracting", error))?;
+                    options.check_cancelled()?;
+                    Ok(())
+                })
+            })();
+            let archive_solid = volume.main.is_solid();
+            match finish_member(
+                &mut None,
+                options,
+                || crate::rar13_member(entry),
+                archive_solid,
+                result,
+            )? {
+                Some(Resume::Fresh) => {
+                    unpack15.reset();
+                    unpack15.read_control = budget.control.clone();
+                    extracted_count = 0;
+                }
+                Some(Resume::Solid) | None => extracted_count += 1,
+            }
         }
         if let Some(last) = resume {
             // A continuation is always the first entry of its volume.

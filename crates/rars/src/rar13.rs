@@ -28,6 +28,7 @@ use crate::detect::{find_archive_start, ArchiveSignature, RAR13_SIGNATURE, SFX_S
 use crate::error::{Error, Result};
 use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
+use crate::truncation::{TruncatedBlock, Truncation};
 use crate::version::ArchiveFamily;
 use crate::volume_extract::VolumeFeed;
 use std::fs::File;
@@ -96,6 +97,7 @@ pub struct Archive {
     pub main: MainHeader,
     pub entries: Vec<Entry>,
     source: ArchiveSource,
+    truncation: Option<Truncation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +214,16 @@ fn admit_header(
         return Err(Error::TooShort);
     }
     budget.admit(size, offset)
+}
+
+/// The member whose header or data the end of the file cuts through, from
+/// the bytes left at its header, `rest`, which starts at file offset `offset`.
+fn cut_member(rest: &[u8], offset: usize) -> Truncation {
+    let name = rest
+        .get(19)
+        .and_then(|&size| rest.get(FILE_HEAD_BASE_SIZE..FILE_HEAD_BASE_SIZE + usize::from(size)))
+        .unwrap_or_default();
+    Truncation::new(offset, TruncatedBlock::Member(name.to_vec()), true)
 }
 
 impl FileHeader {
@@ -396,20 +408,28 @@ impl Archive {
         let main = MainHeader::parse(archive)?;
         let mut pos = main.head_size as usize;
         let mut entries = Vec::new();
+        let mut truncation = None;
 
         while pos < archive.len() {
             if archive.len() - pos < FILE_HEAD_BASE_SIZE {
                 break;
             }
 
-            admit_header(
+            let parsed = admit_header(
                 &archive[pos..],
                 (archive.len() - pos) as u64,
                 false,
                 &mut budget,
                 pos,
-            )?;
-            let (header, name, extra, consumed) = FileHeader::parse(&archive[pos..])?;
+            )
+            .and_then(|()| FileHeader::parse(&archive[pos..]));
+            let (header, name, extra, consumed) = match parsed {
+                Err(Error::TooShort) if options.salvages() => {
+                    truncation = Some(cut_member(&archive[pos..], sig.offset + pos));
+                    break;
+                }
+                parsed => parsed?,
+            };
             let data_start = pos + consumed;
             let data_end =
                 data_start
@@ -418,6 +438,10 @@ impl Archive {
                         "RAR 1.3 file data size overflows usize",
                     ))?;
             if data_end > archive.len() {
+                if options.salvages() {
+                    truncation = Some(cut_member(&archive[pos..], sig.offset + pos));
+                    break;
+                }
                 return Err(Error::TooShort);
             }
 
@@ -436,6 +460,7 @@ impl Archive {
             main,
             entries,
             source: ArchiveSource::Memory(input),
+            truncation,
         })
     }
 
@@ -464,19 +489,21 @@ impl Archive {
         let main = MainHeader::parse(&main_bytes)?;
         let mut pos = main.head_size as usize;
         let mut entries = Vec::new();
+        let mut truncation = None;
 
         while (sfx_offset + pos) as u64 + FILE_HEAD_BASE_SIZE as u64 <= file_len {
             let header_prefix = read_exact_at(&mut file, sfx_offset + pos, FILE_HEAD_BASE_SIZE)?;
             let head_size = read_u16(&header_prefix, 10)? as usize;
-            admit_header(
-                &header_prefix,
-                file_len
-                    .checked_sub((sfx_offset + pos) as u64)
-                    .ok_or(Error::TooShort)?,
-                false,
-                &mut budget,
-                pos,
-            )?;
+            let remaining = file_len
+                .checked_sub((sfx_offset + pos) as u64)
+                .ok_or(Error::TooShort)?;
+            if options.salvages() && head_size as u64 > remaining {
+                // HEAD_SIZE is a u16, so what is left of the header is too.
+                let rest = read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
+                truncation = Some(cut_member(&rest, sfx_offset + pos));
+                break;
+            }
+            admit_header(&header_prefix, remaining, false, &mut budget, pos)?;
             let header_bytes = read_exact_at(&mut file, sfx_offset + pos, head_size)?;
             let (header, name, extra, consumed) = FileHeader::parse(&header_bytes)?;
             let data_start = pos + consumed;
@@ -487,6 +514,10 @@ impl Archive {
                         "RAR 1.3 file data size overflows usize",
                     ))?;
             if (sfx_offset + data_end) as u64 > file_len {
+                if options.salvages() {
+                    truncation = Some(cut_member(&header_bytes, sfx_offset + pos));
+                    break;
+                }
                 return Err(Error::TooShort);
             }
             entries.push(Entry {
@@ -504,7 +535,14 @@ impl Archive {
             main,
             entries,
             source,
+            truncation,
         })
+    }
+
+    /// Where the file is cut short through a member, when it was parsed with
+    /// a member error handler. See [`crate::Archive::truncation`].
+    pub fn truncation(&self) -> Option<&Truncation> {
+        self.truncation.as_ref()
     }
 
     fn copy_range_to(&self, range: Range<usize>, out: &mut impl Write) -> Result<()> {
@@ -655,15 +693,20 @@ impl Archive {
                 extracted_count += 1;
                 Ok(())
             })();
-            if crate::extraction_control::finish_member(
+            match crate::extraction_control::finish_member(
                 &mut on_error,
                 options,
                 || crate::rar13_member(entry),
                 solid,
                 result,
             )? {
-                unpack15.reset();
-                unpack15.read_control = budget.control.clone();
+                Some(crate::extraction_control::Resume::Fresh) => {
+                    unpack15.reset();
+                    unpack15.read_control = budget.control.clone();
+                    extracted_count = 0;
+                }
+                Some(crate::extraction_control::Resume::Solid) => extracted_count += 1,
+                None => {}
             }
         }
         options.check_cancelled()?;
