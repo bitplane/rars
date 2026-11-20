@@ -153,15 +153,6 @@ mod tests {
     ];
 
     #[test]
-    fn kind_conversion_selects_the_whole_member_without_changing_parameters() {
-        for kind in ALL {
-            let spec = FilterSpec::from(kind);
-            assert_eq!(spec.kind, kind);
-            assert_eq!(spec.range, None);
-        }
-    }
-
-    #[test]
     fn every_filter_is_named_and_accepted_by_at_least_one_format() {
         for kind in ALL {
             assert!(
@@ -193,45 +184,5 @@ mod tests {
                 "{kind:?}"
             );
         }
-    }
-
-    #[test]
-    fn each_filter_names_the_formats_that_can_write_it() {
-        use crate::ArchiveVersion;
-        assert_eq!(
-            formats_supporting_filter(FilterKind::Arm),
-            vec![ArchiveVersion::Rar50, ArchiveVersion::Rar70]
-        );
-        assert_eq!(
-            formats_supporting_filter(FilterKind::Itanium),
-            vec![
-                ArchiveVersion::Rar29,
-                ArchiveVersion::Rar30,
-                ArchiveVersion::Rar40
-            ]
-        );
-        // Delta is the one every filtering format has.
-        assert_eq!(
-            formats_supporting_filter(FilterKind::Delta { channels: 2 }),
-            vec![
-                ArchiveVersion::Rar29,
-                ArchiveVersion::Rar30,
-                ArchiveVersion::Rar40,
-                ArchiveVersion::Rar50,
-                ArchiveVersion::Rar70
-            ]
-        );
-        for kind in ALL {
-            assert!(!formats_supporting_filter(kind).is_empty(), "{kind:?}");
-        }
-    }
-
-    #[test]
-    fn a_policy_defaults_to_leaving_the_data_alone() {
-        assert_eq!(FilterPolicy::default(), FilterPolicy::None);
-        assert_eq!(
-            FilterPolicy::explicit(FilterKind::E8),
-            FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8))
-        );
     }
 }

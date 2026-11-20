@@ -1,3 +1,5 @@
+//! Public API tests share one integration-test target.
+
 #[cfg(feature = "write")]
 mod builder;
 
@@ -13,8 +15,20 @@ mod codec_rar29;
 #[cfg(feature = "write")]
 mod codec_rar50;
 
+mod crc32;
+
+mod detect;
+
+mod error;
+
 #[cfg(feature = "write")]
 mod facade;
+
+mod feature_matrix;
+
+mod filename;
+
+mod filter;
 
 #[cfg(feature = "write")]
 mod legacy_reader;
@@ -45,6 +59,12 @@ mod streaming;
 
 #[cfg(feature = "write")]
 mod support;
+
+mod timestamp;
+
+mod version;
+
+mod volume_name;
 
 #[cfg(feature = "write")]
 mod write_plan;
