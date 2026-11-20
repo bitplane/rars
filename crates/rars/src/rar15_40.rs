@@ -910,7 +910,10 @@ impl Archive {
                 NEWSUB_HEAD => {
                     let mut file = parse_file_like_header(&header, relative_block(&block), 0)?;
                     let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = checked_block_next(&block, total, archive.len())?;
+                    let next = checked_block_next(&block, total, archive.len());
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     file.block.offset = block.offset;
                     file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     let kind = classify_new_sub(&file.name);
@@ -918,7 +921,10 @@ impl Archive {
                     pos = next;
                 }
                 COMM_HEAD => {
-                    let next = checked_block_next(&block, total, archive.len())?;
+                    let next = checked_block_next(&block, total, archive.len());
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     let mut comment = parse_comment_header(&header, relative_block(&block))?;
                     comment.block.offset = block.offset;
                     comment.packed_range =
@@ -927,7 +933,10 @@ impl Archive {
                     pos = next;
                 }
                 PROTECT_HEAD => {
-                    let next = checked_block_next(&block, total, archive.len())?;
+                    let next = checked_block_next(&block, total, archive.len());
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     let protect = parse_protect_header(&header, &block, sig.offset, total)?;
                     blocks.push(Block::Protect(protect));
                     pos = next;
@@ -938,7 +947,10 @@ impl Archive {
                     break;
                 }
                 _ => {
-                    let next = checked_block_next(&block, total, archive.len())?;
+                    let next = checked_block_next(&block, total, archive.len());
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     blocks.push(Block::Unknown(block));
                     pos = next;
                 }
@@ -1051,7 +1063,10 @@ impl Archive {
                     let mut file_header =
                         parse_file_like_header(&header, relative_block(&block), 0)?;
                     let total = file_block_total_size(&block, total, file_header.pack_size)?;
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
+                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     file_header.block.offset = block.offset;
                     file_header.packed_range =
                         packed_range(sfx_offset, next, file_header.pack_size);
@@ -1063,7 +1078,10 @@ impl Archive {
                     pos = next;
                 }
                 COMM_HEAD => {
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
+                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     let mut comment = parse_comment_header(&header, relative_block(&block))?;
                     comment.block.offset = block.offset;
                     comment.packed_range =
@@ -1072,7 +1090,10 @@ impl Archive {
                     pos = next;
                 }
                 PROTECT_HEAD => {
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
+                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     let protect = parse_protect_header(&header, &block, sfx_offset, total)?;
                     blocks.push(Block::Protect(protect));
                     pos = next;
@@ -1083,7 +1104,10 @@ impl Archive {
                     break;
                 }
                 _ => {
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
+                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
+                    let Some(next) = service_block_next(&block, next)? else {
+                        break;
+                    };
                     blocks.push(Block::Unknown(block));
                     pos = next;
                 }
@@ -3104,6 +3128,19 @@ fn checked_block_next(block: &BlockHeader, total: usize, archive_len: usize) -> 
     Ok(next)
 }
 
+/// Where the walk goes after a block that carries no member data, or `None`
+/// when that block's data runs past the end of the file. A cut through a
+/// trailing recovery record or other service block leaves every member before
+/// it intact, so the walk ends there instead of failing the whole archive, as
+/// it already does when fewer than seven bytes remain. The header CRC must have
+/// been checked, so a damaged size field is still an error.
+fn service_block_next(block: &BlockHeader, next: Result<usize>) -> Result<Option<usize>> {
+    match next {
+        Err(Error::TooShort) if should_validate_header_crc(block.head_type) => Ok(None),
+        next => next.map(Some),
+    }
+}
+
 fn checked_file_block_next(
     sfx_offset: usize,
     block: &BlockHeader,
@@ -3227,10 +3264,17 @@ mod tests {
                         crate::ArchiveReadOptions::new(),
                     ),
                 ] {
-                    if available < 4 {
+                    if available < 4 && matches!(head_type, FILE_HEAD | ENDARC_HEAD) {
                         assert!(
                             matches!(result, Err(Error::TooShort)),
                             "type {head_type:x}, extent {available}: {result:?}"
+                        );
+                    } else if available < 4 {
+                        // A cut service block ends the walk without being kept.
+                        let archive = result.unwrap();
+                        assert!(
+                            archive.blocks.is_empty(),
+                            "type {head_type:x}, extent {available}"
                         );
                     } else {
                         assert_eq!(result.unwrap().blocks.len(), 1);
@@ -4183,7 +4227,7 @@ mod tests {
                 ArchiveSource::Memory(std::sync::Arc::from(bytes.clone())),
                 crate::ArchiveReadOptions::new(),
             );
-            if add_size != 0 || size < 13 && kind == COMM_HEAD {
+            if size < 13 && kind == COMM_HEAD {
                 assert_eq!(memory.unwrap_err().kind(), seekable.unwrap_err().kind());
             } else {
                 let memory = memory.unwrap();

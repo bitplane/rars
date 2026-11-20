@@ -6763,6 +6763,108 @@ fn parses_rar300_newsub_recovery_record() {
     assert_eq!(recovery.file.unp_size, 5672);
 }
 
+/// Issue #429: self-extractors whose copy was cut short inside the trailing
+/// recovery record. Every member is whole, so the archive has to open and
+/// test from memory and from a path, while a cut through member data and a
+/// damaged service header both stay errors.
+#[test]
+#[cfg(feature = "write")]
+fn sfx_cut_inside_trailing_recovery_record_still_tests() {
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let first = b"issue 429 synthetic payload, first member\n".repeat(128);
+    let second = b"issue 429 synthetic payload, second member\n".repeat(96);
+    let entries = [
+        FileEntry {
+            name: b"first.txt",
+            data: &first,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 2,
+            password: None,
+            file_comment: None,
+        },
+        FileEntry {
+            name: b"second.txt",
+            data: &second,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 2,
+            password: None,
+            file_comment: None,
+        },
+    ];
+    let written = write_compressed_archive(
+        &entries,
+        WriterOptions::new(ArchiveVersion::Rar29, features),
+    )
+    .unwrap();
+    let end = Archive::parse(&written)
+        .unwrap()
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::End(end) => Some(end.block.offset),
+            _ => None,
+        })
+        .unwrap();
+
+    // A synthetic executable stub, then the archive with its end block
+    // replaced by an "RR" service header whose 4 KiB of data the cut stops
+    // 100 bytes into, the layout of the two cut corpus files.
+    let mut stub = b"MZ".to_vec();
+    stub.resize(0x2400, 0);
+    let mut recovery = vec![0u8; 34];
+    recovery[2] = 0x7a;
+    recovery[3..5].copy_from_slice(&0xc000u16.to_le_bytes());
+    recovery[5..7].copy_from_slice(&34u16.to_le_bytes());
+    recovery[7..11].copy_from_slice(&4096u32.to_le_bytes());
+    recovery[11..15].copy_from_slice(&4096u32.to_le_bytes());
+    recovery[15] = 2;
+    recovery[24] = 29;
+    recovery[25] = 0x30;
+    recovery[26..28].copy_from_slice(&2u16.to_le_bytes());
+    recovery[32..34].copy_from_slice(b"RR");
+    let header_crc = (crc32(&recovery[2..]) & 0xffff) as u16;
+    recovery[..2].copy_from_slice(&header_crc.to_le_bytes());
+    let mut cut = stub.clone();
+    cut.extend_from_slice(&written[..end]);
+    let recovery_at = cut.len();
+    cut.extend_from_slice(&recovery);
+    cut.extend_from_slice(b"Protect+");
+    cut.resize(cut.len() + 92, 0xa5);
+
+    let root = scratch::case("sfx-cut-recovery-record");
+    let path = root.join("cut.exe");
+    std::fs::write(&path, &cut).unwrap();
+    let from_memory = Archive::parse(&cut).unwrap();
+    let from_path = Archive::parse_path(&path).unwrap();
+    assert_eq!(from_path.blocks, from_memory.blocks);
+    for archive in [&from_memory, &from_path] {
+        assert_eq!(archive.sfx_offset, stub.len());
+        assert!(archive
+            .new_subs()
+            .all(|sub| sub.kind != NewSubKind::RecoveryRecord));
+        let extracted = collect_extract(archive).unwrap();
+        assert_eq!(extracted.len(), 2);
+        assert_eq!(extracted[0].data, first);
+        assert_eq!(extracted[1].data, second);
+    }
+
+    let last = from_memory.files().last().unwrap().packed_range.clone();
+    let member_cut = &cut[..last.end - 1];
+    assert!(matches!(Archive::parse(member_cut), Err(Error::TooShort)));
+    std::fs::write(&path, member_cut).unwrap();
+    assert!(matches!(Archive::parse_path(&path), Err(Error::TooShort)));
+
+    let mut damaged = cut.clone();
+    damaged[recovery_at + 9] ^= 0x01;
+    assert!(matches!(
+        Archive::parse(&damaged),
+        Err(Error::CrcMismatch { .. })
+    ));
+}
+
 #[test]
 #[cfg(feature = "recovery")]
 fn intact_rar300_recovery_record_leaves_archive_unchanged() {
