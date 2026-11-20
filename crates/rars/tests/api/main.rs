@@ -1,4 +1,7 @@
 #[cfg(feature = "write")]
+mod builder;
+
+#[cfg(feature = "write")]
 mod codec_rar13;
 
 #[cfg(feature = "write")]
@@ -32,4 +35,10 @@ mod rar50_reader;
 mod rar50_writer;
 
 #[cfg(feature = "write")]
+mod streaming;
+
+#[cfg(feature = "write")]
 mod support;
+
+#[cfg(feature = "write")]
+mod write_plan;

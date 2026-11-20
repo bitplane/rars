@@ -1808,19 +1808,6 @@ mod tests {
     }
 
     #[test]
-    fn byte_sources_are_rewindable_without_copying() {
-        let source = EntrySource::from_bytes(Arc::<[u8]>::from(&b"hello"[..]));
-        let mut first = source.open().unwrap();
-        let mut second = source.open().unwrap();
-        let mut a = Vec::new();
-        let mut b = Vec::new();
-        first.read_to_end(&mut a).unwrap();
-        second.read_to_end(&mut b).unwrap();
-        assert_eq!(a, b"hello");
-        assert_eq!(b, b"hello");
-    }
-
-    #[test]
     fn spool_tracks_length_across_seeks_and_overwrites() {
         let scratch = crate::scratch::case("rars-spool");
         let resources = WriterResources::default().with_temp_dir(&*scratch);
