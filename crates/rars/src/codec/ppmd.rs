@@ -1129,6 +1129,20 @@ impl<B: Budget> Ppmd7<B> {
         if !self.allocated {
             return Err(Error::InvalidData("RAR PPMd block reuses missing model"));
         }
+        let symbol = self.decode_next_symbol(input);
+        // A symbol that fails partway through an escape leaves the model in a
+        // lower-order context with `order_fall` raised for contexts it never
+        // took the symbol from, a state that only this call's masks made
+        // consistent. Decoding on from it reads text bytes as context
+        // pointers, so a later block must reset the model first.
+        if !matches!(symbol, Ok(Some(_))) {
+            self.allocated = false;
+        }
+        symbol
+    }
+
+    #[inline(always)]
+    fn decode_next_symbol(&mut self, input: &mut impl PpmdByteReader) -> Result<Option<u8>> {
         let mut mask = [0xffu8; 256];
         let mc = self.min_context;
         let num_stats = self.num_stats(mc);
