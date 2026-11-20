@@ -138,7 +138,7 @@ fn links_that_leave_the_output_directory_are_skipped_and_reported() {
 }
 
 #[test]
-fn corrupt_link_targets_keep_verified_predecessors_and_existing_destinations() {
+fn corrupt_link_targets_are_passed_over_and_keep_existing_destinations() {
     for case in 0..2 {
         let root = scratch::case("legacy-link-refusal");
         let archive = root.join("links.rar");
@@ -177,11 +177,21 @@ fn corrupt_link_targets_keep_verified_predecessors_and_existing_destinations() {
         fs::create_dir(&out).unwrap();
         fs::write(out.join("link-to-real.txt"), b"keep").unwrap();
         let result = extract(&archive, &out, &["--overwrite=always"]);
-        assert!(!result.status.success(), "case {case}");
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(result.status.code(), Some(1), "case {case}: {stderr}");
+        assert!(
+            stderr.contains("'link-to-real.txt'"),
+            "case {case}: {stderr}"
+        );
+        assert!(
+            stderr.contains("1 damaged member(s)"),
+            "case {case}: {stderr}"
+        );
         assert_eq!(fs::read(out.join("real.txt")).unwrap(), b"hello\n");
         assert_eq!(fs::read(out.join("link-to-real.txt")).unwrap(), b"keep");
-        assert!(!out.join("after").exists());
-        assert_eq!(fs::read_dir(out).unwrap().count(), 2);
+        // The member after the damaged link is independent, so it still extracts.
+        assert_eq!(fs::read(out.join("after")).unwrap(), b"hello\n".repeat(100));
+        assert_eq!(fs::read_dir(out).unwrap().count(), 3);
     }
 }
 
