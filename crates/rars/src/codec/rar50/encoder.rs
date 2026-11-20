@@ -1774,10 +1774,17 @@ enum MemberSearch<'a, B: Budget = Allowance> {
 /// least as long as the history it carries can afford that. A block job's run
 /// is a dictionary long, with a dictionary of history behind it. On 32 MiB of
 /// man pages and logs at level 3, chains of 128 packed such runs 2.5% larger
-/// than the tree does, for about a quarter less CPU. A short parse behind a
-/// long history, such as the last scrap of a member, keeps the chains.
+/// than the tree does, for about a quarter less CPU.
+///
+/// A member's last run is usually shorter than the history behind it. Down to
+/// a quarter of that history it still searches a tree: with a 16 MiB
+/// dictionary, the 4 MiB tail of a 20 MiB text member packs 0.36% smaller for
+/// 23% more CPU on one thread, and the tail of 103 MiB of headers 0.17%
+/// smaller for no measurable time (#407). A shorter scrap keeps the chains:
+/// seeding a tree from 16 MiB of history to parse a 64 KiB tail cost 30% more
+/// time for 69 bytes.
 pub(crate) fn searches_tree(window: usize, start: usize, options: EncodeOptions) -> bool {
-    start.min(options.max_match_distance) <= window - start
+    start.min(options.max_match_distance) <= (window - start).saturating_mul(4)
 }
 
 /// Whether the optimal parse of a window this long from `start` searches a
@@ -1917,9 +1924,11 @@ fn packed_collector_preserves_frontiers_across_committed_interiors_and_blocks() 
         max_match_distance: 128 * 1024,
         ..options
     };
+    // A tail under a quarter of its history, so not a tree; and a window
+    // past twice the dictionary, so not the packed index.
     let bounded = OptimalCollector::with_allowance(
         &input,
-        input.len() - LZ_BLOCK_SIZE,
+        input.len() - LZ_BLOCK_SIZE / 4,
         short_dictionary,
         &allowance,
     )
