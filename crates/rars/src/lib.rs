@@ -2178,7 +2178,7 @@ fn rar50_volumes(archives: &[Archive]) -> Result<Vec<rar50::Archive>> {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    #[cfg(any(feature = "recovery", feature = "encryption"))]
+    #[cfg(feature = "encryption")]
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
