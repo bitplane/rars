@@ -2137,36 +2137,6 @@ mod tests {
     }
 
     #[test]
-    fn volume_headers_accept_the_largest_legacy_name() {
-        let name = vec![b'N'; 255];
-        let payload = b"abcdef";
-        let volumes = crate::volume_test_support::sized_for_payload(3, |volume_size| {
-            write_stored_volumes(
-                StoredEntry {
-                    name: &name,
-                    data: payload,
-                    file_time: 0,
-                    file_attr: 0x20,
-                    password: None,
-                    file_comment: None,
-                },
-                WriterOptions::default(),
-                volume_size,
-            )
-        })
-        .unwrap();
-        assert_eq!(volumes.len(), 2);
-        let archives: Vec<_> = volumes.iter().map(|v| Archive::parse(v).unwrap()).collect();
-        for archive in &archives {
-            assert_eq!(archive.entries[0].name, name);
-        }
-        assert_eq!(
-            collect_extract_volumes(&archives, None).unwrap()[0].data,
-            payload
-        );
-    }
-
-    #[test]
     fn reader_workspace_rar13_stored_archives_need_no_dictionary_allocation() {
         for encrypted in crate::test_features::encryption_cases() {
             let password = encrypted.then_some(b"pw".as_slice());
@@ -2330,7 +2300,7 @@ mod tests {
     use crate::codec::rar13::{find_long_lz, LongLz};
     use std::cell::RefCell;
     use std::rc::Rc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct CollectWriter(Rc<RefCell<Vec<u8>>>);
 
@@ -2468,64 +2438,6 @@ mod tests {
                 "RAR 1.3 file header is shorter than its name"
             ))
         ));
-    }
-
-    #[test]
-    fn rejects_normal_extract_on_split_entries() {
-        let entry = StoredEntry {
-            name: b"split.bin",
-            data: b"abcdefghijklmnopqrstuvwxyz",
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-        let volumes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
-            write_stored_volumes(entry, WriterOptions::default(), volume_size)
-        })
-        .unwrap();
-        let first = Archive::parse(&volumes[0]).unwrap();
-
-        assert_eq!(
-            collect_extract(&first, None),
-            Err(Error::InvalidHeader(
-                "RAR 1.3 split entry requires multivolume extraction"
-            ))
-        );
-        assert_eq!(
-            collect_extract(&first, None),
-            Err(Error::InvalidHeader(
-                "RAR 1.3 split entry requires multivolume extraction"
-            ))
-        );
-    }
-
-    #[test]
-    fn controlled_extraction_rejects_split_member_without_volume_set() {
-        let entry = StoredEntry {
-            name: b"split.bin",
-            data: b"abcdefghijklmnopqrstuvwxyz",
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-        let volumes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
-            write_stored_volumes(entry, WriterOptions::default(), volume_size)
-        })
-        .unwrap();
-        for volume in [&volumes[0], volumes.last().unwrap()] {
-            let archive = crate::Archive::Rar13(Archive::parse(volume).unwrap());
-            let error = archive
-                .extract_with_control(crate::ArchiveReadOptions::new(), |_| {
-                    Ok(crate::ExtractionDecision::Extract(Box::new(Vec::new())))
-                })
-                .unwrap_err();
-            assert_eq!(
-                error.root_cause(),
-                &Error::InvalidHeader("RAR 1.3 split entry requires multivolume extraction")
-            );
-        }
     }
 
     #[test]
@@ -2877,74 +2789,6 @@ mod tests {
         assert_eq!(extracted[0].data, input[0].data);
     }
 
-    #[test]
-    fn writes_and_reads_stored_multivolume_archive() {
-        let entry = StoredEntry {
-            name: b"random.bin",
-            data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-
-        let bytes = crate::volume_test_support::sized_for_payload(10, |volume_size| {
-            write_stored_volumes(entry, WriterOptions::default(), volume_size)
-        })
-        .unwrap();
-        assert_eq!(bytes.len(), 4);
-        let volumes: Vec<_> = bytes
-            .iter()
-            .map(|bytes| Archive::parse(bytes).unwrap())
-            .collect();
-        assert!(volumes.iter().all(|archive| archive.main.is_volume()));
-        assert!(!volumes[0].entries[0].is_split_before());
-        assert!(volumes[0].entries[0].is_split_after());
-        assert!(volumes[1].entries[0].is_split_before());
-        assert!(volumes[1].entries[0].is_split_after());
-        assert!(volumes[3].entries[0].is_split_before());
-        assert!(!volumes[3].entries[0].is_split_after());
-        assert!(volumes.iter().all(|archive| archive.entries[0].is_stored()));
-
-        let extracted = collect_extract_volumes(&volumes, None).unwrap();
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].name, b"random.bin");
-        assert_eq!(extracted[0].data, entry.data);
-    }
-
-    #[test]
-    fn writes_and_reads_compressed_multivolume_archive() {
-        let data = b"abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc";
-        let entry = FileEntry {
-            name: b"repeat.txt",
-            data,
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-
-        let bytes = crate::volume_test_support::sized_for_payload(8, |volume_size| {
-            write_compressed_volumes(entry, WriterOptions::default(), volume_size)
-        })
-        .unwrap();
-        assert!(bytes.len() >= 2);
-        let volumes: Vec<_> = bytes
-            .iter()
-            .map(|bytes| Archive::parse(bytes).unwrap())
-            .collect();
-        assert!(volumes.iter().all(|archive| archive.main.is_volume()));
-        assert!(!volumes[0].entries[0].is_stored());
-        assert!(volumes[0].entries[0].is_split_after());
-        assert!(volumes.last().unwrap().entries[0].is_split_before());
-        assert!(!volumes.last().unwrap().entries[0].is_split_after());
-
-        let extracted = collect_extract_volumes(&volumes, None).unwrap();
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].name, b"repeat.txt");
-        assert_eq!(extracted[0].data, data);
-    }
-
     fn short_lz_resistant_prefix(len: usize) -> Vec<u8> {
         let mut data = Vec::with_capacity(len);
         while data.len() < len {
@@ -3066,82 +2910,6 @@ mod tests {
         assert_eq!(inner.flushed, 1);
     }
 
-    #[test]
-    fn extract_volumes_to_annotates_failed_split_completion_with_at_entry() {
-        let entry = StoredEntry {
-            name: b"split.bin",
-            data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-
-        let mut volume_bytes = crate::volume_test_support::sized_for_payload(10, |volume_size| {
-            write_stored_volumes(entry, WriterOptions::default(), volume_size)
-        })
-        .unwrap();
-        assert!(
-            volume_bytes.len() >= 2,
-            "need at least two volumes to exercise the split-completion path"
-        );
-
-        // Corrupt the last fragment so PendingSplitRefs::write_to fails on assembly.
-        let last_index = volume_bytes.len() - 1;
-        let last_archive = Archive::parse(&volume_bytes[last_index]).unwrap();
-        let last_range = last_archive.entries[0].packed_range.clone();
-        volume_bytes[last_index][last_range.start] ^= 0x7f;
-
-        let volumes: Vec<_> = volume_bytes
-            .iter()
-            .map(|bytes| Archive::parse(bytes).unwrap())
-            .collect();
-
-        let err = collect_extract_volumes(&volumes, None).unwrap_err();
-        match err {
-            Error::AtEntry {
-                name,
-                operation,
-                source,
-            } => {
-                assert_eq!(name, b"split.bin");
-                assert_eq!(operation, "extracting");
-                assert!(
-                    matches!(*source, Error::CrcMismatch { .. }),
-                    "expected CrcMismatch source, got {source:?}"
-                );
-            }
-            other => panic!("expected AtEntry annotation, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn entry_packed_data_refuses_to_buffer_file_backed_archives() {
-        let payload = b"packed_data refuses file-backed";
-        let input = [StoredEntry {
-            name: b"file.bin",
-            data: payload,
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        }];
-        let bytes = write_stored_archive(&input, WriterOptions::default()).unwrap();
-
-        let dir = crate::scratch::case("rars-rar13-packed-data");
-        let path = dir.join("entry.rar");
-        std::fs::write(&path, &bytes).unwrap();
-
-        let archive = Archive::parse_path(&path).unwrap();
-        let result = archive.entries[0].packed_data(&archive);
-        assert_eq!(
-            result,
-            Err(Error::InvalidHeader(
-                "RAR 1.3 file-backed packed data requires owned read"
-            ))
-        );
-    }
-
     fn parse_volumes(bytes: &[Vec<u8>]) -> Vec<Archive> {
         bytes.iter().map(|b| Archive::parse(b).unwrap()).collect()
     }
@@ -3184,48 +2952,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_volumes_to_rejects_split_with_inconsistent_flags() {
-        let bytes = split_volumes_for(b"split.bin", b"abcdefghijklmnopqrstuvwxyz");
-        let volumes = parse_volumes(&bytes);
-
-        // Take just the *middle* volume in isolation: it has split_before=true
-        // but no preceding pending state, which the match arm treats as
-        // structurally inconsistent.
-        let middle = volumes.into_iter().nth(1).unwrap();
-        let err = collect_extract_volumes(std::slice::from_ref(&middle), None).unwrap_err();
-        assert_eq!(
-            err,
-            Error::InvalidHeader("RAR 1.3 split entry flags are inconsistent"),
-        );
-    }
-
-    #[test]
-    fn extract_volumes_to_rejects_pending_split_left_incomplete_at_end() {
-        let bytes = split_volumes_for(b"split.bin", b"abcdefghijklmnopqrstuvwxyz");
-        let volumes = parse_volumes(&bytes);
-
-        // Use only the first volume, which leaves pending=Some after the loop.
-        let err = collect_extract_volumes(std::slice::from_ref(&volumes[0]), None).unwrap_err();
-        assert_eq!(err.root_cause(), &Error::MissingVolume);
-    }
-
-    #[test]
-    fn extract_volumes_to_rejects_split_fragments_with_drifted_attributes() {
-        let bytes = split_volumes_for(b"split.bin", b"abcdefghijklmnopqrstuvwxyz");
-        let mut volumes = parse_volumes(&bytes);
-
-        // Mutate the second volume's entry name so PendingSplitRefs::append
-        // refuses it on a name-mismatch.
-        volumes[1].entries[0].name = b"different.bin".to_vec();
-
-        let err = collect_extract_volumes(&volumes, None).unwrap_err();
-        assert_eq!(
-            err,
-            Error::InvalidHeader("RAR 1.3 split entry name changed")
-        );
-    }
-
-    #[test]
     fn extract_volumes_to_rejects_split_fragments_with_drifted_method() {
         let bytes = split_volumes_for(b"split.bin", b"abcdefghijklmnopqrstuvwxyz");
         let mut volumes = parse_volumes(&bytes);
@@ -3255,23 +2981,6 @@ mod tests {
             collect_extract_volumes(&volumes, None).unwrap_err(),
             Error::InvalidHeader("RAR 1.3 split entry encryption flag changed")
         );
-    }
-
-    #[test]
-    fn extract_volumes_to_routes_pending_split_reader_through_fragment_chain() {
-        // Larger payload over more volumes guarantees that the split reader
-        // reads from every volume at least once.
-        let payload: Vec<u8> = (0..96).map(|i| ((i * 53) ^ 0xa5) as u8).collect();
-        let bytes = split_volumes_for(b"chain.bin", &payload);
-        assert!(
-            bytes.len() >= 3,
-            "need at least three volumes for the chain"
-        );
-        let volumes = parse_volumes(&bytes);
-
-        let extracted = collect_extract_volumes(&volumes, None).unwrap();
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].data, payload);
     }
 
     #[test]
@@ -3322,59 +3031,6 @@ mod tests {
         };
         let err = write_compressed_archive_with_comment(&[], options, None).unwrap_err();
         assert_eq!(err, Error::UnsupportedVersion(ArchiveVersion::Rar15));
-    }
-
-    #[test]
-    fn parse_path_round_trips_multi_entry_archive_via_file_backed_seekable_path() {
-        // Two entries plus an archive comment forces parse_seekable to walk
-        // through more than one file-header read iteration.
-        let input = [
-            StoredEntry {
-                name: b"first.txt",
-                data: b"first payload",
-                file_time: 0,
-                file_attr: 0x20,
-                password: None,
-                file_comment: None,
-            },
-            StoredEntry {
-                name: b"second.txt",
-                data: b"second payload",
-                file_time: 0,
-                file_attr: 0x20,
-                password: None,
-                file_comment: None,
-            },
-        ];
-        let bytes = write_stored_archive_with_comment(
-            &input,
-            WriterOptions::default(),
-            Some(b"file-backed comment"),
-        )
-        .unwrap();
-
-        let dir = crate::scratch::case("rars-rar13-parse-seekable");
-        let path = dir.join("multi.rar");
-        std::fs::write(&path, &bytes).unwrap();
-
-        let archive = Archive::parse_path(&path).unwrap();
-        assert_eq!(archive.entries.len(), 2);
-        assert_eq!(archive.entries[0].name, b"first.txt");
-        assert_eq!(archive.entries[1].name, b"second.txt");
-        assert_eq!(
-            archive.archive_comment().unwrap().as_deref(),
-            Some(&b"file-backed comment"[..])
-        );
-    }
-
-    #[test]
-    fn parse_path_rejects_files_without_rar13_signature() {
-        let dir = crate::scratch::case("rars-rar13-parse-path-bad");
-        let path = dir.join("not_a_rar.bin");
-        std::fs::write(&path, [0u8; 64]).unwrap();
-
-        let err = Archive::parse_path(&path).unwrap_err();
-        assert_eq!(err, Error::UnsupportedSignature);
     }
 
     #[test]
@@ -3525,30 +3181,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "encryption")]
-    fn extract_to_encrypted_archive_reads_through_file_backed_decrypted_range() {
-        // The Memory-backed path is already exercised; this test takes the
-        // same encrypted archive out to disk so the stored copy reads a file.
-        let input = [StoredEntry {
-            name: b"secret.bin",
-            data: b"file-backed secret payload",
-            file_time: 0,
-            file_attr: 0x20,
-            password: Some(b"pw"),
-            file_comment: None,
-        }];
-        let bytes = write_stored_archive(&input, WriterOptions::default()).unwrap();
-
-        let dir = crate::scratch::case("rars-rar13-decrypt-file");
-        let path = dir.join("encrypted.rar");
-        std::fs::write(&path, &bytes).unwrap();
-
-        let archive = Archive::parse_path(&path).unwrap();
-        let extracted = collect_extract(&archive, Some(b"pw")).unwrap();
-        assert_eq!(extracted[0].data, b"file-backed secret payload");
-    }
-
-    #[test]
     fn write_compressed_volumes_rejects_non_rar13_target() {
         let options = WriterOptions {
             target: ArchiveVersion::Rar20,
@@ -3586,40 +3218,6 @@ mod tests {
         header[19] = 0;
         let err = FileHeader::parse(&header).unwrap_err();
         assert_eq!(err, Error::TooShort);
-    }
-
-    #[test]
-    fn streaming_writer_attributes_source_size_failures() {
-        let missing = crate::scratch::case("rars-rar13-missing-source").join("absent");
-        for (source, expected, operation) in [
-            (
-                EntrySource::from_path(missing),
-                crate::ErrorKind::Io,
-                "reading source",
-            ),
-            (
-                EntrySource::from_opener(u64::from(u32::MAX) + 1, || {
-                    unreachable!("oversized source must fail before opening")
-                }),
-                crate::ErrorKind::InvalidArgument,
-                "preparing",
-            ),
-        ] {
-            let entry = StreamingEntry::new(b"SOURCE.BIN".to_vec(), source);
-            let mut output = Vec::new();
-            let error = write_streaming_archive_to(
-                &[entry],
-                WriterOptions::default(),
-                MemberCoding::Stored,
-                None,
-                &WriterResources::default(),
-                None,
-                &mut output,
-            )
-            .unwrap_err();
-            assert_eq!(error.kind(), expected);
-            assert_eq!(error.entry_context(), Some((&b"SOURCE.BIN"[..], operation)));
-        }
     }
 
     #[test]
@@ -3883,58 +3481,6 @@ mod tests {
     }
 
     #[test]
-    fn final_volume_progress_report_can_cancel() {
-        struct CancelOnFinalAdvance {
-            entry_finished: AtomicBool,
-            cancelled: AtomicBool,
-        }
-        impl WriteProgress for CancelOnFinalAdvance {
-            fn report(&self, event: WriteProgressEvent<'_>) {
-                match event {
-                    WriteProgressEvent::EntryFinished { .. } => {
-                        self.entry_finished.store(true, Ordering::Relaxed);
-                    }
-                    WriteProgressEvent::Advanced { .. }
-                        if self.entry_finished.load(Ordering::Relaxed) =>
-                    {
-                        self.cancelled.store(true, Ordering::Relaxed);
-                    }
-                    _ => {}
-                }
-            }
-
-            fn is_cancelled(&self) -> bool {
-                self.cancelled.load(Ordering::Relaxed)
-            }
-        }
-        let reporter = CancelOnFinalAdvance {
-            entry_finished: AtomicBool::new(false),
-            cancelled: AtomicBool::new(false),
-        };
-        let entry = FileEntry {
-            name: b"FINAL.TXT",
-            data: b"final progress cancellation final progress cancellation",
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-        // Size the volumes first: probing with the reporter would cancel it.
-        let volume_size = crate::volume_test_support::smallest_volume_size(|volume_size| {
-            write_compressed_volumes(entry, WriterOptions::default(), volume_size)
-        }) + 15;
-        let error = write_compressed_volumes_with_progress(
-            entry,
-            WriterOptions::default(),
-            volume_size,
-            Some(&reporter),
-        )
-        .unwrap_err();
-        assert_eq!(error, Error::Cancelled);
-        assert!(reporter.entry_finished.load(Ordering::Relaxed));
-    }
-
-    #[test]
     fn preservation_reports_unsupported_legacy_header_variants() {
         let entry = StoredEntry {
             name: b"DIR",
@@ -3960,61 +3506,6 @@ mod tests {
             mutate(&mut archive);
             assert!(!archive.rewrite_preservation_issues().is_empty());
         }
-    }
-
-    #[test]
-    fn compressed_volumes_report_each_volume_and_honor_cancellation() {
-        let data = b"a repeated sequence of archive bytes ".repeat(64);
-        let entry = FileEntry {
-            name: b"VOL.TXT",
-            data: &data,
-            file_time: 0,
-            file_attr: 0x20,
-            password: None,
-            file_comment: None,
-        };
-        let volume_count = AtomicUsize::new(0);
-        let reporter = |event: WriteProgressEvent<'_>| {
-            if let WriteProgressEvent::VolumeFinished { volume_index, .. } = event {
-                assert_eq!(volume_index, volume_count.fetch_add(1, Ordering::Relaxed));
-            }
-        };
-        // Size the volumes first, so the probing writes stay out of the count.
-        let volume_size = crate::volume_test_support::smallest_volume_size(|volume_size| {
-            write_compressed_volumes(entry, WriterOptions::default(), volume_size)
-        }) + 31;
-        let volumes = write_compressed_volumes_with_progress(
-            entry,
-            WriterOptions::default(),
-            volume_size,
-            Some(&reporter),
-        )
-        .unwrap();
-        assert_eq!(volume_count.load(Ordering::Relaxed), volumes.len());
-        assert!(volumes.len() > 1);
-
-        struct CancelAfterFirstVolume(AtomicUsize);
-        impl WriteProgress for CancelAfterFirstVolume {
-            fn report(&self, event: WriteProgressEvent<'_>) {
-                if matches!(event, WriteProgressEvent::VolumeFinished { .. }) {
-                    self.0.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-
-            fn is_cancelled(&self) -> bool {
-                self.0.load(Ordering::Relaxed) != 0
-            }
-        }
-        let cancelling = CancelAfterFirstVolume(AtomicUsize::new(0));
-        let error = write_compressed_volumes_with_progress(
-            entry,
-            WriterOptions::default(),
-            volume_size,
-            Some(&cancelling),
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), crate::ErrorKind::Cancelled);
-        assert_eq!(cancelling.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]

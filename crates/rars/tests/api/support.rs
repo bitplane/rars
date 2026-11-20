@@ -22,3 +22,9 @@ pub(super) fn rar50_entry(name: &[u8], data: &[u8]) -> rars::rar50::ArchiveEntry
         rars::EntrySource::from_bytes(std::sync::Arc::<[u8]>::from(data.to_vec())),
     )
 }
+
+#[path = "../support/scratch.rs"]
+pub(super) mod scratch;
+
+#[path = "../support/volume_size.rs"]
+pub(super) mod volume_test_support;
