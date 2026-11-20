@@ -7080,10 +7080,11 @@ mod tests {
                 .unwrap();
                 // Copied into the volumes as it is read, as a stored member
                 // is, rather than loaded under a charge for coding it and
-                // handed back as a copy of itself.
-                let charged = charged.load(std::sync::atomic::Ordering::Relaxed);
+                // handed back as a copy of itself. Like a stored member, it is
+                // charged only for the buffer it is copied through.
+                let charged = charged.load(std::sync::atomic::Ordering::Relaxed) as u64;
                 assert!(
-                    charged < data.len(),
+                    charged <= super::WRITE_WORKSPACE,
                     "{case}: read with {charged} bytes charged"
                 );
                 let volumes = sink.take();
@@ -7093,6 +7094,64 @@ mod tests {
                     [(b"member.bin".to_vec(), data.clone())],
                     "{case}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_stored_volume_member_is_charged_until_its_last_fragment_is_written() {
+        let datas = [binary_member(300_000), binary_member(200_000)];
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            for password in passwords() {
+                // Stored, and level 0, which is written as stored.
+                for (coding, level) in [
+                    (crate::MemberCoding::Stored, None),
+                    (crate::MemberCoding::Compressed, Some(0)),
+                ] {
+                    let case = format!(
+                        "{target:?}, password {}, level {level:?}",
+                        password.is_some()
+                    );
+                    let mut options = super::WriterOptions::new(target, FeatureSet::default());
+                    options.compression_level = level;
+                    let entries: Vec<_> = datas
+                        .iter()
+                        .enumerate()
+                        .map(|(index, data)| {
+                            let entry = super::StreamingEntry::new(
+                                format!("member{index}.bin"),
+                                crate::EntrySource::from_bytes(data.clone()),
+                            );
+                            match password {
+                                Some(password) => entry.with_password(password),
+                                None => entry,
+                            }
+                        })
+                        .collect();
+                    let members: Vec<_> =
+                        entries.iter().map(super::Member::from_streaming).collect();
+                    let resources = crate::WriterResources::default();
+                    let mut sink = crate::volume_sink::ChargedVolumes::new(&resources);
+                    super::volumes::split_members(
+                        &members, options, &coding, None, 40_000, &mut sink, &resources, None,
+                    )
+                    .unwrap();
+                    // Every fragment's payload went out while its member was
+                    // charged for the buffer it is copied through, as a stored
+                    // member in a single archive is.
+                    assert!(sink.payload_writes() > 2, "{case}");
+                    assert_eq!(resources.workspace_in_use(), 0, "{case}");
+
+                    let volumes = sink.collected.take();
+                    assert!(volumes.len() > 2, "{case}");
+                    let names = [b"member0.bin".to_vec(), b"member1.bin".to_vec()];
+                    let expected: Vec<_> = names.into_iter().zip(datas.clone()).collect();
+                    assert_eq!(extracted_set(&volumes, password), expected, "{case}");
+                }
             }
         }
     }
