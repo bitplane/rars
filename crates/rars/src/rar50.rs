@@ -2799,6 +2799,7 @@ fn parse_block_header_bytes_to(
     )
 }
 
+#[cfg(feature = "encryption")]
 fn parse_encrypted_block_header_bytes(
     input: &[u8],
     offset: usize,
@@ -2902,7 +2903,7 @@ fn parse_encrypted_block_header_bytes_to(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn read_block_header_at(
     file: &mut (impl Read + std::io::Seek),
     offset: usize,
@@ -2956,7 +2957,7 @@ fn read_block_header_at_to(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write", feature = "encryption"))]
 fn read_encrypted_block_header_at(
     file: &mut (impl Read + std::io::Seek),
     offset: usize,
