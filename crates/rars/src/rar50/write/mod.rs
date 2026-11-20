@@ -604,7 +604,7 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 ///
 /// The optimal parse in a block job searches a tree seeded with the run's
 /// history, eight bytes of links per byte of dictionary, or the packed hash
-/// chains when the run is shorter than its history. Past the links it spends
+/// chains when the run is shorter than a quarter of its history. Past the links it spends
 /// most of its workspace on the match runs it collects for a block: up to
 /// eight per position on two-symbol noise, the worst found, against one on
 /// real data. Counted allocation peaks per job under `--max-memory`, level 3,
@@ -620,10 +620,16 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// two-symbol noise       132.9 MiB     165.5 MiB     230.6 MiB
 /// ```
 ///
+/// Level 5 peaks the same on noise and random (133.0, 165.5 and 230.6 MiB;
+/// 151.1 MiB), and 174.1 MiB on 64 MiB of shared libraries at 16 MiB.
+///
 /// Random data costs the most per window byte: 583 MiB through the tree at a
 /// 64 MiB dictionary, and 654 MiB through chains, whose deltas pack worst on
-/// it. Noise costs the most per block byte. The charge covers both at once:
-/// 151 MiB at 4 MiB, 203 MiB at 8 MiB, 307 MiB at 16 MiB.
+/// it. Noise costs the most per block byte. The charge covers both at once,
+/// 4% to 9% over the worst peak: 143 MiB at 4 MiB, 179 MiB at 8 MiB, 251 MiB
+/// at 16 MiB, 683 MiB at 64 MiB. It was 13 bytes per window byte and 96 per
+/// block byte, 307 MiB at 16 MiB, which put level 5's dictionary over the
+/// default plan and halved it to level 4's (#407).
 ///
 /// `block_size` is the largest block the parse can be holding, not the size the
 /// reader asks for: a block grows past that when the data it covers is not
@@ -631,7 +637,7 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// [`crate::codec::rar50::MAX_LZ_BLOCK_SIZE`].
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
     if optimal_parse {
-        return lz_workspace(dictionary_size, block_size, 13, 96);
+        return lz_workspace(dictionary_size, block_size, 9, 104);
     }
     lz_workspace(dictionary_size, block_size, 13, 64)
 }
@@ -1931,6 +1937,8 @@ mod tests {
         const MIB: f64 = 1024.0 * 1024.0;
         let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
         for (dictionary, peak) in [(4u64, 133.2), (8, 165.5), (16, 230.6), (64, 654.3)] {
+            // Level 5 measured the same or less: 133.0, 165.5, 230.6 and 583.1
+            // through the tree, and 174.1 MiB on binaries at 16 MiB.
             let charged = streaming_lz_workspace(dictionary << 20, block, true);
             let peak = (peak * MIB) as u64;
             assert!(charged >= peak, "{dictionary} MiB: {charged} < {peak}");
@@ -1940,22 +1948,40 @@ mod tests {
     #[test]
     fn the_workspace_charge_never_falls_as_the_dictionary_grows() {
         let block = crate::codec::rar50::LZ_BLOCK_SIZE;
-        let mut previous = 0;
+        // Each parse on its own: the optimal parse's job measures smaller per
+        // window byte than the lazy one is charged (#407).
+        let mut previous = [0; 2];
         let mut dictionary = 128 * 1024u64;
         while dictionary <= 64 * 1024 * 1024 {
             for optimal_parse in [false, true] {
                 let charged = streaming_lz_workspace(dictionary, block, optimal_parse);
                 assert!(
-                    charged >= previous,
+                    charged >= previous[usize::from(optimal_parse)],
                     "{dictionary} charged less than the size below it"
                 );
-                if !optimal_parse {
-                    previous = charged;
-                }
+                previous[usize::from(optimal_parse)] = charged;
             }
             // Every size the format allows, not just the powers of two, because
             // the rounding inside is the whole reason this function exists.
             dictionary += 128 * 1024;
+        }
+    }
+
+    /// Each level's dictionary fits the plan a default writer makes. Level 5's
+    /// 16 MiB was once charged 307 MiB against 256 and quietly halved to level
+    /// 4's 8 MiB, which cost 6.4% on binaries (#407). The other tests pass an
+    /// unlimited budget, so they could not see it.
+    #[test]
+    fn every_level_keeps_its_dictionary_under_the_default_plan() {
+        let limit = crate::WriterResources::default().planning_memory_limit();
+        for (level, megabytes) in [(1, 1), (2, 4), (3, 4), (4, 8), (5, 16)] {
+            let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                .with_compression_level(level);
+            assert_eq!(
+                dictionary_size_for_options(options, 1 << 30, limit).unwrap(),
+                megabytes << 20,
+                "level {level}"
+            );
         }
     }
 
