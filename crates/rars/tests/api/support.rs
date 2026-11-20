@@ -23,7 +23,7 @@ pub(super) fn rar50_entry(name: &[u8], data: &[u8]) -> rars::rar50::ArchiveEntry
     )
 }
 
-#[path = "../support/scratch.rs"]
+#[path = "../support/scratch_impl.rs"]
 pub(super) mod scratch;
 
 #[path = "../support/volume_size.rs"]
