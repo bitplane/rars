@@ -3347,6 +3347,25 @@ mod tests {
     }
 
     #[test]
+    fn recovery_output_matches_fingerprints_from_the_bitwise_crc64() {
+        let cases: &[(usize, u64, usize, u32)] = &[
+            (1025, 10, 602, 2224291460),
+            (200 * 1024 + 1, 1, 5396, 1605562733),
+            (1024 * 1024 + 7, 10, 138320, 4006196453),
+        ];
+        for &(len, percent, output_len, fingerprint) in cases {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x5555);
+            let output = build_structural_inline_recovery_data(&body, percent).unwrap();
+            assert_eq!(output.len(), output_len, "{len} bytes at {percent}%");
+            assert_eq!(
+                crate::crc32::crc32(&output),
+                fingerprint,
+                "{len} bytes at {percent}%"
+            );
+        }
+    }
+
+    #[test]
     fn crc64_xz_matches_reference_vectors() {
         assert_eq!(crc64_xz(b""), 0);
         assert_eq!(crc64_xz(b"123456789"), 0x995d_c9bb_df19_39fa);
