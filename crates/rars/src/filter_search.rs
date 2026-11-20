@@ -558,6 +558,9 @@ fn x86_code_regions<B: Budget>(data: &[u8], allowance: &B) -> Result<Buffer<Rang
 /// DWARF, sees no win, and declines the filter. Regions are disjoint, so the
 /// samples together never come to more than the member.
 ///
+/// A long region gets one sample per [`X86_REGION_SAMPLE_SPAN`] of it, and is
+/// judged on their sum (see [`x86_region_samples`]).
+///
 /// A region the filter makes bigger is dropped rather than counted against the
 /// rest, which is what keeps the debug data out of the ranged candidate. On a
 /// 20 MB unstripped binary that turns a filter worth 0.2% into one worth
@@ -584,13 +587,24 @@ fn x86_screened_regions<S: OwnedSearch>(
     regions: &[Range<usize>],
     options: S::Options,
 ) -> Result<X86Screen<S::Memory>> {
+    // The packed size of a region's samples under `kind`, or left alone.
+    let priced = |region: &Range<usize>, kind: Option<FilterKind>| -> Result<usize> {
+        let mut packed = 0;
+        for within in x86_region_samples(region) {
+            packed += match kind {
+                None => search.encode_plain(&data[within], options, None)?.len(),
+                Some(kind) => {
+                    let filtered = filtered_sample(search, data, within, kind)?;
+                    search.encode_plain(&filtered, options, None)?.len()
+                }
+            };
+        }
+        Ok(packed)
+    };
     let mut kept = Buffer::new(search.allowance());
     let mut helped = false;
     for region in regions {
-        let within = screen_sample_range(region.len());
-        let within = region.start + within.start..region.start + within.end;
-        let sample = &data[within.clone()];
-        if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
+        if screen_sample_range(region.len()).len() < SCREEN_SAMPLE_ALIGNMENT {
             // Scanner padding makes this possible only when the entire
             // member is too short to provide a useful x86 sample.
             continue;
@@ -600,15 +614,14 @@ fn x86_screened_regions<S: OwnedSearch>(
         // where a reduced parse ranks them the same way; this is a yes or no
         // with no margin under it, and a sample encode is cheap enough to get
         // right.
-        let baseline = search.encode_plain(sample, options, None)?;
-        let transformed = filtered_sample(search, data, within.clone(), FilterKind::E8E9)?;
-        let pair = search.encode_plain(&transformed, options, None)?;
+        let baseline = priced(region, None)?;
+        let pair = priced(region, Some(FilterKind::E8E9))?;
         // No margin here, unlike the detectorless filters: the scanner has
         // already ruled on where code is, so a small win on this sample is
         // evidence rather than noise.
-        if pair.len() <= baseline.len() {
-            helped |= pair.len() < baseline.len();
-            kept.try_push((region.clone(), within, Some(pair.len())))?;
+        if pair <= baseline {
+            helped |= pair < baseline;
+            kept.try_push((region.clone(), Some(pair)))?;
             continue;
         }
         // The pair losing is not the calls losing. Where jumps are dense and
@@ -617,11 +630,9 @@ fn x86_screened_regions<S: OwnedSearch>(
         // never priced: on one 4 MiB run of a debug build the pair came out
         // 1.3% bigger than no filter and the calls alone 7.6% smaller. Only a
         // region the pair fails pays for this second question.
-        let calls = filtered_sample(search, data, within.clone(), FilterKind::E8)?;
-        let calls = search.encode_plain(&calls, options, None)?;
-        if calls.len() < baseline.len() {
+        if priced(region, Some(FilterKind::E8))? < baseline {
             helped = true;
-            kept.try_push((region.clone(), within, None))?;
+            kept.try_push((region.clone(), None))?;
         }
     }
     let rejected_a_region = kept.len() < regions.len();
@@ -640,7 +651,7 @@ fn x86_screened_regions<S: OwnedSearch>(
     // nothing reads.
     let mut jumps_pay = false;
     let mut jumps_cost_more = false;
-    for (_, within, pair) in kept.iter() {
+    for (region, pair) in kept.iter() {
         let Some(pair) = pair else {
             jumps_cost_more = true;
             continue;
@@ -650,19 +661,44 @@ fn x86_screened_regions<S: OwnedSearch>(
             jumps_cost_more = true;
             continue;
         }
-        let e8_only = filtered_sample(search, data, within.clone(), FilterKind::E8)?;
-        let e8_only = search.encode_plain(&e8_only, options, None)?;
-        jumps_cost_more |= e8_only.len() < *pair;
+        jumps_cost_more |= priced(region, Some(FilterKind::E8))? < *pair;
     }
 
     Ok(X86Screen {
         rejected_a_region,
         kept: Buffer::collect(
-            kept.into_iter().map(|(region, _, _)| region),
+            kept.into_iter().map(|(region, _)| region),
             search.allowance(),
         )?,
         jumps_pay,
         jumps_cost_more,
+    })
+}
+
+/// How much of an x86 region each of its screen samples stands for.
+///
+/// The same span RAR 5 searches a large member in, so a region no longer than
+/// one of its pieces is sampled once, in the middle, as it always was.
+const X86_REGION_SAMPLE_SPAN: usize = 4 * 1024 * 1024;
+
+/// Where the x86 screen samples `region`: the middle of each of as many equal
+/// parts as it takes to keep each part within [`X86_REGION_SAMPLE_SPAN`].
+///
+/// One sample used to stand for a region however long. On a 32 MiB slice of a
+/// tar of `/usr/bin` the scanner proposed one region for the last 26 MiB of ELF
+/// executables, and its one 128 KiB sample came out 20 bytes bigger under the
+/// filter at one setting and 500 bytes smaller at another. Turning the region
+/// down also took the whole-member candidate away, so 19 MiB of code went
+/// unfiltered and the member came out 5% larger, at some levels and not
+/// others. Summed over a sample for each 4 MiB, the code in the region
+/// outweighs whatever one window happens to land on.
+fn x86_region_samples(region: &Range<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
+    let parts = region.len().div_ceil(X86_REGION_SAMPLE_SPAN).max(1);
+    (0..parts).map(move |part| {
+        let start = region.start + region.len() * part / parts;
+        let end = region.start + region.len() * (part + 1) / parts;
+        let within = screen_sample_range(end - start);
+        start + within.start..start + within.end
     })
 }
 

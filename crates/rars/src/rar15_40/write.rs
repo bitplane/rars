@@ -5380,6 +5380,76 @@ mod tests {
         );
     }
 
+    /// A script carrying more than 4 MiB of x86 calls, with the middle of the
+    /// code given over to `call` instructions that each reach the next one.
+    ///
+    /// The scanner takes the code, middle and all, for one region. The filter
+    /// turns each of those self-calls into a different address, so in the
+    /// middle it costs, and a screen that samples the region only there turns
+    /// the whole region down. Everywhere else it is worth more than half the
+    /// packed size.
+    fn script_then_code_with_a_costly_middle() -> Vec<u8> {
+        let text = 16 * 1024;
+        let mut data = word_text(text);
+        data.extend_from_slice(&x86_calls(4 * 1024 * 1024 + 256 * 1024));
+        let middle = (text + data.len()) / 2;
+        let mut record = [0x90u8; 16];
+        record[0] = 0xe8;
+        record[1..5].copy_from_slice(&0u32.to_le_bytes());
+        for (at, byte) in data[middle - 128 * 1024..middle + 128 * 1024]
+            .iter_mut()
+            .enumerate()
+        {
+            *byte = record[at % record.len()];
+        }
+        data
+    }
+
+    #[test]
+    fn a_long_code_region_is_screened_across_its_length() {
+        use crate::FilterKind;
+        let data = script_then_code_with_a_costly_middle();
+        for level in [3, 4, 5] {
+            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
+            let candidates = crate::filter_search::filter_candidates(
+                &super::Rar29Search::MEMBER,
+                &data,
+                options,
+            )
+            .unwrap();
+            assert!(
+                candidates.iter().any(|specs| specs
+                    .iter()
+                    .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9))),
+                "level {level}: no x86 candidate in {candidates:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_code_region_is_filtered_solid_or_not() {
+        let data = script_then_code_with_a_costly_middle();
+        let members = entries(&[("tool", &data)]);
+        let options = rar40().with_compression_level(1);
+        let unfiltered = in_memory_with(
+            &members,
+            options,
+            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
+        );
+        let unfiltered = total_pack_size(&unfiltered);
+        for solid in [false, true] {
+            let mut options = options;
+            options.features.solid = solid;
+            let archive = in_memory_with(&members, options, crate::MemberCoding::Compressed);
+            assert_holds(&archive, &[("tool", &data)]);
+            let searched = total_pack_size(&archive);
+            assert!(
+                searched * 2 < unfiltered,
+                "solid {solid}: {searched} searched against {unfiltered} unfiltered"
+            );
+        }
+    }
+
     fn named(kind: crate::FilterKind) -> crate::MemberCoding {
         crate::MemberCoding::Filtered(crate::FilterPolicy::explicit(kind))
     }
