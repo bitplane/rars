@@ -25,6 +25,9 @@ mod legacy_writer;
 #[cfg(feature = "write")]
 mod rar13_writer;
 
+#[cfg(feature = "recovery")]
+mod rar3_recovery;
+
 #[cfg(feature = "write")]
 mod rar50_extract;
 
@@ -33,6 +36,9 @@ mod rar50_reader;
 
 #[cfg(feature = "write")]
 mod rar50_writer;
+
+#[cfg(feature = "recovery")]
+mod rar5_recovery;
 
 #[cfg(feature = "write")]
 mod streaming;

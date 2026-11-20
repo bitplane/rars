@@ -2262,25 +2262,6 @@ mod tests {
 
     #[test]
     #[cfg(feature = "recovery")]
-    fn recovery_publication_rename_failure_preserves_destination_and_cleans_staging() {
-        let root = crate::scratch::case("recovery-publication-rename-failure");
-        let destination = root.join("destination");
-        std::fs::create_dir(&destination).unwrap();
-        let sentinel = destination.join("existing");
-        std::fs::write(&sentinel, b"keep these bytes").unwrap();
-        let result = RecoveryRepairResult {
-            data: b"repaired bytes".to_vec(),
-            report: RecoveryRepairReport::default(),
-        };
-        let error = result.write_to_path(&destination, None).unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Io);
-        assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
-        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
-        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
-    }
-
-    #[test]
-    #[cfg(feature = "recovery")]
     fn recovery_publication_cancellation_at_each_checkpoint_preserves_destination() {
         let root = crate::scratch::case("recovery-publication-checkpoints");
         let destination = root.join("archive.rar");

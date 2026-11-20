@@ -1,3 +1,5 @@
+#[cfg(feature = "recovery")]
+use super::support::scratch;
 use super::support::{rar50_entry, CollectWriter};
 use rars::*;
 use std::{
@@ -2311,4 +2313,23 @@ fn read_session_reports_a_wrong_password_on_every_volume() {
             );
         }
     }
+}
+
+#[test]
+#[cfg(feature = "recovery")]
+fn recovery_publication_rename_failure_preserves_destination_and_cleans_staging() {
+    let root = scratch::case("recovery-publication-rename-failure");
+    let destination = root.join("destination");
+    std::fs::create_dir(&destination).unwrap();
+    let sentinel = destination.join("existing");
+    std::fs::write(&sentinel, b"keep these bytes").unwrap();
+    let result = RecoveryRepairResult {
+        data: b"repaired bytes".to_vec(),
+        report: RecoveryRepairReport::default(),
+    };
+    let error = result.write_to_path(&destination, None).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::Io);
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep these bytes");
+    assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 1);
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
 }

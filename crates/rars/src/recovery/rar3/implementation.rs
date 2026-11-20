@@ -439,16 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn rev3_returns_healthy_padded_data_without_decoding() {
-        let actual = b"a";
-        let recovery = b"rs";
-        assert_eq!(
-            reconstruct_data_volumes(&[Some(actual)], 1, &[(0, recovery)]),
-            Ok(vec![b"a\0".to_vec()])
-        );
-    }
-
-    #[test]
     fn rev3_reconstructs_missing_data_volume_from_recovery_volume() {
         let data = [
             b"volume-one".as_slice(),
