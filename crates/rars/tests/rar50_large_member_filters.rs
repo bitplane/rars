@@ -123,3 +123,35 @@ fn an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run() {
         );
     }
 }
+
+/// A member coded run by run comes out byte for byte as it does coded whole,
+/// filters and all (#383). The script in front leaves the member's last run
+/// 85,536 bytes long, behind 128 KiB of history. A last run shorter than its
+/// history used to search hash chains where the whole member searches a tree,
+/// and the two paths wrote archives a few bytes apart at level 2. Down to a
+/// quarter of its history it now searches a tree too (#419).
+#[test]
+fn a_filtered_member_codes_alike_run_by_run_and_whole() {
+    let root = scratch::case("rar50-filtered-member-paths-agree");
+    let mut data =
+        b"#!/bin/sh\n# unpack the payload behind this script\nexec tail -c +2 \"$0\"\n".repeat(300);
+    data.truncate(20_000);
+    data.extend_from_slice(&code(2 * MIB as usize + 64 * 1024));
+    // Below this member's whole-member charge (173.4 MiB at a 128 KiB
+    // dictionary) and above one run's (169.1 MiB), so the explicit filter is
+    // applied run by run. The runs after the first share one window.
+    let runs = WriterResources::new(171 * MIB).with_temp_dir(&root);
+    let whole = WriterResources::new(1024 * MIB).with_temp_dir(&root);
+    let e8 = || FilterPolicy::Explicit(FilterSpec::whole(FilterKind::E8));
+    let by_runs = write(&data, e8(), &runs);
+    let at_once = write(&data, e8(), &whole);
+    assert!(
+        by_runs == at_once,
+        "runs packed to {} and the whole member to {}",
+        by_runs.len(),
+        at_once.len()
+    );
+    let archive = ArchiveReader::read(&by_runs).unwrap();
+    archive.test(None).unwrap();
+    assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
+}

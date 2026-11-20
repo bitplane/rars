@@ -1306,21 +1306,32 @@ mod run_search_tests {
     }
 
     /// A member longer than one filter search is filtered as well whole as
-    /// run by run. The member opens with text, as a tar of `/usr` can open
-    /// with a script, which the whole-member search used to read as text and
-    /// give up on, and which kept the first run unsearched. The two paths
-    /// choose the same filters (`a_large_member_is_searched_on_the_block_paths_grid`);
-    /// they code a filtered member a few bytes apart at this level (#383).
+    /// run by run, to the byte. The member opens with text, as a tar of
+    /// `/usr` can open with a script, which the whole-member search used to
+    /// read as text and give up on, and which kept the first run unsearched.
+    /// The two paths choose the same filters
+    /// (`a_large_member_is_searched_on_the_block_paths_grid`), and code them
+    /// alike: the member's last run is shorter than the history behind it
+    /// but over a quarter of it, so it searches a tree as the whole member
+    /// does. It searched chains before #419, and a filtered member came out a
+    /// few bytes apart on the two paths (#383).
     #[test]
     fn a_member_too_long_for_one_search_is_filtered_on_both_paths() {
         use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
         use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
         const MIB: u64 = 1024 * 1024;
         let root = crate::scratch::case("rar50-large-member-filter-paths");
-        let data = scripted_code(SEARCH + 256 * 1024);
+        let tail = 120 * 1024;
+        let data = scripted_code(SEARCH + tail);
+        let options = encode_options_for_level(Some(2), 128 * 1024).unwrap();
+        let (window, history) = (
+            options.max_match_distance + tail,
+            options.max_match_distance,
+        );
+        assert!(tail < history && crate::codec::rar50::searches_tree(window, history, options));
         // Above one run's filter search (169.1 MiB at a 128 KiB dictionary)
-        // and below the 1.25 MiB member's whole-member charge (170.1 MiB), so
-        // the member is coded run by run and each run still searches.
+        // and below this 1.12 MiB member's whole-member charge (169.6 MiB),
+        // so the member is coded run by run and each run still searches.
         let blocks = WriterResources::new(169 * MIB + MIB / 2).with_temp_dir(&*root);
         let whole = WriterResources::new(1024 * MIB).with_temp_dir(&*root);
         let write = |policy: FilterPolicy, resources: &WriterResources| {
@@ -1348,7 +1359,7 @@ mod run_search_tests {
         let by_runs = write(FilterPolicy::Auto, &blocks);
         let at_once = write(FilterPolicy::Auto, &whole);
         assert!(
-            by_runs.len().abs_diff(at_once.len()) * 1000 < at_once.len(),
+            by_runs == at_once,
             "runs packed to {} and the whole member to {}",
             by_runs.len(),
             at_once.len()
