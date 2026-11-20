@@ -1,6 +1,7 @@
 use crate::CliResult;
 use rars::crc32::crc32;
 use std::fs;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn volume_part_path(first_path: &Path, index: usize) -> CliResult<PathBuf> {
@@ -82,6 +83,41 @@ pub(crate) fn discover_sibling_volumes(first_path: &Path) -> Vec<PathBuf> {
         }
     });
     paths
+}
+
+/// Splits sorted volume paths into runs whose names number on without a
+/// break, with the first and last name missing at each break.
+pub(crate) fn split_at_gaps(paths: &[PathBuf]) -> (Vec<Range<usize>>, Vec<(PathBuf, PathBuf)>) {
+    let mut runs = Vec::new();
+    let mut gaps = Vec::new();
+    let mut start = 0;
+    for index in 1..paths.len() {
+        if let Some(gap) = missing_between(&paths[index - 1], &paths[index]) {
+            runs.push(start..index);
+            gaps.push(gap);
+            start = index;
+        }
+    }
+    if !paths.is_empty() {
+        runs.push(start..paths.len());
+    }
+    (runs, gaps)
+}
+
+fn missing_between(before: &Path, after: &Path) -> Option<(PathBuf, PathBuf)> {
+    if volume_name_key(before)? != volume_name_key(after)? {
+        return None;
+    }
+    let first = volume_sort_key(before)?.checked_add(1)?;
+    let last = volume_sort_key(after)?.checked_sub(1)?;
+    if first > last {
+        return None;
+    }
+    let name = |index| match rars::volume_name::part_width(before) {
+        Some(width) => rars::volume_name::part_style(before, index, width),
+        None => rars::volume_name::old_style(before, index),
+    };
+    Some((name(first)?, name(last)?))
 }
 
 /// The set key of a self-extracting first volume: `name.partN.exe` or `name.exe` (or `.sfx`).
@@ -299,6 +335,42 @@ mod tests {
             paths,
             ["set.part1.rar", "set.part2.rar", "set.part10.rar"].map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn gaps_in_volume_numbers_split_the_set_and_name_the_missing_volumes() {
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let (runs, gaps) = split_at_gaps(&paths(&["d/data.r02", "d/data.r09"]));
+        assert_eq!(runs, [0..1, 1..2]);
+        assert_eq!(
+            gaps,
+            [(PathBuf::from("d/data.r03"), PathBuf::from("d/data.r08"))]
+        );
+        let (runs, gaps) = split_at_gaps(&paths(&["SET.RAR", "SET.R00", "SET.R02", "SET.R03"]));
+        assert_eq!(runs, [0..2, 2..4]);
+        assert_eq!(gaps, [(PathBuf::from("SET.R01"), PathBuf::from("SET.R01"))]);
+        let (runs, gaps) = split_at_gaps(&paths(&["set.part01.rar", "set.part04.rar"]));
+        assert_eq!(runs, [0..1, 1..2]);
+        assert_eq!(
+            gaps,
+            [(
+                PathBuf::from("set.part02.rar"),
+                PathBuf::from("set.part03.rar")
+            )]
+        );
+        // Unnumbered or unrelated names, and a complete set, stay one run.
+        for names in [
+            &["set.rar", "set.r00", "set.r01"][..],
+            &["a.rar", "b.rar"],
+            &["one.rar", "two.r05"],
+            &["lone.rar"],
+        ] {
+            let (runs, gaps) = split_at_gaps(&paths(names));
+            assert_eq!(runs.len(), 1, "{names:?}");
+            assert_eq!(runs[0], 0..names.len(), "{names:?}");
+            assert_eq!(gaps, [], "{names:?}");
+        }
+        assert_eq!(split_at_gaps(&[]), (vec![], vec![]));
     }
 
     #[test]

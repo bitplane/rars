@@ -235,8 +235,15 @@ fn extraction_volume_failures_preserve_existing_files_and_legacy_encoding() {
         .arg(root.join("incomplete"))
         .output()
         .unwrap();
+    // The member runs on into the volumes left out, so it is skipped, not extracted.
     assert!(!incomplete.status.success());
-    assert!(stderr(&incomplete).contains("failed to extract volume set"));
+    let errors = stderr(&incomplete);
+    assert!(
+        errors.contains("its end is in a missing later volume"),
+        "{errors}"
+    );
+    assert!(errors.contains("incomplete volume set"), "{errors}");
+    assert!(!root.join("incomplete/stored-volume.txt").exists());
 
     let single = rars()
         .args(["extract", "--legacy-name-encoding", "cp850"])
@@ -2663,6 +2670,173 @@ fn legacy_volumes_keep_every_member_of_a_directory_input() {
             "{format}"
         );
     }
+}
+
+/// Writes a tree of files of mixed sizes as a volume set and returns the
+/// volumes in order, with each file's contents by name.
+fn partial_set_fixture(root: &Path, format: &str) -> (Vec<PathBuf>, Vec<(String, Vec<u8>)>) {
+    let tree = root.join("tree");
+    fs::create_dir_all(&tree).unwrap();
+    let mut files = Vec::new();
+    for (index, len) in [100, 2_500, 60, 700, 30, 3_000, 200, 900, 50]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("f{index}");
+        let data = deterministic_noise(len + index);
+        fs::write(tree.join(&name), &data).unwrap();
+        files.push((name, data));
+    }
+    let archive = root.join("set.rar");
+    let add = rars()
+        .args(["a", "--store", "--volume-size", "1k", "--format", format])
+        .arg(&archive)
+        .arg(&tree)
+        .output()
+        .unwrap();
+    assert!(add.status.success(), "{format}: {}", stderr(&add));
+    let mut volumes: Vec<_> = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.is_file())
+        .collect();
+    // set.rar, set.r00, ... and set.part01.rar, ... both sort by name once
+    // the old-style first volume goes first.
+    volumes.sort_by_key(|path| {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        (name != "set.rar", name)
+    });
+    assert!(volumes.len() >= 5, "{format}: {volumes:?}");
+    (volumes, files)
+}
+
+/// The volumes holding part of each member, by the member's file name.
+fn member_volumes(volumes: &[PathBuf]) -> Vec<(String, Vec<usize>)> {
+    let mut placement: Vec<(String, Vec<usize>)> = Vec::new();
+    for (index, path) in volumes.iter().enumerate() {
+        let archive = rars::ArchiveReader::read_path(path).unwrap();
+        for member in archive.members() {
+            let name = String::from_utf8_lossy(&member.meta.name).into_owned();
+            match placement.iter_mut().find(|(known, _)| *known == name) {
+                Some((_, held)) => held.push(index),
+                None => placement.push((name, vec![index])),
+            }
+        }
+    }
+    placement
+}
+
+#[test]
+fn partial_volume_sets_test_and_extract_the_whole_members() {
+    for format in ["rar15", "rar29", "rar50"] {
+        let source = scratch("partial-set-source");
+        let (volumes, files) = partial_set_fixture(&source, format);
+        let placement = member_volumes(&volumes);
+        let count = volumes.len();
+        for missing in [0, count / 2, count - 1] {
+            let case = format!("{format}, volume {missing} of {count} missing");
+            let root = scratch("partial-set");
+            let mut present = Vec::new();
+            for (index, volume) in volumes.iter().enumerate() {
+                if index != missing {
+                    let copy = root.join(volume.file_name().unwrap());
+                    fs::copy(volume, &copy).unwrap();
+                    present.push(copy);
+                }
+            }
+            // A member is whole when no part of it is in the missing volume
+            // and it does not run from one side of it to the other.
+            let whole = |held: &[usize]| {
+                held.iter().all(|&index| index < missing)
+                    || held.iter().all(|&index| index > missing)
+            };
+            let named = |predicate: &dyn Fn(&[usize]) -> bool| -> Vec<String> {
+                placement
+                    .iter()
+                    .filter(|(_, held)| predicate(held))
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            };
+            let mut expected_ok = named(&|held| whole(held));
+            let expected_split =
+                named(&|held| !whole(held) && held.iter().any(|&index| index != missing));
+            assert!(!expected_split.is_empty(), "{case}: nothing split");
+
+            let test = rars().arg("test").arg(&present[0]).output().unwrap();
+            assert!(!test.status.success(), "{case}: {}", stdout(&test));
+            let mut tested: Vec<String> = stdout(&test)
+                .lines()
+                .filter_map(|line| line.strip_prefix("OK "))
+                .map(|name| name.trim_end_matches('/').to_owned())
+                .collect();
+            tested.sort();
+            expected_ok.sort();
+            assert_eq!(tested, expected_ok, "{case}: {}", stderr(&test));
+            let errors = stderr(&test);
+            for name in &expected_split {
+                assert!(
+                    errors.contains(&format!("skipped split member '{name}'")),
+                    "{case}: {name}: {errors}"
+                );
+            }
+            assert!(errors.contains("incomplete volume set"), "{case}: {errors}");
+            if missing != 0 && missing != count - 1 {
+                let gap = root.join(volumes[missing].file_name().unwrap());
+                assert!(
+                    errors.contains(&format!("volume '{}' is missing", gap.display())),
+                    "{case}: {errors}"
+                );
+            }
+
+            let out = root.join("out");
+            let extract = rars().arg("x").arg(&present[0]).arg(&out).output().unwrap();
+            assert!(!extract.status.success(), "{case}: {}", stdout(&extract));
+            for (name, data) in &files {
+                let member = placement
+                    .iter()
+                    .find(|(member, _)| member.ends_with(name.as_str()))
+                    .unwrap();
+                let path = out.join("tree").join(name);
+                if whole(&member.1) {
+                    assert_eq!(&fs::read(&path).unwrap(), data, "{case}: {name}");
+                } else {
+                    assert!(!path.exists(), "{case}: {name}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn a_gap_in_old_style_volume_names_is_reported_as_the_volumes_missing() {
+    let source = scratch("partial-set-gap-source");
+    let (volumes, _) = partial_set_fixture(&source, "rar15");
+    let root = scratch("partial-set-gap");
+    // set.r00 and set.r03 survive; set.r01 and set.r02 between them do not.
+    for name in ["set.r00", "set.r03"] {
+        assert!(volumes.contains(&source.join(name)), "{volumes:?}");
+        fs::copy(source.join(name), root.join(name)).unwrap();
+    }
+    let test = rars()
+        .arg("test")
+        .arg(root.join("set.r03"))
+        .output()
+        .unwrap();
+    assert!(!test.status.success(), "{}", stdout(&test));
+    let errors = stderr(&test);
+    assert!(
+        errors.contains(&format!(
+            "volumes '{}' to '{}' are missing",
+            root.join("set.r01").display(),
+            root.join("set.r02").display()
+        )),
+        "{errors}"
+    );
+    assert!(!errors.contains("missing its first part"), "{errors}");
+    assert!(
+        errors.contains("incomplete volume set: 1 gap(s) in the volume names"),
+        "{errors}"
+    );
 }
 
 #[test]

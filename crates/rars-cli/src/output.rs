@@ -179,6 +179,19 @@ pub(crate) fn redirection_warning(name: impl AsRef<str>) -> String {
     )
 }
 
+pub(crate) fn incomplete_member_warning(volume: &Path, member: &rars::IncompleteMember) -> String {
+    let missing = match member.missing {
+        rars::MissingPart::Start => "its start is in a missing earlier volume",
+        rars::MissingPart::End => "its end is in a missing later volume",
+        _ => "its start and end are in missing volumes",
+    };
+    format!(
+        "warning: {}: skipped split member '{}': {missing}",
+        volume.display(),
+        display_archive_bytes(&member.name)
+    )
+}
+
 pub(crate) fn skipped_link_warning(name: &[u8], target: &[u8]) -> String {
     format!(
         "warning: skipping link '{}' -> '{}': it would point outside the output directory",
