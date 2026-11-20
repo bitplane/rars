@@ -550,7 +550,6 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
                 &mut shard_states,
                 encode_units,
                 &report,
-                &gf,
                 allowance,
             )?;
             ParityRows::Resident(parity)
@@ -567,7 +566,6 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
                 scratch,
                 encode_units,
                 &report,
-                &gf,
                 allowance,
             )?;
             ParityRows::Spooled {
@@ -785,25 +783,41 @@ impl<B: Budget> ParityRows<'_, B> {
 ///
 /// A trailing odd byte is treated as the low half of a word whose high half is
 /// the zero padding every shard carries.
-fn accumulate_scaled(destination: &mut [u8], source: &[u8], coefficient: u16, gf: &GfView<'_>) {
-    let words = source.len() / 2;
-    for word in 0..words {
-        let offset = word * 2;
-        let value = u16::from_le_bytes([source[offset], source[offset + 1]]);
-        let scaled = gf.mul(coefficient, value);
-        if scaled == 0 {
-            continue;
-        }
-        let current = u16::from_le_bytes([destination[offset], destination[offset + 1]]);
-        destination[offset..offset + 2].copy_from_slice(&(current ^ scaled).to_le_bytes());
+fn accumulate_scaled(destination: &mut [u8], source: &[u8], coefficient: u16) {
+    if coefficient == 0 {
+        return;
     }
-    if !source.len().is_multiple_of(2) {
-        let offset = words * 2;
-        let value = u16::from_le_bytes([source[offset], 0]);
-        let scaled = gf.mul(coefficient, value);
-        if scaled != 0 {
-            let current = u16::from_le_bytes([destination[offset], destination[offset + 1]]);
-            destination[offset..offset + 2].copy_from_slice(&(current ^ scaled).to_le_bytes());
+    debug_assert!(destination.len() >= source.len().next_multiple_of(2));
+    let mut tables = [[0u16; 256]; 2];
+    fill_scale_tables(&mut tables, coefficient);
+    let [low, high] = &tables;
+    let (words, tail) = source.as_chunks::<2>();
+    for (target, word) in destination.as_chunks_mut::<2>().0.iter_mut().zip(words) {
+        let product = low[word[0] as usize] ^ high[word[1] as usize];
+        target[0] ^= product as u8;
+        target[1] ^= (product >> 8) as u8;
+    }
+    if let [tail] = tail {
+        let product = low[*tail as usize];
+        let offset = source.len() - 1;
+        destination[offset] ^= product as u8;
+        destination[offset + 1] ^= (product >> 8) as u8;
+    }
+}
+
+/// Two byte-indexed tables replace a log and exp lookup per word: `c * x == lo[x & 0xff] ^ hi[x >> 8]`.
+fn fill_scale_tables(tables: &mut [[u16; 256]; 2], coefficient: u16) {
+    let mut product = u32::from(coefficient);
+    for table in tables.iter_mut() {
+        table[0] = 0;
+        for bit in 0..8 {
+            // Multiplication is linear over GF(2), so setting `bit` adds its
+            // product to every entry below it.
+            let (lower, upper) = table.split_at_mut(1 << bit);
+            for (entry, base) in upper[..lower.len()].iter_mut().zip(lower.iter()) {
+                *entry = base ^ product as u16;
+            }
+            product = times_x(product);
         }
     }
 }
@@ -837,7 +851,6 @@ fn accumulate_shard<B: Budget>(
     source: &[u8],
     matrix: &[Buffer<u16, B>],
     shard_index: usize,
-    gf: &GfView<'_>,
     allowance: &B,
 ) {
     let threads = if crate::parallel::may_nest() {
@@ -858,7 +871,7 @@ fn accumulate_shard<B: Budget>(
     });
     let Some((workers, width, mut tasks)) = tasks else {
         for (row, parity_row) in matrix.iter().zip(parity.iter_mut()) {
-            accumulate_scaled(&mut parity_row[offset..], source, row[shard_index], gf);
+            accumulate_scaled(&mut parity_row[offset..], source, row[shard_index]);
         }
         return;
     };
@@ -896,7 +909,7 @@ fn accumulate_shard<B: Budget>(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (destination, columns, coefficient) = &mut *task;
-        accumulate_scaled(destination, &source[columns.clone()], *coefficient, gf);
+        accumulate_scaled(destination, &source[columns.clone()], *coefficient);
     });
 }
 
@@ -910,7 +923,6 @@ fn encode_parity_resident<B: Budget>(
     shard_states: &mut [u64],
     encode_units: u64,
     report: &dyn Fn(u64) -> Result<()>,
-    gf: &GfView<'_>,
     allowance: &B,
 ) -> Result<Buffer<Buffer<u8, B>, B>> {
     // The streaming entry point admitted these as native-size values.
@@ -946,7 +958,6 @@ fn encode_parity_resident<B: Budget>(
                 &buffer[..want],
                 matrix,
                 shard_index,
-                gf,
                 allowance,
             );
 
@@ -972,7 +983,6 @@ fn encode_parity_striped<B: Budget>(
     scratch: &mut dyn ReadWriteSeek,
     encode_units: u64,
     report: &dyn Fn(u64) -> Result<()>,
-    gf: &GfView<'_>,
     allowance: &B,
 ) -> Result<()> {
     let recovery_shards = plan.recovery_shards as usize;
@@ -1011,7 +1021,6 @@ fn encode_parity_striped<B: Budget>(
                 &buffer[..span_usize],
                 matrix,
                 shard_index,
-                gf,
                 allowance,
             );
 
@@ -2215,16 +2224,22 @@ impl Gf16 {
     }
 }
 
+fn times_x(value: u32) -> u32 {
+    let doubled = value << 1;
+    if doubled > FIELD_MASK {
+        doubled ^ PRIMITIVE_POLYNOMIAL
+    } else {
+        doubled
+    }
+}
+
 fn initialize_field(exp: &mut [u16], log: &mut [u32]) {
     let mut value = 1u32;
     for power in 0..FIELD_SIZE {
         log[value as usize] = power as u32;
         exp[power] = value as u16;
         exp[power + FIELD_SIZE] = value as u16;
-        value <<= 1;
-        if value > FIELD_MASK {
-            value ^= PRIMITIVE_POLYNOMIAL;
-        }
+        value = times_x(value);
     }
     log[0] = ZERO_LOG_SENTINEL;
 }
@@ -3304,6 +3319,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn accumulate_scaled_by_log_exp(destination: &mut [u8], source: &[u8], coefficient: u16) {
+        let gf = shared_gf16();
+        for (offset, pair) in source.chunks(2).enumerate() {
+            let value = u16::from_le_bytes([pair[0], pair.get(1).copied().unwrap_or(0)]);
+            let at = offset * 2;
+            let current = u16::from_le_bytes([destination[at], destination[at + 1]]);
+            destination[at..at + 2]
+                .copy_from_slice(&(current ^ gf.mul(coefficient, value)).to_le_bytes());
+        }
+    }
+
+    #[test]
+    fn accumulate_scaled_matches_log_exp_multiplication() {
+        use super::accumulate_scaled;
+        let mut source = recovery_test_bytes(1031, 7);
+        source[100..140].fill(0);
+        for coefficient in [0, 1, 2, 0x00ff, 0x0100, 0x8000, 0xbeef, 0xffff] {
+            for len in [0usize, 1, 2, 3, 40, 101, 1030, 1031] {
+                let start = recovery_test_bytes(len.next_multiple_of(2), coefficient.into());
+                let mut expected = start.clone();
+                accumulate_scaled_by_log_exp(&mut expected, &source[..len], coefficient);
+                let mut actual = start;
+                accumulate_scaled(&mut actual, &source[..len], coefficient);
+                assert_eq!(
+                    actual, expected,
+                    "coefficient {coefficient:#x}, {len} bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_parity_fingerprints_are_unchanged() {
+        // Lengths and CRC32s of records written before the table kernel.
+        let mut found = Vec::new();
+        for len in [1025usize, 3 * 200 * 1024 + 1] {
+            let body = recovery_test_bytes(len, len as u32 ^ 0x5eed);
+            for percent in [1u64, 10] {
+                for mode in [
+                    super::RecoveryMemoryMode::Resident,
+                    super::RecoveryMemoryMode::Striped { stripe_len: 998 },
+                ] {
+                    let plan = plan_inline_recovery(len as u64, percent).unwrap();
+                    let mut scratch = std::io::Cursor::new(vec![
+                        0u8;
+                        (plan.recovery_shards * plan.group_count)
+                            as usize
+                    ]);
+                    let mut produced = Vec::new();
+                    super::build_streamed_inline_recovery(
+                        &mut std::io::Cursor::new(&body),
+                        len as u64,
+                        percent,
+                        mode,
+                        Some(&mut scratch),
+                        &mut produced,
+                        None,
+                        1,
+                    )
+                    .unwrap();
+                    found.push((produced.len(), crc32fast::hash(&produced)));
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            [
+                (602, 3_644_122_705),
+                (602, 3_644_122_705),
+                (602, 3_644_122_705),
+                (602, 3_644_122_705),
+                (9_492, 2_548_288_029),
+                (9_492, 2_548_288_029),
+                (94_920, 1_590_988_677),
+                (94_920, 1_590_988_677),
+            ]
+        );
     }
 
     #[test]
