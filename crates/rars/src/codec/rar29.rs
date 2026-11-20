@@ -550,11 +550,43 @@ impl<B: Budget> Reader29State<B> {
         }
         // A final match's bytes past the declared size go to the window only.
         self.drain_pending_match(usize::MAX)?;
-        self.finish_member(src).map_err(|error| match error {
-            Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
-            error => error,
-        })?;
+        if let Err(error) = self.finish_member(src) {
+            // The stream goes on past the declared size, as it does when
+            // damage earlier in the member made it decode to more bytes than
+            // were packed. The member has failed, but a solid successor
+            // starts from the tables, PPMd model and window at this member's
+            // end marker, so decode on to it.
+            self.run_on_to_member_end(src);
+            return Err(match error {
+                Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
+                error => error,
+            });
+        }
         Ok(())
+    }
+
+    /// Decodes into the window only, until the member's end marker or the
+    /// first error. Whatever stops it is not reported: the member has
+    /// already failed.
+    fn run_on_to_member_end(&mut self, src: &mut dyn Read) {
+        loop {
+            let pos = self.current_pos();
+            let target = pos.saturating_add(STREAM_CHUNK);
+            if self
+                .output
+                .reserve_up_to(self.output.len() + STREAM_CHUNK, STREAM_HISTORY)
+                .is_err()
+            {
+                break;
+            }
+            let decoded = self.decode_until(target, src);
+            self.trim_history(self.current_pos(), self.current_pos());
+            if decoded.is_err() || self.current_pos() == pos {
+                break;
+            }
+        }
+        // Nothing of this member may reach the next one's output.
+        let _ = self.drain_pending_match(usize::MAX);
     }
 
     fn decode_until(&mut self, target: usize, src: &mut dyn Read) -> Result<()> {
@@ -565,15 +597,17 @@ impl<B: Budget> Reader29State<B> {
             if self.current_pos() >= target {
                 break;
             }
+            // Past a new-file marker the bits are padding, or the next
+            // member's, whether or not the marker keeps the tables.
+            if matches!(
+                self.last_block_end,
+                Some(LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables)
+            ) {
+                return Err(Error::InvalidData(
+                    "RAR 2.9 member ended before its declared size",
+                ));
+            }
             if !self.in_lz_block {
-                if matches!(
-                    self.last_block_end,
-                    Some(LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables)
-                ) {
-                    return Err(Error::InvalidData(
-                        "RAR 2.9 member ended before its declared size",
-                    ));
-                }
                 self.bits.top_up(src)?;
                 self.read_tables()?;
                 self.in_lz_block = true;
@@ -769,6 +803,9 @@ impl<B: Budget> Reader29State<B> {
                 }
                 1 => self.output.try_push(self.ppmd_esc)?,
                 2 => {
+                    // As at a member's end: the next one starts with a block
+                    // header.
+                    self.in_lz_block = false;
                     return Err(Error::InvalidData(
                         "RAR 2.9 member ended before its declared size",
                     ));
@@ -777,12 +814,7 @@ impl<B: Budget> Reader29State<B> {
                     self.read_vm_code_ppmd(src)?;
                 }
                 4 => {
-                    let mut offset = 0usize;
-                    for _ in 0..3 {
-                        offset = (offset << 8) | self.read_ppmd_required_byte()? as usize;
-                    }
-                    offset += 2;
-                    let length = self.read_ppmd_required_byte()? as usize + 32;
+                    let (length, offset) = self.read_ppmd_match()?;
                     self.copy_match(length, offset, output_size)?;
                 }
                 5 => {
@@ -801,13 +833,42 @@ impl<B: Budget> Reader29State<B> {
         require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)
     }
 
+    /// The length and offset of a PPMd block's long match (escape code 4).
+    fn read_ppmd_match(&mut self) -> Result<(usize, usize)> {
+        let mut offset = 0usize;
+        for _ in 0..3 {
+            offset = (offset << 8) | self.read_ppmd_required_byte()? as usize;
+        }
+        let length = self.read_ppmd_required_byte()? as usize + 32;
+        Ok((length, offset + 2))
+    }
+
     fn finish_ppmd_member(&mut self, src: &mut dyn Read) -> Result<bool> {
+        // Output past the declared size goes to the window only, so that
+        // the decoder stays in step with the stream (see
+        // `run_on_to_member_end`).
+        const TRAILING: Error = Error::InvalidData("RAR 2.9 PPMd member has trailing data");
         let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         if symbol != self.ppmd_esc {
-            return Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data"));
+            self.output.try_push(symbol)?;
+            return Err(TRAILING);
         }
         let next = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         match next {
+            1 => {
+                self.output.try_push(self.ppmd_esc)?;
+                Err(TRAILING)
+            }
+            4 => {
+                let (length, offset) = self.read_ppmd_match()?;
+                self.copy_match(length, offset, usize::MAX)?;
+                Err(TRAILING)
+            }
+            5 => {
+                let length = self.read_ppmd_required_byte()? as usize + 4;
+                self.copy_match(length, 1, usize::MAX)?;
+                Err(TRAILING)
+            }
             2 => {
                 self.in_lz_block = false;
                 Ok(true)
@@ -823,7 +884,7 @@ impl<B: Budget> Reader29State<B> {
                 self.read_vm_code_ppmd(src)?;
                 Ok(false)
             }
-            _ => Err(Error::InvalidData("RAR 2.9 PPMd member has trailing data")),
+            _ => Err(TRAILING),
         }
     }
 
@@ -846,6 +907,7 @@ impl<B: Budget> Reader29State<B> {
         if !self.in_lz_block || self.bits.only_zero_padding_left() {
             return Ok(true);
         }
+        let symbol_start = self.bits.bit_pos;
         let symbol = self.main.decode(&mut self.bits)?;
         if symbol == 257 {
             // A filter record after the last byte of output is legal: it
@@ -856,6 +918,8 @@ impl<B: Budget> Reader29State<B> {
             return Ok(false);
         }
         if symbol != 256 {
+            // Left unread, for `run_on_to_member_end`.
+            self.bits.bit_pos = symbol_start;
             return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
         }
         match self.read_end_of_block()? {
