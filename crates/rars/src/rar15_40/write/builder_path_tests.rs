@@ -26,9 +26,9 @@ const STREAMS_ABOVE: u64 = 256 * 1024;
 /// The window members are fitted to here, in place of 4 MiB.
 const DICTIONARY: usize = MIB;
 /// A member over 1 MiB gets the capped dictionary, and one segment of the
-/// streamed parse reads four of them. A member a little longer than that has
-/// its first segment coded and written before its last quarter megabyte is
-/// read.
+/// streamed parse reads four of them at up to 8 threads; more round it up to
+/// a whole batch of their blocks. A member a little longer than that has its
+/// first segment coded and written before its last quarter megabyte is read.
 const MEMBER: usize = 4 * DICTIONARY + DICTIONARY / 2;
 /// How close to the member's end the archive is measured.
 const LAST: u64 = DICTIONARY as u64 / 4;
@@ -87,6 +87,8 @@ fn bytes_in(dir: &Path) -> u64 {
 fn write_to_path_streams_a_large_member_as_a_seekable_archive_does() {
     STREAM_ABOVE.set(STREAMS_ABOVE);
     DICTIONARY_CAP.set(DICTIONARY);
+    // At 9 threads a segment holds the whole member.
+    let _threads = crate::parallel::ThreadCap::set(Some(4));
     let dir = crate::scratch::case("builder-path-streams-legacy");
     let data = large_member();
 
