@@ -100,7 +100,11 @@ jobs:
       # Unit and integration tests, every binary at once rather than one after
       # another; nextest does not run doctests, so they follow. External-decoder
       # tests skip unavailable tools; the release gate requires them.
+      # Pull requests skip the slow tests listed in .config/nextest.toml unless
+      # labelled `full-tests`; pushes to master run every test.
       - name: Tests
+        env:
+          NEXTEST_PROFILE: ${{ github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'full-tests') && 'pr' || 'default' }}
         run: |
           cargo nextest run --workspace --locked --no-fail-fast
           cargo test --workspace --locked --doc
