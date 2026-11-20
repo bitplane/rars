@@ -205,12 +205,17 @@ pub(super) fn encode_options_for_level(
         Error::InvalidArgument("RAR 5 dictionary size exceeds this platform's address space")
     })?;
     Ok(EncodeOptions::new(candidates)
-        // Looking one byte further ahead before settling for the match at hand
-        // is both smaller and quicker than not: at 64 candidates on 4 MiB of
-        // man pages it took 4,383 bytes and half a second off, because a
-        // longer match covers ground the finder then does not have to search.
-        // A lookahead of four is worse than one.
-        .with_lazy_matching(level >= 2)
+        // Looking a byte or two further ahead before settling for the match at
+        // hand is what level 1 parses with; the levels above it parse by
+        // shortest path and never ask. At level 1's eight candidates it costs
+        // time: over ten classes of the bench corpus it took 3.2% off the
+        // total, 1% to 4.3% a class, for a quarter more CPU (17% to 80% a
+        // class), and level 1 stayed six times cheaper than level 2. At 64
+        // candidates on 4 MiB of man pages it was both smaller and quicker,
+        // 4,383 bytes and half a second off, because a longer match covers
+        // ground the finder then does not have to search. A lookahead of four
+        // is worse than one.
+        .with_lazy_matching(level >= 1)
         .with_lazy_lookahead(2)
         // Everything above level 1 parses by shortest path. Gap to each
         // level's own WinRAR over the bench corpus, byte weighted, with the
@@ -230,9 +235,10 @@ pub(super) fn encode_options_for_level(
         // the ordering: at 32, 128, 256 and 512 candidates the parse packs
         // steadily smaller for steadily more time, which is what a level is.
         //
-        // Level 1 keeps the greedy parse. It is the rung that exists to be
-        // quick, it already beats WinRAR's own level 1 by 2.71%, and it is the
-        // only place left to go when the parse is too slow for the job.
+        // Level 1 keeps the lazy parse. It is the rung that exists to be
+        // quick, it beat WinRAR's own level 1 by 2.71% before it looked ahead
+        // at all, and it is the only place left to go when the shortest-path
+        // parse is too slow for the job.
         .with_optimal_parse(level >= 2)
         .with_nice_match_length(parse_effort_for_level(level).0)
         .with_parse_passes(parse_effort_for_level(level).1)
@@ -869,8 +875,8 @@ fn piece_filters<B: Budget>(
 /// level 1     167,767,504  140s    121,255,533  163s
 /// ```
 ///
-/// Level 2 changed eight members by at most 0.17% either way. The greedy
-/// parse of level 1 passes over delta filters the shortest-path parse uses:
+/// Level 2 changed eight members by at most 0.17% either way. Level 1's parse,
+/// then greedy, passes over delta filters the shortest-path parse uses:
 /// one text slice came out 1.05% larger.
 fn run_search_options(options: EncodeOptions) -> EncodeOptions {
     if !options.optimal_parse {

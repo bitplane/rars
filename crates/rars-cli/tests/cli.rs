@@ -51,6 +51,22 @@ fn rar50_level_sensitive_payload() -> Vec<u8> {
         data.extend_from_slice(&deterministic_noise(24));
     }
     data.extend_from_slice(&long_match);
+    // Level 1 looks two bytes ahead, which finds the long match above on its
+    // own and leaves level 5 nothing to win there. Words from a dozen-word
+    // vocabulary in a jumbled order are where the shortest-path parse still
+    // packs well ahead of it.
+    const WORDS: [&[u8]; 12] = [
+        b"the ", b"quick ", b"brown ", b"fox ", b"jumps ", b"over ", b"lazy ", b"dog ", b"and ",
+        b"then ", b"runs ", b"away ",
+    ];
+    let mut state = 0x1234_5678u32;
+    let mut words = Vec::new();
+    while words.len() < 2048 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        words.extend_from_slice(WORDS[(state >> 24) as usize % WORDS.len()]);
+    }
+    words.truncate(2048);
+    data.extend_from_slice(&words);
     data
 }
 
