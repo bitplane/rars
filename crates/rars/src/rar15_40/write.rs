@@ -6858,6 +6858,144 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_volume_member_is_charged_for_its_packed_form_until_its_last_fragment_is_written() {
+        let datas = [binary_member(300_000), binary_member(200_000)];
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            for password in passwords() {
+                for solid in [false, true] {
+                    let case =
+                        format!("{target:?}, password {}, solid {solid}", password.is_some());
+                    let mut options = super::WriterOptions::new(target, FeatureSet::default());
+                    options.features.solid = solid;
+                    let entries: Vec<_> = datas
+                        .iter()
+                        .enumerate()
+                        .map(|(index, data)| {
+                            let entry = super::StreamingEntry::new(
+                                format!("member{index}.bin"),
+                                crate::EntrySource::from_bytes(data.clone()),
+                            );
+                            match password {
+                                Some(password) => entry.with_password(password),
+                                None => entry,
+                            }
+                        })
+                        .collect();
+                    let members: Vec<_> =
+                        entries.iter().map(super::Member::from_streaming).collect();
+                    let resources = crate::WriterResources::default();
+                    let mut sink = crate::volume_sink::ChargedVolumes::new(&resources);
+                    super::volumes::split_members(
+                        &members,
+                        options,
+                        &crate::MemberCoding::Compressed,
+                        None,
+                        40_000,
+                        &mut sink,
+                        &resources,
+                        None,
+                    )
+                    .unwrap();
+                    // Every fragment's payload went out while its member was charged.
+                    assert!(sink.payload_writes() > 2, "{case}");
+                    assert_eq!(resources.workspace_in_use(), 0, "{case}");
+
+                    let volumes = sink.collected.take();
+                    assert!(volumes.len() > 2, "{case}");
+                    let names = [b"member0.bin".to_vec(), b"member1.bin".to_vec()];
+                    let expected: Vec<_> = names.into_iter().zip(datas.clone()).collect();
+                    assert_eq!(extracted_set(&volumes, password), expected, "{case}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn level_zero_volume_members_are_written_as_stored_ones() {
+        /// Notes the most the budget had charged whenever the member was read.
+        struct Watched {
+            data: std::io::Cursor<Vec<u8>>,
+            resources: crate::WriterResources,
+            charged: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        impl std::io::Read for Watched {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                self.charged.fetch_max(
+                    self.resources.workspace_in_use() as usize,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                self.data.read(buffer)
+            }
+        }
+        impl std::io::Seek for Watched {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.data.seek(from)
+            }
+        }
+
+        let data = binary_member(300_000);
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            for solid in [false, true] {
+                let case = format!("{target:?}, solid {solid}");
+                let mut options = super::WriterOptions::new(target, FeatureSet::default());
+                options.compression_level = Some(0);
+                options.features.solid = solid;
+                let resources = crate::WriterResources::default();
+                let charged = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let entry = {
+                    let (data, resources, charged) =
+                        (data.clone(), resources.clone(), charged.clone());
+                    super::StreamingEntry::new(
+                        "member.bin",
+                        crate::EntrySource::from_opener(data.len() as u64, move || {
+                            Ok(Box::new(Watched {
+                                data: std::io::Cursor::new(data.clone()),
+                                resources: resources.clone(),
+                                charged: charged.clone(),
+                            }))
+                        }),
+                    )
+                };
+                let mut sink = crate::volume_sink::CollectedVolumes::new();
+                super::volumes::split_members(
+                    &[super::Member::from_streaming(&entry)],
+                    options,
+                    &crate::MemberCoding::Compressed,
+                    None,
+                    40_000,
+                    &mut sink,
+                    &resources,
+                    None,
+                )
+                .unwrap();
+                // Copied into the volumes as it is read, as a stored member
+                // is, rather than loaded under a charge for coding it and
+                // handed back as a copy of itself.
+                let charged = charged.load(std::sync::atomic::Ordering::Relaxed);
+                assert!(
+                    charged < data.len(),
+                    "{case}: read with {charged} bytes charged"
+                );
+                let volumes = sink.take();
+                assert!(volumes.len() > 2, "{case}");
+                assert_eq!(
+                    extracted_set(&volumes, None),
+                    [(b"member.bin".to_vec(), data.clone())],
+                    "{case}"
+                );
+            }
+        }
+    }
+
     #[cfg(all(
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))

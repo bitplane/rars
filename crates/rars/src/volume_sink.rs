@@ -136,3 +136,83 @@ impl VolumeSink for CollectedVolumes {
         Ok(())
     }
 }
+
+/// Collects a set while checking that every payload write is covered by the
+/// budget, which is what a member's charge holding until it is written
+/// promises. Headers are written outside any charge; payloads are not.
+#[cfg(test)]
+pub(crate) struct ChargedVolumes {
+    pub(crate) collected: CollectedVolumes,
+    resources: crate::WriterResources,
+    payload_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ChargedVolumes {
+    pub(crate) fn new(resources: &crate::WriterResources) -> Self {
+        Self {
+            collected: CollectedVolumes::new(),
+            resources: resources.clone(),
+            payload_writes: Default::default(),
+        }
+    }
+
+    pub(crate) fn payload_writes(&self) -> usize {
+        self.payload_writes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+struct ChargedVolume {
+    inner: Box<dyn VolumeOutput>,
+    resources: crate::WriterResources,
+    payload_writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl Write for ChargedVolume {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if bytes.len() > 512 {
+            self.payload_writes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let charged = self.resources.workspace_in_use();
+            assert!(
+                charged >= bytes.len() as u64,
+                "{} bytes written with {charged} charged",
+                bytes.len()
+            );
+        }
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+impl Seek for ChargedVolume {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(from)
+    }
+}
+
+#[cfg(test)]
+impl VolumeSink for ChargedVolumes {
+    fn expect_volumes(&mut self, total: u64) -> Result<()> {
+        self.collected.expect_volumes(total)
+    }
+
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn VolumeOutput>> {
+        Ok(Box::new(ChargedVolume {
+            inner: self.collected.start_volume(index)?,
+            resources: self.resources.clone(),
+            payload_writes: std::sync::Arc::clone(&self.payload_writes),
+        }))
+    }
+
+    fn finish_volume(&mut self, index: u64, len: u64) -> Result<()> {
+        self.collected.finish_volume(index, len)
+    }
+}
