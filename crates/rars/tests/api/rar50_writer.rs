@@ -1,4 +1,4 @@
-use super::support::{rar50_entry, CollectWriter};
+use super::support::{rar50_entry, scratch, CollectWriter};
 use rars::rar50::{
     write_streaming_archive_to, Archive, ArchiveEntry, ArchiveExtras, FilterPolicy, Rar50Writer,
     WriterOptions,
@@ -540,4 +540,47 @@ fn writer_options_default_targets_rar50_with_store_only_features() {
     let options = WriterOptions::default();
     assert_eq!(options.target, rars::ArchiveVersion::Rar50);
     assert_eq!(options.features, rars::FeatureSet::store_only());
+}
+
+#[test]
+fn streaming_writer_propagates_partial_output_failure_and_cleans_spools() {
+    struct FailingOutput {
+        remaining: usize,
+        written: usize,
+    }
+    impl Write for FailingOutput {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            let count = bytes.len().min(self.remaining);
+            self.remaining -= count;
+            self.written += count;
+            Ok(count)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let scratch = scratch::case("rar50-partial-output-failure");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    let data = vec![42u8; 8192];
+    let entry = ArchiveEntry::new(b"file".to_vec(), EntrySource::from_bytes(data));
+    let mut output = FailingOutput {
+        remaining: 1024,
+        written: 0,
+    };
+    let error = write_streaming_archive_to(
+        &[entry],
+        WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(0),
+        ArchiveExtras::default(),
+        &resources,
+        &mut output,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), rars::ErrorKind::Io);
+    assert_eq!(output.written, 1024);
+    assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
 }
