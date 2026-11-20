@@ -1,0 +1,50 @@
+# Pull requests run every test except the slow ones listed below; pushes to
+# master run them all, and so does a pull request labelled `full-tests`.
+#
+# The list holds tests that took 5 s or more on CI's 4-core runner. Before
+# adding a test here, try to make it cheaper first (see #403): most slow tests
+# push megabytes through the encoder only to cross a threshold a test-only
+# override could lower.
+
+[profile.pr]
+default-filter = """
+not (
+    (binary_id(rars) & test(=codec::ppmd::tests::decodes_what_the_writer_encodes_through_restarts_and_glue)) |
+    (binary_id(rars) & test(=codec::rar29::encoder::block_split::tests::cut_blocks_round_trip_and_never_code_larger)) |
+    (binary_id(rars) & test(=codec::rar29::encoder::tests::ppmd_members_code_to_the_bytes_before_the_search_ran_ahead)) |
+    (binary_id(rars) & test(=codec::rar50::encoder::tests::filtered_state_owns_transform_scratch_history_and_outputs)) |
+    (binary_id(rars) & test(=rar15_40::write::builder_path_tests::write_to_path_streams_a_large_member_as_a_seekable_archive_does)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_filter_friendly_member_streams_close_to_the_in_memory_ratio)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_member_whose_first_volume_does_not_compress_still_compresses_in_a_set)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_named_filter_streams_on_a_solid_chain_and_through_a_pipe)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_password_protected_rar15_member_streams_without_padding)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_piped_member_is_spooled_into_the_archive_a_file_gets)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_solid_member_searches_filters_against_the_chain)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_streamed_rar15_member_splits_into_the_volumes_the_in_memory_writer_does)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_streamed_rar20_member_splits_into_the_volumes_the_in_memory_writer_does)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_streamed_rar20_member_writes_the_archive_the_in_memory_writer_does)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_tight_budget_on_many_threads_writes_what_one_thread_writes)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::password_protected_members_stream_into_a_set)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::rar29_text_packs_no_larger_a_level_up_in_chains_forced_and_streamed)) |
+    (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_large_member_is_searched_on_the_block_paths_grid)) |
+    (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_member_too_long_for_one_search_is_filtered_on_both_paths)) |
+    (binary_id(rars) & test(=rar50::write::tests::parallel_streaming_blocks_are_byte_identical_to_serial_blocks)) |
+    (binary_id(rars) & test(=rar50::write::tests::streaming_entry_order_is_identical_at_one_and_many_job_budgets)) |
+    (binary_id(rars-cli::cli) & test(=raising_the_memory_limit_never_changes_the_archive)) |
+    (binary_id(rars-cli::cli) & test(=rar50_looks_for_a_data_filter_by_default)) |
+    (binary_id(rars::encoder_memory_regression) & test(=default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings)) |
+    (binary_id(rars::encoder_memory_regression) & test(=solid_multirun_history_fits_fixed_ceiling_and_extracts)) |
+    (binary_id(rars::legacy_large_volumes) & test(=a_stored_member_over_4_gib_splits_across_volumes_with_large_headers)) |
+    (binary_id(rars::rar15_40_fixtures) & test(=streaming_and_buffered_writers_agree_byte_for_byte)) |
+    (binary_id(rars::rar50_fixtures) & test(=streaming_writer_handles_solid_encrypted_headers_and_recovery_together)) |
+    (binary_id(rars::rar50_large_member_filters) & test(=an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run)) |
+    (binary_id(rars::rar50_large_member_filters) & test(=runs_of_a_large_member_choose_their_own_filters)) |
+    (binary_id(rars::rar50_shared_block_windows) & test(=filtered_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
+    (binary_id(rars::rar50_shared_block_windows) & test(=filtered_solid_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
+    (binary_id(rars::rar50_shared_block_windows) & test(=runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
+    (binary_id(rars::rar50_shared_block_windows) & test(=solid_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
+    (binary_id(rars::rar50_solid_filters) & test(=a_solid_archive_filters_each_member_from_its_own_offset))
+)
+"""
