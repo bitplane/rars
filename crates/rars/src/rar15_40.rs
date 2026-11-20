@@ -16,6 +16,7 @@ use crate::io_util::{read_exact_at, read_u32};
 use crate::key_cache::KeyCache;
 use crate::member_batches::{self, Plan};
 pub(crate) use crate::source::ArchiveSource;
+use crate::truncation::{TruncatedBlock, Truncation};
 use crate::version::ArchiveFamily;
 #[cfg(any(feature = "write", feature = "recovery"))]
 use crate::ArchiveVersion;
@@ -111,6 +112,7 @@ pub struct Archive {
     source: ArchiveSource,
     // Shared with later volumes parsed in the same session, so keys outlive one call.
     pub(crate) key_cache: Arc<KeyCache>,
+    truncation: Option<Truncation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -873,9 +875,15 @@ impl Archive {
             blocks.push(Block::Comment(comment));
         }
         let blocks_before_first_header = blocks.len();
+        let mut truncation = None;
 
         while pos < archive.len() {
-            if archive.len() - pos < 7 {
+            if main.has_encrypted_headers() && archive.len() - pos < 7 {
+                truncation = Some(Truncation::new(
+                    sig.offset + pos,
+                    TruncatedBlock::Unknown,
+                    true,
+                ));
                 break;
             }
             let (block, header, total) = if main.has_encrypted_headers() {
@@ -891,8 +899,15 @@ impl Archive {
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
-                admit_plain_header(archive, pos, &mut budget)?;
-                let block = parse_block_header(archive, pos)?;
+                let block = admit_plain_header(archive, pos, &mut budget)
+                    .and_then(|()| parse_block_header(archive, pos));
+                let block = match block {
+                    Err(Error::TooShort) => {
+                        truncation = Some(cut_block_header(&archive[pos..], sig.offset + pos)?);
+                        break;
+                    }
+                    block => block?,
+                };
                 let total = block_total_size(&block)?;
                 let header = archive[pos..pos + block.head_size as usize].to_vec();
                 (block, header, total)
@@ -912,6 +927,8 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = checked_block_next(&block, total, archive.len());
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::service(&file.name);
+                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
                     file.block.offset = block.offset;
@@ -923,6 +940,8 @@ impl Archive {
                 COMM_HEAD => {
                     let next = checked_block_next(&block, total, archive.len());
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::Comment;
+                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
                     let mut comment = parse_comment_header(&header, relative_block(&block))?;
@@ -935,6 +954,8 @@ impl Archive {
                 PROTECT_HEAD => {
                     let next = checked_block_next(&block, total, archive.len());
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::RecoveryRecord;
+                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
                     let protect = parse_protect_header(&header, &block, sig.offset, total)?;
@@ -942,13 +963,20 @@ impl Archive {
                     pos = next;
                 }
                 ENDARC_HEAD => {
-                    let _next = checked_block_next(&block, total, archive.len())?;
+                    let next = checked_block_next(&block, total, archive.len());
+                    if service_block_next(&block, next)?.is_none() {
+                        let cut = TruncatedBlock::End;
+                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
+                        break;
+                    }
                     blocks.push(Block::End(parse_end_header(&header, block)));
                     break;
                 }
                 _ => {
                     let next = checked_block_next(&block, total, archive.len());
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::Unknown;
+                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
                     blocks.push(Block::Unknown(block));
@@ -964,6 +992,7 @@ impl Archive {
             blocks,
             source: ArchiveSource::Memory(input),
             key_cache,
+            truncation,
         })
     }
 
@@ -1024,8 +1053,18 @@ impl Archive {
             blocks.push(Block::Comment(comment));
         }
         let blocks_before_first_header = blocks.len();
+        let mut truncation = None;
 
-        while file_len.saturating_sub((sfx_offset + pos) as u64) >= 7 {
+        while ((sfx_offset + pos) as u64) < file_len {
+            let remaining = file_len - (sfx_offset + pos) as u64;
+            if main.has_encrypted_headers() && remaining < 7 {
+                truncation = Some(Truncation::new(
+                    sfx_offset + pos,
+                    TruncatedBlock::Unknown,
+                    true,
+                ));
+                break;
+            }
             let (block, header, total) = if main.has_encrypted_headers() {
                 crate::crypto::require_encryption()?;
                 let password = password.ok_or(Error::NeedPassword)?;
@@ -1042,7 +1081,16 @@ impl Archive {
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
                 let block =
-                    read_block_header_at(&mut file, file_len, sfx_offset, pos, &mut budget)?;
+                    match read_block_header_at(&mut file, file_len, sfx_offset, pos, &mut budget) {
+                        Err(Error::TooShort) => {
+                            // A header cut short is under 64 KiB, as HEAD_SIZE is a u16.
+                            let rest =
+                                read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
+                            truncation = Some(cut_block_header(&rest, sfx_offset + pos)?);
+                            break;
+                        }
+                        block => block?,
+                    };
                 let total = block_total_size(&block)?;
                 let header = read_exact_at(&mut file, sfx_offset + pos, block.head_size as usize)?;
                 (block, header, total)
@@ -1065,6 +1113,8 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file_header.pack_size)?;
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len);
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::service(&file_header.name);
+                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
                     file_header.block.offset = block.offset;
@@ -1080,6 +1130,8 @@ impl Archive {
                 COMM_HEAD => {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len);
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::Comment;
+                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
                     let mut comment = parse_comment_header(&header, relative_block(&block))?;
@@ -1092,6 +1144,8 @@ impl Archive {
                 PROTECT_HEAD => {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len);
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::RecoveryRecord;
+                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
                     let protect = parse_protect_header(&header, &block, sfx_offset, total)?;
@@ -1099,13 +1153,20 @@ impl Archive {
                     pos = next;
                 }
                 ENDARC_HEAD => {
-                    let _next = checked_file_block_next(sfx_offset, &block, total, file_len)?;
+                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
+                    if service_block_next(&block, next)?.is_none() {
+                        let cut = TruncatedBlock::End;
+                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
+                        break;
+                    }
                     blocks.push(Block::End(parse_end_header(&header, block)));
                     break;
                 }
                 _ => {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len);
                     let Some(next) = service_block_next(&block, next)? else {
+                        let cut = TruncatedBlock::Unknown;
+                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
                     blocks.push(Block::Unknown(block));
@@ -1121,6 +1182,7 @@ impl Archive {
             blocks,
             source,
             key_cache,
+            truncation,
         })
     }
 
@@ -1396,6 +1458,14 @@ impl Archive {
             Block::End(end) => end.volume_number,
             _ => None,
         })
+    }
+
+    /// Where the file ends early, when it is cut short after its last whole
+    /// member, such as inside the recovery record or the end block. A file
+    /// that stops at a block boundary isn't counted: RAR 1.5 to 2.x wrote no
+    /// end block, and later versions can leave it out.
+    pub fn truncation(&self) -> Option<&Truncation> {
+        self.truncation.as_ref()
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
@@ -3141,6 +3211,42 @@ fn service_block_next(block: &BlockHeader, next: Result<usize>) -> Result<Option
     }
 }
 
+/// The block whose header the end of the file cuts short, read from the bytes
+/// left at its start, `rest`, which begins at file offset `offset`. A file
+/// header whose member is lost, and a header that does fit, so failed for
+/// another reason, stay `TooShort`.
+///
+/// Fewer than seven bytes is a cut too, but too few to trust the type byte:
+/// old self-extractors often end in a few bytes that are no header at all. Only
+/// an end block is named then, and nothing is an error.
+fn cut_block_header(rest: &[u8], offset: usize) -> Result<Truncation> {
+    let Some(&[size_low, size_high]) = rest.get(5..7) else {
+        let block = match rest.get(2) {
+            Some(&ENDARC_HEAD) => TruncatedBlock::End,
+            _ => TruncatedBlock::Unknown,
+        };
+        return Ok(Truncation::new(offset, block, true));
+    };
+    if usize::from(u16::from_le_bytes([size_low, size_high])) <= rest.len() {
+        return Err(Error::TooShort);
+    }
+    let block = match rest[2] {
+        FILE_HEAD => return Err(Error::TooShort),
+        NEWSUB_HEAD => {
+            let name = rest.get(26..28).and_then(|size| {
+                let size = usize::from(u16::from_le_bytes([size[0], size[1]]));
+                rest.get(32..32 + size)
+            });
+            TruncatedBlock::service(name.unwrap_or_default())
+        }
+        PROTECT_HEAD => TruncatedBlock::RecoveryRecord,
+        COMM_HEAD => TruncatedBlock::Comment,
+        ENDARC_HEAD => TruncatedBlock::End,
+        _ => TruncatedBlock::Unknown,
+    };
+    Ok(Truncation::new(offset, block, true))
+}
+
 fn checked_file_block_next(
     sfx_offset: usize,
     block: &BlockHeader,
@@ -3264,20 +3370,26 @@ mod tests {
                         crate::ArchiveReadOptions::new(),
                     ),
                 ] {
-                    if available < 4 && matches!(head_type, FILE_HEAD | ENDARC_HEAD) {
+                    if available < 4 && head_type == FILE_HEAD {
                         assert!(
                             matches!(result, Err(Error::TooShort)),
                             "type {head_type:x}, extent {available}: {result:?}"
                         );
                     } else if available < 4 {
-                        // A cut service block ends the walk without being kept.
+                        // A cut service or end block ends the walk without
+                        // being kept, and is reported as where the file ends.
                         let archive = result.unwrap();
                         assert!(
                             archive.blocks.is_empty(),
                             "type {head_type:x}, extent {available}"
                         );
+                        let truncation = archive.truncation().unwrap();
+                        assert_eq!(truncation.offset, 20, "type {head_type:x}");
+                        assert!(truncation.started);
                     } else {
-                        assert_eq!(result.unwrap().blocks.len(), 1);
+                        let archive = result.unwrap();
+                        assert_eq!(archive.blocks.len(), 1);
+                        assert_eq!(archive.truncation(), None);
                     }
                 }
             }

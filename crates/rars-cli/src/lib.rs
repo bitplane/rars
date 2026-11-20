@@ -24,8 +24,8 @@ use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
     create_link_output, incomplete_member_warning, open_output_writer, print_ok_entry,
-    rar50_output_relative_path, restore_output_metadata, warn_rar50_redirections, ExtractedOutput,
-    ExtractionStaging, OverwritePolicy,
+    rar50_output_relative_path, restore_output_metadata, truncation_warning,
+    warn_rar50_redirections, ExtractedOutput, ExtractionStaging, OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -171,6 +171,9 @@ fn cmd_info(args: InfoArgs) -> CliResult<()> {
                 println!("{path}: {family:?} at offset {}", archive.sfx_offset());
             } else {
                 print_terse_header(path, &archive);
+            }
+            if let Some(truncation) = archive.truncation() {
+                eprintln!("{}", truncation_warning(Path::new(path), truncation));
             }
             let options = args.read_options.options(password, scratch.as_ref());
             match archive {
@@ -608,6 +611,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
     } else {
         parse_archives_prompting(&paths, &mut password, &args.read_options)?
     };
+    let truncated = warn_truncated(&paths, &archives);
     let mut skipped = 0;
     for run in runs {
         let paths = &paths[run.clone()];
@@ -621,7 +625,36 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             scratch.as_ref(),
         )?;
     }
-    incomplete_set_result(gaps.len(), skipped)
+    incomplete_set_result(gaps.len(), skipped)?;
+    truncated_result(&truncated)
+}
+
+/// Warns about each archive whose file ends early, returning their paths.
+fn warn_truncated(paths: &[PathBuf], archives: &[DetectedArchive]) -> Vec<PathBuf> {
+    paths
+        .iter()
+        .zip(archives)
+        .filter_map(|(path, archive)| {
+            let truncation = archive.truncation()?;
+            eprintln!("{}", truncation_warning(path, truncation));
+            Some(path.clone())
+        })
+        .collect()
+}
+
+/// Fails a command that read a truncated archive, after it has done what it could.
+fn truncated_result(truncated: &[PathBuf]) -> CliResult<()> {
+    match truncated {
+        [] => Ok(()),
+        [path] => Err(CliError::general(format!(
+            "archive '{}' is truncated",
+            path.display()
+        ))),
+        paths => Err(CliError::general(format!(
+            "truncated volumes: {}",
+            display_paths(paths)
+        ))),
+    }
 }
 
 /// Tests one archive, or one run of consecutive volumes.
@@ -768,6 +801,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     } else {
         parse_archives_prompting(&paths, &mut password, &args.read_options)?
     };
+    let truncated = warn_truncated(&paths, &archives);
     ensure_password_for_archives_extract(&archives, &mut password)?;
     let family = archives
         .first()
@@ -842,7 +876,8 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
             out_dir.display()
         )));
     }
-    incomplete_set_result(gaps.len(), skipped)
+    incomplete_set_result(gaps.len(), skipped)?;
+    truncated_result(&truncated)
 }
 
 type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + 'a;

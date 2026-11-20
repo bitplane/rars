@@ -71,6 +71,59 @@ fn extracts_with_the_lines_callers_parse() {
     assert_eq!(fs::read(dir.join("out/sub/b.bin")).unwrap(), payload());
 }
 
+/// An archive cut inside its recovery record, after its last member.
+fn write_cut_in_recovery_record(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    builder(None)
+        .recovery_percent(Some(10))
+        .write_to_path(&path, None)
+        .unwrap();
+    let archive = rars::rar50::Archive::parse_path(&path).unwrap();
+    let recovery = archive.services().find(|service| service.name == b"RR");
+    let cut = recovery.unwrap().block.data_range.start + 100;
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..cut]).unwrap();
+    path
+}
+
+#[test]
+fn a_truncated_archive_is_a_warning_after_every_member() {
+    let dir = scratch::case("unrars-truncated");
+    write_cut_in_recovery_record(&dir, "cut.rar");
+    for args in [
+        &["t", "cut.rar"][..],
+        &["x", "-o+", "cut.rar", "out/"],
+        &["l", "cut.rar"],
+        &["lb", "cut.rar"],
+    ] {
+        let output = unrars(&dir, args);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        let errors = stderr(&output);
+        assert!(
+            errors.contains("Unexpected end of archive"),
+            "{args:?}: {errors}"
+        );
+        assert!(
+            errors.contains("Truncated at the service block: recovery record"),
+            "{args:?}: {errors}"
+        );
+        let text = stdout(&output);
+        assert!(!text.contains("All OK"), "{args:?}: {text}");
+        if args[0] == "t" {
+            assert!(text.contains("Total errors: 1"), "{text}");
+            assert!(text
+                .lines()
+                .any(|line| line.contains("b.bin") && line.ends_with("OK")));
+        }
+    }
+    assert_eq!(fs::read(dir.join("out/sub/b.bin")).unwrap(), payload());
+}
+
 #[test]
 fn keeps_or_replaces_existing_files() {
     let dir = scratch::case("unrars-overwrite");

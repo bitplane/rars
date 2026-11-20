@@ -81,6 +81,65 @@ fn info_lists_rar13_entries() {
     assert!(stdout.contains("checksum=0x0fd8"));
 }
 
+/// Issue #433: test and extract finish every member of an archive cut after
+/// its last one, warn where it ends, then fail. info warns and succeeds.
+#[test]
+fn truncated_archive_tests_and_extracts_its_members_then_fails() {
+    let dir = scratch("truncated-archive");
+    let first = b"issue 433 cli payload\n".repeat(200);
+    let second = deterministic_noise(5000);
+    let path = dir.join("cut.rar");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50)
+        .store(true)
+        .recovery_percent(Some(10));
+    builder
+        .add_bytes(b"first.txt".to_vec(), first.clone(), None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"second.bin".to_vec(), second.clone(), None, None)
+        .unwrap();
+    builder.write_to_path(&path, None).unwrap();
+    let archive = rars::rar50::Archive::parse_path(&path).unwrap();
+    let recovery = archive.services().find(|service| service.name == b"RR");
+    let recovery = recovery.unwrap().block.clone();
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..recovery.data_range.start + 100]).unwrap();
+    let warning = format!(
+        "warning: {}: archive is truncated inside the recovery record, which starts at offset {}",
+        path.display(),
+        recovery.offset
+    );
+
+    let output = rars().arg("test").arg(&path).output().unwrap();
+    assert!(!output.status.success());
+    let errors = stderr(&output);
+    assert!(errors.contains(&warning), "{errors}");
+    assert!(errors.contains("is truncated"), "{errors}");
+    let text = stdout(&output);
+    assert!(
+        text.contains("first.txt") && text.contains("second.bin"),
+        "{text}"
+    );
+
+    let out = dir.join("out");
+    let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
+    assert_eq!(fs::read(out.join("first.txt")).unwrap(), first);
+    assert_eq!(fs::read(out.join("second.bin")).unwrap(), second);
+
+    let output = rars().arg("info").arg(&path).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
+
+    // A cut through member data is an error, not a warning.
+    let last = archive.files().last().unwrap().block.data_range.end;
+    fs::write(&path, &bytes[..last - 10]).unwrap();
+    let output = rars().arg("test").arg(&path).output().unwrap();
+    assert!(!output.status.success());
+    assert!(!stderr(&output).contains("warning"), "{}", stderr(&output));
+}
+
 #[test]
 fn info_lists_packed_archive_comment() {
     let output = rars()

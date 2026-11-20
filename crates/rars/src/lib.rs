@@ -109,6 +109,7 @@ mod stored_copy;
 mod streaming;
 mod temp_file;
 pub mod timestamp;
+mod truncation;
 #[doc(hidden)]
 pub mod volume_order;
 pub use file_times::{FileTimes, Timestamp};
@@ -154,6 +155,7 @@ pub use streaming::{
     DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_MEMORY_PER_THREAD,
 };
 pub use timestamp::StoredTimestamp;
+pub use truncation::{TruncatedBlock, Truncation};
 pub use version::{ArchiveFamily, ArchiveVersion};
 #[cfg(feature = "write")]
 pub use write_plan::{formats_supporting, supported_features, supports, MemberCoding, PlanShape};
@@ -750,6 +752,18 @@ impl Archive {
             Self::Rar13(_) => ArchiveFamily::Rar13,
             Self::Rar15To40(_) => ArchiveFamily::Rar15To40,
             Self::Rar50Plus(_) => ArchiveFamily::Rar50Plus,
+        }
+    }
+
+    /// Where the file ends early, when it is cut short after its last whole
+    /// member, such as inside the recovery record. The members before the cut
+    /// still test and extract. Always `None` for RAR 1.3, which has no blocks
+    /// after its members.
+    pub fn truncation(&self) -> Option<&Truncation> {
+        match self {
+            Self::Rar13(_) => None,
+            Self::Rar15To40(archive) => archive.truncation(),
+            Self::Rar50Plus(archive) => archive.truncation(),
         }
     }
 

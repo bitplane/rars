@@ -1057,6 +1057,7 @@ mod tests {
     fn empty_archive() -> Archive {
         Archive {
             key_cache: Arc::default(),
+            truncation: None,
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1080,6 +1081,7 @@ mod tests {
     fn archive_with_source(blocks: Vec<Block>, source: Vec<u8>) -> Archive {
         Archive {
             key_cache: Arc::default(),
+            truncation: None,
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1259,6 +1261,7 @@ mod tests {
         empty.file_crc = 0;
         let archive = Archive {
             key_cache: Arc::default(),
+            truncation: None,
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,

@@ -3167,6 +3167,7 @@ mod tests {
             })],
             source: ArchiveSource::Memory(source),
             key_cache: Arc::default(),
+            truncation: None,
         }
     }
 
@@ -3227,6 +3228,7 @@ mod tests {
             blocks,
             source: ArchiveSource::Memory(bytes),
             key_cache: Arc::default(),
+            truncation: None,
         }
     }
 
