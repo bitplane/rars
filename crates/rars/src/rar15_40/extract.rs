@@ -444,25 +444,25 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
                 &mut self.encrypted_block,
                 &mut self.decrypted,
                 &mut self.eof,
-                |block| cipher.decrypt_block(block),
+                |data| cipher.decrypt_in_place(data),
             )?,
             SplitCipher::Rar30(cipher) => Self::fill_block_decrypted(
                 &mut self.inner,
                 &mut self.encrypted_block,
                 &mut self.decrypted,
                 &mut self.eof,
-                |block| cipher.decrypt_block(block),
+                |data| cipher.decrypt_in_place(data),
             )?,
         }
         Ok(())
     }
 
-    fn fill_block_decrypted(
+    fn fill_block_decrypted<E: std::fmt::Debug>(
         inner: &mut R,
         encrypted_block: &mut Buffer<u8, B>,
         decrypted: &mut Buffer<u8, B>,
         eof: &mut bool,
-        mut decrypt_block: impl FnMut(&mut [u8; 16]),
+        mut decrypt: impl FnMut(&mut [u8]) -> std::result::Result<(), E>,
     ) -> std::io::Result<()> {
         // fill_decrypted returns before calling us once EOF is known. The only
         // EOF transition below breaks the loop immediately.
@@ -487,9 +487,7 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
                 .map_err(std::io::Error::other)?;
             let mut data = std::mem::replace(encrypted_block, tail);
             data.truncate(full_len);
-            for block in data.as_chunks_mut::<16>().0.iter_mut() {
-                decrypt_block(block);
-            }
+            decrypt(&mut data).expect("data is truncated to whole blocks");
             *decrypted = data;
         } else if !encrypted_block.is_empty() {
             // With no full block, the loop could only have ended at EOF.

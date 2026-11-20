@@ -103,7 +103,7 @@ impl Rar20Cipher {
         self.update_keys(block);
     }
 
-    pub(crate) fn decrypt_block(&mut self, block: &mut [u8; 16]) {
+    fn decrypt_block(&mut self, block: &mut [u8; 16]) {
         let saved = *block;
         let (mut a, mut b, mut c, mut d) = self.load_block(block);
         for i in (0..32).rev() {
