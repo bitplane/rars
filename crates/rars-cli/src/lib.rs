@@ -23,9 +23,9 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
-    create_link_output, open_output_writer, print_ok_entry, rar50_output_relative_path,
-    restore_output_metadata, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
-    OverwritePolicy,
+    create_link_output, incomplete_member_warning, open_output_writer, print_ok_entry,
+    rar50_output_relative_path, restore_output_metadata, warn_rar50_redirections, ExtractedOutput,
+    ExtractionStaging, OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -48,7 +48,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use time::{current_filetime, format_filetime_utc};
 use volumes::{
-    discover_sibling_volumes, rar50_volume_part_path, sort_volume_paths, volume_part_path,
+    discover_sibling_volumes, rar50_volume_part_path, sort_volume_paths, split_at_gaps,
+    volume_part_path,
 };
 
 const DOS_ARCHIVE_ATTR: u8 = 0x20;
@@ -595,25 +596,47 @@ fn info_rar50_verbose(
 fn cmd_test(args: TestArgs) -> CliResult<()> {
     let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
-    let mut paths = args.paths;
-    if paths.len() == 1 {
-        let discovered = discover_sibling_volumes(&paths[0]);
-        if discovered.len() > 1 {
-            paths = discovered;
-        }
+    let paths = volume_set_paths(args.paths);
+    let (runs, gaps) = split_at_gaps(&paths);
+    warn_missing_volumes(&gaps);
+    let mut archives = if paths.len() == 1 {
+        vec![read_archive_path_prompting_with_options(
+            &paths[0],
+            &mut password,
+            &args.read_options,
+        )?]
     } else {
-        sort_volume_paths(&mut paths);
+        parse_archives_prompting(&paths, &mut password, &args.read_options)?
+    };
+    let mut skipped = 0;
+    for run in runs {
+        let paths = &paths[run.clone()];
+        let archives = &mut archives[run];
+        skipped += skip_incomplete_members(paths, archives);
+        test_volume_run(
+            paths,
+            archives,
+            &mut password,
+            &args.read_options,
+            scratch.as_ref(),
+        )?;
     }
+    incomplete_set_result(gaps.len(), skipped)
+}
 
-    if paths.len() == 1 {
-        let archive =
-            read_archive_path_prompting_with_options(&paths[0], &mut password, &args.read_options)?;
-        ensure_password_for_extract(&archive, &mut password)?;
-        warn_rar50_redirections(&archive);
+/// Tests one archive, or one run of consecutive volumes.
+fn test_volume_run(
+    paths: &[PathBuf],
+    archives: &[DetectedArchive],
+    password: &mut Option<Password>,
+    read_options: &cli::ReadOptionsArgs,
+    scratch: Option<&rars::Rar50Scratch>,
+) -> CliResult<()> {
+    if let [archive] = archives {
+        ensure_password_for_extract(archive, password)?;
+        warn_rar50_redirections(archive);
         let mut entries = Vec::new();
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
+        let options = read_options.options(password_bytes(password), scratch);
         archive
             .test_with_options_and_callback(options, |meta| {
                 entries.push(meta.clone());
@@ -632,16 +655,13 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             print_ok_entry(entry);
         }
     } else {
-        let archives = parse_archives_prompting(&paths, &mut password, &args.read_options)?;
-        ensure_password_for_archives_extract(&archives, &mut password)?;
-        for archive in &archives {
+        ensure_password_for_archives_extract(archives, password)?;
+        for archive in archives {
             warn_rar50_redirections(archive);
         }
         let mut entries = Vec::new();
-        let options = args
-            .read_options
-            .options(password_bytes(&password), scratch.as_ref());
-        test_volumes_with_options_and_callback(&archives, options, |meta| {
+        let options = read_options.options(password_bytes(password), scratch);
+        test_volumes_with_options_and_callback(archives, options, |meta| {
             entries.push(meta.clone());
             Ok(())
         })
@@ -649,11 +669,7 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
             classify_rars_error(err, |err| {
                 format!(
                     "failed to test volume set '{}': {err}{}",
-                    paths
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
+                    display_paths(paths),
                     retry_hint(err)
                 )
             })
@@ -665,6 +681,71 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
     Ok(())
 }
 
+/// The volumes `test` and `x` read: the named archive's whole set, or the paths given, in volume order.
+fn volume_set_paths(mut paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    if paths.len() == 1 {
+        let discovered = discover_sibling_volumes(&paths[0]);
+        if discovered.len() > 1 {
+            return discovered;
+        }
+    } else {
+        sort_volume_paths(&mut paths);
+    }
+    paths
+}
+
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn warn_missing_volumes(gaps: &[(PathBuf, PathBuf)]) {
+    for (first, last) in gaps {
+        if first == last {
+            eprintln!("warning: volume '{}' is missing", first.display());
+        } else {
+            eprintln!(
+                "warning: volumes '{}' to '{}' are missing",
+                first.display(),
+                last.display()
+            );
+        }
+    }
+}
+
+/// Drops the members a run of volumes holds only part of, warning about each.
+fn skip_incomplete_members(paths: &[PathBuf], archives: &mut [DetectedArchive]) -> usize {
+    let incomplete = rars::drop_incomplete_members(archives);
+    for member in &incomplete {
+        eprintln!(
+            "{}",
+            incomplete_member_warning(&paths[member.volume], member)
+        );
+    }
+    incomplete.len()
+}
+
+/// Fails a command that read only part of a volume set, after it has done what it could.
+fn incomplete_set_result(gaps: usize, skipped: usize) -> CliResult<()> {
+    let mut problems = Vec::new();
+    if gaps > 0 {
+        problems.push(format!("{gaps} gap(s) in the volume names"));
+    }
+    if skipped > 0 {
+        problems.push(format!("{skipped} split member(s) skipped"));
+    }
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(CliError::general(format!(
+        "incomplete volume set: {}",
+        problems.join(", ")
+    )))
+}
+
 fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
@@ -674,16 +755,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     // Invariant: clap enforces at least two positional paths (archive + outdir).
     let out_dir = paths.pop().expect("outdir");
     validate_extract_destination(&out_dir)?;
-    if paths.len() == 1 {
-        let discovered = discover_sibling_volumes(&paths[0]);
-        if discovered.len() > 1 {
-            paths = discovered;
-        }
-    } else {
-        sort_volume_paths(&mut paths);
-    }
+    let paths = volume_set_paths(paths);
+    let (runs, gaps) = split_at_gaps(&paths);
+    warn_missing_volumes(&gaps);
 
-    let archives = if paths.len() == 1 {
+    let mut archives = if paths.len() == 1 {
         vec![read_archive_path_prompting_with_options(
             &paths[0],
             &mut password,
@@ -704,40 +780,43 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         args.flatten,
         family,
     ));
+    let mut skipped = 0;
+    for run in &runs {
+        skipped += skip_incomplete_members(&paths[run.clone()], &mut archives[run.clone()]);
+    }
     let options = args
         .read_options
         .options(password_bytes(&password), scratch.as_ref());
-    let result = if archives.len() == 1 {
-        extract_single_archive(&archives[0], options, &state)
-    } else {
-        extract_volume_archives(&archives, options, &state)
-    };
-    result
-        .inspect_err(|err| {
-            // Keep verified predecessors; retain the extraction error if publication fails.
-            let _ = state.borrow_mut().publish_before_failure(err);
-        })
-        .map_err(|err| {
-            classify_rars_error(err, |err| {
-                if archives.len() == 1 {
-                    format!(
-                        "failed to write extracted entry to '{}': {err}{}",
-                        out_dir.display(),
-                        retry_hint(err)
-                    )
-                } else {
-                    format!(
-                        "failed to extract volume set '{}': {err}{}",
-                        paths
-                            .iter()
-                            .map(|p| p.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        retry_hint(err)
-                    )
-                }
+    for run in runs {
+        let (paths, archives) = (&paths[run.clone()], &archives[run]);
+        let result = if archives.len() == 1 {
+            extract_single_archive(&archives[0], options, &state)
+        } else {
+            extract_volume_archives(archives, options, &state)
+        };
+        result
+            .inspect_err(|err| {
+                // Keep verified predecessors; retain the extraction error if publication fails.
+                let _ = state.borrow_mut().publish_before_failure(err);
             })
-        })?;
+            .map_err(|err| {
+                classify_rars_error(err, |err| {
+                    if archives.len() == 1 {
+                        format!(
+                            "failed to write extracted entry to '{}': {err}{}",
+                            out_dir.display(),
+                            retry_hint(err)
+                        )
+                    } else {
+                        format!(
+                            "failed to extract volume set '{}': {err}{}",
+                            display_paths(paths),
+                            retry_hint(err)
+                        )
+                    }
+                })
+            })?;
+    }
     let state = state.into_inner();
     let skipped_links = state.skipped_links;
     let outputs = state.publish()?;
@@ -763,7 +842,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
             out_dir.display()
         )));
     }
-    Ok(())
+    incomplete_set_result(gaps.len(), skipped)
 }
 
 type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + 'a;

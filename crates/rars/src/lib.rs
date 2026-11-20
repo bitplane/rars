@@ -69,6 +69,8 @@ pub mod output_staging;
 pub mod output_times;
 mod parallel;
 mod parse_budget;
+mod partial_volumes;
+pub use partial_volumes::{drop_incomplete_members, IncompleteMember, MissingPart};
 #[doc(hidden)]
 pub mod password_check;
 #[cfg(any(feature = "write", feature = "recovery"))]
