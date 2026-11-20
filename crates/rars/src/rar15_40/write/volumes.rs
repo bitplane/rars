@@ -356,7 +356,14 @@ pub(super) fn split_members_above(
                         "preparing volume member",
                     ));
                 }
-                (None, len, 0x30, None, None)
+                // Copied as a stored member is, so charged as one in a single
+                // archive is: for the buffer it goes through.
+                let held = member_charge(member, options, &MemberCoding::Stored, len)
+                    .map(|charge| {
+                        resources.acquire_serialising_cancellable(charge, &|| work.is_cancelled())
+                    })
+                    .transpose()?;
+                (None, len, 0x30, None, held)
             }
         };
         let packed_bytes = packed.as_deref().map(MemberBytes::Borrowed);

@@ -1046,7 +1046,7 @@ struct PackedVolumeMember {
     /// Known once the member has been packed; a stored one is summed as it is copied.
     file_crc: Option<u16>,
     /// The budget's charge for what waits to be written, released once the
-    /// last fragment has been. A stored member packs nothing and has none.
+    /// last fragment has been.
     held: Option<crate::streaming::MemoryPermit>,
 }
 
@@ -1155,6 +1155,12 @@ fn split_member(
             crate::write_stream::member_error(error, member.name, "compressing volume member")
         })?
     } else {
+        // Charged as a stored member in a single archive is: for the buffer
+        // it is copied through.
+        let permit = resources.acquire_serialising_cancellable(
+            member_workspace(unpacked_size as u64, false),
+            &|| work.is_cancelled(),
+        )?;
         PackedVolumeMember {
             payload: VolumePayload::Member,
             len: unpacked_size as u64,
@@ -1162,6 +1168,7 @@ fn split_member(
             file_crc: None,
             held: None,
         }
+        .holding(permit)
     };
     let result = write_volume_set(
         member,
@@ -1980,6 +1987,53 @@ mod tests {
                     collect_extract(&Archive::parse(&archive).unwrap(), password).unwrap();
                 assert!(extracted.len() == 1 && extracted[0].data == data, "{case}");
             }
+        }
+    }
+
+    #[test]
+    fn a_stored_volume_member_is_charged_until_its_last_fragment_is_written() {
+        let data: Vec<u8> = (0..300_000u32)
+            .map(|index| ((index * 7 / 5) ^ (index >> 9)) as u8)
+            .collect();
+        let entry = StreamingEntry::new(
+            b"member.bin".to_vec(),
+            EntrySource::from_bytes(data.clone()),
+        )
+        .with_file_attr(0x20);
+        // Stored, and level 0, which RAR 1.3 volume sets still code.
+        for (coding, level) in [
+            (MemberCoding::Stored, None),
+            (MemberCoding::Compressed, Some(0)),
+        ] {
+            let options = WriterOptions {
+                compression_level: level,
+                ..WriterOptions::default()
+            };
+            let resources = WriterResources::default();
+            let mut sink = crate::volume_sink::ChargedVolumes::new(&resources);
+            split_member(
+                &Member::from_streaming(&entry),
+                options,
+                &coding,
+                20_000,
+                &mut sink,
+                &resources,
+                None,
+                STREAM_MEMBERS_ABOVE,
+            )
+            .unwrap();
+            // Every fragment's payload went out while the member was charged
+            // for the buffer it is copied through, as a stored member in a
+            // single archive is.
+            assert!(sink.payload_writes() > 2, "{level:?}");
+            assert_eq!(resources.workspace_in_use(), 0, "{level:?}");
+
+            let volumes = sink.collected.take();
+            let extracted = collect_extract_volumes(&parse_volumes(&volumes), None).unwrap();
+            assert!(
+                extracted.len() == 1 && extracted[0].data == data,
+                "{level:?}"
+            );
         }
     }
 
