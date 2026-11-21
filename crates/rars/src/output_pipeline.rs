@@ -125,7 +125,7 @@ where
         }
     };
 
-    // The decoder's own workers follow the caller's cap.
+    // The decoder's and the checksums' own workers follow the caller's cap.
     let cap = crate::parallel::ThreadCap::current();
     std::thread::scope(|scope| {
         let stop = &stop;
@@ -146,6 +146,7 @@ where
         });
         let spare = spare_tx.clone();
         scope.spawn(move || {
+            let _cap = crate::parallel::ThreadCap::set(cap);
             for chunk in check_rx {
                 check(&chunk);
                 give_back(chunk, &spare);
