@@ -2,7 +2,7 @@ use super::{Error, Result};
 
 #[cfg(any(test, feature = "write"))]
 use aes::cipher::BlockCipherEncrypt;
-use aes::cipher::{BlockCipherDecrypt, KeyInit};
+use aes::cipher::KeyInit;
 use aes::Aes128;
 use sha1::{Digest, Sha1 as FastSha1};
 use std::str;
@@ -33,9 +33,7 @@ impl Rar30Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.as_chunks_mut::<16>().0.iter_mut() {
-            self.decrypt_block(block);
-        }
+        crate::crypto::cbc_decrypt(&self.cipher, &mut self.iv, data.as_chunks_mut().0);
         Ok(())
     }
 
@@ -61,12 +59,7 @@ impl Rar30Cipher {
     }
 
     pub(crate) fn decrypt_block(&mut self, block: &mut [u8; 16]) {
-        let ciphertext = *block;
-        self.cipher.decrypt_block(block.into());
-        for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
-            *byte ^= iv_byte;
-        }
-        self.iv = ciphertext;
+        crate::crypto::cbc_decrypt(&self.cipher, &mut self.iv, std::slice::from_mut(block));
     }
 }
 
@@ -286,6 +279,25 @@ mod tests {
             .unwrap()
             .decrypt_in_place(&mut data)
             .unwrap();
+        assert_eq!(data, plain);
+    }
+
+    #[test]
+    fn rar30_aes_decrypts_long_buffers_in_uneven_pieces() {
+        let salt = Some(*b"rarsalt!");
+        let plain: Vec<u8> = (0..16 * 203).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut encrypting = Rar30Cipher::new(b"password", salt).unwrap();
+        let mut decrypting = encrypting.clone();
+        let mut data = plain.clone();
+        encrypting.encrypt_in_place(&mut data).unwrap();
+
+        let mut rest = data.as_mut_slice();
+        for blocks in [1, 33, 64, 2, 103] {
+            let (piece, tail) = rest.split_at_mut(blocks * 16);
+            decrypting.decrypt_in_place(piece).unwrap();
+            rest = tail;
+        }
+        assert!(rest.is_empty());
         assert_eq!(data, plain);
     }
 

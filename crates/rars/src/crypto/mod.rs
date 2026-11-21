@@ -57,6 +57,31 @@ pub fn rar30_key_derivations() -> usize {
     rar30::DERIVATIONS.with(std::cell::Cell::get)
 }
 
+/// Blocks handed to the cipher per call, enough to fill every `aes` backend's parallel width.
+#[cfg(feature = "encryption")]
+const CBC_BATCH_BLOCKS: usize = 64;
+
+/// CBC-decrypts whole blocks, many per cipher call so its backend can pipeline them.
+#[cfg(feature = "encryption")]
+pub(crate) fn cbc_decrypt<C>(cipher: &C, iv: &mut [u8; 16], blocks: &mut [[u8; 16]])
+where
+    C: aes::cipher::BlockCipherDecrypt<BlockSize = aes::cipher::consts::U16>,
+{
+    let mut chain = [[0u8; 16]; CBC_BATCH_BLOCKS];
+    for chunk in blocks.chunks_mut(CBC_BATCH_BLOCKS) {
+        let (last, earlier) = chunk.split_last().expect("chunks are never empty");
+        chain[0] = *iv;
+        chain[1..chunk.len()].copy_from_slice(earlier);
+        *iv = *last;
+        cipher.decrypt_blocks(aes::cipher::Array::cast_slice_from_core_mut(chunk));
+        for (block, mask) in chunk.iter_mut().zip(&chain) {
+            for (byte, mask_byte) in block.iter_mut().zip(mask) {
+                *byte ^= mask_byte;
+            }
+        }
+    }
+}
+
 /// Refuses encrypted operations when the implementation is omitted.
 pub(crate) fn require_encryption() -> crate::Result<()> {
     if cfg!(feature = "encryption") {

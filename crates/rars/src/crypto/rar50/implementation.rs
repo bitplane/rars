@@ -2,7 +2,7 @@ use super::{constant_time_eq, Error, Rar50Keys, Result};
 
 #[cfg(any(test, feature = "write", feature = "recovery"))]
 use aes::cipher::BlockCipherEncrypt;
-use aes::cipher::{BlockCipherDecrypt, KeyInit};
+use aes::cipher::KeyInit;
 use aes::Aes256;
 use hmac::{Hmac, Mac};
 use sha2::block_api::compress256;
@@ -129,9 +129,7 @@ impl Rar50Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.as_chunks_mut::<16>().0.iter_mut() {
-            self.decrypt_block(block);
-        }
+        crate::crypto::cbc_decrypt(&self.cipher, &mut self.iv, data.as_chunks_mut().0);
         Ok(())
     }
 
@@ -157,12 +155,7 @@ impl Rar50Cipher {
     }
 
     pub(crate) fn decrypt_block(&mut self, block: &mut [u8; 16]) {
-        let ciphertext = *block;
-        self.cipher.decrypt_block(block.into());
-        for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
-            *byte ^= iv_byte;
-        }
-        self.iv = ciphertext;
+        crate::crypto::cbc_decrypt(&self.cipher, &mut self.iv, std::slice::from_mut(block));
     }
 }
 
@@ -317,6 +310,67 @@ mod tests {
             .decrypt_in_place(&mut data)
             .unwrap();
         assert_eq!(data, plain);
+    }
+
+    #[test]
+    fn rar50_aes_decrypts_nist_cbc_vector_across_split_calls() {
+        // NIST SP 800-38A F.2.6, CBC-AES256.Decrypt.
+        let key = unhex::<32>("603deb1015ca71be2b73aef0857d77811f352c073b6108d72d9810a30914dff4");
+        let iv = unhex::<16>("000102030405060708090a0b0c0d0e0f");
+        let ciphertext = unhex::<64>(concat!(
+            "f58c4c04d6e5f1ba779eabfb5f7bfbd6",
+            "9cfc4e967edb808d679f777bc6702c7d",
+            "39f23369a9d9bacfa530e26304231461",
+            "b2eb05e2c39be9fcda6c19078c6a9d1b",
+        ));
+        let plaintext = concat!(
+            "6bc1bee22e409f96e93d7e117393172a",
+            "ae2d8a571e03ac9c9eb76fac45af8e51",
+            "30c81c46a35ce411e5fbc1191a0a52ef",
+            "f69f2445df4f9b17ad2b417be66c3710",
+        );
+
+        let mut whole = ciphertext;
+        Rar50Cipher::new(key, iv)
+            .decrypt_in_place(&mut whole)
+            .unwrap();
+        assert_eq!(hex(&whole), plaintext);
+
+        let mut split = ciphertext;
+        let mut cipher = Rar50Cipher::new(key, iv);
+        let (first, rest) = split.split_at_mut(16);
+        cipher.decrypt_in_place(first).unwrap();
+        cipher.decrypt_in_place(rest).unwrap();
+        assert_eq!(hex(&split), plaintext);
+    }
+
+    #[test]
+    fn rar50_aes_decrypts_long_buffers_in_uneven_pieces() {
+        let key = [9u8; 32];
+        let iv = [5u8; 16];
+        let plain: Vec<u8> = (0..16 * 203).map(|i| (i * 7 + i / 251) as u8).collect();
+        let mut data = plain.clone();
+        Rar50Cipher::new(key, iv)
+            .encrypt_in_place(&mut data)
+            .unwrap();
+
+        let mut cipher = Rar50Cipher::new(key, iv);
+        let mut rest = data.as_mut_slice();
+        for blocks in [1, 33, 64, 2, 103] {
+            let (piece, tail) = rest.split_at_mut(blocks * 16);
+            cipher.decrypt_in_place(piece).unwrap();
+            rest = tail;
+        }
+        assert!(rest.is_empty());
+        assert_eq!(data, plain);
+    }
+
+    fn unhex<const N: usize>(text: &str) -> [u8; N] {
+        let mut out = [0u8; N];
+        for (byte, pair) in out.iter_mut().zip(text.as_bytes().as_chunks::<2>().0) {
+            *byte = u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap();
+        }
+        out
     }
 
     #[test]
