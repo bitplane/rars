@@ -699,6 +699,7 @@ dependencies = [
  "getrandom",
  "hmac",
  "libc",
+ "memchr",
  "rayon",
  "rustix",
  "sha1",
