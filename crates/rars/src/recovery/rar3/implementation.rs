@@ -83,7 +83,9 @@ impl RSCoder8 {
 
         let mut error_locs = Vec::new();
         let mut denominators = Vec::new();
-        for root in (MAX_PARITY - codeword.len())..=MAX_PARITY {
+        // Roots 0 and 255 are the same element, so a full-length codeword
+        // must not search both.
+        for root in (MAX_PARITY + 1 - codeword.len())..=MAX_PARITY {
             let mut sum = 0;
             for (power, &coefficient) in locator.iter().enumerate() {
                 sum ^= self.mul(self.gf_exp[(power * root) % MAX_PARITY], coefficient);
@@ -314,6 +316,21 @@ mod tests {
         codeword[10] = 0;
 
         coder.correct_erasures(&mut codeword, &[1, 7, 10]).unwrap();
+
+        assert_eq!(codeword, original);
+    }
+
+    #[test]
+    fn rs8_reconstructs_the_last_symbol_of_a_full_length_codeword() {
+        let coder = RSCoder8::new(2).unwrap();
+        let data: Vec<u8> = (0..253).map(|index| index as u8 ^ 0x5a).collect();
+        let parity = coder.encode(&data);
+        let mut codeword = [data.as_slice(), parity.as_slice()].concat();
+        let original = codeword.clone();
+        codeword[0] = 0;
+        codeword[254] = 0;
+
+        coder.correct_erasures(&mut codeword, &[0, 254]).unwrap();
 
         assert_eq!(codeword, original);
     }
