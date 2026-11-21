@@ -128,11 +128,14 @@ pub(crate) fn finish_independent(
 
 /// Whether a worker's error is held for the member error handler, to be
 /// raised in archive order, instead of stopping the batch. Cancellation and
-/// operation-wide resource limits always stop it.
+/// operation-wide resource limits always stop it. So does a workspace refusal:
+/// a worker holds only a share of the workspace, so the batch ends there and
+/// the member streams inline with all of it, as sequential extraction would.
 pub(crate) fn holds_for_handler(options: &ArchiveReadOptions<'_>, error: &Error) -> bool {
     options.member_errors.is_some()
         && error.kind() != crate::ErrorKind::Cancelled
         && (error.kind() != crate::ErrorKind::ResourceLimit || is_member_local_limit(error))
+        && !crate::codec::workspace::is_refusal(error)
 }
 
 pub(crate) type Selector<'a> = dyn FnMut(&ArchiveMember) -> Result<ExtractionDecision> + 'a;

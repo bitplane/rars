@@ -341,6 +341,125 @@ fn parallel_member_handler_can_continue_after_a_member_output_limit() {
     }
 }
 
+/// Compressible text with a byte of noise in every seven.
+fn noisy_text(seed: u32, len: usize) -> Vec<u8> {
+    let mut x = seed.wrapping_mul(2_654_435_761).max(1);
+    (0..len)
+        .map(|i| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            if i % 7 == 0 {
+                x as u8
+            } else {
+                b"the quick brown fox "[i % 20]
+            }
+        })
+        .collect()
+}
+
+fn noisy_archive(version: ArchiveVersion, members: &[(&str, usize)]) -> Archive {
+    let mut builder = Builder::new(version);
+    for (seed, (name, len)) in (1..).zip(members) {
+        builder
+            .add_bytes(name.as_bytes().to_vec(), noisy_text(seed, *len), None, None)
+            .unwrap();
+    }
+    ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap()
+}
+
+/// Extracts under a reader workspace limit, with a handler that carries on if
+/// `carry_on`, and returns whether the call succeeded, the members the handler
+/// passed over and the members extracted. Streaming opens a member's writer
+/// before it can be refused, so an opened member counts only if it passed.
+fn extract_under_workspace_limit(
+    archive: &Archive,
+    limit: u64,
+    carry_on: bool,
+    parallel: bool,
+) -> (bool, Vec<String>, Vec<String>) {
+    let failed = std::sync::Mutex::new(Vec::new());
+    let handler = |member: &rars::ArchiveMember, error: &Error| {
+        assert!(
+            matches!(
+                error.root_cause(),
+                Error::Codec(rars::codec::Error::WorkspaceLimitExceeded(_))
+            ),
+            "{error}"
+        );
+        let name = String::from_utf8_lossy(&member.meta.name).into_owned();
+        failed.lock().unwrap().push(name);
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let mut options = ArchiveReadOptions::new().with_max_reader_workspace_bytes(limit);
+    if carry_on {
+        options = options.with_member_error_handler(&handler);
+    }
+    let mut written = Vec::new();
+    let open = |meta: &rars::ExtractedEntryMeta| -> rars::Result<Box<dyn Write>> {
+        written.push(String::from_utf8_lossy(&meta.name).into_owned());
+        Ok(Box::new(io::sink()))
+    };
+    let result = if parallel {
+        #[cfg(feature = "parallel")]
+        {
+            archive.extract_to_parallel_buffered_with_options(options.with_threads(4), open)
+        }
+        #[cfg(not(feature = "parallel"))]
+        unreachable!()
+    } else {
+        archive.extract_to_with_options(options, open)
+    };
+    let failed = failed.into_inner().unwrap();
+    written.retain(|name| !failed.contains(name));
+    (result.is_ok(), failed, written)
+}
+
+#[test]
+fn a_workspace_refusal_passes_over_only_that_member() {
+    let modes: &[bool] = if cfg!(feature = "parallel") {
+        &[false, true]
+    } else {
+        &[false]
+    };
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let archive = noisy_archive(version, &[("a", 1024), ("big", 1 << 20), ("c", 1024)]);
+        for &parallel in modes {
+            let (ok, failed, written) =
+                extract_under_workspace_limit(&archive, 256 << 10, true, parallel);
+            assert!(ok, "{version:?} parallel={parallel}");
+            assert_eq!(failed, ["big"], "{version:?} parallel={parallel}");
+            assert_eq!(written, ["a", "c"], "{version:?} parallel={parallel}");
+        }
+    }
+}
+
+/// A worker decodes within a share of the workspace. A member refused there is
+/// streamed again with all of it, so parallel extraction admits and refuses
+/// the same members as sequential extraction under the same limit.
+#[test]
+#[cfg(feature = "parallel")]
+fn parallel_extraction_under_a_workspace_limit_matches_sequential() {
+    let members = [
+        ("m0", 256 << 10),
+        ("m1", 256 << 10),
+        ("m2", 256 << 10),
+        ("m3", 256 << 10),
+    ];
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let archive = noisy_archive(version, &members);
+        for limit in [256 << 10, 768 << 10, 2560 << 10, 6 << 20, 20 << 20] {
+            for carry_on in [false, true] {
+                assert_eq!(
+                    extract_under_workspace_limit(&archive, limit, carry_on, true),
+                    extract_under_workspace_limit(&archive, limit, carry_on, false),
+                    "{version:?} limit={limit} carry_on={carry_on}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[cfg(feature = "encryption")]
 fn encrypted_members_can_be_skipped_without_a_password() {

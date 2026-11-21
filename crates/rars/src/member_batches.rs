@@ -27,12 +27,14 @@ pub(crate) enum Plan {
 
 /// Feeds each run of batchable members to `batches` and each inline member to
 /// `inline`, in archive order. `ctx` is the state both share, such as the
-/// caller's writer factory.
+/// caller's writer factory. `batches` returns how many members it published;
+/// a member refused within a worker's share of the workspace goes inline, and
+/// the members after it are batched again.
 pub(crate) fn run<T: Copy, C: ?Sized>(
     items: impl IntoIterator<Item = T>,
     ctx: &mut C,
     mut plan: impl FnMut(T) -> Plan,
-    mut batches: impl FnMut(&mut C, &[(T, u64)]) -> Result<()>,
+    mut batches: impl FnMut(&mut C, &[(T, u64)]) -> Result<usize>,
     mut inline: impl FnMut(&mut C, T) -> Result<()>,
 ) -> Result<()> {
     let mut pending = Vec::new();
@@ -40,16 +42,28 @@ pub(crate) fn run<T: Copy, C: ?Sized>(
         match plan(item) {
             Plan::Batch(cost) => pending.push((item, cost)),
             Plan::Inline => {
-                if !pending.is_empty() {
-                    batches(ctx, &pending)?;
-                    pending.clear();
-                }
+                flush(ctx, &pending, &mut batches, &mut inline)?;
+                pending.clear();
                 inline(ctx, item)?;
             }
         }
     }
-    if !pending.is_empty() {
-        batches(ctx, &pending)?;
+    flush(ctx, &pending, &mut batches, &mut inline)
+}
+
+fn flush<T: Copy, C: ?Sized>(
+    ctx: &mut C,
+    mut pending: &[(T, u64)],
+    batches: &mut impl FnMut(&mut C, &[(T, u64)]) -> Result<usize>,
+    inline: &mut impl FnMut(&mut C, T) -> Result<()>,
+) -> Result<()> {
+    while !pending.is_empty() {
+        let published = batches(ctx, pending)?;
+        let Some(&(refused, _)) = pending.get(published) else {
+            break;
+        };
+        inline(ctx, refused)?;
+        pending = &pending[published + 1..];
     }
     Ok(())
 }
@@ -97,7 +111,9 @@ pub(crate) fn publish<M, B: Budget>(
 /// worker decodes with the allowance it is handed.
 pub(crate) trait Workers: Budget<Charge: Send> + Sync {
     /// Decodes `members` on workers and publishes them in archive order. The
-    /// members ahead of a failure are published before it returns.
+    /// members ahead of a failure are published before it returns. Returns how
+    /// many were published: fewer than all means the next was refused within
+    /// a worker's share of a limited workspace.
     /// `capacity` bounds an unlimited batch's planned cost; a limited
     /// workspace instead admits each batch by `hint` against its ledger.
     #[allow(clippy::too_many_arguments)]
@@ -110,7 +126,7 @@ pub(crate) trait Workers: Budget<Charge: Send> + Sync {
         check: impl Fn() -> Result<()> + Sync,
         decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
         publish: impl FnMut(&mut C, O) -> Result<()>,
-    ) -> Result<()>;
+    ) -> Result<usize>;
 }
 
 /// At most one member per worker and `capacity` bytes of cost per batch; a
@@ -125,7 +141,7 @@ impl Workers for Allowance {
         check: impl Fn() -> Result<()> + Sync,
         decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
         mut publish: impl FnMut(&mut C, O) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         let window = crate::parallel::default_window().max(1);
         let mut rest = members;
         while !rest.is_empty() {
@@ -142,7 +158,7 @@ impl Workers for Allowance {
                 return Err(error);
             }
         }
-        Ok(())
+        Ok(members.len())
     }
 }
 
@@ -156,7 +172,7 @@ impl Workers for Limited {
         check: impl Fn() -> Result<()> + Sync,
         decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
         mut publish: impl FnMut(&mut C, O) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<usize> {
         coordinator::extract_windowed(
             members.iter().map(|&(member, _)| member),
             self,
@@ -209,7 +225,7 @@ mod tests {
                     "batch {:?}",
                     run.iter().map(|m| m.0).collect::<Vec<_>>()
                 ));
-                Ok(())
+                Ok(run.len())
             },
             |log, n| {
                 log.push(format!("inline {n}"));
@@ -231,6 +247,28 @@ mod tests {
     }
 
     #[test]
+    fn a_member_a_batch_hands_back_goes_inline_and_the_rest_batch_again() {
+        let mut log = Vec::new();
+        run(
+            [1u32, 2, 3, 4],
+            &mut log,
+            |_| Plan::Batch(1),
+            |log, run| {
+                let run = run.iter().map(|m| m.0).collect::<Vec<_>>();
+                log.push(format!("batch {run:?}"));
+                // The first batch publishes one member and hands back the next.
+                Ok(if run[0] == 1 { 1 } else { run.len() })
+            },
+            |log, n| {
+                log.push(format!("inline {n}"));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(log, ["batch [1, 2, 3, 4]", "inline 2", "batch [3, 4]"]);
+    }
+
+    #[test]
     fn an_inline_failure_stops_later_members() {
         let mut seen = Vec::new();
         let error = run(
@@ -245,7 +283,7 @@ mod tests {
             },
             |seen, run| {
                 seen.extend(run.iter().map(|m| m.0));
-                Ok(())
+                Ok(run.len())
             },
             |_, _| Err(Error::Cancelled),
         )

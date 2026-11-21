@@ -76,16 +76,12 @@ fn verification_avoids_a_second_output_buffer_and_preserves_decode_routing() {
     let buffered_budget =
         ArchiveReadOptions::new().with_max_reader_workspace_bytes(7 * 1024 * 1024);
     archive.test_with_options(buffered_budget).unwrap();
-    assert_eq!(
-        archive
-            .extract_to_parallel_buffered_with_options(buffered_budget, |_| Ok(
-                Box::new(io::sink())
-            ))
-            .unwrap_err()
-            .kind(),
-        ErrorKind::ResourceLimit,
-        "ordinary publication retains a second output buffer"
-    );
+    // Ordinary publication would retain a second output buffer, so the batch
+    // refuses the member within its share; it then streams inline with the
+    // whole workspace, as sequential extraction does.
+    archive
+        .extract_to_parallel_buffered_with_options(buffered_budget, |_| Ok(Box::new(io::sink())))
+        .unwrap();
     archive
         .test_with_options(budget.with_rar50_buffered_decode_limit(0))
         .unwrap();
