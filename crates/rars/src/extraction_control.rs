@@ -44,6 +44,23 @@ impl std::fmt::Debug for MemberErrorHandler<'_> {
     }
 }
 
+/// Whether a resource limit belongs only to the member which raised it.
+///
+/// Continuing is safe only when the next member starts from fresh decoder
+/// state. Operation-wide budgets and unknown future limit variants remain
+/// terminal by default.
+fn is_member_local_limit(error: &Error) -> bool {
+    matches!(
+        error.root_cause(),
+        Error::MemberOutputLimitExceeded { .. }
+            | Error::Rar50DictionaryLimitExceeded { .. }
+            | Error::Rar50BufferedDecodeLimitExceeded { .. }
+            | Error::Rar50ScratchLimitExceeded { .. }
+            | Error::Rar50FilterMemoryLimitExceeded { .. }
+            | Error::Codec(crate::codec::Error::WorkspaceLimitExceeded(_))
+    )
+}
+
 /// How the next member starts after a failed one the caller chose to pass over.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Resume {
@@ -68,13 +85,13 @@ pub(crate) fn finish_member(
     let Err(error) = result else {
         return Ok(None);
     };
-    if matches!(
-        error.kind(),
-        crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
-    ) {
+    let explicit = handler.is_some();
+    if error.kind() == crate::ErrorKind::Cancelled
+        || (error.kind() == crate::ErrorKind::ResourceLimit
+            && (explicit || solid || !is_member_local_limit(&error)))
+    {
         return Err(error);
     }
-    let explicit = handler.is_some();
     if explicit && solid {
         return Err(error);
     }
@@ -111,13 +128,14 @@ pub(crate) fn finish_independent(
 
 /// Whether a worker's error is held for the member error handler, to be
 /// raised in archive order, instead of stopping the batch. Cancellation and
-/// resource limits always stop it.
+/// operation-wide resource limits always stop it. So does a workspace refusal:
+/// a worker holds only a share of the workspace, so the batch ends there and
+/// the member streams inline with all of it, as sequential extraction would.
 pub(crate) fn holds_for_handler(options: &ArchiveReadOptions<'_>, error: &Error) -> bool {
     options.member_errors.is_some()
-        && !matches!(
-            error.kind(),
-            crate::ErrorKind::Cancelled | crate::ErrorKind::ResourceLimit
-        )
+        && error.kind() != crate::ErrorKind::Cancelled
+        && (error.kind() != crate::ErrorKind::ResourceLimit || is_member_local_limit(error))
+        && !crate::codec::workspace::is_refusal(error)
 }
 
 pub(crate) type Selector<'a> = dyn FnMut(&ArchiveMember) -> Result<ExtractionDecision> + 'a;
@@ -158,4 +176,72 @@ pub(crate) fn select(
         return Ok(Some(ExtractionDecision::Extract(Box::new(std::io::sink()))));
     }
     Ok(Some(decision))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_member_local_limit;
+    use crate::Error;
+
+    #[test]
+    fn only_member_local_resource_limits_are_recoverable() {
+        for error in [
+            Error::MemberOutputLimitExceeded {
+                limit: 8,
+                required: 9,
+            },
+            Error::Rar50DictionaryLimitExceeded {
+                limit: 8,
+                required: 16,
+            },
+            Error::Rar50BufferedDecodeLimitExceeded {
+                limit: 8,
+                required: 16,
+            },
+            Error::Rar50ScratchLimitExceeded {
+                limit: 8,
+                required: 16,
+            },
+            Error::Rar50FilterMemoryLimitExceeded {
+                limit: 8,
+                required: 16,
+            },
+            Error::Codec(crate::codec::Error::WorkspaceLimitExceeded(Box::new(
+                crate::codec::WorkspaceLimitError {
+                    limit: 8,
+                    required: 16,
+                    used: 0,
+                },
+            ))),
+        ] {
+            assert!(is_member_local_limit(&error), "{error}");
+        }
+
+        for error in [
+            Error::TotalOutputLimitExceeded {
+                limit: 8,
+                required: 9,
+                used: 8,
+            },
+            Error::SolidSkipBudgetExceeded {
+                limit: 8,
+                required: 9,
+            },
+            Error::HeaderCountLimitExceeded {
+                limit: 8,
+                required: 9,
+            },
+            Error::HeaderBytesLimitExceeded {
+                limit: 8,
+                required: 9,
+            },
+            Error::MemoryLimitExceeded {
+                limit: 8,
+                required: 9,
+                dictionary_size: 0,
+            },
+        ] {
+            assert!(!is_member_local_limit(&error), "{error}");
+        }
+    }
 }

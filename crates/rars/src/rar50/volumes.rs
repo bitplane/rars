@@ -36,9 +36,11 @@ where
         let count = volume.files().count();
         for (index, file) in volume.files().enumerate().skip(skip) {
             options.check_cancelled()?;
-            // Admission precedes split decryption and checksum-error preference:
-            // a resource refusal must not read payloads or become a checksum error.
-            file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+            if file.is_split_before() || file.is_split_after() {
+                // Split members are terminal, so keep admission ahead of their
+                // structural, decryption and checksum errors.
+                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+            }
             if file.is_split_before() {
                 return Err(Error::InvalidHeader(
                     "RAR 5 split entry is missing its first part",
@@ -69,7 +71,6 @@ where
                 }
                 continue;
             }
-            file.check_output_limit(&budget)?;
             let meta = file.metadata();
             options.check_cancelled()?;
             if meta.is_directory {
@@ -78,6 +79,8 @@ where
                 continue;
             }
             let result = (|| {
+                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+                file.check_output_limit(&budget)?;
                 let mut writer = open(&meta)?;
                 options.check_cancelled()?;
                 budget.run(&file.name, &mut writer, |writer| {

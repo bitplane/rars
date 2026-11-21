@@ -6,6 +6,14 @@ pub(crate) mod coordinator;
 mod ledger;
 pub(crate) use ledger::{Charge, Limited, Reservation, RESERVATION_BYTES};
 
+/// Whether `error` is a codec workspace refusal.
+pub(crate) fn is_refusal(error: &crate::Error) -> bool {
+    matches!(
+        error.root_cause(),
+        crate::Error::Codec(Error::WorkspaceLimitExceeded(_))
+    )
+}
+
 /// A zero-sized policy: its buffers have exactly Vec's layout and no ledger
 /// branch in their hot operations. Limited buffers are a separate instantiation.
 #[derive(Clone, Debug, Default)]

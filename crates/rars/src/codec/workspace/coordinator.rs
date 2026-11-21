@@ -1,5 +1,7 @@
 //! Batch admission happens before dispatch. Workers cannot borrow a sibling's
 //! unused allowance, and publication starts only after every callback joins.
+//! A member refused within its share ends the run, so the caller can stream
+//! it with the whole workspace, as sequential extraction would.
 use super::{Buffer, Limited, Reservation, RESERVATION_BYTES};
 use crate::{Error, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,13 +13,16 @@ struct Slot<T, O> {
     result: Option<Result<O>>,
 }
 
+/// Returns how many of `items` were published. Fewer than all means the next
+/// one was refused within its share of the workspace, and it and those after
+/// it are left to the caller.
 pub(crate) fn extract_windowed<T, O, I, H, M, P>(
     items: I,
     ledger: &Limited,
     hint: H,
     map: M,
     mut publish: P,
-) -> Result<()>
+) -> Result<usize>
 where
     T: Copy + Send,
     O: Send,
@@ -34,6 +39,7 @@ where
         .saturating_sub(overhead + RESERVATION_BYTES);
     let hint = |item| hint(item).min(ceiling);
     let mut items = items.peekable();
+    let mut published = 0;
     while let Some(&first) = items.peek() {
         let first_cost = hint(first)
             .saturating_add(overhead)
@@ -87,20 +93,27 @@ where
         // The members ahead of a failure are published, as sequential
         // extraction would; a member skipped once a later one failed ends the
         // prefix. Dropping slots frees the rest, including results whose
-        // reservations have retired.
+        // reservations have retired. A refusal, or a member skipped once a
+        // sibling was refused, ends the run there, unpublished.
         for index in 0..slots.len() {
             match slots[index].result.take() {
+                Some(Err(error)) if super::is_refusal(&error) => return Ok(published),
                 Some(result) => publish(result?)?,
                 None => {
                     let failure = slots[index..]
                         .iter_mut()
-                        .find_map(|slot| slot.result.take()?.err());
-                    return Err(failure.unwrap_or(Error::Cancelled));
+                        .find_map(|slot| slot.result.take()?.err())
+                        .unwrap_or(Error::Cancelled);
+                    if super::is_refusal(&failure) {
+                        return Ok(published);
+                    }
+                    return Err(failure);
                 }
             }
+            published += 1;
         }
     }
-    Ok(())
+    Ok(published)
 }
 
 #[cfg(test)]
@@ -237,15 +250,48 @@ mod tests {
     #[test]
     fn underestimated_hint_refuses_runtime_growth_without_publishing() {
         let ledger = Allowance::limited(8192);
-        let error = extract_windowed(
+        let published = extract_windowed(
             0..2,
             &ledger,
             |_| 1,
             |_, local| Ok(Buffer::filled(16384, 0u8, local)?),
             |_| panic!("refused result published"),
         )
-        .unwrap_err();
-        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
+        .unwrap();
+        assert_eq!(published, 0, "the refused member is left to the caller");
+        assert_eq!(ledger.used(), 0);
+    }
+
+    #[test]
+    fn a_refusal_within_a_share_ends_the_run_after_the_members_ahead() {
+        let ledger = Allowance::limited(1 << 20);
+        let finished = AtomicUsize::new(0);
+        let mut seen = Vec::new();
+        let published = extract_windowed(
+            0..3usize,
+            &ledger,
+            |_| 16,
+            |index, local| {
+                if index < 2 {
+                    let data = Buffer::filled(16, 0u8, local)?;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    return Ok((index, data));
+                }
+                // Refused only once the others are done, so none is skipped.
+                while finished.load(Ordering::SeqCst) < 2 {
+                    std::hint::spin_loop();
+                }
+                // Within its share this outgrows the hint and is refused.
+                Ok((index, Buffer::filled(900 << 10, 0u8, local)?))
+            },
+            |(index, _)| {
+                seen.push(index);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(published, 2);
+        assert_eq!(seen, [0, 1]);
         assert_eq!(ledger.used(), 0);
     }
 
