@@ -1,27 +1,201 @@
 //! BLAKE2sp, the RAR 5 file hash. `blake2s_simd` picks SSE4.1 or AVX2 at run
 //! time; the portable eight-lane code this replaced ran a tenth as fast on
-//! baseline x86-64, slower than reading a stored member.
+//! baseline x86-64, slower than reading a stored member. It has no ARM
+//! backend, so aarch64 compresses all eight leaves at once with NEON instead.
 
 const OUT_BYTES: usize = 32;
 
-pub(crate) struct Hasher(blake2s_simd::blake2sp::State);
+pub(crate) use backend::{hash, Hasher};
 
-impl Hasher {
-    pub(crate) fn new() -> Self {
-        Self(blake2s_simd::blake2sp::State::new())
+#[cfg(not(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon"
+)))]
+mod backend {
+    use super::OUT_BYTES;
+
+    pub(crate) struct Hasher(blake2s_simd::blake2sp::State);
+
+    impl Hasher {
+        pub(crate) fn new() -> Self {
+            Self(blake2s_simd::blake2sp::State::new())
+        }
+
+        pub(crate) fn update(&mut self, input: &[u8]) {
+            self.0.update(input);
+        }
+
+        pub(crate) fn finalize(self) -> [u8; OUT_BYTES] {
+            *self.0.finalize().as_array()
+        }
     }
 
-    pub(crate) fn update(&mut self, input: &[u8]) {
-        self.0.update(input);
-    }
-
-    pub(crate) fn finalize(self) -> [u8; OUT_BYTES] {
-        *self.0.finalize().as_array()
+    pub(crate) fn hash(input: &[u8]) -> [u8; OUT_BYTES] {
+        *blake2s_simd::blake2sp::blake2sp(input).as_array()
     }
 }
 
-pub(crate) fn hash(input: &[u8]) -> [u8; OUT_BYTES] {
-    *blake2s_simd::blake2sp::blake2sp(input).as_array()
+#[cfg(all(
+    target_arch = "aarch64",
+    target_endian = "little",
+    target_feature = "neon"
+))]
+mod backend {
+    use super::OUT_BYTES;
+    use crate::simd::blake2s::{compress, Words, BLOCK_BYTES, IV, LANES};
+
+    const STRIPE: usize = LANES * BLOCK_BYTES;
+    // Keeping more than this behind each compressed stripe leaves every leaf a block to finalize.
+    const HOLD: usize = STRIPE - BLOCK_BYTES;
+
+    pub(crate) struct Hasher {
+        leaves: Leaves,
+        buf: [u8; 2 * STRIPE],
+        buffered: usize,
+    }
+
+    struct Leaves {
+        words: Words,
+        count: u64,
+    }
+
+    impl Leaves {
+        fn absorb(&mut self, stripe: &[u8; STRIPE]) {
+            self.count += BLOCK_BYTES as u64;
+            compress(
+                &mut self.words,
+                stripe,
+                [self.count; LANES],
+                false,
+                [false; LANES],
+            );
+        }
+    }
+
+    pub(crate) fn hash(input: &[u8]) -> [u8; OUT_BYTES] {
+        let mut hasher = Hasher::new();
+        hasher.update(input);
+        hasher.finalize()
+    }
+
+    impl Hasher {
+        pub(crate) fn new() -> Self {
+            Self {
+                leaves: Leaves {
+                    words: std::array::from_fn(|word| {
+                        std::array::from_fn(|leaf| {
+                            IV[word] ^ leaf_parameter_word(word, leaf as u32)
+                        })
+                    }),
+                    count: 0,
+                },
+                buf: [0; 2 * STRIPE],
+                buffered: 0,
+            }
+        }
+
+        pub(crate) fn update(&mut self, mut input: &[u8]) {
+            if self.buffered > 0 {
+                let take = (self.buf.len() - self.buffered).min(input.len());
+                self.buf[self.buffered..][..take].copy_from_slice(&input[..take]);
+                self.buffered += take;
+                input = &input[take..];
+                if input.is_empty() {
+                    return;
+                }
+                let (stripes, _) = self.buf.as_chunks::<STRIPE>();
+                self.leaves.absorb(&stripes[0]);
+                if input.len() > HOLD {
+                    self.leaves.absorb(&stripes[1]);
+                    self.buffered = 0;
+                } else {
+                    self.buf.copy_within(STRIPE.., 0);
+                    self.buf[STRIPE..][..input.len()].copy_from_slice(input);
+                    self.buffered = STRIPE + input.len();
+                    return;
+                }
+            }
+            while input.len() > STRIPE + HOLD {
+                let (stripe, rest) = input.split_first_chunk::<STRIPE>().unwrap();
+                self.leaves.absorb(stripe);
+                input = rest;
+            }
+            self.buf[..input.len()].copy_from_slice(input);
+            self.buffered = input.len();
+        }
+
+        pub(crate) fn finalize(mut self) -> [u8; OUT_BYTES] {
+            let buffered = self.buffered;
+            let ends_in_second_stripe: [bool; LANES] =
+                std::array::from_fn(|leaf| buffered > STRIPE + leaf * BLOCK_BYTES);
+            let mut counts = [self.leaves.count; LANES];
+            if ends_in_second_stripe.contains(&true) {
+                // One eight-lane compression, kept only for the leaves with a later block.
+                let unchanged = self.leaves.words;
+                let (stripes, _) = self.buf.as_chunks::<STRIPE>();
+                self.leaves.absorb(&stripes[0]);
+                for leaf in 0..LANES {
+                    if ends_in_second_stripe[leaf] {
+                        counts[leaf] = self.leaves.count;
+                    } else {
+                        for (words, unchanged) in self.leaves.words.iter_mut().zip(&unchanged) {
+                            words[leaf] = unchanged[leaf];
+                        }
+                    }
+                }
+            }
+
+            let mut blocks = [0; STRIPE];
+            for (leaf, count) in counts.iter_mut().enumerate() {
+                let start = leaf * BLOCK_BYTES
+                    + if ends_in_second_stripe[leaf] {
+                        STRIPE
+                    } else {
+                        0
+                    };
+                let length = buffered.saturating_sub(start).min(BLOCK_BYTES);
+                blocks[leaf * BLOCK_BYTES..][..length]
+                    .copy_from_slice(&self.buf[start..][..length]);
+                *count += length as u64;
+            }
+            let last_node = std::array::from_fn(|leaf| leaf == LANES - 1);
+            let words = &mut self.leaves.words;
+            compress(words, &blocks, counts, true, last_node);
+
+            let mut digests = [0u8; LANES * OUT_BYTES];
+            for (leaf, digest) in digests
+                .as_chunks_mut::<OUT_BYTES>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                for (word, bytes) in digest.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+                    *bytes = words[word][leaf].to_le_bytes();
+                }
+            }
+            *blake2s_simd::Params::new()
+                .fanout(LANES as u8)
+                .max_depth(2)
+                .inner_hash_length(OUT_BYTES)
+                .node_offset(0)
+                .node_depth(1)
+                .last_node(true)
+                .to_state()
+                .update(&digests)
+                .finalize()
+                .as_array()
+        }
+    }
+
+    fn leaf_parameter_word(word: usize, node_offset: u32) -> u32 {
+        match word {
+            0 => OUT_BYTES as u32 | (LANES as u32) << 16 | 2 << 24,
+            2 => node_offset,
+            3 => (OUT_BYTES as u32) << 24,
+            _ => 0,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -216,6 +390,41 @@ mod tests {
                     "length={length}, chunk={chunk_size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn every_length_up_to_three_stripes_matches_scalar_leaves_under_random_chunking() {
+        let mut random = 0x0BAD_5EEDu32;
+        let mut next = move || {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            random >> 8
+        };
+        let input: Vec<u8> = (0..3 * PARALLELISM * BLOCK_BYTES + 1)
+            .map(|_| next() as u8)
+            .collect();
+        for length in 0..=input.len() {
+            let data = &input[..length];
+            let mut leaves: [_; PARALLELISM] =
+                std::array::from_fn(|lane| node(lane as u64, 0, lane == PARALLELISM - 1));
+            for (block_index, block) in data.chunks(BLOCK_BYTES).enumerate() {
+                leaves[block_index % PARALLELISM].update(block);
+            }
+            let mut root = node(0, 1, true);
+            for leaf in leaves {
+                root.update(leaf.finalize().as_bytes());
+            }
+            let expected: [u8; 32] = *root.finalize().as_array();
+            assert_eq!(hash(data), expected, "length={length}");
+
+            let mut hasher = Hasher::new();
+            let mut rest = data;
+            while !rest.is_empty() {
+                let take = (next() as usize % 1100).min(rest.len());
+                hasher.update(&rest[..take]);
+                rest = &rest[take..];
+            }
+            assert_eq!(hasher.finalize(), expected, "length={length}");
         }
     }
 

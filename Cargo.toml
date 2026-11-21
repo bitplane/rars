@@ -41,7 +41,7 @@ wasm-bindgen = "0.2"
 zeroize = { version = "1.8", default-features = false, features = ["alloc", "zeroize_derive"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 unused_must_use = "deny"
 # cargo-fuzz builds with --cfg fuzzing; rars exposes its RAR 3 VM to the fuzz
 # targets under it.
