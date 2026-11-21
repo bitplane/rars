@@ -33,6 +33,7 @@ blake2s_simd.workspace = true
 crc32fast.workspace = true
 getrandom = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
+memchr.workspace = true
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 zeroize = { workspace = true, optional = true }

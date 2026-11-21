@@ -103,10 +103,14 @@ pub(crate) fn next_x86_opcode(
         return None;
     }
 
-    data[start..end]
-        .iter()
-        .position(|&byte| byte & cmp_mask == 0xe8)
-        .map(|offset| start + offset)
+    let haystack = &data[start..end];
+    let offset = if cmp_mask == 0xff {
+        memchr::memchr(0xe8, haystack)
+    } else {
+        debug_assert_eq!(cmp_mask, 0xfe);
+        memchr::memchr2(0xe8, 0xe9, haystack)
+    };
+    offset.map(|found| start + found)
 }
 
 #[cfg(test)]
@@ -123,6 +127,56 @@ mod tests {
         );
         assert_eq!(next_x86_opcode(b"a\xe8b", 1, 1, 0xff), None);
         assert_eq!(next_x86_opcode(b"", 0, usize::MAX, 0xff), None);
+        assert_eq!(next_x86_opcode(b"", 0, usize::MAX, 0xfe), None);
+    }
+
+    fn all_x86_opcodes(data: &[u8], cmp_mask: u8) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut pos = 0;
+        while let Some(next) = next_x86_opcode(data, pos, data.len(), cmp_mask) {
+            found.push(next);
+            pos = next + 1;
+        }
+        found
+    }
+
+    #[test]
+    fn opcode_scan_finds_opcodes_at_the_first_and_last_byte() {
+        let data = b"\xe8a\xe9\xe8cd\xe8";
+        assert_eq!(all_x86_opcodes(data, 0xff), [0, 3, 6]);
+        assert_eq!(all_x86_opcodes(data, 0xfe), [0, 2, 3, 6]);
+        assert!(all_x86_opcodes(b"\xe9", 0xff).is_empty());
+        assert_eq!(all_x86_opcodes(b"\xe9", 0xfe), [0]);
+        assert_eq!(next_x86_opcode(data, 4, 6, 0xff), None);
+        assert_eq!(next_x86_opcode(data, 4, 7, 0xff), Some(6));
+    }
+
+    #[test]
+    fn opcode_scan_visits_every_opcode_in_sparse_and_dense_data() {
+        let mut state = 0x9e37_79b9u32;
+        let mut sparse = vec![0u8; 1 << 16];
+        for byte in &mut sparse {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *byte = (state >> 24) as u8;
+        }
+        // Calls and jumps every few bytes, as in compiled code.
+        let dense: Vec<u8> = (0..1 << 16)
+            .map(|index| match index % 7 {
+                0 => 0xe8,
+                3 if index % 2 == 0 => 0xe9,
+                _ => (index * 31) as u8 & 0x7f,
+            })
+            .collect();
+
+        for data in [&sparse, &dense] {
+            for (cmp_mask, opcodes) in [(0xff, &[0xe8][..]), (0xfe, &[0xe8, 0xe9][..])] {
+                let expected: Vec<_> = (0..data.len())
+                    .filter(|&pos| opcodes.contains(&data[pos]))
+                    .collect();
+                assert!(!expected.is_empty());
+                assert_eq!(all_x86_opcodes(data, cmp_mask), expected);
+            }
+        }
     }
 
     fn reference_match_length(
