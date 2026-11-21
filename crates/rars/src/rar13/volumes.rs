@@ -61,9 +61,9 @@ where
                 extracted_count += 1;
                 continue;
             }
-            budget.check(u64::from(entry.header.unp_size), &meta.name)?;
             options.check_cancelled()?;
             let result = (|| {
+                budget.check(u64::from(entry.header.unp_size), &meta.name)?;
                 let mut writer = open(&meta)?;
                 options.check_cancelled()?;
                 budget.run(&meta.name, &mut writer, |mut writer| {
