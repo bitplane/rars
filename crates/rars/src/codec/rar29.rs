@@ -126,7 +126,6 @@ fn rar29_delta_messages() -> DeltaErrorMessages {
     DeltaErrorMessages {
         invalid_channels: "RAR 2.9 DELTA filter channel count is invalid",
         zero_channels: "RAR 2.9 DELTA filter has zero channels",
-        truncated_source: "RAR 2.9 DELTA filter source is truncated",
     }
 }
 

@@ -16,7 +16,6 @@ pub(crate) enum FilterOp {
 pub(crate) struct DeltaErrorMessages {
     pub invalid_channels: &'static str,
     pub zero_channels: &'static str,
-    pub truncated_source: &'static str,
 }
 
 #[cfg(any(test, feature = "write"))]
@@ -33,7 +32,12 @@ pub(crate) fn encode_in_place(
         #[cfg(test)]
         FilterOp::E8E9 => e8e9_encode(data, file_offset, true),
         FilterOp::Delta { channels } => {
-            let encoded = delta_encode(data, channels, messages)?;
+            let encoded = delta_encode_with_allowance(
+                data,
+                channels,
+                messages,
+                &super::workspace::Allowance::default(),
+            )?;
             data.copy_from_slice(&encoded);
         }
     }
@@ -46,9 +50,13 @@ pub(crate) fn encode_in_place(
 /// bits. The RAR 2.9 VM takes the count from register R[0] instead, and the
 /// reference decoder accepts up to 1024 there, so a decoder that stops at 32
 /// refuses archives the official tools extract. The bound still has to exist,
-/// because R[0] is a full 32-bit value from the archive and the deinterleave
-/// loop runs once per channel whether or not the channel has any bytes.
+/// because R[0] is a full 32-bit value from the archive.
 pub(crate) const MAX_DELTA_CHANNELS: usize = 1024;
+
+const GENERIC_DELTA_MESSAGES: DeltaErrorMessages = DeltaErrorMessages {
+    invalid_channels: "DELTA filter channel count is invalid",
+    zero_channels: "DELTA filter has zero channels",
+};
 
 #[cfg(test)]
 pub(crate) fn decode_in_place(
@@ -211,34 +219,112 @@ pub(crate) fn delta_decode_with_allowance<B: super::workspace::Budget>(
         return Err(Error::InvalidData(messages.invalid_channels));
     }
     let mut out = super::workspace::Buffer::filled(data.len(), 0, allowance)?;
-    let mut src = 0usize;
-    for channel in 0..channels {
-        let mut prev = 0u8;
-        let mut dest = channel;
-        while dest < out.len() {
-            poller.check_codec(src)?;
-            let byte = *data
-                .get(src)
-                .ok_or(Error::InvalidData(messages.truncated_source))?;
-            prev = prev.wrapping_sub(byte);
-            out[dest] = prev;
-            src += 1;
-            dest += channels;
-        }
+    match DELTA_DECODE_ROWS.get(channels - 1) {
+        Some(decode_rows) => decode_rows(data, &mut out, &mut poller)?,
+        None => delta_decode_strided(data, channels, &mut out, &mut poller)?,
     }
     Ok(out)
 }
 
-#[cfg(any(test, feature = "write"))]
-pub(crate) fn delta_encode(
+const DELTA_POLL_BYTES: usize = 64 * 1024;
+
+type DeltaDecodeRows = fn(&[u8], &mut [u8], &mut crate::read_control::Poller) -> Result<()>;
+
+// Row-major copies run every channel's sum side by side; past eight channels
+// they stop beating one strided pass per channel.
+const DELTA_DECODE_ROWS: [DeltaDecodeRows; 8] = [
+    delta_decode_rows::<1>,
+    delta_decode_rows::<2>,
+    delta_decode_rows::<3>,
+    delta_decode_rows::<4>,
+    delta_decode_rows::<5>,
+    delta_decode_rows::<6>,
+    delta_decode_rows::<7>,
+    delta_decode_rows::<8>,
+];
+
+fn delta_decode_rows<const N: usize>(
+    data: &[u8],
+    out: &mut [u8],
+    poller: &mut crate::read_control::Poller,
+) -> Result<()> {
+    let planes = delta_planes::<N>(data);
+    let (rows, ragged) = out.as_chunks_mut::<N>();
+    let full_rows = rows.len();
+    let mut prev = [0u8; N];
+    for (block, dests) in rows.chunks_mut(DELTA_POLL_BYTES / N).enumerate() {
+        let first = block * (DELTA_POLL_BYTES / N);
+        poller.check_codec(first * N)?;
+        let sources: [&[u8]; N] =
+            std::array::from_fn(|channel| &planes[channel][first..first + dests.len()]);
+        for (row, dest) in dests.iter_mut().enumerate() {
+            for channel in 0..N {
+                prev[channel] = prev[channel].wrapping_sub(sources[channel][row]);
+            }
+            *dest = prev;
+        }
+    }
+    for (channel, dest) in ragged.iter_mut().enumerate() {
+        *dest = prev[channel].wrapping_sub(planes[channel][full_rows]);
+    }
+    Ok(())
+}
+
+fn delta_decode_strided(
     data: &[u8],
     channels: usize,
-    messages: DeltaErrorMessages,
-) -> Result<Vec<u8>> {
+    out: &mut [u8],
+    poller: &mut crate::read_control::Poller,
+) -> Result<()> {
+    let mut planes = data;
+    for channel in 0..channels.min(data.len()) {
+        let plane_start = data.len() - planes.len();
+        let (plane, rest) = planes.split_at(delta_plane_len(data.len(), channels, channel));
+        planes = rest;
+        let mut prev = 0u8;
+        for (index, sources) in plane.chunks(DELTA_POLL_BYTES).enumerate() {
+            poller.check_codec(plane_start + index * DELTA_POLL_BYTES)?;
+            let start = channel + index * DELTA_POLL_BYTES * channels;
+            for (dest, &byte) in out[start..].iter_mut().step_by(channels).zip(sources) {
+                prev = prev.wrapping_sub(byte);
+                *dest = prev;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn delta_planes<const N: usize>(data: &[u8]) -> [&[u8]; N] {
+    let mut rest = data;
+    std::array::from_fn(|channel| {
+        let (plane, tail) = rest.split_at(delta_plane_len(data.len(), N, channel));
+        rest = tail;
+        plane
+    })
+}
+
+fn delta_plane_len(len: usize, channels: usize, channel: usize) -> usize {
+    (len + channels - 1 - channel) / channels
+}
+
+/// Raw delta transform for benches; archive code passes format-specific messages.
+pub fn delta_decode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
+    delta_decode_with_allowance(
+        data,
+        channels,
+        GENERIC_DELTA_MESSAGES,
+        &crate::read_control::ReadControl::default(),
+        &super::workspace::Allowance::default(),
+    )
+    .map(super::workspace::Buffer::into_vec)
+}
+
+#[cfg(feature = "write")]
+pub fn delta_encode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
     delta_encode_with_allowance(
         data,
         channels,
-        messages,
+        GENERIC_DELTA_MESSAGES,
         &super::workspace::Allowance::default(),
     )
     .map(super::workspace::Buffer::into_vec)
@@ -254,15 +340,22 @@ pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
     if channels == 0 || channels > 32 {
         return Err(Error::InvalidData(messages.invalid_channels));
     }
-    let mut out = super::workspace::Buffer::with_capacity(data.len(), allowance)?;
-    for channel in 0..channels {
+    let mut out = super::workspace::Buffer::filled(data.len(), 0, allowance)?;
+    let mut planes = &mut out[..];
+    for channel in 0..channels.min(data.len()) {
+        let (plane, rest) = std::mem::take(&mut planes).split_at_mut(delta_plane_len(
+            data.len(),
+            channels,
+            channel,
+        ));
+        planes = rest;
         let mut prev = 0u8;
-        let mut src = channel;
-        while src < data.len() {
-            let byte = data[src];
-            out.push(prev.wrapping_sub(byte)).map_err(Into::into)?;
+        for (dest, &byte) in plane
+            .iter_mut()
+            .zip(data[channel..].iter().step_by(channels))
+        {
+            *dest = prev.wrapping_sub(byte);
             prev = byte;
-            src += channels;
         }
     }
     Ok(out)
@@ -317,25 +410,17 @@ mod tests {
             let result = if x86 {
                 e8e9_decode_with_control(&mut bytes, 0, true, &control)
             } else {
-                delta_decode_with_control(&bytes, 2, generic_messages(), &control).map(|_| ())
+                delta_decode_with_control(&bytes, 2, GENERIC_DELTA_MESSAGES, &control).map(|_| ())
             };
             assert_eq!(result.unwrap_err(), Error::Cancelled);
         }
     }
     use super::*;
 
-    fn generic_messages() -> DeltaErrorMessages {
-        DeltaErrorMessages {
-            invalid_channels: "DELTA filter channel count is invalid",
-            zero_channels: "DELTA filter has zero channels",
-            truncated_source: "DELTA filter source is truncated",
-        }
-    }
-
     /// Filters a copy, going through the same dispatch the writers use.
     fn encode(op: FilterOp, data: &[u8], file_offset: u32) -> Result<Vec<u8>> {
         let mut out = data.to_vec();
-        encode_in_place(op, &mut out, file_offset, generic_messages())?;
+        encode_in_place(op, &mut out, file_offset, GENERIC_DELTA_MESSAGES)?;
         Ok(out)
     }
 
@@ -418,7 +503,7 @@ mod tests {
         let input = x86_sample();
         let mut filtered = encode(FilterOp::E8, &input, 4096).unwrap();
 
-        decode_in_place(FilterOp::E8, &mut filtered, 4096, generic_messages()).unwrap();
+        decode_in_place(FilterOp::E8, &mut filtered, 4096, GENERIC_DELTA_MESSAGES).unwrap();
 
         assert_eq!(filtered, input);
     }
@@ -428,7 +513,7 @@ mod tests {
         let input = x86_sample();
         let mut filtered = encode(FilterOp::E8E9, &input, 8192).unwrap();
 
-        decode_in_place(FilterOp::E8E9, &mut filtered, 8192, generic_messages()).unwrap();
+        decode_in_place(FilterOp::E8E9, &mut filtered, 8192, GENERIC_DELTA_MESSAGES).unwrap();
 
         assert_eq!(filtered, input);
     }
@@ -472,7 +557,7 @@ mod tests {
             FilterOp::Delta { channels: 3 },
             &mut filtered,
             0,
-            generic_messages(),
+            GENERIC_DELTA_MESSAGES,
         )
         .unwrap();
 
@@ -490,7 +575,7 @@ mod tests {
                 FilterOp::Delta { channels: 33 },
                 &mut filtered,
                 0,
-                generic_messages(),
+                GENERIC_DELTA_MESSAGES,
             ),
             Ok(())
         );
@@ -507,10 +592,124 @@ mod tests {
                 },
                 &mut filtered,
                 0,
-                generic_messages(),
+                GENERIC_DELTA_MESSAGES,
             ),
             Err(Error::InvalidData("DELTA filter channel count is invalid"))
         );
+    }
+
+    fn per_byte_delta_decode(data: &[u8], channels: usize) -> Vec<u8> {
+        let mut out = vec![0; data.len()];
+        let mut src = 0;
+        for channel in 0..channels {
+            let mut prev = 0u8;
+            for dest in (channel..out.len()).step_by(channels) {
+                prev = prev.wrapping_sub(data[src]);
+                out[dest] = prev;
+                src += 1;
+            }
+        }
+        out
+    }
+
+    fn per_byte_delta_encode(data: &[u8], channels: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(data.len());
+        for channel in 0..channels {
+            let mut prev = 0u8;
+            for &byte in data.iter().skip(channel).step_by(channels) {
+                out.push(prev.wrapping_sub(byte));
+                prev = byte;
+            }
+        }
+        out
+    }
+
+    fn noise(len: usize) -> Vec<u8> {
+        let mut state = 0x2545_f491u32;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state >> 7) as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cancellation_interrupts_delta_decode_past_the_row_major_channel_counts() {
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        control.cancel_after_checks(2);
+        let bytes = vec![0; 384 * 1024];
+
+        let result = delta_decode_with_control(&bytes, 64, GENERIC_DELTA_MESSAGES, &control);
+
+        assert_eq!(result.unwrap_err(), Error::Cancelled);
+    }
+
+    #[test]
+    fn delta_decode_runs_each_planar_channel_into_interleaved_output() {
+        let decoded = super::delta_decode(&[1, 2, 3, 4, 5], 2).unwrap();
+
+        assert_eq!(decoded, [255, 252, 253, 247, 250]);
+    }
+
+    #[test]
+    fn delta_matches_per_byte_model_for_every_channel_count_and_ragged_length() {
+        let control = crate::read_control::ReadControl::default();
+        let allowance = super::super::workspace::Allowance::default();
+        let input = noise(300);
+        for channels in (1..=33).chain([64, 255, 1024]) {
+            for len in (0..=2 * channels + 3).chain([97, 300]) {
+                let data = &input[..len.min(input.len())];
+                let decoded = delta_decode_with_allowance(
+                    data,
+                    channels,
+                    GENERIC_DELTA_MESSAGES,
+                    &control,
+                    &allowance,
+                )
+                .unwrap();
+                assert_eq!(
+                    decoded,
+                    per_byte_delta_decode(data, channels),
+                    "decode channels={channels} len={len}"
+                );
+                if channels <= 32 {
+                    let encoded = delta_encode_with_allowance(
+                        data,
+                        channels,
+                        GENERIC_DELTA_MESSAGES,
+                        &allowance,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        encoded,
+                        per_byte_delta_encode(data, channels),
+                        "encode channels={channels} len={len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn controlled_delta_decode_matches_model_across_poll_boundaries() {
+        let token = crate::ReadCancellation::new();
+        let control = crate::read_control::ReadControl::new(Some(&token));
+        let data = noise(3 * 64 * 1024 + 7);
+        for channels in [1, 3, 8, 9] {
+            let decoded = delta_decode_with_allowance(
+                &data,
+                channels,
+                GENERIC_DELTA_MESSAGES,
+                &control,
+                &super::super::workspace::Allowance::default(),
+            )
+            .unwrap();
+            assert_eq!(decoded, per_byte_delta_decode(&data, channels));
+        }
     }
 
     #[test]
@@ -519,7 +718,7 @@ mod tests {
         let expected = encode(FilterOp::E8E9, &input, 1234).unwrap();
         let mut actual = input;
 
-        encode_in_place(FilterOp::E8E9, &mut actual, 1234, generic_messages()).unwrap();
+        encode_in_place(FilterOp::E8E9, &mut actual, 1234, GENERIC_DELTA_MESSAGES).unwrap();
 
         assert_eq!(actual, expected);
     }

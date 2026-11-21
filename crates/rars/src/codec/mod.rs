@@ -2,7 +2,7 @@
 
 mod canonical;
 pub(crate) mod fast;
-pub(crate) mod filters;
+pub mod filters;
 #[cfg(any(test, feature = "write"))]
 mod huffman;
 #[cfg(any(test, feature = "write"))]
