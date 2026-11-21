@@ -173,6 +173,28 @@ impl RSCoder8 {
         out
     }
 
+    /// One table per call replaces a log and exp lookup for every byte.
+    fn accumulate_scaled(&self, destination: &mut [u8], source: &[u8], coefficient: u8) {
+        let destination = &mut destination[..source.len()];
+        match coefficient {
+            0 => {}
+            1 => {
+                for (target, &byte) in destination.iter_mut().zip(source) {
+                    *target ^= byte;
+                }
+            }
+            _ => {
+                let mut table = [0u8; 256];
+                for (byte, product) in table.iter_mut().enumerate() {
+                    *product = self.mul(coefficient, byte as u8);
+                }
+                for (target, &byte) in destination.iter_mut().zip(source) {
+                    *target ^= table[byte as usize];
+                }
+            }
+        }
+    }
+
     fn mul(&self, left: u8, right: u8) -> u8 {
         if left == 0 || right == 0 {
             0
@@ -256,21 +278,21 @@ pub fn reconstruct_data_volumes(
         })
         .collect();
 
-    for offset in 0..shard_len {
-        let mut codeword = vec![0; data_volumes.len() + recovery_count];
-        for (index, data) in data_volumes.iter().enumerate() {
-            if let Some(data) = data {
-                codeword[index] = data.get(offset).copied().unwrap_or(0);
-            }
-        }
-        for (index, data) in recovery_by_index.iter().enumerate() {
-            if let Some(data) = data {
-                codeword[data_volumes.len() + index] = data[offset];
-            }
-        }
+    // The erasures are the same at every offset, so decoding is one linear map
+    // from surviving bytes to missing ones. Decoding a codeword holding a single
+    // one reads off that survivor's coefficient for each missing volume.
+    let surviving = data_volumes
+        .iter()
+        .chain(&recovery_by_index)
+        .enumerate()
+        .filter_map(|(position, data)| Some((position, (*data)?)));
+    let mut codeword = vec![0; data_volumes.len() + recovery_count];
+    for (position, source) in surviving {
+        codeword.fill(0);
+        codeword[position] = 1;
         coder.correct_erasures(&mut codeword, &erasures)?;
         for &index in &missing_data {
-            out[index][offset] = codeword[index];
+            coder.accumulate_scaled(&mut out[index], source, codeword[index]);
         }
     }
 
@@ -333,6 +355,41 @@ mod tests {
         coder.correct_erasures(&mut codeword, &[0, 254]).unwrap();
 
         assert_eq!(codeword, original);
+    }
+
+    #[test]
+    fn accumulate_scaled_adds_the_scaled_source_into_the_destination() {
+        let coder = RSCoder8::new(1).unwrap();
+        let source: Vec<u8> = (0..=255).chain([0, 7, 255]).collect();
+        let start: Vec<u8> = (0..source.len()).map(|i| (i * 37 + 11) as u8).collect();
+        for coefficient in 0..=255u8 {
+            let mut actual = start.clone();
+            coder.accumulate_scaled(&mut actual, &source, coefficient);
+            let expected: Vec<u8> = start
+                .iter()
+                .zip(&source)
+                .map(|(&base, &byte)| base ^ coder.mul(coefficient, byte))
+                .collect();
+            assert_eq!(actual, expected, "coefficient {coefficient}");
+        }
+    }
+
+    #[test]
+    fn accumulate_scaled_by_zero_leaves_the_destination_and_by_one_xors() {
+        let coder = RSCoder8::new(1).unwrap();
+        let mut destination = [0x0f, 0xf0, 0xaa];
+        coder.accumulate_scaled(&mut destination, &[1, 2, 3], 0);
+        assert_eq!(destination, [0x0f, 0xf0, 0xaa]);
+        coder.accumulate_scaled(&mut destination, &[0xff, 0xff, 0x55], 1);
+        assert_eq!(destination, [0xf0, 0x0f, 0xff]);
+    }
+
+    #[test]
+    fn accumulate_scaled_touches_only_the_source_length() {
+        let coder = RSCoder8::new(1).unwrap();
+        let mut destination = [1, 2, 3, 4];
+        coder.accumulate_scaled(&mut destination, &[1, 1], 1);
+        assert_eq!(destination, [0, 3, 3, 4]);
     }
 
     #[test]
@@ -465,6 +522,181 @@ mod tests {
         );
     }
 
+    fn reconstruct_per_byte(
+        data_volumes: &[Option<&[u8]>],
+        recovery_count: usize,
+        recovery_volumes: &[(usize, &[u8])],
+    ) -> Vec<Vec<u8>> {
+        let shard_len = recovery_volumes[0].1.len();
+        let total = data_volumes.len() + recovery_count;
+        let mut codewords = vec![vec![0u8; total]; shard_len];
+        for (index, data) in data_volumes.iter().enumerate() {
+            for (offset, &byte) in data.unwrap_or_default().iter().enumerate() {
+                codewords[offset][index] = byte;
+            }
+        }
+        for &(index, data) in recovery_volumes {
+            for (offset, &byte) in data.iter().enumerate() {
+                codewords[offset][data_volumes.len() + index] = byte;
+            }
+        }
+        let erasures: Vec<_> = (0..total)
+            .filter(|&index| match data_volumes.get(index) {
+                Some(data) => data.is_none(),
+                None => recovery_volumes
+                    .iter()
+                    .all(|&(rev, _)| rev != index - data_volumes.len()),
+            })
+            .collect();
+        let coder = RSCoder8::new(recovery_count).unwrap();
+        for codeword in &mut codewords {
+            coder.correct_erasures(codeword, &erasures).unwrap();
+        }
+        (0..data_volumes.len())
+            .map(|index| codewords.iter().map(|codeword| codeword[index]).collect())
+            .collect()
+    }
+
+    fn rev3_test_bytes(len: usize, seed: u32) -> Vec<u8> {
+        let mut state = seed.wrapping_mul(0x9e37_79b9) | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                state as u8
+            })
+            .collect()
+    }
+
+    fn encode_rev3<T: AsRef<[u8]>>(
+        data: &[T],
+        recovery_count: usize,
+        shard_len: usize,
+    ) -> Vec<Vec<u8>> {
+        let coder = RSCoder8::new(recovery_count).unwrap();
+        let mut recovery = vec![vec![0; shard_len]; recovery_count];
+        for offset in 0..shard_len {
+            let column: Vec<_> = data
+                .iter()
+                .map(|shard| shard.as_ref().get(offset).copied().unwrap_or(0))
+                .collect();
+            for (row, byte) in recovery.iter_mut().zip(coder.encode(&column)) {
+                row[offset] = byte;
+            }
+        }
+        recovery
+    }
+
+    #[test]
+    fn rev3_rebuilds_every_missing_mix_like_the_per_byte_decode() {
+        let shard_len = 37;
+        // Unequal lengths, a byte-short volume, and empty volumes mid-set and last.
+        let lengths = [shard_len, 20, 0, shard_len - 1, 5, 0];
+        let data: Vec<Vec<u8>> = lengths
+            .iter()
+            .enumerate()
+            .map(|(index, &len)| rev3_test_bytes(len, index as u32 + 1))
+            .collect();
+        for recovery_count in 1..=4 {
+            let mut recovery = encode_rev3(&data, recovery_count, shard_len);
+            let total = data.len() + recovery_count;
+            for mask in 1u32..(1 << total) {
+                let missing = |index: usize| mask & (1 << index) != 0;
+                if mask.count_ones() as usize > recovery_count
+                    || (0..data.len()).all(|index| !missing(index))
+                {
+                    continue;
+                }
+                let volumes: Vec<Option<&[u8]>> = data
+                    .iter()
+                    .enumerate()
+                    .map(|(index, shard)| (!missing(index)).then_some(shard.as_slice()))
+                    .collect();
+                for damage in [false, true] {
+                    // A damaged survivor makes the column inconsistent, which
+                    // the decode still maps the same way.
+                    recovery[0][3] ^= u8::from(damage);
+                    let present: Vec<(usize, &[u8])> = recovery
+                        .iter()
+                        .enumerate()
+                        .filter(|&(index, _)| !missing(data.len() + index))
+                        .map(|(index, shard)| (index, shard.as_slice()))
+                        .collect();
+                    let repaired =
+                        reconstruct_data_volumes(&volumes, recovery_count, &present).unwrap();
+                    assert_eq!(
+                        repaired,
+                        reconstruct_per_byte(&volumes, recovery_count, &present),
+                        "parity {recovery_count}, missing {mask:#b}, damaged {damage}"
+                    );
+                    if !damage || missing(data.len()) {
+                        for (shard, original) in repaired.iter().zip(&data) {
+                            assert_eq!(&shard[..original.len()], original.as_slice());
+                            assert!(shard[original.len()..].iter().all(|&byte| byte == 0));
+                        }
+                    }
+                    recovery[0][3] ^= u8::from(damage);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rev3_rebuild_fingerprints_are_unchanged() {
+        // CRC32s of rebuilds made by the per-byte decode. Random recovery
+        // volumes match no data, so every missing byte depends on the map.
+        let shard_len = 4097;
+        let data: Vec<Vec<u8>> = [shard_len, 4096, 0, 1000, shard_len, 13]
+            .iter()
+            .enumerate()
+            .map(|(index, &len)| rev3_test_bytes(len, index as u32 + 10))
+            .collect();
+        let recovery: Vec<Vec<u8>> = (0..3)
+            .map(|index| rev3_test_bytes(shard_len, index + 20))
+            .collect();
+        let mut found = Vec::new();
+        for (missing_data, missing_recovery) in [
+            (&[0][..], &[][..]),
+            (&[2, 4], &[]),
+            (&[1, 3], &[1]),
+            (&[0, 1, 2], &[]),
+            (&[5], &[0, 2]),
+        ] {
+            let volumes: Vec<Option<&[u8]>> = data
+                .iter()
+                .enumerate()
+                .map(|(index, shard)| (!missing_data.contains(&index)).then_some(shard.as_slice()))
+                .collect();
+            let present: Vec<(usize, &[u8])> = recovery
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !missing_recovery.contains(index))
+                .map(|(index, shard)| (index, shard.as_slice()))
+                .collect();
+            let repaired = reconstruct_data_volumes(&volumes, 3, &present).unwrap();
+            found.push(crate::crc32::crc32(&repaired.concat()));
+        }
+        assert_eq!(
+            found,
+            [
+                0x1237_6c6e,
+                0x83ff_42de,
+                0xf4a4_a312,
+                0x4e45_b3b4,
+                0xf963_6b1b
+            ]
+        );
+    }
+
+    #[test]
+    fn rev3_rebuilds_empty_shards() {
+        assert_eq!(
+            reconstruct_data_volumes(&[Some(&[]), None], 1, &[(0, &[])]),
+            Ok(vec![Vec::new(), Vec::new()])
+        );
+    }
+
     #[test]
     fn rev3_reconstructs_missing_data_volume_from_recovery_volume() {
         let data = [
@@ -473,19 +705,8 @@ mod tests {
             b"volume-three".as_slice(),
         ];
         let recovery_count = 2;
-        let coder = RSCoder8::new(recovery_count).unwrap();
         let shard_len = data.iter().map(|shard| shard.len()).max().unwrap();
-        let mut recovery = vec![vec![0; shard_len]; recovery_count];
-        for offset in 0..shard_len {
-            let column: Vec<_> = data
-                .iter()
-                .map(|shard| shard.get(offset).copied().unwrap_or(0))
-                .collect();
-            let encoded = coder.encode(&column);
-            for (row, byte) in recovery.iter_mut().zip(encoded) {
-                row[offset] = byte;
-            }
-        }
+        let recovery = encode_rev3(&data, recovery_count, shard_len);
 
         let repaired = reconstruct_data_volumes(
             &[Some(data[0]), None, Some(data[2])],
