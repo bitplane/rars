@@ -2372,7 +2372,6 @@ fn rar50_delta_messages() -> DeltaErrorMessages {
     DeltaErrorMessages {
         invalid_channels: "RAR 5 DELTA filter channel count is invalid",
         zero_channels: "RAR 5 DELTA filter has zero channels",
-        truncated_source: "RAR 5 DELTA filter source is truncated",
     }
 }
 

@@ -102,6 +102,11 @@ harness = false
 required-features = ["write"]
 
 [[bench]]
+name = "delta_filter"
+harness = false
+required-features = ["write"]
+
+[[bench]]
 name = "recovery"
 harness = false
 required-features = ["write", "recovery", "parallel"]
