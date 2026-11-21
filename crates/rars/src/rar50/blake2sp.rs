@@ -43,11 +43,20 @@ mod backend {
 ))]
 mod backend {
     use super::OUT_BYTES;
-    use crate::simd::blake2s::{compress, Words, BLOCK_BYTES, IV, LANES};
+    use crate::simd::blake2s::{
+        compress, compress_half, join_halves, split_halves, Words, BLOCK_BYTES, IV, LANES,
+    };
 
     const STRIPE: usize = LANES * BLOCK_BYTES;
     // Keeping more than this behind each compressed stripe leaves every leaf a block to finalize.
     const HOLD: usize = STRIPE - BLOCK_BYTES;
+    // Split, a 128 KiB run measured 10% slower than on one thread, and 512 KiB 7% faster.
+    const SPLIT_STRIPES: usize = (256 << 10) / STRIPE;
+
+    // Inside the pool the other members already keep every thread busy.
+    fn splits(stripes: usize) -> bool {
+        stripes >= SPLIT_STRIPES && crate::parallel::may_spawn()
+    }
 
     pub(crate) struct Hasher {
         leaves: Leaves,
@@ -70,6 +79,24 @@ mod backend {
                 false,
                 [false; LANES],
             );
+        }
+
+        // Leaves 0-3 and 4-7 never meet before the root, so each half can run on its own thread.
+        fn absorb_run(&mut self, stripes: &[[u8; STRIPE]]) {
+            if !splits(stripes.len()) {
+                for stripe in stripes {
+                    self.absorb(stripe);
+                }
+                return;
+            }
+            let [mut low, mut high] = split_halves(&self.words);
+            let count = self.count;
+            std::thread::scope(|scope| {
+                scope.spawn(|| compress_half(&mut high, stripes, 1, count));
+                compress_half(&mut low, stripes, 0, count);
+            });
+            self.words = join_halves(&[low, high]);
+            self.count += (stripes.len() * BLOCK_BYTES) as u64;
         }
     }
 
@@ -116,11 +143,10 @@ mod backend {
                     return;
                 }
             }
-            while input.len() > STRIPE + HOLD {
-                let (stripe, rest) = input.split_first_chunk::<STRIPE>().unwrap();
-                self.leaves.absorb(stripe);
-                input = rest;
-            }
+            let whole = input.len().saturating_sub(HOLD + 1) / STRIPE;
+            let (stripes, _) = input[..whole * STRIPE].as_chunks::<STRIPE>();
+            self.leaves.absorb_run(stripes);
+            input = &input[whole * STRIPE..];
             self.buf[..input.len()].copy_from_slice(input);
             self.buffered = input.len();
         }
@@ -194,6 +220,32 @@ mod backend {
             2 => node_offset,
             3 => (OUT_BYTES as u32) << 24,
             _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{hash, splits, SPLIT_STRIPES};
+
+        #[test]
+        fn long_runs_split_only_where_a_thread_is_free() {
+            assert!(!splits(SPLIT_STRIPES - 1));
+            assert_eq!(splits(SPLIT_STRIPES), crate::parallel::may_spawn());
+            let input: Vec<u8> = (0..4 << 20).map(|i| (i % 251) as u8).collect();
+            let split = hash(&input);
+            let _cap = crate::parallel::ThreadCap::set(Some(1));
+            assert!(!splits(SPLIT_STRIPES));
+            assert_eq!(hash(&input), split);
+        }
+
+        #[cfg(feature = "parallel")]
+        #[test]
+        fn pool_workers_never_split() {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(2)
+                .build()
+                .unwrap();
+            assert!(!pool.install(|| splits(SPLIT_STRIPES)));
         }
     }
 }
@@ -425,6 +477,41 @@ mod tests {
                 rest = &rest[take..];
             }
             assert_eq!(hasher.finalize(), expected, "length={length}");
+        }
+    }
+
+    #[test]
+    fn long_inputs_around_power_of_two_runs_match_scalar_leaves() {
+        let stripe = PARALLELISM * BLOCK_BYTES;
+        let mut random = 0x7F4A_7C15u32;
+        let mut next = move || {
+            random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            random >> 8
+        };
+        let input: Vec<u8> = (0..(1 << 20) + 3 * stripe).map(|_| next() as u8).collect();
+        for run in [16 << 10, 64 << 10, 256 << 10, 1 << 20] {
+            for length in [run - stripe, run, run + stripe + 1, run + 2 * stripe] {
+                let data = &input[..length];
+                let mut leaves: [_; PARALLELISM] =
+                    std::array::from_fn(|lane| node(lane as u64, 0, lane == PARALLELISM - 1));
+                for (block_index, block) in data.chunks(BLOCK_BYTES).enumerate() {
+                    leaves[block_index % PARALLELISM].update(block);
+                }
+                let mut root = node(0, 1, true);
+                for leaf in leaves {
+                    root.update(leaf.finalize().as_bytes());
+                }
+                let expected: [u8; 32] = *root.finalize().as_array();
+                assert_eq!(hash(data), expected, "length={length}");
+                let mut hasher = Hasher::new();
+                let mut rest = data;
+                while !rest.is_empty() {
+                    let take = (1 + next() as usize % (2 * run)).min(rest.len());
+                    hasher.update(&rest[..take]);
+                    rest = &rest[take..];
+                }
+                assert_eq!(hasher.finalize(), expected, "length={length}");
+            }
         }
     }
 

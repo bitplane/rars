@@ -48,11 +48,37 @@ pub(crate) fn compress(
     unsafe { neon::compress(state, blocks, &tail) }
 }
 
+pub(crate) const HALF_LANES: usize = LANES / 2;
+
+pub(crate) type HalfWords = [[u32; HALF_LANES]; 8];
+
+pub(crate) fn split_halves(words: &Words) -> [HalfWords; 2] {
+    std::array::from_fn(|half| {
+        std::array::from_fn(|word| words[word].as_chunks::<HALF_LANES>().0[half])
+    })
+}
+
+pub(crate) fn join_halves(halves: &[HalfWords; 2]) -> Words {
+    std::array::from_fn(|word| {
+        std::array::from_fn(|lane| halves[lane / HALF_LANES][word][lane % HALF_LANES])
+    })
+}
+
+/// Sets no finalization flags, so no stripe may hold any lane's last block.
+pub(crate) fn compress_half(
+    state: &mut HalfWords,
+    stripes: &[[u8; LANES * BLOCK_BYTES]],
+    half: usize,
+    count: u64,
+) {
+    // SAFETY: this module only compiles where the build enables `neon`.
+    unsafe { neon::compress_half(state, stripes, half, count) }
+}
+
 mod neon {
-    use super::{Words, BLOCK_BYTES, IV, LANES, SIGMA};
+    use super::{HalfWords, Words, BLOCK_BYTES, HALF_LANES, IV, LANES, SIGMA};
     use std::arch::aarch64::*;
 
-    const VECTOR: usize = 4;
     type FourLanes = [uint32x4_t; 16];
 
     // Both halves step through each round together so eight G chains overlap, not four.
@@ -62,32 +88,15 @@ mod neon {
         blocks: &[u8; LANES * BLOCK_BYTES],
         tail: &[[u32; LANES]; 4],
     ) {
-        let (block_halves, _) = blocks.as_chunks::<{ VECTOR * BLOCK_BYTES }>();
-        let h: [[uint32x4_t; 8]; 2] =
-            std::array::from_fn(|half| std::array::from_fn(|word| load(&state[word], half)));
+        let (block_halves, _) = blocks.as_chunks::<{ HALF_LANES * BLOCK_BYTES }>();
+        let h: [[uint32x4_t; 8]; 2] = std::array::from_fn(|half| {
+            std::array::from_fn(|word| load(&state[word].as_chunks::<HALF_LANES>().0[half]))
+        });
         let m: [FourLanes; 2] = std::array::from_fn(|half| transpose_message(&block_halves[half]));
         let mut v: [FourLanes; 2] = std::array::from_fn(|half| {
-            let iv = |word: usize| vdupq_n_u32(IV[word]);
-            let tail = |word: usize| veorq_u32(iv(word + 4), load(&tail[word], half));
-            let h = &h[half];
-            [
-                h[0],
-                h[1],
-                h[2],
-                h[3],
-                h[4],
-                h[5],
-                h[6],
-                h[7],
-                iv(0),
-                iv(1),
-                iv(2),
-                iv(3),
-                tail(0),
-                tail(1),
-                tail(2),
-                tail(3),
-            ]
+            let tail =
+                std::array::from_fn(|word| load(&tail[word].as_chunks::<HALF_LANES>().0[half]));
+            working(&h[half], tail)
         });
         for sigma in &SIGMA {
             let [a, b] = &mut v;
@@ -97,14 +106,79 @@ mod neon {
         for half in 0..2 {
             for word in 0..8 {
                 let mixed = veorq_u32(h[half][word], veorq_u32(v[half][word], v[half][word + 8]));
-                store(&mut state[word], half, mixed);
+                store(
+                    &mut state[word].as_chunks_mut::<HALF_LANES>().0[half],
+                    mixed,
+                );
             }
         }
     }
 
+    // The state stays in registers from one stripe to the next.
+    #[target_feature(enable = "neon")]
+    pub(super) fn compress_half(
+        state: &mut HalfWords,
+        stripes: &[[u8; LANES * BLOCK_BYTES]],
+        half: usize,
+        mut count: u64,
+    ) {
+        let mut h: [uint32x4_t; 8] = std::array::from_fn(|word| load(&state[word]));
+        for stripe in stripes {
+            count += BLOCK_BYTES as u64;
+            let (block_halves, _) = stripe.as_chunks::<{ HALF_LANES * BLOCK_BYTES }>();
+            let m = transpose_message(&block_halves[half]);
+            let mut words = [[0u32; HALF_LANES]; 16];
+            for (word, value) in words.iter_mut().zip(m) {
+                store(word, value);
+            }
+            let zero = vdupq_n_u32(0);
+            let tail = [
+                vdupq_n_u32(count as u32),
+                vdupq_n_u32((count >> 32) as u32),
+                zero,
+                zero,
+            ];
+            let mut v = working(&h, tail);
+            for sigma in &SIGMA {
+                round(&mut v, |word| load(&words[sigma[word]]));
+            }
+            for word in 0..8 {
+                h[word] = veorq_u32(h[word], veorq_u32(v[word], v[word + 8]));
+            }
+        }
+        for (word, value) in state.iter_mut().zip(h) {
+            store(word, value);
+        }
+    }
+
+    // RFC 7693 section 3.2: the chaining value, then the IV with the counter and flags folded in.
     #[target_feature(enable = "neon")]
     #[inline]
-    fn transpose_message(blocks: &[u8; VECTOR * BLOCK_BYTES]) -> FourLanes {
+    fn working(h: &[uint32x4_t; 8], tail: [uint32x4_t; 4]) -> FourLanes {
+        let iv = |word: usize| vdupq_n_u32(IV[word]);
+        [
+            h[0],
+            h[1],
+            h[2],
+            h[3],
+            h[4],
+            h[5],
+            h[6],
+            h[7],
+            iv(0),
+            iv(1),
+            iv(2),
+            iv(3),
+            veorq_u32(iv(4), tail[0]),
+            veorq_u32(iv(5), tail[1]),
+            veorq_u32(iv(6), tail[2]),
+            veorq_u32(iv(7), tail[3]),
+        ]
+    }
+
+    #[target_feature(enable = "neon")]
+    #[inline]
+    fn transpose_message(blocks: &[u8; HALF_LANES * BLOCK_BYTES]) -> FourLanes {
         let (rows, _) = blocks.as_chunks::<16>();
         let mut m = [vdupq_n_u32(0); 16];
         for group in 0..4 {
@@ -182,24 +256,24 @@ mod neon {
 
     #[target_feature(enable = "neon")]
     #[inline]
-    fn load(words: &[u32; LANES], half: usize) -> uint32x4_t {
-        let (vectors, _) = words.as_chunks::<VECTOR>();
-        // SAFETY: reads the four words of `vectors[half]`, a borrowed array.
-        unsafe { vld1q_u32(vectors[half].as_ptr()) }
+    fn load(words: &[u32; HALF_LANES]) -> uint32x4_t {
+        // SAFETY: reads the four words `words` borrows.
+        unsafe { vld1q_u32(words.as_ptr()) }
     }
 
     #[target_feature(enable = "neon")]
     #[inline]
-    fn store(words: &mut [u32; LANES], half: usize, value: uint32x4_t) {
-        let (vectors, _) = words.as_chunks_mut::<VECTOR>();
-        // SAFETY: writes the four words of `vectors[half]`, a mutably borrowed array.
-        unsafe { vst1q_u32(vectors[half].as_mut_ptr(), value) }
+    fn store(words: &mut [u32; HALF_LANES], value: uint32x4_t) {
+        // SAFETY: writes the four words `words` borrows mutably.
+        unsafe { vst1q_u32(words.as_mut_ptr(), value) }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compress, Words, BLOCK_BYTES, IV, LANES};
+    use super::{
+        compress, compress_half, join_halves, split_halves, Words, BLOCK_BYTES, IV, LANES,
+    };
 
     fn initial() -> Words {
         // Default BLAKE2s parameters: 32-byte digest, fanout 1, depth 1.
@@ -305,6 +379,50 @@ mod tests {
                 0x7F, 0x4C, 0x1D, 0xFE,
             ]
         );
+    }
+
+    #[test]
+    fn half_kernel_runs_carry_four_lanes_through_whole_stripes() {
+        const STRIPE: usize = LANES * BLOCK_BYTES;
+        let mut random = 0x2545_F491u32;
+        let data: Vec<u8> = (0..4 * STRIPE)
+            .map(|_| {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (random >> 24) as u8
+            })
+            .collect();
+        let (stripes, _) = data[..3 * STRIPE].as_chunks::<STRIPE>();
+        let [mut low, mut high] = split_halves(&initial());
+        compress_half(&mut low, &stripes[..1], 0, 0);
+        compress_half(&mut low, &stripes[1..], 0, BLOCK_BYTES as u64);
+        compress_half(&mut high, stripes, 1, 0);
+        let mut state = join_halves(&[low, high]);
+        let last_node = [false, false, true, false, true, false, false, true];
+        let lengths = [1, 17, 63, 64, 64, 3, 32, 48];
+        let mut blocks = [0; STRIPE];
+        for (lane, &len) in lengths.iter().enumerate() {
+            blocks[lane * BLOCK_BYTES..][..len]
+                .copy_from_slice(&data[3 * STRIPE + lane * BLOCK_BYTES..][..len]);
+        }
+        compress(
+            &mut state,
+            &blocks,
+            lengths.map(|len| (3 * BLOCK_BYTES + len) as u64),
+            true,
+            last_node,
+        );
+        for (lane, &len) in lengths.iter().enumerate() {
+            let mut message = Vec::new();
+            for stripe in 0..4 {
+                let block = &data[stripe * STRIPE + lane * BLOCK_BYTES..][..BLOCK_BYTES];
+                message.extend_from_slice(if stripe == 3 { &block[..len] } else { block });
+            }
+            assert_eq!(
+                digest(&state, lane),
+                expected(&message, last_node[lane]),
+                "lane {lane}"
+            );
+        }
     }
 
     #[test]
