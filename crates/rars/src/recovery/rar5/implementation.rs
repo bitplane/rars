@@ -1659,6 +1659,8 @@ fn find_inline_recovery_chunks_in(
     Ok(chunks)
 }
 
+const MARKER_SCAN_WINDOW: usize = 64 * 1024;
+
 /// The next `{RB}` at or after `from`, read in windows that overlap by three
 /// bytes so a marker across two is still found.
 fn next_recovery_marker(
@@ -1670,11 +1672,11 @@ fn next_recovery_marker(
     let mut start = from;
     while start < len {
         check_repair(control)?;
-        let end = (start + 64 * 1024 + 3).min(len);
+        let end = (start + MARKER_SCAN_WINDOW + 3).min(len);
         if let Some(offset) = find_recovery_marker(&read(start..end)?) {
             return Ok(Some(start + offset));
         }
-        start += 64 * 1024;
+        start += MARKER_SCAN_WINDOW;
     }
     Ok(None)
 }
@@ -1725,16 +1727,7 @@ fn recovery_chunk_at(
 }
 
 fn find_recovery_marker(input: &[u8]) -> Option<usize> {
-    let mut offset = 0usize;
-    while offset + 4 <= input.len() {
-        let relative = input[offset..].iter().position(|&byte| byte == b'{')?;
-        offset += relative;
-        if input.get(offset..offset + 4) == Some(b"{RB}") {
-            return Some(offset);
-        }
-        offset += 1;
-    }
-    None
+    memchr::memmem::find(input, b"{RB}")
 }
 
 fn append_inline_recovery_chunk(input: &[u8], found: &FoundInlineRecoveryChunk, out: &mut Vec<u8>) {
@@ -4896,6 +4889,42 @@ fn repair_crc(
 #[cfg(test)]
 mod repair_workspace_tests {
     use super::*;
+
+    #[test]
+    fn marker_search_finds_the_first_complete_marker() {
+        for (input, expected) in [
+            (&b""[..], None),
+            (b"{RB", None),
+            (b"{RB}", Some(0)),
+            (b"{{RB}", Some(1)),
+            (b"{RB{RB}", Some(3)),
+            (b"{RX}{R}{", None),
+            (b"ab{RA}{RB}{RB}", Some(6)),
+            (b"data{RB", None),
+            (b"data{RB}", Some(4)),
+        ] {
+            assert_eq!(find_recovery_marker(input), expected, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn marker_search_finds_a_marker_across_scan_windows() {
+        let control = crate::read_control::ReadControl::default();
+        let window = MARKER_SCAN_WINDOW;
+        for start in [window - 3, window - 1, window, 2 * window - 2] {
+            let mut input = vec![b'{'; 3 * window];
+            input[start..start + 4].copy_from_slice(b"{RB}");
+            let read = |range: std::ops::Range<usize>| Ok(input[range].to_vec());
+            assert_eq!(
+                next_recovery_marker(&read, 0, input.len(), &control),
+                Ok(Some(start))
+            );
+            assert_eq!(
+                next_recovery_marker(&read, start + 1, input.len(), &control),
+                Ok(None)
+            );
+        }
+    }
 
     #[test]
     fn a_stray_marker_claiming_a_large_chunk_is_never_read_whole() {
