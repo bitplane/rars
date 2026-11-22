@@ -650,6 +650,33 @@ pub(super) fn prepared_header_image(
     })
 }
 
+/// Keeps the prepared image's IV, so a patched header draws no entropy and matches a streamed one.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn repeated_header_image(
+    prepared: &[u8],
+    header_type: u64,
+    flags: u64,
+    data_size: Option<u64>,
+    type_specific: &[u8],
+    extra: &[u8],
+    keys: Option<&HeaderEncryptionKeys>,
+    resources: &crate::WriterResources,
+) -> Result<Bytes> {
+    let image = HeaderImage::new(header_type, flags, data_size, type_specific, extra)?;
+    let mut out = Bytes::zeroed(image.image_len(keys.is_some(), 0)?, resources)?;
+    let iv: Option<[u8; 16]> = match (keys, prepared.get(..16)) {
+        (Some(_), Some(iv)) => Some(iv.try_into().expect("sixteen bytes")),
+        _ => None,
+    };
+    image.render_into_with_iv(keys.map(|keys| &keys.keys), iv, &[], &mut out)?;
+    if out.len() != prepared.len() {
+        return Err(Error::InvalidArgument(
+            "RAR 5 header changed length when patched",
+        ));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod prepared_header_tests {
     use super::*;

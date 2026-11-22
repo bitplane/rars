@@ -2404,15 +2404,25 @@ fn write_plain_rar50_streaming(
         print_created_volumes(&paths);
         return Ok(());
     }
-    write_archive_streaming(archive_path, |mut output| {
-        rars::rar50::write_streaming_archive_with_progress(
-            &entries,
-            options,
-            extras.clone(),
-            &resources,
-            Some(progress),
-            output.writer(),
-        )?;
+    write_archive_streaming(archive_path, |output| {
+        match output {
+            ArchiveDestination::File(file) => rars::rar50::write_seekable_archive_with_progress(
+                &entries,
+                options,
+                extras.clone(),
+                &resources,
+                Some(progress),
+                file,
+            ),
+            ArchiveDestination::Pipe(pipe) => rars::rar50::write_streaming_archive_with_progress(
+                &entries,
+                options,
+                extras.clone(),
+                &resources,
+                Some(progress),
+                pipe,
+            ),
+        }?;
         Ok(())
     })?;
     progress.finish("Archive written");
@@ -2642,15 +2652,6 @@ fn write_archive_streaming(
 enum ArchiveDestination<'a> {
     File(&'a mut fs::File),
     Pipe(&'a mut dyn Write),
-}
-
-impl ArchiveDestination<'_> {
-    fn writer(&mut self) -> &mut dyn Write {
-        match self {
-            Self::File(file) => *file,
-            Self::Pipe(pipe) => *pipe,
-        }
-    }
 }
 
 /// Replaces the destination entry only after writing and syncing succeeds.

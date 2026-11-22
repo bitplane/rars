@@ -249,3 +249,103 @@ fn golden_volume_set_layout_is_stable() {
         assert_golden(&format!("stored_volume_{index}.rar"), volume);
     }
 }
+
+fn write_seekable(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: rars::rar50::ArchiveExtras<'_>,
+) -> Vec<u8> {
+    let mut output = std::io::Cursor::new(Vec::new());
+    rars::rar50::write_seekable_archive_to(
+        entries,
+        options,
+        extras,
+        &WriterResources::default(),
+        &mut output,
+    )
+    .unwrap();
+    output.into_inner()
+}
+
+#[test]
+fn seekable_stored_archives_match_the_golden_layouts() {
+    use rars::rar50::ArchiveExtras;
+    let first = deterministic_bytes(4096, 1);
+    let second = deterministic_bytes(37, 2);
+    let entries = [entry(b"first.bin", &first), entry(b"second.bin", &second)];
+    for (name, target) in [
+        ("stored_rar50.rar", ArchiveVersion::Rar50),
+        ("stored_rar70.rar", ArchiveVersion::Rar70),
+    ] {
+        assert_golden(
+            name,
+            &write_seekable(&entries, stored_options(target), ArchiveExtras::default()),
+        );
+    }
+
+    let data = deterministic_bytes(1024, 3);
+    let entries = [entry(b"payload.bin", &data)];
+    let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only());
+    let commented = ArchiveExtras::default().with_comment(b"golden archive comment");
+    assert_golden(
+        "stored_comment.rar",
+        &write_seekable(&entries, options, commented.clone()),
+    );
+    assert_golden(
+        "stored_comment_metadata.rar",
+        &write_seekable(
+            &entries,
+            options,
+            commented.with_metadata(ArchiveMetadataEntry {
+                name: Some(b"golden.rar"),
+                creation_time: Some(0x01D9_0000_0000_0000),
+            }),
+        ),
+    );
+
+    let data = deterministic_bytes(2048, 4);
+    let entries = [
+        entry(b"alpha.bin", &data),
+        entry(b"beta.bin", &data[..512]),
+        entry(b"gamma.bin", &data[..7]),
+    ];
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    assert_golden(
+        "stored_quick_open.rar",
+        &write_seekable(
+            &entries,
+            WriterOptions::new(ArchiveVersion::Rar50, features),
+            ArchiveExtras::default(),
+        ),
+    );
+}
+
+#[test]
+#[cfg(feature = "recovery")]
+fn seekable_recovery_records_match_the_golden_layouts() {
+    let data = deterministic_bytes(8192, 5);
+    let entries = [entry(b"protected.bin", &data)];
+    for percent in [1u64, 5, 10, 50] {
+        assert_golden(
+            &format!("stored_recovery_{percent}.rar"),
+            &write_seekable(
+                &entries,
+                stored_options(ArchiveVersion::Rar50),
+                rars::rar50::ArchiveExtras::default().with_recovery_percent(Some(percent)),
+            ),
+        );
+    }
+    #[cfg(feature = "encryption")]
+    {
+        let data = deterministic_bytes(300 * 1024, 6);
+        assert_golden_digest(
+            "stored_recovery_large.sha256",
+            &write_seekable(
+                &[entry(b"large.bin", &data)],
+                stored_options(ArchiveVersion::Rar50),
+                rars::rar50::ArchiveExtras::default().with_recovery_percent(Some(10)),
+            ),
+        );
+    }
+}

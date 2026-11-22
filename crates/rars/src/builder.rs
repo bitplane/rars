@@ -1191,7 +1191,11 @@ impl Builder {
         self.check_single()?;
         if self.streams_rar50() {
             let mut output = Vec::new();
-            self.write_streaming_rar50(&mut output, &WriterResources::default(), progress)?;
+            self.write_rar50(
+                SingleOutput::Stream(&mut output),
+                &WriterResources::default(),
+                progress,
+            )?;
             return Ok(output);
         }
         let mut output = Vec::new();
@@ -1249,7 +1253,7 @@ impl Builder {
     ) -> Result<()> {
         self.check_single()?;
         if self.streams_rar50() {
-            return self.write_streaming_rar50(output.writer(), resources, progress);
+            return self.write_rar50(output, resources, progress);
         }
         if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
             return Err(Error::UnsupportedFamilyFeature {
@@ -1284,7 +1288,8 @@ impl Builder {
 
     /// Write the archive to `path`, streaming where the format allows it.
     /// The completed archive replaces the destination only after writing and syncing succeed.
-    /// Large compressed RAR 2.0-4.x members stream, as a file can seek back to fill in their headers.
+    /// Large compressed RAR 2.0-4.x members stream, and RAR 5 and RAR 7 stored
+    /// members are read once, as a file can seek back to fill in their headers.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem
@@ -1734,9 +1739,9 @@ impl Builder {
         })
     }
 
-    fn write_streaming_rar50(
+    fn write_rar50(
         &self,
-        output: &mut dyn Write,
+        output: SingleOutput<'_>,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
@@ -1755,14 +1760,24 @@ impl Builder {
             };
         }
         let converted = self.rar50_entries_with_resources(resources)?;
-        rar50::write_streaming_archive_with_progress(
-            &converted.entries,
-            self.rar50_options(),
-            extras,
-            resources,
-            progress,
-            output,
-        )
+        match output {
+            SingleOutput::File(output) => rar50::write_seekable_archive_with_progress(
+                &converted.entries,
+                self.rar50_options(),
+                extras,
+                resources,
+                progress,
+                output,
+            ),
+            SingleOutput::Stream(output) => rar50::write_streaming_archive_with_progress(
+                &converted.entries,
+                self.rar50_options(),
+                extras,
+                resources,
+                progress,
+                output,
+            ),
+        }
     }
 
     fn rar15_options(&self) -> rar15_40::WriterOptions {
