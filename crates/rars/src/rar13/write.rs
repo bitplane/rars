@@ -169,7 +169,7 @@ pub(crate) fn write_archive_with_sources(
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
-    output: &mut dyn Write,
+    output: ArchiveOutput<'_>,
 ) -> Result<()> {
     let members: Vec<_> = entries
         .iter()
@@ -188,7 +188,7 @@ pub(crate) fn write_archive_with_sources(
         archive_comment,
         resources,
         progress,
-        ArchiveOutput::Stream(output),
+        output,
         STREAM_MEMBERS_ABOVE,
     )
 }
@@ -288,7 +288,7 @@ fn check_resources(resources: &WriterResources, options: WriterOptions) -> Resul
     Ok(())
 }
 
-enum ArchiveOutput<'a> {
+pub(crate) enum ArchiveOutput<'a> {
     Stream(&'a mut dyn Write),
     /// Stored members copied from a source have their checksum patched in.
     Seekable(&'a mut dyn SeekWrite),
