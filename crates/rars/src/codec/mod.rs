@@ -88,7 +88,24 @@ impl From<std::io::Error> for Error {
     }
 }
 
+/// A RAR 1.5 stream that runs out of packed data before its declared size.
+pub(crate) const RAR15_ENDED_EARLY: Error =
+    Error::InvalidData("RAR 1.5 member ended before its declared size");
+/// A RAR 2.0 stream that runs out of packed data before its declared size.
+pub(crate) const RAR20_ENDED_EARLY: Error = Error::InvalidData("RAR 2.0 bitstream is truncated");
+/// A RAR 2.9 stream that reaches its end-of-file marker before its declared
+/// size.
+pub(crate) const RAR29_ENDED_EARLY: Error =
+    Error::InvalidData("RAR 2.9 member ended before its declared size");
+
 impl Error {
+    /// Whether a member's stream ended before its declared size. What it
+    /// produced is all there is, and its checksum says whether that is the
+    /// whole file and the declared size is what is wrong.
+    pub(crate) fn ended_early(&self) -> bool {
+        [RAR15_ENDED_EARLY, RAR20_ENDED_EARLY, RAR29_ENDED_EARLY].contains(self)
+    }
+
     fn from_read_error(error: std::io::Error) -> Self {
         if error.kind() == std::io::ErrorKind::UnexpectedEof {
             Self::NeedMoreInput

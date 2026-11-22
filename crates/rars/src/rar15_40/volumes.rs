@@ -191,7 +191,7 @@ where
                         &allowance,
                     );
                 }
-                let crc = {
+                let decoded = {
                     let mut reader = packed_reader(
                         LazyChain::new(&mut walk, first_reader),
                         first,
@@ -206,7 +206,7 @@ where
                 let last = walk
                     .finish()
                     .map_err(|error| first.entry_error("extracting", error))?;
-                last.crc_result(crc, password)
+                last.decoded_result(decoded, password)
                     .map_err(|error| first.entry_error("extracting", error))
             })
         },

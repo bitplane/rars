@@ -138,16 +138,17 @@ fn invalid_flag_rank_preserves_the_table_and_match_overrun_writes_nothing() {
         .unwrap();
     assert_eq!(output, [0; 2]);
     assert_eq!(streaming.state.ch_set_c, alphabet);
-    // Empty input reads as a zero-filled match longer than the member.
+    // Empty input holds no step at all: none starts past the end.
     assert_eq!(
-        super::Unpack15::new().decode_member(&[], 1, false).unwrap(),
-        [0]
+        super::Unpack15::new().decode_member(&[], 1, false),
+        Err(crate::codec::RAR15_ENDED_EARLY)
     );
     output.clear();
-    super::Unpack15::new()
-        .decode_member_from_reader(&mut &[][..], 1, false, &mut output)
-        .unwrap();
-    assert_eq!(output, [0]);
+    assert_eq!(
+        super::Unpack15::new().decode_member_from_reader(&mut &[][..], 1, false, &mut output),
+        Err(crate::codec::RAR15_ENDED_EARLY)
+    );
+    assert!(output.is_empty());
 }
 
 #[test]
@@ -840,17 +841,20 @@ fn literal_only_encoder_follows_match_heavy_solid_history() {
 }
 
 #[test]
-fn final_input_zero_pads_missing_bits_in_both_decode_paths() {
+fn a_step_does_not_start_past_the_input_in_either_decode_path() {
     let mut decoder = Unpack15::new();
-    let direct = decoder.decode_member(&[], 8, false).unwrap();
-    assert_eq!(direct.len(), 8);
+    assert_eq!(
+        decoder.decode_member(&[], 8, false),
+        Err(crate::codec::RAR15_ENDED_EARLY)
+    );
 
     let mut decoder = Unpack15::new();
     let mut from_reader = Vec::new();
-    decoder
-        .decode_member_from_reader(&mut &[][..], 8, false, &mut from_reader)
-        .unwrap();
-    assert_eq!(from_reader, direct);
+    assert_eq!(
+        decoder.decode_member_from_reader(&mut &[][..], 8, false, &mut from_reader),
+        Err(crate::codec::RAR15_ENDED_EARLY)
+    );
+    assert!(from_reader.is_empty());
 }
 
 #[test]

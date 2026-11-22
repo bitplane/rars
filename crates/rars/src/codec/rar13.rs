@@ -12,8 +12,8 @@ pub(crate) use encoder::{unpack15_encode_with_options_and_progress, ENCODER_WORK
 mod streaming_tests;
 
 use super::packed_window::DRAINED;
-use super::workspace::{Allowance, Budget, Buffer};
-use super::{Error, Result};
+use super::workspace::{Allowance, Boxed, Budget, Buffer};
+use super::{Error, Result, RAR15_ENDED_EARLY};
 use std::io::{Read, Write};
 
 const DEC_L1: &[u16] = &[
@@ -143,6 +143,9 @@ pub(crate) struct Reader15State<B: Budget> {
     old_dist_ptr: usize,
     last_dist: u32,
     last_length: u32,
+    /// The state from where only the zero bits padding the packed data's
+    /// last byte were left, to go back to if the member runs out there.
+    tail: Option<Boxed<Reader15State<B>, B>>,
     #[cfg(all(test, feature = "write"))]
     token_stats: DecodeTokenStats,
     #[cfg(all(test, feature = "write"))]
@@ -225,6 +228,7 @@ impl<B: Budget> Reader15State<B> {
             old_dist_ptr: 0,
             last_dist: 0,
             last_length: 0,
+            tail: None,
             #[cfg(all(test, feature = "write"))]
             token_stats: DecodeTokenStats::default(),
             #[cfg(all(test, feature = "write"))]
@@ -269,6 +273,7 @@ impl<B: Budget> Reader15State<B> {
             old_dist_ptr: self.old_dist_ptr,
             last_dist: self.last_dist,
             last_length: self.last_length,
+            tail: None,
             #[cfg(all(test, feature = "write"))]
             token_stats: self.token_stats,
             #[cfg(all(test, feature = "write"))]
@@ -332,11 +337,78 @@ impl<B: Budget> Reader15State<B> {
                 drop(chunk);
                 chunk = Buffer::with_capacity(capacity, &allowance)?;
             }
-            self.decode_loop_until(chunk_target, &mut chunk, input)?;
+            let chunk_start = self.output_written;
+            if let Err(error) = self.decode_loop_until(chunk_target, &mut chunk, input) {
+                if error == RAR15_ENDED_EARLY {
+                    // The packed data holds no more of this member. Write
+                    // what it did hold, for its CRC to say whether that is
+                    // the whole file and only the declared size is wrong.
+                    self.roll_back_to_tail(&mut chunk, chunk_start);
+                    out.write_all(&chunk).map_err(Error::from)?;
+                }
+                return Err(error);
+            }
             out.write_all(&chunk).map_err(Error::from)?;
             chunk.clear();
         }
+        self.tail = None;
         Ok(())
+    }
+
+    /// Goes back to the state kept where only padding was left, for a member
+    /// whose packed data ran out before its declared size: the steps after it
+    /// decoded the padding, and the zeros read past the end, as if they were
+    /// data. Unless the bytes they wrote have already been flushed.
+    fn roll_back_to_tail(&mut self, chunk: &mut Buffer<u8, B>, chunk_start: usize) {
+        let Some(mut tail) = self.tail.take() else {
+            return;
+        };
+        let Some(keep) = tail.output_written.checked_sub(chunk_start) else {
+            return;
+        };
+        chunk.truncate(keep);
+        std::mem::swap(&mut *tail, self);
+        std::mem::swap(&mut tail.bits, &mut self.bits);
+    }
+
+    /// A copy of the state without its packed input, or none if the
+    /// workspace refuses it.
+    fn checkpoint(&mut self) -> Option<Boxed<Self, B>> {
+        let allowance = self.window.allowance();
+        let bits = std::mem::replace(&mut self.bits, ReaderBits::streaming(&allowance));
+        let saved = Boxed::try_new(|| self.try_clone(), &allowance).ok();
+        self.bits = bits;
+        saved
+    }
+
+    /// Decodes the rest of a failed member's packed data into the window
+    /// only. RAR 1.5 has no end-of-file marker, so a member whose declared
+    /// size is short of its stream would otherwise leave a solid successor
+    /// starting from the middle of it.
+    ///
+    /// The run-on is kept only if it ends cleanly, where only the zero bits
+    /// that pad the last byte are left. Damage that has thrown the decoder
+    /// out of step with the stream usually ends some other way, and then the
+    /// declared size is the better guess at where the next member starts.
+    pub(crate) fn run_on(&mut self, input: &mut impl Read) {
+        let saved = self.checkpoint();
+        let control = self.read_control.clone();
+        let src = &mut control.reader(input);
+        let mut sink = std::io::sink();
+        let clean = loop {
+            if self.bits.top_up(src).is_err() || self.bits.read_past_end() {
+                break false;
+            }
+            if self.bits.only_zero_padding_left() {
+                break true;
+            }
+            if self.decode_step(&mut sink).is_err() {
+                break false;
+            }
+        };
+        if let Some(mut saved) = saved.filter(|_| !clean) {
+            std::mem::swap(&mut *saved, self);
+        }
     }
 
     fn init_member(&mut self, target: usize, solid: bool) {
@@ -346,6 +418,7 @@ impl<B: Budget> Reader15State<B> {
         self.flag_buf = 0;
         self.st_mode = false;
         self.l_count = 0;
+        self.tail = None;
 
         if !solid {
             self.reset_non_solid();
@@ -372,9 +445,25 @@ impl<B: Budget> Reader15State<B> {
             // Bits past the end read as zeros, so the window must be topped
             // up before every step, not only when a read runs short.
             self.bits.top_up(src)?;
+            // A step may finish in those zeros, but not start in them: that
+            // would decode bytes the packed data does not hold, and leave a
+            // solid successor out of step.
+            if self.bits.exhausted() {
+                return Err(RAR15_ENDED_EARLY);
+            }
+            // From here the steps decode only zero bits: the padding, unless
+            // the member's last steps are all zeros too. Only running out
+            // before the declared size tells them apart.
+            if self.tail.is_none() && self.bits.only_zero_padding_left() {
+                self.tail = self.checkpoint();
+            }
             self.decode_step(out)?;
         }
-
+        if self.output_written == self.target && self.bits.read_past_end() {
+            // The declared size was reached only by decoding zeros past the
+            // end of the packed data.
+            return Err(RAR15_ENDED_EARLY);
+        }
         Ok(())
     }
 
@@ -743,7 +832,12 @@ impl<B: Budget> Reader15State<B> {
         } else {
             self.token_stats.literals += 1;
         }
-        self.put_byte(byte, out)?;
+        if self.output_written < self.target {
+            self.put_byte(byte, out)?;
+        } else {
+            // Past the declared size, kept only for the next solid member.
+            self.push_window(byte);
+        }
 
         let idx = byte_place as usize;
         let mut cur_byte;
@@ -955,6 +1049,23 @@ impl<B: Budget> ReaderBits<B> {
 
     fn add_bits(&mut self, count: usize) {
         self.bit_pos += count;
+    }
+
+    /// Whether every bit of the packed data has been read.
+    fn exhausted(&self) -> bool {
+        self.refill_at == DRAINED && self.bit_pos >= self.input.len() * 8
+    }
+
+    /// Whether a step has read zeros past the end of the packed data.
+    fn read_past_end(&self) -> bool {
+        self.refill_at == DRAINED && self.bit_pos > self.input.len() * 8
+    }
+
+    /// Whether all that is left of the packed data is the zero bits that pad
+    /// its last byte.
+    fn only_zero_padding_left(&self) -> bool {
+        let left = (self.input.len() * 8).saturating_sub(self.bit_pos);
+        self.refill_at == DRAINED && left < 8 && self.get_bits() >> (16 - left) == 0
     }
 }
 

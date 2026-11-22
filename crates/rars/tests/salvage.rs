@@ -303,7 +303,7 @@ fn build_rar29(method: Rar29Method) -> Vec<u8> {
 /// header.
 fn shift_declared_size(bytes: &mut [u8], index: usize, delta: i64) {
     let Archive::Rar15To40(archive) = ArchiveReader::read(bytes).unwrap() else {
-        unreachable!("a RAR 2.9 archive");
+        unreachable!("a RAR 1.5-4 archive");
     };
     let file = archive.files().nth(index).unwrap();
     let header = file.block.offset..file.block.offset + usize::from(file.block.head_size);
@@ -313,11 +313,49 @@ fn shift_declared_size(bytes: &mut [u8], index: usize, delta: i64) {
     bytes[header.start..header.start + 2].copy_from_slice(&crc.to_le_bytes());
 }
 
+/// Reads `archive`, whose member 2 has had its declared size moved by `delta`,
+/// with a handler. A declared size short of the stream cuts member 2's output
+/// there and fails it. A declared size past the end of the stream leaves the
+/// stream to end member 2, which then passes, because its CRC matches. Either
+/// way every other member is read whole.
+fn check_shifted_member_two(
+    case: &str,
+    archive: &Archive,
+    expected: &[(Vec<u8>, Vec<u8>)],
+    delta: i64,
+) {
+    let failed: &[&[u8]] = if delta < 0 { &[b"m2.txt"] } else { &[] };
+    for read in ["test", "extract"] {
+        let failures = Failures::default();
+        let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+        let options = ArchiveReadOptions::new().with_member_error_handler(&handler);
+        if read == "test" {
+            let tested = test(archive, options).unwrap();
+            for (name, _) in expected {
+                assert!(tested.contains(name), "{case} {read}: {name:?} missing");
+            }
+        } else {
+            let outputs = extract(archive, options).unwrap();
+            for (name, data) in expected {
+                let output = outputs.iter().find(|(seen, _)| seen == name);
+                let output = output.unwrap_or_else(|| panic!("{case}: {name:?} missing"));
+                let len = if name == b"m2.txt" && delta < 0 {
+                    (data.len() as i64 + delta) as usize
+                } else {
+                    data.len()
+                };
+                assert_eq!(output.1, data[..len], "{case} {read}: {name:?}");
+            }
+        }
+        assert_eq!(failures.names(), failed, "{case} {read}");
+    }
+}
+
 /// Damage in a solid RAR 2.9 member can leave its stream decoding to more
-/// bytes than it declares, or fewer. The member fails, and the next one starts
-/// from the tables, PPMd model and window at the stream's end-of-file marker,
-/// as with unrar. Editing the declared size gives the same mismatch
-/// without depending on where a flipped byte lands.
+/// bytes than it declares, or fewer. The next member starts from the tables,
+/// PPMd model and window at the stream's end-of-file marker, as with unrar.
+/// Editing the declared size gives the same mismatch without depending on
+/// where a flipped byte lands.
 #[test]
 fn a_solid_rar29_member_that_ends_away_from_its_declared_size_leaves_the_next_in_step() {
     let expected = rar29_members();
@@ -326,32 +364,35 @@ fn a_solid_rar29_member_that_ends_away_from_its_declared_size_leaves_the_next_in
     for method in [Rar29Method::Lz, Rar29Method::Ppmd] {
         let whole = build_rar29(method);
         for delta in [-1, -len * 3 / 4, 1, len / 2] {
-            let case = format!("{method:?} declared size {delta:+}");
             let mut bytes = whole.clone();
             shift_declared_size(&mut bytes, 2, delta);
             let archive = ArchiveReader::read_owned(bytes).unwrap();
-            for read in ["test", "extract"] {
-                let failures = Failures::default();
-                let handler =
-                    |member: &ArchiveMember, error: &Error| failures.handle(member, error);
-                let options = ArchiveReadOptions::new().with_member_error_handler(&handler);
-                if read == "test" {
-                    let tested = test(&archive, options).unwrap();
-                    for (name, _) in &expected {
-                        assert!(tested.contains(name), "{case} {read}: {name:?} missing");
-                    }
-                } else {
-                    let outputs = extract(&archive, options).unwrap();
-                    for (name, data) in &expected {
-                        let output = outputs.iter().find(|(seen, _)| seen == name);
-                        let output = output.unwrap_or_else(|| panic!("{case}: {name:?} missing"));
-                        if name != b"m2.txt" {
-                            assert_eq!(&output.1, data, "{case} {read}: {name:?}");
-                        }
-                    }
-                }
-                assert_eq!(failures.names(), [b"m2.txt"], "{case} {read}");
-            }
+            let case = format!("{method:?} declared size {delta:+}");
+            check_shifted_member_two(&case, &archive, &expected, delta);
+        }
+    }
+}
+
+/// RAR 1.5 and 2.0 streams have no end-of-file marker: a member's stream ends
+/// with its packed data. A member whose declared size is short of that is
+/// decoded on to the end of its packed data, into the window only, so the next
+/// solid member starts in step. RAR 2.9 does the same up to its marker.
+#[test]
+fn a_solid_member_whose_declared_size_is_wrong_leaves_the_rest_readable() {
+    let expected = members();
+    let len = expected[2].1.len() as i64;
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+    ] {
+        let whole = build(version, true);
+        for delta in [-len / 2, -10, -1, 1, 10, len / 2] {
+            let mut bytes = whole.clone();
+            shift_declared_size(&mut bytes, 2, delta);
+            let archive = ArchiveReader::read_owned(bytes).unwrap();
+            let case = format!("{version:?} declared size {delta:+}");
+            check_shifted_member_two(&case, &archive, &expected, delta);
         }
     }
 }
