@@ -1234,7 +1234,7 @@ impl Builder {
     /// directory, so its header can carry the sizes; smaller ones, and every
     /// RAR 1.3 and 1.5 member, are held in memory. Legacy stored sources are
     /// read twice to prepare and verify checksums; [`write_to_path`](Self::write_to_path)
-    /// reads RAR 1.3/1.4 ones once. Legacy managed-memory quotas are not supported.
+    /// reads them once. Legacy managed-memory quotas are not supported.
     /// On failure, `output` may contain a partial archive. Use
     /// [`write_to_path`](Self::write_to_path) for atomic file publication.
     pub fn write_to(
@@ -1289,9 +1289,9 @@ impl Builder {
 
     /// Write the archive to `path`, streaming where the format allows it.
     /// The completed archive replaces the destination only after writing and syncing succeed.
-    /// Large compressed RAR 2.0-4.x members stream, and RAR 1.3/1.4, RAR 5 and
-    /// RAR 7 stored members are read once, as a file can seek back to fill in
-    /// their headers.
+    /// Large compressed RAR 2.0-4.x members stream, and RAR 1.3 to 4.x, RAR 5
+    /// and RAR 7 stored members are read once, as a file can seek back to fill
+    /// in their headers.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem

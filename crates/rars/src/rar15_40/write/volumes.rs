@@ -323,6 +323,7 @@ pub(super) fn split_members_above(
                     options,
                     coding,
                     &mut solid_encoder,
+                    false,
                     resources,
                     &work,
                 )
@@ -341,7 +342,7 @@ pub(super) fn split_members_above(
                 unpacked_size,
                 file_crc,
                 held,
-            }) => (Some(packed), unpacked_size, method, Some(file_crc), held),
+            }) => (Some(packed), unpacked_size, method, file_crc, held),
             Some(_) => {
                 return Err(Error::WriterFailure(
                     "compressed volume member came back uncoded",
@@ -1266,8 +1267,18 @@ impl<'a> PackedStream<'a> {
         progress: Option<ProgressReporter<'a>>,
         work: Option<&'a WorkTracker<'a>>,
     ) -> Result<Self> {
+        let mut reader = bytes.open()?;
+        // An empty member is never filled, so it is checked for growth here.
+        if expected == 0 {
+            crate::write_stream::check_source_length(
+                &mut reader,
+                0,
+                0,
+                "entry source size changed while writing",
+            )?;
+        }
         Ok(Self {
-            reader: bytes.open()?,
+            reader,
             expected,
             left: expected,
             cipher: cipher.start()?,

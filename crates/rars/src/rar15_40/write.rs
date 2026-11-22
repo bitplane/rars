@@ -686,6 +686,8 @@ fn write_members_to(
 ) -> Result<()> {
     let coding = level_coding(options, coding);
     let stream_above = sink.stream_above;
+    // Stored members copied from a source have their CRC patched in.
+    let patches = sink.can_seek();
     let mut data_keys = DataKeys::default();
     let output = sink.writer();
     output.write_all(RAR15_SIGNATURE)?;
@@ -765,6 +767,7 @@ fn write_members_to(
                 options,
                 coding,
                 &mut solid_encoder,
+                patches,
                 resources,
                 progress,
             )
@@ -783,14 +786,14 @@ fn write_members_to(
                 matches!(&encoded.payload, MemberPayload::Packed(data) if !data.is_empty()),
             );
             write_member(
-                sink.writer(),
+                sink,
                 member,
                 encoded,
                 options,
                 solid_continuation,
                 header_key,
                 &mut data_keys,
-                progress.reporter(),
+                progress,
             )
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
             member.bytes.release();
@@ -831,6 +834,7 @@ fn write_members_to(
                         coding,
                         &mut None,
                         unpacked_size,
+                        patches,
                         admitted.permit,
                         resources,
                         progress,
@@ -843,14 +847,14 @@ fn write_members_to(
             |member, prepared| {
                 match prepared {
                     Prepared::Coded(encoded) => write_member(
-                        sink.writer(),
+                        sink,
                         member,
                         encoded,
                         options,
                         false,
                         header_key,
                         &mut data_keys,
-                        progress.reporter(),
+                        progress,
                     ),
                     Prepared::Streams(permit) => stream_to_sink(
                         sink,
@@ -1763,7 +1767,8 @@ struct EncodedMember<'a> {
     payload: MemberPayload<'a>,
     method: u8,
     unpacked_size: u64,
-    file_crc: u32,
+    /// `None` for a member summed as it is copied, its header patched after.
+    file_crc: Option<u32>,
     /// The budget's charge for what waits to be written, released when the
     /// member has been. A directory holds nothing and has none.
     held: Option<MemoryPermit>,
@@ -1857,6 +1862,7 @@ fn encode_member<'a>(
     options: WriterOptions,
     coding: &MemberCoding,
     solid_encoder: &mut Option<SolidEncoder>,
+    patches: bool,
     resources: &WriterResources,
     progress: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
@@ -1872,6 +1878,7 @@ fn encode_member<'a>(
         coding,
         solid_encoder,
         unpacked_size,
+        patches,
         permit,
         resources,
         progress,
@@ -1912,6 +1919,7 @@ fn encode_measured<'a>(
     coding: &MemberCoding,
     solid_encoder: &mut Option<SolidEncoder>,
     unpacked_size: u64,
+    patches: bool,
     mut held: Option<MemoryPermit>,
     resources: &WriterResources,
     progress: &WorkTracker<'_>,
@@ -1921,7 +1929,7 @@ fn encode_measured<'a>(
             payload: MemberPayload::Packed(Vec::new()),
             method: 0x30,
             unpacked_size: 0,
-            file_crc: 0,
+            file_crc: Some(0),
             held,
         });
     }
@@ -1937,14 +1945,12 @@ fn encode_measured<'a>(
         coding
     };
 
-    // A stored member never needs to be resident: checksum it from its source
-    // and let the writer copy it straight through, encrypting as it goes.
+    // A stored member never needs to be resident: the writer copies it
+    // straight through, encrypting as it goes. Its CRC is summed on the way
+    // where the header can be patched, and read ahead for where it can't.
     if let (MemberCoding::Stored, Some(source)) = (coding, member.bytes.source()) {
-        return Ok(EncodedMember {
-            payload: MemberPayload::Copied(source),
-            method: 0x30,
-            unpacked_size,
-            file_crc: {
+        let file_crc = (!patches)
+            .then(|| -> Result<u32> {
                 let mut crc = Crc32::new();
                 member.bytes.walk_exact_with_progress(
                     unpacked_size,
@@ -1954,8 +1960,14 @@ fn encode_measured<'a>(
                         progress.advance(chunk.len() as u64);
                     },
                 )?;
-                crc.finish()
-            },
+                Ok(crc.finish())
+            })
+            .transpose()?;
+        return Ok(EncodedMember {
+            payload: MemberPayload::Copied(source),
+            method: 0x30,
+            unpacked_size,
+            file_crc,
             held,
         });
     }
@@ -1981,7 +1993,7 @@ fn encode_measured<'a>(
                 payload: member.bytes.stored(),
                 method: 0x30,
                 unpacked_size,
-                file_crc,
+                file_crc: Some(file_crc),
                 held,
             })
         }
@@ -2015,7 +2027,7 @@ fn encode_measured<'a>(
         payload: MemberPayload::Packed(packed),
         method: payload.method,
         unpacked_size,
-        file_crc,
+        file_crc: Some(file_crc),
         held,
     })
 }
@@ -2821,19 +2833,32 @@ impl<R: Read + ?Sized> Read for CrcReader<'_, R> {
 /// Writes one member's header and payload, encrypting either if asked.
 #[allow(clippy::too_many_arguments)]
 fn write_member(
-    output: &mut dyn Write,
+    sink: &mut CancellableOutput<'_, '_>,
     member: &Member<'_>,
     encoded: EncodedMember<'_>,
     options: WriterOptions,
     solid_continuation: bool,
     header_key: Option<&HeaderKey>,
     data_keys: &mut DataKeys,
-    progress: Option<ProgressReporter<'_>>,
+    progress: &WorkTracker<'_>,
 ) -> Result<()> {
     // The member's charge goes once it is written.
     let _held = encoded.held;
     let target = options.target;
-    crate::write_progress::check_cancelled(progress)?;
+    let reporter = progress.reporter();
+    crate::write_progress::check_cancelled(reporter)?;
+    let Some(file_crc) = encoded.file_crc else {
+        return copy_in_place(
+            sink,
+            member,
+            encoded.unpacked_size,
+            options,
+            header_key,
+            data_keys,
+            progress,
+        );
+    };
+    let output = sink.writer();
     let (payload, salt) = match encoded.payload {
         MemberPayload::Packed(mut packed) => {
             let salt = encrypt_packed_data_with_progress(
@@ -2841,7 +2866,7 @@ fn write_member(
                 target,
                 member.password,
                 data_keys,
-                progress,
+                reporter,
             )?;
             (MemberPayload::Packed(packed), salt)
         }
@@ -2867,7 +2892,7 @@ fn write_member(
         HeaderPayload {
             method: encoded.method,
             unpacked_size: encoded.unpacked_size,
-            file_crc: encoded.file_crc,
+            file_crc,
             packed_size,
         },
     )?;
@@ -2881,11 +2906,11 @@ fn write_member(
                 &member.bytes,
                 encoded.unpacked_size,
                 &cipher,
-                progress,
+                reporter,
                 None,
             )?;
             stream.copy(packed_size, output)?;
-            if stream.unpacked_crc() != encoded.file_crc {
+            if stream.unpacked_crc() != file_crc {
                 return Err(Error::SourceChanged(
                     "entry source contents changed while writing",
                 ));
@@ -2901,7 +2926,7 @@ fn write_member(
                 },
                 packed_size,
             )?;
-            if checksum.finish() != encoded.file_crc {
+            if checksum.finish() != file_crc {
                 return Err(Error::SourceChanged(
                     "entry source contents changed while writing",
                 ));
@@ -2910,6 +2935,51 @@ fn write_member(
         }
         None => payload.write_to(output, packed_size),
     }
+}
+
+/// Patching the CRC in lets a seekable output read the source once.
+fn copy_in_place(
+    sink: &mut CancellableOutput<'_, '_>,
+    member: &Member<'_>,
+    unpacked_size: u64,
+    options: WriterOptions,
+    header_key: Option<&HeaderKey>,
+    data_keys: &mut DataKeys,
+    work: &WorkTracker<'_>,
+) -> Result<()> {
+    let Some(output) = sink.as_seekable() else {
+        return Err(Error::WriterFailure(
+            "legacy member CRC left to patch on an output that cannot seek",
+        ));
+    };
+    let cipher = volumes::CipherPlan::new(options.target, member.password, data_keys)?;
+    let mut sizes = HeaderPayload {
+        method: 0x30,
+        unpacked_size,
+        file_crc: 0,
+        packed_size: cipher.packed_len(unpacked_size)?,
+    };
+    let mut out = InPlace {
+        output,
+        member,
+        options,
+        header_key,
+        continues: false,
+        salt: None,
+        header_at: 0,
+        header_len: 0,
+    };
+    out.begin(cipher.salt(), sizes)?;
+    let mut stream = volumes::PackedStream::open(
+        &member.bytes,
+        unpacked_size,
+        &cipher,
+        work.reporter(),
+        Some(work),
+    )?;
+    stream.copy(sizes.packed_size, out.output)?;
+    sizes.file_crc = stream.unpacked_crc();
+    out.finish(sizes)
 }
 
 /// Splits one member across a volume set. No volume is longer than
@@ -3450,10 +3520,12 @@ impl SolidEncoder {
             )));
             let mut packed = 0u64;
             for member in &members[..trial] {
-                let encoded = encode_member(member, options, coding, &mut chain, resources, &quiet)
-                    .map_err(|error| {
-                        crate::write_stream::member_error(error, member.name, "preparing")
-                    })?;
+                let encoded = encode_member(
+                    member, options, coding, &mut chain, false, resources, &quiet,
+                )
+                .map_err(|error| {
+                    crate::write_stream::member_error(error, member.name, "preparing")
+                })?;
                 packed += encoded.payload.size(encoded.unpacked_size);
             }
             if best.is_none_or(|(smallest, _)| packed < smallest) {
@@ -4739,6 +4811,7 @@ mod tests {
                 ),
                 &crate::MemberCoding::Stored,
                 &mut None,
+                false,
                 &resources,
                 &work,
             ),
@@ -4807,6 +4880,7 @@ mod tests {
                         options,
                         &crate::MemberCoding::Compressed,
                         &mut None,
+                        false,
                         &resources,
                         &work,
                     )
@@ -5641,7 +5715,6 @@ mod tests {
         assert!(cancelled.1.load(Ordering::Relaxed) < large.len() as u64);
     }
 
-    #[cfg(feature = "encryption")]
     fn extracted(archive: &[u8], password: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
         extracted_set(&[archive.to_vec()], password)
     }
@@ -6191,6 +6264,191 @@ mod tests {
             })
             .collect();
         (entries, opens)
+    }
+
+    fn stored_archive(
+        entries: &[super::StreamingEntry],
+        options: super::WriterOptions,
+        seekable: bool,
+    ) -> crate::Result<Vec<u8>> {
+        let write = || {
+            let resources = crate::WriterResources::default();
+            let coding = crate::MemberCoding::Stored;
+            if seekable {
+                let mut output = std::io::Cursor::new(Vec::new());
+                super::write_seekable_archive_to(
+                    entries,
+                    options,
+                    coding,
+                    Some(b"note"),
+                    &resources,
+                    None,
+                    &mut output,
+                )
+                .map(|()| output.into_inner())
+            } else {
+                let mut output = Vec::new();
+                super::write_streaming_archive_to(
+                    entries,
+                    options,
+                    coding,
+                    Some(b"note"),
+                    &resources,
+                    None,
+                    &mut output,
+                )
+                .map(|()| output)
+            }
+        };
+        #[cfg(feature = "encryption")]
+        return crate::entropy::seeded::with(write);
+        #[cfg(not(feature = "encryption"))]
+        write()
+    }
+
+    fn stored_cases() -> Vec<(String, super::WriterOptions, Option<&'static [u8]>)> {
+        let mut cases = Vec::new();
+        for target in [
+            ArchiveVersion::Rar15,
+            ArchiveVersion::Rar20,
+            ArchiveVersion::Rar40,
+        ] {
+            let options = super::WriterOptions::new(target, FeatureSet::store_only());
+            cases.push((format!("{target:?}"), options, None));
+            #[cfg(feature = "encryption")]
+            {
+                cases.push((format!("{target:?} encrypted"), options, Some(&b"pw"[..])));
+                if target == ArchiveVersion::Rar40 {
+                    let mut headers = FeatureSet::store_only();
+                    headers.header_encryption = true;
+                    let options = super::WriterOptions::new(target, headers);
+                    cases.push((format!("{target:?} -hp"), options, Some(&b"pw"[..])));
+                }
+            }
+        }
+        cases
+    }
+
+    #[test]
+    fn a_stored_member_to_a_seekable_output_is_opened_once() {
+        let noise = noise(70_001);
+        let contents: [(&str, &[u8]); 3] = [
+            ("noise.bin", &noise),
+            ("short.txt", b"short"),
+            ("empty", b""),
+        ];
+        for (case, options, password) in stored_cases() {
+            let (entries, opens) = counted_entries(&contents);
+            let entries: Vec<_> = entries
+                .into_iter()
+                .map(|entry| match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                })
+                .collect();
+            let count = || opens.swap(0, std::sync::atomic::Ordering::Relaxed);
+
+            let seekable = stored_archive(&entries, options, true).unwrap();
+            let seekable_opens = count();
+            let streamed = stored_archive(&entries, options, false).unwrap();
+            let streamed_opens = count();
+
+            assert_eq!((seekable_opens, streamed_opens), (3, 6), "{case}");
+            assert!(seekable == streamed, "{case}: the archives differ");
+            let expected: Vec<_> = contents
+                .iter()
+                .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+                .collect();
+            assert_eq!(extracted(&seekable, password), expected, "{case}");
+        }
+    }
+
+    #[test]
+    fn a_stored_source_that_changes_length_under_a_seekable_output_is_refused() {
+        for (case, options, password) in stored_cases() {
+            for (declared, actual) in [(4096, 4000usize), (4096, 4200), (0, 1)] {
+                let entry = super::StreamingEntry::new(
+                    b"moving.bin".to_vec(),
+                    crate::EntrySource::from_opener(declared, move || {
+                        Ok(Box::new(std::io::Cursor::new(vec![1u8; actual])))
+                    }),
+                );
+                let entry = match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                };
+                let error = stored_archive(&[entry], options, true).unwrap_err();
+                assert!(
+                    matches!(error.root_cause(), crate::Error::SourceChanged(_)),
+                    "{case}, {actual}: {error:?}"
+                );
+                assert_eq!(
+                    error.entry_context(),
+                    Some((&b"moving.bin"[..], "writing")),
+                    "{case}, {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_level_0_solid_member_to_a_seekable_output_is_opened_once() {
+        let noise = noise(70_001);
+        let contents: [(&str, &[u8]); 2] = [("noise.bin", &noise), ("short.txt", b"short")];
+        for target in [ArchiveVersion::Rar20, ArchiveVersion::Rar40] {
+            let mut features = FeatureSet::store_only();
+            features.solid = true;
+            let options = super::WriterOptions::new(target, features).with_compression_level(0);
+            let (entries, opens) = counted_entries(&contents);
+            let mut output = std::io::Cursor::new(Vec::new());
+            super::write_seekable_archive_to(
+                &entries,
+                options,
+                crate::MemberCoding::Compressed,
+                None,
+                &crate::WriterResources::default(),
+                None,
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(
+                opens.load(std::sync::atomic::Ordering::Relaxed),
+                2,
+                "{target:?}"
+            );
+            let expected: Vec<_> = contents
+                .iter()
+                .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+                .collect();
+            assert_eq!(
+                extracted(&output.into_inner(), None),
+                expected,
+                "{target:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_source_whose_contents_change_between_reads_to_a_stream_is_refused() {
+        for (case, options, password) in stored_cases() {
+            let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entry = super::StreamingEntry::new(
+                b"moving.bin".to_vec(),
+                crate::EntrySource::from_opener(4096, move || {
+                    let fill = opened.fetch_add(1, std::sync::atomic::Ordering::Relaxed) as u8;
+                    Ok(Box::new(std::io::Cursor::new(vec![fill; 4096])))
+                }),
+            );
+            let entry = match password {
+                Some(password) => entry.with_password(password.to_vec()),
+                None => entry,
+            };
+            let error = stored_archive(&[entry], options, false).unwrap_err();
+            assert!(
+                matches!(error.root_cause(), crate::Error::SourceChanged(_)),
+                "{case}: {error:?}"
+            );
+        }
     }
 
     fn volume_set(
@@ -6869,6 +7127,7 @@ mod tests {
                     options,
                     &crate::MemberCoding::Stored,
                     &mut None,
+                    false,
                     &resources,
                     &work,
                 )
@@ -6942,9 +7201,10 @@ mod tests {
             assert!(matches!(coding, crate::MemberCoding::Stored), "{target:?}");
             let resources = crate::WriterResources::default();
             let work = super::WorkTracker::new(None, crate::WriteOperation::Compression, u64::MAX);
-            let encoded =
-                super::encode_member(&member, options, coding, &mut None, &resources, &work)
-                    .unwrap();
+            let encoded = super::encode_member(
+                &member, options, coding, &mut None, false, &resources, &work,
+            )
+            .unwrap();
             let super::MemberPayload::Borrowed(bytes) = encoded.payload else {
                 panic!("{target:?}: a level 0 member was copied");
             };
@@ -6993,6 +7253,7 @@ mod tests {
                     options,
                     &crate::MemberCoding::Compressed,
                     &mut None,
+                    false,
                     &resources,
                     &work,
                 )
@@ -7017,14 +7278,14 @@ mod tests {
                 assert_eq!(resources.workspace_in_use(), held, "{case}");
                 let mut out = Vec::new();
                 super::write_member(
-                    &mut out,
+                    &mut super::CallerOutput::stream(&mut out).cancellable(None),
                     &member,
                     encoded,
                     options,
                     false,
                     None,
                     &mut super::DataKeys::default(),
-                    None,
+                    &work,
                 )
                 .unwrap();
                 assert_eq!(resources.workspace_in_use(), 0, "{case}");
