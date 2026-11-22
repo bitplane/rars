@@ -17,7 +17,7 @@ pub use crate::streaming::EntrySource;
 use crate::streaming::{MemoryPermit, WriterResources};
 use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::write_stream::{MemberBytes, MemberPayload};
+use crate::write_stream::{MemberBytes, MemberPayload, SeekWrite};
 use crate::FeatureSet;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -453,10 +453,6 @@ fn write_seekable_archive_with_threshold(
         None,
     )
 }
-
-pub(crate) trait SeekWrite: Write + Seek {}
-
-impl<T: Write + Seek + ?Sized> SeekWrite for T {}
 
 pub(crate) enum ArchiveOutput<'a> {
     /// Members larger than `spool_above` are coded into a temporary spool, so
