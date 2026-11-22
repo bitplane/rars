@@ -248,6 +248,10 @@ pub(super) fn write_archive<'a>(
     // A seekable archive lets stored members be read once and their headers
     // patched. Every member is stored, so none is read before it is copied.
     let hash_on_copy = sink.can_seek() && plan.compress.method == 0;
+    // Members go out as their windows finish unless the main header has to
+    // locate blocks after them. Stored members hashed on their copy already
+    // go out in one pass.
+    let in_order = !hash_on_copy && !plan.quick_open && plan.recovery_percent.is_none();
     for entry in entries {
         super::validate_entry(entry)?;
     }
@@ -283,113 +287,6 @@ pub(super) fn write_archive<'a>(
         crate::WriteOperation::Compression,
         total_input,
     );
-    let compress = if hash_on_copy {
-        compress::compress_members_hashing_stored_later
-    } else {
-        compress::compress_members_with_context
-    };
-    let compressed = compress(
-        &sources,
-        &plan.compress,
-        resources,
-        &MemberProgress {
-            entries,
-            work: &work,
-        },
-        &|index, error| member_error(error, &entries[index].name, "compressing"),
-    )?;
-
-    // Everything between the main header and the quick-open block, in order.
-    // Entries and their owned service vectors contain records larger than a byte
-    // in disjoint live storage. Their combined count fits usize, including
-    // the producer record and optional archive comment. This relies on services
-    // being owned vectors, rather than shared lists counted repeatedly.
-    let block_count = entries.iter().fold(
-        1 + usize::from(plan.archive_comment.is_some()),
-        |total, entry| total + 1 + entry.services.len(),
-    );
-    let mut blocks = Records::<PreparedBlock>::new(block_count, resources)?;
-    blocks.push(producer_block(header_keys.as_ref(), resources)?)?;
-    if let Some(comment) = &plan.archive_comment {
-        blocks.push(prepare_comment(
-            comment,
-            &mut write_keys,
-            header_keys.as_ref(),
-            resources,
-        )?)?;
-    }
-    for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
-        check_cancelled(plan.progress)?;
-        let mut block = prepare_member(
-            entry,
-            member,
-            &plan,
-            hash_on_copy,
-            &mut write_keys,
-            header_keys.as_ref(),
-            resources,
-        )
-        .map_err(|error| member_error(error, &entry.name, "preparing"))?;
-        block.entry_index = Some(index);
-        blocks.push(block)?;
-        for service in &entry.services {
-            let mut block =
-                prepare_service(service, &mut write_keys, header_keys.as_ref(), resources)
-                    .map_err(|error| member_error(error, &entry.name, "preparing service"))?;
-            block.entry_index = Some(index);
-            blocks.push(block)?;
-        }
-    }
-    if !work.finish() {
-        return Err(Error::Cancelled);
-    }
-    if let Some(progress) = plan.progress {
-        progress.report(crate::WriteProgressEvent::OperationFinished {
-            operation: crate::WriteOperation::Compression,
-            total_bytes: Some(total_input),
-            total_entries: Some(total_entries),
-            pass: 1,
-        });
-    }
-
-    let body_len = blocks.iter().try_fold(0u64, |total, block| {
-        total
-            .checked_add(block.len()?)
-            .ok_or(Error::InvalidArgument("RAR 5 archive body size overflows"))
-    })?;
-
-    // Quick-open stores how far back each cached header sits from the
-    // quick-open block itself. Both move together when the prefix grows, so
-    // the distances only need positions within the body.
-    let quick_open_payload = if plan.quick_open {
-        let mut payload = Spool::create(resources)?;
-        let mut checksum = crate::crc32::Crc32::new();
-        let mut offset = 0u64;
-        for block in blocks.iter_mut() {
-            check_cancelled(plan.progress)?;
-            if block.quick_open_cached {
-                let distance = body_len - offset;
-                if block.patch.is_some() {
-                    block.quick_open_record = Some((payload.len(), distance));
-                }
-                append_quick_open_entry(&mut payload, &mut checksum, distance, &block.header)?;
-            }
-            offset += block.len()?;
-        }
-        let payload_len = payload.len();
-        let header = stored_service_header(
-            b"QO",
-            payload_len,
-            checksum.finish(),
-            &[],
-            header_keys.as_ref(),
-            resources,
-        )?;
-        payload.park();
-        Some((header, payload))
-    } else {
-        None
-    };
 
     let head_crypt = match &header_keys {
         Some(keys) => {
@@ -399,7 +296,6 @@ pub(super) fn write_archive<'a>(
         }
         None => Bytes::new(resources),
     };
-
     let mut main_flags = if plan.locked {
         crate::rar50::MHFL_LOCKED
     } else {
@@ -411,76 +307,42 @@ pub(super) fn write_archive<'a>(
     if plan.recovery_percent.is_some() {
         main_flags |= MHFL_RECOVERY;
     }
+    let layout_inputs = |body_len, quick_open_payload_len| LayoutInputs {
+        header_encrypted: plan.header_encrypted,
+        head_crypt_len: head_crypt.len() as u64,
+        main_flags,
+        volume_number: None,
+        archive_metadata: plan.archive_metadata,
+        metadata_record: plan.metadata_record,
+        body_len,
+        quick_open_payload_len,
+        recovery_percent: plan.recovery_percent,
+    };
 
-    let layout = resolve_layout(
-        &LayoutInputs {
-            header_encrypted: plan.header_encrypted,
-            head_crypt_len: head_crypt.len() as u64,
-            main_flags,
-            volume_number: None,
-            archive_metadata: plan.archive_metadata,
-            metadata_record: plan.metadata_record,
-            body_len,
-            quick_open_payload_len: quick_open_payload
-                .as_ref()
-                .map(|(_, payload)| payload.len()),
-            recovery_percent: plan.recovery_percent,
-        },
-        resources,
-    )?;
-
-    report_emission(plan.progress, true);
     // Only mirror the archive when a recovery record has to read it back.
     let mut mirror = match plan.recovery_percent {
         Some(_) => Some(Spool::create(resources)?),
         None => None,
     };
-    let main = match &header_keys {
-        Some(keys) => encrypted_main_header_block(
-            &keys.keys,
-            main_flags,
-            None,
-            &layout.main_extra,
-            resources,
-        )?,
-        None => {
-            let mut main = Bytes::new(resources);
-            write_main_header(&mut main, main_flags, None, &layout.main_extra, resources)?;
-            main
-        }
-    };
-    // The layout predicted this before any of it existed. If the
-    // prediction is off, every offset in the locator is off with it.
-    debug_assert_eq!(
-        main.len() as u64,
-        layout.main_header_len,
-        "main header size differs from the size its layout was built on"
-    );
-    {
-        let mut tee = Tee {
-            output: sink.writer(),
-            mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
-        };
-        tee.write_all(RAR50_SIGNATURE)?;
-        tee.write_all(&head_crypt)?;
-        tee.write_all(&main)?;
-    }
-
-    let mut quick_open_payload = quick_open_payload;
-    let mut quick_open_patched = false;
     // Members hashed on their copy report it here, as compression skipped them.
     let copy_work = WorkTracker::new(
         plan.progress,
         crate::WriteOperation::Emission,
         if hash_on_copy { total_input } else { 0 },
     );
-    for block in blocks {
+    let mut quick_open_payload = None;
+    let mut quick_open_patched = false;
+    let mut emit = |block: PreparedBlock<'_>,
+                    sink: &mut CancellableOutput<'_, '_>,
+                    mirror: &mut Option<Spool>,
+                    quick_open_payload: &mut Option<(PreparedHeader, Spool)>|
+     -> Result<()> {
         let entry_index = block.entry_index;
         let result = emit_block(
             block,
             entries,
-            &mut sink,
-            &mut mirror,
+            sink,
+            mirror,
             quick_open_payload.as_mut().map(|(_, payload)| payload),
             header_keys.as_ref(),
             resources,
@@ -488,10 +350,192 @@ pub(super) fn write_archive<'a>(
             &copy_work,
         );
         quick_open_patched |= result.as_ref().is_ok_and(|patched| *patched);
-        result.map_err(|error| match entry_index {
+        result.map(|_| ()).map_err(|error| match entry_index {
             Some(index) => member_error(error, &entries[index].name, "writing"),
             None => error,
+        })
+    };
+
+    let mut leading = Records::<PreparedBlock>::new(2, resources)?;
+    leading.push(producer_block(header_keys.as_ref(), resources)?)?;
+    if let Some(comment) = &plan.archive_comment {
+        leading.push(prepare_comment(
+            comment,
+            &mut write_keys,
+            header_keys.as_ref(),
+            resources,
+        )?)?;
+    }
+    // Drawn here whether the main header goes out before the members or after,
+    // so a seekable and a stream output draw in the same order.
+    let main_iv = header_keys.as_ref().map(|_| fresh_iv()).transpose()?;
+    // Written in front of the first member, so a write that stops before any
+    // member is ready leaves the output untouched.
+    let begin = |sink: &mut CancellableOutput<'_, '_>, mirror: &mut Option<Spool>| {
+        report_emission(plan.progress, true);
+        let layout = resolve_layout(&layout_inputs(0, None), resources)?;
+        write_archive_head(
+            sink,
+            main_iv,
+            mirror,
+            &head_crypt,
+            &layout.main_extra,
+            layout.main_header_len,
+            main_flags,
+            header_keys.as_ref(),
+            resources,
+        )
+    };
+    // Everything between the main header and the quick-open block, in order,
+    // held only while the main header waits for its length. Entries and their
+    // owned service vectors contain records larger than a byte in disjoint
+    // live storage, so their combined count fits usize.
+    let (mut held, mut leading) = if in_order {
+        (None, Some(leading))
+    } else {
+        let block_count = entries.iter().fold(leading.len(), |total, entry| {
+            total + 1 + entry.services.len()
+        });
+        let mut held = Records::<PreparedBlock>::new(block_count, resources)?;
+        for block in leading {
+            held.push(block)?;
+        }
+        (Some(held), None)
+    };
+
+    compress::compress_members_in_order(
+        &sources,
+        &plan.compress,
+        resources,
+        &MemberProgress {
+            entries,
+            work: &work,
+        },
+        &|index, error| member_error(error, &entries[index].name, "compressing"),
+        hash_on_copy,
+        &mut |index, member| {
+            check_cancelled(plan.progress)?;
+            let entry = &entries[index];
+            // A member and its services are all prepared before any goes out.
+            let mut blocks = Records::<PreparedBlock>::new(1 + entry.services.len(), resources)?;
+            let block = prepare_member(
+                entry,
+                member,
+                &plan,
+                hash_on_copy,
+                &mut write_keys,
+                header_keys.as_ref(),
+                resources,
+            )
+            .map_err(|error| member_error(error, &entry.name, "preparing"))?;
+            blocks.push(block)?;
+            for service in &entry.services {
+                let block =
+                    prepare_service(service, &mut write_keys, header_keys.as_ref(), resources)
+                        .map_err(|error| member_error(error, &entry.name, "preparing service"))?;
+                blocks.push(block)?;
+            }
+            for mut block in blocks {
+                block.entry_index = Some(index);
+                match held.as_mut() {
+                    Some(held) => held.push(block)?,
+                    None => {
+                        if let Some(leading) = leading.take() {
+                            begin(&mut sink, &mut mirror)?;
+                            for block in leading {
+                                emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
+                            }
+                        }
+                        emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    if let Some(progress) = plan.progress {
+        progress.report(crate::WriteProgressEvent::OperationFinished {
+            operation: crate::WriteOperation::Compression,
+            total_bytes: Some(total_input),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
+    }
+    // An archive without members.
+    if let Some(leading) = leading {
+        begin(&mut sink, &mut mirror)?;
+        for block in leading {
+            emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
+        }
+    }
+
+    let mut layout = None;
+    if let Some(mut blocks) = held {
+        let body_len = blocks.iter().try_fold(0u64, |total, block| {
+            total
+                .checked_add(block.len()?)
+                .ok_or(Error::InvalidArgument("RAR 5 archive body size overflows"))
         })?;
+
+        // Quick-open stores how far back each cached header sits from the
+        // quick-open block itself. Both move together when the prefix grows, so
+        // the distances only need positions within the body.
+        if plan.quick_open {
+            let mut payload = Spool::create(resources)?;
+            let mut checksum = crate::crc32::Crc32::new();
+            let mut offset = 0u64;
+            for block in blocks.iter_mut() {
+                check_cancelled(plan.progress)?;
+                if block.quick_open_cached {
+                    let distance = body_len - offset;
+                    if block.patch.is_some() {
+                        block.quick_open_record = Some((payload.len(), distance));
+                    }
+                    append_quick_open_entry(&mut payload, &mut checksum, distance, &block.header)?;
+                }
+                offset += block.len()?;
+            }
+            let payload_len = payload.len();
+            let header = stored_service_header(
+                b"QO",
+                payload_len,
+                checksum.finish(),
+                &[],
+                header_keys.as_ref(),
+                resources,
+            )?;
+            payload.park();
+            quick_open_payload = Some((header, payload));
+        }
+
+        let resolved = resolve_layout(
+            &layout_inputs(
+                body_len,
+                quick_open_payload
+                    .as_ref()
+                    .map(|(_, payload)| payload.len()),
+            ),
+            resources,
+        )?;
+        report_emission(plan.progress, true);
+        write_archive_head(
+            &mut sink,
+            main_iv,
+            &mut mirror,
+            &head_crypt,
+            &resolved.main_extra,
+            resolved.main_header_len,
+            main_flags,
+            header_keys.as_ref(),
+            resources,
+        )?;
+        for block in blocks {
+            emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
+        }
+        layout = Some(resolved);
     }
 
     if let Some((prepared, mut payload)) = quick_open_payload {
@@ -531,6 +575,9 @@ pub(super) fn write_archive<'a>(
     let output = sink.writer();
     if let Some(recovery_percent) = plan.recovery_percent {
         let mirror = mirror.as_mut().expect("recovery mirrors the archive");
+        let layout = layout
+            .as_ref()
+            .expect("recovery holds members for the layout");
         // The recovery block has to start exactly where the locator in the
         // main header says it does.
         debug_assert_eq!(layout.recovery_prefix_len, Some(mirror.len()));
@@ -568,6 +615,46 @@ pub(super) fn write_archive<'a>(
     }
     check_cancelled(plan.progress)?;
     report_emission(plan.progress, false);
+    Ok(())
+}
+
+/// The signature, any encryption header and the main header.
+#[allow(clippy::too_many_arguments)]
+fn write_archive_head(
+    sink: &mut CancellableOutput<'_, '_>,
+    main_iv: Option<[u8; 16]>,
+    mirror: &mut Option<Spool>,
+    head_crypt: &[u8],
+    main_extra: &[u8],
+    main_header_len: u64,
+    main_flags: u64,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+) -> Result<()> {
+    let main = match header_keys {
+        Some(keys) => encrypted_main_header_block(
+            &keys.keys, main_iv, main_flags, None, main_extra, resources,
+        )?,
+        None => {
+            let mut main = Bytes::new(resources);
+            write_main_header(&mut main, main_flags, None, main_extra, resources)?;
+            main
+        }
+    };
+    // The layout predicted this before any of it existed. If the
+    // prediction is off, every offset in the locator is off with it.
+    debug_assert_eq!(
+        main.len() as u64,
+        main_header_len,
+        "main header size differs from the size its layout was built on"
+    );
+    let mut tee = Tee {
+        output: sink.writer(),
+        mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
+    };
+    tee.write_all(RAR50_SIGNATURE)?;
+    tee.write_all(head_crypt)?;
+    tee.write_all(&main)?;
     Ok(())
 }
 
@@ -2249,6 +2336,7 @@ impl VolumeWriter<'_> {
             let main = match self.header_keys {
                 Some(keys) => encrypted_main_header_block(
                     &keys.keys,
+                    None,
                     main_flags,
                     stored_number,
                     &layout.main_extra,
@@ -2942,14 +3030,23 @@ mod emission_ledger_tests {
                         CallerOutput::stream(&mut output),
                     )
                     .unwrap_err();
-                    assert!(output.is_empty());
+                    if empty {
+                        assert!(output.is_empty());
+                    } else {
+                        // The member went out as it finished; the archive was
+                        // never closed.
+                        let mut end = Bytes::new(&resources);
+                        write_end_header(&mut end, 0, &resources).unwrap();
+                        assert!(!output.is_empty() && !output.ends_with(&end));
+                    }
                     error
                 };
                 assert_eq!(error, Error::Cancelled);
                 assert!(progress.armed.load(Ordering::Relaxed));
                 assert!(progress.cancelled.load(Ordering::Relaxed));
                 assert!(!progress.finished.load(Ordering::Relaxed));
-                assert!(!progress.emitted.load(Ordering::Relaxed));
+                let wrote_member = !volumes && !empty;
+                assert_eq!(progress.emitted.load(Ordering::Relaxed), wrote_member);
                 assert_eq!(resources.workspace_in_use(), 0);
                 assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
             }
@@ -4241,7 +4338,7 @@ mod stored_pipe_tests {
             ("quick_open", "2570524:8e585393f60e0b4d"),
             ("recovery", "2715543:e2c41f112ff34c56"),
             ("encrypted", "2570414:095fdfd7c4ea3e13"),
-            ("encrypted_headers", "2570602:4864d1044ce10dd8"),
+            ("encrypted_headers", "2570602:6261c6bdeaa4b8b7"),
         ];
         let actual: Vec<_> = cases
             .iter()
@@ -4367,7 +4464,7 @@ mod stored_pipe_tests {
             ),
         ];
         let expected = [
-            ("seekable", "2570602:93084858"),
+            ("seekable", "2570602:d156fdb9"),
             (
                 "volumes",
                 "1000000:2813d873 1000000:a39861c1 571262:ce3e9274",

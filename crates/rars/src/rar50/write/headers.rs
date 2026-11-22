@@ -126,8 +126,18 @@ impl HeaderImage<'_> {
         data: &[u8],
         resources: &WriterResources,
     ) -> Result<Bytes> {
+        self.render_with_iv(keys, None, data, resources)
+    }
+
+    fn render_with_iv(
+        &self,
+        keys: Option<&Rar50Keys>,
+        iv: Option<[u8; 16]>,
+        data: &[u8],
+        resources: &WriterResources,
+    ) -> Result<Bytes> {
         let mut out = Bytes::zeroed(self.image_len(keys.is_some(), data.len())?, resources)?;
-        self.render_into(keys, data, &mut out)?;
+        self.render_into_with_iv(keys, iv, data, &mut out)?;
         Ok(out)
     }
 }
@@ -452,8 +462,11 @@ pub(super) fn write_main_header(
     )
 }
 
+/// `iv` is drawn by the caller when the header has to keep its place among
+/// the archive's draws but is rendered after them.
 pub(super) fn encrypted_main_header_block(
     keys: &Rar50Keys,
+    iv: Option<[u8; 16]>,
     archive_flags: u64,
     volume_number: Option<u64>,
     extra: &[u8],
@@ -464,16 +477,14 @@ pub(super) fn encrypted_main_header_block(
     if let Some(volume_number) = volume_number {
         specific.vint(volume_number);
     }
-    encrypted_header_block(
-        keys,
+    HeaderImage::new(
         HEAD_MAIN,
         if extra.is_empty() { 0 } else { HFL_EXTRA },
         None,
         specific.as_slice(),
         extra,
-        &[],
-        resources,
-    )
+    )?
+    .render_with_iv(Some(keys), iv, &[], resources)
 }
 
 pub(crate) struct HeaderEncryptionKeys {

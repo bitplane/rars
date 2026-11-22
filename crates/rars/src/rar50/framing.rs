@@ -123,17 +123,7 @@ impl<'a> HeaderImage<'a> {
 
     /// Render into a zeroed buffer of exactly `image_len` bytes. Allocation and
     /// admission belong to the caller; salts, framing and encryption are shared.
-    pub(crate) fn render_into(
-        &self,
-        keys: Option<&Rar50Keys>,
-        data: &[u8],
-        out: &mut [u8],
-    ) -> Result<()> {
-        self.render_into_with_iv(keys, None, data, out)
-    }
-
-    /// As [`render_into`](Self::render_into), encrypting under `iv` when one
-    /// is given rather than drawing a fresh one.
+    /// A fresh IV is drawn when `iv` is `None`.
     pub(crate) fn render_into_with_iv(
         &self,
         keys: Option<&Rar50Keys>,
