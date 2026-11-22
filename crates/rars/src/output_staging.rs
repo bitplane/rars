@@ -91,6 +91,45 @@ impl ExtractionStaging {
     }
 }
 
+/// What makes two output paths the same file: the inode on Unix, the
+/// resolved path elsewhere.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[cfg_attr(unix, derive(Copy))]
+pub struct FileIdentity(#[cfg(unix)] (u64, u64), #[cfg(not(unix))] PathBuf);
+
+impl FileIdentity {
+    /// The identity of what `path` names, following a final symlink.
+    pub fn of(path: &Path) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = fs::metadata(path)?;
+            Ok(Self((metadata.dev(), metadata.ino())))
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self(fs::canonicalize(path)?))
+        }
+    }
+
+    /// The identity of a path [`ExtractionStaging::reject_alias`] resolved.
+    pub fn resolved(resolved: PathBuf) -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Self::of(&resolved)
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self(resolved))
+        }
+    }
+
+    #[cfg(unix)]
+    pub fn from_inode(device: u64, inode: u64) -> Self {
+        Self((device, inode))
+    }
+}
+
 /// Whether `path` certainly does not exist, so resolving it can only fail:
 /// one lstat instead of resolving every component to learn the same. Other
 /// errors are left for `canonicalize` to report. On Windows a failed resolve
