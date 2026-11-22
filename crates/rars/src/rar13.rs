@@ -223,7 +223,16 @@ fn cut_member(rest: &[u8], offset: usize) -> Truncation {
         .get(19)
         .and_then(|&size| rest.get(FILE_HEAD_BASE_SIZE..FILE_HEAD_BASE_SIZE + usize::from(size)))
         .unwrap_or_default();
-    Truncation::new(offset, TruncatedBlock::Member(name.to_vec()), true)
+    Truncation::new(
+        offset,
+        TruncatedBlock::Member(c_string(name).to_vec()),
+        true,
+    )
+}
+
+/// The bytes before the first NUL.
+fn c_string(bytes: &[u8]) -> &[u8] {
+    bytes.split(|&byte| byte == 0).next().unwrap_or_default()
 }
 
 impl FileHeader {
@@ -253,7 +262,8 @@ impl FileHeader {
             return Err(Error::TooShort);
         }
 
-        let name = input[FILE_HEAD_BASE_SIZE..FILE_HEAD_BASE_SIZE + name_size].to_vec();
+        // A C string, as UnRAR reads it: the name ends at its first NUL.
+        let name = c_string(&input[FILE_HEAD_BASE_SIZE..minimum_size]).to_vec();
         let extra = input[minimum_size..head_size as usize].to_vec();
         Ok((
             Self {
@@ -887,6 +897,16 @@ impl Entry {
         self.header.flags & LHD_PASSWORD != 0
     }
 
+    /// An encrypted member with nothing in it: no data and the checksum of
+    /// no data. Every key decrypts it to the same nothing, so without a
+    /// password it still passes.
+    fn is_empty_without_key(&self, password: Option<&[u8]>) -> bool {
+        password.is_none()
+            && self.is_encrypted()
+            && self.header.unp_size == 0
+            && self.header.file_crc == Rar13Checksum::new().finish()
+    }
+
     pub fn is_split_before(&self) -> bool {
         self.header.flags & LHD_SPLIT_BEFORE != 0
     }
@@ -965,6 +985,9 @@ impl Entry {
         out: &mut impl Write,
         allowance: &B,
     ) -> Result<()> {
+        if self.is_empty_without_key(password) {
+            return Ok(());
+        }
         let source = archive.range_reader(self.packed_range.clone())?;
         let mut reader = if self.is_encrypted() {
             crate::crypto::require_encryption()?;
@@ -1005,7 +1028,7 @@ impl Entry {
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
-        if self.is_stored() {
+        if self.is_stored() || self.is_empty_without_key(password) {
             return self.write_stored_to(archive, password, out, &unpack15.allowance);
         }
         let mut checksum = Rar13Checksum::new();

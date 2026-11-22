@@ -292,6 +292,21 @@ impl FileHeader {
         self.block.flags & FHD_PASSWORD != 0
     }
 
+    /// An encrypted member with nothing in it: no data and the CRC of no
+    /// data. RAR 1.5-4 keeps no password check, and every key decrypts this
+    /// member to the same nothing, so without a password it still passes.
+    pub(crate) fn is_empty_without_key(&self, password: Option<&[u8]>) -> bool {
+        password.is_none() && self.is_encrypted() && self.unp_size == 0 && self.file_crc == 0
+    }
+
+    /// Whether [`Self::name`] came from a well-formed Unicode name field
+    /// rather than the unspecified legacy bytes.
+    pub fn name_is_unicode(&self) -> bool {
+        self.unicode_name
+            .as_deref()
+            .is_some_and(unicode_field_decodes)
+    }
+
     pub fn is_solid(&self) -> bool {
         self.block.flags & FHD_SOLID != 0
     }
@@ -450,7 +465,7 @@ impl FileHeader {
 
     pub fn metadata(&self) -> ExtractedEntryMeta {
         ExtractedEntryMeta {
-            name_is_unicode: self.unicode_name.is_some(),
+            name_is_unicode: self.name_is_unicode(),
             name: self.name.clone(),
             file_time: self.file_time,
             mtime_refinement: self.mtime_refinement(),
@@ -487,6 +502,9 @@ impl FileHeader {
             return Err(Error::InvalidHeader(
                 "RAR 1.5 stored file has mismatched packed and unpacked sizes",
             ));
+        }
+        if self.is_empty_without_key(password) {
+            return Ok(());
         }
         let mut reader = self
             .packed_reader_with_allowance(archive, password, allowance)
@@ -2892,7 +2910,9 @@ fn parse_file_like_header(
 
 #[cfg(any(test, feature = "write"))]
 pub(crate) fn validate_unicode_name(raw: &[u8], decoded: &[u8]) -> Result<()> {
-    if decode_file_name(raw, FHD_UNICODE) != decoded || std::str::from_utf8(decoded).is_err() {
+    if decode_unicode_field(raw).as_deref() != Some(decoded)
+        || std::str::from_utf8(decoded).is_err()
+    {
         return Err(Error::InvalidArgument("invalid legacy Unicode filename"));
     }
     crate::filename::validate_relative(decoded)?;
@@ -2902,25 +2922,51 @@ pub(crate) fn validate_unicode_name(raw: &[u8], decoded: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// The member name a header's name field gives.
+///
+/// The field is a C string: the name ends at its first NUL, as UnRAR reads it.
+/// With `FHD_UNICODE`, the bytes after that NUL encode the Unicode name. When
+/// they are malformed the member keeps its legacy name, raw, rather than a
+/// name made from the damaged field.
 pub(crate) fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
-    if flags & FHD_UNICODE == 0 {
-        return raw.to_vec();
+    if flags & FHD_UNICODE != 0 {
+        if let Some(name) = decode_unicode_field(raw) {
+            return name;
+        }
     }
+    legacy_name_part(raw).to_vec()
+}
 
+/// Whether a name field with `FHD_UNICODE` set gives its member a Unicode name.
+pub(crate) fn unicode_field_decodes(raw: &[u8]) -> bool {
+    decode_unicode_field(raw).is_some()
+}
+
+/// The legacy (OEM) name: the field up to its first NUL.
+fn legacy_name_part(raw: &[u8]) -> &[u8] {
+    raw.split(|byte| *byte == 0).next().unwrap_or_default()
+}
+
+/// Decodes an `FHD_UNICODE` name field to UTF-8, or `None` when its Unicode
+/// part is malformed: a command cut short, a copy run past the legacy name, a
+/// control character (NUL included) or unpaired surrogate in the result, no
+/// characters at all, or too few to give the legacy name.
+///
+/// WinRAR writes this field from a Windows name, which holds no control
+/// characters, and makes the legacy name from it in a code page that spends
+/// at most three bytes on a UTF-16 unit. Damaged and third-party archives
+/// carry junk here instead.
+fn decode_unicode_field(raw: &[u8]) -> Option<Vec<u8>> {
     let Some(zero_pos) = raw.iter().position(|byte| *byte == 0) else {
-        return raw.to_vec();
+        // A field without a NUL is the name itself, in UTF-8.
+        return (!raw.is_empty()).then(|| raw.to_vec());
     };
-    if zero_pos + 1 >= raw.len() {
-        return raw[..zero_pos].to_vec();
-    }
-
     let fallback = &raw[..zero_pos];
-    let high_byte = raw[zero_pos + 1];
+    let high_byte = *raw.get(zero_pos + 1)?;
     let encoded = &raw[zero_pos + 2..];
     let mut pos = 0usize;
     let mut flag_byte = 0u8;
     let mut flag_bits = 0u8;
-    let mut dst_pos = 0usize;
     let mut units = Vec::new();
 
     while pos < encoded.len() {
@@ -2935,62 +2981,44 @@ pub(crate) fn decode_file_name(raw: &[u8], flags: u16) -> Vec<u8> {
 
         match mode {
             0 => {
-                let Some(&low) = encoded.get(pos) else {
-                    return raw.to_vec();
-                };
+                let low = *encoded.get(pos)?;
                 pos += 1;
                 units.push(u16::from(low));
-                dst_pos += 1;
             }
             1 => {
-                let Some(&low) = encoded.get(pos) else {
-                    return raw.to_vec();
-                };
+                let low = *encoded.get(pos)?;
                 pos += 1;
                 units.push((u16::from(high_byte) << 8) | u16::from(low));
-                dst_pos += 1;
             }
             2 => {
-                let Some((&low, &high)) = encoded.get(pos).zip(encoded.get(pos + 1)) else {
-                    return raw.to_vec();
-                };
+                let (&low, &high) = encoded.get(pos).zip(encoded.get(pos + 1))?;
                 pos += 2;
                 units.push((u16::from(high) << 8) | u16::from(low));
-                dst_pos += 1;
             }
             // The mode is the top two bits of a byte, so this is mode 3.
             _ => {
-                let Some(&length_byte) = encoded.get(pos) else {
-                    return raw.to_vec();
-                };
+                let length_byte = *encoded.get(pos)?;
                 pos += 1;
                 let (count, correction, high) = if length_byte & 0x80 != 0 {
-                    let Some(&correction) = encoded.get(pos) else {
-                        return raw.to_vec();
-                    };
+                    let correction = *encoded.get(pos)?;
                     pos += 1;
                     ((length_byte & 0x7f) as usize + 2, correction, high_byte)
                 } else {
                     (length_byte as usize + 2, 0, 0)
                 };
                 for _ in 0..count {
-                    let Some(&low) = fallback.get(dst_pos) else {
-                        return raw.to_vec();
-                    };
-                    let low = low.wrapping_add(correction);
+                    let low = fallback.get(units.len())?.wrapping_add(correction);
                     units.push((u16::from(high) << 8) | u16::from(low));
-                    dst_pos += 1;
                 }
             }
         }
     }
 
-    // An invalid Unicode field must not collapse distinct archive identities
-    // to the same replacement-character name. Keep the undecodable field, as
-    // for malformed encoding commands above; filesystem extraction can refuse it.
-    String::from_utf16(&units)
-        .map(String::into_bytes)
-        .unwrap_or_else(|_| raw.to_vec())
+    if units.is_empty() || units.iter().any(|&unit| unit < 0x20) || fallback.len() > 3 * units.len()
+    {
+        return None;
+    }
+    String::from_utf16(&units).ok().map(String::into_bytes)
 }
 
 fn admit_plain_header(
@@ -5808,13 +5836,31 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unicode_filename_keeps_its_identity() {
-        let first = b"fallback\0\0\x80\0\xd8";
-        let second = b"fallback\0\0\x80\x01\xd8";
-        assert_eq!(decode_file_name(first, FHD_UNICODE), first);
-        assert_eq!(decode_file_name(second, FHD_UNICODE), second);
-        let invalid_copy = b"fallback\0\0\xc0\x7f";
-        assert_eq!(decode_file_name(invalid_copy, FHD_UNICODE), invalid_copy);
+    fn malformed_unicode_field_keeps_the_raw_legacy_name() {
+        for raw in [
+            &b"fb\0\0\x80\0\xd8"[..],   // unpaired surrogate
+            &b"fb\0\0\x80\x01\xd8"[..], // a different one
+            &b"fb\0\0\xc0\x7f"[..],     // copy runs past the legacy name
+            &b"fb\0\0\0ab\0c"[..],      // a NUL unit after "ab"
+            &b"fb\0|\0\0\x02\0"[..],    // a NUL first unit
+            &b"fb\0(\0\x01"[..],        // a lone control character
+        ] {
+            assert_eq!(decode_file_name(raw, FHD_UNICODE), b"fb", "{raw:?}");
+            assert!(!unicode_field_decodes(raw), "{raw:?}");
+        }
+        // Two characters cannot give a seven-byte legacy name.
+        assert_eq!(
+            decode_file_name(b"seven-b\0\0\0ab", FHD_UNICODE),
+            b"seven-b"
+        );
+        assert_eq!(decode_file_name(b"six-by\0\0\0ab", FHD_UNICODE), b"ab");
+    }
+
+    #[test]
+    fn legacy_name_field_ends_at_its_first_nul() {
+        assert_eq!(decode_file_name(b"name\0junk", 0), b"name");
+        assert_eq!(decode_file_name(b"\0junk", 0), b"");
+        assert_eq!(decode_file_name(b"ctl\x12", 0), b"ctl\x12");
     }
 
     #[test]
@@ -5888,7 +5934,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_unicode_commands_keep_the_raw_name() {
+    fn truncated_unicode_commands_keep_the_legacy_name() {
         for raw in [
             &b"x\0\0\0"[..],       // mode 0: missing low byte
             &b"x\0\x01\x40"[..],   // mode 1: missing low byte
@@ -5897,7 +5943,7 @@ mod tests {
             &b"x\0\0\xc0\x80"[..], // mode 3: missing correction
             &b"x\0\0\xc0\0"[..],   // mode 3: run exceeds fallback
         ] {
-            assert_eq!(decode_file_name(raw, FHD_UNICODE), raw);
+            assert_eq!(decode_file_name(raw, FHD_UNICODE), b"x", "{raw:?}");
         }
     }
 }

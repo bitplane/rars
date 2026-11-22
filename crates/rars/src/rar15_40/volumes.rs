@@ -157,7 +157,7 @@ where
     validate_split_fragment(first, password)?;
     budget.check(first.unp_size, &first.name)?;
     let meta = ExtractedEntryMeta {
-        name_is_unicode: first.unicode_name.is_some(),
+        name_is_unicode: first.name_is_unicode(),
         name: first.name.clone(),
         file_time: first.file_time,
         mtime_refinement: first.mtime_refinement(),

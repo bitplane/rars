@@ -998,6 +998,7 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     }
     let state = state.into_inner();
     let skipped_links = state.skipped_links;
+    let skipped_unnamed = state.skipped_unnamed;
     let outputs = state.publish()?;
     restore_output_metadata(&outputs).map_err(|err| {
         CliError::general(format!(
@@ -1019,6 +1020,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
         return Err(CliError::general(format!(
             "skipped {skipped_links} link(s) that would point outside '{}'",
             out_dir.display()
+        )));
+    }
+    if skipped_unnamed > 0 {
+        return Err(CliError::general(format!(
+            "skipped {skipped_unnamed} member(s) with no name"
         )));
     }
     incomplete_set_result(gaps.len(), skipped)?;
@@ -1054,6 +1060,8 @@ struct ExtractOutputState<'a> {
     published_identities: HashSet<PathBuf>,
     published_paths: HashMap<PathBuf, PathBuf>,
     skipped_links: usize,
+    /// Members whose header gives no name: decoded and checked, never written.
+    skipped_unnamed: usize,
     /// Leaves a file already at its destination alone instead of failing (`unrars -o-`).
     skip_existing: bool,
     /// Members `skip_existing` left alone.
@@ -1095,6 +1103,7 @@ impl<'a> ExtractOutputState<'a> {
             published_identities: HashSet::new(),
             published_paths: HashMap::new(),
             skipped_links: 0,
+            skipped_unnamed: 0,
             skip_existing: false,
             kept_existing: 0,
             selected: None,
@@ -1127,6 +1136,9 @@ impl<'a> ExtractOutputState<'a> {
 
     fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
         self.publish_verified()?;
+        if self.unnamed(meta) {
+            return Ok(Box::new(std::io::sink()));
+        }
         let (name, stored) = self.entry_path(meta)?;
         if self.flatten && meta.is_directory {
             return Ok(Box::new(std::io::sink()));
@@ -1168,6 +1180,9 @@ impl<'a> ExtractOutputState<'a> {
         link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
         self.publish_verified()?;
+        if self.unnamed(meta) {
+            return Ok(());
+        }
         let (name, stored) = self.entry_path(meta)?;
         let relative = self.output_relative(&stored);
         let destination = output::checked_output_path(self.out_dir, &relative)
@@ -1217,6 +1232,18 @@ impl<'a> ExtractOutputState<'a> {
             restore_metadata,
         });
         Ok(())
+    }
+
+    /// Whether a member has no name to write it under, as when its header's
+    /// name field starts with a NUL. Like UnRAR, extraction leaves it out;
+    /// its data is still decoded, so a solid stream stays in step.
+    fn unnamed(&mut self, meta: &rars::ExtractedEntryMeta) -> bool {
+        if !meta.name.is_empty() {
+            return false;
+        }
+        eprintln!("warning: skipping a member with no name");
+        self.skipped_unnamed += 1;
+        true
     }
 
     fn output_relative(&self, stored: &Path) -> PathBuf {

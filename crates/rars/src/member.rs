@@ -65,7 +65,7 @@ impl<'a> ArchiveMemberRef<'a> {
     pub fn name_is_unicode(self) -> bool {
         match self {
             Self::Rar13(_) => false,
-            Self::Rar15To40(file) => file.unicode_name.is_some(),
+            Self::Rar15To40(file) => file.name_is_unicode(),
             Self::Rar50Plus(_) => true,
         }
     }

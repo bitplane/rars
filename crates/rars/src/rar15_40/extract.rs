@@ -150,7 +150,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         out: &mut impl Write,
     ) -> Result<()> {
         debug_assert!(!file.is_stored());
-        if file.is_empty_compressed_payload() {
+        if file.is_empty_compressed_payload() || file.is_empty_without_key(self.password) {
             file.crc_result(0, self.password)?;
             return Ok(());
         }
@@ -195,7 +195,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     ) -> Result<Buffer<u8, B>> {
         debug_assert!(!file.is_stored());
         let mut out = Buffer::new(&self.allowance);
-        if file.is_empty_compressed_payload() {
+        if file.is_empty_compressed_payload() || file.is_empty_without_key(self.password) {
             file.crc_result(0, self.password)?;
             return Ok(out);
         }
