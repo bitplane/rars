@@ -8,6 +8,7 @@
 //! here rather than in one of them.
 
 use crate::write_progress::{check_cancelled, EmissionWriter, ProgressReporter, ResourceProgress};
+use crate::write_stream::CallerOutput;
 use crate::{
     rar13, rar15_40, rar50, ArchiveFamily, ArchiveVersion, EntrySource, Error, FeatureSet, Result,
     WriteProgress, WriterResources,
@@ -1255,16 +1256,7 @@ impl Builder {
         if self.streams_rar50() {
             return self.write_rar50(output, resources, progress);
         }
-        if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
-            return Err(Error::UnsupportedFamilyFeature {
-                family: self.format.family(),
-                feature: if resources.max_memory_bytes().is_some() {
-                    "aggregate managed-memory limit"
-                } else {
-                    "preparation memory quota"
-                },
-            });
-        }
+        crate::write_stream::refuse_managed_memory(resources, self.format.family())?;
         let progress = ResourceProgress::new(resources, progress.map(ProgressReporter));
         let reporting = Some(ProgressReporter(&progress));
         check_cancelled(reporting)?;
@@ -1272,7 +1264,7 @@ impl Builder {
             SingleOutput::File(output) if self.format.family() == ArchiveFamily::Rar15To40 => {
                 let mut output = EmissionWriter::new(output, reporting);
                 self.write_rar15_single(
-                    rar15_40::ArchiveOutput::seekable(&mut output),
+                    rar15_40::seekable_output(&mut output),
                     resources,
                     Some(&progress),
                 )?;
@@ -1281,7 +1273,7 @@ impl Builder {
             SingleOutput::File(output) if self.format.family() == ArchiveFamily::Rar13 => {
                 let mut output = EmissionWriter::new(output, reporting);
                 self.write_rar13_single(
-                    rar13::ArchiveOutput::Seekable(&mut output),
+                    CallerOutput::seekable(&mut output),
                     resources,
                     Some(&progress),
                 )?;
@@ -1606,13 +1598,11 @@ impl Builder {
     ) -> Result<()> {
         match self.format.family() {
             ArchiveFamily::Rar50Plus => unreachable!("RAR 5/7 use the streaming writer"),
-            ArchiveFamily::Rar15To40 => self.write_rar15_single(
-                rar15_40::ArchiveOutput::stream(output),
-                resources,
-                progress,
-            ),
+            ArchiveFamily::Rar15To40 => {
+                self.write_rar15_single(rar15_40::stream_output(output), resources, progress)
+            }
             ArchiveFamily::Rar13 => {
-                self.write_rar13_single(rar13::ArchiveOutput::Stream(output), resources, progress)
+                self.write_rar13_single(CallerOutput::stream(output), resources, progress)
             }
         }
     }
@@ -1845,7 +1835,7 @@ impl Builder {
 
     fn write_rar15_single(
         &self,
-        output: rar15_40::ArchiveOutput<'_>,
+        output: CallerOutput<'_>,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
@@ -1888,7 +1878,7 @@ impl Builder {
 
     fn write_rar13_single(
         &self,
-        output: rar13::ArchiveOutput<'_>,
+        output: CallerOutput<'_>,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {

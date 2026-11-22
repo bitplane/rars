@@ -10,10 +10,10 @@ pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::write_stream::{MemberBytes, MemberPayload, SeekWrite};
+use crate::write_stream::{CallerOutput, CancellableOutput, MemberBytes, MemberPayload};
 use crate::ArchiveVersion;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
-use std::io::{Seek, SeekFrom};
+use std::io::Seek;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -169,7 +169,7 @@ pub(crate) fn write_archive_with_sources(
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
-    output: ArchiveOutput<'_>,
+    output: CallerOutput<'_>,
 ) -> Result<()> {
     let members: Vec<_> = entries
         .iter()
@@ -233,7 +233,7 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
-    check_resources(resources, options)?;
+    crate::write_stream::refuse_managed_memory(resources, options.target.family())?;
     let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
     write_archive_to(
         &members,
@@ -242,7 +242,7 @@ pub fn write_streaming_archive_to(
         archive_comment,
         resources,
         progress,
-        ArchiveOutput::Stream(output),
+        CallerOutput::stream(output),
         STREAM_MEMBERS_ABOVE,
     )
 }
@@ -258,7 +258,7 @@ pub fn write_seekable_archive_to<W: Write + Seek>(
     progress: Option<&dyn WriteProgress>,
     output: &mut W,
 ) -> Result<()> {
-    check_resources(resources, options)?;
+    crate::write_stream::refuse_managed_memory(resources, options.target.family())?;
     let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
     write_archive_to(
         &members,
@@ -267,40 +267,9 @@ pub fn write_seekable_archive_to<W: Write + Seek>(
         archive_comment,
         resources,
         progress,
-        ArchiveOutput::Seekable(output),
+        CallerOutput::seekable(output),
         STREAM_MEMBERS_ABOVE,
     )
-}
-
-fn check_resources(resources: &WriterResources, options: WriterOptions) -> Result<()> {
-    // Managed-memory quotas require codec and source allocations to be charged;
-    // legacy members do not yet provide that accounting.
-    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
-        return Err(Error::UnsupportedFamilyFeature {
-            family: options.target.family(),
-            feature: if resources.max_memory_bytes().is_some() {
-                "aggregate managed-memory limit"
-            } else {
-                "preparation memory quota"
-            },
-        });
-    }
-    Ok(())
-}
-
-pub(crate) enum ArchiveOutput<'a> {
-    Stream(&'a mut dyn Write),
-    /// Stored members copied from a source have their checksum patched in.
-    Seekable(&'a mut dyn SeekWrite),
-}
-
-impl ArchiveOutput<'_> {
-    fn writer(&mut self) -> &mut dyn Write {
-        match self {
-            Self::Stream(output) => *output,
-            Self::Seekable(output) => *output,
-        }
-    }
 }
 
 /// One member, however the caller supplied it.
@@ -370,7 +339,7 @@ fn collect_archive(
         archive_comment,
         &WriterResources::default(),
         progress,
-        ArchiveOutput::Stream(&mut out),
+        CallerOutput::stream(&mut out),
         STREAM_MEMBERS_ABOVE,
     )?;
     Ok(out)
@@ -384,7 +353,7 @@ fn write_archive_to(
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
-    output: ArchiveOutput<'_>,
+    output: CallerOutput<'_>,
     stream_above: u64,
 ) -> Result<()> {
     if members.iter().any(|member| member.password.is_some()) {
@@ -395,25 +364,9 @@ fn write_archive_to(
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = Some(&control as &dyn WriteProgress);
     crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
-    let mut stream;
-    let mut seekable;
-    let mut output = match output {
-        ArchiveOutput::Stream(inner) => {
-            stream = crate::write_progress::CancellableIo {
-                inner,
-                progress: progress.map(ProgressReporter),
-            };
-            ArchiveOutput::Stream(&mut stream)
-        }
-        ArchiveOutput::Seekable(inner) => {
-            seekable = crate::write_progress::CancellableIo {
-                inner,
-                progress: progress.map(ProgressReporter),
-            };
-            ArchiveOutput::Seekable(&mut seekable)
-        }
-    };
-    let patches = matches!(output, ArchiveOutput::Seekable(_));
+    let mut output = output.cancellable(progress.map(ProgressReporter));
+    // Stored members copied from a source have their checksum patched in.
+    let patches = output.can_seek();
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -855,7 +808,7 @@ fn spooled_payload_matches(
 
 /// Writes one member's header and payload.
 fn write_member(
-    output: &mut ArchiveOutput<'_>,
+    output: &mut CancellableOutput<'_, '_>,
     member: &Member<'_>,
     encoded: EncodedMember<'_>,
     options: WriterOptions,
@@ -924,10 +877,8 @@ fn write_member(
         Ok(header)
     };
     let header = build_header(encoded.file_crc.unwrap_or(0))?;
-    let header_at = match &mut *output {
-        ArchiveOutput::Seekable(seekable) if encoded.file_crc.is_none() => {
-            seekable.stream_position()?
-        }
+    let header_at = match output.as_seekable() {
+        Some(seekable) if encoded.file_crc.is_none() => seekable.stream_position()?,
         _ => 0,
     };
     output.writer().write_all(&header)?;
@@ -971,7 +922,21 @@ fn write_member(
                     "entry source contents changed while writing",
                 )),
                 Some(_) => Ok(()),
-                None => patch_header(output, header_at, &header, &build_header(summed)?),
+                // A member summed as it is copied gets its checksum only once the header is out.
+                None => {
+                    let Some(output) = output.as_seekable() else {
+                        return Err(Error::WriterFailure(
+                            "RAR 1.3 member checksum left to patch on an output that cannot seek",
+                        ));
+                    };
+                    crate::write_stream::patch_header(
+                        output,
+                        header_at,
+                        header.len() as u64,
+                        &build_header(summed)?,
+                        Error::WriterFailure("RAR 1.3 file header changed length when patched"),
+                    )
+                }
             }
         }
         Payload::Shared(packed) => packed.write_to(writer, u64::from(packed_size)),
@@ -984,30 +949,6 @@ fn write_member(
             Ok(())
         }
     }
-}
-
-/// A member summed as it is copied gets its checksum only once the header is out.
-fn patch_header(
-    output: &mut ArchiveOutput<'_>,
-    at: u64,
-    placeholder: &[u8],
-    patched: &[u8],
-) -> Result<()> {
-    let ArchiveOutput::Seekable(output) = output else {
-        return Err(Error::WriterFailure(
-            "RAR 1.3 member checksum left to patch on an output that cannot seek",
-        ));
-    };
-    if patched.len() != placeholder.len() {
-        return Err(Error::WriterFailure(
-            "RAR 1.3 file header changed length when patched",
-        ));
-    }
-    let end = output.stream_position()?;
-    output.seek(SeekFrom::Start(at))?;
-    output.write_all(patched)?;
-    output.seek(SeekFrom::Start(end))?;
-    Ok(())
 }
 
 /// A member not read ahead for its checksum is counted as it is copied.
@@ -1207,7 +1148,7 @@ fn split_member(
     progress: Option<&dyn WriteProgress>,
     stream_above: u64,
 ) -> Result<()> {
-    check_resources(resources, options)?;
+    crate::write_stream::refuse_managed_memory(resources, options.target.family())?;
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let reporting = &control as &dyn WriteProgress;
@@ -1471,6 +1412,7 @@ fn write_volume_set(
         let mut out = sink.start_volume(index)?;
         out.write_all(layout.head)?;
         // A placeholder: the header gives the checksum of what follows it.
+        let header_at = out.stream_position()?;
         out.write_all(&vec![0; layout.header_len])?;
         let mut fragment = Rar13Checksum::new();
         let mut left = len;
@@ -1543,15 +1485,13 @@ fn write_volume_set(
                 extra: &[],
             },
         )?;
-        if header.len() != layout.header_len {
-            return Err(Error::WriterFailure(
-                "RAR 1.3 volume header changed length when patched",
-            ));
-        }
-        let back = (layout.header_len as u64 + len) as i64;
-        out.seek(SeekFrom::Current(-back))?;
-        out.write_all(&header)?;
-        out.seek(SeekFrom::Current(len as i64))?;
+        crate::write_stream::patch_header(
+            &mut out,
+            header_at,
+            layout.header_len as u64,
+            &header,
+            Error::WriterFailure("RAR 1.3 volume header changed length when patched"),
+        )?;
         out.flush()?;
         drop(out);
         sink.finish_volume(index, bytes)?;
@@ -2105,7 +2045,7 @@ mod tests {
                 let mut archive = Vec::new();
                 write_main_header(&mut archive, options.features, None).unwrap();
                 write_member(
-                    &mut ArchiveOutput::Stream(&mut archive),
+                    &mut CallerOutput::stream(&mut archive).cancellable(None),
                     &member,
                     encoded,
                     options,
@@ -2244,7 +2184,7 @@ mod tests {
             None,
             &resources,
             None,
-            super::ArchiveOutput::Stream(&mut out),
+            super::CallerOutput::stream(&mut out),
             stream_above,
         )
         .unwrap();
@@ -5275,7 +5215,7 @@ mod tests {
             }
         }
         impl Seek for Counted {
-            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
                 self.inner.seek(position)
             }
         }
@@ -5424,5 +5364,82 @@ mod tests {
             .iter()
             .any(|&(done, _)| done > 0 && done < len as u64));
         assert_eq!(reported.last().map(|&(done, _)| done), Some(len as u64));
+    }
+
+    #[test]
+    fn seekable_and_volume_archives_match_fingerprints_captured_from_master() {
+        let text: Vec<u8> = b"legacy text, said twice. ".repeat(4000);
+        let noise = crate::write_stream::noise(70_000);
+        let entries = |password: Option<&[u8]>| {
+            let entry = |name: &[u8], data: &Vec<u8>| {
+                let entry =
+                    StreamingEntry::new(name.to_vec(), EntrySource::from_bytes(data.clone()));
+                match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                }
+            };
+            let letters = noise.iter().map(|byte| b'a' + byte % 16).collect();
+            vec![
+                entry(b"TEXT.TXT", &text),
+                entry(b"NOISE.BIN", &noise),
+                entry(b"EMPTY.TXT", &Vec::new()),
+                entry(b"LETTERS.TXT", &letters),
+            ]
+        };
+        let volumes = |entry: &StreamingEntry, coding: MemberCoding, size: usize| {
+            let mut sink = crate::volume_sink::CollectedVolumes::new();
+            write_volumes_to(
+                entry,
+                WriterOptions::default(),
+                coding,
+                size,
+                &mut sink,
+                &WriterResources::default(),
+                None,
+            )
+            .unwrap();
+            sink.take()
+        };
+        let mut cases = Vec::new();
+        for (name, coding, member, size) in [
+            ("stored", MemberCoding::Stored, 1, 30_000),
+            ("compressed", MemberCoding::Compressed, 3, 15_000),
+        ] {
+            let archive = seekable_archive(&entries(None), coding.clone()).unwrap();
+            cases.push((
+                format!("seekable_{name}"),
+                crate::write_stream::fingerprint([&archive[..]]),
+            ));
+            let parts = volumes(&entries(None)[member], coding, size);
+            cases.push((
+                format!("volumes_{name}"),
+                crate::write_stream::fingerprint(parts.iter().map(Vec::as_slice)),
+            ));
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let archive = crate::entropy::seeded::with(|| {
+                seekable_archive(&entries(Some(b"pw")), MemberCoding::Stored).unwrap()
+            });
+            cases.push((
+                "seekable_encrypted".into(),
+                crate::write_stream::fingerprint([&archive[..]]),
+            ));
+        }
+        let expected = [
+            ("seekable_stored", "240177:994e7518"),
+            (
+                "volumes_stored",
+                "30000:8bae9d7e 30000:9377ff08 10225:5b128e3c",
+            ),
+            ("seekable_compressed", "112582:d5db9b77"),
+            (
+                "volumes_compressed",
+                "15000:4c426e46 15000:9c9166ff 12492:7e13c63d",
+            ),
+            ("seekable_encrypted", "240177:fcd81fc7"),
+        ];
+        crate::write_stream::assert_fingerprints(&cases, &expected);
     }
 }

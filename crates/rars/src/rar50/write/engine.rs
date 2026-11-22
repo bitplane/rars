@@ -38,29 +38,9 @@ use crate::recovery::rar5::{
 use crate::streaming::preparation::{Bytes, Owned, Records};
 use crate::streaming::Spool;
 use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, WorkTracker};
-use crate::write_stream::SeekWrite;
+use crate::write_stream::{patch_header, CallerOutput, CancellableOutput};
 use crate::{Error, Result, WriterResources};
-use std::io::{Read, Seek, SeekFrom, Write};
-
-/// A seekable archive lets stored members be read once and their headers patched.
-pub(super) enum ArchiveOutput<'a> {
-    Stream(&'a mut dyn Write),
-    Seekable(&'a mut dyn SeekWrite),
-}
-
-enum Sink<'o, 'p> {
-    Stream(CancellableIo<'p, &'o mut dyn Write>),
-    Seekable(CancellableIo<'p, &'o mut dyn SeekWrite>),
-}
-
-impl Sink<'_, '_> {
-    fn writer(&mut self) -> &mut dyn Write {
-        match self {
-            Self::Stream(output) => output,
-            Self::Seekable(output) => output,
-        }
-    }
-}
+use std::io::{Read, Seek, Write};
 
 pub(super) struct EnginePlan<'a> {
     pub(super) compress: CompressPlan,
@@ -251,20 +231,12 @@ pub(super) fn write_archive<'a>(
     entries: &'a [ArchiveEntry],
     plan: EnginePlan<'a>,
     resources: &WriterResources,
-    output: ArchiveOutput<'_>,
+    output: CallerOutput<'_>,
 ) -> Result<()> {
-    let mut sink = match output {
-        ArchiveOutput::Stream(inner) => Sink::Stream(CancellableIo {
-            inner,
-            progress: plan.progress,
-        }),
-        ArchiveOutput::Seekable(inner) => Sink::Seekable(CancellableIo {
-            inner,
-            progress: plan.progress,
-        }),
-    };
-    // Every member is stored, so none is read before it is copied.
-    let hash_on_copy = matches!(sink, Sink::Seekable(_)) && plan.compress.method == 0;
+    let mut sink = output.cancellable(plan.progress);
+    // A seekable archive lets stored members be read once and their headers
+    // patched. Every member is stored, so none is read before it is copied.
+    let hash_on_copy = sink.can_seek() && plan.compress.method == 0;
     for entry in entries {
         super::validate_entry(entry)?;
     }
@@ -593,7 +565,7 @@ pub(super) fn write_archive<'a>(
 fn emit_block(
     block: PreparedBlock<'_>,
     entries: &[ArchiveEntry],
-    sink: &mut Sink<'_, '_>,
+    sink: &mut CancellableOutput<'_, '_>,
     mirror: &mut Option<Spool>,
     quick_open: Option<&mut Spool>,
     header_keys: Option<&HeaderEncryptionKeys>,
@@ -609,10 +581,8 @@ fn emit_block(
         quick_open_record,
         ..
     } = block;
-    let patch = match (patch, entry_index, &mut *sink) {
-        (Some(patch), Some(index), Sink::Seekable(output)) => {
-            Some((patch, index, output.stream_position()?))
-        }
+    let patch = match (patch, entry_index, sink.as_seekable()) {
+        (Some(patch), Some(index), Some(output)) => Some((patch, index, output.stream_position()?)),
         (None, ..) => None,
         _ => {
             return Err(Error::InvalidArgument(
@@ -659,17 +629,14 @@ fn emit_block(
                 header_keys,
                 resources,
             )?;
-            let Sink::Seekable(output) = sink else {
-                unreachable!("a patched header has a seekable archive");
-            };
-            let end = output.stream_position()?;
-            output.seek(SeekFrom::Start(header_at))?;
-            output.write_all(&patched)?;
-            output.seek(SeekFrom::Start(end))?;
+            let changed = Error::InvalidArgument("RAR 5 header changed length when patched");
+            let len = prepared.len() as u64;
+            let output = sink
+                .as_seekable()
+                .expect("a patched header has a seekable archive");
+            patch_header(output, header_at, len, &patched, changed.clone())?;
             if let (Some(spool), Some(at)) = (mirror.as_mut(), mirror_at) {
-                spool.seek_to(at)?;
-                spool.write_all(&patched)?;
-                spool.seek_to(spool.len())?;
+                patch_header(spool, at, len, &patched, changed)?;
             }
             Some(patched)
         }
@@ -1885,14 +1852,13 @@ impl VolumeWriter<'_> {
                 self.header_keys,
                 self.resources,
             )?;
-            if header.len() as u64 != header_len {
-                return Err(Error::WriterFailure(
-                    "RAR 5 fragment header changed length when patched",
-                ));
-            }
-            body.seek_to(header_at)?;
-            body.write_all(&header)?;
-            body.seek_to(body.len())?;
+            patch_header(
+                body,
+                header_at,
+                header_len,
+                &header,
+                Error::WriterFailure("RAR 5 fragment header changed length when patched"),
+            )?;
 
             self.fragments_in_volume += 1;
             start += fragment_len;
@@ -2690,7 +2656,7 @@ mod emission_ledger_tests {
                     &entries,
                     plan,
                     &resources,
-                    ArchiveOutput::Stream(&mut output),
+                    CallerOutput::stream(&mut output),
                 )
                 .unwrap_err();
                 assert!(output.is_empty());
@@ -2759,7 +2725,7 @@ mod emission_ledger_tests {
                     &entries,
                     settings,
                     &WriterResources::default(),
-                    ArchiveOutput::Stream(&mut bytes),
+                    CallerOutput::stream(&mut bytes),
                 )
                 .unwrap();
                 let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
@@ -2859,7 +2825,7 @@ mod emission_ledger_tests {
                         &entries,
                         settings,
                         &resources,
-                        ArchiveOutput::Stream(&mut output),
+                        CallerOutput::stream(&mut output),
                     )
                     .unwrap_err();
                     assert!(output.is_empty());
@@ -2891,7 +2857,7 @@ mod emission_ledger_tests {
             &[entry],
             plan,
             &WriterResources::default(),
-            ArchiveOutput::Stream(&mut bytes),
+            CallerOutput::stream(&mut bytes),
         )
         .unwrap();
 
@@ -2986,7 +2952,7 @@ mod emission_ledger_tests {
             &entries,
             settings(),
             &resources,
-            ArchiveOutput::Stream(&mut counting),
+            CallerOutput::stream(&mut counting),
         )
         .unwrap();
         assert!(counting.writes >= 6);
@@ -2999,7 +2965,7 @@ mod emission_ledger_tests {
                 &entries,
                 settings(),
                 &resources,
-                ArchiveOutput::Stream(&mut sink),
+                CallerOutput::stream(&mut sink),
             )
             .unwrap_err();
             assert_eq!(error.kind(), crate::ErrorKind::Io, "write {fail_at}");
@@ -3401,7 +3367,7 @@ mod emission_ledger_tests {
                 &entries,
                 plan(encrypted),
                 &base,
-                ArchiveOutput::Stream(&mut expected),
+                CallerOutput::stream(&mut expected),
             )
             .unwrap();
             let mut actual = Vec::new();
@@ -3409,7 +3375,7 @@ mod emission_ledger_tests {
                 &entries,
                 plan(encrypted),
                 &resources,
-                ArchiveOutput::Stream(&mut actual),
+                CallerOutput::stream(&mut actual),
             )
             .unwrap();
             if !encrypted {
@@ -3422,7 +3388,7 @@ mod emission_ledger_tests {
                 &entries,
                 plan(encrypted),
                 &resources,
-                ArchiveOutput::Stream(&mut FailingSink)
+                CallerOutput::stream(&mut FailingSink)
             )
             .is_err());
             assert_eq!(ledger.used(), 0);
@@ -3482,7 +3448,7 @@ mod emission_ledger_tests {
                 &entries,
                 settings,
                 &resources,
-                ArchiveOutput::Stream(&mut output),
+                CallerOutput::stream(&mut output),
             ) {
                 Ok(()) => {
                     assert!(!output.is_empty());
@@ -3570,7 +3536,7 @@ mod emission_ledger_tests {
                 &entries,
                 settings,
                 &resources,
-                ArchiveOutput::Stream(&mut output),
+                CallerOutput::stream(&mut output),
             ) {
                 Ok(()) => {
                     assert!(!output.is_empty());
@@ -3606,13 +3572,8 @@ mod emission_ledger_tests {
         });
         let resources = WriterResources::default().with_max_preparation_bytes(128);
         let mut output = Vec::new();
-        let error = write_archive(
-            &[],
-            settings,
-            &resources,
-            ArchiveOutput::Stream(&mut output),
-        )
-        .unwrap_err();
+        let error = write_archive(&[], settings, &resources, CallerOutput::stream(&mut output))
+            .unwrap_err();
         assert!(matches!(
             error,
             Error::WriterPreparationLimitExceeded { limit: 128, .. }
@@ -3647,7 +3608,7 @@ mod emission_ledger_tests {
                     std::slice::from_ref(&entry),
                     settings,
                     &resources,
-                    ArchiveOutput::Stream(&mut output),
+                    CallerOutput::stream(&mut output),
                 );
                 assert_eq!(resources.workspace_in_use(), 0);
                 drop(Records::<u8>::new(limit as usize, &resources).unwrap());
@@ -3720,7 +3681,7 @@ mod emission_ledger_tests {
                 &entries,
                 settings,
                 resources,
-                ArchiveOutput::Stream(&mut output),
+                CallerOutput::stream(&mut output),
             )?;
             Ok(output)
         };
@@ -3797,7 +3758,7 @@ mod emission_ledger_tests {
                 &entries,
                 settings,
                 resources,
-                ArchiveOutput::Stream(&mut output),
+                CallerOutput::stream(&mut output),
             )?;
             Ok(output)
         };
@@ -3889,7 +3850,7 @@ mod emission_ledger_tests {
                         &entries,
                         settings,
                         resources,
-                        ArchiveOutput::Stream(&mut Vec::new()),
+                        CallerOutput::stream(&mut Vec::new()),
                     )
                 }
             };
@@ -3933,7 +3894,7 @@ mod emission_ledger_tests {
                 &entries,
                 settings,
                 resources,
-                ArchiveOutput::Stream(&mut Vec::new()),
+                CallerOutput::stream(&mut Vec::new()),
             )
         };
         let (resources, attempts) =
@@ -4039,6 +4000,7 @@ mod emission_ledger_tests {
 mod stored_pipe_tests {
     use super::super::{write_streaming_archive_to, ArchiveExtras, WriterOptions};
     use super::*;
+    use std::io::SeekFrom;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -4156,6 +4118,60 @@ mod stored_pipe_tests {
             let (_, want) = expected.iter().find(|(case, _)| case == name).unwrap();
             assert_eq!(fingerprint, want, "{name}: {actual:?}");
         }
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn encrypted_header_archives_match_fingerprints_captured_from_master() {
+        use super::super::{write_seekable_archive_to, write_streaming_volumes_to};
+        let locked: Vec<ArchiveEntry> = entries()
+            .into_iter()
+            .map(|entry| entry.with_password(b"secret".to_vec()))
+            .collect();
+        let mut headers = crate::FeatureSet::store_only();
+        headers.header_encryption = true;
+        let seekable = crate::entropy::seeded::with(|| {
+            let mut output = std::io::Cursor::new(Vec::new());
+            write_seekable_archive_to(
+                &locked,
+                store(headers),
+                ArchiveExtras::default(),
+                &WriterResources::default(),
+                &mut output,
+            )
+            .unwrap();
+            output.into_inner()
+        });
+        let mut sink = crate::volume_sink::CollectedVolumes::new();
+        crate::entropy::seeded::with(|| {
+            write_streaming_volumes_to(
+                &locked,
+                store(headers),
+                ArchiveExtras::default(),
+                1_000_000,
+                &mut sink,
+                &WriterResources::default(),
+            )
+        })
+        .unwrap();
+        let cases = [
+            (
+                "seekable".to_string(),
+                crate::write_stream::fingerprint([&seekable[..]]),
+            ),
+            (
+                "volumes".to_string(),
+                crate::write_stream::fingerprint(sink.take().iter().map(Vec::as_slice)),
+            ),
+        ];
+        let expected = [
+            ("seekable", "2570602:93084858"),
+            (
+                "volumes",
+                "1000000:2813d873 1000000:a39861c1 571262:ce3e9274",
+            ),
+        ];
+        crate::write_stream::assert_fingerprints(&cases, &expected);
     }
 
     struct Counting {

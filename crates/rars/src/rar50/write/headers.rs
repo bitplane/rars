@@ -683,6 +683,37 @@ mod prepared_header_tests {
     use crate::{ErrorKind, WriterResources};
 
     #[test]
+    fn a_patched_header_that_changes_length_is_refused() {
+        let resources = WriterResources::default();
+        let prepared = prepared_header_image(
+            crate::rar50::HEAD_FILE,
+            0,
+            Some(1),
+            b"file",
+            &[],
+            None,
+            &resources,
+        )
+        .unwrap();
+        // A data size past 127 takes a second vint byte.
+        let error = repeated_header_image(
+            &prepared,
+            crate::rar50::HEAD_FILE,
+            0,
+            Some(128),
+            b"file",
+            &[],
+            None,
+            &resources,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            Error::InvalidArgument("RAR 5 header changed length when patched")
+        );
+    }
+
+    #[test]
     fn exact_images_match_existing_serialization_and_include_encryption_padding() {
         #[cfg(feature = "encryption")]
         let keys = header_encryption_keys(&mut WriteKeys::default(), b"secret").unwrap();

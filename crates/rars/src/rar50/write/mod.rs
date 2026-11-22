@@ -427,7 +427,7 @@ pub fn write_seekable_archive_with_progress<W: Write + Seek>(
         extras,
         resources,
         progress.map(ProgressReporter),
-        engine::ArchiveOutput::Seekable(output),
+        crate::write_stream::CallerOutput::seekable(output),
     )
 }
 
@@ -445,7 +445,7 @@ pub(crate) fn write_streaming_archive_reporting(
         extras,
         resources,
         progress,
-        engine::ArchiveOutput::Stream(output),
+        crate::write_stream::CallerOutput::stream(output),
     )
 }
 
@@ -455,7 +455,7 @@ fn write_archive_reporting(
     extras: ArchiveExtras<'_>,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
-    output: engine::ArchiveOutput<'_>,
+    output: crate::write_stream::CallerOutput<'_>,
 ) -> Result<()> {
     let control = crate::write_progress::ResourceProgress::new(resources, progress);
     let progress =

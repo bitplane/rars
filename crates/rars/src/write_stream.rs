@@ -217,6 +217,120 @@ pub(crate) trait SeekWrite: Write + Seek {}
 
 impl<T: Write + Seek + ?Sized> SeekWrite for T {}
 
+/// Seeking lets a writer patch a header once the bytes behind it are known.
+pub(crate) enum Output<W, S> {
+    Stream(W),
+    Seekable(S),
+}
+
+/// One shape for every family, so the seekable path is not re-derived per format.
+pub(crate) struct ArchiveOutput<W, S> {
+    pub(crate) to: Output<W, S>,
+    /// Opt-in, so a family that cannot yet stream a member keeps holding each one.
+    pub(crate) stream_above: Option<u64>,
+}
+
+pub(crate) type CallerOutput<'a> = ArchiveOutput<&'a mut dyn Write, &'a mut dyn SeekWrite>;
+
+/// Every write checks cancellation, so a large copy stops promptly.
+pub(crate) type CancellableOutput<'o, 'p> = ArchiveOutput<
+    crate::write_progress::CancellableIo<'p, &'o mut dyn Write>,
+    crate::write_progress::CancellableIo<'p, &'o mut dyn SeekWrite>,
+>;
+
+impl<'a> CallerOutput<'a> {
+    pub(crate) fn stream(output: &'a mut dyn Write) -> Self {
+        Self {
+            to: Output::Stream(output),
+            stream_above: None,
+        }
+    }
+
+    pub(crate) fn seekable(output: &'a mut dyn SeekWrite) -> Self {
+        Self {
+            to: Output::Seekable(output),
+            stream_above: None,
+        }
+    }
+
+    pub(crate) fn streaming_above(self, limit: u64) -> Self {
+        Self {
+            stream_above: Some(limit),
+            ..self
+        }
+    }
+
+    pub(crate) fn cancellable<'p>(
+        self,
+        progress: Option<crate::write_progress::ProgressReporter<'p>>,
+    ) -> CancellableOutput<'a, 'p> {
+        use crate::write_progress::CancellableIo;
+        ArchiveOutput {
+            to: match self.to {
+                Output::Stream(inner) => Output::Stream(CancellableIo { inner, progress }),
+                Output::Seekable(inner) => Output::Seekable(CancellableIo { inner, progress }),
+            },
+            stream_above: self.stream_above,
+        }
+    }
+}
+
+impl<W: Write, S: Write + Seek> ArchiveOutput<W, S> {
+    pub(crate) fn writer(&mut self) -> &mut dyn Write {
+        match &mut self.to {
+            Output::Stream(output) => output,
+            Output::Seekable(output) => output,
+        }
+    }
+
+    pub(crate) fn as_seekable(&mut self) -> Option<&mut S> {
+        match &mut self.to {
+            Output::Stream(_) => None,
+            Output::Seekable(output) => Some(output),
+        }
+    }
+
+    pub(crate) fn can_seek(&self) -> bool {
+        matches!(self.to, Output::Seekable(_))
+    }
+}
+
+/// A rewrite of another length would overwrite the payload, so it is refused unwritten.
+pub(crate) fn patch_header(
+    output: &mut (impl Write + Seek + ?Sized),
+    at: u64,
+    len: u64,
+    header: &[u8],
+    changed: Error,
+) -> Result<()> {
+    if header.len() as u64 != len {
+        return Err(changed);
+    }
+    let end = output.stream_position()?;
+    output.seek(std::io::SeekFrom::Start(at))?;
+    output.write_all(header)?;
+    output.seek(std::io::SeekFrom::Start(end))?;
+    Ok(())
+}
+
+/// Legacy writers don't charge codec and source allocations, so cannot honour a quota.
+pub(crate) fn refuse_managed_memory(
+    resources: &crate::WriterResources,
+    family: crate::ArchiveFamily,
+) -> Result<()> {
+    if resources.max_preparation_bytes().is_none() && resources.max_memory_bytes().is_none() {
+        return Ok(());
+    }
+    Err(Error::UnsupportedFamilyFeature {
+        family,
+        feature: if resources.max_memory_bytes().is_some() {
+            "aggregate managed-memory limit"
+        } else {
+            "preparation memory quota"
+        },
+    })
+}
+
 /// A member's bytes as they will appear in the archive.
 pub(crate) enum MemberPayload<'a> {
     /// Already in memory: everything compressed, and anything encrypted.
@@ -279,6 +393,39 @@ pub(crate) fn check_source_length(
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn fingerprint<'a>(outputs: impl IntoIterator<Item = &'a [u8]>) -> String {
+    outputs
+        .into_iter()
+        .map(|bytes| format!("{}:{:08x}", bytes.len(), crate::crc32::crc32(bytes)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+pub(crate) fn assert_fingerprints(actual: &[(String, String)], expected: &[(&str, &str)]) {
+    for (name, fingerprint) in actual {
+        let want = expected
+            .iter()
+            .find(|(case, _)| case == name)
+            .map(|(_, want)| *want);
+        assert_eq!(Some(fingerprint.as_str()), want, "{name}: {actual:?}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
 }
 
 /// Tells a member read as its payload is written from one read whole first.
@@ -432,6 +579,44 @@ mod tests {
                 .kind(),
             crate::ErrorKind::Io
         );
+    }
+
+    #[test]
+    fn a_patched_header_is_rewritten_in_place_and_the_cursor_returns_to_the_end() {
+        let mut output = std::io::Cursor::new(b"head----tail".to_vec());
+        output.set_position(12);
+        let changed = Error::WriterFailure("changed");
+        super::patch_header(&mut output, 4, 4, b"BODY", changed.clone()).unwrap();
+        assert_eq!(output.get_ref(), b"headBODYtail");
+        assert_eq!(output.position(), 12);
+
+        for wrong in [&b"BOD"[..], b"BODY!"] {
+            let error = super::patch_header(&mut output, 4, 4, wrong, changed.clone());
+            assert_eq!(error.unwrap_err(), changed);
+            assert_eq!(output.get_ref(), b"headBODYtail");
+            assert_eq!(output.position(), 12);
+        }
+    }
+
+    #[test]
+    fn managed_memory_quotas_are_refused_by_name() {
+        let family = crate::ArchiveFamily::Rar13;
+        super::refuse_managed_memory(&crate::WriterResources::default(), family).unwrap();
+        for (resources, feature) in [
+            (
+                crate::WriterResources::default().with_max_preparation_bytes(1 << 20),
+                "preparation memory quota",
+            ),
+            (
+                crate::WriterResources::default().with_max_memory_bytes(1 << 20),
+                "aggregate managed-memory limit",
+            ),
+        ] {
+            assert_eq!(
+                super::refuse_managed_memory(&resources, family).unwrap_err(),
+                Error::UnsupportedFamilyFeature { family, feature }
+            );
+        }
     }
 
     #[test]
