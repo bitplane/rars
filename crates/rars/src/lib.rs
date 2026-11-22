@@ -67,6 +67,8 @@ pub mod output_links;
 pub mod output_staging;
 #[doc(hidden)]
 pub mod output_times;
+#[doc(hidden)]
+pub mod output_tree;
 mod parallel;
 mod parse_budget;
 mod partial_volumes;

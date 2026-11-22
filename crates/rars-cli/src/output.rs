@@ -104,6 +104,23 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
     Ok(())
 }
 
+/// The modified time and mode a regular file can take before it is
+/// published, or `None` when they wait for the end: a mode that denies its
+/// owner reading would stop a later member copying from it.
+pub(crate) fn early_file_metadata(
+    output: &ExtractedOutput,
+) -> Option<(Option<std::time::SystemTime>, Option<u32>)> {
+    let meta = &output.meta;
+    let mode = extracted_mode(meta.file_attr, meta.attr_source, false);
+    if !output.restore_metadata || mode.is_some_and(|mode| mode & 0o400 == 0) {
+        return None;
+    }
+    let modified = meta
+        .modified
+        .and_then(|time| std::time::SystemTime::try_from(time).ok());
+    Some((modified, mode))
+}
+
 #[cfg(unix)]
 fn set_extracted_permissions(
     path: &Path,
@@ -113,9 +130,17 @@ fn set_extracted_permissions(
 ) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
+    if let Some(mode) = extracted_mode(file_attr, attr_source, is_directory) {
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn extracted_mode(file_attr: u64, attr_source: AttrSource, is_directory: bool) -> Option<u32> {
     const FILE_ATTRIBUTE_READONLY: u64 = 0x01;
 
-    let mode = match attr_source {
+    match attr_source {
         // A DOS attribute word says nothing about permissions except whether
         // the entry is read-only. Everything else is already right: the file
         // was created 0666 & ~umask and the directory 0777 & ~umask, which is
@@ -130,12 +155,7 @@ fn set_extracted_permissions(
         AttrSource::Unix if file_attr & 0o170000 != 0 => Some((file_attr & 0o777) as u32),
         // Missing type bits and unknown (including future) hosts leave modes unchanged.
         _ => None,
-    };
-
-    if let Some(mode) = mode {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     }
-    Ok(())
 }
 
 #[cfg(not(unix))]
@@ -148,11 +168,30 @@ fn set_extracted_permissions(
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn extracted_mode(_file_attr: u64, _attr_source: AttrSource, _is_directory: bool) -> Option<u32> {
+    None
+}
+
 pub(crate) fn checked_output_path(out_dir: &Path, rel: &Path) -> rars::Result<PathBuf> {
-    rars::filename::checked_output_path(out_dir, rel).map_err(|error| match error {
+    rars::filename::checked_output_path(out_dir, rel).map_err(path_error)
+}
+
+/// Reports an unsafe output path as a bad header, as every extraction refusal is.
+fn path_error(error: Error) -> Error {
+    match error {
         Error::UnsafePath(message) => Error::InvalidHeader(message),
         other => other,
-    })
+    }
+}
+
+/// Reports an unsafe output path as [`checked_output_path`] does, naming the
+/// member. Other errors pass through unchanged.
+pub(crate) fn refused_path(error: Error, name: &[u8]) -> Error {
+    match error {
+        Error::UnsafePath(_) => rars::output_staging::refused_output(path_error(error), name),
+        other => other,
+    }
 }
 
 pub(crate) fn print_ok_entry(entry: &ExtractedEntryMeta) {
