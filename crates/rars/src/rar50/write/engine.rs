@@ -160,6 +160,16 @@ impl PreparedSource {
         })
     }
 
+    /// The copy's checksums for a member hashed on its copy; otherwise
+    /// checks them against the ones its header already carries.
+    fn finish_checksums(&self, integrity: ChecksumSink) -> Result<Option<ChecksumSink>> {
+        if self.hashed_on_copy {
+            return Ok(Some(integrity));
+        }
+        self.verify(integrity)?;
+        Ok(None)
+    }
+
     fn verify(&self, integrity: ChecksumSink) -> Result<()> {
         if integrity.crc.finish() != self.crc32 || integrity.hash.finalize() != self.hash {
             return Err(Error::SourceChanged(
@@ -191,8 +201,6 @@ impl Read for CheckedReader<'_, '_> {
 }
 
 impl CheckedReader<'_, '_> {
-    /// The copy's checksums for a member hashed on its copy; otherwise
-    /// checks them against the ones its header already carries.
     fn finish(mut self, source: &PreparedSource, observed: u64) -> Result<Option<ChecksumSink>> {
         crate::write_stream::check_source_length(
             &mut *self.reader,
@@ -200,11 +208,7 @@ impl CheckedReader<'_, '_> {
             source.len,
             "entry source size changed while writing",
         )?;
-        if source.hashed_on_copy {
-            return Ok(Some(self.integrity));
-        }
-        source.verify(self.integrity)?;
-        Ok(None)
+        source.finish_checksums(self.integrity)
     }
 }
 
@@ -1128,19 +1132,14 @@ fn write_payload(
             Ok(None)
         }
         Payload::Stored(source) => {
-            let mut reader = source.open(copy_work.filter(|_| source.hashed_on_copy))?;
-            let mut buffer = Bytes::zeroed(super::stored_block_len(source.len), resources)?;
-            let mut copied = 0u64;
-            while copied < source.len {
-                let want = (source.len - copied).min(buffer.len() as u64) as usize;
-                let read = reader.read(&mut buffer[..want])?;
-                if read == 0 {
-                    break;
-                }
-                output.write_all(&buffer[..read])?;
-                copied += read as u64;
-            }
-            let checksums = reader.finish(&source, copied)?;
+            let work = copy_work.filter(|_| source.hashed_on_copy);
+            let pipelined = crate::output_pipeline::admit_with(source.len, |bytes| {
+                resources.reserve_preparation(bytes).ok()
+            });
+            let checksums = match pipelined {
+                Some(_charge) => copy_stored_pipelined(&source, output, work)?,
+                None => copy_stored_inline(&source, output, resources, work)?,
+            };
             source.source.release();
             Ok(checksums)
         }
@@ -1213,6 +1212,79 @@ fn write_payload(
             }
         }
     }
+}
+
+fn copy_stored_inline(
+    source: &PreparedSource,
+    output: &mut dyn Write,
+    resources: &WriterResources,
+    work: Option<&WorkTracker<'_>>,
+) -> Result<Option<ChecksumSink>> {
+    let mut reader = source.open(work)?;
+    let mut buffer = Bytes::zeroed(super::stored_block_len(source.len), resources)?;
+    let mut copied = 0u64;
+    while copied < source.len {
+        let want = (source.len - copied).min(buffer.len() as u64) as usize;
+        let read = reader.read(&mut buffer[..want])?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+    reader.finish(source, copied)
+}
+
+fn copy_stored_pipelined(
+    source: &PreparedSource,
+    output: &mut dyn Write,
+    work: Option<&WorkTracker<'_>>,
+) -> Result<Option<ChecksumSink>> {
+    let mut integrity = ChecksumSink::default();
+    // The producer and the checksum thread already fill a cap of two, so BLAKE2sp gets no split helper.
+    let hash_cap = (crate::parallel::threads() <= 2).then_some(1);
+    crate::output_pipeline::run(
+        |chunks| produce_stored(source, work, chunks),
+        &mut |chunk: &[u8]| {
+            let _cap = crate::parallel::ThreadCap::set(hash_cap);
+            integrity.crc.update(chunk);
+            integrity.hash.update(chunk);
+        },
+        output,
+    )
+    .map_err(|error| match error {
+        crate::output_pipeline::PipeError::Produce(error) => error,
+        crate::output_pipeline::PipeError::Write(error) => error.into(),
+    })?;
+    source.finish_checksums(integrity)
+}
+
+fn produce_stored(
+    source: &PreparedSource,
+    work: Option<&WorkTracker<'_>>,
+    chunks: &mut crate::output_pipeline::Chunks<'_>,
+) -> Result<()> {
+    let mut reader = source.source.open()?;
+    let mut copied = 0u64;
+    while copied < source.len {
+        let space = chunks.space()?;
+        let want = (source.len - copied).min(space.len() as u64) as usize;
+        let read = reader.read(&mut space[..want])?;
+        if read == 0 {
+            break;
+        }
+        chunks.commit(read)?;
+        copied += read as u64;
+        if work.is_some_and(|work| !work.advance(read as u64)) {
+            return Err(Error::Cancelled);
+        }
+    }
+    crate::write_stream::check_source_length(
+        &mut *reader,
+        copied,
+        source.len,
+        "entry source size changed while writing",
+    )
 }
 
 /// Computes the recovery record over `prefix` and writes its service block.
@@ -4120,6 +4192,66 @@ mod stored_pipe_tests {
         }
     }
 
+    fn seekable(
+        entries: &[ArchiveEntry],
+        options: WriterOptions,
+        extras: ArchiveExtras,
+    ) -> Vec<u8> {
+        let mut output = std::io::Cursor::new(Vec::new());
+        super::super::write_seekable_archive_to(
+            entries,
+            options,
+            extras,
+            &WriterResources::default(),
+            &mut output,
+        )
+        .unwrap();
+        output.into_inner()
+    }
+
+    #[test]
+    fn stored_seekable_archives_match_fingerprints_captured_before_the_pipelined_copy() {
+        let entries = entries();
+        let plain = crate::FeatureSet::store_only();
+        let mut quick_open = plain;
+        quick_open.quick_open = true;
+        let mut cases = Vec::new();
+        cases.extend([
+            (
+                "one".to_string(),
+                seekable(&entries[..1], store(plain), ArchiveExtras::default()),
+            ),
+            (
+                "several".to_string(),
+                seekable(&entries, store(plain), ArchiveExtras::default()),
+            ),
+            (
+                "quick_open".to_string(),
+                seekable(&entries, store(quick_open), ArchiveExtras::default()),
+            ),
+        ]);
+        #[cfg(feature = "recovery")]
+        cases.push((
+            "recovery".to_string(),
+            seekable(
+                &entries,
+                store(plain),
+                ArchiveExtras::default().with_recovery_percent(Some(5)),
+            ),
+        ));
+        let cases: Vec<_> = cases
+            .into_iter()
+            .map(|(name, bytes)| (name, crate::write_stream::fingerprint([&bytes[..]])))
+            .collect();
+        let expected = [
+            ("one", "2500141:a6c68802"),
+            ("several", "2570267:a6dc6e09"),
+            ("quick_open", "2570524:d5eb5a67"),
+            ("recovery", "2715543:c207e3f3"),
+        ];
+        crate::write_stream::assert_fingerprints(&cases, &expected);
+    }
+
     #[test]
     #[cfg(feature = "encryption")]
     fn encrypted_header_archives_match_fingerprints_captured_from_master() {
@@ -4216,5 +4348,226 @@ mod stored_pipe_tests {
         assert!(reads <= 10, "{reads} reads");
         let archive = crate::ArchiveReader::read_owned(archive).unwrap();
         assert_eq!(archive.read_member(b"large", None).unwrap().unwrap(), bytes);
+    }
+}
+
+#[cfg(test)]
+mod stored_copy_pipeline_tests {
+    use super::super::{
+        write_seekable_archive_with_progress, write_streaming_archive_with_progress, ArchiveExtras,
+        WriterOptions,
+    };
+    use super::*;
+    use crate::atomic64::AtomicU64;
+    use std::io::SeekFrom;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread::ThreadId;
+
+    #[derive(Default)]
+    struct Opening {
+        threads: Mutex<Vec<ThreadId>>,
+        served: AtomicU64,
+    }
+
+    struct Traced {
+        len: u64,
+        at: u64,
+        opening: Arc<Opening>,
+    }
+
+    impl Read for Traced {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.opening
+                .threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            let count = (self.len - self.at).min(buffer.len() as u64) as usize;
+            buffer[..count].fill((self.at % 251) as u8);
+            self.at += count as u64;
+            self.opening
+                .served
+                .fetch_add(count as u64, Ordering::Relaxed);
+            Ok(count)
+        }
+    }
+
+    impl Seek for Traced {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.at = match position {
+                SeekFrom::Start(at) => at,
+                SeekFrom::Current(by) => self.at.saturating_add_signed(by),
+                SeekFrom::End(by) => self.len.saturating_add_signed(by),
+            };
+            Ok(self.at)
+        }
+    }
+
+    fn traced(len: u64) -> (crate::EntrySource, Arc<Mutex<Vec<Arc<Opening>>>>) {
+        let openings = Arc::new(Mutex::new(Vec::new()));
+        let opened = openings.clone();
+        let source = crate::EntrySource::from_opener(len, move || {
+            let opening = Arc::new(Opening::default());
+            opened.lock().unwrap().push(opening.clone());
+            Ok(Box::new(Traced {
+                len,
+                at: 0,
+                opening,
+            }))
+        });
+        (source, openings)
+    }
+
+    fn write(
+        source: crate::EntrySource,
+        seekable: bool,
+        progress: Option<&dyn crate::WriteProgress>,
+        resources: &WriterResources,
+        output: &mut (impl Write + Seek),
+    ) -> Result<()> {
+        let options = WriterOptions::new(
+            crate::ArchiveVersion::Rar50,
+            crate::FeatureSet::store_only(),
+        )
+        .with_compression_level(0);
+        let entries = [ArchiveEntry::new(b"member".to_vec(), source)];
+        if seekable {
+            write_seekable_archive_with_progress(
+                &entries,
+                options,
+                ArchiveExtras::default(),
+                resources,
+                progress,
+                output,
+            )
+        } else {
+            write_streaming_archive_with_progress(
+                &entries,
+                options,
+                ArchiveExtras::default(),
+                resources,
+                progress,
+                output,
+            )
+        }
+    }
+
+    fn copy_read_on_caller(len: u64, seekable: bool, resources: &WriterResources) -> bool {
+        let (source, openings) = traced(len);
+        write(
+            source,
+            seekable,
+            None,
+            resources,
+            &mut std::io::Cursor::new(Vec::new()),
+        )
+        .unwrap();
+        let caller = std::thread::current().id();
+        // A pipe's pre-pass opens the source first; the last opening is the copy's.
+        let copy = openings.lock().unwrap().last().unwrap().clone();
+        let threads = copy.threads.lock().unwrap();
+        threads.iter().all(|thread| *thread == caller)
+    }
+
+    #[test]
+    fn large_members_are_copied_off_the_caller_unless_it_may_not_spawn() {
+        let unlimited = WriterResources::default();
+        // Room for the inline copy's block, not for the pipeline's four.
+        let tight = WriterResources::default().with_max_preparation_bytes(3 << 20);
+        for seekable in [false, true] {
+            if crate::parallel::may_spawn() {
+                assert!(
+                    !copy_read_on_caller(4 << 20, seekable, &unlimited),
+                    "seekable={seekable}"
+                );
+            }
+            assert!(
+                copy_read_on_caller(256 << 10, seekable, &unlimited),
+                "seekable={seekable}"
+            );
+            assert!(
+                copy_read_on_caller(4 << 20, seekable, &tight),
+                "seekable={seekable}"
+            );
+            let _cap = crate::parallel::ThreadCap::set(Some(1));
+            assert!(
+                copy_read_on_caller(4 << 20, seekable, &unlimited),
+                "seekable={seekable}"
+            );
+        }
+    }
+
+    struct Output {
+        inner: std::io::Cursor<Vec<u8>>,
+        room: u64,
+        fail: bool,
+        full: Arc<AtomicBool>,
+    }
+
+    impl Write for Output {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.inner.position() + buffer.len() as u64 > self.room {
+                self.full.store(true, Ordering::Relaxed);
+                if self.fail {
+                    return Err(std::io::Error::other("disk full"));
+                }
+            }
+            self.inner.write(buffer)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for Output {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    struct CancelWhenFull(Arc<AtomicBool>);
+
+    impl crate::WriteProgress for CancelWhenFull {
+        fn report(&self, _: crate::WriteProgressEvent<'_>) {}
+        fn is_cancelled(&self) -> bool {
+            self.0.load(Ordering::Relaxed)
+        }
+    }
+
+    #[test]
+    fn a_failing_or_cancelled_output_stops_reading_the_member() {
+        for seekable in [false, true] {
+            for fail in [true, false] {
+                let (source, openings) = traced(64 << 20);
+                let full = Arc::new(AtomicBool::new(false));
+                let mut output = Output {
+                    inner: std::io::Cursor::new(Vec::new()),
+                    room: 5 << 20,
+                    fail,
+                    full: full.clone(),
+                };
+                let progress = CancelWhenFull(full);
+                let progress = (!fail).then_some(&progress as &dyn crate::WriteProgress);
+                let error = write(
+                    source,
+                    seekable,
+                    progress,
+                    &WriterResources::default(),
+                    &mut output,
+                )
+                .unwrap_err();
+                let case = format!("seekable={seekable}, fail={fail}: {error}");
+                if fail {
+                    assert_eq!(error.kind(), crate::ErrorKind::Io, "{case}");
+                    assert!(error.to_string().contains("disk full"), "{case}");
+                } else {
+                    assert_eq!(error.kind(), crate::ErrorKind::Cancelled, "{case}");
+                }
+                let copy = openings.lock().unwrap().last().unwrap().clone();
+                let served = copy.served.load(Ordering::Relaxed);
+                assert!(served < 16 << 20, "{case}: {served} bytes read");
+            }
+        }
     }
 }

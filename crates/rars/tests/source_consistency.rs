@@ -56,13 +56,25 @@ fn write_rar50(
 fn rar50_stored_emission_rejects_changed_sources() {
     for encrypted in [false, true] {
         for volumes in [false, true] {
-            for changed_len in [4095, 4096, 4097] {
-                let result =
-                    write_rar50(changing_source(4096, 1, changed_len), encrypted, volumes, 0);
-                assert!(
-                    result.is_err(),
-                    "encrypted={encrypted}, volumes={volumes}, size={changed_len}"
-                );
+            // A member over 256 KiB is copied by a pipeline rather than inline.
+            let lens: &[usize] = if volumes { &[4096] } else { &[4096, 1 << 20] };
+            for &len in lens {
+                for changed_len in [len - 1, len, len + 1] {
+                    let result =
+                        write_rar50(changing_source(len, 1, changed_len), encrypted, volumes, 0);
+                    let case = format!(
+                        "encrypted={encrypted}, volumes={volumes}, len={len}, size={changed_len}"
+                    );
+                    let error = result.expect_err(&case);
+                    // An encrypted member that runs short still fails as I/O.
+                    if !encrypted {
+                        assert_eq!(
+                            error.kind(),
+                            rars::ErrorKind::SourceChanged,
+                            "{case}: {error}"
+                        );
+                    }
+                }
             }
         }
     }

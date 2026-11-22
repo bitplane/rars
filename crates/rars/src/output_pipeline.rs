@@ -16,12 +16,19 @@ pub(crate) enum PipeError<E> {
 
 /// The pooled buffers' charge when a member of `size` bytes should be pipelined, or None to run inline.
 pub(crate) fn admit<B: Budget>(size: u64, allowance: &B) -> Option<B::Charge> {
+    admit_with(size, |bytes| {
+        let mut charge = allowance.charge();
+        B::resize(&mut charge, bytes).ok()?;
+        Some(charge)
+    })
+}
+
+/// As [`admit`], for a caller whose buffers are charged elsewhere: `reserve` gets their bytes and refuses with None.
+pub(crate) fn admit_with<C>(size: u64, reserve: impl FnOnce(u64) -> Option<C>) -> Option<C> {
     if size <= INLINE_LIMIT || !crate::parallel::may_spawn() {
         return None;
     }
-    let mut charge = allowance.charge();
-    B::resize(&mut charge, (CHUNK * BUFFERS) as u64).ok()?;
-    Some(charge)
+    reserve((CHUNK * BUFFERS) as u64)
 }
 
 /// The producer's side: fills pooled buffers and hands each full one to the writer and the checksum.

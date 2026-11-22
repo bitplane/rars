@@ -115,8 +115,14 @@ fn a_source_of_another_length_than_it_declared_fails_as_changed() {
         if encrypted && !cfg!(feature = "encryption") {
             continue;
         }
-        for served in [4095, 4097] {
-            let (source, _) = counted(4096, bytes(served, 7));
+        // A member over 256 KiB is copied by a pipeline rather than inline.
+        for (len, served) in [
+            (4096, 4095),
+            (4096, 4097),
+            (1 << 20, (1 << 20) - 1),
+            (1 << 20, (1 << 20) + 1),
+        ] {
+            let (source, _) = counted(len, bytes(served, 7));
             let entry = ArchiveEntry::new(b"file".to_vec(), source);
             let entry = if encrypted {
                 entry.with_password(b"secret".to_vec())
@@ -132,7 +138,7 @@ fn a_source_of_another_length_than_it_declared_fails_as_changed() {
             assert_eq!(
                 error.kind(),
                 ErrorKind::SourceChanged,
-                "encrypted={encrypted}, served={served}: {error}"
+                "encrypted={encrypted}, len={len}, served={served}: {error}"
             );
             assert_eq!(error.entry_context().unwrap().0, b"file");
         }
