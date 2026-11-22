@@ -266,6 +266,64 @@ fn a_damaged_member_is_reported_and_the_others_test_and_extract() {
     }
 }
 
+/// Issue #444: a header whose name field starts with a NUL gives its member
+/// no name. Extraction leaves that member out, as UnRAR does, and still
+/// decodes it, so the solid members after it come out whole.
+#[test]
+fn a_member_with_no_name_is_skipped_and_the_solid_stream_stays_in_step() {
+    let dir = scratch("unnamed-member");
+    let path = dir.join("solid.rar");
+    let (members, _) = salvage_fixture(&path, rars::ArchiveVersion::Rar29, true);
+    let mut bytes = fs::read(&path).unwrap();
+    // Blank m1's name: its header CRC is repaired, so only the name is odd.
+    let name = bytes.windows(6).position(|v| v == b"m1.txt").unwrap();
+    bytes[name] = 0;
+    let mut at = 7;
+    loop {
+        let flags = u16::from_le_bytes([bytes[at + 3], bytes[at + 4]]);
+        let size = usize::from(u16::from_le_bytes([bytes[at + 5], bytes[at + 6]]));
+        if (at..at + size).contains(&name) {
+            let crc = crc32(&bytes[at + 2..at + size]) as u16;
+            bytes[at..at + 2].copy_from_slice(&crc.to_le_bytes());
+            break;
+        }
+        let packed = if flags & 0x8000 != 0 {
+            u32::from_le_bytes(bytes[at + 7..at + 11].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        at += size + packed;
+    }
+    fs::write(&path, &bytes).unwrap();
+
+    let output = rars().arg("test").arg(&path).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let out = dir.join("out");
+    let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(
+        errors.contains("warning: skipping a member with no name"),
+        "{errors}"
+    );
+    assert!(
+        errors.contains("skipped 1 member(s) with no name"),
+        "{errors}"
+    );
+    let mut written: Vec<_> = fs::read_dir(&out)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    written.sort();
+    assert_eq!(written, ["m0.txt", "m2.txt", "m3.txt", "m4.txt"]);
+    for (name, data) in &members {
+        if name != "m1.txt" {
+            assert_eq!(&fs::read(out.join(name)).unwrap(), data, "{name}");
+        }
+    }
+}
+
 /// Issue #436: in a volume set, a damaged member that sits in one volume is
 /// reported and the members around it, split ones included, still read.
 #[test]

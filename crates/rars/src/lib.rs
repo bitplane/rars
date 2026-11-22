@@ -588,7 +588,9 @@ impl ArchiveMember {
     pub fn name_is_unicode(&self) -> bool {
         match &self.detail {
             ArchiveMemberDetail::Rar13 { .. } => false,
-            ArchiveMemberDetail::Rar15To40 { unicode_name, .. } => unicode_name.is_some(),
+            ArchiveMemberDetail::Rar15To40 { unicode_name, .. } => unicode_name
+                .as_deref()
+                .is_some_and(rar15_40::unicode_field_decodes),
             _ => true,
         }
     }
