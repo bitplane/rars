@@ -899,18 +899,19 @@ fn skip_incomplete_members(paths: &[PathBuf], archives: &mut [DetectedArchive]) 
     incomplete.len()
 }
 
-/// Fails a command that read only part of a volume set, after it has done what it could.
+/// Fails a command that skipped members of a partial volume set, after it has
+/// done what it could. A gap in the volume names alone only warns: a member
+/// that crosses it is split, and skipped, so with none skipped every member
+/// on either side was read whole.
 fn incomplete_set_result(gaps: usize, skipped: usize) -> CliResult<()> {
+    if skipped == 0 {
+        return Ok(());
+    }
     let mut problems = Vec::new();
     if gaps > 0 {
         problems.push(format!("{gaps} gap(s) in the volume names"));
     }
-    if skipped > 0 {
-        problems.push(format!("{skipped} split member(s) skipped"));
-    }
-    if problems.is_empty() {
-        return Ok(());
-    }
+    problems.push(format!("{skipped} split member(s) skipped"));
     Err(CliError::general(format!(
         "incomplete volume set: {}",
         problems.join(", ")

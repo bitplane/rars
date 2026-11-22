@@ -3237,6 +3237,67 @@ fn a_gap_in_old_style_volume_names_is_reported_as_the_volumes_missing() {
 }
 
 #[test]
+fn a_gap_that_no_member_crosses_only_warns() {
+    for format in ["rar15", "rar29", "rar50"] {
+        let root = scratch("partial-set-clean-gap");
+        let set = root.join("set");
+        fs::create_dir_all(&set).unwrap();
+        // Two one-member archives written as volumes, named as the first and
+        // third volumes of one set: the second is missing, and nothing spans it.
+        let names = if format == "rar50" {
+            ["set.part1.rar", "set.part3.rar"]
+        } else {
+            ["set.rar", "set.r01"]
+        };
+        for (name, member) in names.into_iter().zip(["one.txt", "two.txt"]) {
+            let source = root.join(member);
+            fs::write(&source, member).unwrap();
+            let written = root.join(format!("written-{member}"));
+            fs::create_dir_all(&written).unwrap();
+            let add = rars()
+                .args(["a", "--store", "--volume-size", "1k", "--format", format])
+                .arg(written.join("volume.rar"))
+                .arg(&source)
+                .output()
+                .unwrap();
+            assert!(add.status.success(), "{format}: {}", stderr(&add));
+            let mut volumes: Vec<_> = fs::read_dir(&written)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(volumes.len(), 1, "{format}: {volumes:?}");
+            fs::copy(volumes.pop().unwrap(), set.join(name)).unwrap();
+        }
+        let missing = set.join(if format == "rar50" {
+            "set.part2.rar"
+        } else {
+            "set.r00"
+        });
+
+        let test = rars().arg("test").arg(set.join(names[0])).output().unwrap();
+        assert!(test.status.success(), "{format}: {}", stderr(&test));
+        assert!(stdout(&test).contains("OK one.txt"), "{format}");
+        assert!(stdout(&test).contains("OK two.txt"), "{format}");
+        assert!(
+            stderr(&test).contains(&format!("volume '{}' is missing", missing.display())),
+            "{format}: {}",
+            stderr(&test)
+        );
+
+        let out = root.join("out");
+        let extract = rars()
+            .arg("x")
+            .arg(set.join(names[0]))
+            .arg(&out)
+            .output()
+            .unwrap();
+        assert!(extract.status.success(), "{format}: {}", stderr(&extract));
+        assert_eq!(fs::read(out.join("one.txt")).unwrap(), b"one.txt");
+        assert_eq!(fs::read(out.join("two.txt")).unwrap(), b"two.txt");
+    }
+}
+
+#[test]
 fn add_rejects_duplicate_archive_names() {
     let dir = scratch("add-duplicate-names");
     let source = dir.join("same.txt");
