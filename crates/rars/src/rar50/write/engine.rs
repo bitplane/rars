@@ -62,8 +62,6 @@ impl Sink<'_, '_> {
     }
 }
 
-const STORED_COPY_BUFFER: u64 = 1024 * 1024;
-
 pub(super) struct EnginePlan<'a> {
     pub(super) compress: CompressPlan,
     pub(super) recovery_percent: Option<u64>,
@@ -1162,10 +1160,9 @@ fn write_payload(
             output.write_all(data)?;
             Ok(None)
         }
-        Payload::Stored(source) if source.hashed_on_copy => {
-            let mut reader = source.open(copy_work)?;
-            let mut buffer =
-                Bytes::zeroed(source.len.clamp(1, STORED_COPY_BUFFER) as usize, resources)?;
+        Payload::Stored(source) => {
+            let mut reader = source.open(copy_work.filter(|_| source.hashed_on_copy))?;
+            let mut buffer = Bytes::zeroed(super::stored_block_len(source.len), resources)?;
             let mut copied = 0u64;
             while copied < source.len {
                 let want = (source.len - copied).min(buffer.len() as u64) as usize;
@@ -1179,13 +1176,6 @@ fn write_payload(
             let checksums = reader.finish(&source, copied)?;
             source.source.release();
             Ok(checksums)
-        }
-        Payload::Stored(source) => {
-            let mut reader = source.open(None)?;
-            let copied = std::io::copy(&mut reader.by_ref().take(source.len), output)?;
-            reader.finish(&source, copied)?;
-            source.source.release();
-            Ok(None)
         }
         Payload::Packed(mut packed) => {
             packed.copy_to(output)?;
@@ -4042,5 +4032,173 @@ mod emission_ledger_tests {
         .expect("encrypted ciphertext must be charged to its spool");
         assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod stored_pipe_tests {
+    use super::super::{write_streaming_archive_to, ArchiveExtras, WriterOptions};
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn data(len: usize, seed: usize) -> Vec<u8> {
+        (0..len)
+            .map(|at| (at.wrapping_mul(31) ^ (at >> 9) ^ seed) as u8)
+            .collect()
+    }
+
+    fn entries() -> Vec<ArchiveEntry> {
+        [(2_500_000, 1), (0, 2), (70_000, 3)]
+            .into_iter()
+            .map(|(len, seed)| {
+                ArchiveEntry::new(
+                    format!("member{seed}").into_bytes(),
+                    crate::EntrySource::from_bytes(data(len, seed)),
+                )
+            })
+            .collect()
+    }
+
+    fn store(features: crate::FeatureSet) -> WriterOptions {
+        WriterOptions::new(crate::ArchiveVersion::Rar50, features).with_compression_level(0)
+    }
+
+    fn piped(entries: &[ArchiveEntry], options: WriterOptions, extras: ArchiveExtras) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_streaming_archive_to(
+            entries,
+            options,
+            extras,
+            &WriterResources::default(),
+            &mut output,
+        )
+        .unwrap();
+        output
+    }
+
+    fn fingerprint(bytes: &[u8]) -> String {
+        let hash = crate::rar50::blake2sp::hash(bytes);
+        let hex: String = hash[..8].iter().map(|byte| format!("{byte:02x}")).collect();
+        format!("{}:{hex}", bytes.len())
+    }
+
+    #[test]
+    fn stored_pipe_archives_match_fingerprints_captured_from_master() {
+        let entries = entries();
+        let plain = crate::FeatureSet::store_only();
+        let mut quick_open = plain;
+        quick_open.quick_open = true;
+        let mut cases = Vec::new();
+        cases.extend([
+            (
+                "one",
+                piped(&entries[..1], store(plain), ArchiveExtras::default()),
+            ),
+            (
+                "empty",
+                piped(&entries[1..2], store(plain), ArchiveExtras::default()),
+            ),
+            (
+                "several",
+                piped(&entries, store(plain), ArchiveExtras::default()),
+            ),
+            (
+                "quick_open",
+                piped(&entries, store(quick_open), ArchiveExtras::default()),
+            ),
+        ]);
+        #[cfg(feature = "recovery")]
+        cases.push((
+            "recovery",
+            piped(
+                &entries,
+                store(plain),
+                ArchiveExtras::default().with_recovery_percent(Some(5)),
+            ),
+        ));
+        #[cfg(feature = "encryption")]
+        {
+            let locked: Vec<ArchiveEntry> = entries
+                .iter()
+                .cloned()
+                .map(|entry| entry.with_password(b"secret".to_vec()))
+                .collect();
+            let mut headers = plain;
+            headers.header_encryption = true;
+            cases.push((
+                "encrypted",
+                crate::entropy::seeded::with(|| {
+                    piped(&locked, store(plain), ArchiveExtras::default())
+                }),
+            ));
+            cases.push((
+                "encrypted_headers",
+                crate::entropy::seeded::with(|| {
+                    piped(&locked, store(headers), ArchiveExtras::default())
+                }),
+            ));
+        }
+        let expected = [
+            ("one", "2500141:214930c9491ae64f"),
+            ("empty", "135:48c92c5a1d765e8b"),
+            ("several", "2570267:4b7664377148b4e7"),
+            ("quick_open", "2570524:8e585393f60e0b4d"),
+            ("recovery", "2715543:e2c41f112ff34c56"),
+            ("encrypted", "2570414:095fdfd7c4ea3e13"),
+            ("encrypted_headers", "2570602:4864d1044ce10dd8"),
+        ];
+        let actual: Vec<_> = cases
+            .iter()
+            .map(|(name, bytes)| (*name, fingerprint(bytes)))
+            .collect();
+        for (name, fingerprint) in &actual {
+            let (_, want) = expected.iter().find(|(case, _)| case == name).unwrap();
+            assert_eq!(fingerprint, want, "{name}: {actual:?}");
+        }
+    }
+
+    struct Counting {
+        inner: std::io::Cursor<Vec<u8>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for Counting {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            self.inner.read(buffer)
+        }
+    }
+
+    impl Seek for Counting {
+        fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(position)
+        }
+    }
+
+    #[test]
+    fn both_stored_pipe_passes_read_a_large_member_in_mebibyte_blocks() {
+        let bytes = data(3 * 1024 * 1024, 0);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let source = {
+            let (bytes, reads) = (bytes.clone(), reads.clone());
+            crate::EntrySource::from_opener(bytes.len() as u64, move || {
+                Ok(Box::new(Counting {
+                    inner: std::io::Cursor::new(bytes.clone()),
+                    reads: reads.clone(),
+                }))
+            })
+        };
+        let archive = piped(
+            &[ArchiveEntry::new(b"large".to_vec(), source)],
+            store(crate::FeatureSet::store_only()),
+            ArchiveExtras::default(),
+        );
+        // Three blocks and an end-of-source probe per pass; 64 KiB and 8 KiB
+        // blocks took 48 and 384.
+        let reads = reads.load(Ordering::SeqCst);
+        assert!(reads <= 10, "{reads} reads");
+        let archive = crate::ArchiveReader::read_owned(archive).unwrap();
+        assert_eq!(archive.read_member(b"large", None).unwrap().unwrap(), bytes);
     }
 }
