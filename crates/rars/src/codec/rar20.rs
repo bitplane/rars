@@ -19,7 +19,7 @@ mod match_copy_tests;
 
 use super::packed_window::DRAINED;
 use super::workspace::{Allowance, Budget, Buffer};
-use super::{Error, Result};
+use super::{Error, Result, RAR20_ENDED_EARLY};
 use std::io::{Read, Write};
 
 const MAIN_COUNT: usize = 298;
@@ -267,7 +267,17 @@ impl<B: Budget> Reader20State<B> {
             let rest = target.saturating_sub(self.current_pos());
             let total = (len + rest).min(STREAM_HISTORY).max(len + next);
             self.output.reserve_up_to(total, STREAM_HISTORY)?;
-            self.decode_until(end, src).map_err(truncated)?;
+            if let Err(error) = self.decode_until(end, src) {
+                let error = truncated(error);
+                if error == RAR20_ENDED_EARLY {
+                    // The packed data holds no more of this member. Write
+                    // what it did hold, for its CRC to say whether that is
+                    // the whole file and only the declared size is wrong.
+                    out.write_all(self.raw_range(flushed, self.current_pos()))
+                        .map_err(Error::from)?;
+                }
+                return Err(error);
+            }
             out.write_all(self.raw_range(flushed, end))
                 .map_err(Error::from)?;
             flushed = end;
@@ -286,6 +296,49 @@ impl<B: Budget> Reader20State<B> {
     // A final match's bytes past the declared size go to the window only.
     fn keep_overrun(&mut self) -> Result<()> {
         self.drain_pending_match(usize::MAX)
+    }
+
+    /// Decodes the rest of a failed member's packed data into the window
+    /// only. RAR 2.0 has no end-of-file marker, so a member whose declared
+    /// size is short of its stream would otherwise leave a solid successor
+    /// starting from the middle of it.
+    ///
+    /// The run-on is kept only if it ends cleanly, where only the zero bits
+    /// that pad the last byte are left. Damage that has thrown the decoder
+    /// out of step with the stream usually ends some other way, and then the
+    /// declared size is the better guess at where the next member starts.
+    pub(crate) fn run_on(&mut self, input: &mut impl Read) {
+        let allowance = self.output.allowance();
+        let bits = std::mem::replace(&mut self.bits, BitReader::with_allowance(&allowance));
+        let saved = self.try_clone().ok();
+        self.bits = bits;
+        let control = self.read_control.clone();
+        let src: &mut dyn Read = &mut control.reader(input);
+        let clean = loop {
+            if self.pending_match.is_none() {
+                if self.bits.top_up(src).is_err() {
+                    break false;
+                }
+                if self.bits.only_zero_padding_left() {
+                    break true;
+                }
+            }
+            let pos = self.current_pos();
+            if self.decode_until(pos + 1, src).is_err() || self.current_pos() == pos {
+                break false;
+            }
+            if pos.saturating_sub(MAX_HISTORY) >= self.base_offset + MAX_HISTORY / 4 {
+                self.trim_history(pos, pos);
+            }
+        };
+        match saved {
+            Some(saved) if !clean => *self = saved,
+            // Nothing of this member may reach the next one's output.
+            _ => {
+                let _ = self.keep_overrun();
+                self.finish_history();
+            }
+        }
     }
 
     fn decode_until(&mut self, target: usize, src: &mut dyn Read) -> Result<()> {
@@ -637,21 +690,24 @@ impl<B: Budget> Reader20State<B> {
         if self.bits.remaining_bytes_from_current() < 5 {
             return Ok(());
         }
+        let symbol_start = self.bits.bit_pos;
         if self.audio_block {
             if self.audio_tables[self.cur_channel].state.is_empty() {
                 return Ok(());
             }
             if self.audio_tables[self.cur_channel].decode(&mut self.bits)? == 256 {
-                self.read_trailing_tables()?;
+                return self.read_trailing_tables();
             }
         } else {
             if self.main.state.is_empty() {
                 return Ok(());
             }
             if self.main.decode(&mut self.bits)? == 269 {
-                self.read_trailing_tables()?;
+                return self.read_trailing_tables();
             }
         }
+        // Left unread, for `run_on`.
+        self.bits.bit_pos = symbol_start;
         Ok(())
     }
 
@@ -949,6 +1005,13 @@ impl<B: Budget> BitReader<B> {
     fn remaining_bytes_from_current(&self) -> usize {
         self.input.len().saturating_sub(self.bit_pos / 8)
     }
+
+    /// Whether all that is left of the packed data is the zero bits that pad
+    /// its last byte.
+    fn only_zero_padding_left(&self) -> bool {
+        let left = (self.input.len() * 8).saturating_sub(self.bit_pos);
+        self.refill_at == DRAINED && left < 8 && self.peek_bits(left as u8) == Ok(0)
+    }
 }
 
 #[cfg(all(test, feature = "write"))]
@@ -960,7 +1023,7 @@ impl BitReader<Allowance> {
 
 fn truncated(error: Error) -> Error {
     match error {
-        Error::NeedMoreInput => Error::InvalidData("RAR 2.0 bitstream is truncated"),
+        Error::NeedMoreInput => RAR20_ENDED_EARLY,
         error => error,
     }
 }

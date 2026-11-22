@@ -28,7 +28,7 @@ use super::packed_window::DRAINED;
 use super::ppmd::{Ppmd7, PpmdByteReader};
 use super::rarvm;
 use super::workspace::{Allowance, Budget, Buffer};
-use super::{Error, Result};
+use super::{Error, Result, RAR29_ENDED_EARLY};
 use crate::read_control::Rar3VmPrograms;
 use std::io::{Read, Write};
 
@@ -512,11 +512,22 @@ impl<B: Budget> Reader29State<B> {
             let rest = final_target.saturating_sub(self.current_pos());
             let total = (len + rest).min(STREAM_HISTORY).max(len + next);
             self.output.reserve_up_to(total, STREAM_HISTORY)?;
-            self.decode_until(target, src)
-                .map_err(|error| match error {
+            if let Err(error) = self.decode_until(target, src) {
+                if error == RAR29_ENDED_EARLY {
+                    // The stream holds no more of this member. Write what it
+                    // did hold, for its CRC to say whether that is the whole
+                    // file and only the declared size is wrong.
+                    let end = self.current_pos();
+                    let safe_end = self.safe_flush_end(flushed, end, final_target)?;
+                    if safe_end > flushed {
+                        self.write_range(flushed, safe_end, start, out)?;
+                    }
+                }
+                return Err(match error {
                     Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
                     error => error,
-                })?;
+                });
+            }
 
             let safe_end = self.safe_flush_end(flushed, target, final_target)?;
             if safe_end <= flushed {
@@ -527,19 +538,7 @@ impl<B: Budget> Reader29State<B> {
                 continue;
             }
 
-            // Unfiltered output is written straight from the history, without
-            // a copy that would double the chunk's memory.
-            if self
-                .filters
-                .iter()
-                .any(|filter| filter.start >= flushed && filter.end() <= safe_end)
-            {
-                let decoded = self.filtered_range_owned(flushed, safe_end, start)?;
-                out.write_all(&decoded).map_err(Error::from)?;
-            } else {
-                out.write_all(self.raw_range(flushed, safe_end)?)
-                    .map_err(Error::from)?;
-            }
+            self.write_range(flushed, safe_end, start, out)?;
             flushed = safe_end;
             self.trim_history(flushed, self.current_pos());
             target = self
@@ -562,6 +561,30 @@ impl<B: Budget> Reader29State<B> {
             });
         }
         Ok(())
+    }
+
+    /// Writes decoded positions `start..end` to `out`, applying the filters
+    /// that lie within them.
+    fn write_range(
+        &mut self,
+        start: usize,
+        end: usize,
+        member_start: usize,
+        out: &mut impl Write,
+    ) -> Result<()> {
+        // Unfiltered output is written straight from the history, without
+        // a copy that would double the chunk's memory.
+        if self
+            .filters
+            .iter()
+            .any(|filter| filter.start >= start && filter.end() <= end)
+        {
+            let decoded = self.filtered_range_owned(start, end, member_start)?;
+            out.write_all(&decoded).map_err(Error::from)
+        } else {
+            out.write_all(self.raw_range(start, end)?)
+                .map_err(Error::from)
+        }
     }
 
     /// Decodes into the window only, until the member's end marker or the
@@ -602,9 +625,7 @@ impl<B: Budget> Reader29State<B> {
                 self.last_block_end,
                 Some(LzBlockEnd::NewFileKeepTables | LzBlockEnd::NewFileNewTables)
             ) {
-                return Err(Error::InvalidData(
-                    "RAR 2.9 member ended before its declared size",
-                ));
+                return Err(RAR29_ENDED_EARLY);
             }
             if !self.in_lz_block {
                 self.bits.top_up(src)?;
@@ -805,9 +826,7 @@ impl<B: Budget> Reader29State<B> {
                     // As at a member's end: the next one starts with a block
                     // header.
                     self.in_lz_block = false;
-                    return Err(Error::InvalidData(
-                        "RAR 2.9 member ended before its declared size",
-                    ));
+                    return Err(RAR29_ENDED_EARLY);
                 }
                 3 => {
                     self.read_vm_code_ppmd(src)?;

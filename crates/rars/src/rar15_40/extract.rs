@@ -62,10 +62,31 @@ impl<B: Budget> CodecState<B> {
         let mut packed = file
             .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-        let crc = self.decode_split_to(&mut packed, file, solid, password, out)?;
-        file.crc_result(crc, password)
+        let decoded = self.decode_split_to(&mut packed, file, solid, password, out)?;
+        let ended_early = decoded.ended_early.is_some();
+        let result = file.decoded_result(decoded, password);
+        if result.is_err() && !ended_early {
+            // The member reached its declared size and is still wrong. A
+            // solid successor starts where this member's packed data ends,
+            // which may be further on, if the size is what is wrong.
+            self.run_on(&mut packed);
+        }
+        result
     }
 
+    /// Decodes the rest of a failed member's packed data into the window
+    /// only, keeping it if it ends cleanly. RAR 2.9 does this itself, up to
+    /// its end-of-file marker.
+    fn run_on(&mut self, input: &mut impl Read) {
+        match self {
+            Self::Unpack15(decoder) => decoder.run_on(input),
+            Self::Unpack20(decoder) => decoder.run_on(input),
+            Self::Unpack29(_) => {}
+        }
+    }
+
+    /// Decodes `file`. A stream that ends before the declared size returns
+    /// the error that says so, for the caller to weigh against the CRC.
     fn decode_to(
         &mut self,
         input: &mut impl Read,
@@ -73,27 +94,30 @@ impl<B: Budget> CodecState<B> {
         solid: bool,
         password: Option<&[u8]>,
         out: &mut impl Write,
-    ) -> Result<()> {
+    ) -> Result<Option<Error>> {
         let target = usize::try_from(file.unp_size)
             .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
-        match self {
-            Self::Unpack15(decoder) => decoder
-                .decode_member_from_reader(input, target, solid, out)
-                .map_err(Error::from)
-                .map_err(|error| file.map_encrypted_payload_error(password, error))?,
-            Self::Unpack20(decoder) => decoder
-                .decode_member_from_reader(input, target, out)
-                .map_err(Error::from)
-                .map_err(|error| file.map_encrypted_payload_error(password, error))?,
-            Self::Unpack29(decoder) => if solid {
-                decoder.decode_member_from_reader(input, target, out)
-            } else {
-                decoder.decode_non_solid_member_from_reader(input, target, out)
+        let result = match self {
+            Self::Unpack15(decoder) => decoder.decode_member_from_reader(input, target, solid, out),
+            Self::Unpack20(decoder) => decoder.decode_member_from_reader(input, target, out),
+            Self::Unpack29(decoder) => {
+                if solid {
+                    decoder.decode_member_from_reader(input, target, out)
+                } else {
+                    decoder.decode_non_solid_member_from_reader(input, target, out)
+                }
             }
-            .map_err(Error::from)
-            .map_err(|error| file.map_encrypted_payload_error(password, error))?,
+        };
+        let Err(error) = result else {
+            return Ok(None);
+        };
+        let ended_early = error.ended_early();
+        let error = file.map_encrypted_payload_error(password, Error::from(error));
+        if ended_early {
+            Ok(Some(error))
+        } else {
+            Err(error)
         }
-        Ok(())
     }
     /// Returns the output's CRC; a split member's last header holds the one to check it against.
     fn decode_split_to(
@@ -103,14 +127,36 @@ impl<B: Budget> CodecState<B> {
         solid: bool,
         password: Option<&[u8]>,
         out: &mut impl Write,
-    ) -> Result<u32> {
+    ) -> Result<Decoded> {
         let mut crc = Crc32::new();
         let mut crc_writer = CrcWriter {
             inner: out,
             crc: &mut crc,
         };
-        self.decode_to(input, file, solid, password, &mut crc_writer)?;
-        Ok(crc.finish())
+        let ended_early = self.decode_to(input, file, solid, password, &mut crc_writer)?;
+        Ok(Decoded {
+            crc: crc.finish(),
+            ended_early,
+        })
+    }
+}
+
+/// A decoded member's CRC, and the error that ended its stream before its
+/// declared size, if one did.
+pub(super) struct Decoded {
+    crc: u32,
+    ended_early: Option<Error>,
+}
+
+impl FileHeader {
+    /// Checks a decoded member against its CRC. A stream that ended before
+    /// its declared size passes if what it produced matches: the whole file
+    /// is there, and the declared size is what is wrong.
+    pub(super) fn decoded_result(&self, decoded: Decoded, password: Option<&[u8]>) -> Result<()> {
+        match (self.crc_result(decoded.crc, password), decoded.ended_early) {
+            (Err(_), Some(error)) => Err(error),
+            (result, _) => result,
+        }
     }
 }
 
@@ -176,14 +222,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         input: &mut impl Read,
         first: &FileHeader,
         out: &mut impl Write,
-    ) -> Result<u32> {
+    ) -> Result<Decoded> {
         let solid = self.file_is_solid(first);
         let password = self.password;
-        let crc = self
+        let decoded = self
             .codec_for(first)?
             .decode_split_to(input, first, solid, password, out)?;
         self.decoded_files += 1;
-        Ok(crc)
+        Ok(decoded)
     }
 
     /// Decode compressed recovery data into a charged buffer.
@@ -202,8 +248,12 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         let password = self.password;
         let mut input = file.packed_reader_with_allowance(archive, password, &self.allowance)?;
         let solid = self.file_is_solid(file);
-        self.codec_for(file)?
-            .decode_to(&mut input, file, solid, password, &mut out)?;
+        if let Some(error) = self
+            .codec_for(file)?
+            .decode_to(&mut input, file, solid, password, &mut out)?
+        {
+            return Err(error);
+        }
         Ok(out)
     }
 
