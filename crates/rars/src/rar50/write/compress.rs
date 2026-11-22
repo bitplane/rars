@@ -574,6 +574,28 @@ pub(super) fn compress_members_with_context(
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
 ) -> Result<Records<CompressedMember>> {
+    compress_members(sources, plan, resources, advance, error_context, false)
+}
+
+/// Leaves stored members unhashed, for a writer that hashes them as it copies.
+pub(super) fn compress_members_hashing_stored_later(
+    sources: &[EntrySource],
+    plan: &CompressPlan,
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+) -> Result<Records<CompressedMember>> {
+    compress_members(sources, plan, resources, advance, error_context, true)
+}
+
+fn compress_members(
+    sources: &[EntrySource],
+    plan: &CompressPlan,
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    stored_hashed_later: bool,
+) -> Result<Records<CompressedMember>> {
     if advance.is_cancelled() || resources.is_cancelled() {
         return Err(Error::Cancelled);
     }
@@ -600,6 +622,10 @@ pub(super) fn compress_members_with_context(
         }
         // Storing is not "compress and hope it does not help": the header
         // records method zero, so the payload must be the source bytes.
+        ExecutionPlan::Stored if stored_hashed_later => Records::collect(
+            integrity.iter().map(|_| Spool::create_parked(resources)),
+            resources,
+        )?,
         ExecutionPlan::Stored => {
             for (index, (source, (input_size, crc, hash))) in
                 sources.iter().zip(&mut integrity).enumerate()

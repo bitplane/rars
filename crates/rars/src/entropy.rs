@@ -8,7 +8,40 @@ fn entropy_error(error: getrandom::Error, context: &'static str) -> Error {
 
 /// Fill salt or IV bytes using the operating system's entropy source.
 pub(crate) fn fill_entropy(bytes: &mut [u8], context: &'static str) -> Result<()> {
+    #[cfg(all(test, feature = "write", feature = "encryption"))]
+    if seeded::fill(bytes) {
+        return Ok(());
+    }
     fill_entropy_with(bytes, context, getrandom::fill)
+}
+
+/// Counter entropy, so encrypted writes can be compared byte for byte.
+#[cfg(all(test, feature = "write", feature = "encryption"))]
+pub(crate) mod seeded {
+    use std::cell::Cell;
+
+    thread_local! {
+        static NEXT: Cell<Option<u8>> = const { Cell::new(None) };
+    }
+
+    pub(crate) fn with<T>(run: impl FnOnce() -> T) -> T {
+        NEXT.set(Some(0));
+        let result = run();
+        NEXT.set(None);
+        result
+    }
+
+    pub(super) fn fill(bytes: &mut [u8]) -> bool {
+        let Some(mut next) = NEXT.get() else {
+            return false;
+        };
+        for byte in bytes {
+            *byte = next;
+            next = next.wrapping_add(1);
+        }
+        NEXT.set(Some(next));
+        true
+    }
 }
 
 fn fill_entropy_with(

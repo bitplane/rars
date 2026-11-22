@@ -129,6 +129,18 @@ impl<'a> HeaderImage<'a> {
         data: &[u8],
         out: &mut [u8],
     ) -> Result<()> {
+        self.render_into_with_iv(keys, None, data, out)
+    }
+
+    /// As [`render_into`](Self::render_into), encrypting under `iv` when one
+    /// is given rather than drawing a fresh one.
+    pub(crate) fn render_into_with_iv(
+        &self,
+        keys: Option<&Rar50Keys>,
+        iv: Option<[u8; 16]>,
+        data: &[u8],
+        out: &mut [u8],
+    ) -> Result<()> {
         if keys.is_some() {
             crate::crypto::require_encryption()?;
         }
@@ -149,18 +161,24 @@ impl<'a> HeaderImage<'a> {
         if let Some(keys) = keys {
             #[cfg(not(feature = "encryption"))]
             {
-                let _ = keys;
+                let _ = (keys, iv);
                 return Err(Error::FeatureDisabled {
                     feature: "encryption",
                 });
             }
             #[cfg(feature = "encryption")]
             {
-                let mut iv = [0; 16];
-                crate::entropy::fill_entropy(
-                    &mut iv,
-                    "RAR 5 writer could not generate encryption IV",
-                )?;
+                let iv = match iv {
+                    Some(iv) => iv,
+                    None => {
+                        let mut iv = [0; 16];
+                        crate::entropy::fill_entropy(
+                            &mut iv,
+                            "RAR 5 writer could not generate encryption IV",
+                        )?;
+                        iv
+                    }
+                };
                 out[..16].copy_from_slice(&iv);
                 Rar50Cipher::new(keys.key, iv)
                     .encrypt_in_place(&mut out[16..header_len])

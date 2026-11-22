@@ -8,7 +8,7 @@ pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
 use crate::{EntrySource, WriteProgress, WriterResources};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 
 mod compress;
 mod engine;
@@ -401,6 +401,36 @@ pub fn write_streaming_archive_with_progress(
     )
 }
 
+/// As [`write_streaming_archive_to`], seeking back to fill in stored members' headers so each is read once.
+pub fn write_seekable_archive_to<W: Write + Seek>(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+    output: &mut W,
+) -> Result<()> {
+    write_seekable_archive_with_progress(entries, options, extras, resources, None, output)
+}
+
+/// As [`write_seekable_archive_to`], reporting progress as it goes.
+pub fn write_seekable_archive_with_progress<W: Write + Seek>(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut W,
+) -> Result<()> {
+    write_archive_reporting(
+        entries,
+        options,
+        extras,
+        resources,
+        progress.map(ProgressReporter),
+        engine::ArchiveOutput::Seekable(output),
+    )
+}
+
 pub(crate) fn write_streaming_archive_reporting(
     entries: &[ArchiveEntry],
     options: WriterOptions,
@@ -408,6 +438,24 @@ pub(crate) fn write_streaming_archive_reporting(
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
+) -> Result<()> {
+    write_archive_reporting(
+        entries,
+        options,
+        extras,
+        resources,
+        progress,
+        engine::ArchiveOutput::Stream(output),
+    )
+}
+
+fn write_archive_reporting(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+    output: engine::ArchiveOutput<'_>,
 ) -> Result<()> {
     let control = crate::write_progress::ResourceProgress::new(resources, progress);
     let progress =

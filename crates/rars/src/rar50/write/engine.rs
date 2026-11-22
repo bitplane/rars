@@ -7,7 +7,9 @@
 //! final archive output streams in one pass. The
 //! workspace admission budget is not an aggregate RAM or disk quota.
 //!
-//! Stored payloads are reread and verified during emission. Recovery requires
+//! Stored payloads are reread and verified during emission, or, when the output
+//! can seek and every member is stored, read once behind a header patched
+//! with the checksums of what was copied. Recovery requires
 //! a further pass over the preceding archive bytes, mirrored into a spool.
 
 use super::compress::{self, CompressPlan, CompressedMember};
@@ -16,9 +18,9 @@ use super::headers::write_vint;
 use super::headers::{
     block_header_image, encrypted_header_block, encrypted_main_header_block, file_specific,
     fresh_iv, header_encryption_keys, header_encryption_password, prepared_header_image,
-    stored_file_specific, write_end_header, write_extra_record, write_file_encryption_record,
-    write_hash_record_with_value, write_head_crypt, write_main_header, HeaderEncryptionKeys,
-    PreparedHeader, WriteKeys,
+    repeated_header_image, stored_file_specific, write_end_header, write_extra_record,
+    write_file_encryption_record, write_hash_record_with_value, write_head_crypt,
+    write_main_header, HeaderEncryptionKeys, PreparedHeader, WriteKeys,
 };
 use super::layout::{recovery_covers, resolve_layout, settle_layout, LayoutInputs};
 use super::{encrypt_reader_to, ArchiveEntry};
@@ -35,9 +37,32 @@ use crate::recovery::rar5::{
 };
 use crate::streaming::preparation::{Bytes, Owned, Records};
 use crate::streaming::Spool;
-use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter};
+use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, WorkTracker};
+use crate::write_stream::SeekWrite;
 use crate::{Error, Result, WriterResources};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+
+/// A seekable archive lets stored members be read once and their headers patched.
+pub(super) enum ArchiveOutput<'a> {
+    Stream(&'a mut dyn Write),
+    Seekable(&'a mut dyn SeekWrite),
+}
+
+enum Sink<'o, 'p> {
+    Stream(CancellableIo<'p, &'o mut dyn Write>),
+    Seekable(CancellableIo<'p, &'o mut dyn SeekWrite>),
+}
+
+impl Sink<'_, '_> {
+    fn writer(&mut self) -> &mut dyn Write {
+        match self {
+            Self::Stream(output) => output,
+            Self::Seekable(output) => output,
+        }
+    }
+}
+
+const STORED_COPY_BUFFER: u64 = 1024 * 1024;
 
 pub(super) struct EnginePlan<'a> {
     pub(super) compress: CompressPlan,
@@ -68,6 +93,10 @@ struct PreparedBlock<'a> {
     quick_open_cached: bool,
     /// Index into the caller's entries; names are cloned only on error.
     entry_index: Option<usize>,
+    /// The header's checksums wait for the copy, so it is rewritten after it.
+    patch: Option<MemberHeader>,
+    /// Record offset and distance, so a patched header reaches quick-open too.
+    quick_open_record: Option<(u64, u64)>,
 }
 
 impl PreparedBlock<'_> {
@@ -130,22 +159,26 @@ struct PreparedSource {
     len: u64,
     crc32: u32,
     hash: [u8; 32],
+    /// Not hashed yet: the copy's checksums go into a patched header.
+    hashed_on_copy: bool,
 }
 
 impl PreparedSource {
-    fn new(source: &crate::EntrySource, member: &CompressedMember) -> Self {
+    fn new(source: &crate::EntrySource, member: &CompressedMember, hashed_on_copy: bool) -> Self {
         Self {
             source: source.clone(),
             len: member.input_size,
             crc32: member.crc32,
             hash: member.hash,
+            hashed_on_copy,
         }
     }
 
-    fn open(&self) -> Result<CheckedReader> {
+    fn open<'w, 'p>(&self, work: Option<&'w WorkTracker<'p>>) -> Result<CheckedReader<'w, 'p>> {
         Ok(CheckedReader {
             reader: self.source.open()?,
             integrity: ChecksumSink::default(),
+            work,
         })
     }
 
@@ -159,28 +192,41 @@ impl PreparedSource {
     }
 }
 
-struct CheckedReader {
+struct CheckedReader<'w, 'p> {
     reader: Box<dyn crate::EntryReader>,
     integrity: ChecksumSink,
+    /// Advanced as a member hashed on its copy is read.
+    work: Option<&'w WorkTracker<'p>>,
 }
 
-impl Read for CheckedReader {
+impl Read for CheckedReader<'_, '_> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.reader.read(buffer)?;
         self.integrity.write_all(&buffer[..read])?;
+        if let Some(work) = self.work {
+            if !work.advance(read as u64) {
+                return Err(std::io::Error::other(Error::Cancelled));
+            }
+        }
         Ok(read)
     }
 }
 
-impl CheckedReader {
-    fn finish(mut self, source: &PreparedSource, observed: u64) -> Result<()> {
+impl CheckedReader<'_, '_> {
+    /// The copy's checksums for a member hashed on its copy; otherwise
+    /// checks them against the ones its header already carries.
+    fn finish(mut self, source: &PreparedSource, observed: u64) -> Result<Option<ChecksumSink>> {
         crate::write_stream::check_source_length(
             &mut *self.reader,
             observed,
             source.len,
             "entry source size changed while writing",
         )?;
-        source.verify(self.integrity)
+        if source.hashed_on_copy {
+            return Ok(Some(self.integrity));
+        }
+        source.verify(self.integrity)?;
+        Ok(None)
     }
 }
 
@@ -207,13 +253,20 @@ pub(super) fn write_archive<'a>(
     entries: &'a [ArchiveEntry],
     plan: EnginePlan<'a>,
     resources: &WriterResources,
-    output: &mut dyn Write,
+    output: ArchiveOutput<'_>,
 ) -> Result<()> {
-    let mut controlled_output = CancellableIo {
-        inner: output,
-        progress: plan.progress,
+    let mut sink = match output {
+        ArchiveOutput::Stream(inner) => Sink::Stream(CancellableIo {
+            inner,
+            progress: plan.progress,
+        }),
+        ArchiveOutput::Seekable(inner) => Sink::Seekable(CancellableIo {
+            inner,
+            progress: plan.progress,
+        }),
     };
-    let output: &mut dyn Write = &mut controlled_output;
+    // Every member is stored, so none is read before it is copied.
+    let hash_on_copy = matches!(sink, Sink::Seekable(_)) && plan.compress.method == 0;
     for entry in entries {
         super::validate_entry(entry)?;
     }
@@ -249,7 +302,12 @@ pub(super) fn write_archive<'a>(
         crate::WriteOperation::Compression,
         total_input,
     );
-    let compressed = compress::compress_members_with_context(
+    let compress = if hash_on_copy {
+        compress::compress_members_hashing_stored_later
+    } else {
+        compress::compress_members_with_context
+    };
+    let compressed = compress(
         &sources,
         &plan.compress,
         resources,
@@ -285,6 +343,7 @@ pub(super) fn write_archive<'a>(
             entry,
             member,
             &plan,
+            hash_on_copy,
             &mut write_keys,
             header_keys.as_ref(),
             resources,
@@ -325,15 +384,14 @@ pub(super) fn write_archive<'a>(
         let mut payload = Spool::create(resources)?;
         let mut checksum = crate::crc32::Crc32::new();
         let mut offset = 0u64;
-        for block in &blocks {
+        for block in blocks.iter_mut() {
             check_cancelled(plan.progress)?;
             if block.quick_open_cached {
-                append_quick_open_entry(
-                    &mut payload,
-                    &mut checksum,
-                    body_len - offset,
-                    &block.header,
-                )?;
+                let distance = body_len - offset;
+                if block.patch.is_some() {
+                    block.quick_open_record = Some((payload.len(), distance));
+                }
+                append_quick_open_entry(&mut payload, &mut checksum, distance, &block.header)?;
             }
             offset += block.len()?;
         }
@@ -347,13 +405,7 @@ pub(super) fn write_archive<'a>(
             resources,
         )?;
         payload.park();
-        Some(PreparedBlock {
-            header,
-            payload: Payload::Packed(payload),
-            payload_len,
-            quick_open_cached: false,
-            entry_index: None,
-        })
+        Some((header, payload))
     } else {
         None
     };
@@ -388,7 +440,9 @@ pub(super) fn write_archive<'a>(
             archive_metadata: plan.archive_metadata,
             metadata_record: plan.metadata_record,
             body_len,
-            quick_open_payload_len: quick_open_payload.as_ref().map(|block| block.payload_len),
+            quick_open_payload_len: quick_open_payload
+                .as_ref()
+                .map(|(_, payload)| payload.len()),
             recovery_percent: plan.recovery_percent,
         },
         resources,
@@ -400,56 +454,100 @@ pub(super) fn write_archive<'a>(
         Some(_) => Some(Spool::create(resources)?),
         None => None,
     };
+    let main = match &header_keys {
+        Some(keys) => encrypted_main_header_block(
+            &keys.keys,
+            main_flags,
+            None,
+            &layout.main_extra,
+            resources,
+        )?,
+        None => {
+            let mut main = Bytes::new(resources);
+            write_main_header(&mut main, main_flags, None, &layout.main_extra, resources)?;
+            main
+        }
+    };
+    // The layout predicted this before any of it existed. If the
+    // prediction is off, every offset in the locator is off with it.
+    debug_assert_eq!(
+        main.len() as u64,
+        layout.main_header_len,
+        "main header size differs from the size its layout was built on"
+    );
     {
-        let mut sink = Tee {
-            output,
+        let mut tee = Tee {
+            output: sink.writer(),
             mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
         };
-
-        let main = match &header_keys {
-            Some(keys) => encrypted_main_header_block(
-                &keys.keys,
-                main_flags,
-                None,
-                &layout.main_extra,
-                resources,
-            )?,
-            None => {
-                let mut main = Bytes::new(resources);
-                write_main_header(&mut main, main_flags, None, &layout.main_extra, resources)?;
-                main
-            }
-        };
-        // The layout predicted this before any of it existed. If the
-        // prediction is off, every offset in the locator is off with it.
-        debug_assert_eq!(
-            main.len() as u64,
-            layout.main_header_len,
-            "main header size differs from the size its layout was built on"
-        );
-
-        sink.write_all(RAR50_SIGNATURE)?;
-        sink.write_all(&head_crypt)?;
-        sink.write_all(&main)?;
-
-        for block in blocks {
-            let entry_index = block.entry_index;
-            let result = (|| {
-                sink.write_all(&block.header)?;
-                write_payload(block.payload, &mut sink, resources, plan.progress)
-            })();
-            result.map_err(|error| match entry_index {
-                Some(index) => member_error(error, &entries[index].name, "writing"),
-                None => error,
-            })?;
-        }
-
-        if let Some(block) = quick_open_payload {
-            sink.write_all(&block.header)?;
-            write_payload(block.payload, &mut sink, resources, plan.progress)?;
-        }
+        tee.write_all(RAR50_SIGNATURE)?;
+        tee.write_all(&head_crypt)?;
+        tee.write_all(&main)?;
     }
 
+    let mut quick_open_payload = quick_open_payload;
+    let mut quick_open_patched = false;
+    // Members hashed on their copy report it here, as compression skipped them.
+    let copy_work = WorkTracker::new(
+        plan.progress,
+        crate::WriteOperation::Emission,
+        if hash_on_copy { total_input } else { 0 },
+    );
+    for block in blocks {
+        let entry_index = block.entry_index;
+        let result = emit_block(
+            block,
+            entries,
+            &mut sink,
+            &mut mirror,
+            quick_open_payload.as_mut().map(|(_, payload)| payload),
+            header_keys.as_ref(),
+            resources,
+            plan.progress,
+            &copy_work,
+        );
+        quick_open_patched |= result.as_ref().is_ok_and(|patched| *patched);
+        result.map_err(|error| match entry_index {
+            Some(index) => member_error(error, &entries[index].name, "writing"),
+            None => error,
+        })?;
+    }
+
+    if let Some((prepared, mut payload)) = quick_open_payload {
+        let patched = if quick_open_patched {
+            let payload_len = payload.len();
+            let mut checksum = ChecksumSink::default();
+            payload.copy_to(&mut checksum)?;
+            let (specific, extra) =
+                stored_service_parts(b"QO", payload_len, checksum.crc.finish(), &[], resources)?;
+            Some(repeated_header_image(
+                &prepared,
+                HEAD_SERVICE,
+                HFL_EXTRA | HFL_DATA,
+                Some(payload_len),
+                &specific,
+                &extra,
+                header_keys.as_ref(),
+                resources,
+            )?)
+        } else {
+            None
+        };
+        let mut tee = Tee {
+            output: sink.writer(),
+            mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
+        };
+        tee.write_all(patched.as_deref().unwrap_or(&prepared))?;
+        write_payload(
+            Payload::Packed(payload),
+            &mut tee,
+            resources,
+            plan.progress,
+            None,
+        )?;
+    }
+
+    let output = sink.writer();
     if let Some(recovery_percent) = plan.recovery_percent {
         let mirror = mirror.as_mut().expect("recovery mirrors the archive");
         // The recovery block has to start exactly where the locator in the
@@ -490,6 +588,110 @@ pub(super) fn write_archive<'a>(
     check_cancelled(plan.progress)?;
     report_emission(plan.progress, false);
     Ok(())
+}
+
+/// A member hashed on its copy goes out behind a zeroed placeholder, patched everywhere it was copied.
+#[allow(clippy::too_many_arguments)]
+fn emit_block(
+    block: PreparedBlock<'_>,
+    entries: &[ArchiveEntry],
+    sink: &mut Sink<'_, '_>,
+    mirror: &mut Option<Spool>,
+    quick_open: Option<&mut Spool>,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+    copy_work: &WorkTracker<'_>,
+) -> Result<bool> {
+    let PreparedBlock {
+        header: prepared,
+        payload,
+        entry_index,
+        patch,
+        quick_open_record,
+        ..
+    } = block;
+    let patch = match (patch, entry_index, &mut *sink) {
+        (Some(patch), Some(index), Sink::Seekable(output)) => {
+            Some((patch, index, output.stream_position()?))
+        }
+        (None, ..) => None,
+        _ => {
+            return Err(Error::InvalidArgument(
+                "RAR 5 member header can only be patched in a seekable archive",
+            ))
+        }
+    };
+    let mirror_at = mirror.as_ref().map(Spool::len);
+    let checksums = {
+        let mut tee = Tee {
+            output: sink.writer(),
+            mirror: mirror.as_mut().map(|spool| spool as &mut dyn Write),
+        };
+        if patch.is_some() {
+            tee.write_all(&Bytes::zeroed(prepared.len(), resources)?)?;
+        } else {
+            tee.write_all(&prepared)?;
+        }
+        let entry = patch
+            .as_ref()
+            .map(|(patch, index, _)| (*index, &entries[*index].name, patch.input_size));
+        if let Some((index, name, size)) = entry {
+            copy_work.entry_started(index, entries.len(), name, size);
+        }
+        let checksums = write_payload(
+            payload,
+            &mut tee,
+            resources,
+            progress,
+            entry.is_some().then_some(copy_work),
+        )?;
+        if let Some((index, name, size)) = entry {
+            copy_work.entry_finished(index, entries.len(), name, size);
+        }
+        checksums
+    };
+    let patched = match (patch, checksums) {
+        (Some((patch, index, header_at)), Some(checksums)) => {
+            let patched = patch.render(
+                &entries[index],
+                checksums.crc.finish(),
+                checksums.hash.finalize(),
+                &prepared,
+                header_keys,
+                resources,
+            )?;
+            let Sink::Seekable(output) = sink else {
+                unreachable!("a patched header has a seekable archive");
+            };
+            let end = output.stream_position()?;
+            output.seek(SeekFrom::Start(header_at))?;
+            output.write_all(&patched)?;
+            output.seek(SeekFrom::Start(end))?;
+            if let (Some(spool), Some(at)) = (mirror.as_mut(), mirror_at) {
+                spool.seek_to(at)?;
+                spool.write_all(&patched)?;
+                spool.seek_to(spool.len())?;
+            }
+            Some(patched)
+        }
+        (None, None) => None,
+        _ => {
+            return Err(Error::InvalidArgument(
+                "RAR 5 member was hashed on its copy without a header to patch",
+            ))
+        }
+    };
+    let Some(patched) = patched else {
+        return Ok(false);
+    };
+    if let (Some(payload), Some((at, distance))) = (quick_open, quick_open_record) {
+        // The record keeps its length, so it is rewritten where it stands.
+        payload.seek_to(at)?;
+        append_quick_open_entry(payload, &mut crate::crc32::Crc32::new(), distance, &patched)?;
+        payload.park();
+    }
+    Ok(true)
 }
 
 /// Appends one quick-open record: how far back the header sits, then the
@@ -570,6 +772,8 @@ fn stored_service_block<'a>(
         payload_len: data.len() as u64,
         quick_open_cached: false,
         entry_index: None,
+        patch: None,
+        quick_open_record: None,
     })
 }
 
@@ -581,9 +785,7 @@ fn stored_service_header(
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
 ) -> Result<PreparedHeader> {
-    let mut extra = Bytes::new(resources);
-    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
-    let specific = stored_file_specific(name, data_len, crc32, 0, None, 0, resources)?;
+    let (specific, extra) = stored_service_parts(name, data_len, crc32, service_data, resources)?;
     prepared_header_image(
         HEAD_SERVICE,
         HFL_EXTRA | HFL_DATA,
@@ -593,6 +795,19 @@ fn stored_service_header(
         header_keys,
         resources,
     )
+}
+
+fn stored_service_parts(
+    name: &[u8],
+    data_len: u64,
+    crc32: u32,
+    service_data: &[u8],
+    resources: &WriterResources,
+) -> Result<(Bytes, Bytes)> {
+    let mut extra = Bytes::new(resources);
+    write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
+    let specific = stored_file_specific(name, data_len, crc32, 0, None, 0, resources)?;
+    Ok((specific, extra))
 }
 
 // Archive-level identification is not a member or a quick-open entry. Its
@@ -628,6 +843,8 @@ fn producer_block(
         payload_len: data.len() as u64,
         quick_open_cached: false,
         entry_index: None,
+        patch: None,
+        quick_open_record: None,
     })
 }
 
@@ -731,6 +948,8 @@ fn encrypted_service_block<'a>(
         payload_len,
         quick_open_cached: false,
         entry_index: None,
+        patch: None,
+        quick_open_record: None,
     })
 }
 
@@ -750,95 +969,69 @@ fn decoded_rar50_name_len(bytes: &[u8]) -> usize {
         .sum()
 }
 
-/// Builds a member's final header and decides how its payload will be written.
+/// Builds a member's header and decides how its payload will be written.
 fn prepare_member<'a>(
     entry: &'a ArchiveEntry,
     member: CompressedMember,
     plan: &EnginePlan<'_>,
+    hash_on_copy: bool,
     write_keys: &mut WriteKeys<'a>,
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
 ) -> Result<PreparedBlock<'static>> {
+    let hash_on_copy = hash_on_copy && member.store;
     let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
         member.input_size
     } else {
         member.packed.len()
     };
+    let (crc32, hash, input_size) = (member.crc32, member.hash, member.input_size);
     let plain = if member.store {
-        MemberPlainPayload::Stored(PreparedSource::new(&entry.source, &member))
+        MemberPlainPayload::Stored(PreparedSource::new(&entry.source, &member, hash_on_copy))
     } else {
         MemberPlainPayload::Packed(member.packed)
     };
 
-    let mut extra = Bytes::new(resources);
-    let (payload, payload_len, data_crc32, hash) = match entry.password.as_deref() {
+    let (payload, recipe) = match entry.password.as_deref() {
         Some(password) => {
             let (salt, keys) = write_keys.for_password(password)?;
             let iv = fresh_iv()?;
-            write_file_encryption_record(
-                &mut extra,
-                salt,
-                iv,
-                keys.checked_password_record()?,
-                true,
-            )?;
-            let crc32 = keys.checked_crc_mac(member.crc32)?;
-            let hash = keys.checked_hash_mac(member.hash)?;
+            let recipe = MemberHeader {
+                compression_info,
+                input_size,
+                // Encryption pads the payload up to the cipher block size.
+                payload_len: plain_len.div_ceil(16) * 16,
+                encryption: Some(MemberEncryption {
+                    salt,
+                    iv,
+                    keys: keys.clone(),
+                }),
+            };
             (
                 Payload::Encrypted {
                     plain: Owned::new(plain.into(), resources)?,
                     keys,
                     iv,
                 },
-                // Encryption pads the payload up to the cipher block size.
-                plain_len.div_ceil(16) * 16,
-                crc32,
-                hash,
+                recipe,
             )
         }
-        None => (plain.into(), plain_len, member.crc32, member.hash),
+        None => (
+            plain.into(),
+            MemberHeader {
+                compression_info,
+                input_size,
+                payload_len: plain_len,
+                encryption: None,
+            },
+        ),
     };
-    // A link has no file payload to hash; its target is protected by the header CRC.
-    if entry.redirection.is_none() {
-        write_hash_record_with_value(&mut extra, hash)?;
-    }
-    super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds)?;
-    if let Some(times) = entry.file_times {
-        write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?)?;
-    }
-    if let Some(link) = &entry.redirection {
-        let mut record = Bytes::new(resources);
-        record.vint(link.redirection_type)?;
-        record.vint(link.flags)?;
-        record.vint(link.target_name.len() as u64)?;
-        record.extend_from_slice(&link.target_name)?;
-        write_extra_record(&mut extra, super::super::FHEXTRA_REDIR, &record)?;
-    }
-
-    let specific = file_specific(
-        &entry.name,
-        // Match Unix link stat size, while the packed payload remains empty.
-        entry
-            .redirection
-            .as_ref()
-            .map_or(member.input_size, |link| {
-                entry
-                    .redirection_size
-                    .unwrap_or_else(|| decoded_rar50_name_len(&link.target_name) as u64)
-            }),
-        data_crc32,
-        entry.attributes,
-        entry.mtime.filter(|_| entry.mtime_nanoseconds.is_none()),
-        compression_info,
-        entry.host_os,
-        entry.is_directory,
-        resources,
-    )?;
+    let (specific, extra) = recipe.parts(entry, crc32, hash, resources)?;
     let header = prepared_header_image(
         HEAD_FILE,
         HFL_EXTRA | HFL_DATA,
-        Some(payload_len),
+        Some(recipe.payload_len),
         &specific,
         &extra,
         header_keys,
@@ -848,34 +1041,155 @@ fn prepare_member<'a>(
     Ok(PreparedBlock {
         header,
         payload,
-        payload_len,
+        payload_len: recipe.payload_len,
         quick_open_cached: true,
         entry_index: None,
+        patch: hash_on_copy.then_some(recipe),
+        quick_open_record: None,
     })
 }
 
+/// Everything in a member's header but its checksums.
+struct MemberHeader {
+    compression_info: u64,
+    input_size: u64,
+    payload_len: u64,
+    encryption: Option<MemberEncryption>,
+}
+
+struct MemberEncryption {
+    salt: [u8; 16],
+    iv: [u8; 16],
+    keys: Rar50Keys,
+}
+
+impl MemberHeader {
+    fn parts(
+        &self,
+        entry: &ArchiveEntry,
+        crc32: u32,
+        hash: [u8; 32],
+        resources: &WriterResources,
+    ) -> Result<(Bytes, Bytes)> {
+        let mut extra = Bytes::new(resources);
+        let (data_crc32, hash) = match &self.encryption {
+            Some(encryption) => {
+                write_file_encryption_record(
+                    &mut extra,
+                    encryption.salt,
+                    encryption.iv,
+                    encryption.keys.checked_password_record()?,
+                    true,
+                )?;
+                (
+                    encryption.keys.checked_crc_mac(crc32)?,
+                    encryption.keys.checked_hash_mac(hash)?,
+                )
+            }
+            None => (crc32, hash),
+        };
+        // A link has no file payload to hash; its target is protected by the header CRC.
+        if entry.redirection.is_none() {
+            write_hash_record_with_value(&mut extra, hash)?;
+        }
+        super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds)?;
+        if let Some(times) = entry.file_times {
+            write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?)?;
+        }
+        if let Some(link) = &entry.redirection {
+            let mut record = Bytes::new(resources);
+            record.vint(link.redirection_type)?;
+            record.vint(link.flags)?;
+            record.vint(link.target_name.len() as u64)?;
+            record.extend_from_slice(&link.target_name)?;
+            write_extra_record(&mut extra, super::super::FHEXTRA_REDIR, &record)?;
+        }
+
+        let specific = file_specific(
+            &entry.name,
+            // Match Unix link stat size, while the packed payload remains empty.
+            entry.redirection.as_ref().map_or(self.input_size, |link| {
+                entry
+                    .redirection_size
+                    .unwrap_or_else(|| decoded_rar50_name_len(&link.target_name) as u64)
+            }),
+            data_crc32,
+            entry.attributes,
+            entry.mtime.filter(|_| entry.mtime_nanoseconds.is_none()),
+            self.compression_info,
+            entry.host_os,
+            entry.is_directory,
+            resources,
+        )?;
+        Ok((specific, extra))
+    }
+
+    /// The header again with the copy's checksums, at the prepared length.
+    fn render(
+        &self,
+        entry: &ArchiveEntry,
+        crc32: u32,
+        hash: [u8; 32],
+        prepared: &[u8],
+        header_keys: Option<&HeaderEncryptionKeys>,
+        resources: &WriterResources,
+    ) -> Result<Bytes> {
+        let (specific, extra) = self.parts(entry, crc32, hash, resources)?;
+        repeated_header_image(
+            prepared,
+            HEAD_FILE,
+            HFL_EXTRA | HFL_DATA,
+            Some(self.payload_len),
+            &specific,
+            &extra,
+            header_keys,
+            resources,
+        )
+    }
+}
+
+/// Returns the payload's checksums when it was hashed on its copy.
 fn write_payload(
     payload: Payload<'_>,
     output: &mut dyn Write,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
-) -> Result<()> {
+    copy_work: Option<&WorkTracker<'_>>,
+) -> Result<Option<ChecksumSink>> {
     check_cancelled(progress)?;
     match payload {
         Payload::Borrowed(data) => {
             output.write_all(data)?;
-            Ok(())
+            Ok(None)
+        }
+        Payload::Stored(source) if source.hashed_on_copy => {
+            let mut reader = source.open(copy_work)?;
+            let mut buffer =
+                Bytes::zeroed(source.len.clamp(1, STORED_COPY_BUFFER) as usize, resources)?;
+            let mut copied = 0u64;
+            while copied < source.len {
+                let want = (source.len - copied).min(buffer.len() as u64) as usize;
+                let read = reader.read(&mut buffer[..want])?;
+                if read == 0 {
+                    break;
+                }
+                output.write_all(&buffer[..read])?;
+                copied += read as u64;
+            }
+            let checksums = reader.finish(&source, copied)?;
+            source.source.release();
+            Ok(checksums)
         }
         Payload::Stored(source) => {
-            let mut reader = source.open()?;
+            let mut reader = source.open(None)?;
             let copied = std::io::copy(&mut reader.by_ref().take(source.len), output)?;
             reader.finish(&source, copied)?;
             source.source.release();
-            Ok(())
+            Ok(None)
         }
         Payload::Packed(mut packed) => {
             packed.copy_to(output)?;
-            Ok(())
+            Ok(None)
         }
         Payload::Encrypted { plain, keys, iv } => {
             const ENCRYPT_CHUNK: usize = 64 * 1024;
@@ -890,7 +1204,7 @@ fn write_payload(
             })?;
             match plain.into_inner() {
                 PlainPayload::Stored(source) => {
-                    let mut reader = source.open()?;
+                    let mut reader = source.open(copy_work.filter(|_| source.hashed_on_copy))?;
                     encrypt_reader_to(
                         &mut reader,
                         source.len,
@@ -900,10 +1214,22 @@ fn write_payload(
                         ENCRYPT_CHUNK,
                         progress,
                         resources,
-                    )?;
-                    reader.finish(&source, source.len)?;
+                    )
+                    .map_err(|error| {
+                        // Only a member hashed on its copy has not been
+                        // measured before; running short is the source's doing.
+                        if source.hashed_on_copy
+                            && matches!(&error, Error::Io(io)
+                                if io.kind == std::io::ErrorKind::UnexpectedEof)
+                        {
+                            Error::SourceChanged("entry source size changed while writing")
+                        } else {
+                            error
+                        }
+                    })?;
+                    let checksums = reader.finish(&source, source.len)?;
                     source.source.release();
-                    Ok(())
+                    Ok(checksums)
                 }
                 PlainPayload::Packed(mut packed) => {
                     let len = packed.len();
@@ -917,13 +1243,15 @@ fn write_payload(
                         ENCRYPT_CHUNK,
                         progress,
                         resources,
-                    )
+                    )?;
+                    Ok(None)
                 }
                 PlainPayload::Borrowed(mut data) => {
                     let len = data.len() as u64;
                     encrypt_reader_to(
                         &mut data, len, output, &keys, iv, chunk_size, progress, resources,
-                    )
+                    )?;
+                    Ok(None)
                 }
             }
         }
@@ -1417,8 +1745,8 @@ fn prepare_volume_member<'a>(
                 progress.is_some_and(ProgressReporter::is_cancelled)
             })?;
             if member.store {
-                let source = PreparedSource::new(&entry.source, &member);
-                let mut reader = source.open()?;
+                let source = PreparedSource::new(&entry.source, &member, false);
+                let mut reader = source.open(None)?;
                 encrypt_reader_to(
                     &mut reader,
                     plain_len,
@@ -1478,7 +1806,7 @@ fn prepare_volume_member<'a>(
             payload_len: plain_len,
             source: if member.store {
                 FragmentSource::Stored {
-                    prepared: PreparedSource::new(&entry.source, &member),
+                    prepared: PreparedSource::new(&entry.source, &member, false),
                     emitted: Owned::new(ChecksumSink::default(), resources)?,
                 }
             } else {
@@ -1788,7 +2116,13 @@ impl VolumeWriter<'_> {
         self.trailing_len = 0;
         if self.volume_index == 0 {
             body.write_all(&marker.header)?;
-            write_payload(marker.payload, &mut body, self.resources, self.progress)?;
+            write_payload(
+                marker.payload,
+                &mut body,
+                self.resources,
+                self.progress,
+                None,
+            )?;
         } else {
             // A split member's header comes first in a later volume, as RAR
             // writes it; python-rarfile reads stored members on that basis.
@@ -1808,7 +2142,13 @@ impl VolumeWriter<'_> {
         let mut body = self.body.take().expect("volume started");
         if let Some(marker) = self.trailing_producer.take() {
             body.write_all(&marker.header)?;
-            write_payload(marker.payload, &mut body, self.resources, self.progress)?;
+            write_payload(
+                marker.payload,
+                &mut body,
+                self.resources,
+                self.progress,
+                None,
+            )?;
         }
         let volume_number = self.volume_index;
         self.volume_index += 1;
@@ -2126,6 +2466,89 @@ mod input_size_tests {
     }
 }
 
+#[cfg(all(test, feature = "encryption"))]
+mod hashed_on_copy_tests {
+    use super::super::{
+        write_seekable_archive_to, write_streaming_archive_to, ArchiveExtras, WriterOptions,
+    };
+    use super::*;
+
+    fn entries(password: Option<&[u8]>) -> Vec<ArchiveEntry> {
+        [5000usize, 0, 33]
+            .into_iter()
+            .enumerate()
+            .map(|(index, len)| {
+                let data: Vec<u8> = (0..len).map(|at| (at * 7 + index) as u8).collect();
+                let entry = ArchiveEntry::new(
+                    format!("member{index}").into_bytes(),
+                    crate::EntrySource::from_bytes(data),
+                );
+                match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn encrypted_archives_match_the_streamed_ones_under_the_same_entropy() {
+        let cases: [(bool, bool, Option<u64>); 4] = [
+            (false, false, None),
+            (true, false, None),
+            (false, true, None),
+            (true, false, Some(5)),
+        ];
+        for (header_encryption, quick_open, recovery) in cases {
+            if recovery.is_some() && !cfg!(feature = "recovery") {
+                continue;
+            }
+            let mut features = crate::FeatureSet::store_only();
+            features.header_encryption = header_encryption;
+            features.quick_open = quick_open;
+            let options = WriterOptions::new(crate::ArchiveVersion::Rar50, features)
+                .with_compression_level(0);
+            let entries = entries(Some(b"secret"));
+            let extras = ArchiveExtras::default().with_recovery_percent(recovery);
+            let resources = WriterResources::default();
+            let streamed = crate::entropy::seeded::with(|| {
+                let mut output = Vec::new();
+                write_streaming_archive_to(
+                    &entries,
+                    options,
+                    extras.clone(),
+                    &resources,
+                    &mut output,
+                )
+                .unwrap();
+                output
+            });
+            let seekable = crate::entropy::seeded::with(|| {
+                let mut output = std::io::Cursor::new(Vec::new());
+                write_seekable_archive_to(
+                    &entries,
+                    options,
+                    extras.clone(),
+                    &resources,
+                    &mut output,
+                )
+                .unwrap();
+                output.into_inner()
+            });
+            assert_eq!(
+                seekable, streamed,
+                "headers={header_encryption}, quick_open={quick_open}, recovery={recovery:?}"
+            );
+            let archive = crate::ArchiveReader::read_with_options(
+                &seekable,
+                crate::ArchiveReadOptions::with_password(b"secret"),
+            )
+            .unwrap();
+            archive.test(Some(b"secret")).unwrap();
+        }
+    }
+}
+
 #[cfg(test)]
 mod quick_open_tests {
     use super::*;
@@ -2201,6 +2624,7 @@ mod service_payload_tests {
                     &mut actual,
                     &WriterResources::default(),
                     None,
+                    None,
                 )
                 .unwrap();
                 assert_eq!(actual, expected, "service size {size}");
@@ -2272,7 +2696,13 @@ mod emission_ledger_tests {
                 error
             } else {
                 let mut output = Vec::new();
-                let error = write_archive(&entries, plan, &resources, &mut output).unwrap_err();
+                let error = write_archive(
+                    &entries,
+                    plan,
+                    &resources,
+                    ArchiveOutput::Stream(&mut output),
+                )
+                .unwrap_err();
                 assert!(output.is_empty());
                 error
             };
@@ -2335,7 +2765,13 @@ mod emission_ledger_tests {
                     settings.archive_comment = None;
                 }
                 let mut bytes = Vec::new();
-                write_archive(&entries, settings, &WriterResources::default(), &mut bytes).unwrap();
+                write_archive(
+                    &entries,
+                    settings,
+                    &WriterResources::default(),
+                    ArchiveOutput::Stream(&mut bytes),
+                )
+                .unwrap();
                 let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
                 let raw = archive.as_rar50().unwrap();
                 assert_eq!(raw.files().count(), count);
@@ -2429,8 +2865,13 @@ mod emission_ledger_tests {
                     error
                 } else {
                     let mut output = Vec::new();
-                    let error =
-                        write_archive(&entries, settings, &resources, &mut output).unwrap_err();
+                    let error = write_archive(
+                        &entries,
+                        settings,
+                        &resources,
+                        ArchiveOutput::Stream(&mut output),
+                    )
+                    .unwrap_err();
                     assert!(output.is_empty());
                     error
                 };
@@ -2456,7 +2897,13 @@ mod emission_ledger_tests {
         plan.quick_open = true;
         plan.recovery_percent = None;
         let mut bytes = Vec::new();
-        write_archive(&[entry], plan, &WriterResources::default(), &mut bytes).unwrap();
+        write_archive(
+            &[entry],
+            plan,
+            &WriterResources::default(),
+            ArchiveOutput::Stream(&mut bytes),
+        )
+        .unwrap();
 
         let archive = crate::ArchiveReader::read_owned(bytes).unwrap();
         let raw = archive.as_rar50().unwrap();
@@ -2545,14 +2992,26 @@ mod emission_ledger_tests {
             fail_at: usize::MAX,
             writes: 0,
         };
-        write_archive(&entries, settings(), &resources, &mut counting).unwrap();
+        write_archive(
+            &entries,
+            settings(),
+            &resources,
+            ArchiveOutput::Stream(&mut counting),
+        )
+        .unwrap();
         assert!(counting.writes >= 6);
 
         let mut member_failure = false;
         let mut archive_failure = false;
         for fail_at in 0..counting.writes {
             let mut sink = FailOnWrite { fail_at, writes: 0 };
-            let error = write_archive(&entries, settings(), &resources, &mut sink).unwrap_err();
+            let error = write_archive(
+                &entries,
+                settings(),
+                &resources,
+                ArchiveOutput::Stream(&mut sink),
+            )
+            .unwrap_err();
             assert_eq!(error.kind(), crate::ErrorKind::Io, "write {fail_at}");
             assert_eq!(sink.writes, fail_at + 1);
             if error.entry_context() == Some((b"file".as_slice(), "writing")) {
@@ -2756,9 +3215,9 @@ mod emission_ledger_tests {
                 };
                 let mut actual = Vec::new();
                 let result = if fail_sink {
-                    write_payload(payload, &mut FailingSink, &resources, None)
+                    write_payload(payload, &mut FailingSink, &resources, None, None).map(drop)
                 } else {
-                    write_payload(payload, &mut actual, &resources, None)
+                    write_payload(payload, &mut actual, &resources, None, None).map(drop)
                 };
                 if limit == 65536 {
                     assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::ResourceLimit);
@@ -2948,18 +3407,34 @@ mod emission_ledger_tests {
             let ledger = Allowance::limited(8 * 1024 * 1024);
             let resources = base.clone().with_execution_allowance(ledger.clone());
             let mut expected = Vec::new();
-            write_archive(&entries, plan(encrypted), &base, &mut expected).unwrap();
+            write_archive(
+                &entries,
+                plan(encrypted),
+                &base,
+                ArchiveOutput::Stream(&mut expected),
+            )
+            .unwrap();
             let mut actual = Vec::new();
-            write_archive(&entries, plan(encrypted), &resources, &mut actual).unwrap();
+            write_archive(
+                &entries,
+                plan(encrypted),
+                &resources,
+                ArchiveOutput::Stream(&mut actual),
+            )
+            .unwrap();
             if !encrypted {
                 assert_eq!(actual, expected);
             } else {
                 assert_eq!(actual.len(), expected.len());
             }
             assert_eq!(ledger.used(), 0);
-            assert!(
-                write_archive(&entries, plan(encrypted), &resources, &mut FailingSink).is_err()
-            );
+            assert!(write_archive(
+                &entries,
+                plan(encrypted),
+                &resources,
+                ArchiveOutput::Stream(&mut FailingSink)
+            )
+            .is_err());
             assert_eq!(ledger.used(), 0);
             let mut expected = super::super::CollectedVolumes::new();
             write_volumes(&entries, plan(encrypted), 4096, &mut expected, &base).unwrap();
@@ -3013,7 +3488,12 @@ mod emission_ledger_tests {
             settings.recovery_percent = None;
             settings.quick_open = true;
             let mut output = Vec::new();
-            match write_archive(&entries, settings, &resources, &mut output) {
+            match write_archive(
+                &entries,
+                settings,
+                &resources,
+                ArchiveOutput::Stream(&mut output),
+            ) {
                 Ok(()) => {
                     assert!(!output.is_empty());
                     break;
@@ -3096,7 +3576,12 @@ mod emission_ledger_tests {
             settings.compress.method = 0;
             settings.recovery_percent = None;
             let mut output = Vec::new();
-            match write_archive(&entries, settings, &resources, &mut output) {
+            match write_archive(
+                &entries,
+                settings,
+                &resources,
+                ArchiveOutput::Stream(&mut output),
+            ) {
                 Ok(()) => {
                     assert!(!output.is_empty());
                     break;
@@ -3131,7 +3616,13 @@ mod emission_ledger_tests {
         });
         let resources = WriterResources::default().with_max_preparation_bytes(128);
         let mut output = Vec::new();
-        let error = write_archive(&[], settings, &resources, &mut output).unwrap_err();
+        let error = write_archive(
+            &[],
+            settings,
+            &resources,
+            ArchiveOutput::Stream(&mut output),
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             Error::WriterPreparationLimitExceeded { limit: 128, .. }
@@ -3166,7 +3657,7 @@ mod emission_ledger_tests {
                     std::slice::from_ref(&entry),
                     settings,
                     &resources,
-                    &mut output,
+                    ArchiveOutput::Stream(&mut output),
                 );
                 assert_eq!(resources.workspace_in_use(), 0);
                 drop(Records::<u8>::new(limit as usize, &resources).unwrap());
@@ -3235,7 +3726,12 @@ mod emission_ledger_tests {
             settings.recovery_percent = None;
             settings.quick_open = true;
             let mut output = Vec::new();
-            write_archive(&entries, settings, resources, &mut output)?;
+            write_archive(
+                &entries,
+                settings,
+                resources,
+                ArchiveOutput::Stream(&mut output),
+            )?;
             Ok(output)
         };
         let (resources, attempts) =
@@ -3307,7 +3803,12 @@ mod emission_ledger_tests {
             let mut settings = plan(false);
             settings.compress.method = 0;
             let mut output = Vec::new();
-            write_archive(&entries, settings, resources, &mut output)?;
+            write_archive(
+                &entries,
+                settings,
+                resources,
+                ArchiveOutput::Stream(&mut output),
+            )?;
             Ok(output)
         };
         let (resources, attempts) =
@@ -3394,7 +3895,12 @@ mod emission_ledger_tests {
                         resources,
                     )
                 } else {
-                    write_archive(&entries, settings, resources, &mut Vec::new())
+                    write_archive(
+                        &entries,
+                        settings,
+                        resources,
+                        ArchiveOutput::Stream(&mut Vec::new()),
+                    )
                 }
             };
             let (resources, attempts) =
@@ -3433,7 +3939,12 @@ mod emission_ledger_tests {
             let mut settings = plan(true);
             settings.compress.method = 0;
             settings.archive_comment = None;
-            write_archive(&entries, settings, resources, &mut Vec::new())
+            write_archive(
+                &entries,
+                settings,
+                resources,
+                ArchiveOutput::Stream(&mut Vec::new()),
+            )
         };
         let (resources, attempts) =
             WriterResources::default().refuse_preparation_growth_at(usize::MAX);
