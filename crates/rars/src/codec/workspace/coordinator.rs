@@ -263,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    fn a_refusal_within_a_share_ends_the_run_after_the_members_ahead() {
+    fn a_refusal_ends_the_run_after_the_members_ahead() {
         let ledger = Allowance::limited(1 << 20);
         let finished = AtomicUsize::new(0);
         let mut seen = Vec::new();
@@ -281,8 +281,9 @@ mod tests {
                 while finished.load(Ordering::SeqCst) < 2 {
                     std::hint::spin_loop();
                 }
-                // Within its share this outgrows the hint and is refused.
-                Ok((index, Buffer::filled(900 << 10, 0u8, local)?))
+                // Larger than the whole workspace, so refused however the
+                // window, which follows the thread count, groups the members.
+                Ok((index, Buffer::filled(2 << 20, 0u8, local)?))
             },
             |(index, _)| {
                 seen.push(index);
@@ -290,7 +291,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(published, 2);
+        assert_eq!(published, 2, "the refused member is left to the caller");
         assert_eq!(seen, [0, 1]);
         assert_eq!(ledger.used(), 0);
     }
