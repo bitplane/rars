@@ -488,6 +488,8 @@ pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
     feed: &'f mut VolumeFeed<'p, 'o, Archive>,
     options: crate::ArchiveReadOptions<'o>,
     first: FileHeader,
+    /// The member's size, once a fragment states it.
+    size: Option<u64>,
     split_after: bool,
     last: Option<Archive>,
     fragments: Buffer<Fragment, B>,
@@ -515,6 +517,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
             feed,
             options,
             first: first.clone(),
+            size: first.known_unpacked_size(),
             split_after: true,
             last: None,
             fragments,
@@ -561,10 +564,8 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
         file.check_dictionary_limit(self.options.rar50_dictionary_size_limit)?;
         validate_split_fragment(file, self.options.password)?;
         // The stored name may differ; size, compression info and checksums still tie it to its member.
-        if let (Some(size), Some(first)) =
-            (file.known_unpacked_size(), self.first.known_unpacked_size())
-        {
-            if size != first {
+        if let (Some(size), Some(known)) = (file.known_unpacked_size(), self.size) {
+            if size != known {
                 return Err(Error::InvalidHeader(
                     "RAR 5 split entry unpacked size changed",
                 ));
@@ -666,6 +667,7 @@ impl<B: Budget> SplitWalk<'_, '_, '_, B> {
                     "RAR 5 split entry is interrupted by a regular entry",
                 ));
             }
+            self.size = self.size.or(file.known_unpacked_size());
             let reader = volume
                 .source
                 .owned_range_reader(file.block.data_range.clone())?;

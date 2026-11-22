@@ -289,6 +289,15 @@ impl FileHeader {
         self.block.flags & FHD_SPLIT_AFTER != 0
     }
 
+    /// Declared unpacked size, unless the header marks it unknown. A volume
+    /// set written from stdin sets both size words to all ones on every
+    /// fragment but the last, which carries the real size.
+    pub fn known_unp_size(&self) -> Option<u64> {
+        let unknown =
+            self.is_split_after() && self.block.flags & FHD_LARGE != 0 && self.unp_size == u64::MAX;
+        (!unknown).then_some(self.unp_size)
+    }
+
     pub fn is_encrypted(&self) -> bool {
         self.block.flags & FHD_PASSWORD != 0
     }
