@@ -155,6 +155,19 @@ where
 {
     let password = session.password;
     validate_split_fragment(first, password)?;
+    let allowance = session.allowance.clone();
+    let mut walk = SplitWalk::new(feed, first, &allowance)?;
+    // Parts written before the size was known record it only in the last header.
+    let sized;
+    let first = if first.known_unp_size().is_none() {
+        let last = walk.prefetch()?;
+        let mut header = first.clone();
+        header.unp_size = last.unp_size;
+        sized = header;
+        &sized
+    } else {
+        first
+    };
     budget.check(first.unp_size, &first.name)?;
     let meta = ExtractedEntryMeta {
         name_is_unicode: first.name_is_unicode(),
@@ -166,8 +179,6 @@ where
         is_directory: false,
     };
     check_legacy_size(&meta, first.unp_size, links.is_some())?;
-    let allowance = session.allowance.clone();
-    let mut walk = SplitWalk::new(feed, first, &allowance)?;
     let first_reader = volume
         .source
         .owned_range_reader(first.packed_range.clone())?;
@@ -314,9 +325,12 @@ pub(super) fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>
 pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
     feed: &'f mut VolumeFeed<'p, 'o, Archive>,
     first: FileHeader,
+    /// The member's size, once a fragment states it.
+    size: Option<u64>,
     split_after: bool,
     last: Option<Archive>,
     packed_len: usize,
+    prefetched: std::collections::VecDeque<RangeReader<'static>>,
     /// The volume of each fragment, charged to the reader workspace.
     fragments: Buffer<usize, B>,
     /// A refused or missing volume, reported as itself rather than as a decode failure.
@@ -333,9 +347,11 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
             fragments: Buffer::copied(&[feed.current_index()], allowance)?,
             feed,
             first: first.clone(),
+            size: first.known_unp_size(),
             split_after: true,
             last: None,
             packed_len: packed_len(0, first)?,
+            prefetched: Default::default(),
             failure: None,
         })
     }
@@ -343,10 +359,25 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     /// Reads past any fragments the decoder did not need and returns the member's last header.
     fn finish(&mut self) -> Result<&FileHeader> {
         while self.next_fragment()?.is_some() {}
+        self.last_header()
+    }
+
+    fn last_header(&self) -> Result<&FileHeader> {
         self.last
             .as_ref()
             .and_then(|volume| volume.files().next())
             .ok_or(Error::InvalidHeader("RAR 1.5 split entry is incomplete"))
+    }
+
+    /// Fetches every remaining volume of the member before any of its data is read.
+    fn prefetch(&mut self) -> Result<&FileHeader> {
+        while let Some(reader) = self
+            .advance()
+            .inspect_err(|error| self.failure = Some(error.clone()))?
+        {
+            self.prefetched.push_back(reader);
+        }
+        self.last_header()
     }
 
     fn into_last_volume(mut self) -> Result<Archive> {
@@ -363,10 +394,12 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
         validate_split_fragment(file, self.feed.options().password)?;
         let first = &self.first;
         // The stored name may differ; size, method and CRC still tie the fragment to its member.
-        if file.unp_size != first.unp_size {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 split entry unpacked size changed",
-            ));
+        if let (Some(size), Some(known)) = (file.known_unp_size(), self.size) {
+            if size != known {
+                return Err(Error::InvalidHeader(
+                    "RAR 1.5 split entry unpacked size changed",
+                ));
+            }
         }
         if file.method != first.method {
             return Err(Error::InvalidHeader(
@@ -408,6 +441,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
                     "RAR 1.5 split entry is interrupted by a regular entry",
                 ));
             }
+            self.size = self.size.or(file.known_unp_size());
             self.fragments.try_push(self.feed.current_index())?;
             self.packed_len = packed_len(self.packed_len, file)?;
             let reader = volume
@@ -435,6 +469,9 @@ impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
     fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
         if let Some(error) = &self.failure {
             return Err(error.clone());
+        }
+        if let Some(reader) = self.prefetched.pop_front() {
+            return Ok(Some(reader));
         }
         self.advance()
             .inspect_err(|error| self.failure = Some(error.clone()))

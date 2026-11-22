@@ -34,8 +34,8 @@ pub struct IncompleteMember {
 /// usual: with [`crate::test_volumes_with_options_and_callback`] and
 /// [`crate::extract_volumes_with_links`], or on its own for a single volume.
 /// A complete set loses nothing. A continuation that does not match the
-/// member before it (a different size, method or encryption) is taken as a
-/// break in the set: the member before it is missing its end, and the
+/// member before it (a different method, encryption or known size) is taken
+/// as a break in the set: the member before it is missing its end, and the
 /// continuation its start. Archives that are not volumes are left alone.
 pub fn drop_incomplete_members(volumes: &mut [Archive]) -> Vec<IncompleteMember> {
     let mut incomplete = Vec::new();
@@ -43,8 +43,12 @@ pub fn drop_incomplete_members(volumes: &mut [Archive]) -> Vec<IncompleteMember>
     let mut running: Option<Chain> = None;
     for (index, volume) in volumes.iter().enumerate() {
         let (first, last) = split_ends(volume);
-        let carried = running.take().and_then(|chain| match &first {
-            Some(first) if chain.key == first.key => Some(chain),
+        let carried = running.take().and_then(|mut chain| match &first {
+            Some(first) if chain.key.continues_as(&first.key) => {
+                // Once a fragment states the size, the rest must agree with it.
+                chain.key.size = chain.key.size.or(first.key.size);
+                Some(chain)
+            }
             _ => {
                 chain.close(true, &mut incomplete, &mut drops);
                 None
@@ -81,11 +85,25 @@ enum End {
 }
 
 /// What ties a member's fragments together, since their stored names may differ.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 struct MemberKey {
+    /// `None` when the header marks it unknown, as a set written from stdin
+    /// does on every fragment but the last.
     size: Option<u64>,
     coding: u64,
     encrypted: bool,
+}
+
+impl MemberKey {
+    /// Whether `next` can continue a member with this key. An unknown size
+    /// matches any size.
+    fn continues_as(&self, next: &MemberKey) -> bool {
+        let sizes_agree = match (self.size, next.size) {
+            (Some(size), Some(next)) => size == next,
+            _ => true,
+        };
+        sizes_agree && self.coding == next.coding && self.encrypted == next.encrypted
+    }
 }
 
 struct Fragment {
@@ -158,7 +176,7 @@ fn split_ends(volume: &Archive) -> (Option<Fragment>, Option<Fragment>) {
             after: file.is_split_after(),
             name: file.name.clone(),
             key: MemberKey {
-                size: Some(file.unp_size),
+                size: file.known_unp_size(),
                 coding: u64::from(file.method) | u64::from(file.unp_ver) << 8,
                 encrypted: file.is_encrypted(),
             },

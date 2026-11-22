@@ -1088,8 +1088,41 @@ mod tests {
             Err(Error::InvalidHeader(_))
         ));
 
+        let mut new_size = file(b"a.txt", FHD_SPLIT_BEFORE);
+        new_size.unp_size = 5;
+        assert!(matches!(
+            continuation_check(first.clone(), &new_size, None),
+            Err(Error::InvalidHeader(_))
+        ));
+
         let same = file(b"a.txt", FHD_SPLIT_BEFORE);
         continuation_check(first, &same, None).unwrap();
+    }
+
+    #[test]
+    fn an_unknown_split_size_matches_any_continuation() {
+        // Volumes written from stdin put all ones in both size words of
+        // every fragment but the last, which carries the real size.
+        let mut first = file(b"a.txt", FHD_LARGE | FHD_SPLIT_AFTER);
+        first.unp_size = u64::MAX;
+        assert_eq!(first.known_unp_size(), None);
+
+        let mut middle = file(b"a.txt", FHD_LARGE | FHD_SPLIT_BEFORE | FHD_SPLIT_AFTER);
+        middle.unp_size = u64::MAX;
+        continuation_check(first.clone(), &middle, None).unwrap();
+
+        let mut last = file(b"a.txt", FHD_SPLIT_BEFORE);
+        last.unp_size = 5;
+        continuation_check(first, &last, None).unwrap();
+
+        // All ones is only unknown on a fragment that runs on, and only
+        // with the high words present.
+        let mut ends = file(b"a.txt", FHD_LARGE | FHD_SPLIT_BEFORE);
+        ends.unp_size = u64::MAX;
+        assert_eq!(ends.known_unp_size(), Some(u64::MAX));
+        let mut short = file(b"a.txt", FHD_SPLIT_AFTER);
+        short.unp_size = u64::MAX;
+        assert_eq!(short.known_unp_size(), Some(u64::MAX));
     }
 
     #[test]
