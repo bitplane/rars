@@ -574,6 +574,15 @@ impl WriterResources {
         CapacityCharge::new(self, &self.preparation_budget)
     }
 
+    /// Charges `bytes` of preparation capacity held elsewhere, as [`preparation::Bytes`] charges its own.
+    pub(crate) fn reserve_preparation(&self, bytes: u64) -> Result<Option<CapacityCharge>> {
+        let mut charge = self.preparation_charge();
+        if let Some(charge) = &mut charge {
+            charge.grow_to(bytes)?;
+        }
+        Ok(charge)
+    }
+
     #[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
     fn spool_capacity_charge(&self) -> Option<CapacityCharge> {
         CapacityCharge::new(self, &self.spool_memory_budget)
