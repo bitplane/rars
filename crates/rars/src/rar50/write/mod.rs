@@ -563,14 +563,21 @@ fn compression_plan(
     })
 }
 
+/// Large enough to cut read syscalls and let BLAKE2sp split across two threads.
+const STORED_BLOCK: u64 = 1024 * 1024;
+
+fn stored_block_len(len: u64) -> usize {
+    len.clamp(1, STORED_BLOCK) as usize
+}
+
 fn source_integrity(
     source: &EntrySource,
     expected_size: u64,
-    block_size: usize,
     progress: &dyn compress::CompressionProgress,
-    _resources: &WriterResources,
+    resources: &WriterResources,
 ) -> Result<(u32, [u8; 32])> {
-    if let Some(allowance) = &_resources.execution {
+    let block_size = stored_block_len(expected_size);
+    if let Some(allowance) = &resources.execution {
         return source_integrity_with_allowance(
             source,
             expected_size,

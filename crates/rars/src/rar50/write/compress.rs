@@ -627,23 +627,7 @@ fn compress_members(
             resources,
         )?,
         ExecutionPlan::Stored => {
-            for (index, (source, (input_size, crc, hash))) in
-                sources.iter().zip(&mut integrity).enumerate()
-            {
-                advance.started(index, *input_size);
-                (*crc, *hash) = super::source_integrity(
-                    source,
-                    *input_size,
-                    plan.block_size,
-                    advance,
-                    resources,
-                )
-                .map_err(|error| error_context(index, error))?;
-                if !advance.advance(*input_size) {
-                    return Err(Error::Cancelled);
-                }
-                advance.finished(index, *input_size);
-            }
+            hash_stored_members(sources, &mut integrity, resources, advance, error_context)?;
             Records::collect(
                 integrity.iter().map(|_| Spool::create_parked(resources)),
                 resources,
@@ -692,6 +676,60 @@ fn compress_members(
             },
         ),
         resources,
+    )
+}
+
+/// Members' checksums are independent, so a window of them is hashed across the pool.
+fn hash_stored_members(
+    sources: &[EntrySource],
+    integrity: &mut [(u64, u32, [u8; 32])],
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+) -> Result<()> {
+    // The window borrows these while its results are written into `integrity`.
+    let jobs = Records::collect(
+        integrity
+            .iter()
+            .enumerate()
+            .map(|(index, &(size, ..))| Ok((index, size))),
+        resources,
+    )?;
+    crate::parallel::map_slice_windowed(
+        &jobs,
+        crate::parallel::default_window(),
+        |&(index, size), opens| {
+            let block = super::stored_block_len(size) as u64;
+            let permit = if opens {
+                resources.acquire_serialising_cancellable(block, &|| advance.is_cancelled())?
+            } else {
+                match resources.try_acquire_serialising(block)? {
+                    Some(permit) => permit,
+                    None => return Ok(None),
+                }
+            };
+            advance.started(index, size);
+            Ok(Some(permit))
+        },
+        // Failures wait for `consume`, so the first member in order is reported
+        // rather than the first to fail.
+        |&(index, size), _permit| {
+            Ok(super::source_integrity(
+                &sources[index],
+                size,
+                advance,
+                resources,
+            ))
+        },
+        |&(index, size), checksums| {
+            let (crc, hash) = checksums.map_err(|error| error_context(index, error))?;
+            (integrity[index].1, integrity[index].2) = (crc, hash);
+            if !advance.advance(size) {
+                return Err(Error::Cancelled);
+            }
+            advance.finished(index, size);
+            Ok(())
+        },
     )
 }
 
@@ -3043,13 +3081,14 @@ mod tests {
             let resources = WriterResources::default()
                 .with_temp_dir(&*scratch)
                 .with_execution_allowance(ledger.clone());
-            let source = EntrySource::from_opener(8, {
+            // The read buffer fits the member, up to a block.
+            let source = EntrySource::from_opener(65536, {
                 let opens = opens.clone();
                 let ledger = ledger.clone();
                 move || {
                     assert!(ledger.used() >= 65536);
                     opens.fetch_add(1, Ordering::Relaxed);
-                    Ok(Box::new(std::io::Cursor::new([7u8; 8])))
+                    Ok(Box::new(std::io::Cursor::new(vec![7u8; 65536])))
                 }
             });
             let result =
@@ -3063,7 +3102,7 @@ mod tests {
             } else {
                 let result = result.unwrap();
                 assert!(result[0].store);
-                assert_eq!(result[0].crc32, crate::crc32::crc32(&[7u8; 8]));
+                assert_eq!(result[0].crc32, crate::crc32::crc32(&[7u8; 65536]));
                 drop(result);
                 assert_eq!(opens.load(Ordering::Relaxed), 1);
             }
@@ -4163,5 +4202,150 @@ mod tests {
         .unwrap();
         assert_eq!(first_wave.load(Ordering::SeqCst) / run, 3);
         assert_eq!(resources.workspace_in_use(), 0);
+    }
+}
+
+#[cfg(test)]
+mod stored_hashing_tests {
+    use super::*;
+    use crate::rar50::FilterPolicy;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::Arc;
+
+    fn stored_plan() -> CompressPlan {
+        let options = EncodeOptions::new(8);
+        CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 128 * 1024,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 0,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+        }
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn stored_members_are_hashed_side_by_side() {
+        use std::time::{Duration, Instant};
+        let opened = Arc::new(AtomicUsize::new(0));
+        let met = Arc::new(AtomicUsize::new(0));
+        let sources: Vec<EntrySource> = (0..2)
+            .map(|_| {
+                let (opened, met) = (opened.clone(), met.clone());
+                EntrySource::from_opener(4, move || {
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while opened.load(Ordering::SeqCst) < 2 && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    if opened.load(Ordering::SeqCst) >= 2 {
+                        met.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(Box::new(std::io::Cursor::new(b"data".to_vec())))
+                })
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let members = pool
+            .install(|| {
+                compress_members_with_context(
+                    &sources,
+                    &stored_plan(),
+                    &WriterResources::default(),
+                    &|_| true,
+                    &|_, error| error,
+                )
+            })
+            .unwrap();
+        assert_eq!(
+            met.load(Ordering::SeqCst),
+            2,
+            "one member waited for the other"
+        );
+        let expected = crate::rar50::blake2sp::hash(b"data");
+        assert!(members.iter().all(|member| member.hash == expected));
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn the_first_failing_member_is_reported_whichever_fails_first() {
+        let sources: Vec<EntrySource> = [50, 0]
+            .into_iter()
+            .map(|delay| {
+                EntrySource::from_opener(4, move || {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    Ok(Box::new(std::io::Cursor::new(b"x".to_vec())))
+                })
+            })
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let error = pool
+            .install(|| {
+                compress_members_with_context(
+                    &sources,
+                    &stored_plan(),
+                    &WriterResources::default(),
+                    &|_| true,
+                    &|index, _| Error::WriterFailure(["first", "second"][index]),
+                )
+            })
+            .err()
+            .unwrap();
+        assert_eq!(error, Error::WriterFailure("first"));
+    }
+
+    #[test]
+    fn cancelling_stops_hashing_members_not_yet_opened() {
+        struct Stop(Arc<AtomicBool>);
+        impl CompressionProgress for Stop {
+            fn advance(&self, _: u64) -> bool {
+                !self.is_cancelled()
+            }
+            fn is_cancelled(&self) -> bool {
+                self.0.load(Ordering::SeqCst)
+            }
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let window = crate::parallel::default_window();
+        let sources: Vec<EntrySource> = (0..window * 2 + 1)
+            .map(|_| {
+                let (stop, opened) = (stop.clone(), opened.clone());
+                EntrySource::from_opener(4, move || {
+                    opened.fetch_add(1, Ordering::SeqCst);
+                    stop.store(true, Ordering::SeqCst);
+                    Ok(Box::new(std::io::Cursor::new(b"data".to_vec())))
+                })
+            })
+            .collect();
+        let result = compress_members_with_context(
+            &sources,
+            &stored_plan(),
+            &WriterResources::default(),
+            &Stop(stop),
+            &|_, error| error,
+        );
+        assert_eq!(result.err().unwrap(), Error::Cancelled);
+        let opened = opened.load(Ordering::SeqCst);
+        assert!(
+            (1..=window).contains(&opened),
+            "{opened} of {} opened",
+            sources.len()
+        );
     }
 }
