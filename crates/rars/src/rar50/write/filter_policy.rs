@@ -582,6 +582,7 @@ mod dictionary_encoding_tests {
             algorithm_version: 0,
             file_offset: 0,
             piece: false,
+            exhaustive: false,
             allowance: Allowance::limited(0),
         };
         let filter = FilterSpec::whole(FilterKind::Delta { channels: 1 });
@@ -634,6 +635,8 @@ struct Rar50OwnedSearch<B: Budget> {
     /// Whether this is one piece of a larger member, which measures E8 alone
     /// alongside E8E9 (see `prices_calls_alone`).
     piece: bool,
+    /// Whether every finalist is encoded in full (see [`exhaustive_search`]).
+    exhaustive: bool,
     allowance: B,
 }
 impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
@@ -654,8 +657,23 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
     fn max_delta_channels(&self) -> usize {
         crate::codec::rar50::MAX_DELTA_CHANNELS
     }
+    /// One step down from the caller's parse: the lazy parse that seeds the
+    /// shortest path, and below level 2, where that lazy parse is the real
+    /// one, a greedy parse unless the search is exhaustive.
+    ///
+    /// The screens and the trial encode about twice the member in samples. At
+    /// level 1 lazy matching was a tenth of the time on 64 MiB of a tar of
+    /// `/usr`, 0.5 s of 4.8 s, for 2 KB of 14.7 MB. Above it, the greedy parse
+    /// made 64 MiB of `/usr` files 0.12% larger at level 3.
     fn screen_options(&self, options: EncodeOptions) -> EncodeOptions {
-        options.with_optimal_parse(false)
+        if options.optimal_parse || self.exhaustive {
+            options.with_optimal_parse(false)
+        } else {
+            options.with_lazy_matching(false)
+        }
+    }
+    fn exhaustive(&self) -> bool {
+        self.exhaustive
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, B>> {
         if self.file_offset != 0 {
@@ -669,6 +687,19 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         Ok(crate::codec::rar50::filtered_owned_member(
             data,
             filters,
+            &self.allowance,
+        )?)
+    }
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8, B>> {
+        Ok(crate::codec::rar50::filtered_run_bytes(
+            data,
+            filters,
+            self.file_offset + offset,
             &self.allowance,
         )?)
     }
@@ -736,14 +767,17 @@ fn choose_owned_filter<B: Budget>(
 ) -> Result<crate::filter_search::FilterChoice<B>> {
     let piece = filter_search_bytes();
     if data.len() <= piece {
-        return choose_filter_at(
+        return crate::filter_search::choose_owned(
+            &Rar50OwnedSearch {
+                algorithm_version,
+                file_offset: 0,
+                piece: false,
+                exhaustive: exhaustive_search(options),
+                allowance: allowance.clone(),
+            },
             data,
-            0,
-            false,
-            algorithm_version,
             options,
             progress,
-            allowance,
         );
     }
     let run = options
@@ -782,28 +816,11 @@ fn choose_owned_filter<B: Budget>(
     Ok((specs, packed))
 }
 
-/// The search over `data`, which starts `file_offset` bytes into its member
-/// and is all of it unless `piece`.
-fn choose_filter_at<B: Budget>(
-    data: &[u8],
-    file_offset: usize,
-    piece: bool,
-    algorithm_version: u8,
-    options: EncodeOptions,
-    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-    allowance: &B,
-) -> Result<crate::filter_search::FilterChoice<B>> {
-    crate::filter_search::choose_owned(
-        &Rar50OwnedSearch {
-            algorithm_version,
-            file_offset,
-            piece,
-            allowance: allowance.clone(),
-        },
-        data,
-        options,
-        progress,
-    )
+/// Whether the search at these settings encodes every finalist in full
+/// rather than ranking them by a trial: level 5's, which is the level that
+/// spends whatever it takes.
+fn exhaustive_search(options: EncodeOptions) -> bool {
+    options.max_match_candidates >= match_candidates_for_level(5).expect("level 5 is a level")
 }
 /// The filters for one run of a member too large to search whole, ranged over
 /// the run. The run is searched on its own, without the history it is later
@@ -849,16 +866,18 @@ fn piece_filters<B: Budget>(
     if past_offsets || !auto_size_filter_search_applies(data) {
         return Ok(Buffer::new(allowance));
     }
-    choose_filter_at(
+    crate::filter_search::choose_owned_specs(
+        &Rar50OwnedSearch {
+            algorithm_version,
+            file_offset,
+            piece: true,
+            exhaustive: exhaustive_search(options),
+            allowance: allowance.clone(),
+        },
         data,
-        file_offset,
-        true,
-        algorithm_version,
         run_search_options(options),
         progress,
-        allowance,
     )
-    .map(|(specs, _)| specs)
 }
 
 /// The parse a run's filter search measures with: the member's own, but no
