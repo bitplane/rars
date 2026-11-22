@@ -5425,4 +5425,81 @@ mod tests {
             .any(|&(done, _)| done > 0 && done < len as u64));
         assert_eq!(reported.last().map(|&(done, _)| done), Some(len as u64));
     }
+
+    #[test]
+    fn seekable_and_volume_archives_match_fingerprints_captured_from_master() {
+        let text: Vec<u8> = b"legacy text, said twice. ".repeat(4000);
+        let noise = crate::write_stream::noise(70_000);
+        let entries = |password: Option<&[u8]>| {
+            let entry = |name: &[u8], data: &Vec<u8>| {
+                let entry =
+                    StreamingEntry::new(name.to_vec(), EntrySource::from_bytes(data.clone()));
+                match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                }
+            };
+            let letters = noise.iter().map(|byte| b'a' + byte % 16).collect();
+            vec![
+                entry(b"TEXT.TXT", &text),
+                entry(b"NOISE.BIN", &noise),
+                entry(b"EMPTY.TXT", &Vec::new()),
+                entry(b"LETTERS.TXT", &letters),
+            ]
+        };
+        let volumes = |entry: &StreamingEntry, coding: MemberCoding, size: usize| {
+            let mut sink = crate::volume_sink::CollectedVolumes::new();
+            write_volumes_to(
+                entry,
+                WriterOptions::default(),
+                coding,
+                size,
+                &mut sink,
+                &WriterResources::default(),
+                None,
+            )
+            .unwrap();
+            sink.take()
+        };
+        let mut cases = Vec::new();
+        for (name, coding, member, size) in [
+            ("stored", MemberCoding::Stored, 1, 30_000),
+            ("compressed", MemberCoding::Compressed, 3, 15_000),
+        ] {
+            let archive = seekable_archive(&entries(None), coding.clone()).unwrap();
+            cases.push((
+                format!("seekable_{name}"),
+                crate::write_stream::fingerprint([&archive[..]]),
+            ));
+            let parts = volumes(&entries(None)[member], coding, size);
+            cases.push((
+                format!("volumes_{name}"),
+                crate::write_stream::fingerprint(parts.iter().map(Vec::as_slice)),
+            ));
+        }
+        #[cfg(feature = "encryption")]
+        {
+            let archive = crate::entropy::seeded::with(|| {
+                seekable_archive(&entries(Some(b"pw")), MemberCoding::Stored).unwrap()
+            });
+            cases.push((
+                "seekable_encrypted".into(),
+                crate::write_stream::fingerprint([&archive[..]]),
+            ));
+        }
+        let expected = [
+            ("seekable_stored", "240177:994e7518"),
+            (
+                "volumes_stored",
+                "30000:8bae9d7e 30000:9377ff08 10225:5b128e3c",
+            ),
+            ("seekable_compressed", "112582:d5db9b77"),
+            (
+                "volumes_compressed",
+                "15000:4c426e46 15000:9c9166ff 12492:7e13c63d",
+            ),
+            ("seekable_encrypted", "240177:fcd81fc7"),
+        ];
+        crate::write_stream::assert_fingerprints(&cases, &expected);
+    }
 }

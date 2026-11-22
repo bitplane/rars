@@ -4158,6 +4158,60 @@ mod stored_pipe_tests {
         }
     }
 
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn encrypted_header_archives_match_fingerprints_captured_from_master() {
+        use super::super::{write_seekable_archive_to, write_streaming_volumes_to};
+        let locked: Vec<ArchiveEntry> = entries()
+            .into_iter()
+            .map(|entry| entry.with_password(b"secret".to_vec()))
+            .collect();
+        let mut headers = crate::FeatureSet::store_only();
+        headers.header_encryption = true;
+        let seekable = crate::entropy::seeded::with(|| {
+            let mut output = std::io::Cursor::new(Vec::new());
+            write_seekable_archive_to(
+                &locked,
+                store(headers),
+                ArchiveExtras::default(),
+                &WriterResources::default(),
+                &mut output,
+            )
+            .unwrap();
+            output.into_inner()
+        });
+        let mut sink = crate::volume_sink::CollectedVolumes::new();
+        crate::entropy::seeded::with(|| {
+            write_streaming_volumes_to(
+                &locked,
+                store(headers),
+                ArchiveExtras::default(),
+                1_000_000,
+                &mut sink,
+                &WriterResources::default(),
+            )
+        })
+        .unwrap();
+        let cases = [
+            (
+                "seekable".to_string(),
+                crate::write_stream::fingerprint([&seekable[..]]),
+            ),
+            (
+                "volumes".to_string(),
+                crate::write_stream::fingerprint(sink.take().iter().map(Vec::as_slice)),
+            ),
+        ];
+        let expected = [
+            ("seekable", "2570602:93084858"),
+            (
+                "volumes",
+                "1000000:2813d873 1000000:a39861c1 571262:ce3e9274",
+            ),
+        ];
+        crate::write_stream::assert_fingerprints(&cases, &expected);
+    }
+
     struct Counting {
         inner: std::io::Cursor<Vec<u8>>,
         reads: Arc<AtomicUsize>,

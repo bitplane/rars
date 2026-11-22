@@ -281,6 +281,39 @@ pub(crate) fn check_source_length(
     }
 }
 
+#[cfg(test)]
+pub(crate) fn fingerprint<'a>(outputs: impl IntoIterator<Item = &'a [u8]>) -> String {
+    outputs
+        .into_iter()
+        .map(|bytes| format!("{}:{:08x}", bytes.len(), crate::crc32::crc32(bytes)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(test)]
+pub(crate) fn assert_fingerprints(actual: &[(String, String)], expected: &[(&str, &str)]) {
+    for (name, fingerprint) in actual {
+        let want = expected
+            .iter()
+            .find(|(case, _)| case == name)
+            .map(|(_, want)| *want);
+        assert_eq!(Some(fingerprint.as_str()), want, "{name}: {actual:?}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
 /// Tells a member read as its payload is written from one read whole first.
 #[cfg(all(test, feature = "encryption"))]
 pub(crate) struct Watch {
