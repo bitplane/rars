@@ -267,7 +267,7 @@ pub(crate) enum Output<W, S> {
 /// One shape for every family, so the seekable path is not re-derived per format.
 pub(crate) struct ArchiveOutput<W, S> {
     pub(crate) to: Output<W, S>,
-    /// Opt-in, so a family that cannot yet stream a member keeps holding each one.
+    /// A compressed member above this is written as it is coded instead of held; RAR 5 does so only on a seekable output.
     pub(crate) stream_above: Option<u64>,
 }
 
