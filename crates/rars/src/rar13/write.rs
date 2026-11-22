@@ -10,7 +10,7 @@ pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::write_stream::{MemberBytes, MemberPayload};
+use crate::write_stream::{MemberBytes, MemberPayload, SeekWrite};
 use crate::ArchiveVersion;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::{Seek, SeekFrom};
@@ -188,7 +188,7 @@ pub(crate) fn write_archive_with_sources(
         archive_comment,
         resources,
         progress,
-        output,
+        ArchiveOutput::Stream(output),
         STREAM_MEMBERS_ABOVE,
     )
 }
@@ -233,6 +233,46 @@ pub fn write_streaming_archive_to(
     progress: Option<&dyn WriteProgress>,
     output: &mut dyn Write,
 ) -> Result<()> {
+    check_resources(resources, options)?;
+    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
+    write_archive_to(
+        &members,
+        options,
+        coding,
+        archive_comment,
+        resources,
+        progress,
+        ArchiveOutput::Stream(output),
+        STREAM_MEMBERS_ABOVE,
+    )
+}
+
+/// Like [`write_streaming_archive_to`], but seeking lets a stored member be read once.
+#[doc(hidden)]
+pub fn write_seekable_archive_to<W: Write + Seek>(
+    entries: &[StreamingEntry],
+    options: WriterOptions,
+    coding: MemberCoding,
+    archive_comment: Option<&[u8]>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut W,
+) -> Result<()> {
+    check_resources(resources, options)?;
+    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
+    write_archive_to(
+        &members,
+        options,
+        coding,
+        archive_comment,
+        resources,
+        progress,
+        ArchiveOutput::Seekable(output),
+        STREAM_MEMBERS_ABOVE,
+    )
+}
+
+fn check_resources(resources: &WriterResources, options: WriterOptions) -> Result<()> {
     // Managed-memory quotas require codec and source allocations to be charged;
     // legacy members do not yet provide that accounting.
     if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
@@ -245,18 +285,22 @@ pub fn write_streaming_archive_to(
             },
         });
     }
+    Ok(())
+}
 
-    let members: Vec<_> = entries.iter().map(Member::from_streaming).collect();
-    write_archive_to(
-        &members,
-        options,
-        coding,
-        archive_comment,
-        resources,
-        progress,
-        output,
-        STREAM_MEMBERS_ABOVE,
-    )
+enum ArchiveOutput<'a> {
+    Stream(&'a mut dyn Write),
+    /// Stored members copied from a source have their checksum patched in.
+    Seekable(&'a mut dyn SeekWrite),
+}
+
+impl ArchiveOutput<'_> {
+    fn writer(&mut self) -> &mut dyn Write {
+        match self {
+            Self::Stream(output) => *output,
+            Self::Seekable(output) => *output,
+        }
+    }
 }
 
 /// One member, however the caller supplied it.
@@ -326,7 +370,7 @@ fn collect_archive(
         archive_comment,
         &WriterResources::default(),
         progress,
-        &mut out,
+        ArchiveOutput::Stream(&mut out),
         STREAM_MEMBERS_ABOVE,
     )?;
     Ok(out)
@@ -340,7 +384,7 @@ fn write_archive_to(
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
-    output: &mut dyn Write,
+    output: ArchiveOutput<'_>,
     stream_above: u64,
 ) -> Result<()> {
     if members.iter().any(|member| member.password.is_some()) {
@@ -351,11 +395,25 @@ fn write_archive_to(
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = Some(&control as &dyn WriteProgress);
     crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
-    let mut output = crate::write_progress::CancellableIo {
-        inner: output,
-        progress: progress.map(ProgressReporter),
+    let mut stream;
+    let mut seekable;
+    let mut output = match output {
+        ArchiveOutput::Stream(inner) => {
+            stream = crate::write_progress::CancellableIo {
+                inner,
+                progress: progress.map(ProgressReporter),
+            };
+            ArchiveOutput::Stream(&mut stream)
+        }
+        ArchiveOutput::Seekable(inner) => {
+            seekable = crate::write_progress::CancellableIo {
+                inner,
+                progress: progress.map(ProgressReporter),
+            };
+            ArchiveOutput::Seekable(&mut seekable)
+        }
     };
-    let output = &mut output as &mut dyn Write;
+    let patches = matches!(output, ArchiveOutput::Seekable(_));
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -370,7 +428,7 @@ fn write_archive_to(
 
     let mut head = Vec::new();
     write_main_header(&mut head, options.features, archive_comment)?;
-    output.write_all(&head)?;
+    output.writer().write_all(&head)?;
 
     let encode_options = rar15_encode_options_for_level(options.compression_level);
     let mut solid_encoder = (options.features.solid && coding.compresses())
@@ -415,9 +473,10 @@ fn write_archive_to(
             resources,
             &work,
             stream_above,
+            patches,
         )
         .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
-        write_member(output, member, encoded, options, work.reporter())
+        write_member(&mut output, member, encoded, options, &work)
             .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
         member.bytes.release();
         report_compression_entry(
@@ -442,7 +501,8 @@ struct EncodedMember<'a> {
     payload: Payload<'a>,
     method: u8,
     unpacked_size: usize,
-    file_crc: u16,
+    /// `None` for a member summed as it is copied, its header patched after.
+    file_crc: Option<u16>,
     /// The budget's charge for what waits to be written, released when the
     /// member has been. A directory holds nothing and has none.
     held: Option<crate::streaming::MemoryPermit>,
@@ -509,6 +569,7 @@ fn encode_member<'a>(
     resources: &WriterResources,
     work: &WorkTracker<'_>,
     stream_above: u64,
+    patches: bool,
 ) -> Result<EncodedMember<'a>> {
     work.check()?;
     let unpacked_size = member.unpacked_size()?;
@@ -523,7 +584,7 @@ fn encode_member<'a>(
             payload: Payload::Shared(MemberPayload::Packed(Vec::new())),
             method: METHOD_STORE,
             unpacked_size: 0,
-            file_crc: file_checksum(&[]),
+            file_crc: Some(file_checksum(&[])),
             held: None,
         });
     }
@@ -553,25 +614,28 @@ fn encode_member<'a>(
         &|| work.is_cancelled(),
     )?;
 
-    // A stored member never needs to be resident: checksum it from its source
-    // and let the writer copy it straight through, encrypting as it goes.
+    // A stored member never needs to be resident: the writer copies it
+    // straight through, encrypting as it goes. Its checksum is summed on the
+    // way where the header can be patched, and read ahead for where it can't.
     if let (MemberCoding::Stored, Some(source)) = (coding, member.bytes.source()) {
         return Ok(EncodedMember {
             payload: Payload::Shared(MemberPayload::Copied(source)),
             method: METHOD_STORE,
             unpacked_size,
-            file_crc: {
-                let mut checksum = Rar13Checksum::new();
-                member.bytes.walk_exact_with_progress(
-                    unpacked_size as u64,
-                    work.reporter(),
-                    |chunk| {
-                        checksum.update(chunk);
-                        work.advance(chunk.len() as u64);
-                    },
-                )?;
-                checksum.finish()
-            },
+            file_crc: (!patches)
+                .then(|| -> Result<u16> {
+                    let mut checksum = Rar13Checksum::new();
+                    member.bytes.walk_exact_with_progress(
+                        unpacked_size as u64,
+                        work.reporter(),
+                        |chunk| {
+                            checksum.update(chunk);
+                            work.advance(chunk.len() as u64);
+                        },
+                    )?;
+                    Ok(checksum.finish())
+                })
+                .transpose()?,
             held: None,
         }
         .holding(permit));
@@ -597,7 +661,7 @@ fn encode_member<'a>(
             payload: Payload::Shared(member.bytes.stored()),
             method: METHOD_STORE,
             unpacked_size,
-            file_crc,
+            file_crc: Some(file_crc),
             held: None,
         }
         .holding(permit));
@@ -621,7 +685,7 @@ fn encode_member<'a>(
         payload: Payload::Shared(MemberPayload::Packed(packed)),
         method,
         unpacked_size,
-        file_crc,
+        file_crc: Some(file_crc),
         held: None,
     }
     .holding(permit))
@@ -658,7 +722,7 @@ fn encode_spooled_member<'a>(
             payload: Payload::Spooled(spool),
             method: METHOD_BEST,
             unpacked_size,
-            file_crc: checksum.finish(),
+            file_crc: Some(checksum.finish()),
             held: None,
         });
     }
@@ -690,7 +754,7 @@ fn encode_spooled_member<'a>(
                     payload: Payload::Spooled(spool),
                     method: METHOD_BEST,
                     unpacked_size,
-                    file_crc: crc,
+                    file_crc: Some(crc),
                     held: None,
                 });
             }
@@ -701,7 +765,7 @@ fn encode_spooled_member<'a>(
         payload: Payload::Shared(MemberPayload::Copied(source)),
         method: METHOD_STORE,
         unpacked_size,
-        file_crc: file_crc.expect("every attempt list has a first attempt"),
+        file_crc: Some(file_crc.expect("every attempt list has a first attempt")),
         held: None,
     })
 }
@@ -791,14 +855,15 @@ fn spooled_payload_matches(
 
 /// Writes one member's header and payload.
 fn write_member(
-    output: &mut dyn Write,
+    output: &mut ArchiveOutput<'_>,
     member: &Member<'_>,
     encoded: EncodedMember<'_>,
     options: WriterOptions,
-    progress: Option<ProgressReporter<'_>>,
+    work: &WorkTracker<'_>,
 ) -> Result<()> {
     // The member's charge goes once it is written.
     let _held = encoded.held;
+    let progress = work.reporter();
     crate::write_progress::check_cancelled(progress)?;
     // A payload in memory is encrypted in place; one copied from a source or
     // a spool is encrypted as it is copied.
@@ -839,61 +904,127 @@ fn write_member(
         flags |= LHD_COMMENT;
     }
     let file_extra = encode_file_comment(member.file_comment)?;
-    let mut header = Vec::new();
-    write_file_header(
-        &mut header,
-        FileEntryRecord {
-            name: member.name,
-            unpacked_size: encoded.unpacked_size as u32,
-            file_crc: encoded.file_crc,
-            packed_size,
-            file_time: member.file_time,
-            file_attr: member.file_attr,
-            flags,
-            unp_ver: DEFAULT_UNP_VER,
-            method: encoded.method,
-            extra: &file_extra,
-        },
-    )?;
-    output.write_all(&header)?;
+    let build_header = |file_crc: u16| -> Result<Vec<u8>> {
+        let mut header = Vec::new();
+        write_file_header(
+            &mut header,
+            FileEntryRecord {
+                name: member.name,
+                unpacked_size: encoded.unpacked_size as u32,
+                file_crc,
+                packed_size,
+                file_time: member.file_time,
+                file_attr: member.file_attr,
+                flags,
+                unp_ver: DEFAULT_UNP_VER,
+                method: encoded.method,
+                extra: &file_extra,
+            },
+        )?;
+        Ok(header)
+    };
+    let header = build_header(encoded.file_crc.unwrap_or(0))?;
+    let header_at = match &mut *output {
+        ArchiveOutput::Seekable(seekable) if encoded.file_crc.is_none() => {
+            seekable.stream_position()?
+        }
+        _ => 0,
+    };
+    output.writer().write_all(&header)?;
     let mut encrypting;
-    let output: &mut dyn Write = match cipher {
+    let writer: &mut dyn Write = match cipher {
         Some(cipher) => {
             encrypting = Rar13EncryptingWriter {
-                inner: output,
+                inner: output.writer(),
                 cipher,
                 buffer: Vec::new(),
             };
             &mut encrypting
         }
-        None => output,
+        None => output.writer(),
     };
     match payload {
         Payload::Shared(copied @ MemberPayload::Copied(_)) => {
             let mut checksum = Rar13Checksum::new();
+            let mut advancing;
+            let writer: &mut dyn Write = match encoded.file_crc {
+                // Read ahead for its checksum, the member was counted then.
+                Some(_) => writer,
+                None => {
+                    advancing = Advancing {
+                        inner: writer,
+                        work,
+                    };
+                    &mut advancing
+                }
+            };
             copied.write_to(
                 &mut Rar13ChecksumWriter {
-                    inner: output,
+                    inner: writer,
                     checksum: &mut checksum,
                 },
                 u64::from(packed_size),
             )?;
-            if checksum.finish() != encoded.file_crc {
-                return Err(Error::SourceChanged(
+            let summed = checksum.finish();
+            match encoded.file_crc {
+                Some(file_crc) if summed != file_crc => Err(Error::SourceChanged(
                     "entry source contents changed while writing",
-                ));
+                )),
+                Some(_) => Ok(()),
+                None => patch_header(output, header_at, &header, &build_header(summed)?),
             }
-            Ok(())
         }
-        Payload::Shared(packed) => packed.write_to(output, u64::from(packed_size)),
+        Payload::Shared(packed) => packed.write_to(writer, u64::from(packed_size)),
         Payload::Spooled(mut spool) => {
-            if spool.copy_to(output)? != u64::from(packed_size) {
+            if spool.copy_to(writer)? != u64::from(packed_size) {
                 return Err(Error::WriterFailure(
                     "spooled member is not the size its header gives",
                 ));
             }
             Ok(())
         }
+    }
+}
+
+/// A member summed as it is copied gets its checksum only once the header is out.
+fn patch_header(
+    output: &mut ArchiveOutput<'_>,
+    at: u64,
+    placeholder: &[u8],
+    patched: &[u8],
+) -> Result<()> {
+    let ArchiveOutput::Seekable(output) = output else {
+        return Err(Error::WriterFailure(
+            "RAR 1.3 member checksum left to patch on an output that cannot seek",
+        ));
+    };
+    if patched.len() != placeholder.len() {
+        return Err(Error::WriterFailure(
+            "RAR 1.3 file header changed length when patched",
+        ));
+    }
+    let end = output.stream_position()?;
+    output.seek(SeekFrom::Start(at))?;
+    output.write_all(patched)?;
+    output.seek(SeekFrom::Start(end))?;
+    Ok(())
+}
+
+/// A member not read ahead for its checksum is counted as it is copied.
+struct Advancing<'w, 't> {
+    inner: &'w mut dyn Write,
+    work: &'w WorkTracker<'t>,
+}
+
+impl Write for Advancing<'_, '_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.work.advance(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
     }
 }
 
@@ -1076,16 +1207,7 @@ fn split_member(
     progress: Option<&dyn WriteProgress>,
     stream_above: u64,
 ) -> Result<()> {
-    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
-        return Err(Error::UnsupportedFamilyFeature {
-            family: options.target.family(),
-            feature: if resources.max_memory_bytes().is_some() {
-                "aggregate managed-memory limit"
-            } else {
-                "preparation memory quota"
-            },
-        });
-    }
+    check_resources(resources, options)?;
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let reporting = &control as &dyn WriteProgress;
@@ -1237,7 +1359,7 @@ fn pack_volume_member(
             payload,
             len,
             method: encoded.method,
-            file_crc: Some(encoded.file_crc),
+            file_crc: encoded.file_crc,
             held: None,
         }
         .holding(permit));
@@ -1960,6 +2082,7 @@ mod tests {
                     &resources,
                     &work,
                     u64::MAX,
+                    false,
                 )
                 .unwrap();
                 let held = match &encoded.payload {
@@ -1981,7 +2104,14 @@ mod tests {
                 assert_eq!(resources.workspace_in_use(), held, "{case}");
                 let mut archive = Vec::new();
                 write_main_header(&mut archive, options.features, None).unwrap();
-                write_member(&mut archive, &member, encoded, options, None).unwrap();
+                write_member(
+                    &mut ArchiveOutput::Stream(&mut archive),
+                    &member,
+                    encoded,
+                    options,
+                    &work,
+                )
+                .unwrap();
                 assert_eq!(resources.workspace_in_use(), 0, "{case}");
                 let extracted =
                     collect_extract(&Archive::parse(&archive).unwrap(), password).unwrap();
@@ -2114,7 +2244,7 @@ mod tests {
             None,
             &resources,
             None,
-            &mut out,
+            super::ArchiveOutput::Stream(&mut out),
             stream_above,
         )
         .unwrap();
@@ -2250,6 +2380,7 @@ mod tests {
                 &resources,
                 &work,
                 u64::MAX,
+                false,
             ),
             Err(crate::Error::Cancelled)
         ));
@@ -5129,5 +5260,169 @@ mod tests {
                 "{actual}: {error:?}"
             );
         }
+    }
+
+    fn counted_source(data: Vec<u8>, read: Arc<AtomicU64>) -> EntrySource {
+        struct Counted {
+            inner: std::io::Cursor<Vec<u8>>,
+            read: Arc<AtomicU64>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.inner.read(buffer)?;
+                self.read.fetch_add(count as u64, Ordering::Relaxed);
+                Ok(count)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+                self.inner.seek(position)
+            }
+        }
+        EntrySource::from_opener(data.len() as u64, move || {
+            Ok(Box::new(Counted {
+                inner: std::io::Cursor::new(data.clone()),
+                read: read.clone(),
+            }))
+        })
+    }
+
+    fn seekable_archive(entries: &[StreamingEntry], coding: MemberCoding) -> Result<Vec<u8>> {
+        let mut output = std::io::Cursor::new(Vec::new());
+        write_seekable_archive_to(
+            entries,
+            WriterOptions::default(),
+            coding,
+            Some(b"note"),
+            &WriterResources::default(),
+            None,
+            &mut output,
+        )?;
+        Ok(output.into_inner())
+    }
+
+    fn streamed_archive(entries: &[StreamingEntry], coding: MemberCoding) -> Vec<u8> {
+        let mut output = Vec::new();
+        write_streaming_archive_to(
+            entries,
+            WriterOptions::default(),
+            coding,
+            Some(b"note"),
+            &WriterResources::default(),
+            None,
+            &mut output,
+        )
+        .unwrap();
+        output
+    }
+
+    #[test]
+    fn a_stored_member_to_a_seekable_output_is_read_once() {
+        let data: Vec<u8> = (0..300_000u32).map(|at| (at ^ (at >> 7)) as u8).collect();
+        let read = Arc::new(AtomicU64::new(0));
+        let entries = [
+            StreamingEntry::new(
+                b"BIG.BIN".to_vec(),
+                counted_source(data.clone(), read.clone()),
+            ),
+            StreamingEntry::new(b"EMPTY.TXT".to_vec(), EntrySource::from_bytes(Vec::new())),
+        ];
+        let archive = seekable_archive(&entries, MemberCoding::Stored).unwrap();
+        assert_eq!(read.load(Ordering::Relaxed), data.len() as u64);
+        assert_eq!(archive, streamed_archive(&entries, MemberCoding::Stored));
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn a_seekable_output_holds_the_archive_a_stream_does() {
+        let text: Vec<u8> = b"legacy text, said twice. ".repeat(4000);
+        for coding in [MemberCoding::Stored, MemberCoding::Compressed] {
+            let entries = [
+                StreamingEntry::new(b"TEXT.TXT".to_vec(), EntrySource::from_bytes(text.clone()))
+                    .with_file_comment(b"about".to_vec()),
+                StreamingEntry::new(
+                    b"SECRET.TXT".to_vec(),
+                    EntrySource::from_bytes(text.clone()),
+                )
+                .with_password(b"pw".to_vec()),
+                StreamingEntry::new(b"EMPTY.TXT".to_vec(), EntrySource::from_bytes(Vec::new()))
+                    .with_password(b"pw".to_vec()),
+                StreamingEntry::new(b"DIR".to_vec(), EntrySource::from_bytes(Vec::new()))
+                    .with_file_attr(0x10),
+            ];
+            let archive = seekable_archive(&entries, coding.clone()).unwrap();
+            assert_eq!(
+                archive,
+                streamed_archive(&entries, coding.clone()),
+                "{coding:?}"
+            );
+            let parsed = Archive::parse(&archive).unwrap();
+            let secret = collect_extract(&parsed, Some(b"pw")).unwrap();
+            assert_eq!(secret[1].data, text, "{coding:?}");
+        }
+    }
+
+    #[test]
+    fn a_source_that_changes_size_under_a_seekable_output_is_refused() {
+        for actual in [4000usize, 4200] {
+            let entry = StreamingEntry::new(
+                b"MOVING.BIN".to_vec(),
+                EntrySource::from_opener(4096, move || {
+                    Ok(Box::new(std::io::Cursor::new(vec![1u8; actual])))
+                }),
+            );
+            let error = seekable_archive(&[entry], MemberCoding::Stored).unwrap_err();
+            assert!(
+                matches!(error.root_cause(), Error::SourceChanged(_)),
+                "{actual}: {error:?}"
+            );
+            assert_eq!(
+                error.entry_context(),
+                Some((&b"MOVING.BIN"[..], "writing")),
+                "{actual}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_member_to_a_seekable_output_is_counted_as_it_is_copied() {
+        let len = 1 << 20;
+        let read = Arc::new(AtomicU64::new(0));
+        let entry = StreamingEntry::new(
+            b"BIG.BIN".to_vec(),
+            counted_source(vec![7; len], read.clone()),
+        );
+        let reported = std::sync::Mutex::new(Vec::new());
+        let progress = |event: WriteProgressEvent<'_>| {
+            if let WriteProgressEvent::Advanced {
+                completed_bytes, ..
+            } = event
+            {
+                reported
+                    .lock()
+                    .unwrap()
+                    .push((completed_bytes, read.load(Ordering::Relaxed)));
+            }
+        };
+        write_seekable_archive_to(
+            &[entry],
+            WriterOptions::default(),
+            MemberCoding::Stored,
+            None,
+            &WriterResources::default(),
+            Some(&progress),
+            &mut std::io::Cursor::new(Vec::new()),
+        )
+        .unwrap();
+        let reported = reported.into_inner().unwrap();
+        // Never ahead of what has been read, and moving while it is.
+        assert!(
+            reported.iter().all(|&(done, read)| done <= read),
+            "{reported:?}"
+        );
+        assert!(reported
+            .iter()
+            .any(|&(done, _)| done > 0 && done < len as u64));
+        assert_eq!(reported.last().map(|&(done, _)| done), Some(len as u64));
     }
 }

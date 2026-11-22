@@ -15,7 +15,7 @@ pub(crate) use write::{
 pub use write::{
     write_compressed_archive, write_compressed_archive_with_comment,
     write_compressed_archive_with_comment_and_progress, write_compressed_volumes,
-    write_compressed_volumes_with_progress, write_stored_archive,
+    write_compressed_volumes_with_progress, write_seekable_archive_to, write_stored_archive,
     write_stored_archive_with_comment, write_stored_volumes, write_streaming_archive_to,
     write_volumes_to, EntrySource, FileEntry, MemberCoding, StoredEntry, StreamingEntry,
     WriterOptions, WriterResources,

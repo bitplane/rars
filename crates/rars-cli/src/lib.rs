@@ -1982,7 +1982,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     }
     progress.bar("Compressing archive", total);
 
-    write_archive_streaming(&archive_path, |mut output| {
+    write_archive_streaming(&archive_path, |output| {
         let written = match write_plan {
             AddWritePlan::Rar15To40 => {
                 let entries: Vec<_> = inputs
@@ -2048,15 +2048,26 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
                 if let Some(level) = compression_level {
                     options = options.with_compression_level(level);
                 }
-                rars::rar13::write_streaming_archive_to(
-                    &entries,
-                    options,
-                    coding.clone(),
-                    archive_comment.as_deref(),
-                    &resources,
-                    Some(&progress),
-                    output.writer(),
-                )
+                match output {
+                    ArchiveDestination::File(file) => rars::rar13::write_seekable_archive_to(
+                        &entries,
+                        options,
+                        coding.clone(),
+                        archive_comment.as_deref(),
+                        &resources,
+                        Some(&progress),
+                        file,
+                    ),
+                    ArchiveDestination::Pipe(pipe) => rars::rar13::write_streaming_archive_to(
+                        &entries,
+                        options,
+                        coding.clone(),
+                        archive_comment.as_deref(),
+                        &resources,
+                        Some(&progress),
+                        pipe,
+                    ),
+                }
             }
         };
         written.map_err(|error| add_plan::map_write_error(error, shape, &asked_filters))

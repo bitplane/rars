@@ -9,7 +9,7 @@
 use crate::error::{Error, Result};
 use crate::streaming::EntrySource;
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 
 pub(crate) use crate::entropy::fill_entropy;
 
@@ -212,6 +212,10 @@ impl<'a> MemberBytes<'a> {
         }
     }
 }
+
+pub(crate) trait SeekWrite: Write + Seek {}
+
+impl<T: Write + Seek + ?Sized> SeekWrite for T {}
 
 /// A member's bytes as they will appear in the archive.
 pub(crate) enum MemberPayload<'a> {
