@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 thread_local! {
-    /// What `ArchiveOutput::seekable` streams members above on this thread.
+    /// What `seekable_output` streams members above on this thread.
     pub(super) static STREAM_ABOVE: Cell<u64> = const { Cell::new(super::STREAM_MEMBERS_ABOVE) };
     /// The largest window a member is fitted on this thread.
     pub(super) static DICTIONARY_CAP: Cell<usize> = const { Cell::new(usize::MAX) };

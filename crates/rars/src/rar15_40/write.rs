@@ -17,7 +17,9 @@ pub use crate::streaming::EntrySource;
 use crate::streaming::{MemoryPermit, WriterResources};
 use crate::write_plan::{MemberCoding, PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::write_stream::{MemberBytes, MemberPayload, SeekWrite};
+use crate::write_stream::{
+    CallerOutput, CancellableOutput, MemberBytes, MemberPayload, Output, SeekWrite,
+};
 use crate::FeatureSet;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -283,7 +285,7 @@ pub(crate) fn write_archive_with_retained_metadata(
     progress: Option<&dyn WriteProgress>,
     header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
-    output: ArchiveOutput<'_>,
+    output: CallerOutput<'_>,
 ) -> Result<()> {
     // Builder validates retained records at their setters and constructs each
     // file with its metadata, so neither record validity nor array length can
@@ -397,7 +399,7 @@ pub fn write_streaming_archive_to(
         archive_comment,
         resources,
         progress,
-        ArchiveOutput::stream(output),
+        stream_output(output),
         None,
         None,
     )
@@ -445,130 +447,74 @@ fn write_seekable_archive_with_threshold(
         archive_comment,
         resources,
         progress,
-        ArchiveOutput::Seekable {
-            output,
-            stream_above,
-        },
+        CallerOutput::seekable(output).streaming_above(stream_above),
         None,
         None,
     )
 }
 
-pub(crate) enum ArchiveOutput<'a> {
-    /// Members larger than `spool_above` are coded into a temporary spool, so
-    /// their header can carry the sizes before the payload follows.
-    Stream {
-        output: &'a mut dyn Write,
-        spool_above: Option<u64>,
-    },
-    Seekable {
-        output: &'a mut dyn SeekWrite,
-        stream_above: u64,
-    },
+/// An output that cannot seek, large members spooled.
+pub(crate) fn stream_output(output: &mut dyn Write) -> CallerOutput<'_> {
+    CallerOutput::stream(output).streaming_above(STREAM_MEMBERS_ABOVE)
 }
 
-impl<'a> ArchiveOutput<'a> {
-    /// An output that cannot seek, large members spooled.
-    pub(crate) fn stream(output: &'a mut dyn Write) -> Self {
-        Self::Stream {
-            output,
-            spool_above: Some(STREAM_MEMBERS_ABOVE),
-        }
-    }
-
-    pub(crate) fn seekable(output: &'a mut dyn SeekWrite) -> Self {
-        // A test lowers the threshold on its own thread, so a member streams
-        // through the builder without coding 64 MiB in a debug build.
-        #[cfg(test)]
-        let stream_above = builder_path_tests::STREAM_ABOVE.get();
-        #[cfg(not(test))]
-        let stream_above = STREAM_MEMBERS_ABOVE;
-        Self::Seekable {
-            output,
-            stream_above,
-        }
-    }
+pub(crate) fn seekable_output(output: &mut dyn SeekWrite) -> CallerOutput<'_> {
+    // A test lowers the threshold on its own thread, so a member streams
+    // through the builder without coding 64 MiB in a debug build.
+    #[cfg(test)]
+    let stream_above = builder_path_tests::STREAM_ABOVE.get();
+    #[cfg(not(test))]
+    let stream_above = STREAM_MEMBERS_ABOVE;
+    CallerOutput::seekable(output).streaming_above(stream_above)
 }
 
-/// The archive output with cancellation checked on every write.
-enum Sink<'o, 'p> {
-    Stream(
-        crate::write_progress::CancellableIo<'p, &'o mut dyn Write>,
-        Option<u64>,
-    ),
-    Seekable(
-        crate::write_progress::CancellableIo<'p, &'o mut dyn SeekWrite>,
-        u64,
-    ),
-}
-
-impl Sink<'_, '_> {
-    fn writer(&mut self) -> &mut dyn Write {
-        match self {
-            Self::Stream(output, _) => output,
-            Self::Seekable(output, _) => output,
+/// Streams one member: patched in place, or spooled first.
+#[allow(clippy::too_many_arguments)]
+fn stream_to_sink(
+    sink: &mut CancellableOutput<'_, '_>,
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    header_key: Option<&HeaderKey>,
+    data_keys: &mut DataKeys,
+    solid: Option<SolidLink<'_>>,
+    resources: &WriterResources,
+    admitted: Option<MemoryPermit>,
+    progress: &WorkTracker<'_>,
+) -> Result<u8> {
+    progress.check()?;
+    validate_member(member.name, options.target, member.unpacked_size()?)?;
+    let continues = solid.as_ref().is_some_and(|link| link.continues);
+    match &mut sink.to {
+        Output::Seekable(output) => {
+            let mut out = InPlace {
+                output,
+                member,
+                options,
+                header_key,
+                continues,
+                salt: None,
+                header_at: 0,
+                header_len: 0,
+            };
+            stream_member_admitted(
+                &mut out, member, options, coding, data_keys, solid, resources, admitted, progress,
+            )
         }
-    }
-
-    /// Streams one member: patched in place, or spooled first.
-    #[allow(clippy::too_many_arguments)]
-    fn stream_member(
-        &mut self,
-        member: &Member<'_>,
-        options: WriterOptions,
-        coding: &MemberCoding,
-        header_key: Option<&HeaderKey>,
-        data_keys: &mut DataKeys,
-        solid: Option<SolidLink<'_>>,
-        resources: &WriterResources,
-        admitted: Option<MemoryPermit>,
-        progress: &WorkTracker<'_>,
-    ) -> Result<u8> {
-        progress.check()?;
-        validate_member(member.name, options.target, member.unpacked_size()?)?;
-        let continues = solid.as_ref().is_some_and(|link| link.continues);
-        match self {
-            Self::Seekable(output, _) => {
-                let mut out = InPlace {
-                    output,
-                    member,
-                    options,
-                    header_key,
-                    continues,
-                    salt: None,
-                    header_at: 0,
-                    header_len: 0,
-                };
-                stream_member_admitted(
-                    &mut out, member, options, coding, data_keys, solid, resources, admitted,
-                    progress,
-                )
-            }
-            Self::Stream(output, _) => {
-                let mut out = Spooled {
-                    output,
-                    member,
-                    options,
-                    header_key,
-                    continues,
-                    salt: None,
-                    spool: None,
-                    resources,
-                };
-                stream_member_admitted(
-                    &mut out, member, options, coding, data_keys, solid, resources, admitted,
-                    progress,
-                )
-            }
-        }
-    }
-
-    /// Members larger than this are streamed: patched in place on an output
-    /// that seeks, spooled on one that doesn't. `None` holds every member.
-    fn stream_above(&self) -> Option<u64> {
-        match self {
-            Self::Stream(_, above) => *above,
-            Self::Seekable(_, above) => Some(*above),
+        Output::Stream(output) => {
+            let mut out = Spooled {
+                output,
+                member,
+                options,
+                header_key,
+                continues,
+                salt: None,
+                spool: None,
+                resources,
+            };
+            stream_member_admitted(
+                &mut out, member, options, coding, data_keys, solid, resources, admitted, progress,
+            )
         }
     }
 }
@@ -592,10 +538,7 @@ fn collect_archive(
         &WriterResources::default(),
         progress,
         // The archive is held whole anyway, so its members are too.
-        ArchiveOutput::Stream {
-            output: &mut out,
-            spool_above: None,
-        },
+        CallerOutput::stream(&mut out),
         None,
         None,
     )?;
@@ -610,7 +553,7 @@ fn write_archive_to(
     archive_comment: Option<&[u8]>,
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
-    output: ArchiveOutput<'_>,
+    output: CallerOutput<'_>,
     explicit_header_password: Option<&[u8]>,
     archive_comment_password: Option<&[u8]>,
 ) -> Result<()> {
@@ -621,16 +564,7 @@ fn write_archive_to(
         crate::crypto::require_encryption()?;
     }
 
-    if resources.max_preparation_bytes().is_some() || resources.max_memory_bytes().is_some() {
-        return Err(Error::UnsupportedFamilyFeature {
-            family: options.target.family(),
-            feature: if resources.max_memory_bytes().is_some() {
-                "aggregate managed-memory limit"
-            } else {
-                "preparation memory quota"
-            },
-        });
-    }
+    crate::write_stream::refuse_managed_memory(resources, options.target.family())?;
 
     if let Some(password) = archive_comment_password {
         if password.is_empty()
@@ -650,29 +584,7 @@ fn write_archive_to(
     let reporting = &control as &dyn WriteProgress;
     let progress = Some(reporting);
     crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
-    let reporter = progress.map(ProgressReporter);
-    let mut output = match output {
-        ArchiveOutput::Stream {
-            output: inner,
-            spool_above,
-        } => Sink::Stream(
-            crate::write_progress::CancellableIo {
-                inner,
-                progress: reporter,
-            },
-            spool_above,
-        ),
-        ArchiveOutput::Seekable {
-            output: inner,
-            stream_above,
-        } => Sink::Seekable(
-            crate::write_progress::CancellableIo {
-                inner,
-                progress: reporter,
-            },
-            stream_above,
-        ),
-    };
+    let mut output = output.cancellable(progress.map(ProgressReporter));
     let output = &mut output;
     let has_file_comment = members.iter().any(|member| member.file_comment.is_some());
     if has_file_comment && options.features.header_encryption {
@@ -770,10 +682,10 @@ fn write_members_to(
     archive_comment_password: Option<&[u8]>,
     resources: &WriterResources,
     progress: &WorkTracker<'_>,
-    sink: &mut Sink<'_, '_>,
+    sink: &mut CancellableOutput<'_, '_>,
 ) -> Result<()> {
     let coding = level_coding(options, coding);
-    let stream_above = sink.stream_above();
+    let stream_above = sink.stream_above;
     let mut data_keys = DataKeys::default();
     let output = sink.writer();
     output.write_all(RAR15_SIGNATURE)?;
@@ -825,24 +737,24 @@ fn write_members_to(
                 None => false,
             };
             if streams {
-                let method = sink
-                    .stream_member(
-                        member,
-                        options,
-                        coding,
-                        header_key,
-                        &mut data_keys,
-                        Some(SolidLink {
-                            encoder: &mut solid_encoder,
-                            continues: solid_run_has_member,
-                        }),
-                        resources,
-                        None,
-                        progress,
-                    )
-                    .map_err(|error| {
-                        crate::write_stream::member_error(error, member.name, "writing")
-                    })?;
+                let method = stream_to_sink(
+                    sink,
+                    member,
+                    options,
+                    coding,
+                    header_key,
+                    &mut data_keys,
+                    Some(SolidLink {
+                        encoder: &mut solid_encoder,
+                        continues: solid_run_has_member,
+                    }),
+                    resources,
+                    None,
+                    progress,
+                )
+                .map_err(|error| {
+                    crate::write_stream::member_error(error, member.name, "writing")
+                })?;
                 // A streamed member is never empty, so only storing it ends the run.
                 solid_run_has_member = method != 0x30;
                 member.bytes.release();
@@ -940,19 +852,19 @@ fn write_members_to(
                         &mut data_keys,
                         progress.reporter(),
                     ),
-                    Prepared::Streams(permit) => sink
-                        .stream_member(
-                            member,
-                            options,
-                            coding,
-                            header_key,
-                            &mut data_keys,
-                            None,
-                            resources,
-                            permit,
-                            progress,
-                        )
-                        .map(|_| ()),
+                    Prepared::Streams(permit) => stream_to_sink(
+                        sink,
+                        member,
+                        options,
+                        coding,
+                        header_key,
+                        &mut data_keys,
+                        None,
+                        resources,
+                        permit,
+                        progress,
+                    )
+                    .map(|_| ()),
                 }
                 .map_err(|error| {
                     crate::write_stream::member_error(error, member.name, "writing")
@@ -2422,15 +2334,15 @@ struct InPlace<'o, 'm> {
 }
 
 impl InPlace<'_, '_> {
-    fn write_header(&mut self, sizes: HeaderPayload) -> Result<u64> {
+    fn header(&self, sizes: HeaderPayload) -> Result<Vec<u8>> {
         let continuation = self.continues && sizes.method != 0x30;
         let header = member_header(self.member, self.options, continuation, self.salt, sizes)?;
-        let from = self.output.stream_position()?;
-        match self.header_key {
-            Some(key) => write_encrypted_header(self.output, &header, key)?,
-            None => self.output.write_all(&header)?,
-        }
-        Ok(self.output.stream_position()? - from)
+        let Some(key) = self.header_key else {
+            return Ok(header);
+        };
+        let mut encrypted = Vec::new();
+        write_encrypted_header(&mut encrypted, &header, key)?;
+        Ok(encrypted)
     }
 }
 
@@ -2438,7 +2350,9 @@ impl StreamedOut for InPlace<'_, '_> {
     fn begin(&mut self, salt: Option<[u8; 8]>, sizes: HeaderPayload) -> Result<()> {
         self.salt = salt;
         self.header_at = self.output.stream_position()?;
-        self.header_len = self.write_header(sizes)?;
+        let header = self.header(sizes)?;
+        self.output.write_all(&header)?;
+        self.header_len = header.len() as u64;
         Ok(())
     }
 
@@ -2457,15 +2371,14 @@ impl StreamedOut for InPlace<'_, '_> {
     }
 
     fn finish(&mut self, sizes: HeaderPayload) -> Result<()> {
-        let end = self.output.stream_position()?;
-        self.output.seek(SeekFrom::Start(self.header_at))?;
-        if self.write_header(sizes)? != self.header_len {
-            return Err(Error::InvalidArgument(
-                "legacy file header changed length when patched",
-            ));
-        }
-        self.output.seek(SeekFrom::Start(end))?;
-        Ok(())
+        let header = self.header(sizes)?;
+        crate::write_stream::patch_header(
+            self.output,
+            self.header_at,
+            self.header_len,
+            &header,
+            Error::InvalidArgument("legacy file header changed length when patched"),
+        )
     }
 }
 
@@ -5809,10 +5722,7 @@ mod tests {
             None,
             &resources,
             None,
-            super::ArchiveOutput::Stream {
-                output: &mut out,
-                spool_above: Some(256 * 1024),
-            },
+            super::CallerOutput::stream(&mut out).streaming_above(256 * 1024),
             None,
             None,
         )
@@ -7417,10 +7327,7 @@ mod tests {
                         None,
                         resources,
                         None,
-                        super::ArchiveOutput::Seekable {
-                            output: &mut out,
-                            stream_above: STREAM_ABOVE,
-                        },
+                        super::CallerOutput::seekable(&mut out).streaming_above(STREAM_ABOVE),
                         None,
                         None,
                     )
@@ -8582,7 +8489,7 @@ mod tests {
                 None,
                 &crate::WriterResources::default(),
                 None,
-                super::ArchiveOutput::stream(&mut watch.sink(&mut archive)),
+                super::stream_output(&mut watch.sink(&mut archive)),
                 None,
                 None,
             )
@@ -8692,5 +8599,53 @@ mod tests {
         let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
         assert_ne!(parsed.files().next().unwrap().method, 0x30);
         rar20_members(&archive, false, &[&mixed]);
+    }
+
+    #[test]
+    fn a_member_header_that_changes_length_when_patched_is_refused_unwritten() {
+        use super::{
+            EntrySource, HeaderPayload, InPlace, Member, StreamedOut, StreamingEntry, WriterOptions,
+        };
+        use crate::{ArchiveVersion, Error, FeatureSet};
+        let entry = StreamingEntry::new(b"data.bin".to_vec(), EntrySource::from_bytes(vec![1; 8]));
+        let member = Member::from_streaming(&entry);
+        fn sizes(size: u64) -> HeaderPayload {
+            HeaderPayload {
+                method: 0x30,
+                unpacked_size: size,
+                file_crc: 0,
+                packed_size: size,
+            }
+        }
+        fn begun<'o, 'm>(
+            output: &'o mut std::io::Cursor<Vec<u8>>,
+            member: &'m Member<'m>,
+        ) -> InPlace<'o, 'm> {
+            let mut out = InPlace {
+                output,
+                member,
+                options: WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only()),
+                header_key: None,
+                continues: false,
+                salt: None,
+                header_at: 0,
+                header_len: 0,
+            };
+            out.begin(None, sizes(8)).unwrap();
+            out.write_packed(&[1; 8]).unwrap();
+            out
+        }
+        let mut unpatched = std::io::Cursor::new(Vec::new());
+        begun(&mut unpatched, &member);
+        let mut output = std::io::Cursor::new(Vec::new());
+        // Past 4 GiB the header gains its high size fields.
+        let error = begun(&mut output, &member)
+            .finish(sizes(u64::from(u32::MAX) + 1))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            Error::InvalidArgument("legacy file header changed length when patched")
+        );
+        assert_eq!(output.into_inner(), unpatched.into_inner());
     }
 }

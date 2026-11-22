@@ -750,19 +750,15 @@ impl<'a> VolumePacker<'a> {
             crc,
         } = fragment;
         let header = head.header(continued, split_after, len, file_crc, self.header_key)?;
-        if header.len() as u64 != header_len {
-            return Err(Error::WriterFailure(
-                "legacy file header changed length when patched",
-            ));
-        }
         let volume = self.open.as_mut().expect("volume started");
-        let back = i64::try_from(header_len + len)
-            .map_err(|_| Error::InvalidArgument("legacy volume fragment is too long"))?;
-        volume.out.seek(SeekFrom::Current(-back))?;
-        volume.out.write_all(&header)?;
-        volume
-            .out
-            .seek(SeekFrom::Current(back - header_len as i64))?;
+        let header_at = volume.out.stream_position()? - len - header_len;
+        crate::write_stream::patch_header(
+            &mut volume.out,
+            header_at,
+            header_len,
+            &header,
+            Error::WriterFailure("legacy file header changed length when patched"),
+        )?;
         volume.crc = crc32_combine(volume.crc, crc32(&header), header_len);
         volume.crc = crc32_combine(volume.crc, crc, len);
         volume.used += header_len + len;
