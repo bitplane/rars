@@ -211,7 +211,7 @@ impl BuilderEntry {
     }
 }
 
-/// A pending file can seek, which lets large RAR 2.0-4.x members stream into it.
+/// A pending file can seek, so a member's header can be patched after its payload.
 enum SingleOutput<'a> {
     Stream(&'a mut dyn Write),
     File(&'a mut fs::File),
@@ -1231,9 +1231,9 @@ impl Builder {
     /// Legacy families emit headers and members directly. RAR 2.0 to 4.x code
     /// a compressed member over 64 MiB into a spool in the resources' temp
     /// directory, so its header can carry the sizes; smaller ones, and every
-    /// RAR 1.3 and 1.5 member, are held in memory. Stored sources are read
-    /// twice to prepare and verify checksums. Legacy managed-memory quotas are
-    /// not supported.
+    /// RAR 1.3 and 1.5 member, are held in memory. Legacy stored sources are
+    /// read twice to prepare and verify checksums; [`write_to_path`](Self::write_to_path)
+    /// reads RAR 1.3/1.4 ones once. Legacy managed-memory quotas are not supported.
     /// On failure, `output` may contain a partial archive. Use
     /// [`write_to_path`](Self::write_to_path) for atomic file publication.
     pub fn write_to(
@@ -1278,6 +1278,15 @@ impl Builder {
                 )?;
                 output.finish()
             }
+            SingleOutput::File(output) if self.format.family() == ArchiveFamily::Rar13 => {
+                let mut output = EmissionWriter::new(output, reporting);
+                self.write_rar13_single(
+                    rar13::ArchiveOutput::Seekable(&mut output),
+                    resources,
+                    Some(&progress),
+                )?;
+                output.finish()
+            }
             output => {
                 let mut output = EmissionWriter::new(output.writer(), reporting);
                 self.write_legacy_to(&mut output, resources, Some(&progress))?;
@@ -1288,8 +1297,9 @@ impl Builder {
 
     /// Write the archive to `path`, streaming where the format allows it.
     /// The completed archive replaces the destination only after writing and syncing succeed.
-    /// Large compressed RAR 2.0-4.x members stream, and RAR 5 and RAR 7 stored
-    /// members are read once, as a file can seek back to fill in their headers.
+    /// Large compressed RAR 2.0-4.x members stream, and RAR 1.3/1.4, RAR 5 and
+    /// RAR 7 stored members are read once, as a file can seek back to fill in
+    /// their headers.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem
@@ -1601,7 +1611,9 @@ impl Builder {
                 resources,
                 progress,
             ),
-            ArchiveFamily::Rar13 => self.write_rar13_single(output, resources, progress),
+            ArchiveFamily::Rar13 => {
+                self.write_rar13_single(rar13::ArchiveOutput::Stream(output), resources, progress)
+            }
         }
     }
 
@@ -1876,7 +1888,7 @@ impl Builder {
 
     fn write_rar13_single(
         &self,
-        output: &mut dyn Write,
+        output: rar13::ArchiveOutput<'_>,
         resources: &WriterResources,
         progress: Option<&dyn WriteProgress>,
     ) -> Result<()> {
