@@ -491,13 +491,26 @@ pub(crate) fn damaged_member_warning(
     }
 }
 
+/// A damaged member `x --keep-broken` kept, with what was read of it.
+pub(crate) fn kept_broken_warning(path: &Path, name: &[u8], error: &rars::Error) -> String {
+    format!(
+        "warning: {}: '{}': kept broken: {}",
+        path.display(),
+        display_archive_bytes(name),
+        error.root_cause()
+    )
+}
+
 pub(crate) fn truncation_warning(path: &Path, truncation: &rars::Truncation) -> String {
     format!("warning: {}: archive is {truncation}", path.display())
 }
 
-/// Warns that an archive ends early and about each malformed block its
-/// reader passed over.
+/// Warns that an archive ends early, about each malformed block its reader
+/// passed over, and about each damaged header a salvaging read went past.
 pub(crate) fn warn_archive_structure(path: &Path, archive: &DetectedArchive) {
+    for damage in archive.header_damage() {
+        eprintln!("warning: {}: {damage}", path.display());
+    }
     for skipped in archive.skipped_blocks() {
         eprintln!("warning: {}: {skipped}", path.display());
     }

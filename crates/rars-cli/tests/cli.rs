@@ -332,6 +332,251 @@ fn a_damaged_member_is_reported_and_the_others_test_and_extract() {
     }
 }
 
+/// The time and mode `keep_broken_fixture` stores: member `index` has
+/// `KEPT_MTIME + 2 * index`, even for DOS times.
+const KEPT_MTIME: u64 = 1_600_000_000;
+const KEPT_MODE: u32 = 0o640;
+
+/// Writes [`salvage_members`] to `path` with stored times and modes,
+/// returning them and where each one's packed data is in the archive.
+fn keep_broken_fixture(
+    path: &Path,
+    version: rars::ArchiveVersion,
+    store: bool,
+) -> (Members, Vec<std::ops::Range<usize>>) {
+    let members = salvage_members();
+    let mut builder = rars::Builder::new(version).store(store);
+    for (index, (name, data)) in members.iter().enumerate() {
+        builder
+            .add_bytes(
+                name.as_bytes().to_vec(),
+                data.clone(),
+                Some(rars::Timestamp::from_unix_seconds(
+                    (KEPT_MTIME + 2 * index as u64) as i64,
+                )),
+                Some(KEPT_MODE),
+            )
+            .unwrap();
+    }
+    builder.write_to_path(path, None).unwrap();
+    let ranges = match rars::ArchiveReader::read_path(path).unwrap() {
+        rars::Archive::Rar15To40(archive) => archive
+            .files()
+            .map(|file| file.packed_range.clone())
+            .collect(),
+        rars::Archive::Rar50Plus(archive) => archive
+            .files()
+            .map(|file| file.block.data_range.clone())
+            .collect(),
+        _ => unreachable!("only RAR 2.9 and 5 are written here"),
+    };
+    (members, ranges)
+}
+
+/// Asserts the file has the time, and on Unix the mode, member `index` stored.
+fn assert_kept_metadata(path: &Path, index: usize) {
+    let metadata = fs::metadata(path).unwrap();
+    let modified = metadata
+        .modified()
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    assert_eq!(
+        modified,
+        KEPT_MTIME + 2 * index as u64,
+        "{}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            KEPT_MODE,
+            "{}",
+            path.display()
+        );
+    }
+}
+
+/// Issue #365: `x --keep-broken` keeps a member that fails its checksum with
+/// every byte read for it, under its own name and with its stored time and
+/// mode, warns, extracts the rest and fails as a damaged member does. With
+/// `--in-place` it is the same; flattened too.
+#[test]
+fn keep_broken_keeps_a_member_that_fails_its_checksum() {
+    let dir = scratch("keep-broken-checksum");
+    for version in [rars::ArchiveVersion::Rar29, rars::ArchiveVersion::Rar50] {
+        let path = dir.join(format!("{version:?}.rar"));
+        let (members, ranges) = keep_broken_fixture(&path, version, true);
+        let mut bytes = fs::read(&path).unwrap();
+        let at = ranges[2].start + ranges[2].len() / 2;
+        bytes[at] ^= 0x20;
+        fs::write(&path, &bytes).unwrap();
+        let mut damaged = members[2].1.clone();
+        damaged[at - ranges[2].start] ^= 0x20;
+
+        for extra in [&[][..], &["--in-place"], &["--flatten"]] {
+            let case = format!("{version:?} {extra:?}");
+            let out = dir.join(format!("out-{version:?}-{}", extra.join("")));
+            let output = rars()
+                .args(["x", "--keep-broken"])
+                .args(extra)
+                .arg(&path)
+                .arg(&out)
+                .output()
+                .unwrap();
+            let errors = stderr(&output);
+            assert_eq!(output.status.code(), Some(1), "{case}: {errors}");
+            let warning = format!("warning: {}: 'm2.txt': kept broken: ", path.display());
+            assert!(errors.contains(&warning), "{case}: {errors}");
+            assert_eq!(errors.matches("kept broken").count(), 1, "{case}: {errors}");
+            assert!(errors.contains("1 damaged member(s)"), "{case}: {errors}");
+            assert!(stdout(&output).contains("x m2.txt"), "{case}");
+            for (index, (name, data)) in members.iter().enumerate() {
+                let written = fs::read(out.join(name)).unwrap();
+                let expected = if index == 2 { &damaged } else { data };
+                assert!(written == *expected, "{case}: {name}");
+                assert_kept_metadata(&out.join(name), index);
+            }
+        }
+    }
+}
+
+/// Issue #365: a member whose stream fails partway is kept with the bytes
+/// decoded before the failure, and the members after it still extract.
+#[test]
+fn keep_broken_keeps_what_decoded_of_a_member_damaged_partway() {
+    let dir = scratch("keep-broken-partway");
+    for version in [rars::ArchiveVersion::Rar29, rars::ArchiveVersion::Rar50] {
+        let case = format!("{version:?}");
+        let path = dir.join(format!("{version:?}.rar"));
+        let (members, ranges) = keep_broken_fixture(&path, version, false);
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = ranges[2].start + ranges[2].len() / 2;
+        for byte in &mut bytes[middle..middle + 16] {
+            *byte ^= 0xa5;
+        }
+        fs::write(&path, &bytes).unwrap();
+
+        let out = dir.join(format!("out-{version:?}"));
+        let output = rars()
+            .args(["x", "--keep-broken"])
+            .arg(&path)
+            .arg(&out)
+            .output()
+            .unwrap();
+        let errors = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{case}: {errors}");
+        assert!(
+            errors.contains("'m2.txt': kept broken: "),
+            "{case}: {errors}"
+        );
+        let kept = fs::read(out.join("m2.txt")).unwrap();
+        let data = &members[2].1;
+        assert_ne!(&kept, data, "{case}");
+        let whole = kept
+            .iter()
+            .zip(data)
+            .take_while(|(kept, data)| kept == data)
+            .count();
+        // The damage is halfway through the packed data.
+        assert!(whole >= data.len() / 4, "{case}: {whole} of {}", data.len());
+        assert_kept_metadata(&out.join("m2.txt"), 2);
+        for (name, data) in members.iter().filter(|(name, _)| name != "m2.txt") {
+            assert_eq!(&fs::read(out.join(name)).unwrap(), data, "{case}: {name}");
+        }
+    }
+}
+
+/// Issue #365: a file header whose checksum fails is read as stored with
+/// `--keep-broken`, warned about, and its member and those after it extract.
+#[test]
+fn keep_broken_reads_past_a_damaged_header() {
+    let dir = scratch("keep-broken-header");
+    for version in [rars::ArchiveVersion::Rar29, rars::ArchiveVersion::Rar50] {
+        let case = format!("{version:?}");
+        let path = dir.join(format!("{version:?}.rar"));
+        let (members, _) = keep_broken_fixture(&path, version, false);
+        let mut bytes = fs::read(&path).unwrap();
+        let name = bytes.windows(6).position(|v| v == b"m2.txt").unwrap();
+        // Renames it to l2.txt, so the header fails its checksum.
+        bytes[name] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+
+        let out = dir.join(format!("out-{version:?}"));
+        let output = rars()
+            .args(["x", "--keep-broken"])
+            .arg(&path)
+            .arg(&out)
+            .output()
+            .unwrap();
+        let errors = stderr(&output);
+        assert_eq!(output.status.code(), Some(1), "{case}: {errors}");
+        let warning = format!("warning: {}: header at offset ", path.display());
+        assert!(errors.contains(&warning), "{case}: {errors}");
+        assert!(errors.contains("fails its checksum"), "{case}: {errors}");
+        assert!(errors.contains("1 damaged header(s)"), "{case}: {errors}");
+        for (index, (name, data)) in members.iter().enumerate() {
+            let name = if index == 2 { "l2.txt" } else { name };
+            assert_eq!(&fs::read(out.join(name)).unwrap(), data, "{case}: {name}");
+            assert_kept_metadata(&out.join(name), index);
+        }
+
+        // Without it, the damaged header still fails the archive.
+        let out = dir.join(format!("plain-{version:?}"));
+        let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
+        assert_ne!(output.status.code(), Some(0), "{case}");
+        assert!(!out.join("l2.txt").exists(), "{case}");
+        assert!(!stderr(&output).contains("header at offset"), "{case}");
+    }
+}
+
+/// Issue #365: a salvaged extraction never exits as a clean one does: it
+/// gives the status a damaged member gives without `--keep-broken`, and
+/// without it nothing damaged is kept and the errors are unchanged.
+#[test]
+fn keep_broken_fails_as_a_damaged_member_does_and_is_off_by_default() {
+    let dir = scratch("keep-broken-exit");
+    let path = dir.join("damaged.rar");
+    let (members, ranges) = keep_broken_fixture(&path, rars::ArchiveVersion::Rar50, true);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[ranges[1].start + 7] ^= 0x01;
+    fs::write(&path, &bytes).unwrap();
+
+    let run = |out: &Path, flag: Option<&str>| {
+        rars()
+            .arg("x")
+            .args(flag)
+            .arg(&path)
+            .arg(out)
+            .output()
+            .unwrap()
+    };
+    let plain = run(&dir.join("plain"), None);
+    let kept = run(&dir.join("kept"), Some("--keep-broken"));
+    let in_place = run(&dir.join("in-place"), Some("--in-place"));
+    assert_ne!(kept.status.code(), Some(0), "{}", stderr(&kept));
+    assert_eq!(kept.status.code(), plain.status.code(), "{}", stderr(&kept));
+
+    // Without the flag the damaged member's output is never published, and
+    // the error is the one it always was.
+    let errors = stderr(&plain);
+    assert!(!dir.join("plain/m1.txt").exists());
+    assert!(!errors.contains("kept broken"), "{errors}");
+    let warning = format!("warning: {}: while ", path.display());
+    assert!(errors.contains(&warning), "{errors}");
+    assert!(errors.contains("entry 'm1.txt'"), "{errors}");
+    assert!(errors.contains("1 damaged member(s)"), "{errors}");
+    assert!(!stdout(&plain).contains("x m1.txt"));
+    assert!(!stderr(&in_place).contains("kept broken"));
+    assert_eq!(in_place.status.code(), plain.status.code());
+    for (name, data) in members.iter().filter(|(name, _)| name != "m1.txt") {
+        assert_eq!(&fs::read(dir.join("plain").join(name)).unwrap(), data);
+    }
+}
+
 /// Edits the RAR 1.5-4 file header of the member named `name`, then reseals
 /// the header's CRC, so only the edit is odd. `edit` gets the header and the
 /// offset of the name in it.
