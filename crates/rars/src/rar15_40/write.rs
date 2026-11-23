@@ -9192,6 +9192,35 @@ mod tests {
         }
     }
 
+    /// A rewrite's scoped source is staged in order, so it is never opened
+    /// ahead to be sampled, however large it is.
+    #[test]
+    fn a_scoped_rewrite_source_is_not_sampled() {
+        struct Scoped;
+        impl crate::streaming::SourceFactory for Scoped {
+            fn max_preparation_window(&self) -> usize {
+                1
+            }
+            fn len(&self) -> crate::Result<u64> {
+                Ok(4 * crate::incompressible::MIN_MEMBER)
+            }
+            fn open(&self) -> crate::Result<Box<dyn crate::EntryReader>> {
+                panic!("a scoped rewrite source was opened to be sampled")
+            }
+        }
+        let entry = super::StreamingEntry::new(
+            b"member".to_vec(),
+            crate::EntrySource::from_factory(Scoped),
+        );
+        for options in sampled_targets() {
+            assert!(
+                !sampled_store(&entry, options, &crate::MemberCoding::Compressed),
+                "{:?}",
+                options.target
+            );
+        }
+    }
+
     /// Noise in 100 KB blocks, each twice over, packs to half its size, but
     /// no shared sample is long enough to hold a block and its repeat. RAR
     /// 2.0's own samples are a dictionary long, so they see the repeats and
