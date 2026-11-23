@@ -151,6 +151,143 @@ mod threaded {
         (outputs, None)
     }
 
+    /// How many windows of items [`map_ordered`] starts ahead of the oldest
+    /// one it has not consumed.
+    const LOOKAHEAD: usize = 64;
+
+    /// Maps `items` on the pool, at most `window` at a time, and hands each
+    /// result to `consume` in order, on the calling thread. Unlike a batch, a
+    /// slow item holds back only the consumption of the items after it: they
+    /// keep starting, as far as `admit` lets them, up to [`LOOKAHEAD`] windows
+    /// ahead of it.
+    ///
+    /// `admit(item, idle)` is asked, in order, whether the next item may
+    /// start. `idle` means nothing has started that is not consumed, and then
+    /// it must say yes. `finished(item)` follows the end of its mapping, and
+    /// `consumed(item)` its consumption, so `admit` can count what a running
+    /// item holds apart from what its result holds. The last item is mapped on
+    /// the calling thread, which would otherwise wait. A failure, from `map`
+    /// or `consume`, is returned once the items before it are consumed; items
+    /// not yet started are skipped and those running are waited for.
+    ///
+    /// Call it only where [`may_spawn`] holds: it blocks the calling thread.
+    pub(crate) fn map_ordered<T, O, E, F, A, D, R, C>(
+        items: &[T],
+        window: usize,
+        mut admit: A,
+        mut finished: D,
+        mut consumed: R,
+        map: F,
+        mut consume: C,
+    ) -> Result<(), E>
+    where
+        T: Copy + Send,
+        O: Send,
+        E: Send,
+        F: Fn(T) -> Result<O, E> + Sync,
+        A: FnMut(T, bool) -> bool,
+        D: FnMut(T),
+        R: FnMut(T),
+        C: FnMut(O) -> Result<(), E>,
+    {
+        use std::collections::VecDeque;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+
+        // A task's result, or None when it was skipped or panicked.
+        type Report<O, E> = (usize, Option<Result<O, E>>);
+        // Reports None if the task unwinds, so the calling thread stops
+        // waiting for it; leaving the scope then raises the panic.
+        struct Reporter<O, E> {
+            index: usize,
+            sender: Option<mpsc::Sender<Report<O, E>>>,
+        }
+        impl<O, E> Reporter<O, E> {
+            fn send(mut self, result: Option<Result<O, E>>) {
+                if let Some(sender) = self.sender.take() {
+                    let _ = sender.send((self.index, result));
+                }
+            }
+        }
+        impl<O, E> Drop for Reporter<O, E> {
+            fn drop(&mut self) {
+                if let Some(sender) = self.sender.take() {
+                    let _ = sender.send((self.index, None));
+                }
+            }
+        }
+        enum Slot<O, E> {
+            Running,
+            Done(Option<Result<O, E>>),
+        }
+
+        let window = window.max(1);
+        let ahead = window.saturating_mul(LOOKAHEAD);
+        let stop = AtomicBool::new(false);
+        let (map, stop) = (&map, &stop);
+        let (sender, receiver) = mpsc::channel::<Report<O, E>>();
+        // Tasks keep this thread's cap on any fan-out of their own.
+        let cap = super::ThreadCap::current();
+        rayon::in_place_scope(|scope| {
+            // The started items not yet consumed, from `head` on.
+            let mut slots = VecDeque::new();
+            let (mut head, mut next, mut running) = (0, 0, 0);
+            let finish = |result| {
+                stop.store(true, Ordering::Release);
+                result
+            };
+            loop {
+                while next < items.len() && running < window && next - head < ahead {
+                    let item = items[next];
+                    let idle = next == head;
+                    if !admit(item, idle) {
+                        debug_assert!(!idle, "an idle call always admits");
+                        if !idle {
+                            break;
+                        }
+                    }
+                    if next + 1 == items.len() {
+                        slots.push_back(Slot::Done(Some(map(item))));
+                        finished(item);
+                    } else {
+                        slots.push_back(Slot::Running);
+                        running += 1;
+                        let reporter = Reporter {
+                            index: next,
+                            sender: Some(sender.clone()),
+                        };
+                        scope.spawn(move |_| {
+                            let _cap = super::ThreadCap::set(cap);
+                            let stopped = stop.load(Ordering::Acquire);
+                            reporter.send((!stopped).then(|| map(item)));
+                        });
+                    }
+                    next += 1;
+                }
+                match slots.front() {
+                    None => return Ok(()),
+                    Some(Slot::Done(_)) => {}
+                    Some(Slot::Running) => {
+                        let (index, result) = receiver.recv().expect("this thread holds a sender");
+                        slots[index - head] = Slot::Done(result);
+                        running -= 1;
+                        finished(items[index]);
+                        continue;
+                    }
+                }
+                let Some(Slot::Done(Some(result))) = slots.pop_front() else {
+                    // A task panicked; leaving the scope raises it.
+                    return finish(Ok(()));
+                };
+                match result.and_then(&mut consume) {
+                    Ok(()) => consumed(items[head]),
+                    Err(error) => return finish(Err(error)),
+                }
+                head += 1;
+            }
+        })
+    }
+
     /// Maps `items` in parallel but keeps only a window of results alive,
     /// handing each to `consume` in order before starting the next window.
     ///
@@ -254,10 +391,12 @@ mod threaded {
 
     const DEFAULT_BLOCK_DECODE_WORKERS: usize = 8;
 
-    /// None inside the pool, where members already decode side by side, or under a cap of one.
+    /// None under a cap of one. Members decoding side by side in the pool
+    /// share one pool of these workers, so together they add only that many
+    /// threads, and the largest of them no longer decodes alone.
     pub(crate) fn block_decode_workers(policy: crate::read_control::DecodeWorkers) -> usize {
         use crate::read_control::DecodeWorkers;
-        if rayon::current_thread_index().is_some() || super::ThreadCap::current() == Some(1) {
+        if super::ThreadCap::current() == Some(1) {
             return 0;
         }
         match policy {
@@ -305,6 +444,38 @@ mod sequential {
             }
         }
         (outputs, None)
+    }
+
+    /// One at a time, in order.
+    #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
+    pub(crate) fn map_ordered<T, O, E, F, A, D, R, C>(
+        items: &[T],
+        _window: usize,
+        mut admit: A,
+        mut finished: D,
+        mut consumed: R,
+        map: F,
+        mut consume: C,
+    ) -> Result<(), E>
+    where
+        T: Copy + Send,
+        O: Send,
+        E: Send,
+        F: Fn(T) -> Result<O, E> + Sync,
+        A: FnMut(T, bool) -> bool,
+        D: FnMut(T),
+        R: FnMut(T),
+        C: FnMut(O) -> Result<(), E>,
+    {
+        for &item in items {
+            let admitted = admit(item, true);
+            debug_assert!(admitted, "an idle call always admits");
+            let output = map(item);
+            finished(item);
+            consume(output?)?;
+            consumed(item);
+        }
+        Ok(())
     }
 
     /// One at a time, so the window only decides how much output is alive at
@@ -580,6 +751,138 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn ordered_maps_start_past_a_slow_item_and_consume_in_order() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let fourth_done = AtomicBool::new(false);
+        let waited = AtomicBool::new(false);
+        let mut consumed = Vec::new();
+        let (mut admitted, mut finished, mut released) = (0, 0, 0);
+        let mut last_on_caller = false;
+        pool.install(|| {
+            let caller = std::thread::current().id();
+            super::threaded::map_ordered(
+                &[0, 1, 2, 3, 4, 5, 6],
+                2,
+                |_, _| {
+                    admitted += 1;
+                    true
+                },
+                |_| finished += 1,
+                |_| released += 1,
+                |item| {
+                    if item == 0 {
+                        // A batch of two would never start item 4 while this runs.
+                        let start = Instant::now();
+                        while !fourth_done.load(Ordering::Acquire)
+                            && start.elapsed() < Duration::from_secs(10)
+                        {
+                            std::thread::yield_now();
+                        }
+                        waited.store(fourth_done.load(Ordering::Acquire), Ordering::Release);
+                    }
+                    if item == 4 {
+                        fourth_done.store(true, Ordering::Release);
+                    }
+                    Ok::<_, ()>((item, std::thread::current().id() == caller))
+                },
+                |(item, on_caller)| {
+                    consumed.push(item);
+                    last_on_caller = on_caller;
+                    Ok(())
+                },
+            )
+        })
+        .unwrap();
+        assert!(waited.load(Ordering::Acquire));
+        assert_eq!(consumed, [0, 1, 2, 3, 4, 5, 6]);
+        assert!(last_on_caller, "the last item maps on the calling thread");
+        assert_eq!((admitted, finished, released), (7, 7, 7));
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn ordered_maps_consume_the_prefix_ahead_of_a_failure() {
+        for fail_in_consume in [false, true] {
+            let mut consumed = Vec::new();
+            let result = super::threaded::map_ordered(
+                &[0, 1, 2, 3, 4, 5, 6, 7],
+                3,
+                |_, _| true,
+                |_| {},
+                |_| {},
+                |item| {
+                    if item == 3 && !fail_in_consume {
+                        Err(item)
+                    } else {
+                        Ok(item)
+                    }
+                },
+                |item| {
+                    if item == 3 {
+                        return Err(30);
+                    }
+                    consumed.push(item);
+                    Ok(())
+                },
+            );
+            assert_eq!(result, Err(if fail_in_consume { 30 } else { 3 }));
+            assert_eq!(consumed, [0, 1, 2]);
+        }
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn ordered_maps_wait_for_room_and_admit_when_idle() {
+        use std::cell::Cell;
+        // Each item holds one unit until consumed, against a limit of two;
+        // item 2 is over the limit alone and starts only when nothing is held.
+        let held = Cell::new(0u32);
+        let mut most = 0;
+        let mut consumed = Vec::new();
+        let costs = [1u32, 1, 5, 1, 1, 1];
+        super::threaded::map_ordered(
+            &[0usize, 1, 2, 3, 4, 5],
+            4,
+            |item, idle| {
+                let cost = costs[item];
+                if !idle && held.get() + cost > 2 {
+                    return false;
+                }
+                assert!(!idle || held.get() == 0);
+                held.set(held.get() + cost);
+                most = most.max(held.get());
+                true
+            },
+            |_| {},
+            |item| held.set(held.get() - costs[item]),
+            Ok::<_, ()>,
+            |item| {
+                consumed.push(item);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(consumed, [0, 1, 2, 3, 4, 5]);
+        assert_eq!(held.get(), 0);
+        assert_eq!(most, 5);
     }
 
     #[cfg(all(

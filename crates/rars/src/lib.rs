@@ -106,6 +106,7 @@ pub use rewrite_plan::{rewrite_payload_bytes, RewritePayload};
 mod rewrite_staging;
 #[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
+mod memory_limit;
 mod output_pipeline;
 mod simd;
 mod source;

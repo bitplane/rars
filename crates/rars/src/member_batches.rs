@@ -114,13 +114,16 @@ pub(crate) trait Workers: Budget<Charge: Send> + Sync {
     /// members ahead of a failure are published before it returns. Returns how
     /// many were published: fewer than all means the next was refused within
     /// a worker's share of a limited workspace.
-    /// `capacity` bounds an unlimited batch's planned cost; a limited
-    /// workspace instead admits each batch by `hint` against its ledger.
+    /// `capacity` bounds an unlimited batch's planned cost, which a member
+    /// holds until it is published, or with `retained` false only while it
+    /// decodes; a limited workspace instead admits each batch by `hint`
+    /// against its ledger.
     #[allow(clippy::too_many_arguments)]
     fn batches<T: Copy + Send, O: Send, C: ?Sized>(
         &self,
         members: &[(T, u64)],
         capacity: u64,
+        retained: bool,
         ctx: &mut C,
         hint: impl Fn(T) -> u64,
         check: impl Fn() -> Result<()> + Sync,
@@ -129,20 +132,78 @@ pub(crate) trait Workers: Budget<Charge: Send> + Sync {
     ) -> Result<usize>;
 }
 
-/// At most one member per worker and `capacity` bytes of cost per batch; a
-/// member costing more than `capacity` forms a batch of its own.
+/// Workspace, by the members' hints, that the members an unlimited policy has
+/// running may hold together: 1 GiB, or a quarter of the memory this process
+/// may use when that is less. Sequential extraction holds one member's; this
+/// lets several streaming members, each with its own window, run side by side
+/// without one window per thread. One member can always run alone.
+fn running_workspace() -> u64 {
+    scaled_running_workspace(crate::memory_limit::physical_memory())
+}
+
+fn scaled_running_workspace(physical: Option<u64>) -> u64 {
+    const CEILING: u64 = 1024 * 1024 * 1024;
+    physical.map_or(CEILING, |total| CEILING.min(total / 4))
+}
+
+/// At most one member per worker. Members start as soon as there is room, not
+/// a batch at a time, so a slow member holds back only the publication of
+/// those after it. The results not yet published hold at most `capacity`
+/// bytes of cost, and the running members [`running_workspace`] by their
+/// hints; a member over either waits until that one is empty.
 impl Workers for Allowance {
     fn batches<T: Copy + Send, O: Send, C: ?Sized>(
         &self,
         members: &[(T, u64)],
         capacity: u64,
+        retained: bool,
         ctx: &mut C,
-        _: impl Fn(T) -> u64,
+        hint: impl Fn(T) -> u64,
         check: impl Fn() -> Result<()> + Sync,
         decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
         mut publish: impl FnMut(&mut C, O) -> Result<()>,
     ) -> Result<usize> {
         let window = crate::parallel::default_window().max(1);
+        if window > 1 && members.len() > 1 && crate::parallel::may_spawn() {
+            check()?;
+            let running_limit = running_workspace();
+            // Bytes of unpublished cost, and the running members' workspace.
+            let held = std::cell::Cell::new((0u128, 0u128));
+            let fits = |held: u128, more: u64, limit: u64| {
+                held == 0 || held + u128::from(more) <= u128::from(limit)
+            };
+            crate::parallel::map_ordered(
+                members,
+                window,
+                |(member, cost), idle| {
+                    let workspace = hint(member);
+                    let (bytes, running) = held.get();
+                    let admitted = idle
+                        || (fits(bytes, cost, capacity) && fits(running, workspace, running_limit));
+                    if admitted {
+                        held.set((bytes + u128::from(cost), running + u128::from(workspace)));
+                    }
+                    admitted
+                },
+                |(member, cost)| {
+                    let (bytes, running) = held.get();
+                    let done = if retained { 0 } else { u128::from(cost) };
+                    held.set((bytes - done, running - u128::from(hint(member))));
+                },
+                |(_, cost)| {
+                    if retained {
+                        let (bytes, running) = held.get();
+                        held.set((bytes - u128::from(cost), running));
+                    }
+                },
+                |(member, _)| {
+                    check()?;
+                    decode(member, self)
+                },
+                |output| publish(ctx, output),
+            )?;
+            return Ok(members.len());
+        }
         let mut rest = members;
         while !rest.is_empty() {
             check()?;
@@ -167,6 +228,7 @@ impl Workers for Limited {
         &self,
         members: &[(T, u64)],
         _: u64,
+        _: bool,
         ctx: &mut C,
         hint: impl Fn(T) -> u64,
         check: impl Fn() -> Result<()> + Sync,
@@ -293,6 +355,17 @@ mod tests {
     }
 
     #[test]
+    fn running_workspace_is_a_quarter_of_memory_up_to_a_gibibyte() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(scaled_running_workspace(None), 1024 * MIB);
+        assert_eq!(scaled_running_workspace(Some(64 * 1024 * MIB)), 1024 * MIB);
+        assert_eq!(scaled_running_workspace(Some(4096 * MIB)), 1024 * MIB);
+        // A 512 MiB container, as SABnzbd often runs in.
+        assert_eq!(scaled_running_workspace(Some(512 * MIB)), 128 * MIB);
+        assert_eq!(scaled_running_workspace(Some(0)), 0);
+    }
+
+    #[test]
     fn batches_respect_the_window_and_byte_budget() {
         let costs = |costs: &[u64]| costs.iter().map(|&cost| ((), cost)).collect::<Vec<_>>();
         assert_eq!(batch_len(&costs(&[6, 4, 1]), 8, 10), 2);
@@ -314,6 +387,7 @@ mod tests {
             .batches(
                 &members,
                 10,
+                true,
                 &mut published,
                 |_| 0,
                 || Ok(()),

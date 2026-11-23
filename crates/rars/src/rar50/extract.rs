@@ -1044,12 +1044,20 @@ impl Archive {
         buffered_decode_limit: u64,
         allowance: &B,
         open: &mut F,
+        redirect: Option<&mut Redirect<'_>>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
         file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+        if let Some(redirection) = &file.redirection {
+            // As sequential extraction does, before any split check.
+            return match redirect {
+                Some(redirect) => publish_redirection(file, redirection, redirect, &options),
+                None => Ok(()),
+            };
+        }
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let mut session =
             DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
@@ -1069,7 +1077,23 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.parallel_to_impl(options, &mut open, false)
+        self.parallel_to_impl(options, &mut open, None, false)
+    }
+
+    /// As [`Self::extract_to_parallel_buffered`], and reports each redirection
+    /// to `redirect` in archive order, as [`Self::extract_to_with_redirections`]
+    /// does.
+    pub(crate) fn extract_parallel_with_redirections<F, R>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        mut redirect: R,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    {
+        self.parallel_to_impl(options, &mut open, Some(&mut redirect), false)
     }
 
     pub(crate) fn test_to<F>(
@@ -1086,6 +1110,7 @@ impl Archive {
                 tested(meta)?;
                 Ok(Box::new(std::io::sink()) as Box<dyn Write>)
             },
+            None,
             true,
         )
     }
@@ -1094,6 +1119,7 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
+        redirect: Option<&mut Redirect<'_>>,
         verification: bool,
     ) -> Result<()>
     where
@@ -1109,14 +1135,23 @@ impl Archive {
                 .files()
                 .any(|file| file.decoded_compression_info().is_ok_and(|info| info.solid))
         {
-            return self.extract_to(options, open);
+            return match redirect {
+                Some(redirect) => self.extract_to_with_redirections(options, open, redirect),
+                None => self.extract_to(options, open),
+            };
         }
 
         match options.max_reader_workspace_bytes {
-            Some(limit) => {
-                self.parallel_with(options, open, verification, &Allowance::limited(limit))
+            Some(limit) => self.parallel_with(
+                options,
+                open,
+                redirect,
+                verification,
+                &Allowance::limited(limit),
+            ),
+            None => {
+                self.parallel_with(options, open, redirect, verification, &Allowance::default())
             }
-            None => self.parallel_with(options, open, verification, &Allowance::default()),
         }?;
         options.check_cancelled()
     }
@@ -1125,6 +1160,7 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
+        mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
         allowance: &B,
     ) -> Result<()>
@@ -1137,37 +1173,50 @@ impl Archive {
             if file.is_split_before() || file.is_split_after() {
                 // Fails inline, as sequential extraction does.
                 Plan::Inline
-            } else if file.is_directory() || file.redirection.is_some() {
-                Plan::Batch(0)
-            } else if verification && file.is_stored() {
-                // Verified as it is read, so nothing is buffered.
+            } else if file.is_directory()
+                || file.redirection.is_some()
+                || (verification
+                    && (file.is_stored() || file.should_stream_decode(buffered_decode_limit)))
+            {
+                // Nothing buffered: verified as it is read or streamed to a sink.
                 Plan::Batch(0)
             } else if file.should_stream_decode(buffered_decode_limit) {
+                // Its writer has to be open while it streams.
                 Plan::Inline
             } else {
                 Plan::Batch(file.unpacked_size)
             }
         };
-        // Workspace admission also counts the packed input a decoder holds.
+        // What a member holds while it decodes, for workspace admission.
         let hint = |file: &FileHeader| {
-            let Plan::Batch(cost) = plan(file) else {
-                unreachable!("only batched members are admitted")
-            };
-            if file.is_directory() || file.redirection.is_some() || file.is_stored() {
-                cost
+            if file.is_directory() || file.redirection.is_some() {
+                0
+            } else if file.is_stored() {
+                // Verified as it is read; otherwise buffered whole.
+                if verification {
+                    0
+                } else {
+                    file.unpacked_size
+                }
+            } else if file.should_stream_decode(buffered_decode_limit) {
+                file.streaming_workspace()
             } else {
-                cost.saturating_add(file.packed_size()).saturating_add(8192)
+                // A buffered decode holds the whole output, even for a sink.
+                file.unpacked_size
+                    .saturating_add(file.packed_size())
+                    .saturating_add(8192)
             }
         };
         member_batches::run(
             self.files(),
-            open,
+            &mut (open, &mut redirect),
             plan,
-            |open, members| {
+            |ctx, members| {
                 allowance.batches(
                     members,
                     buffered_decode_limit,
-                    open,
+                    !verification,
+                    ctx,
                     hint,
                     || options.check_cancelled(),
                     |file, local| {
@@ -1184,27 +1233,53 @@ impl Archive {
                             decoded => Ok((file, decoded)),
                         }
                     },
-                    |open, (file, entry)| {
+                    |(open, redirect), (file, entry)| {
                         let published = entry.and_then(|entry| {
-                            member_batches::publish(
-                                entry,
-                                open,
-                                &publication,
-                                |meta| meta.name.clone(),
-                                |_, _| Ok(false),
-                            )
+                            match (&file.redirection, redirect.as_deref_mut()) {
+                                (Some(redirection), Some(redirect)) => {
+                                    publish_redirection(file, redirection, redirect, &options)
+                                }
+                                _ => member_batches::publish(
+                                    entry,
+                                    &mut **open,
+                                    &publication,
+                                    |meta| meta.name.clone(),
+                                    |_, _| Ok(false),
+                                ),
+                            }
                         });
                         finish_independent(options, || crate::rar50_member(file), published)
                     },
                 )
             },
-            |open, file| {
-                let extracted =
-                    self.extract_inline(file, options, buffered_decode_limit, allowance, open);
+            |(open, redirect), file| {
+                let extracted = self.extract_inline(
+                    file,
+                    options,
+                    buffered_decode_limit,
+                    allowance,
+                    *open,
+                    redirect.as_deref_mut(),
+                );
                 finish_independent(options, || crate::rar50_member(file), extracted)
             },
         )
     }
+}
+
+type Redirect<'a> = dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()> + 'a;
+
+/// Reports a redirection between the cancellation checks sequential
+/// extraction makes around it.
+fn publish_redirection(
+    file: &FileHeader,
+    redirection: &FileRedirection,
+    redirect: &mut Redirect<'_>,
+    options: &crate::ArchiveReadOptions<'_>,
+) -> Result<()> {
+    options.check_cancelled()?;
+    redirect(&file.metadata(), redirection)?;
+    options.check_cancelled()
 }
 
 type ParallelExtractedEntry<B> = member_batches::Decoded<ExtractedEntryMeta, B>;
@@ -1419,6 +1494,18 @@ impl<'a> DecoderSession<'a, Allowance> {
 impl FileHeader {
     fn should_stream_decode(&self, buffered_decode_limit: u64) -> bool {
         self.unpacked_size > buffered_decode_limit
+    }
+
+    /// Roughly what streaming this member holds: its window, no larger than
+    /// the member, a filter block and the packed input window.
+    fn streaming_workspace(&self) -> u64 {
+        let window = self
+            .decoded_compression_info()
+            .map_or(self.unpacked_size, |info| info.dictionary_size)
+            .min(self.unpacked_size);
+        window
+            .saturating_add(4 * 1024 * 1024)
+            .saturating_add(crate::codec::packed_window::PACKED_WINDOW as u64)
     }
 }
 
