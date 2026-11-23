@@ -65,10 +65,10 @@ def test_listing_swapped_volumes_raises_a_volume_order_error(tmp_path, format):
 
 
 def test_listing_checks_order_where_no_member_is_split(tmp_path):
-    # 3907 bytes fills a 4096-byte volume exactly, so each volume holds one whole member.
+    # 3943 bytes fills a 4096-byte volume exactly, so each volume holds one whole member.
     builder = rars.RarBuilder(version="rar50", level=0, volume_size=4096)
     for index in range(4):
-        builder.add_bytes(bytes([index]) * 3907, f"m{index}")
+        builder.add_bytes(bytes([index]) * 3943, f"m{index}")
     paths = builder.write(tmp_path / "set.part1.rar")
     for path in paths:
         with rars.RarFile(path, first_volume_only=True) as volume:
