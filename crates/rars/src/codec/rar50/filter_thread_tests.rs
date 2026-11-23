@@ -1,4 +1,8 @@
-use super::super::{Allowance, DecodedChunk, ReaderState, Unpack50Encoder};
+use super::super::{
+    Allowance, DecodedChunk, Error, FilterStage, FilterType, PendingFilter, ReaderState,
+    StreamDecodeError, Unpack50Encoder,
+};
+use super::Piece;
 use crate::read_control::ReadControl;
 use crate::{ArchiveReadOptions, FilterKind, FilterSpec};
 
@@ -11,6 +15,7 @@ struct Run {
     reps: [usize; 4],
     last_length: usize,
     has_tables: bool,
+    ended_early: Option<usize>,
 }
 
 fn decoder(workers: Option<usize>) -> ReaderState<Allowance> {
@@ -56,6 +61,7 @@ fn run(
         reps: state.reps,
         last_length: state.last_length,
         has_tables: state.tables.is_some(),
+        ended_early: state.ended_early(),
     }
 }
 
@@ -252,5 +258,52 @@ fn the_filter_thread_stops_at_a_sink_failure() {
             "workers={workers:?}"
         );
         assert_eq!(calls, 3, "workers={workers:?}");
+    }
+}
+
+#[test]
+fn a_whole_stream_shorter_than_declared_ends_early_as_in_the_decoder() {
+    let data = prose(40_000, 11);
+    // Every filter inside the stream: the member is whole, only shorter than declared.
+    let stream = filtered(&data, &mixed_filters());
+    let short = assert_aside_matches_serial(&stream, data.len() + 5_000);
+    assert_eq!(short.error, None);
+    assert_eq!(short.ended_early, Some(data.len()));
+    assert!(short.bytes == data, "the filtered bytes differ");
+}
+
+/// A filter reaching past the last byte leaves a member whose stream ended
+/// early truncated, and is invalid in one that ran to its declared size, as
+/// the decoder's own stage judges them. An encoder never writes one.
+#[test]
+fn a_filter_past_an_early_end_leaves_the_member_truncated() {
+    for ended_early in [true, false] {
+        let allowance = Allowance::default();
+        let mut stage = FilterStage::new(&allowance);
+        let (send, pieces) = std::sync::mpsc::sync_channel(4);
+        let (spare, _spare) = std::sync::mpsc::sync_channel(4);
+        let filter = PendingFilter {
+            start: 10,
+            length: 100,
+            filter_type: FilterType::Delta,
+            channels: 2,
+        };
+        send.send(Piece::Filter(filter)).unwrap();
+        send.send(Piece::Bytes(vec![7; 50])).unwrap();
+        send.send(Piece::Done { ended_early }).unwrap();
+        drop(send);
+        let mut sink = |_: DecodedChunk<'_>| Ok::<(), ()>(());
+        let result = super::run_filters(&mut stage, pieces, spare, &mut sink);
+        if ended_early {
+            assert!(matches!(
+                result,
+                Err(StreamDecodeError::Decode(Error::NeedMoreInput))
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(StreamDecodeError::Decode(Error::InvalidData(_)))
+            ));
+        }
     }
 }
