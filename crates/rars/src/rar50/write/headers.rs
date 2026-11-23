@@ -212,7 +212,7 @@ mod tests {
         let mut refusals = 0;
         loop {
             let resources = WriterResources::default().with_max_preparation_bytes(limit);
-            match resolved_main_extra(Some(metadata), None, None, &resources) {
+            match resolved_main_extra(Some(metadata), None, 0, None, &resources) {
                 Ok(extra) => {
                     assert!(!extra.is_empty());
                     break;
@@ -395,9 +395,11 @@ pub(super) fn archive_metadata_record(
     )
 }
 
+/// The quick-open offset is padded to `quick_open_width`, so it can be patched in place.
 pub(super) fn write_locator_record(
     out: &mut impl HeaderOutput,
     quick_open_offset: Option<u64>,
+    quick_open_width: usize,
     recovery_record_offset: Option<u64>,
 ) -> Result<()> {
     let mut flags = 0;
@@ -411,7 +413,7 @@ pub(super) fn write_locator_record(
     let mut record = HeaderScratch::<21>::new();
     record.vint(flags);
     if let Some(quick_open_offset) = quick_open_offset {
-        record.vint(quick_open_offset);
+        record.vint_padded(quick_open_offset, quick_open_width);
     }
     if let Some(recovery_record_offset) = recovery_record_offset {
         record.vint(recovery_record_offset);
@@ -424,13 +426,19 @@ pub(super) fn write_locator_record(
 pub(super) fn resolved_main_extra(
     archive_metadata: Option<ArchiveMetadataEntry<'_>>,
     quick_open_offset: Option<u64>,
+    quick_open_width: usize,
     recovery_offset: Option<u64>,
     resources: &WriterResources,
 ) -> Result<Bytes> {
     let mut main_extra = Bytes::new(resources);
     let locator_quick_open_offset = quick_open_offset.or_else(|| archive_metadata.map(|_| 0));
     if locator_quick_open_offset.is_some() || recovery_offset.is_some() {
-        write_locator_record(&mut main_extra, locator_quick_open_offset, recovery_offset)?;
+        write_locator_record(
+            &mut main_extra,
+            locator_quick_open_offset,
+            quick_open_width,
+            recovery_offset,
+        )?;
     }
     if let Some(archive_metadata) = archive_metadata {
         main_extra.extend_from_slice(&archive_metadata_record(archive_metadata, resources)?)?;
@@ -979,7 +987,7 @@ mod scratch_tests {
             buffered_record(super::super::super::FHEXTRA_HTIME, &body)
         );
         actual.clear();
-        write_locator_record(&mut actual, Some(u64::MAX), Some(u64::MAX)).unwrap();
+        write_locator_record(&mut actual, Some(u64::MAX), 0, Some(u64::MAX)).unwrap();
         let mut body = Vec::new();
         write_vint(
             &mut body,

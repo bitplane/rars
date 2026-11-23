@@ -35,6 +35,8 @@ pub(super) struct LayoutInputs<'a> {
     /// members and their services.
     pub(super) body_len: u64,
     pub(super) quick_open_payload_len: Option<u64>,
+    /// Bytes the quick-open offset takes at least, so it can be patched in place.
+    pub(super) quick_open_width: usize,
     pub(super) recovery_percent: Option<u64>,
 }
 
@@ -117,6 +119,7 @@ pub(super) fn settle_layout(
         let mut main_extra = resolved_main_extra(
             inputs.archive_metadata,
             quick_open_offset,
+            inputs.quick_open_width,
             recovery_offset,
             resources,
         )?;
@@ -260,6 +263,7 @@ mod tests {
             metadata_record: None,
             body_len,
             quick_open_payload_len: None,
+            quick_open_width: 0,
             recovery_percent: Some(5),
         }
     }

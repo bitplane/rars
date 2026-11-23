@@ -336,3 +336,113 @@ fn seeded_encrypted_outputs_differ_only_in_the_padded_size_field() {
         }
     }
 }
+
+fn quick_open_records(archive: &[u8]) -> Vec<(usize, Vec<u8>)> {
+    let parsed = crate::rar50::Archive::parse(archive).unwrap();
+    let block_at = crate::detect::RAR50_SIGNATURE.len()
+        + parsed.main.locator().unwrap().quick_open_offset.unwrap() as usize;
+    let service = parsed
+        .services()
+        .find(|service| service.name == b"QO")
+        .unwrap();
+    assert_eq!(
+        service.block.offset, block_at,
+        "the locator points at the block"
+    );
+    let payload = &archive[service.block.data_range.clone()];
+    let vint = |at: &mut usize| {
+        let mut value = 0u64;
+        for shift in (0..70).step_by(7) {
+            let byte = payload[*at];
+            *at += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        value as usize
+    };
+    let mut records = Vec::new();
+    let mut at = 0;
+    while at < payload.len() {
+        at += 4;
+        let end = vint(&mut at);
+        let end = at + end;
+        assert_eq!(vint(&mut at), 0);
+        let distance = vint(&mut at);
+        let len = vint(&mut at);
+        records.push((block_at - distance, payload[at..at + len].to_vec()));
+        at = end;
+    }
+    records
+}
+
+#[test]
+fn quick_open_repeats_every_header_as_finally_written() {
+    let members = vec![
+        text(4096, 1),
+        text(1024 * 1024, 2),
+        noise(600 * 1024, 7),
+        text(4096, 3),
+    ];
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    let options =
+        WriterOptions::new(crate::ArchiveVersion::Rar50, features).with_compression_level(1);
+    let write = |output: CallerOutput<'_>| {
+        write_archive_reporting(
+            &entries(&members, Encryption::headers_only(false)),
+            options,
+            ArchiveExtras::default(),
+            &WriterResources::default(),
+            None,
+            output.streaming_above(ABOVE),
+        )
+        .unwrap()
+    };
+    let mut seekable = Cursor::new(Vec::new());
+    write(CallerOutput::seekable(&mut seekable));
+    let mut streamed = Vec::new();
+    write(CallerOutput::stream(&mut streamed));
+    for archive in [seekable.into_inner(), streamed] {
+        assert_holds(&archive, &members, Encryption::headers_only(false));
+        let parsed = crate::rar50::Archive::parse(&archive).unwrap();
+        let headers: Vec<_> = parsed
+            .files()
+            .map(|file| {
+                (
+                    file.block.offset,
+                    archive[file.block.offset..file.block.header_range.end].to_vec(),
+                )
+            })
+            .collect();
+        assert_eq!(headers.len(), members.len());
+        assert_eq!(quick_open_records(&archive), headers);
+    }
+}
+
+#[test]
+fn quick_open_after_a_prefix_leaves_the_prefix_alone() {
+    let members = vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)];
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    let options =
+        WriterOptions::new(crate::ArchiveVersion::Rar50, features).with_compression_level(1);
+    let prefix = vec![0x5a; 1000];
+    let mut output = Cursor::new(prefix.clone());
+    output.set_position(prefix.len() as u64);
+    write_archive_reporting(
+        &entries(&members, Encryption::headers_only(false)),
+        options,
+        ArchiveExtras::default(),
+        &WriterResources::default(),
+        None,
+        CallerOutput::seekable(&mut output).streaming_above(ABOVE),
+    )
+    .unwrap();
+    let output = output.into_inner();
+    assert_eq!(output[..prefix.len()], prefix);
+    let archive = &output[prefix.len()..];
+    assert_holds(archive, &members, Encryption::headers_only(false));
+    assert_eq!(quick_open_records(archive).len(), members.len());
+}
