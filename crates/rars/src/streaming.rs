@@ -575,7 +575,7 @@ impl WriterResources {
     }
 
     /// The most workspace ever in use at once.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "parallel"))]
     pub(crate) fn workspace_peak(&self) -> u64 {
         self.budget.peak.load(std::sync::atomic::Ordering::Relaxed)
     }
