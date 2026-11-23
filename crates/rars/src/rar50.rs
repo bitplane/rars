@@ -5428,7 +5428,11 @@ mod tests {
 
     fn build_archive_with_optional_comment(comment: Option<&[u8]>) -> Archive {
         use crate::FeatureSet;
-        let features = FeatureSet::store_only();
+        // The hash record gives the file header an extra area to parse.
+        let features = FeatureSet {
+            blake2sp: true,
+            ..FeatureSet::store_only()
+        };
         let entries = [rar50_entry(b"payload.txt", b"payload bytes")
             .with_attributes(0x20)
             .with_host_os(3)];

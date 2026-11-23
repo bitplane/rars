@@ -49,13 +49,21 @@ fn measured<T>(run: impl FnOnce() -> T) -> (T, Work) {
     (value, WORK.with(Cell::get))
 }
 
+/// These tests exercise the hash record, which rars writes only on request.
+fn hashed() -> FeatureSet {
+    FeatureSet {
+        blake2sp: true,
+        ..FeatureSet::store_only()
+    }
+}
+
 fn fixture(data: &[u8], stored: bool, encrypted: bool) -> (Archive, FileHeader) {
     let mut input = ArchiveEntry::new(b"payload".to_vec(), EntrySource::from_bytes(data.to_vec()));
     if encrypted {
         input = input.with_password(b"password".to_vec());
     }
     let bytes = Rar50Writer::new(
-        WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+        WriterOptions::new(ArchiveVersion::Rar50, hashed())
             .with_compression_level(if stored { 0 } else { 1 })
             .with_dictionary_size(128 * 1024),
     )

@@ -3054,7 +3054,10 @@ mod tests {
         .concat();
         let mut bytes = Rar50Writer::new(WriterOptions::new(
             ArchiveVersion::Rar50,
-            FeatureSet::store_only(),
+            FeatureSet {
+                blake2sp: true,
+                ..FeatureSet::store_only()
+            },
         ))
         .entry(entry(b"filtered.bin", &data))
         .filter_policy(FilterPolicy::explicit(FilterKind::E8))

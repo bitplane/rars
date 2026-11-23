@@ -165,7 +165,7 @@ fn later_integrity_failure_keeps_verified_redirection_over_empty_directory() {
     assert!(!result.status.success());
     assert!(
         String::from_utf8_lossy(&result.stderr).contains("while verifying entry 'later.txt'")
-            && String::from_utf8_lossy(&result.stderr).contains("hash mismatch"),
+            && String::from_utf8_lossy(&result.stderr).contains("checksum mismatch"),
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );

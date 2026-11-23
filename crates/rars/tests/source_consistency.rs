@@ -31,8 +31,11 @@ fn write_rar50(
     } else {
         entry
     };
-    let options = rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::default())
-        .with_compression_level(level);
+    // Only a BLAKE2sp hash can tell these payloads apart: they share a CRC32.
+    let mut features = FeatureSet::default();
+    features.blake2sp = true;
+    let options =
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(level);
     if volumes {
         let mut sink = rar50::CollectedVolumes::new();
         rar50::write_streaming_volumes_to(

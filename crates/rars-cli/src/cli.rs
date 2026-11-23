@@ -253,6 +253,9 @@ pub(crate) struct AddArgs {
     /// Emit a quick-open service block (RAR 5+ only)
     #[arg(long = "quick-open")]
     pub quick_open: bool,
+    /// Store a BLAKE2sp hash of each file beside its CRC32 (RAR 5+ only)
+    #[arg(long)]
+    pub blake2sp: bool,
     /// Archive-level comment
     #[arg(long, value_name = "TEXT")]
     pub comment: Option<String>,

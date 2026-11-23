@@ -2113,6 +2113,7 @@ struct AddCommand {
     solid: bool,
     header_encryption: bool,
     quick_open: bool,
+    blake2sp: bool,
     archive_comment: Option<Vec<u8>>,
     archive_name: Option<Vec<u8>>,
     file_comment: Option<Vec<u8>>,
@@ -2173,6 +2174,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         solid: args.solid,
         header_encryption: args.encrypt_headers,
         quick_open: args.quick_open,
+        blake2sp: args.blake2sp,
         archive_comment: args.comment.map(String::into_bytes),
         archive_name: args.archive_name.map(String::into_bytes),
         file_comment: args.file_comment.map(String::into_bytes),
@@ -2205,6 +2207,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         solid,
         header_encryption,
         quick_open,
+        blake2sp,
         archive_comment,
         archive_name,
         file_comment,
@@ -2260,6 +2263,10 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             (
                 rars::WriterOption::Feature(rars::Feature::QuickOpen),
                 quick_open,
+            ),
+            (
+                rars::WriterOption::Feature(rars::Feature::Blake2sp),
+                blake2sp,
             ),
             (
                 rars::WriterOption::DictionarySize,
@@ -2329,6 +2336,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             recovery_percent,
             rar50_filter_policy(no_filter, store, delta_filter, e8_filter, arm_filter),
             quick_open,
+            blake2sp,
             archive_comment.as_deref(),
             file_comment.as_deref(),
             archive_name.as_deref(),
@@ -2737,6 +2745,7 @@ fn write_plain_rar50_streaming(
     recovery_percent: Option<u64>,
     filter_policy: rars::rar50::FilterPolicy,
     quick_open: bool,
+    blake2sp: bool,
     archive_comment: Option<&[u8]>,
     file_comment: Option<&[u8]>,
     archive_name: Option<&[u8]>,
@@ -2787,6 +2796,7 @@ fn write_plain_rar50_streaming(
     features.header_encryption = header_encryption;
     features.solid = solid;
     features.quick_open = quick_open;
+    features.blake2sp = blake2sp;
     let mut options = rars::rar50::WriterOptions::new(target, features);
     if let Some(level) = compression_level {
         options = options.with_compression_level(level);

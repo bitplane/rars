@@ -7,6 +7,14 @@ use std::sync::Arc;
 
 type ExtractedFiles = Vec<(Vec<u8>, Vec<u8>)>;
 
+/// These tests exercise the hash record, which rars writes only on request.
+fn hashed() -> FeatureSet {
+    FeatureSet {
+        blake2sp: true,
+        ..FeatureSet::store_only()
+    }
+}
+
 fn entry(name: &[u8], data: &[u8]) -> ArchiveEntry {
     ArchiveEntry::new(
         name.to_vec(),
@@ -27,7 +35,7 @@ impl Write for Sink {
 fn archive(version: ArchiveVersion, filter: Option<FilterKind>) -> (Archive, Vec<u8>) {
     let data = b"independent buffered dictionary filter member repeated bytes\n".repeat(64);
     let mut writer = Rar50Writer::new(
-        WriterOptions::new(version, FeatureSet::store_only())
+        WriterOptions::new(version, hashed())
             .with_compression_level(1)
             .with_dictionary_size(if version == ArchiveVersion::Rar70 {
                 192 * 1024
@@ -154,8 +162,7 @@ fn independent_history_encrypted_digest_and_password_errors_match_stateful_decod
     let data = b"encrypted independent Delta and BLAKE2sp MAC bytes\n".repeat(64);
     for filter in [None, Some(FilterKind::Delta { channels: 2 })] {
         let mut writer = Rar50Writer::new(
-            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
-                .with_compression_level(1),
+            WriterOptions::new(ArchiveVersion::Rar50, hashed()).with_compression_level(1),
         )
         .entry(entry(b"encrypted", &data).with_password(b"password".to_vec()));
         if let Some(filter) = filter {
