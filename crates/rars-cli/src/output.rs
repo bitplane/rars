@@ -252,6 +252,17 @@ pub(crate) fn truncation_warning(path: &Path, truncation: &rars::Truncation) -> 
     format!("warning: {}: archive is {truncation}", path.display())
 }
 
+/// Warns that an archive ends early and about each malformed block its
+/// reader passed over.
+pub(crate) fn warn_archive_structure(path: &Path, archive: &DetectedArchive) {
+    for skipped in archive.skipped_blocks() {
+        eprintln!("warning: {}: {skipped}", path.display());
+    }
+    if let Some(truncation) = archive.truncation() {
+        eprintln!("{}", truncation_warning(path, truncation));
+    }
+}
+
 pub(crate) fn skipped_link_warning(name: &[u8], target: &[u8]) -> String {
     format!(
         "warning: skipping link '{}' -> '{}': it would point outside the output directory",

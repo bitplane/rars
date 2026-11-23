@@ -6962,6 +6962,12 @@ fn cut_after_the_last_member_reads_it_and_says_where() {
                 let archive = archive.expect(&context);
                 let truncation = archive.truncation().map(|truncation: &Truncation| {
                     assert!(truncation.started, "{context}");
+                    // Issue #489: only these blocks follow every member.
+                    let after_members = matches!(
+                        truncation.block,
+                        TruncatedBlock::End | TruncatedBlock::RecoveryRecord
+                    );
+                    assert_eq!(truncation.members_complete, after_members, "{context}");
                     (truncation.block.clone(), truncation.offset as usize)
                 });
                 assert_eq!(truncation, expected, "{context}");
