@@ -599,6 +599,215 @@ fn compress_members(
     if advance.is_cancelled() || resources.is_cancelled() {
         return Err(Error::Cancelled);
     }
+    let Some(stored_early) = probe_members(sources, plan, resources, advance, error_context)?
+    else {
+        return compress_members_as_planned(
+            sources,
+            plan,
+            resources,
+            advance,
+            error_context,
+            stored_hashed_later,
+        );
+    };
+
+    // The rest are planned and coded as if the stored members were not there:
+    // nothing about one independent member depends on another.
+    let split = |store: bool| -> Result<(Records<usize>, Records<EntrySource>)> {
+        let count = stored_early.iter().filter(|&&early| early == store).count();
+        let mut indexes = Records::new(count, resources)?;
+        let mut picked = Records::new(count, resources)?;
+        for index in (0..sources.len()).filter(|&index| stored_early[index] == store) {
+            indexes.push(index)?;
+            picked.push(sources[index].clone())?;
+        }
+        Ok((indexes, picked))
+    };
+    let (stored, stored_sources) = split(true)?;
+    let (coded, coded_sources) = split(false)?;
+
+    let mut stored_integrity = Records::new(stored.len(), resources)?;
+    for (member, source) in stored_sources.iter().enumerate() {
+        let size = source
+            .len()
+            .map_err(|error| error_context(stored[member], error))?;
+        stored_integrity.push((size, 0, [0; 32]))?;
+    }
+    hash_stored_members(
+        &stored_sources,
+        &mut stored_integrity,
+        resources,
+        &Remapped::new(&stored, advance),
+        &|member, error| error_context(stored[member], error),
+    )?;
+    let compressed = if coded.is_empty() {
+        Records::new(0, resources)?
+    } else {
+        compress_members_as_planned(
+            &coded_sources,
+            plan,
+            resources,
+            &Remapped::new(&coded, advance),
+            &|member, error| error_context(coded[member], error),
+            stored_hashed_later,
+        )?
+    };
+
+    let mut stored_members = stored_integrity.iter();
+    let mut compressed = compressed.into_iter();
+    Records::collect(
+        stored_early.iter().map(|&store| {
+            if !store {
+                return Ok(compressed
+                    .next()
+                    .expect("one compressed result per coded member"));
+            }
+            let &(input_size, crc32, hash) = stored_members
+                .next()
+                .expect("one checksum per stored member");
+            Ok(CompressedMember {
+                input_size,
+                crc32,
+                hash,
+                packed: Spool::create_parked(resources)?,
+                store: true,
+                solid_continuation: false,
+            })
+        }),
+        resources,
+    )
+}
+
+/// Progress for a subset of the members, reported under their own indexes.
+struct Remapped<'a> {
+    members: &'a [usize],
+    progress: &'a dyn CompressionProgress,
+}
+
+impl<'a> Remapped<'a> {
+    fn new(members: &'a [usize], progress: &'a dyn CompressionProgress) -> Self {
+        Self { members, progress }
+    }
+}
+
+impl CompressionProgress for Remapped<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.progress.is_cancelled()
+    }
+    fn advance(&self, bytes: u64) -> bool {
+        self.progress.advance(bytes)
+    }
+    fn started(&self, member: usize, size: u64) {
+        self.progress.started(self.members[member], size);
+    }
+    fn finished(&self, member: usize, size: u64) {
+        self.progress.finished(self.members[member], size);
+    }
+}
+
+/// Which members to store without coding them, judged from samples of each
+/// (#481), or `None` when there are none.
+///
+/// Only independent members are sampled. A member in a solid chain is coded
+/// against the ones before it, so a sample coded alone says nothing about what
+/// it packs to there, and a stored member would leave a gap in the dictionary
+/// the next one is decoded against. A filter the caller named is applied
+/// whatever it does to the size, as it is when the comparison comes after.
+fn probe_members(
+    sources: &[EntrySource],
+    plan: &CompressPlan,
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+) -> Result<Option<Records<bool>>> {
+    if plan.method == 0 || plan.solid || matches!(plan.filter_policy, FilterPolicy::Explicit(_)) {
+        return Ok(None);
+    }
+    let mut candidates = Records::new(sources.len(), resources)?;
+    for (index, source) in sources.iter().enumerate() {
+        // A rewrite's sources are staged one window at a time, in order, and
+        // held until written, so opening one ahead to sample it can need
+        // staging that the members before it still hold.
+        if source.max_preparation_window() != usize::MAX {
+            continue;
+        }
+        let size = source.len().map_err(|error| error_context(index, error))?;
+        if crate::incompressible::sample_ranges(size).is_some() {
+            candidates.push((index, size))?;
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+    let mut stored = Records::collect(sources.iter().map(|_| Ok(false)), resources)?;
+    let mut any = false;
+    let sample = crate::incompressible::SAMPLE_LEN;
+    let charge = super::streaming_lz_workspace(sample as u64, sample, false) + sample as u64;
+    crate::parallel::map_slice_windowed(
+        &candidates,
+        crate::parallel::default_window(),
+        |_, opens| {
+            if opens {
+                resources
+                    .acquire_serialising_cancellable(charge, &|| advance.is_cancelled())
+                    .map(Some)
+            } else {
+                resources.try_acquire_serialising(charge)
+            }
+        },
+        |&(index, size), _permit| {
+            let cancelled = || advance.is_cancelled() || resources.is_cancelled();
+            let probe = || -> Result<bool> {
+                let mut reader = sources[index].open()?;
+                crate::incompressible::looks_incompressible(&mut *reader, size, |sample| {
+                    if cancelled() {
+                        return Err(Error::Cancelled);
+                    }
+                    match &resources.execution {
+                        Some(allowance) => probe_packed_len(sample, plan, &cancelled, allowance),
+                        None => probe_packed_len(sample, plan, &cancelled, &Allowance::default()),
+                    }
+                })
+            };
+            probe().map_err(|error| error_context(index, error))
+        },
+        |&(index, _), store| {
+            stored[index] = store;
+            any |= store;
+            Ok(())
+        },
+    )?;
+    Ok(any.then_some(stored))
+}
+
+/// What a probe sample packs to coded on its own at level 1, unfiltered: the
+/// cheapest coding there is, and about the least any level saves.
+fn probe_packed_len<B: Budget>(
+    sample: &[u8],
+    plan: &CompressPlan,
+    cancelled: &dyn Fn() -> bool,
+    allowance: &B,
+) -> Result<usize> {
+    let options = super::filter_policy::encode_options_for_level(Some(1), sample.len() as u64)?;
+    let packed = crate::codec::rar50::encode_owned_member(
+        sample,
+        plan.algorithm_version,
+        options,
+        None,
+        Some(&mut |_| !cancelled()),
+        allowance,
+    )?;
+    Ok(packed.len())
+}
+
+fn compress_members_as_planned(
+    sources: &[EntrySource],
+    plan: &CompressPlan,
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    stored_hashed_later: bool,
+) -> Result<Records<CompressedMember>> {
     let mut integrity = Records::new(sources.len(), resources)?;
     for (index, source) in sources.iter().enumerate() {
         let input_size = source.len().map_err(|error| error_context(index, error))?;
@@ -723,10 +932,8 @@ fn hash_stored_members(
         },
         |&(index, size), checksums| {
             let (crc, hash) = checksums.map_err(|error| error_context(index, error))?;
+            // Hashing reported its progress as it read.
             (integrity[index].1, integrity[index].2) = (crc, hash);
-            if !advance.advance(size) {
-                return Err(Error::Cancelled);
-            }
             advance.finished(index, size);
             Ok(())
         },
@@ -4347,5 +4554,147 @@ mod stored_hashing_tests {
             "{opened} of {} opened",
             sources.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod incompressible_probe_tests {
+    use super::*;
+    use crate::rar50::FilterPolicy;
+
+    fn noise(len: usize, mut state: u64) -> Vec<u8> {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state >> 32) as u8
+            })
+            .collect()
+    }
+
+    fn text(len: usize) -> Vec<u8> {
+        let mut text = Vec::with_capacity(len + 64);
+        let mut line = 0u32;
+        while text.len() < len {
+            text.extend_from_slice(format!("line {line}: a member worth compressing\n").as_bytes());
+            line = (line * 7 + 13) % 1000;
+        }
+        text.truncate(len);
+        text
+    }
+
+    fn level_one_plan(solid: bool) -> CompressPlan {
+        let dictionary_size = 128 * 1024;
+        let options =
+            super::super::filter_policy::encode_options_for_level(Some(1), dictionary_size)
+                .unwrap();
+        CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+        }
+    }
+
+    /// Too little memory to code a block, enough to sample and hash.
+    fn too_small_to_code() -> WriterResources {
+        WriterResources::new(16 * 1024 * 1024)
+    }
+
+    fn checksums(data: &[u8]) -> (u32, [u8; 32]) {
+        let mut crc = Crc32::new();
+        crc.update(data);
+        let mut hash = blake2sp::Hasher::new();
+        hash.update(data);
+        (crc.finish(), hash.finalize())
+    }
+
+    /// A noise member is stored from its samples, so it never needs the memory
+    /// to code it, and its checksums are those of the whole member.
+    #[test]
+    fn noise_is_stored_without_coding_it() {
+        let data = noise(2 * 1024 * 1024, 0x9e37_79b9_7f4a_7c15);
+        let members = compress_members_with_context(
+            &[EntrySource::from_bytes(data.clone())],
+            &level_one_plan(false),
+            &too_small_to_code(),
+            &|_| true,
+            &|_, error| error,
+        )
+        .unwrap();
+        let member = &members[0];
+        assert!(member.store);
+        assert_eq!(member.input_size, data.len() as u64);
+        assert_eq!((member.crc32, member.hash), checksums(&data));
+    }
+
+    /// A solid chain is never sampled: a member that does not compress alone
+    /// may against the members before it, and storing it would leave a gap in
+    /// the dictionary the next member is decoded against.
+    #[test]
+    fn a_solid_member_is_not_sampled() {
+        let data = noise(2 * 1024 * 1024, 0x2545_f491_4f6c_dd1d);
+        let result = compress_members_with_context(
+            &[EntrySource::from_bytes(data)],
+            &level_one_plan(true),
+            &too_small_to_code(),
+            &|_| true,
+            &|_, error| error,
+        );
+        assert!(
+            matches!(result, Err(Error::MemoryLimitExceeded { .. })),
+            "{:?}",
+            result.map(|members| members.len())
+        );
+    }
+
+    /// Stored and coded members come back in order, each with its own result,
+    /// and a member with only part of it noise is still coded.
+    #[test]
+    fn members_beside_a_stored_one_keep_their_place_and_their_coding() {
+        let quiet = text(1536 * 1024);
+        let mut halves = text(1024 * 1024);
+        halves.extend(noise(1024 * 1024, 7));
+        let loud = noise(3 * 1024 * 1024, 11);
+        let inputs = [quiet, loud.clone(), halves, Vec::new(), loud];
+        let sources: Vec<_> = inputs
+            .iter()
+            .map(|data| EntrySource::from_bytes(data.clone()))
+            .collect();
+        let started = std::sync::Mutex::new(Vec::new());
+        struct Started<'a>(&'a std::sync::Mutex<Vec<usize>>);
+        impl CompressionProgress for Started<'_> {
+            fn advance(&self, _: u64) -> bool {
+                true
+            }
+            fn started(&self, member: usize, _: u64) {
+                self.0.lock().unwrap().push(member);
+            }
+        }
+        let members = compress_members_with_context(
+            &sources,
+            &level_one_plan(false),
+            &WriterResources::default(),
+            &Started(&started),
+            &|_, error| error,
+        )
+        .unwrap();
+        let stored: Vec<_> = members.iter().map(|member| member.store).collect();
+        assert_eq!(stored, [false, true, false, true, true]);
+        for (member, data) in members.iter().zip(&inputs) {
+            assert_eq!(member.input_size, data.len() as u64);
+            assert_eq!((member.crc32, member.hash), checksums(data));
+            if !member.store {
+                assert!(member.packed.len() < data.len() as u64 * 3 / 4);
+            }
+        }
+        let mut started = started.into_inner().unwrap();
+        started.sort_unstable();
+        assert_eq!(started, [0, 1, 2, 3, 4]);
     }
 }

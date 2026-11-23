@@ -53,6 +53,8 @@ pub mod filename;
 pub mod filter;
 #[cfg(feature = "write")]
 mod filter_search;
+#[cfg(feature = "write")]
+mod incompressible;
 mod io_util;
 mod key_cache;
 mod member;
