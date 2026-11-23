@@ -1190,6 +1190,11 @@ impl<'a> ExtractOutputState<'a> {
         }
         self.publish_verified()?;
         if opened == Opened::Output {
+            // Every member before this one is published now, as it is when
+            // a member opens without settling.
+            let output = &self.outputs[self.settled];
+            let (path, meta) = (output.path.clone(), output.meta.clone());
+            self.remember_directory_time(&path, &meta)?;
             self.settled += 1;
         }
         Ok(false)
@@ -1264,7 +1269,11 @@ impl<'a> ExtractOutputState<'a> {
         }
         self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
-        self.remember_directory_time(&destination, meta)?;
+        // Settling, members before this one may not be published yet: the
+        // time is taken when it settles.
+        if !self.settling {
+            self.remember_directory_time(&destination, meta)?;
+        }
         let staging =
             self.prepare_staged_path(&destination, meta.is_directory, existing.as_ref())?;
         let (path, writer) = match &mut self.staging_tree {
