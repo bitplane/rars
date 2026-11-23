@@ -1,6 +1,9 @@
 use super::{write_archive_reporting, ArchiveEntry, ArchiveExtras, WriterOptions};
 use crate::write_stream::CallerOutput;
-use crate::{ArchiveReadOptions, ArchiveReader, EntrySource, Error, FeatureSet, WriterResources};
+use crate::{
+    ArchiveReadOptions, ArchiveReader, EntrySource, Error, FeatureSet, FilterKind, FilterPolicy,
+    WriterResources,
+};
 use std::io::Cursor;
 
 const ABOVE: u64 = 256 * 1024;
@@ -89,11 +92,20 @@ fn seekable(
     lock: Encryption,
     resources: &WriterResources,
 ) -> crate::Result<Vec<u8>> {
+    seekable_with(members, lock, extras(lock), resources)
+}
+
+fn seekable_with(
+    members: &[Vec<u8>],
+    lock: Encryption,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+) -> crate::Result<Vec<u8>> {
     let mut output = Cursor::new(Vec::new());
     write_archive_reporting(
         &entries(members, lock),
         options(lock),
-        extras(lock),
+        extras,
         resources,
         None,
         CallerOutput::seekable(&mut output).streaming_above(ABOVE),
@@ -106,11 +118,20 @@ fn streamed(
     lock: Encryption,
     resources: &WriterResources,
 ) -> crate::Result<Vec<u8>> {
+    streamed_with(members, lock, extras(lock), resources)
+}
+
+fn streamed_with(
+    members: &[Vec<u8>],
+    lock: Encryption,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+) -> crate::Result<Vec<u8>> {
     let mut output = Vec::new();
     write_archive_reporting(
         &entries(members, lock),
         options(lock),
-        extras(lock),
+        extras,
         resources,
         None,
         CallerOutput::stream(&mut output).streaming_above(ABOVE),
@@ -445,4 +466,111 @@ fn quick_open_after_a_prefix_leaves_the_prefix_alone() {
     let archive = &output[prefix.len()..];
     assert_holds(archive, &members, Encryption::headers_only(false));
     assert_eq!(quick_open_records(archive).len(), members.len());
+}
+
+fn filtered(lock: Encryption) -> ArchiveExtras<'static> {
+    extras(lock).with_filter_policy(FilterPolicy::explicit(FilterKind::Delta { channels: 4 }))
+}
+
+fn every_encryption_case() -> Vec<Encryption> {
+    let cases = header_encryption_cases();
+    #[cfg(feature = "encryption")]
+    let cases: Vec<_> = cases.into_iter().chain(member_encryption_cases()).collect();
+    cases
+}
+
+#[test]
+fn a_large_explicit_filter_member_is_spooled_only_on_a_stream_output() {
+    let members = vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)];
+    for lock in every_encryption_case() {
+        let resources = WriterResources::default().with_max_spool_bytes(64 * 1024);
+        let archive = seekable_with(&members, lock, filtered(lock), &resources).unwrap();
+        assert_holds(&archive, &members, lock);
+
+        let error = streamed_with(&members, lock, filtered(lock), &resources).unwrap_err();
+        assert!(
+            matches!(error.root_cause(), Error::WriterSpoolLimitExceeded { .. }),
+            "{error}"
+        );
+        let unlimited = streamed_with(&members, lock, filtered(lock), &WriterResources::default());
+        assert_holds(&unlimited.unwrap(), &members, lock);
+    }
+}
+
+fn data_size_width(archive: &[u8], name: &[u8]) -> (usize, u64) {
+    let parsed = crate::rar50::Archive::parse(archive).unwrap();
+    let file = parsed.files().find(|file| file.name == name).unwrap();
+    let vint = |at: usize| {
+        archive[at..]
+            .iter()
+            .position(|byte| byte & 0x80 == 0)
+            .unwrap()
+            + 1
+    };
+    // CRC, then the header size, type and flags, then the extra area size.
+    let mut at = file.block.offset + 4;
+    for _ in 0..3 {
+        at += vint(at);
+    }
+    if file.block.extra_area_size.is_some() {
+        at += vint(at);
+    }
+    (vint(at), file.block.data_size.unwrap())
+}
+
+#[test]
+fn an_explicit_filter_member_reserves_room_to_outgrow_its_size() {
+    let members = vec![text(4096, 1), text(1024 * 1024, 2)];
+    let resources = WriterResources::default();
+    // 1 MiB takes three vint bytes, and the most it could pack to five.
+    let locks = vec![Encryption::headers_only(false)];
+    #[cfg(feature = "encryption")]
+    let locks: Vec<_> = locks
+        .into_iter()
+        .chain([Encryption {
+            headers: false,
+            members: true,
+        }])
+        .collect();
+    for lock in locks {
+        let plain = seekable(&members, lock, &resources).unwrap();
+        assert_eq!(data_size_width(&plain, b"member1.bin").0, 3);
+        let archive = seekable_with(&members, lock, filtered(lock), &resources).unwrap();
+        assert_eq!(data_size_width(&archive, b"member1.bin").0, 5);
+        assert_holds(&archive, &members, lock);
+    }
+}
+
+#[test]
+fn an_explicit_filter_member_that_outgrows_its_size_goes_out_in_place() {
+    let members = vec![text(4096, 1), noise(600 * 1024, 7), text(4096, 3)];
+    for lock in every_encryption_case() {
+        let resources = WriterResources::default().with_max_spool_bytes(64 * 1024);
+        let archive = seekable_with(&members, lock, filtered(lock), &resources).unwrap();
+        assert_holds(&archive, &members, lock);
+        if !lock.headers {
+            let (_, packed) = data_size_width(&archive, b"member1.bin");
+            assert!(packed > 600 * 1024, "packed to {packed}");
+        }
+    }
+}
+
+#[test]
+fn an_in_place_explicit_filter_archive_does_not_depend_on_the_thread_count() {
+    let members = vec![text(4096, 1), text(1024 * 1024, 2), noise(300 * 1024, 4)];
+    let lock = Encryption::headers_only(false);
+    let resources = WriterResources::default();
+    let archive = seekable_with(&members, lock, filtered(lock), &resources).unwrap();
+    assert_holds(&archive, &members, lock);
+    #[cfg(feature = "parallel")]
+    for threads in [1, 3] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let again = pool
+            .install(|| seekable_with(&members, lock, filtered(lock), &resources))
+            .unwrap();
+        assert!(again == archive, "{threads} threads wrote another archive");
+    }
 }

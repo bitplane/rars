@@ -68,6 +68,8 @@ pub(super) enum FallbackReason {
         required: u64,
         limit: u64,
     },
+    /// The member goes out as it is packed, which only runs can do.
+    InPlace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,29 +180,33 @@ impl ExecutionPlan {
                         admission: required,
                     });
                 };
-                let blocks = streaming_workspace(settings, false, size);
-                // Fallback uses only the base encoder candidate. Automatic
-                // filters search each run as if it were a member of its own
-                // when that fits; an explicit filter is coded the same way,
-                // without the search, so it is charged the same.
-                let search = whole_member_workspace(size.min(search_piece(settings)), settings);
-                let run_filters = search <= limit
-                    || matches!(fallback, FallbackReason::ExplicitFilterWorkspace { .. });
-                Ok(MemberPlan {
-                    execution: Execution::Blocks {
-                        fallback,
-                        run_filters,
-                    },
-                    workspace: if run_filters {
-                        blocks.max(search)
-                    } else {
-                        blocks
-                    },
-                    admission: block_admission(settings, false, size, run_filters),
-                })
+                Ok(MemberPlan::in_runs(settings, size, fallback, limit))
             }),
             resources,
         )?))
+    }
+
+    /// Coded whole, an explicit-filter member could not go out as it is packed.
+    pub(super) fn in_place(
+        &mut self,
+        settings: &CompressPlan,
+        member: usize,
+        size: u64,
+        resources: &WriterResources,
+    ) {
+        let (Self::IndependentMembers(members), FilterPolicy::Explicit(spec)) =
+            (self, &settings.filter_policy)
+        else {
+            return;
+        };
+        if members[member].execution == Execution::WholeMember && spec_fits(spec, size) {
+            members[member] = MemberPlan::in_runs(
+                settings,
+                size,
+                FallbackReason::InPlace,
+                resources.planning_memory_limit(),
+            );
+        }
     }
 
     #[cfg(test)]
@@ -208,6 +214,31 @@ impl ExecutionPlan {
         match self {
             Self::IndependentMembers(members) => members,
             _ => panic!("expected independent member plan"),
+        }
+    }
+}
+
+impl MemberPlan {
+    fn in_runs(settings: &CompressPlan, size: u64, fallback: FallbackReason, limit: u64) -> Self {
+        let blocks = streaming_workspace(settings, false, size);
+        // Fallback uses only the base encoder candidate. Automatic filters
+        // search each run as if it were a member of its own when that fits; an
+        // explicit filter is coded the same way, without the search, so it is
+        // charged the same.
+        let search = whole_member_workspace(size.min(search_piece(settings)), settings);
+        let run_filters =
+            search <= limit || matches!(settings.filter_policy, FilterPolicy::Explicit(_));
+        Self {
+            execution: Execution::Blocks {
+                fallback,
+                run_filters,
+            },
+            workspace: if run_filters {
+                blocks.max(search)
+            } else {
+                blocks
+            },
+            admission: block_admission(settings, false, size, run_filters),
         }
     }
 }

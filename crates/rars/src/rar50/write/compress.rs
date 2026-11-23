@@ -1046,8 +1046,13 @@ fn compress_members_as_planned(
         integrity.push((input_size, 0, plan.blake2sp.then_some([0; 32])))?;
     }
 
-    let execution =
+    let mut execution =
         ExecutionPlan::with_resources(plan, integrity.iter().map(|entry| entry.0), resources)?;
+    for (index, &(input_size, ..)) in integrity.iter().enumerate() {
+        if straight(index, input_size) {
+            execution.in_place(plan, index, input_size, resources);
+        }
+    }
     // One rule, shared with the whole-member path and the legacy writers, plus
     // the two cases that are not really fallbacks: storing was asked for, and
     // an empty member has nothing to pack. `StoreFallback` refuses to store a

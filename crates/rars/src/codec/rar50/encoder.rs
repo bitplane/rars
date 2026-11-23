@@ -235,6 +235,23 @@ mod splitter_tests {
     }
 }
 
+/// From format limits and two encoder invariants, so no tuning of what the
+/// encoder chooses can outgrow it.
+pub(crate) fn packed_most(input_size: u64) -> u64 {
+    // The encoder never codes an empty block but perhaps the last, and gives a
+    // block one filter record at most. A block is five header bytes and at
+    // most 1,248 bytes of tables: twenty level lengths of eight bits, 446
+    // lengths of a fifteen-bit code and seven extra bits, and byte padding.
+    const BLOCK_MOST: u64 = 5 + 1_248;
+    // A filter record, or a match of fifteen main bits, nine length bits,
+    // fifteen distance bits, 34 raw distance bits and a fifteen-bit align
+    // code, at most 91 bits; any token but a filter covers at least one byte.
+    const TOKEN_MOST: u64 = 12;
+    input_size
+        .saturating_add(1)
+        .saturating_mul(BLOCK_MOST + 2 * TOKEN_MOST)
+}
+
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
 
 /// The most channels a RAR 5 delta filter record can name. The count is written
