@@ -23,10 +23,10 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
-    create_link_output, damaged_member_warning, incomplete_member_warning, open_output_writer,
-    print_ok_entry, print_ok_name, rar50_output_relative_path, restore_output_metadata,
-    warn_archive_structure, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
-    OverwritePolicy,
+    create_link_output, damaged_member_warning, incomplete_member_warning, kept_broken_warning,
+    open_output_writer, print_ok_entry, print_ok_name, rar50_output_relative_path,
+    restore_output_metadata, warn_archive_structure, warn_rar50_redirections, ExtractedOutput,
+    ExtractionStaging, OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -655,6 +655,8 @@ struct PassedOver {
     locked: usize,
     unnamed: usize,
     comments: usize,
+    /// Damaged headers `x --keep-broken` read past.
+    headers: usize,
 }
 
 impl std::ops::AddAssign for PassedOver {
@@ -663,6 +665,7 @@ impl std::ops::AddAssign for PassedOver {
         self.locked += other.locked;
         self.unnamed += other.unnamed;
         self.comments += other.comments;
+        self.headers += other.headers;
     }
 }
 
@@ -686,6 +689,9 @@ impl PassedOver {
         }
         if self.comments > 0 {
             problems.push("a damaged archive comment".to_string());
+        }
+        if self.headers > 0 {
+            problems.push(format!("{} damaged header(s)", self.headers));
         }
         if problems.is_empty() {
             return Ok(());
@@ -715,11 +721,14 @@ struct DamagedMembers<'p> {
     testing: Mutex<Option<rars::ExtractedEntryMeta>>,
     /// One of our own callbacks failed, and its error ends the run.
     callback_failed: AtomicBool,
+    /// Under `x --keep-broken`, the member whose output is open.
+    keep_broken: Option<&'p KeptBroken>,
 }
 
 impl<'p> DamagedMembers<'p> {
     fn new(path: &'p Path) -> Self {
         Self {
+            keep_broken: None,
             path,
             count: AtomicUsize::new(0),
             locked: AtomicUsize::new(0),
@@ -755,11 +764,25 @@ impl<'p> DamagedMembers<'p> {
             );
             return Ok(rars::ExtractionErrorAction::Continue);
         }
+        let password_class = error_is_password_class(error);
+        if !password_class
+            && self
+                .keep_broken
+                .is_some_and(|kept| kept.keep(&member.meta.name))
+        {
+            // Its output stays, and is finished like a verified member's.
+            eprintln!(
+                "{}",
+                kept_broken_warning(self.path, &member.meta.name, error)
+            );
+            self.count.fetch_add(1, Ordering::Relaxed);
+            return Ok(rars::ExtractionErrorAction::Continue);
+        }
         eprintln!(
             "{}",
             damaged_member_warning(self.path, &member.meta.name, error, &retry_hint(error))
         );
-        let count = if error_is_password_class(error) {
+        let count = if password_class {
             &self.locked
         } else {
             &self.count
@@ -807,8 +830,44 @@ impl<'p> DamagedMembers<'p> {
             damaged: self.count.load(Ordering::Relaxed),
             locked: self.locked.load(Ordering::Relaxed),
             unnamed: self.unnamed.load(Ordering::Relaxed),
-            comments: 0,
+            ..PassedOver::default()
         }
+    }
+}
+
+/// For `x --keep-broken` and `unrars -kb`: the member whose output the
+/// library opened last, so one it fails on after delivering its bytes can be
+/// kept. The library reports a member's failure before it opens the next.
+#[derive(Default)]
+struct KeptBroken {
+    open: Mutex<Option<Vec<u8>>>,
+}
+
+impl KeptBroken {
+    /// Opens a member's output, noting it if there is one to keep.
+    fn open(
+        &self,
+        state: &mut ExtractOutputState<'_>,
+        meta: &rars::ExtractedEntryMeta,
+    ) -> rars::Result<Box<dyn Write + Send>> {
+        *lock(&self.open) = None;
+        let outputs = state.outputs.len();
+        let writer = state.open_entry(meta)?;
+        if state.outputs.len() > outputs {
+            *lock(&self.open) = Some(meta.name.clone());
+        }
+        Ok(writer)
+    }
+
+    /// A member that is no file of ours, such as a link, is next.
+    fn close(&self) {
+        *lock(&self.open) = None;
+    }
+
+    /// Whether the member the library failed on has an output to keep. Its
+    /// output is then published as a verified member's is.
+    fn keep(&self, member: &[u8]) -> bool {
+        lock(&self.open).take().is_some_and(|open| open == member)
     }
 }
 
@@ -1013,7 +1072,10 @@ fn incomplete_set_result(gaps: usize, skipped: usize) -> CliResult<()> {
     )))
 }
 
-fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
+fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
+    // Kept files are written where they belong, with what was read of them.
+    args.read_options.salvage = args.keep_broken;
+    let in_place = args.in_place || args.keep_broken;
     let scratch = args.read_options.scratch();
     let mut password = resolve_password_args(&args.password)?;
     let overwrite: OverwritePolicy = args.overwrite.into();
@@ -1044,10 +1106,11 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let state = RefCell::new(ExtractOutputState::new(
         &out_dir,
         overwrite,
-        args.in_place,
+        in_place,
         args.flatten,
         family,
     ));
+    let kept = KeptBroken::default();
     let mut skipped = 0;
     for run in &runs {
         skipped += skip_incomplete_members(&paths[run.clone()], &mut archives[run.clone()]);
@@ -1058,7 +1121,8 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let mut passed_over = PassedOver::default();
     for run in runs {
         let (paths, archives) = (&paths[run.clone()], &archives[run]);
-        let damaged = DamagedMembers::new(&paths[0]);
+        let mut damaged = DamagedMembers::new(&paths[0]);
+        damaged.keep_broken = args.keep_broken.then_some(&kept);
         let handler =
             |member: &rars::ArchiveMember, error: &rars::Error| damaged.handle(member, error);
         let options = options.with_member_error_handler(&handler);
@@ -1141,6 +1205,10 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
             "skipped {skipped_unnamed} member(s) with no name"
         )));
     }
+    passed_over.headers = archives
+        .iter()
+        .map(|archive| archive.header_damage().len())
+        .sum();
     incomplete_set_result(gaps.len(), skipped)?;
     passed_over.result(&paths)?;
     truncated_result(&truncated)
@@ -2419,8 +2487,12 @@ fn open_after_damage(
 ) -> rars::Result<Box<dyn Write>> {
     let mut state = state.borrow_mut();
     state.discard_failed(&damaged.take_failed());
+    let opened = match damaged.keep_broken {
+        Some(kept) => kept.open(&mut state, meta),
+        None => state.open_entry(meta),
+    };
     damaged
-        .callback(state.open_entry(meta))
+        .callback(opened)
         .map(|writer| writer as Box<dyn Write>)
 }
 
@@ -2432,6 +2504,9 @@ fn link_after_damage(
 ) -> rars::Result<()> {
     let mut state = state.borrow_mut();
     state.discard_failed(&damaged.take_failed());
+    if let Some(kept) = damaged.keep_broken {
+        kept.close();
+    }
     damaged.callback(state.create_link(meta, link))
 }
 

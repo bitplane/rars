@@ -301,6 +301,101 @@ fn reports_damage_passwords_and_non_archives() {
     assert_eq!(unrars(&dir, &["q", "junk.rar"]).status.code(), Some(7));
 }
 
+/// Three stored members, the middle one [`payload`].
+fn write_three(path: &Path, version: ArchiveVersion) {
+    let mut builder = Builder::new(version).store(true);
+    for (name, data) in [
+        (&b"a.txt"[..], b"hello\n".to_vec()),
+        (b"mid.bin", payload()),
+        (b"z.txt", b"after\n".to_vec()),
+    ] {
+        builder.add_bytes(name.to_vec(), data, None, None).unwrap();
+    }
+    builder.write_to_path(path, None).unwrap();
+}
+
+/// Issue #365: `-kb` keeps a member that fails its checksum with every byte
+/// read for it, says so as unrar does after the file's line, goes on to the
+/// members after it and exits with unrar's checksum status. Without `-kb`
+/// nothing of it is kept.
+#[test]
+fn kb_keeps_a_member_that_fails_its_checksum() {
+    let dir = scratch::case("unrars-kb-checksum");
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let name = format!("{version:?}.rar");
+        let path = dir.join(&name);
+        write_three(&path, version);
+        let mut bytes = fs::read(&path).unwrap();
+        let start = bytes
+            .windows(64)
+            .position(|window| window == &payload()[..64])
+            .unwrap();
+        bytes[start + 1000] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+        let mut damaged = payload();
+        damaged[1000] ^= 0xff;
+
+        let out = format!("kb-{version:?}/");
+        let output = unrars(&dir, &["x", "-kb", &name, &out]);
+        let errors = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "{version:?}: {errors}");
+        assert!(
+            errors.contains(&format!("{:<20} - checksum error", "mid.bin")),
+            "{version:?}: {errors}"
+        );
+        let text = stdout(&output);
+        assert!(text.contains("Total errors: 1"), "{version:?}: {text}");
+        let kept_line = format!(
+            "Extracting  {}\n",
+            Path::new(&out).join("mid.bin").display()
+        );
+        assert!(text.contains(&kept_line), "{version:?}: {text}");
+        assert!(fs::read(dir.join(&out).join("mid.bin")).unwrap() == damaged);
+        assert_eq!(fs::read(dir.join(&out).join("a.txt")).unwrap(), b"hello\n");
+        assert_eq!(fs::read(dir.join(&out).join("z.txt")).unwrap(), b"after\n");
+
+        let out = format!("plain-{version:?}/");
+        let output = unrars(&dir, &["x", &name, &out]);
+        assert_eq!(output.status.code(), Some(3), "{version:?}");
+        assert!(stderr(&output).contains("- checksum error"));
+        assert!(!dir.join(&out).join("mid.bin").exists(), "{version:?}");
+    }
+}
+
+/// Issue #365: `-kb` reads past a file header whose checksum fails, reports
+/// it as unrar does and extracts its member and the ones after it.
+#[test]
+fn kb_reads_past_a_damaged_file_header() {
+    let dir = scratch::case("unrars-kb-header");
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let name = format!("{version:?}.rar");
+        let path = dir.join(&name);
+        write_three(&path, version);
+        let mut bytes = fs::read(&path).unwrap();
+        let at = bytes.windows(7).position(|v| v == b"mid.bin").unwrap();
+        // Renames it to lid.bin, so the header fails its checksum.
+        bytes[at] ^= 0x01;
+        fs::write(&path, bytes).unwrap();
+
+        let out = format!("kb-{version:?}/");
+        let output = unrars(&dir, &["x", "-kb", &name, &out]);
+        let errors = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "{version:?}: {errors}");
+        assert!(
+            errors.contains("lid.bin - the file header is corrupt"),
+            "{version:?}: {errors}"
+        );
+        assert_eq!(
+            errors.contains("Corrupt header is found"),
+            version == ArchiveVersion::Rar50,
+            "{version:?}: {errors}"
+        );
+        assert!(stdout(&output).contains("Total errors: 2"), "{version:?}");
+        assert_eq!(fs::read(dir.join(&out).join("lid.bin")).unwrap(), payload());
+        assert_eq!(fs::read(dir.join(&out).join("z.txt")).unwrap(), b"after\n");
+    }
+}
+
 #[test]
 fn selects_members_by_mask_and_lists_bare_names() {
     let dir = scratch::case("unrars-masks");

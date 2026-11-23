@@ -6,12 +6,14 @@
 
 use crate::output::{restore_output_metadata, ExtractedOutput, OverwritePolicy};
 use crate::password::Password;
-use crate::{display_bytes_lossy, ExtractOutputState};
+use crate::{display_bytes_lossy, lock, ExtractOutputState, KeptBroken};
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ErrorKind};
 use std::cell::{Cell, RefCell};
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use zeroize::Zeroizing;
 
 // Exit codes, as unrar returns them.
@@ -86,7 +88,8 @@ struct Invocation {
     banner: bool,
     /// Off with `-idd`.
     done: bool,
-    /// `-kb`: keep a file whose checksum fails, written where it lands.
+    /// `-kb`: keep a damaged file with what could be read of it, written
+    /// where it lands, and read past damaged headers.
     keep_broken: bool,
     archive: PathBuf,
     masks: Vec<Vec<u8>>,
@@ -215,7 +218,7 @@ Switches
   -or     Rename extracted files that would overwrite
   -y      Overwrite existing files unless -o- was given
   -p<pwd> Use this password; -p- for none; -p alone to be asked
-  -kb     Keep files that fail their checksum
+  -kb     Keep broken extracted files
   -inul   No messages
   -idq    Errors only; -idc no banner; -idd no closing \"All OK\"
   --      End of switches
@@ -273,7 +276,8 @@ fn run(invocation: &Invocation) -> i32 {
         PasswordSwitch::Unset | PasswordSwitch::Never => None,
     };
     let may_ask = invocation.password == PasswordSwitch::Unset;
-    let archive = match open_archive(&path, &mut password, may_ask) {
+    let salvage = salvaging(invocation);
+    let archive = match open_archive(&path, &mut password, may_ask, salvage) {
         Ok(archive) => archive,
         Err(error) => return report_open_failure(out, &path, &error),
     };
@@ -318,15 +322,22 @@ fn prompt_password() -> Option<Password> {
     Some(Zeroizing::new(line.into_bytes()))
 }
 
+/// `-kb` reads past damage when extracting.
+fn salvaging(invocation: &Invocation) -> bool {
+    invocation.keep_broken && matches!(invocation.command, Command::Extract { .. })
+}
+
 fn open_archive(
     path: &Path,
     password: &mut Option<Password>,
     may_ask: bool,
+    salvage: bool,
 ) -> rars::Result<Archive> {
     let read = |password: &Option<Password>| {
         ArchiveReader::read_path_with_options(
             path,
-            ArchiveReadOptions::with_optional_password(password.as_deref().map(Vec::as_slice)),
+            ArchiveReadOptions::with_optional_password(password.as_deref().map(Vec::as_slice))
+                .with_salvage(salvage),
         )
     };
     match read(password) {
@@ -528,7 +539,8 @@ fn run_members(
     archive: &Archive,
     password: Option<&[u8]>,
 ) -> i32 {
-    let options = ArchiveReadOptions::with_optional_password(password);
+    let salvage = salvaging(invocation);
+    let options = ArchiveReadOptions::with_optional_password(password).with_salvage(salvage);
     let command = invocation.command;
     let announce = move |volume: &Path| match command {
         Command::Extract { .. } => out.info(&format!("\nExtracting from {}\n", volume.display())),
@@ -536,6 +548,8 @@ fn run_members(
         _ => {}
     };
     announce(path);
+    let header_errors = AtomicUsize::new(report_header_damage(out, archive));
+    let later_header_errors = &header_errors;
     let mut index = 1;
     // The first volume that ends early, of those after the first.
     let truncated = std::sync::Mutex::new(None);
@@ -549,8 +563,11 @@ fn run_members(
         announce(&next);
         let volume = ArchiveReader::read_path_with_options(
             &next,
-            ArchiveReadOptions::with_optional_password(password),
+            ArchiveReadOptions::with_optional_password(password).with_salvage(salvage),
         );
+        if let Ok(volume) = &volume {
+            later_header_errors.fetch_add(report_header_damage(out, volume), Ordering::Relaxed);
+        }
         if let Some(truncation) = volume.as_ref().ok().and_then(Archive::truncation) {
             if let Ok(mut truncated) = later_truncation.lock() {
                 truncated.get_or_insert_with(|| truncation.clone());
@@ -570,11 +587,17 @@ fn run_members(
             Extracted {
                 warnings,
                 all_kept: false,
+                errors: MemberErrors::default(),
             }
         }),
     };
+    let header_errors = header_errors.into_inner();
     let code = match result {
-        Ok(Extracted { warnings, all_kept }) => {
+        Ok(Extracted {
+            warnings,
+            all_kept,
+            errors,
+        }) => {
             if matched.get() == 0 || all_kept {
                 out.info("No files to extract");
                 return NO_FILES;
@@ -583,16 +606,23 @@ fn run_members(
                 .lock()
                 .ok()
                 .and_then(|mut truncated| truncated.take());
-            if report_truncation(out, archive.truncation().or(later.as_ref())) {
-                out.info("Total errors: 1");
-                WARNING
-            } else if warnings {
+            let truncated = report_truncation(out, archive.truncation().or(later.as_ref()));
+            let member_errors = errors.count.into_inner();
+            let total = header_errors + member_errors + usize::from(truncated);
+            if total > 0 {
+                out.info(&format!("Total errors: {total}"));
+            }
+            if member_errors > 0 {
+                errors.code.into_inner()
+            } else if header_errors > 0 {
+                CHECKSUM
+            } else if truncated || warnings {
                 WARNING
             } else {
                 OK
             }
         }
-        Err(error) => report_failure(out, archive, path, &error),
+        Err(error) => report_failure(out, archive, path, &error, header_errors),
     };
     if code == OK && invocation.done && command != Command::Print {
         out.info("All OK");
@@ -605,6 +635,27 @@ struct Extracted {
     warnings: bool,
     /// `-o-` kept every selected file that was already there, so nothing was written.
     all_kept: bool,
+    /// The members `-kb` went past.
+    errors: MemberErrors,
+}
+
+/// The members `-kb` reported and went past.
+#[derive(Default)]
+struct MemberErrors {
+    count: AtomicUsize,
+    /// The exit code of the first.
+    code: AtomicI32,
+}
+
+/// What `-kb` keeps: a member the library fails on after delivering its
+/// bytes keeps its output, and its error is reported once that is in place,
+/// after the file's line as unrar reports it.
+#[derive(Default)]
+struct KeepBroken {
+    kept: KeptBroken,
+    /// The error lines of kept members not yet in place, by member name.
+    pending: Mutex<Vec<(Vec<u8>, String)>>,
+    errors: MemberErrors,
 }
 
 fn extract<V>(
@@ -623,6 +674,8 @@ where
         Overwrite::Never | Overwrite::Ask => OverwritePolicy::Never,
         Overwrite::Rename => OverwritePolicy::Rename,
     };
+    let keep = KeepBroken::default();
+    let broken = &keep;
     let mut state = ExtractOutputState::new(
         &invocation.destination,
         policy,
@@ -638,20 +691,63 @@ where
         } else {
             "Extracting"
         };
-        out.info(&format!("{verb:<11} {:<57} OK", output.path.display()));
+        let pending = {
+            let mut pending = lock(&broken.pending);
+            pending
+                .iter()
+                .position(|(name, _)| *name == output.meta.name)
+                .map(|index| pending.remove(index).1)
+        };
+        match pending {
+            Some(line) => {
+                out.info(&format!("{verb:<11} {}", output.path.display()));
+                out.error(&line);
+            }
+            None => out.info(&format!("{verb:<11} {:<57} OK", output.path.display())),
+        }
     }));
+    let keep_broken = invocation.keep_broken;
+    // Goes past a damaged member, keeping what was read of it.
+    let handler = |member: &rars::ArchiveMember, error: &rars::Error| {
+        if matches!(error.kind(), ErrorKind::BadPassword | ErrorKind::Io) {
+            return Ok(rars::ExtractionErrorAction::Abort);
+        }
+        let (line, code) = member_error_line(&display_name(&member.meta.name), error);
+        let errors = &broken.errors;
+        let _ = errors
+            .code
+            .compare_exchange(OK, code, Ordering::Relaxed, Ordering::Relaxed);
+        errors.count.fetch_add(1, Ordering::Relaxed);
+        if broken.kept.keep(&member.meta.name) {
+            lock(&broken.pending).push((member.meta.name.clone(), line));
+        } else {
+            out.error(&line);
+        }
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let options = if keep_broken {
+        options.with_member_error_handler(&handler)
+    } else {
+        options
+    };
     let state = RefCell::new(state);
     let result = rars::output_links::extract_arriving_with_links(
         archive,
         volumes,
         options,
         |meta| {
-            state
-                .borrow_mut()
-                .open_entry(meta)
-                .map(|writer| writer as Box<dyn Write>)
+            let mut state = state.borrow_mut();
+            let opened = if keep_broken {
+                broken.kept.open(&mut state, meta)
+            } else {
+                state.open_entry(meta)
+            };
+            opened.map(|writer| writer as Box<dyn Write>)
         },
-        |meta, link| state.borrow_mut().create_link(meta, link),
+        |meta, link| {
+            broken.kept.close();
+            state.borrow_mut().create_link(meta, link)
+        },
     );
     if let Err(error) = result {
         let _ = state.borrow_mut().publish_before_failure(&error);
@@ -665,6 +761,7 @@ where
     Ok(Extracted {
         warnings: skipped_links > 0,
         all_kept: kept > 0 && outputs.iter().all(|output| output.meta.is_directory),
+        errors: keep.errors,
     })
 }
 
@@ -743,33 +840,80 @@ fn report_truncation(out: Out, truncation: Option<&rars::Truncation>) -> bool {
     true
 }
 
-fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error) -> i32 {
+/// Reports a failure that ended the run. `earlier` errors were reported before it.
+fn report_failure(
+    out: Out,
+    archive: &Archive,
+    path: &Path,
+    error: &rars::Error,
+    earlier: usize,
+) -> i32 {
+    let total = earlier + 1;
     let member = rars::output_staging::failed_entry_name(error).map(display_name);
     if let Some(index) = missing_volume(error) {
         let name = archive
             .volume_path(path, index)
             .unwrap_or_else(|| path.to_path_buf());
         out.error(&format!("Cannot find volume {}", name.display()));
-        out.info("Total errors: 1");
+        out.info(&format!("Total errors: {total}"));
         return MISSING_VOLUME;
     }
     let member = member.unwrap_or_else(|| path.display().to_string());
-    let code = match error.kind() {
+    let (line, code) = member_error_line(&member, error);
+    out.error(&line);
+    out.info(&format!("Total errors: {total}"));
+    code
+}
+
+/// What unrar says about a member it failed on, and the exit code it gives.
+fn member_error_line(member: &str, error: &rars::Error) -> (String, i32) {
+    match error.kind() {
         ErrorKind::ChecksumMismatch | ErrorKind::InvalidArchive => {
-            out.error(&format!("{member:<20} - checksum error"));
-            CHECKSUM
+            (format!("{member:<20} - checksum error"), CHECKSUM)
         }
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
-            out.error(&format!("Incorrect password for {member}"));
-            BAD_PASSWORD
+            (format!("Incorrect password for {member}"), BAD_PASSWORD)
         }
-        _ => {
-            out.error(&format!("ERROR: {error}"));
-            FATAL
+        _ => (format!("ERROR: {error}"), FATAL),
+    }
+}
+
+/// Reports the damaged headers `-kb` read past as unrar does, returning the
+/// errors unrar would count for them.
+fn report_header_damage(out: Out, archive: &Archive) -> usize {
+    let mut errors = 0;
+    for damage in archive.header_damage() {
+        let Some(name) = header_member(archive, damage.offset) else {
+            out.error("Corrupt header is found");
+            errors += 1;
+            continue;
+        };
+        if archive.family() == rars::ArchiveFamily::Rar50Plus {
+            out.error("Corrupt header is found");
         }
-    };
-    out.info("Total errors: 1");
-    code
+        out.error(&format!(
+            "{} - the file header is corrupt",
+            display_name(name)
+        ));
+        // unrar counts a damaged file header as two errors.
+        errors += 2;
+    }
+    errors
+}
+
+/// The name of the file whose header is at `offset`.
+fn header_member(archive: &Archive, offset: u64) -> Option<&[u8]> {
+    match archive {
+        Archive::Rar15To40(archive) => archive
+            .files()
+            .find(|file| file.block.offset as u64 == offset)
+            .map(|file| file.name.as_slice()),
+        Archive::Rar50Plus(archive) => archive
+            .files()
+            .find(|file| file.block.offset as u64 == offset)
+            .map(|file| file.name.as_slice()),
+        _ => None,
+    }
 }
 
 fn missing_volume(error: &rars::Error) -> Option<usize> {

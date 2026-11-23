@@ -103,6 +103,9 @@ pub(crate) struct ReadOptionsArgs {
     /// of CPU time. Enable only for archives you trust.
     #[arg(long)]
     pub allow_rar3_vm: bool,
+    /// Read past damage instead of refusing it: set by `x --keep-broken`.
+    #[arg(skip)]
+    pub salvage: bool,
 }
 
 impl ReadOptionsArgs {
@@ -138,7 +141,9 @@ impl ReadOptionsArgs {
         options.rar50_decode_workers = self.rar50_decode_workers;
         options.rar50_scratch = scratch;
         options.allow_rar3_vm_programs = self.allow_rar3_vm;
-        options.with_member_error_handler(&stop_at_damaged_member)
+        options
+            .with_salvage(self.salvage)
+            .with_member_error_handler(&stop_at_damaged_member)
     }
 }
 
@@ -190,6 +195,9 @@ pub(crate) struct ExtractArgs {
     /// Write each file at its destination instead of staging it; a failed member leaves a partial file
     #[arg(long)]
     pub in_place: bool,
+    /// Keep a damaged member's file with what could be read of it, like unrar -kb; implies --in-place
+    #[arg(long)]
+    pub keep_broken: bool,
     /// Write every file straight into the output directory under its base name, creating no directories
     #[arg(long)]
     pub flatten: bool,
