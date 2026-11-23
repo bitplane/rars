@@ -110,6 +110,29 @@ pub struct MainHeader {
 }
 
 impl MainHeader {
+    /// Stands in for a main header a salvaging parse couldn't read, at file
+    /// offset `offset`: a plain archive, not a volume, with no records.
+    fn lost(offset: usize) -> Self {
+        Self {
+            block: BlockHeader {
+                header_crc: 0,
+                header_size: 0,
+                header_type: HEAD_MAIN,
+                flags: 0,
+                extra_area_size: None,
+                data_size: None,
+                offset,
+                header_range: 0..0,
+                data_range: offset..offset,
+            },
+            archive_flags: 0,
+            volume_number: None,
+            extras: Vec::new(),
+            encrypted_headers: false,
+            rewrite_metadata_complete: false,
+        }
+    }
+
     pub fn is_volume(&self) -> bool {
         self.archive_flags & MHFL_VOLUME != 0
     }
@@ -240,6 +263,9 @@ pub struct FileHeader {
     crypto: Option<FileCryptoState>,
     /// Set by a salvaging parse on a member the file ends partway through.
     pub(crate) cut_short: bool,
+    /// Set by a salvaging parse on a solid member after members of its
+    /// stream were lost to header damage.
+    pub(crate) history_lost: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -716,7 +742,7 @@ impl Archive {
                     data_limit,
                 )
             },
-            |offset| Ok(input[offset..archive_len.min(offset + CUT_HEADER_PEEK)].to_vec()),
+            |offset, len| Ok(input[offset..archive_len.min(offset + len)].to_vec()),
         )?;
 
         options.check_cancelled()?;
@@ -792,8 +818,8 @@ impl Archive {
                     data_limit,
                 )
             },
-            |offset| {
-                let len = archive_len.saturating_sub(offset).min(CUT_HEADER_PEEK);
+            |offset, len| {
+                let len = archive_len.saturating_sub(offset).min(len);
                 read_exact_at(&mut *file_cell.borrow_mut(), sfx_offset + offset, len)
             },
         )?;
@@ -1877,6 +1903,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
     let name = reader.read_bytes(name_len)?.to_vec();
     let mut file = FileHeader {
         cut_short: false,
+        history_lost: false,
         block: parsed.block.clone(),
         file_flags,
         rewrite_metadata_complete: reader.pos == reader.range.end,
@@ -2514,12 +2541,12 @@ fn parse_archive_blocks<F, G, H>(
     key_cache: &KeyCache,
     mut read_block: F,
     mut read_encrypted_block: G,
-    mut peek: H,
+    mut read: H,
 ) -> Result<ParsedArchive>
 where
     F: FnMut(usize, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
     G: FnMut(usize, &Rar50Keys, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
-    H: FnMut(usize) -> Result<Vec<u8>>,
+    H: FnMut(usize, usize) -> Result<Vec<u8>>,
 {
     options.check_cancelled()?;
     // Budget refusals already identify the header; do not duplicate its context.
@@ -2529,34 +2556,84 @@ where
     };
     let password = options.password;
     let mut budget = crate::parse_budget::ParseBudget::new(options);
+    let mut salvage = Salvage::new(archive_len);
     let mut pos = RAR50_SIGNATURE.len();
-    let first = read_block(pos, &mut budget).map_err(|error| at_offset(error, pos))?;
-    let (header_keys, header_metadata_complete) = if first.block.header_type == HEAD_CRYPT {
-        pos = first.next_offset;
-        let (keys, complete) = parse_archive_encryption_header(&first, password, key_cache)?;
-        (Some(keys), complete)
-    } else {
-        (None, true)
-    };
-
     let main_pos = pos;
-    let main_block;
-    let first = if let Some(keys) = &header_keys {
-        main_block =
-            read_encrypted_block(pos, keys, &mut budget).map_err(|error| at_offset(error, pos))?;
-        &main_block
-    } else {
-        &first
+    let first = match read_block(pos, &mut budget) {
+        // Salvage reads on past a plaintext main header that is lost.
+        Err(error) if options.salvage && error.kind() == crate::ErrorKind::InvalidArchive => {
+            Err(crate::header_damage::record_reason(&error))
+        }
+        Ok(first)
+            if options.salvage && !matches!(first.block.header_type, HEAD_MAIN | HEAD_CRYPT) =>
+        {
+            Err("it is not a main header")
+        }
+        first => Ok(first.map_err(|error| at_offset(error, pos))?),
     };
-    if first.block.header_type != HEAD_MAIN {
-        return Err(Error::InvalidHeader("RAR 5 main header is missing"));
-    }
-    let mut main = parse_main_header_bytes(first).map_err(|error| at_offset(error, main_pos))?;
-    main.encrypted_headers = header_keys.is_some();
-    main.rewrite_metadata_complete &= header_metadata_complete;
-    if first.next_offset > archive_len {
-        return Err(at_offset(Error::TooShort, main_pos));
-    }
+    let (mut main, header_keys, main_end) = match first {
+        Ok(first) => {
+            let (header_keys, header_metadata_complete) = if first.block.header_type == HEAD_CRYPT {
+                pos = first.next_offset;
+                let (keys, complete) =
+                    parse_archive_encryption_header(&first, password, key_cache)?;
+                (Some(keys), complete)
+            } else {
+                (None, true)
+            };
+            let main_block;
+            let first = if let Some(keys) = &header_keys {
+                main_block = read_encrypted_block(pos, keys, &mut budget)
+                    .map_err(|error| at_offset(error, pos))?;
+                &main_block
+            } else {
+                &first
+            };
+            if first.block.header_type != HEAD_MAIN {
+                return Err(Error::InvalidHeader("RAR 5 main header is missing"));
+            }
+            let mut main = parse_main_header_bytes(first).map_err(|error| at_offset(error, pos))?;
+            main.encrypted_headers = header_keys.is_some();
+            main.rewrite_metadata_complete &= header_metadata_complete;
+            if first.next_offset > archive_len {
+                return Err(at_offset(Error::TooShort, pos));
+            }
+            pos = first.next_offset;
+            (main, header_keys, pos)
+        }
+        Err(reason) => {
+            // Nothing in it is known: the archive is read as a plain one.
+            salvage.lost = true;
+            salvage.start_lost = true;
+            let found = salvage.resume(
+                pos,
+                reason,
+                archive_len,
+                sfx_offset,
+                &mut Vec::new(),
+                &budget,
+                &mut read,
+            )?;
+            match found {
+                Some((next, _)) => pos = next,
+                None => {
+                    budget.control.report_damage(
+                        sfx_offset + pos,
+                        crate::HeaderDamageKind::Unreadable { reason },
+                    );
+                    pos = archive_len;
+                }
+            }
+            // Members may start anywhere after the lost header.
+            (MainHeader::lost(sfx_offset + main_pos), None, main_pos + 1)
+        }
+    };
+    let main_pos = if header_keys.is_some() {
+        // The main header follows the encryption header.
+        main.block.offset - sfx_offset
+    } else {
+        main_pos
+    };
     // Where the locator says the quick-open and recovery blocks start, when
     // that is at or past the end of the file.
     let located_past_end = |offset: Option<u64>| {
@@ -2570,7 +2647,6 @@ where
             located_past_end(locator.recovery_record_offset),
         )
     });
-    pos = first.next_offset;
 
     let mut blocks = Vec::new();
     let mut truncation = None;
@@ -2578,6 +2654,29 @@ where
     // header error found later still loses to an earlier member's key error.
     let mut crypto_headers = Vec::new();
     let walked = (|| {
+        // Under salvage, the next header that checks out after damage at
+        // `pos`, if there is one, and where the damage began.
+        macro_rules! resume {
+            ($pos:expr, $reason:expr) => {
+                if options.salvage && header_keys.is_none() {
+                    let found = salvage.resume(
+                        $pos,
+                        $reason,
+                        archive_len,
+                        sfx_offset,
+                        &mut blocks,
+                        &budget,
+                        &mut read,
+                    )?;
+                    if found.is_some() {
+                        crypto_headers.retain(|&(index, _)| index < blocks.len());
+                    }
+                    found
+                } else {
+                    None
+                }
+            };
+        }
         while pos < archive_len {
             let parsed = if let Some(keys) = &header_keys {
                 read_encrypted_block(pos, keys, &mut budget)
@@ -2585,20 +2684,29 @@ where
                 read_block(pos, &mut budget)
             };
             let parsed = match parsed {
-                // Salvage ends the walk at a plaintext header that doesn't
-                // parse, keeping the members before it.
+                // Salvage resyncs past a plaintext header that doesn't
+                // parse, or ends the walk there, keeping the members before
+                // it.
                 Err(error) if header_keys.is_none() && salvage_stops(&options, &error) => {
+                    let reason = crate::header_damage::record_reason(&error);
+                    if let Some((next, _)) = resume!(pos, reason) {
+                        pos = next;
+                        continue;
+                    }
+                    salvage.lost = true;
                     budget.control.report_damage(
                         sfx_offset + pos,
-                        crate::HeaderDamageKind::Unreadable {
-                            reason: crate::header_damage::record_reason(&error),
-                        },
+                        crate::HeaderDamageKind::Unreadable { reason },
                     );
                     break;
                 }
                 // Only plaintext headers can be read when cut short.
                 Err(Error::TooShort) if header_keys.is_none() => {
-                    let rest = peek(pos).map_err(|error| at_offset(error, pos))?;
+                    let rest = read(pos, CUT_HEADER_PEEK).map_err(|error| at_offset(error, pos))?;
+                    if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                        pos = next;
+                        continue;
+                    }
                     match cut_header_block(&rest, archive_len - pos) {
                         // A file header: its member is lost.
                         Some(TruncatedBlock::Member(_)) if !options.salvages() => {
@@ -2609,10 +2717,11 @@ where
                             break;
                         }
                         None if options.salvage => {
+                            salvage.lost = true;
                             budget.control.report_damage(
                                 sfx_offset + pos,
                                 crate::HeaderDamageKind::Unreadable {
-                                    reason: "the header's sizes run past the end of the file",
+                                    reason: SIZES_PAST_END,
                                 },
                             );
                             break;
@@ -2622,8 +2731,37 @@ where
                 }
                 parsed => parsed.map_err(|error| at_offset(error, pos))?,
             };
+            let known = matches!(
+                parsed.block.header_type,
+                HEAD_FILE | HEAD_SERVICE | HEAD_END
+            );
+            if let Some(reason) = salvage.read_header(pos, parsed.damaged, known) {
+                if let Some((next, _)) = resume!(pos, reason) {
+                    pos = next;
+                    continue;
+                }
+            }
             let next = parsed.next_offset;
             if next > archive_len {
+                if salvage.suspect.is_some() {
+                    // A damaged header whose sizes run past the end: if a
+                    // header follows, its member's data ends there.
+                    if let Some((next, start)) = resume!(pos, SIZES_PAST_END) {
+                        let data_start = parsed.block.data_range.start;
+                        if start == pos
+                            && parsed.block.header_type == HEAD_FILE
+                            && sfx_offset + next > data_start
+                        {
+                            if let Ok(mut file) = parse_file_header_bytes(&parsed) {
+                                file.block.data_range.end = sfx_offset + next;
+                                crypto_headers.push((blocks.len(), pos));
+                                blocks.push(Block::File(file));
+                            }
+                        }
+                        pos = next;
+                        continue;
+                    }
+                }
                 // The header is whole but its data is cut. A recovery record or
                 // other service block isn't needed to read the members before it.
                 let block = match parsed.block.header_type {
@@ -2651,6 +2789,7 @@ where
                         Ok(file) => TruncatedBlock::Member(file.name),
                         // A damaged header whose fields run on into its data.
                         Err(error) if options.salvage => {
+                            salvage.lost = true;
                             parsed.control.report_damage(
                                 sfx_offset + pos,
                                 crate::HeaderDamageKind::Unreadable {
@@ -2688,10 +2827,16 @@ where
                     if let Some(file) = file_header(&parsed)? {
                         crypto_headers.push((blocks.len(), pos));
                         blocks.push(Block::File(file));
+                    } else {
+                        salvage.lost = true;
                     }
                 }
                 HEAD_SERVICE => {
                     let Some(service) = file_header(&parsed)? else {
+                        // No member is lost with it.
+                        salvage
+                            .passed
+                            .push(parsed.block.offset..parsed.block.data_range.end);
                         pos = next;
                         continue;
                     };
@@ -2761,7 +2906,402 @@ where
         matches!(block, Block::Service(service) if matches!(&service.name[..], b"QO" | b"RR"))
     });
     let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), past_trailing_block));
+    if options.salvage && header_keys.is_none() {
+        if salvage.lost {
+            let found = quick_open_members(
+                &blocks,
+                &main,
+                main_pos,
+                main_end,
+                archive_len,
+                sfx_offset,
+                &budget,
+                &mut read,
+            )?;
+            if !found.is_empty() {
+                let mut found: Vec<Block> = found.into_iter().map(Block::File).collect();
+                let crypto: Vec<_> = (0..found.len())
+                    .map(|index| (index, block_span(&found[index]).start - sfx_offset))
+                    .collect();
+                attach_crypto(&mut found, &crypto, options, key_cache)?;
+                blocks.extend(found);
+                blocks.sort_by_key(|block| block_span(block).start);
+            }
+        }
+        salvage.mark_history(&mut blocks, sfx_offset + main_end);
+    }
     Ok((main, blocks, truncation, budget.control.take_damage()))
+}
+
+/// Why a salvaging walk resynced: a header whose sizes run past the file.
+const SIZES_PAST_END: &str = "the header's sizes run past the end of the file";
+/// Why a salvaging walk resynced: a header of no type a walk reads, which
+/// fails its checksum, is taken for no header at all.
+const UNKNOWN_DAMAGED: &str = "it fails its checksum and its type is unknown";
+/// Why a salvaging walk resynced: the header fails its checksum, as do the
+/// ones just before it.
+const DAMAGED_RUN: &str = "it fails its checksum, as do the headers before it";
+/// How many headers in a row a salvaging walk reads as stored when their
+/// checksums fail.
+const MAX_DAMAGED_RUN: usize = 3;
+
+/// Where a block's header starts and its data ends, in the file.
+fn block_span(block: &Block) -> Range<usize> {
+    let block = match block {
+        Block::File(file) | Block::Service(file) => &file.block,
+        Block::End(end) => &end.block,
+        Block::Unknown(block) => block,
+    };
+    block.offset..block.data_range.end.max(block.offset)
+}
+
+/// What a salvaging walk keeps to resync past a header that doesn't parse.
+struct Salvage {
+    resync: crate::resync::ResyncBudget,
+    /// The first of the blocks just read whose header failed its checksum,
+    /// by offset from the archive's start. Its sizes may be wrong, and so may
+    /// everything the walk read after it.
+    suspect: Option<usize>,
+    /// How many headers in a row failed their checksums.
+    run: usize,
+    /// Whether any member may have been lost.
+    lost: bool,
+    /// Whether the main header was lost, so members before the first block
+    /// found may have been too.
+    start_lost: bool,
+    /// Blocks passed over that hold no member, in the file.
+    passed: Vec<Range<usize>>,
+}
+
+impl Salvage {
+    fn new(archive_len: usize) -> Self {
+        Self {
+            resync: crate::resync::ResyncBudget::new(archive_len),
+            suspect: None,
+            run: 0,
+            lost: false,
+            start_lost: false,
+            passed: Vec::new(),
+        }
+    }
+
+    /// Notes a block header just read at `pos`, and whether its checksum
+    /// failed. Returns the reason to resync instead of reading it as stored:
+    /// it is of no type the walk reads, or too many damaged headers came in
+    /// a row. The walk got to those by the sizes of a damaged one, and
+    /// following them on would let a crafted file send it through the same
+    /// bytes again after every resync.
+    fn read_header(&mut self, pos: usize, damaged: bool, known: bool) -> Option<&'static str> {
+        if !damaged {
+            self.suspect = None;
+            self.run = 0;
+            return None;
+        }
+        if self.suspect.is_none() {
+            self.suspect = Some(pos);
+        }
+        self.run += 1;
+        if !known {
+            Some(UNKNOWN_DAMAGED)
+        } else if self.run > MAX_DAMAGED_RUN {
+            Some(DAMAGED_RUN)
+        } else {
+            None
+        }
+    }
+
+    /// Where the walk carries on after the header at `pos` failed with
+    /// `reason`: the next header after it that checks out, or after the first
+    /// damaged header of the run that led here, if one did. Blocks read since
+    /// that one are dropped, with what they reported, as the walk only got to
+    /// them by its sizes. Returns the header found and where the damage
+    /// began; `None` when no header is found, and then nothing is changed.
+    ///
+    /// `pos` and the result are relative to `archive_offset`, where the
+    /// archive starts in the file, and `archive_len` is its length from there.
+    #[allow(clippy::too_many_arguments)]
+    fn resume(
+        &mut self,
+        pos: usize,
+        reason: &'static str,
+        archive_len: usize,
+        archive_offset: usize,
+        blocks: &mut Vec<Block>,
+        budget: &crate::parse_budget::ParseBudget,
+        read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
+    ) -> Result<Option<(usize, usize)>> {
+        let start = self.suspect.unwrap_or(pos);
+        let Some(next) = crate::resync::scan(
+            start + 1,
+            archive_len,
+            &mut self.resync,
+            &budget.control,
+            read,
+            &|prefix, left| resync_probe(prefix, left),
+            &mut |at, header| resync_confirm(at, header, archive_len, archive_offset, budget),
+        )?
+        else {
+            return Ok(None);
+        };
+        if self.suspect.is_some() {
+            blocks.retain(|block| block_span(block).start <= archive_offset + start);
+            budget
+                .control
+                .retract_damage(archive_offset + start + 1..archive_offset + pos + 1);
+        }
+        budget.control.report_damage(
+            archive_offset + start,
+            crate::HeaderDamageKind::Resynced {
+                reason,
+                next: (archive_offset + next) as u64,
+            },
+        );
+        self.suspect = None;
+        self.run = 0;
+        self.lost = true;
+        Ok(Some((next, start)))
+    }
+
+    /// Marks each solid member whose stream lost an earlier member: one
+    /// after a gap between the blocks read, until a member that starts a
+    /// fresh stream. `first` is where the first block after the main header
+    /// is due.
+    fn mark_history(&self, blocks: &mut [Block], first: usize) {
+        let mut spans: Vec<(Range<usize>, Option<usize>)> = blocks
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block_span(block), Some(index)))
+            .chain(self.passed.iter().map(|span| (span.clone(), None)))
+            .collect();
+        spans.sort_by_key(|(span, _)| span.start);
+        let mut due = first;
+        let mut broken = self.start_lost;
+        for (span, index) in spans {
+            // A block that starts inside the one before was over-read by a
+            // damaged size; only a gap can hide a lost member.
+            broken |= span.start > due;
+            due = span.end;
+            let Some(Block::File(file)) = index.map(|index| &mut blocks[index]) else {
+                continue;
+            };
+            if file.is_stored() {
+                continue;
+            }
+            if file.compression_info & 0x40 != 0 {
+                file.history_lost = broken;
+            } else {
+                broken = false;
+            }
+        }
+    }
+}
+
+/// Whether the bytes at an offset, `prefix`, with `left` bytes to the end of
+/// the archive, may start a header a resync can take: a file, service or end
+/// block whose header fits. Returns the header's size.
+fn resync_probe(prefix: &[u8], left: usize) -> Option<usize> {
+    // The format keeps the size to three bytes: headers are at most 2 MiB.
+    let (size, size_len) = read_vint_at(prefix, 4, prefix.len().min(7)).ok()?;
+    let total = 4 + size_len + usize::try_from(size).ok()?;
+    let header_type = u64::from(*prefix.get(4 + size_len)?);
+    let flags = *prefix.get(5 + size_len)?;
+    (size >= 2
+        && total <= left
+        && matches!(header_type, HEAD_FILE | HEAD_SERVICE | HEAD_END)
+        && flags & 0x80 == 0)
+        .then_some(total)
+}
+
+/// Whether `header`, the bytes of a candidate at `at`, is a header a resync
+/// can take: its checksum matches, its fields parse, its data ends inside the
+/// archive's `archive_len` bytes, and the reader's header limits allow it.
+fn resync_confirm(
+    at: usize,
+    header: Vec<u8>,
+    archive_len: usize,
+    sfx_offset: usize,
+    budget: &crate::parse_budget::ParseBudget,
+) -> Result<bool> {
+    if !budget.would_admit(header.len()) {
+        return Ok(false);
+    }
+    let parsed = parse_strict_header_image(header, at, archive_len, sfx_offset)?;
+    match parsed.block.header_type {
+        HEAD_FILE | HEAD_SERVICE => parse_file_header_bytes(&parsed).map(|_| true),
+        HEAD_END => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+/// A plaintext block header at `at` from its bytes, checksum and all,
+/// whatever the read options: salvage reads damaged headers as stored, and
+/// headers found past damage have to be whole. Its data must end inside the
+/// archive's `archive_len` bytes.
+fn parse_strict_header_image(
+    header: Vec<u8>,
+    at: usize,
+    archive_len: usize,
+    sfx_offset: usize,
+) -> Result<ParsedBlockHeader> {
+    let crc = u32::from_le_bytes(
+        header
+            .get(..4)
+            .ok_or(Error::TooShort)?
+            .try_into()
+            .expect("four bytes"),
+    );
+    let (size, size_len) = read_vint_at(&header, 4, header.len())?;
+    if Some(header.len()) != usize::try_from(size).ok().map(|size| 4 + size_len + size) {
+        return Err(Error::InvalidHeader("RAR 5 header size doesn't match"));
+    }
+    let total = header.len();
+    parse_block_header_image(
+        header,
+        at,
+        archive_len,
+        sfx_offset,
+        HeaderPrefix {
+            crc,
+            size,
+            size_len,
+            plaintext: true,
+        },
+        total,
+        &crate::read_control::ReadControl::default(),
+    )
+}
+
+/// The members a salvaging parse can still read from the quick-open block's
+/// copies of their headers, when the walk lost some: those whose block
+/// neither overlaps a block the walk read nor is split across volumes. Each
+/// copy is checked as a header found by a resync is, and each one taken is
+/// reported as [`crate::HeaderDamageKind::QuickOpenCopy`].
+///
+/// The quick-open block is the one the walk read, or else the one the main
+/// header's locator points to. Its records are read one at a time, and each
+/// must pass its own checksum.
+#[allow(clippy::too_many_arguments)]
+fn quick_open_members(
+    blocks: &[Block],
+    main: &MainHeader,
+    main_pos: usize,
+    main_end: usize,
+    archive_len: usize,
+    sfx_offset: usize,
+    budget: &crate::parse_budget::ParseBudget,
+    read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
+) -> Result<Vec<FileHeader>> {
+    let walked = blocks.iter().find_map(|block| match block {
+        Block::Service(service) if service.name == b"QO" => Some(service.block.clone()),
+        _ => None,
+    });
+    let mut located = || -> Result<Option<BlockHeader>> {
+        let Some(offset) = main.locator().and_then(|locator| locator.quick_open_offset) else {
+            return Ok(None);
+        };
+        let Some(at) = usize::try_from(offset)
+            .ok()
+            .and_then(|offset| main_pos.checked_add(offset))
+            .filter(|&at| at >= main_end && at < archive_len)
+        else {
+            return Ok(None);
+        };
+        let prefix = read(at, crate::resync::PROBE_LEN.min(archive_len - at))?;
+        let Some(len) = resync_probe(&prefix, archive_len - at) else {
+            return Ok(None);
+        };
+        if !budget.would_admit(len) {
+            return Ok(None);
+        }
+        let Ok(parsed) = parse_strict_header_image(read(at, len)?, at, archive_len, sfx_offset)
+        else {
+            return Ok(None);
+        };
+        Ok(match parse_file_header_bytes(&parsed) {
+            Ok(service) if parsed.block.header_type == HEAD_SERVICE && service.name == b"QO" => {
+                Some(service.block)
+            }
+            _ => None,
+        })
+    };
+    let Some(quick_open) = (match walked {
+        Some(block) => Some(block),
+        None => located()?,
+    }) else {
+        return Ok(Vec::new());
+    };
+
+    let quick_open_at = quick_open.offset - sfx_offset;
+    let mut taken: Vec<Range<usize>> = blocks.iter().map(block_span).collect();
+    let mut found = Vec::new();
+    let mut at = quick_open.data_range.start - sfx_offset;
+    let end = quick_open.data_range.end - sfx_offset;
+    while at < end {
+        budget.control.check()?;
+        // CRC32, then the size of the rest, which holds three small vints and
+        // a header of at most 2 MiB.
+        let prefix = read(at, (end - at).min(14))?;
+        let Ok((size, size_len)) = read_vint_at(&prefix, 4, prefix.len()) else {
+            break;
+        };
+        let Some(record_len) = usize::try_from(size)
+            .ok()
+            .map(|size| 4 + size_len + size)
+            .filter(|&len| len <= end - at && len <= (2 << 20) + 64)
+        else {
+            break;
+        };
+        let record_at = at;
+        at += record_len;
+        if !budget.would_admit(record_len) {
+            continue;
+        }
+        let record = read(record_at, record_len)?;
+        let crc = u32::from_le_bytes(record[..4].try_into().expect("four bytes"));
+        if crc32(&record[4..]) != crc {
+            continue;
+        }
+        let mut reader = SliceReader::new(&record, 4 + size_len, record_len);
+        let cached = (|| {
+            let _flags = reader.read_vint()?;
+            let distance = reader.read_vint()?;
+            let len = usize_from_u64(reader.read_vint()?, "RAR 5 quick-open record overflows")?;
+            let header = reader.read_bytes(len)?.to_vec();
+            let header_at = usize::try_from(distance)
+                .ok()
+                .and_then(|distance| quick_open_at.checked_sub(distance))
+                .filter(|&header_at| header_at >= main_end)
+                .ok_or(Error::InvalidHeader(
+                    "RAR 5 quick-open record points outside the archive",
+                ))?;
+            let parsed = parse_strict_header_image(header, header_at, archive_len, sfx_offset)?;
+            if parsed.block.header_type != HEAD_FILE {
+                return Ok(None);
+            }
+            parse_file_header_bytes(&parsed).map(Some)
+        })();
+        let Ok(Some(file)) = cached else {
+            continue;
+        };
+        let span = file.block.offset..file.block.data_range.end;
+        if file.is_split_before()
+            || file.is_split_after()
+            || taken
+                .iter()
+                .any(|taken| taken.start < span.end && span.start < taken.end)
+        {
+            continue;
+        }
+        budget.control.report_damage(
+            file.block.offset,
+            crate::HeaderDamageKind::QuickOpenCopy {
+                name: file.name.clone(),
+            },
+        );
+        taken.push(span);
+        found.push(file);
+    }
+    Ok(found)
 }
 
 /// Whether a salvaging parse passes over a header whose block was read
@@ -2898,6 +3438,8 @@ where
 
 struct ParsedBlockHeader {
     control: crate::read_control::ReadControl,
+    /// Whether the header failed its checksum and was read as stored.
+    damaged: bool,
     block: BlockHeader,
     header: Vec<u8>,
     type_specific_range: Range<usize>,
@@ -3248,11 +3790,13 @@ fn parse_block_header_image(
     let header_total = header.len();
     // All four callers decoded this same immutable size prefix before reading
     // or decrypting the complete header image.
+    let mut damaged = false;
     match validate_block_header_crc(&header, prefix.crc) {
         // Salvage reads the header as stored, and the walk stops if it
         // doesn't parse.
         // An encrypted header that fails is more likely a wrong password.
         Err(Error::Crc32Mismatch { expected, actual }) if prefix.plaintext && control.salvage() => {
+            damaged = true;
             control.report_damage(
                 sfx_offset + offset,
                 crate::HeaderDamageKind::Checksum { expected, actual },
@@ -3302,6 +3846,7 @@ fn parse_block_header_image(
 
     Ok(ParsedBlockHeader {
         control: control.clone(),
+        damaged,
         block: BlockHeader {
             header_crc: prefix.crc,
             header_size: prefix.size,
@@ -5551,6 +6096,7 @@ mod tests {
     fn file_header_name_bytes_preserve_non_utf8_names() {
         let file = FileHeader {
             cut_short: false,
+            history_lost: false,
             block: BlockHeader {
                 header_crc: 0,
                 header_size: 0,

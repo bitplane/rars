@@ -88,6 +88,8 @@ pub struct Entry {
     pub name: Vec<u8>,
     pub extra: Vec<u8>,
     pub packed_range: Range<usize>,
+    /// Set by a salvaging parse on a member the file ends partway through.
+    pub(crate) cut_short: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -230,6 +232,12 @@ fn cut_member(rest: &[u8], offset: usize) -> Truncation {
     )
 }
 
+/// Whether a salvaging parse keeps a member the file ends partway through,
+/// to decode as far as it goes: one that isn't split across volumes.
+fn salvages_cut_member(options: &crate::ArchiveReadOptions<'_>, entry: &Entry) -> bool {
+    options.salvage && !entry.is_split_before() && !entry.is_split_after()
+}
+
 /// The bytes before the first NUL.
 fn c_string(bytes: &[u8]) -> &[u8] {
     bytes.split(|&byte| byte == 0).next().unwrap_or_default()
@@ -307,6 +315,7 @@ impl<B: Budget> Decoder15<B> {
         input: &mut impl Read,
         output_size: usize,
         solid: bool,
+        input_cut: bool,
         out: &mut impl Write,
     ) -> crate::codec::Result<()> {
         self.read_control.check_codec()?;
@@ -315,6 +324,7 @@ impl<B: Budget> Decoder15<B> {
         }
         let state = self.state.as_mut().expect("decoder initialized above");
         state.read_control = self.read_control.clone();
+        state.input_cut = input_cut;
         state.decode_member_from_reader(input, output_size, solid, out)
     }
 }
@@ -450,6 +460,16 @@ impl Archive {
             if data_end > archive.len() {
                 if options.salvages() {
                     truncation = Some(cut_member(&archive[pos..], sig.offset + pos));
+                    let entry = Entry {
+                        header,
+                        name,
+                        extra,
+                        packed_range: sig.offset + data_start..sig.offset + archive.len(),
+                        cut_short: true,
+                    };
+                    if salvages_cut_member(&options, &entry) {
+                        entries.push(entry);
+                    }
                     break;
                 }
                 return Err(Error::TooShort);
@@ -460,6 +480,7 @@ impl Archive {
                 name,
                 extra,
                 packed_range: sig.offset + data_start..sig.offset + data_end,
+                cut_short: false,
             });
             pos = data_end;
         }
@@ -526,6 +547,18 @@ impl Archive {
             if (sfx_offset + data_end) as u64 > file_len {
                 if options.salvages() {
                     truncation = Some(cut_member(&header_bytes, sfx_offset + pos));
+                    let file_end = usize::try_from(file_len)
+                        .map_err(|_| Error::InvalidHeader("RAR 1.3 file size overflows usize"))?;
+                    let entry = Entry {
+                        header,
+                        name,
+                        extra,
+                        packed_range: sfx_offset + data_start..file_end,
+                        cut_short: true,
+                    };
+                    if salvages_cut_member(&options, &entry) {
+                        entries.push(entry);
+                    }
                     break;
                 }
                 return Err(Error::TooShort);
@@ -535,6 +568,7 @@ impl Archive {
                 name,
                 extra,
                 packed_range: sfx_offset + data_start..sfx_offset + data_end,
+                cut_short: false,
             });
             pos = data_end;
         }
@@ -684,18 +718,21 @@ impl Archive {
                 options.check_cancelled()?;
                 budget.run(&meta.name, &mut writer, |mut writer| {
                     if entry.is_stored() && !entry.is_encrypted() {
+                        let result =
+                            entry.write_stored_to(self, password, &mut writer, &unpack15.allowance);
                         entry
-                            .write_stored_to(self, password, &mut writer, &unpack15.allowance)
+                            .cut_short_result(result)
                             .map_err(|error| entry.entry_error("extracting", error))?;
                     } else {
+                        let result = entry.write_compressed_to(
+                            self,
+                            password,
+                            &mut unpack15,
+                            self.main.is_solid() && extracted_count != 0,
+                            &mut writer,
+                        );
                         entry
-                            .write_compressed_to(
-                                self,
-                                password,
-                                &mut unpack15,
-                                self.main.is_solid() && extracted_count != 0,
-                                &mut writer,
-                            )
+                            .cut_short_result(result)
                             .map_err(|error| entry.entry_error("extracting", error))?;
                     }
                     Ok(())
@@ -816,7 +853,13 @@ impl Archive {
             decoder.read_control = budget.control.clone();
             let mut data = Vec::new();
             budget.run(b"CMT", &mut data, |writer| {
-                decoder.decode_member_from_reader(&mut packed, unpacked_len, false, writer)?;
+                decoder.decode_member_from_reader(
+                    &mut packed,
+                    unpacked_len,
+                    false,
+                    false,
+                    writer,
+                )?;
                 Ok(())
             })?;
             return Ok(Some(data));
@@ -1045,6 +1088,7 @@ impl Entry {
                 &mut packed,
                 self.header.unp_size as usize,
                 solid,
+                self.cut_short,
                 &mut checksum_writer,
             )?;
         } else {
@@ -1053,6 +1097,7 @@ impl Entry {
                 &mut packed,
                 self.header.unp_size as usize,
                 solid,
+                self.cut_short,
                 &mut checksum_writer,
             )?;
         }
@@ -1074,6 +1119,20 @@ impl Entry {
         out: &mut impl Write,
     ) -> Result<()> {
         self.write_compressed_to(archive, password, &mut Decoder15::new(), false, out)
+    }
+
+    /// Under salvage, a member the file ends partway through fails as that,
+    /// whatever else stopped it, once what decoded is delivered.
+    fn cut_short_result(&self, result: Result<()>) -> Result<()> {
+        match result {
+            Err(error) if self.cut_short && error.kind() != crate::ErrorKind::Cancelled => {
+                Err(Error::MemberCutShort {
+                    packed: u64::from(self.header.pack_size),
+                    present: self.packed_range.len() as u64,
+                })
+            }
+            result => result,
+        }
     }
 
     fn entry_error(&self, operation: &'static str, error: Error) -> Error {

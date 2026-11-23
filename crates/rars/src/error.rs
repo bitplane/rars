@@ -262,6 +262,13 @@ pub enum Error {
         packed: u64,
         present: u64,
     },
+    /// A solid member that follows header damage a salvaging parse resynced
+    /// past: members of its solid stream before it were lost, so it decodes
+    /// without the history it refers to. Reported only under
+    /// `ArchiveReadOptions::salvage`, after what decoded was delivered, and
+    /// whether or not that passed its checksum: those bytes are never taken
+    /// as verified.
+    SolidHistoryLost,
     Codec(crate::codec::Error),
     Rar3Recovery(crate::recovery::rar3::Error),
     Rar5Recovery(crate::recovery::rar5::Error),
@@ -413,6 +420,10 @@ impl std::fmt::Display for Error {
             Self::MemberCutShort { packed, present } => write!(
                 f,
                 "the archive ends {present} bytes into its {packed} bytes of data"
+            ),
+            Self::SolidHistoryLost => write!(
+                f,
+                "members of its solid stream before it were lost to header damage, so it can't be decoded with certainty"
             ),
             Self::Codec(error) => write!(f, "{error}"),
             Self::Rar3Recovery(error) => write!(f, "{error}"),
@@ -574,6 +585,7 @@ impl Error {
             | Self::MemberEndedEarly { .. }
             | Self::MemberRanPastDeclaredSize { .. }
             | Self::MemberCutShort { .. }
+            | Self::SolidHistoryLost
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)

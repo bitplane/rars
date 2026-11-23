@@ -39,6 +39,15 @@ impl ParseBudget {
         Ok(())
     }
 
+    /// Whether a header of `size` bytes would be admitted now, without
+    /// charging for it: a salvaging scan reads candidates within the limits.
+    pub(crate) fn would_admit(&self, size: usize) -> bool {
+        self.count_limit.is_none_or(|limit| self.count < limit)
+            && self
+                .byte_limit
+                .is_none_or(|limit| size as u64 <= limit - self.bytes)
+    }
+
     pub(crate) fn admit(&mut self, size: usize, offset: usize) -> Result<()> {
         self.check_count(offset)?;
         if let Some(limit) = self.byte_limit {

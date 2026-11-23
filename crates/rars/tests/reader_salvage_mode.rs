@@ -84,7 +84,15 @@ fn member_ranges(bytes: &[u8], index: usize) -> (Range<usize>, Range<usize>) {
                 file.block.data_range.clone(),
             )
         }
-        _ => unreachable!("a RAR 1.5-5 archive"),
+        Archive::Rar13(archive) => {
+            let entry = &archive.entries[index];
+            let head = usize::from(entry.header.head_size);
+            (
+                entry.packed_range.start - head..entry.packed_range.start,
+                entry.packed_range.clone(),
+            )
+        }
+        _ => unreachable!("a RAR 1.3-5 archive"),
     }
 }
 
@@ -632,8 +640,8 @@ fn a_rar50_header_that_does_not_parse_ends_the_walk_with_the_members_before_it()
     let members = members(6000);
     let mut bytes = build(ArchiveVersion::Rar50, false, &members);
     let (header, _) = member_ranges(&bytes, 2);
-    // A header size that never ends.
-    bytes[header.start + 4..header.start + 16].fill(0xff);
+    // A header size that never ends, and no header after it to resync to.
+    bytes[header.start + 4..].fill(0xff);
     assert!(ArchiveReader::read(&bytes).is_err());
 
     let (archive, outputs, failed) = salvage(&bytes, None);
@@ -892,6 +900,7 @@ fn a_legacy_member_that_runs_past_its_declared_size_is_reported_as_such() {
 fn a_member_the_file_ends_partway_through_delivers_what_is_there() {
     let members = members(30_000);
     let cases = [
+        ("RAR 1.3", ArchiveVersion::Rar13, None),
         ("RAR 1.5", ArchiveVersion::Rar15, None),
         ("RAR 2.0", ArchiveVersion::Rar20, None),
         ("RAR 2.9 LZ", ArchiveVersion::Rar29, Some(Rar29Method::Lz)),
@@ -954,4 +963,425 @@ fn a_member_the_file_ends_partway_through_delivers_what_is_there() {
             }
         }
     }
+}
+
+/// RAR 1.3 the same, stored and compressed, read from bytes and from a
+/// seekable reader, which parse apart.
+#[test]
+fn a_rar13_member_the_file_ends_partway_through_delivers_what_is_there() {
+    let members = members(30_000);
+    for store in [false, true] {
+        // RAR 1.3 has no solid stored archives.
+        for solid in [false, true].into_iter().filter(|&solid| !(store && solid)) {
+            let mut builder = Builder::new(ArchiveVersion::Rar13)
+                .store(store)
+                .solid(solid);
+            for (name, data) in &members {
+                builder
+                    .add_bytes(name.clone(), data.clone(), None, None)
+                    .unwrap();
+            }
+            let bytes = builder.to_bytes().unwrap();
+            let (_, packed) = member_ranges(&bytes, 2);
+            let cut = bytes[..packed.start + packed.len() / 2].to_vec();
+            let present = (packed.len() / 2) as u64;
+            for from_reader in [false, true] {
+                let case = format!("store={store} solid={solid} from_reader={from_reader}");
+                let failures = Failures::default();
+                let handler =
+                    |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+                let options = ArchiveReadOptions::new()
+                    .with_salvage(true)
+                    .with_member_error_handler(&handler);
+                let archive = if from_reader {
+                    ArchiveReader::read_reader_with_options(io::Cursor::new(cut.clone()), options)
+                } else {
+                    ArchiveReader::read_with_options(&cut, options)
+                }
+                .unwrap();
+                assert!(archive.truncation().is_some(), "{case}");
+                let outputs = extract(&archive, options).unwrap();
+                let failed = failures.take();
+                assert_eq!(
+                    failed,
+                    [(
+                        b"m2.txt".to_vec(),
+                        format!(
+                            "MemberCutShort {{ packed: {}, present: {present} }}",
+                            packed.len()
+                        )
+                    )],
+                    "{case}"
+                );
+                archive
+                    .test_with_options_and_callback(options, |_| Ok(()))
+                    .unwrap();
+                assert_eq!(failures.take(), failed, "{case}: test and extract agree");
+                assert_eq!(outputs.len(), 3, "{case}");
+                assert_eq!(outputs[..2], members[..2], "{case}");
+                let delivered = output(&outputs, b"m2.txt");
+                let whole = &members[2].1;
+                assert!(
+                    delivered.len() > whole.len() / 8,
+                    "{case}: {}",
+                    delivered.len()
+                );
+                assert!(delivered.len() < whole.len(), "{case}");
+                assert!(whole.starts_with(delivered), "{case}");
+                if store {
+                    assert_eq!(delivered.len() as u64, present, "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// Where each member's block header starts.
+fn header_starts(bytes: &[u8]) -> Vec<usize> {
+    (0..5)
+        .map(|index| member_ranges(bytes, index).0.start)
+        .collect()
+}
+
+/// Makes the block header at `start` unreadable: its size says less than the
+/// fixed fields (RAR 1.5-4), or never ends (RAR 5).
+fn break_header(bytes: &mut [u8], version: ArchiveVersion, start: usize) {
+    if version == ArchiveVersion::Rar50 {
+        bytes[start + 4..start + 16].fill(0xff);
+    } else {
+        bytes[start + 5..start + 7].copy_from_slice(&3u16.to_le_bytes());
+    }
+}
+
+/// [`salvage`], parsing from bytes or from a seekable reader, which take
+/// apart paths through the walk.
+fn salvage_from(bytes: &[u8], from_reader: bool) -> (Archive, Outputs, Vec<(Vec<u8>, String)>) {
+    if !from_reader {
+        return salvage(bytes, None);
+    }
+    let failures = Failures::default();
+    let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+    let options = ArchiveReadOptions::new()
+        .with_salvage(true)
+        .with_member_error_handler(&handler);
+    let archive =
+        ArchiveReader::read_reader_with_options(io::Cursor::new(bytes.to_vec()), options).unwrap();
+    let outputs = extract(&archive, options).unwrap();
+    let extracted = failures.take();
+    archive
+        .test_with_options_and_callback(options, |_| Ok(()))
+        .unwrap();
+    assert_eq!(failures.take(), extracted, "test and extract agree");
+    (archive, outputs, extracted)
+}
+
+fn resyncs(archive: &Archive) -> Vec<(u64, u64)> {
+    archive
+        .header_damage()
+        .iter()
+        .filter_map(|damage| match damage.kind {
+            HeaderDamageKind::Resynced { next, .. } => Some((damage.offset, next)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A block header that doesn't parse no longer ends the walk: it goes on at
+/// the next header that checks out, and the members after it are read.
+#[test]
+fn the_walk_resyncs_past_a_header_that_does_not_parse() {
+    let members = members(6000);
+    for version in VERSIONS {
+        for from_reader in [false, true] {
+            let case = format!("{version:?} from_reader={from_reader}");
+            let mut bytes = build(version, false, &members);
+            let starts = header_starts(&bytes);
+            break_header(&mut bytes, version, starts[2]);
+            assert!(ArchiveReader::read(&bytes).is_err(), "{case}");
+
+            let (archive, outputs, failed) = salvage_from(&bytes, from_reader);
+            assert!(failed.is_empty(), "{case}: {failed:?}");
+            assert_eq!(
+                resyncs(&archive),
+                [(starts[2] as u64, starts[3] as u64)],
+                "{case}"
+            );
+            assert_eq!(archive.header_damage().len(), 1, "{case}");
+            let expected: Vec<_> = members
+                .iter()
+                .enumerate()
+                .filter(|&(index, _)| index != 2)
+                .map(|(_, member)| member.clone())
+                .collect();
+            assert_eq!(outputs, expected, "{case}");
+        }
+    }
+}
+
+/// In a solid archive the members after the gap have lost their history:
+/// what decodes is delivered, and each is reported, never verified.
+#[test]
+fn solid_members_after_a_resync_are_never_verified() {
+    let members = members(6000);
+    for version in VERSIONS {
+        let case = format!("{version:?}");
+        let mut bytes = build(version, true, &members);
+        let starts = header_starts(&bytes);
+        break_header(&mut bytes, version, starts[2]);
+
+        let (archive, outputs, failed) = salvage(&bytes, None);
+        assert_eq!(resyncs(&archive).len(), 1, "{case}");
+        assert_eq!(outputs[..2], members[..2], "{case}");
+        assert_eq!(outputs.len(), 4, "{case}");
+        assert_eq!(
+            failed,
+            [
+                (b"m3.txt".to_vec(), "SolidHistoryLost".to_string()),
+                (b"m4.txt".to_vec(), "SolidHistoryLost".to_string()),
+            ],
+            "{case}"
+        );
+    }
+}
+
+/// Sets the packed size in member `index`'s header to `size`, keeping the
+/// field's width and leaving the header's checksum stale.
+fn damage_packed_size(bytes: &mut [u8], version: ArchiveVersion, start: usize, size: u64) {
+    if version != ArchiveVersion::Rar50 {
+        bytes[start + 7..start + 11].copy_from_slice(&(size as u32).to_le_bytes());
+        return;
+    }
+    let mut at = start + 4;
+    read_vint(bytes, &mut at);
+    read_vint(bytes, &mut at);
+    let flags = read_vint(bytes, &mut at);
+    if flags & 1 != 0 {
+        read_vint(bytes, &mut at);
+    }
+    assert!(flags & 2 != 0, "the member has data");
+    let field = at;
+    read_vint(bytes, &mut at);
+    let width = at - field;
+    let size = size.min((1u64 << (7 * width)) - 1);
+    let mut left = size;
+    for (index, byte) in bytes[field..at].iter_mut().enumerate() {
+        *byte = (left & 0x7f) as u8 | if index + 1 < width { 0x80 } else { 0 };
+        left >>= 7;
+    }
+}
+
+/// A header whose packed size is damaged, so whose checksum fails, sends the
+/// walk to the wrong place. The resync goes back to just after that header,
+/// so the members after it are kept. When the size grew, the member's data
+/// is taken to end at the next header, and verifies.
+#[test]
+fn a_damaged_packed_size_is_resynced_from_the_header_it_damaged() {
+    let members = members(6000);
+    for version in VERSIONS {
+        // A grown size loses no member, so even a solid stream stays whole.
+        let cases = [
+            ("shrunk", false, false),
+            ("grown", true, false),
+            ("grown", true, true),
+        ];
+        for (what, grow, solid) in cases {
+            for from_reader in [false, true] {
+                let case = format!("{version:?} {what} solid={solid} from_reader={from_reader}");
+                let mut bytes = build(version, solid, &members);
+                let starts = header_starts(&bytes);
+                let (_, packed) = member_ranges(&bytes, 2);
+                let size = if grow {
+                    u64::from(u32::MAX)
+                } else {
+                    packed.len() as u64 / 2
+                };
+                damage_packed_size(&mut bytes, version, starts[2], size);
+
+                let (archive, outputs, failed) = salvage_from(&bytes, from_reader);
+                assert_eq!(
+                    resyncs(&archive),
+                    [(starts[2] as u64, starts[3] as u64)],
+                    "{case}: {:?}",
+                    archive.header_damage()
+                );
+                assert!(
+                    archive
+                        .header_damage()
+                        .iter()
+                        .any(|damage| damage.offset == starts[2] as u64
+                            && matches!(damage.kind, HeaderDamageKind::Checksum { .. })),
+                    "{case}"
+                );
+                for (name, data) in members.iter().filter(|(name, _)| name != b"m2.txt") {
+                    assert_eq!(output(&outputs, name), data, "{case}");
+                }
+                let names: Vec<_> = failed.iter().map(|(name, _)| name.clone()).collect();
+                if grow {
+                    assert_eq!(outputs, members, "{case}");
+                    assert!(failed.is_empty(), "{case}: {failed:?}");
+                } else {
+                    assert_eq!(names, [b"m2.txt".to_vec()], "{case}");
+                }
+            }
+        }
+    }
+}
+
+/// Random bytes over a stretch of an archive, header or data, never give a
+/// member that passes as verified but doesn't hold what was stored. A resync can
+/// land on a false header, but its member then fails its checksum.
+#[test]
+fn random_damage_never_passes_as_verified() {
+    let members = members(3000);
+    let mut seed = 526u32;
+    let mut next = move || {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        (seed >> 8) as usize
+    };
+    for version in VERSIONS {
+        for solid in [false, true] {
+            let bytes = build(version, solid, &members);
+            let first = header_starts(&bytes)[0];
+            for trial in 0..40 {
+                let case = format!("{version:?} solid={solid} trial={trial}");
+                let mut damaged = bytes.clone();
+                let start = first + next() % (bytes.len() - first);
+                let len = (1 + next() % 2048).min(bytes.len() - start);
+                for byte in &mut damaged[start..start + len] {
+                    *byte = next() as u8;
+                }
+                let failures = Failures::default();
+                let handler =
+                    |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+                let options = ArchiveReadOptions::new()
+                    .with_salvage(true)
+                    .with_member_error_handler(&handler);
+                let Ok(archive) = ArchiveReader::read_with_options(&damaged, options) else {
+                    continue;
+                };
+                let Ok(outputs) = extract(&archive, options) else {
+                    continue;
+                };
+                let failed = failures.take();
+                for (name, data) in &outputs {
+                    // A damaged header read as stored can name a directory
+                    // or an empty file, which has nothing to verify; the
+                    // header is listed as damaged.
+                    if data.is_empty() || failed.iter().any(|(failed, _)| failed == name) {
+                        continue;
+                    }
+                    // A name can be damaged and read as stored; the bytes
+                    // passed their checksum, so are a stored member's.
+                    assert!(
+                        members.iter().any(|member| member.1 == *data),
+                        "{case}: {name:?} passed but isn't a stored member: {} bytes, {:?}",
+                        data.len(),
+                        archive.header_damage()
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn build_quick_open(solid: bool, members: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .solid(solid)
+        .archive_metadata(None, false, true)
+        .unwrap();
+    for (name, data) in members {
+        builder
+            .add_bytes(name.clone(), data.clone(), None, None)
+            .unwrap();
+    }
+    builder.to_bytes().unwrap()
+}
+
+fn quick_open_copies(archive: &Archive) -> Vec<(u64, Vec<u8>)> {
+    archive
+        .header_damage()
+        .iter()
+        .filter_map(|damage| match &damage.kind {
+            HeaderDamageKind::QuickOpenCopy { name } => Some((damage.offset, name.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A RAR 5 member whose own header is lost is read from its copy in the
+/// quick-open block, and reported as such. Its data still has to pass its
+/// checksum, and with it a solid stream is whole again.
+#[test]
+fn the_quick_open_copy_stands_in_for_a_lost_rar50_header() {
+    let members = members(6000);
+    for solid in [false, true] {
+        for from_reader in [false, true] {
+            let case = format!("solid={solid} from_reader={from_reader}");
+            let mut bytes = build_quick_open(solid, &members);
+            let starts = header_starts(&bytes);
+            break_header(&mut bytes, ArchiveVersion::Rar50, starts[2]);
+            assert!(ArchiveReader::read(&bytes).is_err(), "{case}");
+
+            let (archive, outputs, failed) = salvage_from(&bytes, from_reader);
+            assert_eq!(
+                resyncs(&archive),
+                [(starts[2] as u64, starts[3] as u64)],
+                "{case}"
+            );
+            assert_eq!(
+                quick_open_copies(&archive),
+                [(starts[2] as u64, b"m2.txt".to_vec())],
+                "{case}"
+            );
+            assert!(failed.is_empty(), "{case}: {failed:?}");
+            assert_eq!(outputs, members, "{case}");
+        }
+    }
+}
+
+/// A RAR 5 main header that doesn't parse is resynced past too, the archive
+/// read as a plain one. The quick-open block is then found by the walk.
+#[test]
+fn a_lost_rar50_main_header_is_resynced_past() {
+    let members = members(6000);
+    for quick_open in [false, true] {
+        for solid in [false, true] {
+            let case = format!("quick_open={quick_open} solid={solid}");
+            let mut bytes = if quick_open {
+                build_quick_open(solid, &members)
+            } else {
+                build(ArchiveVersion::Rar50, solid, &members)
+            };
+            let starts = header_starts(&bytes);
+            // The main header follows the eight-byte signature.
+            break_header(&mut bytes, ArchiveVersion::Rar50, 8);
+            if quick_open {
+                break_header(&mut bytes, ArchiveVersion::Rar50, starts[2]);
+            }
+            assert!(ArchiveReader::read(&bytes).is_err(), "{case}");
+
+            let (archive, outputs, failed) = salvage(&bytes, None);
+            let mut expected_resyncs = vec![(8, starts[0] as u64)];
+            if quick_open {
+                expected_resyncs.push((starts[2] as u64, starts[3] as u64));
+            }
+            assert_eq!(resyncs(&archive), expected_resyncs, "{case}");
+            assert!(failed.is_empty(), "{case}: {failed:?}");
+            assert_eq!(outputs, members, "{case}");
+        }
+    }
+}
+
+/// Without salvage the quick-open copies are never read: the damaged
+/// archive fails as it did.
+#[test]
+fn quick_open_copies_are_unused_without_salvage() {
+    let members = members(6000);
+    let mut bytes = build_quick_open(false, &members);
+    let starts = header_starts(&bytes);
+    break_header(&mut bytes, ArchiveVersion::Rar50, starts[2]);
+    let failures = Failures::default();
+    let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+    let options = ArchiveReadOptions::new().with_member_error_handler(&handler);
+    assert!(ArchiveReader::read_with_options(&bytes, options).is_err());
 }

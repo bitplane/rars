@@ -145,6 +145,12 @@ impl ReadControl {
             });
         }
     }
+    /// Drops the damage recorded for offsets in `range`.
+    pub(crate) fn retract_damage(&self, range: std::ops::Range<usize>) {
+        if let Some(log) = &self.4 {
+            log.retract(range.start as u64..range.end as u64);
+        }
+    }
     /// The header damage recorded so far, in file order.
     pub(crate) fn take_damage(&self) -> Vec<crate::HeaderDamage> {
         self.4.as_ref().map(|log| log.take()).unwrap_or_default()

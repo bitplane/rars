@@ -245,6 +245,9 @@ pub struct FileHeader {
     pub packed_range: Range<usize>,
     /// Set by a salvaging parse on a member the file ends partway through.
     pub(crate) cut_short: bool,
+    /// Set by a salvaging parse on a solid member after members of its
+    /// stream were lost to header damage.
+    pub(crate) history_lost: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -553,8 +556,14 @@ impl FileHeader {
     }
 
     /// Under salvage, a member the file ends partway through fails as that,
-    /// whatever else stopped it, once what decoded is delivered.
+    /// whatever else stopped it, once what decoded is delivered. So does a
+    /// solid member whose earlier history was lost, even if it passed.
     pub(crate) fn cut_short_result(&self, result: Result<()>) -> Result<()> {
+        let result = match result {
+            Err(error) if !crate::header_damage::decoding_failure(&error) => Err(error),
+            _ if self.history_lost => Err(Error::SolidHistoryLost),
+            result => result,
+        };
         match result {
             Err(error) if self.is_cut_short() && error.kind() != crate::ErrorKind::Cancelled => {
                 Err(Error::MemberCutShort {
@@ -677,6 +686,7 @@ impl FileHeader {
             | Error::MemberEndedEarly { .. }
             | Error::MemberRanPastDeclaredSize { .. }
             | Error::MemberCutShort { .. }
+            | Error::SolidHistoryLost
             | Error::Cancelled
             | Error::InvalidArgument(_)
             | Error::WriterFailure(_)
@@ -979,6 +989,28 @@ impl Archive {
         let blocks_before_first_header = blocks.len();
         let mut truncation = None;
         let mut skipped = Vec::new();
+        let archive_len = archive.len();
+        let mut salvage = Salvage::new(archive_len, main.is_solid());
+        let mut read = |at: usize, len: usize| Ok(archive[at..at + len].to_vec());
+        // Under salvage, the next header that checks out after damage at
+        // `pos`, if there is one, and where the damage began.
+        macro_rules! resume {
+            ($pos:expr, $reason:expr) => {
+                if options.salvage {
+                    salvage.resume(
+                        $pos,
+                        $reason,
+                        archive_len,
+                        sig.offset,
+                        &mut blocks,
+                        &budget,
+                        &mut read,
+                    )?
+                } else {
+                    None
+                }
+            };
+        }
 
         while pos < archive.len() {
             if main.has_encrypted_headers() && archive.len() - pos < 7 {
@@ -1003,15 +1035,17 @@ impl Archive {
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
                 let block = admit_plain_header(archive, pos, &mut budget).and_then(|()| {
-                    parse_block_header_salvaging(archive, pos, &budget.control, sig.offset + pos)
+                    parse_block_header_flagged(archive, pos, &budget.control, sig.offset + pos)
                 });
-                let block = match block {
+                let (block, damaged) = match block {
                     Err(Error::TooShort) => {
-                        match cut_block_header(
-                            &archive[pos..],
-                            sig.offset + pos,
-                            options.salvages(),
-                        ) {
+                        let cut =
+                            cut_block_header(&archive[pos..], sig.offset + pos, options.salvages());
+                        if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                            pos = next;
+                            continue;
+                        }
+                        match cut {
                             // A whole header whose sizes run past the file.
                             Err(error) if options.salvage => {
                                 unreadable(&budget.control, sig.offset + pos, &error);
@@ -1021,41 +1055,101 @@ impl Archive {
                         break;
                     }
                     Err(error) if salvage_stops(&options, &error) => {
+                        let reason = crate::header_damage::record_reason(&error);
+                        if let Some((next, _)) = resume!(pos, reason) {
+                            pos = next;
+                            continue;
+                        }
                         unreadable(&budget.control, sig.offset + pos, &error);
                         break;
                     }
                     block => block?,
                 };
+                let known = known_block_type(block.head_type);
+                if let Some(reason) = salvage.read_header(pos, damaged, known) {
+                    if let Some((next, _)) = resume!(pos, reason) {
+                        pos = next;
+                        continue;
+                    }
+                }
                 let total = block_total_size(&block)?;
                 let header = archive[pos..pos + block.head_size as usize].to_vec();
                 (block, header, total)
             };
             match block.head_type {
-                FILE_HEAD => {
+                FILE_HEAD | NEWSUB_HEAD => {
                     let mut file = match parse_file_like_header(&header, relative_block(&block), 0)
                     {
                         Err(error) if salvage_skips(&options, &error) => {
                             unreadable(&budget.control, sig.offset + pos, &error);
+                            salvage.lost |= block.head_type == FILE_HEAD;
                             match checked_block_next(&block, total, archive.len()) {
                                 Ok(next) => {
                                     pos = next;
                                     continue;
                                 }
-                                Err(_) => break,
+                                Err(_) => {
+                                    if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                        pos = next;
+                                        continue;
+                                    }
+                                    break;
+                                }
                             }
                         }
                         file => file?,
                     };
                     let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = match checked_block_next(&block, total, archive.len()) {
+                    let next = checked_block_next(&block, total, archive.len());
+                    if block.head_type == NEWSUB_HEAD {
+                        let next = match service_block_next(&block, next)? {
+                            Some(next) => next,
+                            None => {
+                                if salvage.suspect.is_some() {
+                                    if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                        pos = next;
+                                        continue;
+                                    }
+                                }
+                                let cut = TruncatedBlock::service(&file.name);
+                                truncation =
+                                    Some(Truncation::new(sig.offset + block.offset, cut, true));
+                                break;
+                            }
+                        };
+                        file.block.offset = block.offset;
+                        file.packed_range = packed_range(sig.offset, next, file.pack_size);
+                        let kind = classify_new_sub(&file.name);
+                        blocks.push(Block::NewSub(NewSubHeader { file, kind }));
+                        pos = next;
+                        continue;
+                    }
+                    file.block.offset = block.offset;
+                    salvage.mark(&mut file);
+                    let next = match next {
                         Err(Error::TooShort) if options.salvages() => {
+                            let data_start = block.offset + total - file.pack_size as usize;
+                            if salvage.suspect.is_some() {
+                                // A damaged header whose sizes run past the end:
+                                // if a header follows, its member's data ends
+                                // there.
+                                let was_lost = salvage.lost;
+                                if let Some((next, start)) = resume!(pos, SIZES_PAST_END) {
+                                    if start == pos && next > data_start {
+                                        salvage.lost = was_lost;
+                                        file.packed_range =
+                                            sig.offset + data_start..sig.offset + next;
+                                        blocks.push(Block::File(file));
+                                    }
+                                    pos = next;
+                                    continue;
+                                }
+                            }
                             let cut = TruncatedBlock::Member(file.name.clone());
                             if salvages_cut_member(&options, &file) {
                                 file.cut_short = true;
-                                file.block.offset = block.offset;
-                                let start =
-                                    sig.offset + block.offset + total - file.pack_size as usize;
-                                file.packed_range = start..sig.offset + archive.len();
+                                file.packed_range =
+                                    sig.offset + data_start..sig.offset + archive.len();
                                 blocks.push(Block::File(file));
                             }
                             truncation =
@@ -1064,72 +1158,77 @@ impl Archive {
                         }
                         next => next?,
                     };
-                    file.block.offset = block.offset;
                     file.packed_range = packed_range(sig.offset, next, file.pack_size);
                     blocks.push(Block::File(file));
-                    pos = next;
-                }
-                NEWSUB_HEAD => {
-                    let mut file = parse_file_like_header(&header, relative_block(&block), 0)?;
-                    let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = checked_block_next(&block, total, archive.len());
-                    let Some(next) = service_block_next(&block, next)? else {
-                        let cut = TruncatedBlock::service(&file.name);
-                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
-                        break;
-                    };
-                    file.block.offset = block.offset;
-                    file.packed_range = packed_range(sig.offset, next, file.pack_size);
-                    let kind = classify_new_sub(&file.name);
-                    blocks.push(Block::NewSub(NewSubHeader { file, kind }));
                     pos = next;
                 }
                 COMM_HEAD => {
                     let next = checked_block_next(&block, total, archive.len());
                     let Some(next) = service_block_next(&block, next)? else {
+                        if salvage.suspect.is_some() {
+                            if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                pos = next;
+                                continue;
+                            }
+                        }
                         let cut = TruncatedBlock::Comment;
                         truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
-                    let mut comment = parse_comment_header(&header, relative_block(&block))?;
+                    let mut comment = match parse_comment_header(&header, relative_block(&block)) {
+                        Err(error) if salvage_skips(&options, &error) => {
+                            unreadable(&budget.control, sig.offset + pos, &error);
+                            pos = next;
+                            continue;
+                        }
+                        comment => comment?,
+                    };
                     comment.block.offset = block.offset;
                     comment.packed_range =
                         sig.offset + block.offset + 13..sig.offset + block.offset + total;
                     blocks.push(Block::Comment(comment));
                     pos = next;
                 }
-                PROTECT_HEAD => {
+                head_type => {
                     let next = checked_block_next(&block, total, archive.len());
                     let Some(next) = service_block_next(&block, next)? else {
-                        let cut = TruncatedBlock::RecoveryRecord;
+                        if salvage.suspect.is_some() {
+                            if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                pos = next;
+                                continue;
+                            }
+                        }
+                        let cut = match head_type {
+                            PROTECT_HEAD => TruncatedBlock::RecoveryRecord,
+                            ENDARC_HEAD => TruncatedBlock::End,
+                            _ => TruncatedBlock::Unknown,
+                        };
                         truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
-                    let offset = sig.offset + block.offset;
-                    let protect =
-                        protect_block(&header, block, sig.offset, total, offset, &mut skipped);
-                    blocks.push(protect?);
-                    pos = next;
-                }
-                ENDARC_HEAD => {
-                    let next = checked_block_next(&block, total, archive.len());
-                    if service_block_next(&block, next)?.is_none() {
-                        let cut = TruncatedBlock::End;
-                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
-                        break;
+                    match head_type {
+                        PROTECT_HEAD => {
+                            let offset = sig.offset + block.offset;
+                            let protect = protect_block(
+                                &header,
+                                block,
+                                sig.offset,
+                                total,
+                                offset,
+                                &mut skipped,
+                            );
+                            blocks.push(protect?);
+                        }
+                        ENDARC_HEAD => {
+                            blocks.push(Block::End(parse_end_header(&header, block)));
+                            break;
+                        }
+                        _ => {
+                            skipped
+                                .extend(short_legacy_auth_block(&block, sig.offset + block.offset));
+                            blocks.push(Block::Unknown(block));
+                        }
                     }
-                    blocks.push(Block::End(parse_end_header(&header, block)));
-                    break;
-                }
-                _ => {
-                    let next = checked_block_next(&block, total, archive.len());
-                    let Some(next) = service_block_next(&block, next)? else {
-                        let cut = TruncatedBlock::Unknown;
-                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
-                        break;
-                    };
-                    skipped.extend(short_legacy_auth_block(&block, sig.offset + block.offset));
-                    blocks.push(Block::Unknown(block));
                     pos = next;
                 }
             }
@@ -1210,6 +1309,29 @@ impl Archive {
         let blocks_before_first_header = blocks.len();
         let mut truncation = None;
         let mut skipped = Vec::new();
+        // The archive's length from its start, as a scan counts it.
+        let archive_len = usize::try_from(file_len.saturating_sub(sfx_offset as u64))
+            .unwrap_or(usize::MAX - sfx_offset);
+        let mut salvage = Salvage::new(archive_len, main.is_solid());
+        // Under salvage, the next header that checks out after damage at
+        // `pos`, if there is one, and where the damage began.
+        macro_rules! resume {
+            ($pos:expr, $reason:expr) => {
+                if options.salvage {
+                    salvage.resume(
+                        $pos,
+                        $reason,
+                        archive_len,
+                        sfx_offset,
+                        &mut blocks,
+                        &budget,
+                        &mut |at, len| read_exact_at(&mut file, sfx_offset + at, len),
+                    )?
+                } else {
+                    None
+                }
+            };
+        }
 
         while ((sfx_offset + pos) as u64) < file_len {
             let remaining = file_len - (sfx_offset + pos) as u64;
@@ -1237,56 +1359,125 @@ impl Archive {
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
                 let block =
-                    match read_block_header_at(&mut file, file_len, sfx_offset, pos, &mut budget) {
-                        Err(Error::TooShort) => {
-                            // A header cut short is under 64 KiB, as HEAD_SIZE is a u16.
-                            let rest =
-                                read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
-                            match cut_block_header(&rest, sfx_offset + pos, options.salvages()) {
-                                // A whole header whose sizes run past the file.
-                                Err(error) if options.salvage => {
-                                    unreadable(&budget.control, sfx_offset + pos, &error);
-                                }
-                                cut => truncation = Some(cut?),
+                    read_block_header_flagged_at(&mut file, file_len, sfx_offset, pos, &mut budget);
+                let (block, damaged) = match block {
+                    Err(Error::TooShort) => {
+                        // A header cut short is under 64 KiB, as HEAD_SIZE is a u16.
+                        let rest = read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
+                        let cut = cut_block_header(&rest, sfx_offset + pos, options.salvages());
+                        if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                            pos = next;
+                            continue;
+                        }
+                        match cut {
+                            // A whole header whose sizes run past the file.
+                            Err(error) if options.salvage => {
+                                unreadable(&budget.control, sfx_offset + pos, &error);
                             }
-                            break;
+                            cut => truncation = Some(cut?),
                         }
-                        Err(error) if salvage_stops(&options, &error) => {
-                            unreadable(&budget.control, sfx_offset + pos, &error);
-                            break;
+                        break;
+                    }
+                    Err(error) if salvage_stops(&options, &error) => {
+                        let reason = crate::header_damage::record_reason(&error);
+                        if let Some((next, _)) = resume!(pos, reason) {
+                            pos = next;
+                            continue;
                         }
-                        block => block?,
-                    };
+                        unreadable(&budget.control, sfx_offset + pos, &error);
+                        break;
+                    }
+                    block => block?,
+                };
+                let known = known_block_type(block.head_type);
+                if let Some(reason) = salvage.read_header(pos, damaged, known) {
+                    if let Some((next, _)) = resume!(pos, reason) {
+                        pos = next;
+                        continue;
+                    }
+                }
                 let total = block_total_size(&block)?;
                 let header = read_exact_at(&mut file, sfx_offset + pos, block.head_size as usize)?;
                 (block, header, total)
             };
             match block.head_type {
-                FILE_HEAD => {
+                FILE_HEAD | NEWSUB_HEAD => {
                     let mut file_header =
                         match parse_file_like_header(&header, relative_block(&block), 0) {
                             Err(error) if salvage_skips(&options, &error) => {
                                 unreadable(&budget.control, sfx_offset + pos, &error);
+                                salvage.lost |= block.head_type == FILE_HEAD;
                                 match checked_file_block_next(sfx_offset, &block, total, file_len) {
                                     Ok(next) => {
                                         pos = next;
                                         continue;
                                     }
-                                    Err(_) => break,
+                                    Err(_) => {
+                                        if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                            pos = next;
+                                            continue;
+                                        }
+                                        break;
+                                    }
                                 }
                             }
                             file => file?,
                         };
                     let total = file_block_total_size(&block, total, file_header.pack_size)?;
-                    let next = match checked_file_block_next(sfx_offset, &block, total, file_len) {
+                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
+                    if block.head_type == NEWSUB_HEAD {
+                        let next = match service_block_next(&block, next)? {
+                            Some(next) => next,
+                            None => {
+                                if salvage.suspect.is_some() {
+                                    if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                        pos = next;
+                                        continue;
+                                    }
+                                }
+                                let cut = TruncatedBlock::service(&file_header.name);
+                                truncation =
+                                    Some(Truncation::new(sfx_offset + block.offset, cut, true));
+                                break;
+                            }
+                        };
+                        file_header.block.offset = block.offset;
+                        file_header.packed_range =
+                            packed_range(sfx_offset, next, file_header.pack_size);
+                        let kind = classify_new_sub(&file_header.name);
+                        blocks.push(Block::NewSub(NewSubHeader {
+                            file: file_header,
+                            kind,
+                        }));
+                        pos = next;
+                        continue;
+                    }
+                    file_header.block.offset = block.offset;
+                    salvage.mark(&mut file_header);
+                    let next = match next {
                         Err(Error::TooShort) if options.salvages() => {
+                            let data_start = block.offset + total - file_header.pack_size as usize;
+                            if salvage.suspect.is_some() {
+                                // A damaged header whose sizes run past the end:
+                                // if a header follows, its member's data ends
+                                // there.
+                                let was_lost = salvage.lost;
+                                if let Some((next, start)) = resume!(pos, SIZES_PAST_END) {
+                                    if start == pos && next > data_start {
+                                        salvage.lost = was_lost;
+                                        file_header.packed_range =
+                                            sfx_offset + data_start..sfx_offset + next;
+                                        blocks.push(Block::File(file_header));
+                                    }
+                                    pos = next;
+                                    continue;
+                                }
+                            }
                             let cut = TruncatedBlock::Member(file_header.name.clone());
                             if salvages_cut_member(&options, &file_header) {
                                 file_header.cut_short = true;
-                                file_header.block.offset = block.offset;
-                                let start = sfx_offset + block.offset + total
-                                    - file_header.pack_size as usize;
-                                file_header.packed_range = start..file_len as usize;
+                                file_header.packed_range =
+                                    sfx_offset + data_start..file_len as usize;
                                 blocks.push(Block::File(file_header));
                             }
                             truncation =
@@ -1295,78 +1486,78 @@ impl Archive {
                         }
                         next => next?,
                     };
-                    file_header.block.offset = block.offset;
                     file_header.packed_range =
                         packed_range(sfx_offset, next, file_header.pack_size);
                     blocks.push(Block::File(file_header));
                     pos = next;
                 }
-                NEWSUB_HEAD => {
-                    let mut file_header =
-                        parse_file_like_header(&header, relative_block(&block), 0)?;
-                    let total = file_block_total_size(&block, total, file_header.pack_size)?;
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
-                    let Some(next) = service_block_next(&block, next)? else {
-                        let cut = TruncatedBlock::service(&file_header.name);
-                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
-                        break;
-                    };
-                    file_header.block.offset = block.offset;
-                    file_header.packed_range =
-                        packed_range(sfx_offset, next, file_header.pack_size);
-                    let kind = classify_new_sub(&file_header.name);
-                    blocks.push(Block::NewSub(NewSubHeader {
-                        file: file_header,
-                        kind,
-                    }));
-                    pos = next;
-                }
                 COMM_HEAD => {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len);
                     let Some(next) = service_block_next(&block, next)? else {
+                        if salvage.suspect.is_some() {
+                            if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                pos = next;
+                                continue;
+                            }
+                        }
                         let cut = TruncatedBlock::Comment;
                         truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
-                    let mut comment = parse_comment_header(&header, relative_block(&block))?;
+                    let mut comment = match parse_comment_header(&header, relative_block(&block)) {
+                        Err(error) if salvage_skips(&options, &error) => {
+                            unreadable(&budget.control, sfx_offset + pos, &error);
+                            pos = next;
+                            continue;
+                        }
+                        comment => comment?,
+                    };
                     comment.block.offset = block.offset;
                     comment.packed_range =
                         sfx_offset + block.offset + 13..sfx_offset + block.offset + total;
                     blocks.push(Block::Comment(comment));
                     pos = next;
                 }
-                PROTECT_HEAD => {
+                head_type => {
                     let next = checked_file_block_next(sfx_offset, &block, total, file_len);
                     let Some(next) = service_block_next(&block, next)? else {
-                        let cut = TruncatedBlock::RecoveryRecord;
+                        if salvage.suspect.is_some() {
+                            if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
+                                pos = next;
+                                continue;
+                            }
+                        }
+                        let cut = match head_type {
+                            PROTECT_HEAD => TruncatedBlock::RecoveryRecord,
+                            ENDARC_HEAD => TruncatedBlock::End,
+                            _ => TruncatedBlock::Unknown,
+                        };
                         truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
-                    let offset = sfx_offset + block.offset;
-                    let protect =
-                        protect_block(&header, block, sfx_offset, total, offset, &mut skipped);
-                    blocks.push(protect?);
-                    pos = next;
-                }
-                ENDARC_HEAD => {
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
-                    if service_block_next(&block, next)?.is_none() {
-                        let cut = TruncatedBlock::End;
-                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
-                        break;
+                    match head_type {
+                        PROTECT_HEAD => {
+                            let offset = sfx_offset + block.offset;
+                            let protect = protect_block(
+                                &header,
+                                block,
+                                sfx_offset,
+                                total,
+                                offset,
+                                &mut skipped,
+                            );
+                            blocks.push(protect?);
+                        }
+                        ENDARC_HEAD => {
+                            blocks.push(Block::End(parse_end_header(&header, block)));
+                            break;
+                        }
+                        _ => {
+                            skipped
+                                .extend(short_legacy_auth_block(&block, sfx_offset + block.offset));
+                            blocks.push(Block::Unknown(block));
+                        }
                     }
-                    blocks.push(Block::End(parse_end_header(&header, block)));
-                    break;
-                }
-                _ => {
-                    let next = checked_file_block_next(sfx_offset, &block, total, file_len);
-                    let Some(next) = service_block_next(&block, next)? else {
-                        let cut = TruncatedBlock::Unknown;
-                        truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
-                        break;
-                    };
-                    skipped.extend(short_legacy_auth_block(&block, sfx_offset + block.offset));
-                    blocks.push(Block::Unknown(block));
                     pos = next;
                 }
             }
@@ -3060,6 +3251,7 @@ fn parse_file_like_header(
         ))?;
     Ok(FileHeader {
         cut_short: false,
+        history_lost: false,
         block,
         pack_size,
         unp_size,
@@ -3222,6 +3414,18 @@ fn read_block_header_at(
     offset: usize,
     budget: &mut crate::parse_budget::ParseBudget,
 ) -> Result<BlockHeader> {
+    read_block_header_flagged_at(file, file_len, archive_offset, offset, budget)
+        .map(|(block, _)| block)
+}
+
+/// [`read_block_header_at`], and whether the header's CRC failed.
+fn read_block_header_flagged_at(
+    file: &mut (impl Read + std::io::Seek),
+    file_len: u64,
+    archive_offset: usize,
+    offset: usize,
+    budget: &mut crate::parse_budget::ParseBudget,
+) -> Result<(BlockHeader, bool)> {
     let absolute = archive_offset
         .checked_add(offset)
         .ok_or(Error::InvalidHeader("RAR 1.5 block offset overflows usize"))?;
@@ -3256,9 +3460,9 @@ fn read_block_header_at(
         }
         header = read_exact_at(file, absolute, head_size + names)?;
     }
-    let mut block = parse_block_header_salvaging(&header, 0, &budget.control, absolute)?;
+    let (mut block, damaged) = parse_block_header_flagged(&header, 0, &budget.control, absolute)?;
     block.offset = offset;
-    Ok(block)
+    Ok((block, damaged))
 }
 
 fn relative_block(block: &BlockHeader) -> BlockHeader {
@@ -3300,6 +3504,16 @@ fn parse_block_header_salvaging(
     control: &crate::read_control::ReadControl,
     report_offset: usize,
 ) -> Result<BlockHeader> {
+    parse_block_header_flagged(input, offset, control, report_offset).map(|(block, _)| block)
+}
+
+/// [`parse_block_header_salvaging`], and whether the header's CRC failed.
+fn parse_block_header_flagged(
+    input: &[u8],
+    offset: usize,
+    control: &crate::read_control::ReadControl,
+    report_offset: usize,
+) -> Result<(BlockHeader, bool)> {
     let (block, mismatch) = parse_block_header_unchecked(input, offset)?;
     match mismatch {
         Some((expected, actual)) if control.salvage() => {
@@ -3310,11 +3524,20 @@ fn parse_block_header_salvaging(
                     actual: actual.into(),
                 },
             );
-            Ok(block)
+            Ok((block, true))
         }
         Some((expected, actual)) => Err(Error::CrcMismatch { expected, actual }),
-        None => Ok(block),
+        None => Ok((block, false)),
     }
+}
+
+/// Whether a block of `head_type` is one the walk reads. Under salvage, a
+/// header of any other type whose checksum fails is taken for no header.
+fn known_block_type(head_type: u8) -> bool {
+    matches!(
+        head_type,
+        FILE_HEAD | NEWSUB_HEAD | COMM_HEAD | PROTECT_HEAD | ENDARC_HEAD | SUB_HEAD | 0x76 | 0x79
+    )
 }
 
 /// A block header, and its stored and computed CRCs if they differ.
@@ -3555,6 +3778,212 @@ fn unreadable(control: &crate::read_control::ReadControl, offset: usize, error: 
             reason: crate::header_damage::record_reason(error),
         },
     );
+}
+
+/// Why a salvaging walk resynced: a header whose sizes run past the file.
+const SIZES_PAST_END: &str = "its sizes run past the end of the file";
+/// Why a salvaging walk resynced: a header of no known type, which fails its
+/// checksum, is taken for no header at all.
+const UNKNOWN_DAMAGED: &str = "it fails its checksum and its type is unknown";
+/// Why a salvaging walk resynced: the header fails its checksum, as do the
+/// ones just before it.
+const DAMAGED_RUN: &str = "it fails its checksum, as do the headers before it";
+/// How many headers in a row a salvaging walk reads as stored when their
+/// checksums fail.
+const MAX_DAMAGED_RUN: usize = 3;
+
+/// What a salvaging walk keeps to resync past a header that doesn't parse.
+struct Salvage {
+    resync: crate::resync::ResyncBudget,
+    /// The first of the blocks just read whose header failed its checksum,
+    /// by offset. Its sizes may be wrong, and so may everything the walk
+    /// read after it.
+    suspect: Option<usize>,
+    /// How many headers in a row failed their checksums.
+    run: usize,
+    /// Whether members were lost since the last that starts a solid stream.
+    lost: bool,
+    /// Whether the archive is solid.
+    solid: bool,
+}
+
+impl Salvage {
+    fn new(archive_len: usize, solid: bool) -> Self {
+        Self {
+            resync: crate::resync::ResyncBudget::new(archive_len),
+            suspect: None,
+            run: 0,
+            lost: false,
+            solid,
+        }
+    }
+
+    /// Notes a block header just read at `pos`, and whether its checksum
+    /// failed. Returns the reason to resync instead of reading it as stored:
+    /// it is of no type the walk reads, or too many damaged headers came in
+    /// a row. The walk got to those by the sizes of a damaged one, and
+    /// following them on would let a crafted file send it through the same
+    /// bytes again after every resync.
+    fn read_header(&mut self, pos: usize, damaged: bool, known: bool) -> Option<&'static str> {
+        if !damaged {
+            self.suspect = None;
+            self.run = 0;
+            return None;
+        }
+        if self.suspect.is_none() {
+            self.suspect = Some(pos);
+        }
+        self.run += 1;
+        if !known {
+            Some(UNKNOWN_DAMAGED)
+        } else if self.run > MAX_DAMAGED_RUN {
+            Some(DAMAGED_RUN)
+        } else {
+            None
+        }
+    }
+
+    /// Marks `file` if it is a solid member whose history was lost, and
+    /// starts a fresh stream at one that doesn't continue the last.
+    fn mark(&mut self, file: &mut FileHeader) {
+        if file.is_stored() {
+            return;
+        }
+        // As extraction decides it: RAR 1.5 members continue the archive's
+        // one stream, later ones say whether they do.
+        let continues = self.solid && (file.unp_ver < 20 || file.is_solid());
+        if continues {
+            file.history_lost = self.lost;
+        } else {
+            self.lost = false;
+        }
+    }
+
+    /// Where the walk carries on after the header at `pos` failed with
+    /// `reason`: the next header after it that checks out, or after the first
+    /// damaged header of the run that led here, if one did. Blocks read since
+    /// that one are dropped, with what they reported, as the walk only got to
+    /// them by its sizes. Returns the header found and where the damage
+    /// began; `None` when no header is found, and then nothing is changed.
+    ///
+    /// `pos` and the result are relative to `archive_offset`, where the
+    /// archive starts in the file, and `archive_len` is its length from there.
+    #[allow(clippy::too_many_arguments)]
+    fn resume(
+        &mut self,
+        pos: usize,
+        reason: &'static str,
+        archive_len: usize,
+        archive_offset: usize,
+        blocks: &mut Vec<Block>,
+        budget: &crate::parse_budget::ParseBudget,
+        read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
+    ) -> Result<Option<(usize, usize)>> {
+        let from = self.suspect.unwrap_or(pos) + 1;
+        let Some(next) = crate::resync::scan(
+            from,
+            archive_len,
+            &mut self.resync,
+            &budget.control,
+            read,
+            &|prefix, left| resync_probe(prefix, left),
+            &mut |at, header| resync_confirm(at, &header, archive_len, budget),
+        )?
+        else {
+            return Ok(None);
+        };
+        let start = self.suspect.unwrap_or(pos);
+        if self.suspect.is_some() {
+            blocks.retain(|block| block_offset(block) <= start);
+            budget
+                .control
+                .retract_damage(archive_offset + start + 1..archive_offset + pos + 1);
+        }
+        budget.control.report_damage(
+            archive_offset + start,
+            crate::HeaderDamageKind::Resynced {
+                reason,
+                next: (archive_offset + next) as u64,
+            },
+        );
+        self.suspect = None;
+        self.run = 0;
+        // The scan found the first header after the damage that checks out,
+        // so a member between is lost only if its own header is: the one
+        // the damage began at, unless that was read and kept.
+        self.lost |= !blocks.iter().any(|block| block_offset(block) == start);
+        Ok(Some((next, start)))
+    }
+}
+
+/// Where a block starts, relative to the archive.
+fn block_offset(block: &Block) -> usize {
+    match block {
+        Block::File(file) => file.block.offset,
+        Block::Comment(comment) => comment.block.offset,
+        Block::Protect(protect) => protect.block.offset,
+        Block::NewSub(sub) => sub.file.block.offset,
+        Block::End(end) => end.block.offset,
+        Block::Unknown(block) => block.offset,
+    }
+}
+
+/// Whether the bytes at an offset, `prefix`, with `left` bytes to the end of
+/// the archive, may start a header a resync can take: a file, service or end
+/// block that fits. Returns the header's size.
+///
+/// Only those three are taken: they are what a reader needs after damage,
+/// and the others either carry no checksum worth the name or are rare.
+fn resync_probe(prefix: &[u8], left: usize) -> Option<usize> {
+    let head_type = *prefix.get(2)?;
+    let flags = u16::from_le_bytes([*prefix.get(3)?, *prefix.get(4)?]);
+    let size = usize::from(u16::from_le_bytes([*prefix.get(5)?, *prefix.get(6)?]));
+    if size > left {
+        return None;
+    }
+    match head_type {
+        // An end block is a few fixed fields.
+        ENDARC_HEAD => (7..=32).contains(&size).then_some(size),
+        FILE_HEAD | NEWSUB_HEAD => {
+            let fixed = prefix.get(..32)?;
+            let name_size = usize::from(u16::from_le_bytes([fixed[26], fixed[27]]));
+            // A method from store to best, and a name that fits.
+            (size >= 32
+                && flags & LONG_BLOCK != 0
+                && (0x30..=0x35).contains(&fixed[25])
+                && name_size != 0
+                && 32 + name_size <= size)
+                .then_some(size)
+        }
+        _ => None,
+    }
+}
+
+/// Whether `header`, the bytes of a candidate at `at`, is a header a resync
+/// can take: its checksum matches, its fields parse, its data ends inside the
+/// archive's `archive_len` bytes, and the reader's header limits allow it.
+fn resync_confirm(
+    at: usize,
+    header: &[u8],
+    archive_len: usize,
+    budget: &crate::parse_budget::ParseBudget,
+) -> Result<bool> {
+    if !budget.would_admit(header.len()) {
+        return Ok(false);
+    }
+    let (block, mismatch) = parse_block_header_unchecked(header, 0)?;
+    if mismatch.is_some() || usize::from(block.head_size) != header.len() {
+        return Ok(false);
+    }
+    let total = block_total_size(&block)?;
+    let total = match block.head_type {
+        FILE_HEAD | NEWSUB_HEAD => {
+            let file = parse_file_like_header(header, block.clone(), 0)?;
+            file_block_total_size(&block, total, file.pack_size)?
+        }
+        _ => total,
+    };
+    Ok(at.checked_add(total).is_some_and(|end| end <= archive_len))
 }
 
 fn cut_block_header(rest: &[u8], offset: usize, salvage: bool) -> Result<Truncation> {
@@ -4958,6 +5387,7 @@ mod tests {
     fn file_header_with(flags: u16) -> FileHeader {
         FileHeader {
             cut_short: false,
+            history_lost: false,
             block: block_header_with(flags),
             pack_size: 0,
             unp_size: 0,

@@ -30,6 +30,24 @@ pub enum HeaderDamageKind {
     /// walk went on past it and its member is lost; otherwise the walk
     /// stopped here and any members after it are lost.
     Unreadable { reason: &'static str },
+    /// The header doesn't parse, or a damaged header before it sent the walk
+    /// astray, so the walk scanned forward for the next block header that
+    /// checks out and carried on there, at file offset `next`. Anything
+    /// between is lost, unless a quick-open copy fills it in.
+    ///
+    /// A header is taken only if its checksum matches and its type, sizes and
+    /// fields make sense, with its data inside the file. A false match in
+    /// compressed data is still possible, so a member found this way is
+    /// verified by its own checksum like any other. A solid member after the
+    /// gap has lost the history it needs and fails with
+    /// [`crate::Error::SolidHistoryLost`] once its bytes are delivered.
+    Resynced { reason: &'static str, next: u64 },
+    /// The member's own header was lost to damage, and it was read from the
+    /// copy in the RAR 5 quick-open block instead. The format says not to
+    /// trust those copies, so salvage only uses one for a member the main
+    /// headers no longer give. Its data is still checked against the checksum
+    /// that copy records. `name` is the member's stored name.
+    QuickOpenCopy { name: Vec<u8> },
 }
 
 impl fmt::Display for HeaderDamage {
@@ -48,6 +66,17 @@ impl fmt::Display for HeaderDamage {
             HeaderDamageKind::Unreadable { reason } => write!(
                 f,
                 "header at offset {} doesn't parse: {reason}",
+                self.offset
+            ),
+            HeaderDamageKind::Resynced { reason, next } => write!(
+                f,
+                "header at offset {} doesn't parse ({reason}); reading resumed at the next header found, at offset {next}",
+                self.offset
+            ),
+            HeaderDamageKind::QuickOpenCopy { name } => write!(
+                f,
+                "member '{}' at offset {} was read from its quick-open copy, as its own header is lost",
+                String::from_utf8_lossy(name).escape_debug(),
                 self.offset
             ),
         }
@@ -81,6 +110,15 @@ impl DamageLog {
         }
     }
 
+    /// Drops what was listed for offsets in `range`: headers a damaged size
+    /// led the walk to, which a resync found were no headers at all.
+    pub(crate) fn retract(&self, range: std::ops::Range<u64>) {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|damage| !range.contains(&damage.offset));
+    }
+
     pub(crate) fn take(&self) -> Vec<HeaderDamage> {
         let mut list = std::mem::take(
             &mut *self
@@ -100,4 +138,14 @@ pub(crate) fn record_reason(error: &crate::Error) -> &'static str {
         crate::Error::TooShort => "it runs past the end of its data",
         _ => "it doesn't parse",
     }
+}
+
+/// Whether `error` is what decoding a member's bytes can end in: invalid
+/// data or a checksum that fails. A member whose history was lost reports
+/// that instead, as the cause.
+pub(crate) fn decoding_failure(error: &crate::Error) -> bool {
+    matches!(
+        error.kind(),
+        crate::ErrorKind::InvalidArchive | crate::ErrorKind::ChecksumMismatch
+    )
 }
