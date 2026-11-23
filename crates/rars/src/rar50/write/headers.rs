@@ -462,8 +462,7 @@ pub(super) fn write_main_header(
     )
 }
 
-/// `iv` is drawn by the caller when the header has to keep its place among
-/// the archive's draws but is rendered after them.
+/// The IV is drawn early when the header is rendered after the members.
 pub(super) fn encrypted_main_header_block(
     keys: &Rar50Keys,
     iv: Option<[u8; 16]>,
@@ -651,7 +650,51 @@ pub(super) fn prepared_header_image(
     keys: Option<&HeaderEncryptionKeys>,
     resources: &crate::WriterResources,
 ) -> Result<PreparedHeader> {
-    let image = HeaderImage::new(header_type, flags, data_size, type_specific, extra)?;
+    prepared_header_image_at_least(
+        0,
+        header_type,
+        flags,
+        data_size,
+        type_specific,
+        extra,
+        keys,
+        resources,
+    )
+}
+
+/// A header written over a longer one is padded to cover it.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn prepared_header_image_at_least(
+    len: usize,
+    header_type: u64,
+    flags: u64,
+    data_size: Option<u64>,
+    type_specific: &[u8],
+    extra: &[u8],
+    keys: Option<&HeaderEncryptionKeys>,
+    resources: &crate::WriterResources,
+) -> Result<PreparedHeader> {
+    let mut width = 0;
+    let image = loop {
+        let image = HeaderImage::with_data_size_width(
+            header_type,
+            flags,
+            data_size,
+            width,
+            type_specific,
+            extra,
+        )?;
+        if image.header_len(keys.is_some())? >= len {
+            break image;
+        }
+        // A vint holds 64 bits in ten bytes and readers take no more.
+        if width >= 10 || data_size.is_none() {
+            return Err(Error::InvalidArgument(
+                "RAR 5 header cannot be padded to cover the one before it",
+            ));
+        }
+        width = width.max(1) + 1;
+    };
     let length = image.header_len(keys.is_some())?;
     let charge = resources.reserve_prepared_header(length as u64)?;
     let bytes = image.render(keys.map(|keys| &keys.keys), &[], resources)?;
@@ -686,6 +729,30 @@ pub(super) fn repeated_header_image(
         ));
     }
     Ok(out)
+}
+
+/// A provisional header and its patch share `iv` and `width`, so they match in length.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reserved_header_image(
+    header_type: u64,
+    flags: u64,
+    data_size: u64,
+    width: usize,
+    type_specific: &[u8],
+    extra: &[u8],
+    keys: Option<&HeaderEncryptionKeys>,
+    iv: Option<[u8; 16]>,
+    resources: &crate::WriterResources,
+) -> Result<Bytes> {
+    let image = HeaderImage::with_data_size_width(
+        header_type,
+        flags,
+        Some(data_size),
+        width,
+        type_specific,
+        extra,
+    )?;
+    image.render_with_iv(keys.map(|keys| &keys.keys), iv, &[], resources)
 }
 
 #[cfg(test)]

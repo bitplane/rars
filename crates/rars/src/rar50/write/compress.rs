@@ -522,8 +522,12 @@ struct MemberStream<B: Budget> {
     source: EntrySource,
     reader: Option<Box<dyn crate::EntryReader>>,
     remaining: u64,
-    /// Taken when the member is handed on.
+    /// Taken when handed on; a member going straight out never fills it.
     packed: Option<Spool>,
+    straight: bool,
+    packed_len: u64,
+    /// Members go out in order, so one waits for its last block to be packed.
+    done: bool,
     /// A chunk read to decide a block boundary and not used by that block.
     pushback: Buffer<u8, B>,
     /// How much of the member has gone into jobs so far.
@@ -558,6 +562,9 @@ impl<B: Budget> MemberStream<B> {
             reader: None,
             remaining: size,
             packed: Some(Spool::create_parked(resources)?),
+            straight: false,
+            packed_len: 0,
+            done: size == 0,
             pushback: Buffer::new(allowance),
             placed: 0,
             crc: Crc32::new(),
@@ -576,12 +583,34 @@ impl<B: Budget> MemberStream<B> {
             .expect("a member is packed before it is handed on")
     }
 
-    /// Hands on a member with nothing left, its blocks all packed.
     fn hand_on(&mut self, consume: &mut ConsumePacked<'_>) -> Result<()> {
-        let packed = self.packed.take().expect("a member is handed on once");
         let hash = self.hash.take().map(blake2sp::Hasher::finalize);
-        consume(self.member, packed, self.crc.finish(), hash)
+        let crc32 = self.crc.finish();
+        let packing = if self.straight {
+            Packing::Closed {
+                crc32,
+                hash,
+                packed_len: self.packed_len,
+            }
+        } else {
+            let packed = self.packed.take().expect("a member is handed on once");
+            Packing::Done(packed, crc32, hash)
+        };
+        consume(self.member, packing)
     }
+}
+
+/// Writing a member can take workspace, so no wave may hold any when this runs.
+fn hand_on_done<B: Budget>(
+    streams: &mut [MemberStream<B>],
+    handed: &mut usize,
+    consume: &mut ConsumePacked<'_>,
+) -> Result<()> {
+    while *handed < streams.len() && streams[*handed].done {
+        streams[*handed].hand_on(consume)?;
+        *handed += 1;
+    }
+    Ok(())
 }
 
 /// `advance` is called with each newly completed chunk of work and returns
@@ -601,15 +630,17 @@ pub(super) fn compress_members_with_context(
         advance,
         error_context,
         false,
-        &mut |_, member| members.push(member),
+        &|_, _| false,
+        &mut |_, handed| match handed {
+            Handed::Member(member) => members.push(member),
+            _ => unreachable!("no member goes out straight"),
+        },
     )?;
     Ok(members)
 }
 
-/// Hands each member to `consume` in order as soon as its window is done, so a
-/// writer can emit it while later members are still to be read. With
-/// `stored_hashed_later`, stored members are left unhashed for a writer that
-/// hashes them as it copies.
+/// Members are handed on as their windows finish, so a writer need not hold them all.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn compress_members_in_order(
     sources: &[EntrySource],
     plan: &CompressPlan,
@@ -617,6 +648,7 @@ pub(super) fn compress_members_in_order(
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     stored_hashed_later: bool,
+    straight: &Straight<'_>,
     consume: &mut Consume<'_>,
 ) -> Result<()> {
     if advance.is_cancelled() || resources.is_cancelled() {
@@ -631,6 +663,7 @@ pub(super) fn compress_members_in_order(
             advance,
             error_context,
             stored_hashed_later,
+            straight,
             consume,
         );
     };
@@ -678,7 +711,8 @@ pub(super) fn compress_members_in_order(
             &Remapped::new(&coded, advance),
             &|member, error| error_context(coded[member], error),
             stored_hashed_later,
-            &mut |member, compressed| {
+            &|member, size| straight(coded[member], size),
+            &mut |member, handed| {
                 let index = coded[member];
                 hand_on_stored(
                     &stored,
@@ -688,7 +722,7 @@ pub(super) fn compress_members_in_order(
                     resources,
                     consume,
                 )?;
-                consume(index, compressed)
+                consume(index, handed)
             },
         )?;
     }
@@ -720,7 +754,7 @@ fn hand_on_stored(
             store: true,
             solid_continuation: false,
         };
-        consume(stored[*next], member)?;
+        consume(stored[*next], Handed::Member(member))?;
         *next += 1;
     }
     Ok(())
@@ -848,6 +882,7 @@ fn probe_packed_len<B: Budget>(
     Ok(packed.len())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compress_members_as_planned(
     sources: &[EntrySource],
     plan: &CompressPlan,
@@ -855,6 +890,7 @@ fn compress_members_as_planned(
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     stored_hashed_later: bool,
+    straight: &Straight<'_>,
     consume: &mut Consume<'_>,
 ) -> Result<()> {
     let mut integrity = Records::new(sources.len(), resources)?;
@@ -872,22 +908,26 @@ fn compress_members_as_planned(
     // the two cases that are not really fallbacks: storing was asked for, and
     // an empty member has nothing to pack. `StoreFallback` refuses to store a
     // solid member, whose successors decode against the dictionary it fills.
-    let finished =
-        |member: usize, packed: Spool, input_size: u64, crc32: u32, hash| CompressedMember {
+    let store = |input_size: u64, packed_len: u64| {
+        plan.method == 0
+            || input_size == 0
+            || should_store_compressed_payload(
+                input_size,
+                packed_len,
+                plan.solid,
+                &plan.filter_policy,
+            )
+    };
+    let stored = |index: usize, (input_size, crc32, hash): Integrity| {
+        Ok::<_, Error>(Handed::Member(CompressedMember {
             input_size,
             crc32,
             hash,
-            store: plan.method == 0
-                || input_size == 0
-                || should_store_compressed_payload(
-                    input_size,
-                    packed.len(),
-                    plan.solid,
-                    &plan.filter_policy,
-                ),
-            packed,
-            solid_continuation: plan.solid && member > 0,
-        };
+            store: true,
+            packed: Spool::create_parked(resources)?,
+            solid_continuation: plan.solid && index > 0,
+        }))
+    };
     match execution {
         ExecutionPlan::IndependentMembers(members) => compress_members_whole(
             sources,
@@ -897,19 +937,15 @@ fn compress_members_as_planned(
             resources,
             advance,
             error_context,
+            straight,
             consume,
         ),
         // Storing is not "compress and hope it does not help": the header
         // records method zero, so the payload must be the source bytes.
-        ExecutionPlan::Stored if stored_hashed_later => {
-            integrity
-                .iter()
-                .enumerate()
-                .try_for_each(|(index, &(size, crc, hash))| {
-                    let packed = Spool::create_parked(resources)?;
-                    consume(index, finished(index, packed, size, crc, hash))
-                })
-        }
+        ExecutionPlan::Stored if stored_hashed_later => integrity
+            .iter()
+            .enumerate()
+            .try_for_each(|(index, &member)| consume(index, stored(index, member)?)),
         ExecutionPlan::Stored => hash_stored_members(
             sources,
             &integrity,
@@ -917,10 +953,7 @@ fn compress_members_as_planned(
             resources,
             advance,
             error_context,
-            &mut |index, size, crc, hash| {
-                let packed = Spool::create_parked(resources)?;
-                consume(index, finished(index, packed, size, crc, hash))
-            },
+            &mut |index, size, crc, hash| consume(index, stored(index, (size, crc, hash))?),
         ),
         ExecutionPlan::Blocks {
             workspace,
@@ -936,20 +969,95 @@ fn compress_members_as_planned(
             resources,
             advance,
             error_context,
-            &mut |index, packed, crc, hash| {
-                consume(
-                    index,
-                    finished(index, packed, integrity[index].0, crc, hash),
-                )
+            straight,
+            &mut |index, packing| {
+                let input_size = integrity[index].0;
+                let handed = settle(packing, input_size, plan.solid && index > 0, &store);
+                consume(index, handed)
             },
         ),
     }
 }
 
-/// Receives each finished member, in order, with its index.
-pub(super) type Consume<'a> = dyn FnMut(usize, CompressedMember) -> Result<()> + 'a;
-/// Receives each member's packed bytes and checksums, in order.
-type ConsumePacked<'a> = dyn FnMut(usize, Spool, u32, Option<[u8; 32]>) -> Result<()> + 'a;
+fn settle<'b>(
+    packing: Packing<'b>,
+    input_size: u64,
+    solid_continuation: bool,
+    store: &dyn Fn(u64, u64) -> bool,
+) -> Handed<'b> {
+    match packing {
+        Packing::Done(packed, crc32, hash) => Handed::Member(CompressedMember {
+            input_size,
+            crc32,
+            hash,
+            store: store(input_size, packed.len()),
+            packed,
+            solid_continuation,
+        }),
+        Packing::Opening(input_size) => Handed::Opening { input_size },
+        Packing::Packed(bytes) => Handed::Packed(bytes),
+        Packing::Closed {
+            crc32,
+            hash,
+            packed_len,
+        } => Handed::Closed(ClosedMember {
+            input_size,
+            crc32,
+            hash,
+            packed_len,
+            store: store(input_size, packed_len),
+        }),
+    }
+}
+
+/// A large member goes out as it is packed, so it is handed on in pieces.
+pub(super) enum Handed<'b> {
+    Member(CompressedMember),
+    /// Every member before it has been handed on.
+    Opening {
+        input_size: u64,
+    },
+    Packed(&'b [u8]),
+    Closed(ClosedMember),
+}
+
+pub(super) struct ClosedMember {
+    pub(super) input_size: u64,
+    pub(super) crc32: u32,
+    pub(super) hash: Option<[u8; 32]>,
+    pub(super) packed_len: u64,
+    /// Its packed bytes are already out, so the writer stores it over them.
+    pub(super) store: bool,
+}
+
+impl ClosedMember {
+    pub(super) fn stored(&self, resources: &WriterResources) -> Result<CompressedMember> {
+        Ok(CompressedMember {
+            input_size: self.input_size,
+            crc32: self.crc32,
+            hash: self.hash,
+            packed: Spool::create_parked(resources)?,
+            store: true,
+            solid_continuation: false,
+        })
+    }
+}
+
+pub(super) type Consume<'a> = dyn FnMut(usize, Handed<'_>) -> Result<()> + 'a;
+pub(super) type Straight<'a> = dyn Fn(usize, u64) -> bool + Sync + 'a;
+
+/// The store rule differs by path, so packing hands on before applying it.
+enum Packing<'b> {
+    Done(Spool, u32, Option<[u8; 32]>),
+    Opening(u64),
+    Packed(&'b [u8]),
+    Closed {
+        crc32: u32,
+        hash: Option<[u8; 32]>,
+        packed_len: u64,
+    },
+}
+type ConsumePacked<'a> = dyn FnMut(usize, Packing<'_>) -> Result<()> + 'a;
 
 /// Members' checksums are independent, so a window of them is hashed across the pool.
 fn hash_stored_members(
@@ -1015,6 +1123,7 @@ fn compress_streaming_members(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    straight: &Straight<'_>,
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()> {
     if resources.memory_limit() < required {
@@ -1039,13 +1148,10 @@ fn compress_streaming_members(
         .min(crate::parallel::threads())
         .max(1);
 
-    if let Some(allowance) = &resources.execution {
-        let encode = if plan.solid {
-            compress_solid_chain::<crate::codec::workspace::Limited>
-        } else {
-            compress_independent_members::<crate::codec::workspace::Limited>
-        };
-        return encode(
+    // One dictionary runs through solid members, so none can be stored
+    // instead once its packed bytes have gone out, and none goes straight.
+    match (&resources.execution, plan.solid) {
+        (Some(allowance), true) => compress_solid_chain(
             sources,
             integrity,
             plan,
@@ -1057,11 +1163,22 @@ fn compress_streaming_members(
             error_context,
             allowance,
             consume,
-        );
-    }
-
-    if plan.solid {
-        compress_solid_chain(
+        ),
+        (Some(allowance), false) => compress_independent_members(
+            sources,
+            integrity,
+            plan,
+            run_filters,
+            batch_capacity,
+            required,
+            resources,
+            advance,
+            error_context,
+            allowance,
+            straight,
+            consume,
+        ),
+        (None, true) => compress_solid_chain(
             sources,
             integrity,
             plan,
@@ -1073,9 +1190,8 @@ fn compress_streaming_members(
             error_context,
             &Allowance::default(),
             consume,
-        )
-    } else {
-        compress_independent_members(
+        ),
+        (None, false) => compress_independent_members(
             sources,
             integrity,
             plan,
@@ -1086,8 +1202,9 @@ fn compress_streaming_members(
             advance,
             error_context,
             &Allowance::default(),
+            straight,
             consume,
-        )
+        ),
     }
 }
 
@@ -1129,6 +1246,7 @@ fn compress_members_whole(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    straight: &Straight<'_>,
     consume: &mut Consume<'_>,
 ) -> Result<()> {
     let mut start = 0;
@@ -1172,6 +1290,7 @@ fn compress_members_whole(
                 resources,
                 advance,
                 error_context,
+                straight,
                 consume,
             )?;
             start = end;
@@ -1244,7 +1363,7 @@ fn compress_members_whole(
         // The writer may need workspace of its own for what it is handed.
         drop(permit);
         for (index, member) in (start..end).zip(completed) {
-            consume(index, member)?;
+            consume(index, Handed::Member(member))?;
         }
         start = end;
     }
@@ -1414,6 +1533,7 @@ fn compress_fallback_members(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    straight: &Straight<'_>,
     consume: &mut Consume<'_>,
 ) -> Result<()> {
     struct Remapped<'a> {
@@ -1450,24 +1570,13 @@ fn compress_fallback_members(
             progress: advance,
         },
         &|member, error| error_context(first + member, error),
-        &mut |member, packed, crc32, hash| {
-            let input_size = integrity[member].0;
-            consume(
-                first + member,
-                CompressedMember {
-                    input_size,
-                    crc32,
-                    hash,
-                    store: should_store_compressed_payload(
-                        input_size,
-                        packed.len(),
-                        false,
-                        &plan.filter_policy,
-                    ),
-                    packed,
-                    solid_continuation: false,
-                },
-            )
+        &|member, size| straight(first + member, size),
+        &mut |member, packing| {
+            let store = |input_size, packed_len| {
+                should_store_compressed_payload(input_size, packed_len, false, &plan.filter_policy)
+            };
+            let handed = settle(packing, integrity[member].0, false, &store);
+            consume(first + member, handed)
         },
     )
     // What a member was handed back with already names its member.
@@ -1499,6 +1608,7 @@ fn compress_independent_members<B: Budget + Send + Sync>(
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     allowance: &B,
+    straight: &Straight<'_>,
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()>
 where
@@ -1533,7 +1643,22 @@ where
         )?;
         let mut offsets = Records::collect((0..streams.len()).map(|_| Ok(0usize)), resources)?;
         let mut cursor = 0usize;
+        let mut handed = 0usize;
+        let goes_straight = |stream: &MemberStream<B>| straight(stream.member, stream.input_size);
         while streams.iter().any(MemberStream::has_more) {
+            // Between waves, so writing a whole member holds no workspace.
+            hand_on_done(&mut streams, &mut handed, consume)?;
+            // A member that goes straight out opens a wave of its own, once
+            // every member before it is out.
+            if let Some(member) = (cursor..streams.len()).find(|&m| streams[m].has_more()) {
+                let stream = &mut streams[member];
+                if offsets[member] == 0 && goes_straight(stream) {
+                    debug_assert_eq!(handed, member, "members before it are out");
+                    stream.straight = true;
+                    stream.packed = None;
+                    consume(stream.member, Packing::Opening(stream.input_size))?;
+                }
+            }
             let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
             let reserved = required.saturating_mul(wave_capacity as u64);
             let _permit = resources
@@ -1550,6 +1675,9 @@ where
                     continue;
                 }
                 misses = 0;
+                if offsets[member] == 0 && !stream.straight && goes_straight(stream) {
+                    break;
+                }
 
                 let mut job = BlockJob {
                     data: Buffer::new(allowance),
@@ -1633,12 +1761,12 @@ where
                 resources,
                 advance,
                 error_context,
+                consume,
             )?;
         }
 
-        for stream in streams.iter_mut() {
-            stream.hand_on(consume)?;
-        }
+        hand_on_done(&mut streams, &mut handed, consume)?;
+        debug_assert_eq!(handed, streams.len(), "every member is handed on");
         group_start = group_end;
     }
     Ok(())
@@ -1791,19 +1919,14 @@ where
             resources,
             advance,
             error_context,
+            consume,
         )?;
         // The writer may need workspace of its own for what it is handed.
         drop(permit);
-        // Every block read so far is packed, so a member with nothing left is done.
-        while handed < streams.len() && !streams[handed].has_more() {
-            streams[handed].hand_on(consume)?;
-            handed += 1;
-        }
+        hand_on_done(&mut streams, &mut handed, consume)?;
     }
-    // Empty members after the last block.
-    for stream in &mut streams[handed..] {
-        stream.hand_on(consume)?;
-    }
+    hand_on_done(&mut streams, &mut handed, consume)?;
+    debug_assert_eq!(handed, streams.len(), "every member is handed on");
     Ok(())
 }
 
@@ -2005,6 +2128,7 @@ where
 
 /// Compresses a wave of blocks in parallel, then appends the results to their
 /// members in job order so output does not depend on scheduling.
+#[allow(clippy::too_many_arguments)]
 fn compress_wave<B: Budget + Send + Sync>(
     jobs: Records<BlockJob<B>>,
     plan: &CompressPlan,
@@ -2013,6 +2137,7 @@ fn compress_wave<B: Budget + Send + Sync>(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    consume: &mut ConsumePacked<'_>,
 ) -> Result<()>
 where
     B::Charge: Send,
@@ -2026,7 +2151,7 @@ where
             |_| _required,
             |job, _, progress, allowance| encode_block_job(job, plan, progress, allowance),
         )?;
-        return append_packed_runs(packed_runs, plan, streams, advance, error_context);
+        return append_packed_runs(packed_runs, plan, streams, advance, error_context, consume);
     }
     let jobs = prepare_block_jobs::<B, B>(jobs, resources)?;
     let packed_runs = run_jobs(jobs, resources, advance, |job, progress| {
@@ -2036,7 +2161,7 @@ where
         }
         encode_block_job(job, plan, progress, &allowance)
     })?;
-    append_packed_runs(packed_runs, plan, streams, advance, error_context)
+    append_packed_runs(packed_runs, plan, streams, advance, error_context, consume)
 }
 
 type PackedBlocks<B> = Records<(usize, Buffer<u8, B>, bool)>;
@@ -2213,6 +2338,7 @@ fn append_packed_runs<B: Budget, C: Budget>(
     streams: &mut [MemberStream<B>],
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    consume: &mut ConsumePacked<'_>,
 ) -> Result<()> {
     // A solid wave can cover thousands of tiny members. Keep only the spool
     // currently being appended open, rather than one descriptor per member.
@@ -2220,33 +2346,43 @@ fn append_packed_runs<B: Budget, C: Budget>(
     for (member, packed, last) in packed_runs.into_iter().flatten() {
         if previous != Some(member) {
             if let Some(previous) = previous {
-                streams[previous].packed().park();
+                if let Some(spool) = streams[previous].packed.as_mut() {
+                    spool.park();
+                }
             }
             previous = Some(member);
         }
-        streams[member]
-            .packed()
-            .write_all(&packed)
-            .map_err(|error| error_context(streams[member].member, error.into()))?;
+        let stream = &mut streams[member];
+        stream.packed_len += packed.len() as u64;
+        if stream.straight {
+            consume(stream.member, Packing::Packed(&packed))?;
+        } else {
+            stream
+                .packed()
+                .write_all(&packed)
+                .map_err(|error| error_context(stream.member, error.into()))?;
+        }
         if last {
-            let stream = &mut streams[member];
             // A completed block run always came from `has_more`, so an empty
             // member cannot reach this branch.
             if !should_store_compressed_payload(
                 stream.input_size,
-                stream.packed().len(),
+                stream.packed_len,
                 plan.solid,
                 &plan.filter_policy,
             ) {
                 stream.source.release();
             }
+            stream.done = true;
             advance.finished(stream.member, stream.input_size);
         }
     }
     // Both wave builders dispatch only non-empty jobs, and every job emits
     // one packed block for each recorded boundary.
     let previous = previous.expect("compression wave contains a packed block");
-    streams[previous].packed().park();
+    if let Some(spool) = streams[previous].packed.as_mut() {
+        spool.park();
+    }
     Ok(())
 }
 
@@ -2290,7 +2426,11 @@ fn compress_members_hashing_stored_later(
         advance,
         error_context,
         true,
-        &mut |_, member| members.push(member),
+        &|_, _| false,
+        &mut |_, handed| match handed {
+            Handed::Member(member) => members.push(member),
+            _ => unreachable!("no member goes out straight"),
+        },
     )?;
     Ok(members)
 }
@@ -2303,12 +2443,48 @@ mod tests {
     ) -> Result<Vec<Spool>> {
         let sizes = integrity.to_vec();
         let mut spools = Vec::new();
-        run(&sizes, &mut |member, packed, crc, hash| {
+        run(&sizes, &mut |member, packing| {
+            let Packing::Done(packed, crc, hash) = packing else {
+                unreachable!("no member goes out straight");
+            };
             (integrity[member].1, integrity[member].2) = (crc, hash);
             spools.push(packed);
             Ok(())
         })?;
         Ok(spools)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn independent<B: Budget + Send + Sync>(
+        sources: &[EntrySource],
+        integrity: &[Integrity],
+        plan: &CompressPlan,
+        filter_runs: bool,
+        batch_capacity: usize,
+        required: u64,
+        resources: &WriterResources,
+        advance: &dyn CompressionProgress,
+        error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+        allowance: &B,
+        consume: &mut ConsumePacked<'_>,
+    ) -> Result<()>
+    where
+        B::Charge: Send,
+    {
+        compress_independent_members(
+            sources,
+            integrity,
+            plan,
+            filter_runs,
+            batch_capacity,
+            required,
+            resources,
+            advance,
+            error_context,
+            allowance,
+            &|_, _| false,
+            consume,
+        )
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -2447,6 +2623,7 @@ mod tests {
                 assert_eq!(index, 0);
                 error.at_entry(b"waiting.bin".to_vec(), "compressing")
             },
+            &|_, _| false,
             &mut |_, _| Ok(()),
         )
         .err()
@@ -2931,6 +3108,7 @@ mod tests {
                     &resources,
                     progress,
                     &|_, error| error,
+                    &|_, _| false,
                     &mut |_, _| Ok(()),
                 )
                 .err()
@@ -3041,7 +3219,7 @@ mod tests {
             let encode = if solid {
                 compress_solid_chain::<Allowance>
             } else {
-                compress_independent_members::<Allowance>
+                independent::<Allowance>
             };
             let expected = packed_by(&mut expected_integrity, |integrity, consume| {
                 encode(
@@ -3078,7 +3256,7 @@ mod tests {
                 let encode = if solid {
                     compress_solid_chain::<crate::codec::workspace::Limited>
                 } else {
-                    compress_independent_members::<crate::codec::workspace::Limited>
+                    independent::<crate::codec::workspace::Limited>
                 };
                 let result = packed_by(&mut integrity, |integrity, consume| {
                     encode(
@@ -3119,7 +3297,7 @@ mod tests {
             let encode = if solid {
                 compress_solid_chain::<crate::codec::workspace::Limited>
             } else {
-                compress_independent_members::<crate::codec::workspace::Limited>
+                independent::<crate::codec::workspace::Limited>
             };
             let mut integrity = initial;
             let result = packed_by(&mut integrity, |integrity, consume| {
@@ -3172,7 +3350,7 @@ mod tests {
             let encode = if solid {
                 compress_solid_chain::<Allowance>
             } else {
-                compress_independent_members::<Allowance>
+                independent::<Allowance>
             };
             let expected = packed_by(&mut expected_integrity, |integrity, consume| {
                 encode(
@@ -3194,7 +3372,7 @@ mod tests {
             let encode = if solid {
                 compress_solid_chain::<crate::codec::workspace::Limited>
             } else {
-                compress_independent_members::<crate::codec::workspace::Limited>
+                independent::<crate::codec::workspace::Limited>
             };
             let actual = packed_by(&mut actual_integrity, |integrity, consume| {
                 encode(

@@ -227,8 +227,7 @@ const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
 /// and text does not care either way. The curve turns back up below 32K, where
 /// re-sending the tables starts to cost more than fitting them gains.
 const RAR29_LZ_BLOCK_SIZE: usize = 64 * 1024;
-/// Smaller members keep the whole-member engine and filter trials.
-const STREAM_MEMBERS_ABOVE: u64 = 64 * 1024 * 1024;
+use crate::write_stream::STREAM_MEMBERS_ABOVE;
 
 /// The largest dictionary the format encodes, used when a memory estimate
 /// cannot resolve the real one. It has to stay an upper bound, so it does not

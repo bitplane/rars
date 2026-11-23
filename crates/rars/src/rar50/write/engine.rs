@@ -3,8 +3,12 @@
 //! Native member spools use temporary files; bare-WASM spools retain bytes in
 //! memory. Compression may load whole members; headers also allocate memory.
 //! Service payloads borrow input and are encrypted in chunks during emission.
-//! Quick-open data uses a quota-controlled spool. Once block lengths are known,
-//! final archive output streams in one pass. The
+//! Quick-open data uses a quota-controlled spool. Members go out in order as
+//! their windows finish, unless quick open or recovery needs every block
+//! length before the main header, in which case they are held until the
+//! last. On a seekable output, a large unencrypted non-solid member goes out
+//! as it is packed, behind a header patched once it is done, or stored over
+//! its attempt when packing does not pay. The
 //! workspace admission budget is not an aggregate RAM or disk quota.
 //!
 //! Stored payloads are reread and verified during emission, or, when the output
@@ -12,7 +16,7 @@
 //! with the checksums of what was copied. Recovery requires
 //! a further pass over the preceding archive bytes, mirrored into a spool.
 
-use super::compress::{self, CompressPlan, CompressedMember};
+use super::compress::{self, ClosedMember, CompressPlan, CompressedMember, Handed};
 #[cfg(test)]
 use super::headers::write_vint;
 use super::headers::{
@@ -22,6 +26,7 @@ use super::headers::{
     write_file_encryption_record, write_hash_record_with_value, write_head_crypt,
     write_main_header, HeaderEncryptionKeys, PreparedHeader, WriteKeys,
 };
+use super::headers::{prepared_header_image_at_least, reserved_header_image};
 use super::layout::{recovery_covers, resolve_layout, settle_layout, LayoutInputs};
 use super::{encrypt_reader_to, ArchiveEntry};
 use crate::crypto::rar50::Rar50Keys;
@@ -403,6 +408,23 @@ pub(super) fn write_archive<'a>(
         (Some(held), None)
     };
 
+    // Large members go out as they are packed, behind a header patched once
+    // they are done, when the archive can seek and nothing is held. Only a
+    // member that would be stored rather than grow does: its payload never
+    // outgrows its declared size, which sizes the header's reserved field.
+    let straight_above = sink.stream_above.filter(|_| {
+        in_order
+            && sink.can_seek()
+            && !plan.compress.solid
+            && !matches!(
+                plan.compress.filter_policy,
+                super::FilterPolicy::Explicit(_)
+            )
+    });
+    let straight = |index: usize, size: u64| {
+        straight_above.is_some_and(|above| size > above) && entries[index].password.is_none()
+    };
+    let mut in_place: Option<InPlace> = None;
     compress::compress_members_in_order(
         &sources,
         &plan.compress,
@@ -413,41 +435,93 @@ pub(super) fn write_archive<'a>(
         },
         &|index, error| member_error(error, &entries[index].name, "compressing"),
         hash_on_copy,
-        &mut |index, member| {
+        &straight,
+        &mut |index, handed| {
             check_cancelled(plan.progress)?;
             let entry = &entries[index];
             // A member and its services are all prepared before any goes out.
             let mut blocks = Records::<PreparedBlock>::new(1 + entry.services.len(), resources)?;
-            let block = prepare_member(
-                entry,
-                member,
-                &plan,
-                hash_on_copy,
-                &mut write_keys,
-                header_keys.as_ref(),
-                resources,
-            )
-            .map_err(|error| member_error(error, &entry.name, "preparing"))?;
-            blocks.push(block)?;
-            for service in &entry.services {
-                let block =
-                    prepare_service(service, &mut write_keys, header_keys.as_ref(), resources)
-                        .map_err(|error| member_error(error, &entry.name, "preparing service"))?;
-                blocks.push(block)?;
+            let mut opening = None;
+            match handed {
+                Handed::Packed(bytes) => {
+                    let member = in_place.as_mut().expect("packed bytes follow an opening");
+                    return member
+                        .write(bytes, &mut sink)
+                        .map_err(|error| member_error(error, &entry.name, "writing"));
+                }
+                Handed::Opening { input_size } => opening = Some(input_size),
+                Handed::Member(member) => {
+                    let block = prepare_member(
+                        entry,
+                        member,
+                        &plan,
+                        hash_on_copy,
+                        0,
+                        &mut write_keys,
+                        header_keys.as_ref(),
+                        resources,
+                    )
+                    .map_err(|error| member_error(error, &entry.name, "preparing"))?;
+                    blocks.push(block)?;
+                }
+                Handed::Closed(closed) => {
+                    let member = in_place.take().expect("a member closes after it opens");
+                    if closed.store {
+                        // Stored, the member goes over the attempt, which it
+                        // is at least as long as.
+                        let block = prepare_member(
+                            entry,
+                            closed.stored(resources)?,
+                            &plan,
+                            false,
+                            member.header_len(),
+                            &mut write_keys,
+                            header_keys.as_ref(),
+                            resources,
+                        )
+                        .map_err(|error| member_error(error, &entry.name, "preparing"))?;
+                        blocks.push(block)?;
+                    }
+                    member
+                        .close(entry, &closed, &mut sink, header_keys.as_ref(), resources)
+                        .map_err(|error| member_error(error, &entry.name, "writing"))?;
+                }
+            }
+            if opening.is_none() {
+                for service in &entry.services {
+                    let block =
+                        prepare_service(service, &mut write_keys, header_keys.as_ref(), resources)
+                            .map_err(|error| {
+                                member_error(error, &entry.name, "preparing service")
+                            })?;
+                    blocks.push(block)?;
+                }
+            }
+            if held.is_none() {
+                if let Some(leading) = leading.take() {
+                    begin(&mut sink, &mut mirror)?;
+                    for block in leading {
+                        emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
+                    }
+                }
+            }
+            if let Some(input_size) = opening {
+                let opened = InPlace::open(
+                    entry,
+                    input_size,
+                    &plan,
+                    &mut sink,
+                    header_keys.as_ref(),
+                    resources,
+                );
+                in_place =
+                    Some(opened.map_err(|error| member_error(error, &entry.name, "writing"))?);
             }
             for mut block in blocks {
                 block.entry_index = Some(index);
                 match held.as_mut() {
                     Some(held) => held.push(block)?,
-                    None => {
-                        if let Some(leading) = leading.take() {
-                            begin(&mut sink, &mut mirror)?;
-                            for block in leading {
-                                emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
-                            }
-                        }
-                        emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?;
-                    }
+                    None => emit(block, &mut sink, &mut mirror, &mut quick_open_payload)?,
                 }
             }
             Ok(())
@@ -618,7 +692,6 @@ pub(super) fn write_archive<'a>(
     Ok(())
 }
 
-/// The signature, any encryption header and the main header.
 #[allow(clippy::too_many_arguments)]
 fn write_archive_head(
     sink: &mut CancellableOutput<'_, '_>,
@@ -1031,11 +1104,13 @@ fn decoded_rar50_name_len(bytes: &[u8]) -> usize {
 }
 
 /// Builds a member's header and decides how its payload will be written.
+#[allow(clippy::too_many_arguments)]
 fn prepare_member<'a>(
     entry: &'a ArchiveEntry,
     member: CompressedMember,
     plan: &EnginePlan<'_>,
     hash_on_copy: bool,
+    header_at_least: usize,
     write_keys: &mut WriteKeys<'a>,
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
@@ -1089,7 +1164,8 @@ fn prepare_member<'a>(
         ),
     };
     let (specific, extra) = recipe.parts(entry, crc32, hash, resources)?;
-    let header = prepared_header_image(
+    let header = prepared_header_image_at_least(
+        header_at_least,
         HEAD_FILE,
         member_header_flags(&extra),
         Some(recipe.payload_len),
@@ -1117,6 +1193,153 @@ fn member_header_flags(extra: &[u8]) -> u64 {
         HFL_DATA
     } else {
         HFL_DATA | HFL_EXTRA
+    }
+}
+
+/// Spooling a large member costs as much temp disk as it packs to.
+struct InPlace {
+    recipe: MemberHeader,
+    header_at: u64,
+    header_len: usize,
+    /// The provisional header's, so the patched one draws no entropy.
+    iv: Option<[u8; 16]>,
+    /// Fixed by the declared size, so the archive does not depend on threads.
+    width: usize,
+    written: u64,
+}
+
+impl InPlace {
+    fn open(
+        entry: &ArchiveEntry,
+        input_size: u64,
+        plan: &EnginePlan<'_>,
+        sink: &mut CancellableOutput<'_, '_>,
+        header_keys: Option<&HeaderEncryptionKeys>,
+        resources: &WriterResources,
+    ) -> Result<Self> {
+        let compress = &plan.compress;
+        let recipe = MemberHeader {
+            compression_info: super::filter_policy::compression_info(
+                compress.algorithm_version,
+                compress.method,
+                compress.dictionary_size,
+                false,
+            )?,
+            input_size,
+            payload_len: 0,
+            encryption: None,
+        };
+        // A payload as long as the member is stored instead, so the packed
+        // size always fits the width of the declared one.
+        let width = (u64::BITS - input_size.leading_zeros()).div_ceil(7).max(1) as usize;
+        // A placeholder hash keeps the provisional header as long as its patch.
+        let placeholder = compress.blake2sp.then_some([0; 32]);
+        let header = Self::header(
+            &recipe,
+            entry,
+            0,
+            placeholder,
+            0,
+            width,
+            header_keys,
+            None,
+            resources,
+        )?;
+        let output = sink
+            .as_seekable()
+            .expect("a member goes out in place only to a seekable archive");
+        let header_at = output.stream_position()?;
+        output.write_all(&header)?;
+        Ok(Self {
+            recipe,
+            header_at,
+            header_len: header.len(),
+            iv: header_keys.map(|_| header[..16].try_into().expect("sixteen bytes")),
+            width,
+            written: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn header(
+        recipe: &MemberHeader,
+        entry: &ArchiveEntry,
+        crc32: u32,
+        hash: Option<[u8; 32]>,
+        packed_len: u64,
+        width: usize,
+        header_keys: Option<&HeaderEncryptionKeys>,
+        iv: Option<[u8; 16]>,
+        resources: &WriterResources,
+    ) -> Result<Bytes> {
+        let (specific, extra) = recipe.parts(entry, crc32, hash, resources)?;
+        reserved_header_image(
+            HEAD_FILE,
+            member_header_flags(&extra),
+            packed_len,
+            width,
+            &specific,
+            &extra,
+            header_keys,
+            iv,
+            resources,
+        )
+    }
+
+    fn header_len(&self) -> usize {
+        self.header_len
+    }
+
+    /// Those reaching the member's size are not written: it will be stored over them.
+    fn write(&mut self, bytes: &[u8], sink: &mut CancellableOutput<'_, '_>) -> Result<()> {
+        let written = self.written + bytes.len() as u64;
+        if written < self.recipe.input_size {
+            sink.writer().write_all(bytes)?;
+            self.written = written;
+        } else {
+            self.written = self.recipe.input_size;
+        }
+        Ok(())
+    }
+
+    fn close(
+        self,
+        entry: &ArchiveEntry,
+        closed: &ClosedMember,
+        sink: &mut CancellableOutput<'_, '_>,
+        header_keys: Option<&HeaderEncryptionKeys>,
+        resources: &WriterResources,
+    ) -> Result<()> {
+        let output = sink
+            .as_seekable()
+            .expect("a member goes out in place only to a seekable archive");
+        if closed.store {
+            output.seek(std::io::SeekFrom::Start(self.header_at))?;
+            return Ok(());
+        }
+        if closed.packed_len != self.written {
+            return Err(Error::InvalidArgument(
+                "RAR 5 member packed in place is not the size written",
+            ));
+        }
+        let header = Self::header(
+            &self.recipe,
+            entry,
+            closed.crc32,
+            closed.hash,
+            closed.packed_len,
+            self.width,
+            header_keys,
+            self.iv,
+            resources,
+        )?;
+        patch_header(
+            output,
+            self.header_at,
+            self.header_len as u64,
+            &header,
+            Error::InvalidArgument("RAR 5 header changed length when patched"),
+        )
     }
 }
 

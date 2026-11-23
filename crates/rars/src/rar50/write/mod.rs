@@ -14,6 +14,8 @@ mod compress;
 mod engine;
 mod filter_policy;
 pub(crate) mod headers;
+#[cfg(test)]
+mod in_place_tests;
 mod layout;
 mod plan;
 #[cfg(test)]
@@ -365,9 +367,10 @@ impl<'a> ArchiveExtras<'a> {
 }
 
 /// Writes a RAR 5 or RAR 7 archive to `output`, admitting estimated compression
-/// workspace through `resources`. Packed payloads are retained in spools before
-/// emission. This is not a total RAM or temporary-disk limit; bare-WASM spools
-/// remain in memory.
+/// workspace through `resources`. Each packed payload is held in a spool until
+/// its member is written, which happens as its window finishes, or after the
+/// last member with quick open or recovery. This is not a total RAM or
+/// temporary-disk limit; bare-WASM spools remain in memory.
 ///
 /// Supports solid compression, per-member and header encryption, and recovery
 /// records, in any combination.
@@ -401,7 +404,8 @@ pub fn write_streaming_archive_with_progress(
     )
 }
 
-/// As [`write_streaming_archive_to`], seeking back to fill in stored members' headers so each is read once.
+/// As [`write_streaming_archive_to`], seeking back to fill in stored members' headers so each is read once,
+/// and writing a member over 64 MiB as it is packed rather than spooling it.
 pub fn write_seekable_archive_to<W: Write + Seek>(
     entries: &[ArchiveEntry],
     options: WriterOptions,
@@ -427,7 +431,8 @@ pub fn write_seekable_archive_with_progress<W: Write + Seek>(
         extras,
         resources,
         progress.map(ProgressReporter),
-        crate::write_stream::CallerOutput::seekable(output),
+        crate::write_stream::CallerOutput::seekable(output)
+            .streaming_above(crate::write_stream::STREAM_MEMBERS_ABOVE),
     )
 }
 

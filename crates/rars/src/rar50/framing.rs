@@ -25,11 +25,18 @@ impl<const N: usize> HeaderScratch<N> {
         self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
         self.len += bytes.len();
     }
-    pub(crate) fn vint(&mut self, mut value: u64) {
+    pub(crate) fn vint(&mut self, value: u64) {
+        self.vint_padded(value, 0);
+    }
+    /// Readers take continuation bits as padding, so a field can be reserved.
+    pub(crate) fn vint_padded(&mut self, mut value: u64, width: usize) {
+        let mut written = 0;
         loop {
-            self.extend_from_slice(&[(value as u8 & 0x7f) | if value >= 0x80 { 0x80 } else { 0 }]);
+            written += 1;
+            let more = value >= 0x80 || written < width;
+            self.extend_from_slice(&[(value as u8 & 0x7f) | if more { 0x80 } else { 0 }]);
             value >>= 7;
-            if value == 0 {
+            if !more {
                 break;
             }
         }
@@ -82,6 +89,18 @@ impl<'a> HeaderImage<'a> {
         specific: &'a [u8],
         extra: &'a [u8],
     ) -> Result<Self> {
+        Self::with_data_size_width(kind, flags, data_size, 0, specific, extra)
+    }
+
+    /// A header written before its payload keeps its length when patched.
+    pub(crate) fn with_data_size_width(
+        kind: u64,
+        flags: u64,
+        data_size: Option<u64>,
+        width: usize,
+        specific: &'a [u8],
+        extra: &'a [u8],
+    ) -> Result<Self> {
         let mut prefix = HeaderScratch::new();
         prefix.vint(kind);
         prefix.vint(flags);
@@ -89,7 +108,7 @@ impl<'a> HeaderImage<'a> {
             prefix.vint(extra.len() as u64);
         }
         if let Some(data_size) = data_size {
-            prefix.vint(data_size);
+            prefix.vint_padded(data_size, width);
         }
         let body_len = checked_image_len(&[prefix.len(), specific.len(), extra.len()])?;
         let mut size = HeaderScratch::new();

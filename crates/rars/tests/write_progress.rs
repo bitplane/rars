@@ -110,7 +110,8 @@ fn member_events_surround_work_and_emission_surrounds_output() {
             );
             assert!(position(('s', index)) < position(('r', index)));
             assert!(position(('r', index)) < position(('f', index)));
-            assert!(position(('f', index)) < position(('e', 0)));
+            // Members go out as they finish, so emission overlaps compression.
+            assert!(position(('f', index)) < position(('z', 0)));
         }
         assert!(position(('w', 0)) < position(('z', 0)));
     }
@@ -370,6 +371,7 @@ fn cancellation_on_final_compression_update_prevents_archive_and_volume_emission
     struct CancelFinalUpdate {
         member_finished: AtomicBool,
         cancelled: AtomicBool,
+        emitted: AtomicBool,
     }
     impl WriteProgress for CancelFinalUpdate {
         fn report(&self, event: WriteProgressEvent<'_>) {
@@ -383,14 +385,14 @@ fn cancellation_on_final_compression_update_prevents_archive_and_volume_emission
                 } if self.member_finished.load(Ordering::Relaxed) => {
                     self.cancelled.store(true, Ordering::Relaxed);
                 }
+                WriteProgressEvent::OperationStarted {
+                    operation: WriteOperation::Emission,
+                    ..
+                } => self.emitted.store(true, Ordering::Relaxed),
                 WriteProgressEvent::OperationFinished {
                     operation: WriteOperation::Compression,
                     ..
-                }
-                | WriteProgressEvent::OperationStarted {
-                    operation: WriteOperation::Emission,
-                    ..
-                } => panic!("cancelled preparation reported success or began emission"),
+                } => panic!("cancelled preparation reported success"),
                 _ => {}
             }
         }
@@ -438,7 +440,12 @@ fn cancellation_on_final_compression_update_prevents_archive_and_volume_emission
                 assert_eq!(result, Err(Error::Cancelled));
                 assert!(reporter.member_finished.load(Ordering::Relaxed));
                 assert!(reporter.cancelled.load(Ordering::Relaxed));
-                assert!(output.is_empty());
+                // A single archive writes its member as it finishes, ahead of
+                // the final update, but is never closed.
+                const END_OF_ARCHIVE: [u8; 8] = [0x1d, 0x77, 0x56, 0x51, 0x03, 0x05, 0x04, 0x00];
+                assert_eq!(reporter.emitted.load(Ordering::Relaxed), !volumes);
+                assert_eq!(output.is_empty(), volumes);
+                assert!(!output.ends_with(&END_OF_ARCHIVE));
                 assert!(sink.take().is_empty());
                 assert_eq!(resources.managed_memory_in_use(), 0);
                 assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
