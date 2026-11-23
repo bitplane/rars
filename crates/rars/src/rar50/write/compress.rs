@@ -235,8 +235,14 @@ struct BlockJob<B: Budget> {
     blocks: Records<(usize, usize, bool)>,
     /// Where `data` starts in its member. Only filtered runs read it.
     offset: usize,
-    /// Filters ranged over `data`. A run with any is coded as one filtered
-    /// stream, cut where its filter records fit rather than at `blocks`.
+    /// Where one run ends and the next starts in `data`, when the job codes
+    /// several runs of its member back to back: see [`runs_per_job`]. Each
+    /// run keeps its own filter search, filters and blocks, so only the tree
+    /// it would have seeded is saved.
+    seams: Records<usize>,
+    /// Filters ranged over `data`, each inside one run. A run with any is
+    /// coded as one filtered stream, cut where its filter records fit rather
+    /// than at `blocks`.
     filters: Records<crate::FilterSpec>,
     /// In a solid run, where each member's bytes lie in `data` and how far
     /// into the member they start. A solid run can hold several members, and
@@ -437,14 +443,7 @@ where
     crate::parallel::for_each_mut(&mut pieces, |_, piece| {
         let job = piece.job;
         if !job.filters.is_empty() {
-            let last = job.blocks.last().is_some_and(|&(_, _, last)| last);
-            piece.filtered = Some(crate::codec::rar50::filter_run_in_place(
-                piece.bytes,
-                &job.filters,
-                job.offset,
-                last,
-                allowance,
-            ));
+            piece.filtered = Some(job.filter_in_place(piece.bytes, allowance));
         }
     });
     let filtered = pieces
@@ -506,12 +505,152 @@ impl<B: Budget> BlockJob<B> {
         }
         Ok(())
     }
+
+    /// The runs this job codes, over `len` bytes of them: its `data`, or its
+    /// part of a shared window once `data` has gone there.
+    fn runs(&self, len: usize) -> impl Iterator<Item = std::ops::Range<usize>> + '_ {
+        let mut start = 0;
+        self.seams
+            .iter()
+            .copied()
+            .chain(std::iter::once(len))
+            .map(move |end| {
+                let run = start..end;
+                start = end;
+                run
+            })
+    }
+
+    /// Transforms `bytes`, the job's data, into what its encode codes, and
+    /// returns the blocks it is coded in with their records. Each run is
+    /// filtered as [`filter_run_in_place`](crate::codec::rar50::filter_run_in_place)
+    /// filters a run that is a job of its own, and a run without filters
+    /// keeps its blocks, as it does when it is a job of its own.
+    fn filter_in_place<C: Budget>(
+        &self,
+        bytes: &mut [u8],
+        allowance: &C,
+    ) -> crate::codec::Result<crate::codec::rar50::FilteredRunBlocks<C>> {
+        let last = self.blocks.last().is_some_and(|&(_, _, last)| last);
+        if self.seams.is_empty() {
+            return crate::codec::rar50::filter_run_in_place(
+                bytes,
+                &self.filters,
+                self.offset,
+                last,
+                allowance,
+            );
+        }
+        let len = bytes.len();
+        let mut ends = Buffer::new(allowance);
+        let mut records = Buffer::new(allowance);
+        for run in self.runs(len) {
+            let mut filters = Buffer::new(allowance);
+            for spec in self.filters.iter() {
+                let range = spec.range.clone().unwrap_or(0..len);
+                let (start, end) = (range.start.max(run.start), range.end.min(run.end));
+                if start < end {
+                    filters.try_push(crate::FilterSpec::range(
+                        spec.kind,
+                        start - run.start..end - run.start,
+                    ))?;
+                }
+            }
+            if filters.is_empty() {
+                for &(_, end, last) in self.blocks.iter() {
+                    if run.start < end && end <= run.end {
+                        ends.try_push((end, last))?;
+                        records.try_push(Buffer::new(allowance))?;
+                    }
+                }
+                continue;
+            }
+            let (run_ends, run_records) = crate::codec::rar50::filter_run_in_place(
+                &mut bytes[run.clone()],
+                &filters,
+                self.offset + run.start,
+                last && run.end == len,
+                allowance,
+            )?;
+            for (&(end, last), block_records) in run_ends.iter().zip(run_records) {
+                ends.try_push((run.start + end, last))?;
+                records.try_push(block_records)?;
+            }
+        }
+        Ok((ends, records))
+    }
 }
 
 pub(super) fn run_size(plan: &CompressPlan) -> usize {
     plan.encode_options
         .max_match_distance
         .max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE)
+}
+
+/// How many of a member's runs one block job codes back to back.
+///
+/// A run that follows another in its member seeds a tree from the
+/// dictionary before it, which is about a fifth of level 3's time. A job of
+/// several runs parses straight on instead, and a tree that has parsed up to
+/// a run holds what one seeded there would, so the archive is the same
+/// whatever this returns. Only how many jobs can run at once changes.
+///
+/// So runs are joined up only as far as every thread still has a job: the
+/// largest member is cut into a whole number of jobs per thread, where those
+/// jobs' windows fit the budget side by side. One thread codes a member in as
+/// few jobs as the budget allows, and a machine with more threads than runs
+/// codes every run on its own, as before. A run that walks chains, which only
+/// a member's short last run does, still starts a job of its own.
+fn runs_per_job(
+    plan: &CompressPlan,
+    largest: u64,
+    admission: u64,
+    memory_limit: u64,
+    threads: usize,
+) -> usize {
+    if !plan.encode_options.optimal_parse {
+        return 1;
+    }
+    let run = run_size(plan) as u64;
+    let runs = largest.div_ceil(run).max(1);
+    let threads = threads.max(1) as u64;
+    // A window this long is what the finders are known to hold.
+    let longest = (SHARED_WINDOW_LIMIT as u64 / run).max(1);
+    for waves in 1u64.. {
+        let jobs = threads.saturating_mul(waves);
+        let joined = runs.div_ceil(jobs);
+        if joined <= 1 {
+            return 1;
+        }
+        if joined > longest {
+            continue;
+        }
+        let concurrent = threads.min(runs.div_ceil(joined));
+        if memory_limit / joined_admission(plan, admission, joined as usize) >= concurrent {
+            return usize::try_from(joined).unwrap_or(1);
+        }
+    }
+    1
+}
+
+/// What a job of `joined` runs is admitted for, beside `admission` for one:
+/// each further run is held by the coordinator while it is read and its
+/// filters are searched, and then by the job's window.
+fn joined_admission(plan: &CompressPlan, admission: u64, joined: usize) -> u64 {
+    let further = (joined.saturating_sub(1) as u64).saturating_mul(run_size(plan) as u64);
+    admission.saturating_add(further.saturating_mul(2)).max(1)
+}
+
+/// Whether the run a member starts next, `unread` bytes from its end, would
+/// search a tree when coded as a job of its own: one that follows a whole run
+/// carries a dictionary of history, and a run never ends short of its size
+/// before the member does.
+fn next_run_searches_tree(plan: &CompressPlan, unread: u64) -> bool {
+    let options = plan.encode_options;
+    let dictionary = options.max_match_distance;
+    let run = usize::try_from(unread).map_or(run_size(plan), |unread| unread.min(run_size(plan)));
+    options.optimal_parse
+        && crate::codec::rar50::searches_tree(dictionary.saturating_add(run), dictionary, options)
 }
 
 /// A member being read, and the packed bytes it has produced so far.
@@ -575,6 +714,11 @@ impl<B: Budget> MemberStream<B> {
     /// Whether this member has anything left, read or unread.
     fn has_more(&self) -> bool {
         self.remaining != 0 || !self.pushback.is_empty()
+    }
+
+    /// Bytes not yet in a job.
+    fn unread(&self) -> u64 {
+        self.remaining + self.pushback.len() as u64
     }
 
     fn packed(&mut self) -> &mut Spool {
@@ -1143,6 +1287,23 @@ fn compress_streaming_members(
         // is above the whole budget, one job at a time takes all of it.
         admission.min(resources.memory_limit())
     };
+    // A budget with its own ledger admits each job for one run's window.
+    let runs_per_job = if resources.execution.is_some() || plan.solid {
+        1
+    } else {
+        runs_per_job(
+            plan,
+            integrity.iter().map(|&(size, ..)| size).max().unwrap_or(0),
+            required,
+            resources.memory_limit(),
+            crate::parallel::threads(),
+        )
+    };
+    let required = if runs_per_job > 1 {
+        joined_admission(plan, required, runs_per_job)
+    } else {
+        required
+    };
     let batch_capacity = usize::try_from(resources.memory_limit() / required)
         .unwrap_or(usize::MAX)
         .min(crate::parallel::threads())
@@ -1169,6 +1330,7 @@ fn compress_streaming_members(
             integrity,
             plan,
             run_filters,
+            runs_per_job,
             batch_capacity,
             required,
             resources,
@@ -1196,6 +1358,7 @@ fn compress_streaming_members(
             integrity,
             plan,
             run_filters,
+            runs_per_job,
             batch_capacity,
             required,
             resources,
@@ -1602,6 +1765,7 @@ fn compress_independent_members<B: Budget + Send + Sync>(
     integrity: &[Integrity],
     plan: &CompressPlan,
     filter_runs: bool,
+    runs_per_job: usize,
     batch_capacity: usize,
     required: u64,
     resources: &WriterResources,
@@ -1691,18 +1855,30 @@ where
                     },
                     blocks: Records::new(0, resources)?,
                     offset: offsets[member],
+                    seams: Records::new(0, resources)?,
                     filters: Records::new(0, resources)?,
                     segments: Records::new(0, resources)?,
                     records: None,
                     shared: None,
                 };
-                while stream.has_more() && job.data.len() < run_size(plan) {
-                    job.append(
-                        read_block(stream, plan.block_size, advance)
-                            .map_err(|error| error_context(stream.member, error))?,
-                    )?;
-                    job.blocks
-                        .push_growing((member, job.data.len(), !stream.has_more()))?;
+                let mut run_start = 0;
+                loop {
+                    while stream.has_more() && job.data.len() - run_start < run_size(plan) {
+                        job.append(
+                            read_block(stream, plan.block_size, advance)
+                                .map_err(|error| error_context(stream.member, error))?,
+                        )?;
+                        job.blocks
+                            .push_growing((member, job.data.len(), !stream.has_more()))?;
+                    }
+                    if job.seams.len() + 1 >= runs_per_job
+                        || !stream.has_more()
+                        || !next_run_searches_tree(plan, stream.unread())
+                    {
+                        break;
+                    }
+                    run_start = job.data.len();
+                    job.seams.push_growing(run_start)?;
                 }
                 offsets[member] += job.data.len();
                 if filter_runs {
@@ -1738,12 +1914,8 @@ where
                         histories[member]
                             .remember(&job.data, plan.encode_options.max_match_distance)?;
                     } else {
-                        let window = crate::codec::rar50::filtered_run_bytes(
-                            &job.data,
-                            &job.filters,
-                            job.offset,
-                            allowance,
-                        )?;
+                        let mut window = Buffer::copied(&job.data, allowance)?;
+                        job.filter_in_place(&mut window, allowance)?;
                         histories[member]
                             .remember(&window, plan.encode_options.max_match_distance)?;
                     }
@@ -1838,6 +2010,7 @@ where
                 },
                 blocks: Records::new(0, resources)?,
                 offset: 0,
+                seams: Records::new(0, resources)?,
                 filters: Records::new(0, resources)?,
                 segments: Records::new(0, resources)?,
                 records: None,
@@ -2011,7 +2184,14 @@ fn check_source_end(reader: &mut dyn Read) -> Result<()> {
 
 /// The part of an explicit filter that falls in a job's run, ranged over it.
 fn explicit_run_filter<B: Budget>(job: &mut BlockJob<B>, spec: &crate::FilterSpec) -> Result<()> {
-    if let Some(range) = explicit_run_range(spec, job.offset..job.offset + job.data.len()) {
+    let mut found = Vec::new();
+    for run in job.runs(job.data.len()) {
+        let offset = job.offset + run.start;
+        if let Some(range) = explicit_run_range(spec, offset..job.offset + run.end) {
+            found.push(run.start + range.start..run.start + range.end);
+        }
+    }
+    for range in found {
         job.filters
             .push_growing(crate::FilterSpec::range(spec.kind, range))?;
     }
@@ -2056,9 +2236,16 @@ where
     let piece = filter_search_bytes();
     let mut pieces = Records::new(0, resources)?;
     for (index, job) in jobs.iter().enumerate() {
-        let whole = [(0..job.data.len(), job.offset)];
+        // A job of several runs searches each as it would a job of its own.
+        let runs: Vec<_> = job
+            .runs(job.data.len())
+            .map(|run| {
+                let offset = job.offset + run.start;
+                (run, offset)
+            })
+            .collect();
         let segments = if job.segments.is_empty() {
-            &whole[..]
+            &runs[..]
         } else {
             &job.segments[..]
         };
@@ -2192,7 +2379,7 @@ fn encode_block_job<B: Budget, C: Budget>(
     progress: &dyn CompressionProgress,
     allowance: &C,
 ) -> Result<PackedBlocks<C>> {
-    if !job.filters.is_empty() {
+    if !job.filters.is_empty() && job.seams.is_empty() {
         let (member, _, last) = *job.blocks.last().expect("a job holds a block");
         let mut reported = 0usize;
         let mut run_progress = |position: usize| {
@@ -2227,38 +2414,57 @@ fn encode_block_job<B: Budget, C: Budget>(
         )?),
         None => None,
     };
-    let BlockJob {
-        data,
-        history,
-        blocks,
-        ..
-    } = job;
+    let mut job = job;
+    let empty = Buffer::new(&job.data.allowance());
+    let data = std::mem::replace(&mut job.data, empty);
     // The encoder parses history and run as one window. Grow the history into
     // it and let the run go, rather than have the encoder copy both into a
     // third buffer for the whole encode.
-    let start = history.len();
-    let window = if start == 0 {
+    let start = job.history.len();
+    let mut window = if start == 0 {
         data
     } else {
-        let mut window = history;
+        let empty = Buffer::new(&data.allowance());
+        let mut window = std::mem::replace(&mut job.history, empty);
         window
             .extend_from_slice(&data)
             .map_err(Into::<crate::codec::Error>::into)?;
         drop(data);
         window
     };
+    // A job of several runs with filters among them is coded as each run would
+    // be on its own, filtered runs as one stream cut where their records fit.
+    let filtered = if job.filters.is_empty() {
+        None
+    } else {
+        Some(job.filter_in_place(&mut window[start..], allowance)?)
+    };
+    let (cuts, records) = match &filtered {
+        Some((cuts, records)) => (&cuts[..], Some(&records[..])),
+        None => (&boundaries[..], records.as_deref()),
+    };
     let packed = streaming_blocks_in_window(
         &window,
         start,
-        &boundaries,
-        records.as_deref(),
+        cuts,
+        records,
         plan.algorithm_version,
         plan.encode_options,
         Some(&mut block_done),
         allowance,
     )?;
     drop(window);
-    for ((member, _, last), packed) in blocks.into_iter().zip(packed) {
+    if filtered.is_some() {
+        let (member, _, last) = *job.blocks.last().expect("a job holds a block");
+        let mut run = Buffer::new(allowance);
+        for block in packed {
+            run.extend_from_slice(&block)
+                .map_err(Into::<crate::codec::Error>::into)?;
+        }
+        output.push((member, run, last))?;
+        return Ok(output);
+    }
+    for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
         output.push((member, packed, last))?;
     }
     Ok(output)
@@ -2476,6 +2682,7 @@ mod tests {
             integrity,
             plan,
             filter_runs,
+            1,
             batch_capacity,
             required,
             resources,
@@ -4742,6 +4949,182 @@ mod tests {
         .unwrap();
         assert_eq!(first_wave.load(Ordering::SeqCst) / run, 3);
         assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    fn joined_runs_plan(filter_policy: FilterPolicy) -> CompressPlan {
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(65536)
+            .with_optimal_parse(true);
+        CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 65536,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy,
+            candidates: vec![options].into(),
+            blake2sp: true,
+        }
+    }
+
+    /// Five runs that alternate between x86-like calls, which the search
+    /// filters, and numbered lines, which it leaves alone, with a stretch of zeros
+    /// that grows a block past a run's end, then a tail short enough to walk
+    /// chains.
+    fn joined_runs_input(run: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(5 * run + 10_000);
+        // Numbered lines: long matches, which an unoptimised build parses
+        // quickly, and every one of them distinct.
+        let mut line = 0u32;
+        let mut word = |data: &mut Vec<u8>| {
+            line += 1;
+            let text = format!(
+                "{line:07} a tree that parsed up to a run holds what one seeded there would\n"
+            );
+            data.extend_from_slice(text.as_bytes());
+        };
+        for index in 0..5 {
+            let end = (index + 1) * run - if index == 2 { 20_000 } else { 0 };
+            while data.len() < end {
+                if index % 2 == 0 {
+                    data.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5, 0xe8]);
+                    let target = 0x1000 + (data.len() as u32 / 5 % 13) * 0x40;
+                    let relative = target.wrapping_sub(data.len() as u32 + 4);
+                    data.extend_from_slice(&relative.to_le_bytes());
+                    data.extend_from_slice(&[0x5d, 0xc3]);
+                } else {
+                    word(&mut data);
+                }
+            }
+            data.truncate(end);
+            if index == 2 {
+                data.resize(data.len() + 40_000, 0);
+            }
+        }
+        while data.len() < 5 * run + 10_000 {
+            word(&mut data);
+        }
+        data.truncate(5 * run + 10_000);
+        data
+    }
+
+    /// A job of several runs parses straight through where each run of its
+    /// own seeds a tree from the history before it. The bytes are the same
+    /// either way, with the runs' filters searched, given, or not looked
+    /// for, and with jobs coded on their own or sharing a wave's window.
+    #[test]
+    fn joined_runs_code_the_bytes_their_runs_code_alone() {
+        let scratch = crate::scratch::case("joined-runs");
+        let resources = WriterResources::default().with_temp_dir(&*scratch);
+        let run = run_size(&joined_runs_plan(FilterPolicy::None));
+        let data = joined_runs_input(run);
+        let sources = [EntrySource::from_bytes(data.clone())];
+        let e8 = crate::FilterSpec::range(crate::FilterKind::E8, run / 2..3 * run + 7);
+        let mut sizes = Vec::new();
+        // Each coding takes seconds in an unoptimised build, so each policy
+        // is checked where it matters: a job of every run, jobs sharing a
+        // wave's window, and an explicit filter that spans joined runs.
+        for (policy, filter_runs, joined) in [
+            (FilterPolicy::None, false, &[(6, 1), (2, 2)][..]),
+            (FilterPolicy::Auto, true, &[(2, 3)][..]),
+            (FilterPolicy::Explicit(e8), true, &[(2, 1)][..]),
+        ] {
+            let plan = joined_runs_plan(policy.clone());
+            let code = |runs_per_job: usize, batch_capacity: usize| -> Vec<u8> {
+                let mut integrity = [(data.len() as u64, 0, None)];
+                let mut spools = super::super::plan::with_filter_search_bytes(256 * 1024, || {
+                    packed_by(&mut integrity, |integrity, consume| {
+                        compress_independent_members::<Allowance>(
+                            &sources,
+                            integrity,
+                            &plan,
+                            filter_runs,
+                            runs_per_job,
+                            batch_capacity,
+                            1,
+                            &resources,
+                            &|_| true,
+                            &|_, error| error,
+                            &Allowance::default(),
+                            &|_, _| false,
+                            consume,
+                        )
+                    })
+                })
+                .unwrap();
+                let mut packed = Vec::new();
+                spools[0].copy_to(&mut packed).unwrap();
+                packed
+            };
+            let alone = code(1, 1);
+            for &(runs_per_job, batch_capacity) in joined {
+                assert!(
+                    code(runs_per_job, batch_capacity) == alone,
+                    "{policy:?}, {runs_per_job} runs a job, {batch_capacity} jobs a wave"
+                );
+            }
+            let decoded = crate::codec::rar50::decode_lz(&alone, 0, data.len()).unwrap();
+            assert!(decoded == data, "{policy:?} does not round-trip");
+            sizes.push(alone.len());
+        }
+        // Both filtered codings filtered something.
+        assert!(sizes[1] < sizes[0] && sizes[2] < sizes[0], "{sizes:?}");
+        assert_eq!(resources.workspace_in_use(), 0);
+    }
+
+    #[test]
+    fn runs_are_joined_only_while_every_thread_keeps_a_job() {
+        const MIB: u64 = 1024 * 1024;
+        let level3 = |optimal_parse: bool| {
+            let options = EncodeOptions::new(128)
+                .with_max_match_distance(4 * MIB as usize)
+                .with_optimal_parse(optimal_parse);
+            CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 4 * MIB,
+                block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+                solid: false,
+                method: 1,
+                filter_policy: FilterPolicy::Auto,
+                candidates: vec![options].into(),
+                blake2sp: true,
+            }
+        };
+        let plan = level3(true);
+        let budget = |threads: u64| 256 * MIB + 160 * MIB * (threads - 1);
+        let joined = |size: u64, threads: usize| {
+            runs_per_job(&plan, size, 159 * MIB, budget(threads as u64), threads)
+        };
+        // Sixteen runs: one job a thread, or two a thread where a job of
+        // eight would not fit the budget twice over.
+        assert_eq!(joined(64 * MIB, 1), 8);
+        assert_eq!(joined(64 * MIB, 2), 4);
+        assert_eq!(joined(64 * MIB, 4), 4);
+        assert_eq!(joined(64 * MIB, 8), 2);
+        assert_eq!(joined(64 * MIB, 16), 1);
+        assert_eq!(joined(64 * MIB, 32), 1);
+        assert_eq!(joined(12 * MIB, 1), 3);
+        assert_eq!(joined(12 * MIB, 2), 2);
+        assert_eq!(joined(12 * MIB, 3), 1);
+        assert_eq!(joined(4 * MIB, 1), 1);
+        // Chains are seeded with one store a byte, so a lazy parse keeps its runs.
+        assert_eq!(
+            runs_per_job(&level3(false), 64 * MIB, 159 * MIB, budget(1), 1),
+            1
+        );
+        // A run that takes the whole budget is coded on its own.
+        assert_eq!(runs_per_job(&plan, 64 * MIB, 256 * MIB, budget(1), 1), 1);
+        // However many jobs run at once, the budget holds them all.
+        for threads in 1..=32 {
+            for size in [4, 8, 12, 20, 64, 1024] {
+                let runs = joined(size * MIB, threads);
+                let jobs = (size / 4).div_ceil(runs as u64).min(threads as u64);
+                let admitted = budget(threads as u64) / joined_admission(&plan, 159 * MIB, runs);
+                assert!(admitted >= jobs, "{size} MiB at {threads} threads");
+            }
+        }
     }
 }
 
