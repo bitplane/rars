@@ -5,7 +5,7 @@ const ARCHIVE_VERSIONS = Object.freeze([
 
 // Unknown keys are refused, so a misspelt or renamed setting can't be silently ignored.
 const WRITER_OPTIONS = Object.freeze([
-  "version", "level", "solid", "password", "encryptHeaders", "comment",
+  "version", "level", "solid", "password", "encryptHeaders", "blake2sp", "comment",
   "recoveryPercent", "maxMemoryBytes", "volumeSize",
 ]);
 
@@ -364,7 +364,7 @@ export function createApi(runtime) {
     const level = options.level ?? 3;
     if (!Number.isInteger(level)) throw new TypeError("level must be an integer");
     if (level < 0 || level > 5) throw invalid("level must be from 0 to 5");
-    for (const key of ["solid", "encryptHeaders"]) {
+    for (const key of ["solid", "encryptHeaders", "blake2sp"]) {
       if (options[key] !== undefined && typeof options[key] !== "boolean") {
         throw new TypeError(`${key} must be a boolean`);
       }
@@ -383,6 +383,9 @@ export function createApi(runtime) {
       if (!["rar29", "rar30", "rar40", "rar50", "rar70"].includes(version)) {
         throw invalid(`${version} cannot write header encryption`);
       }
+    }
+    if (options.blake2sp && !modern) {
+      throw invalid(`${version} cannot write BLAKE2sp file hashes`);
     }
     if (options.volumeSize !== undefined) {
       if (!Number.isSafeInteger(options.volumeSize)) {

@@ -753,32 +753,44 @@ fn writes_store_only_rar50_archive_that_reader_extracts() {
             .with_attributes(0x20)
             .with_host_os(3),
     ];
-    let bytes = write_stored_archive(
-        &entries,
-        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
-    )
-    .unwrap();
+    for blake2sp in [false, true] {
+        let mut features = FeatureSet::store_only();
+        features.blake2sp = blake2sp;
+        let bytes = write_stored_archive(
+            &entries,
+            rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
+        )
+        .unwrap();
 
-    assert_eq!(&bytes[..8], b"Rar!\x1a\x07\x01\0");
-    let archive = Archive::parse(&bytes).unwrap();
-    assert_eq!(archive.main.archive_flags, 0);
-    assert_rar50_end_header_has_flags_vint(&archive);
-    let files: Vec<_> = archive.files().collect();
-    assert_eq!(files.len(), 2);
-    assert!(files.iter().all(|file| file.is_stored()));
-    assert!(files.iter().all(|file| file.hash.is_some()));
-    assert_eq!(files[0].data_crc32, Some(crc32(&entry_data(&entries[0]))));
-    assert_eq!(files[1].data_crc32, Some(crc32(&entry_data(&entries[1]))));
-    assert_eq!(files[0].hash.as_ref().unwrap().hash_type, 0);
-    assert_eq!(files[0].hash.as_ref().unwrap().data.len(), 32);
-    files[0].verify_hash(&entry_data(&entries[0])).unwrap();
+        assert_eq!(&bytes[..8], b"Rar!\x1a\x07\x01\0");
+        let archive = Archive::parse(&bytes).unwrap();
+        assert_eq!(archive.main.archive_flags, 0);
+        assert_rar50_end_header_has_flags_vint(&archive);
+        let files: Vec<_> = archive.files().collect();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|file| file.is_stored()));
+        // A hash record only when asked for; the CRC32 always.
+        assert!(files.iter().all(|file| file.hash.is_some() == blake2sp));
+        assert_eq!(files[0].data_crc32, Some(crc32(&entry_data(&entries[0]))));
+        assert_eq!(files[1].data_crc32, Some(crc32(&entry_data(&entries[1]))));
+        if blake2sp {
+            assert_eq!(files[0].hash.as_ref().unwrap().hash_type, 0);
+            assert_eq!(files[0].hash.as_ref().unwrap().data.len(), 32);
+            files[0].verify_hash(&entry_data(&entries[0])).unwrap();
+        }
+        files[0].verify_integrity(&entry_data(&entries[0])).unwrap();
+        assert!(matches!(
+            files[0].verify_integrity(b"something else"),
+            Err(Error::Crc32Mismatch { .. } | Error::HashMismatch { .. })
+        ));
 
-    let extracted = collect_extract(&archive).unwrap();
-    assert_eq!(extracted[0].name, entries[0].name);
-    assert_eq!(extracted[0].data, entry_data(&entries[0]));
-    assert_eq!(extracted[0].file_time, 0x5a21_0000);
-    assert_eq!(extracted[1].name, entries[1].name);
-    assert_eq!(extracted[1].data, entry_data(&entries[1]));
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(extracted[0].name, entries[0].name);
+        assert_eq!(extracted[0].data, entry_data(&entries[0]));
+        assert_eq!(extracted[0].file_time, 0x5a21_0000);
+        assert_eq!(extracted[1].name, entries[1].name);
+        assert_eq!(extracted[1].data, entry_data(&entries[1]));
+    }
 }
 
 #[test]
@@ -846,7 +858,7 @@ fn writes_compressed_rar50_archive_that_reader_extracts() {
     let archive = Archive::parse(&bytes).unwrap();
     let files: Vec<_> = archive.files().collect();
     assert_eq!(files.len(), 2);
-    assert!(files.iter().all(|file| file.hash.is_some()));
+    assert!(files.iter().all(|file| file.hash.is_none()));
     assert_eq!(files[0].data_crc32, Some(crc32(&entry_data(&entries[0]))));
 
     let extracted = collect_extract(&archive).unwrap();
@@ -1232,7 +1244,8 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
     assert!(last.is_split_before());
     assert!(!last.is_split_after());
     assert_eq!(last.decoded_compression_info().unwrap().method, 3);
-    assert!(last.hash.is_some());
+    assert!(last.hash.is_none());
+    assert_eq!(last.data_crc32, Some(crc32(&payload)));
 
     let extracted = collect_extract_volumes_with_password(&archives, Some(b"password")).unwrap();
     assert_eq!(extracted[0].name, b"compressed-split.txt");
@@ -1241,19 +1254,28 @@ fn writes_compressed_rar50_volume_set_that_reader_reassembles() {
 }
 
 /// A fragment that is not the last one has no whole-member checksum to report,
-/// so it reports the bytes it stores instead, the way WinRAR does. Both a CRC32
-/// and a hash record go on every fragment: a reader takes the hash record as
-/// the member's checksum type, and unrar reads that type from the first
-/// fragment and compares it against the last, so a first fragment offering only
-/// a CRC32 fails a member that is perfectly intact.
+/// so it reports the bytes it stores instead, the way WinRAR does. Every
+/// fragment carries a CRC32, and with BLAKE2sp asked for, a hash record too: a
+/// reader takes the hash record as the member's checksum type, and unrar reads
+/// that type from the first fragment and compares it against the last, so a
+/// first fragment offering only a CRC32 fails a member that is perfectly intact.
 #[test]
 #[cfg(feature = "write")]
 fn every_rar50_volume_fragment_checksums_the_bytes_it_stores() {
+    for blake2sp in [false, true] {
+        every_rar50_volume_fragment_checksums_the_bytes_it_stores_with(blake2sp);
+    }
+}
+
+#[cfg(feature = "write")]
+fn every_rar50_volume_fragment_checksums_the_bytes_it_stores_with(blake2sp: bool) {
     let payload = deterministic_noise(4096);
     let entry = entry(b"fragment-checksums.bin", &payload).with_mtime(Some(0x5a21_0031));
+    let mut features = FeatureSet::store_only();
+    features.blake2sp = blake2sp;
     let parts = write_volumes(
         std::slice::from_ref(&entry),
-        rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only()),
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
         1024,
         None,
     )
@@ -1267,9 +1289,10 @@ fn every_rar50_volume_fragment_checksums_the_bytes_it_stores() {
     let member_crc = crc32(&payload);
     for (index, archive) in archives.iter().enumerate() {
         let file = archive.files().next().unwrap();
-        assert!(
+        assert_eq!(
             file.hash.is_some(),
-            "volume {} has no hash record",
+            blake2sp,
+            "volume {} hash record",
             index + 1
         );
         let stored = &parts[index][file.block.data_range.clone()];
@@ -3178,14 +3201,22 @@ fn writes_encrypted_stored_rar50_archive_that_reader_extracts_with_password() {
             .with_host_os(3)
             .with_password(b"password".to_vec()),
     ];
-    let features = FeatureSet::store_only();
+    for blake2sp in [false, true] {
+        writes_encrypted_stored_rar50_archive_with(&entries, blake2sp);
+    }
+}
+
+#[cfg(all(feature = "write", feature = "encryption"))]
+fn writes_encrypted_stored_rar50_archive_with(entries: &[rar50::ArchiveEntry], blake2sp: bool) {
+    let mut features = FeatureSet::store_only();
+    features.blake2sp = blake2sp;
     let first = write_stored_archive(
-        &entries,
+        entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
     )
     .unwrap();
     let second = write_stored_archive(
-        &entries,
+        entries,
         rar50::WriterOptions::new(ArchiveVersion::Rar50, features),
     )
     .unwrap();
@@ -3238,12 +3269,15 @@ fn writes_encrypted_stored_rar50_archive_that_reader_extracts_with_password() {
             "RAR 5 encrypted hash MAC needs encryption keys"
         ))
     ));
-    assert!(matches!(
-        file.verify_hash(&extracted[0].data),
-        Err(Error::InvalidHeader(
-            "RAR 5 encrypted hash verification needs encryption keys"
-        ))
-    ));
+    match blake2sp {
+        true => assert!(matches!(
+            file.verify_hash(&extracted[0].data),
+            Err(Error::InvalidHeader(
+                "RAR 5 encrypted hash verification needs encryption keys"
+            ))
+        )),
+        false => assert!(file.hash.is_none()),
+    }
 }
 
 #[test]

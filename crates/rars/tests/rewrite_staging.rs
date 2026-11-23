@@ -468,9 +468,10 @@ fn corrupt_dependencies_fail_cleanly_but_independent_omissions_are_skipped() {
                 .unwrap();
         }
         let mut bytes = builder.to_bytes().unwrap();
+        // The last match: the member's name runs straight into its data.
         let offset = bytes
             .windows(25)
-            .position(|bytes| bytes == b"fault".repeat(5))
+            .rposition(|bytes| bytes == b"fault".repeat(5))
             .unwrap();
         bytes[offset] ^= 1;
         let archive = ArchiveReader::read_owned(bytes).unwrap();

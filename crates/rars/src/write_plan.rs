@@ -113,6 +113,7 @@ pub fn supported_features(target: ArchiveVersion, shape: PlanShape) -> FeatureSe
             shape,
         ),
         quick_open: supports(target, WriterOption::Feature(Feature::QuickOpen), shape),
+        blake2sp: supports(target, WriterOption::Feature(Feature::Blake2sp), shape),
     }
 }
 
@@ -146,6 +147,8 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         WriterOption::Feature(Feature::QuickOpen) => {
             family == ArchiveFamily::Rar50Plus && !shape.volumes
         }
+        // The hash record arrived with RAR 5.
+        WriterOption::Feature(Feature::Blake2sp) => family == ArchiveFamily::Rar50Plus,
         WriterOption::CompressionLevel => true,
         // PPMd arrived with RAR 2.9 and left again with RAR 5. A split set
         // takes the automatic choice only: the volume writer is handed the
@@ -475,6 +478,7 @@ mod tests {
             Feature::Solid => set.solid,
             Feature::HeaderEncryption => set.header_encryption,
             Feature::QuickOpen => set.quick_open,
+            Feature::Blake2sp => set.blake2sp,
         }
     }
 

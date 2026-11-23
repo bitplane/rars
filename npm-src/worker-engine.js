@@ -138,6 +138,7 @@ async function build(wasm, payload, platform, volumes, report) {
     solid: options.solid,
     password: options.password,
     encryptHeaders: options.encryptHeaders,
+    blake2sp: options.blake2sp,
     comment: options.comment,
     recoveryPercent: options.recoveryPercent,
     maxMemoryBytes: options.maxMemoryBytes,

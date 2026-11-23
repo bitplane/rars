@@ -321,6 +321,9 @@ pub(super) struct CompressPlan {
     /// each run of it when it does not.
     pub(super) filter_policy: FilterPolicy,
     pub(super) candidates: Records<EncodeOptions>,
+    /// Hash members with BLAKE2sp as well as CRC32, for an archive that
+    /// stores the hash.
+    pub(super) blake2sp: bool,
 }
 
 /// Working memory a member needs to be filtered as a whole: the member, the
@@ -364,6 +367,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![encode_options].into(),
+            blake2sp: true,
         }
     }
 
@@ -539,6 +543,7 @@ mod tests {
             encode_options: options,
             dictionary_size: dictionary,
             candidates: vec![options].into(),
+            blake2sp: true,
             ..settings()
         };
         let size = 256 * 1024 * 1024;
