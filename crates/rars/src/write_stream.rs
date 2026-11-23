@@ -230,6 +230,9 @@ pub(crate) struct ArchiveOutput<W, S> {
     pub(crate) stream_above: Option<u64>,
 }
 
+/// Smaller members keep the whole-member engine and filter trials.
+pub(crate) const STREAM_MEMBERS_ABOVE: u64 = 64 * 1024 * 1024;
+
 pub(crate) type CallerOutput<'a> = ArchiveOutput<&'a mut dyn Write, &'a mut dyn SeekWrite>;
 
 /// Every write checks cancellation, so a large copy stops promptly.

@@ -1724,7 +1724,7 @@ pub(crate) fn recovery_end_header(
     specific.vint(end_flags);
     let image = framing::HeaderImage::new(HEAD_END, 0, None, &specific, &[])?;
     let mut end = vec![0; image.image_len(keys.is_some(), 0)?];
-    image.render_into(keys.as_ref(), &[], &mut end)?;
+    image.render_into_with_iv(keys.as_ref(), None, &[], &mut end)?;
     Ok(end)
 }
 
@@ -5300,6 +5300,18 @@ mod tests {
             read_vint_at(&overlong, 0, overlong.len()),
             Err(Error::InvalidHeader("RAR 5 vint is too long"))
         );
+    }
+
+    #[test]
+    fn read_vint_at_accepts_a_value_padded_wider_than_it_needs() {
+        // A writer can reserve a size field before it knows the size.
+        assert_eq!(
+            read_vint_at(&[0x85, 0x80, 0x80, 0x00], 0, 4).unwrap(),
+            (5, 4)
+        );
+        assert_eq!(read_vint_at(&[0x80, 0x00], 0, 2).unwrap(), (0, 2));
+        let padded = [0x80 | 0x7f, 0x80 | 0x01, 0x80, 0x80, 0x80, 0x00];
+        assert_eq!(read_vint_at(&padded, 0, padded.len()).unwrap(), (255, 6));
     }
 
     #[test]
