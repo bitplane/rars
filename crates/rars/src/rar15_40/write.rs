@@ -1197,11 +1197,27 @@ struct Rar29Search {
     /// measured at its own: from 0, every call in a later segment looks
     /// convertible and every call back into the file's start looks not.
     file_offset: usize,
+    /// Whether every finalist is encoded in full rather than ranked by a
+    /// trial, which only level 5 pays for.
+    exhaustive: bool,
 }
 
 impl Rar29Search {
     /// The search over a whole member.
-    const MEMBER: Self = Self { file_offset: 0 };
+    const MEMBER: Self = Self {
+        file_offset: 0,
+        exhaustive: false,
+    };
+
+    /// The search over `data` starting `file_offset` bytes into its member, for
+    /// a member written at `options`.
+    fn at(file_offset: usize, options: Rar29EncodeOptions) -> Self {
+        // Level 5 is the only level with more than one shortest-path pass.
+        Self {
+            file_offset,
+            exhaustive: options.optimal_parse_passes > 1,
+        }
+    }
 }
 
 impl crate::filter_search::FilterSearch for Rar29Search {
@@ -1225,10 +1241,14 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         kinds
     }
 
+    fn exhaustive(&self) -> bool {
+        self.exhaustive
+    }
+
     /// Unlike RAR 5, a greedy parse here really is cheaper. On a megabyte of
     /// binary it measured 59ms against 91ms at full effort, and it ranks
-    /// candidates the same way, so the screens run reduced and only the
-    /// finalists pay full price.
+    /// candidates the same way, so the screens and the trial run reduced and
+    /// only the winner pays full price.
     fn screen_options(&self, options: Rar29EncodeOptions) -> Rar29EncodeOptions {
         let mut ranking = Rar29EncodeOptions::new(options.max_match_candidates.min(8))
             .with_lazy_matching(false)
@@ -1248,6 +1268,17 @@ impl crate::filter_search::FilterSearch for Rar29Search {
 
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
         crate::codec::rar29::filtered_members(data, self.file_offset, filters)
+            .map(|filtered| filtered.data)
+            .map_err(Error::from)
+    }
+
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Vec<u8>> {
+        crate::codec::rar29::filtered_members(data, self.file_offset + offset, filters)
             .map(|filtered| filtered.data)
             .map_err(Error::from)
     }
@@ -1326,7 +1357,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
             // encoded beside it is charged its own, and only while it runs.
             let each = crate::codec::rar29::member_encode_workspace(data.len(), lazy);
             let (filters, measured) = crate::filter_search::choose_filter_side_by_side(
-                &Rar29Search::MEMBER,
+                &Rar29Search::at(0, options),
                 data,
                 lazy,
                 Some(&|walked| {
@@ -2609,7 +2640,7 @@ fn stream_member_admitted(
                     let mut poll = |_| !progress.is_cancelled();
                     // Only the choice is kept, so the lazy parse measures it.
                     crate::filter_search::choose_filter(
-                        &Rar29Search { file_offset: start },
+                        &Rar29Search::at(start, encode_options),
                         segment,
                         encode_options.with_optimal_parse_passes(0),
                         Some(&mut poll),
@@ -4852,7 +4883,9 @@ mod tests {
         };
         let mut options =
             super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
-        options.compression_level = Some(1);
+        // Level 5, whose search encodes every finalist in full. Below it the
+        // trial picks one and only that one is encoded.
+        options.compression_level = Some(5);
         let charge = super::member_workspace(options, data.len() as u64, true);
         let lazy = super::rar29_encode_options_for_options(options)
             .unwrap()
@@ -4896,16 +4929,16 @@ mod tests {
             (packed, encoded.method, peak.load(Ordering::SeqCst))
         };
         // Room for nothing beside the member's own charge runs the finalists in turn.
-        let (in_turn, method, peak) = encode(charge);
-        assert_eq!(peak, charge);
-        assert_eq!(method, 0x31);
+        let (in_turn, method, alone) = encode(charge);
+        assert!(alone <= charge, "{alone} against {charge}");
+        assert_eq!(method, 0x35);
         // Each encode beside the first is charged while it runs, and the
         // finalists choose and code the same bytes however many run at once.
         for (limit, most) in [(charge + room, charge + room), (u64::MAX, u64::MAX)] {
             let (side_by_side, method, peak) = encode(limit);
             assert!(side_by_side == in_turn, "limit {limit}");
-            assert_eq!(method, 0x31);
-            assert!(peak >= charge + room && peak <= most, "{peak} for {limit}");
+            assert_eq!(method, 0x35);
+            assert!(peak > alone && peak <= most, "{peak} for {limit}");
         }
     }
 
@@ -5242,7 +5275,10 @@ mod tests {
 
         let code = x86_calls(2 * 1024 * 1024);
         let start = 1024 * 1024;
-        let at = super::Rar29Search { file_offset: start };
+        let at = super::Rar29Search {
+            file_offset: start,
+            exhaustive: false,
+        };
         let whole = [FilterSpec::whole(FilterKind::E8)];
         let in_member = super::Rar29Search::MEMBER
             .filtered_bytes(

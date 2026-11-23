@@ -15,11 +15,11 @@
 //! repeat at, and its regions become ranged delta filters at the record size.
 //! Filters with no detector are measured on a sample of the member and have to
 //! win by a clear margin to earn a whole-member encode. What survives is a
-//! handful of finalists, each encoded once at the caller's real settings,
-//! smallest wins.
-//!
-//! The unfiltered member is always one of the finalists, so the result can never
-//! be larger than leaving the data alone.
+//! handful of finalists. A trial on windows of the member ranks them and only
+//! the winner is encoded at the caller's real settings; a small member, or a
+//! search that asks for it, has every finalist encoded in full and the smallest
+//! wins. Only that full comparison is sure never to come out larger than
+//! leaving the data alone.
 
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::{FilterKind, FilterSpec, Result};
@@ -141,6 +141,13 @@ pub(crate) trait FilterSearch {
         options
     }
 
+    /// Whether every finalist is encoded in full at the caller's settings,
+    /// rather than ranked by a trial on windows of the member. See
+    /// [`OwnedSearch::exhaustive`].
+    fn exhaustive(&self) -> bool {
+        false
+    }
+
     /// Apply the filters to a copy of `data`, without encoding it.
     ///
     /// This is how a screen prices a filter it can only afford to try on a slice
@@ -149,6 +156,32 @@ pub(crate) trait FilterSearch {
     /// [`FilterSearch::encode_filtered`] instead and keeps the result; this is
     /// for a sample slice, where there is nothing to keep.
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>>;
+
+    /// [`FilterSearch::filtered_bytes`] for `data` lying `offset` bytes into
+    /// the data searched, which the x86 filters convert by position. The
+    /// filters' ranges are in `data`.
+    ///
+    /// Defaults to filtering `data` behind `offset` bytes of padding, which a
+    /// format whose filters can start at an offset should not pay for.
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Vec<u8>> {
+        let mut padded = vec![0; offset];
+        padded.extend_from_slice(data);
+        let filters: Vec<FilterSpec> = filters
+            .iter()
+            .map(|spec| {
+                let range = spec.range.clone().unwrap_or(0..data.len());
+                FilterSpec::range(spec.kind, offset + range.start..offset + range.end)
+            })
+            .collect();
+        let mut filtered = self.filtered_bytes(&padded, &filters)?;
+        filtered.drain(..offset);
+        Ok(filtered)
+    }
 
     /// Encode without filters.
     ///
@@ -193,11 +226,37 @@ pub(crate) trait OwnedSearch {
     }
     fn max_delta_channels(&self) -> usize;
     fn screen_options(&self, options: Self::Options) -> Self::Options;
+    /// Whether every finalist is encoded in full at the caller's settings and
+    /// the smallest kept, rather than the finalists ranked by a trial and only
+    /// the winner encoded. See [`trial_winner`].
+    fn exhaustive(&self) -> bool {
+        false
+    }
     fn filtered_bytes(
         &self,
         data: &[u8],
         filters: &[FilterSpec],
     ) -> Result<Buffer<u8, Self::Memory>>;
+    /// See [`FilterSearch::filtered_window`], and the same default.
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8, Self::Memory>> {
+        let mut padded = Buffer::filled(offset + data.len(), 0, self.allowance())?;
+        padded[offset..].copy_from_slice(data);
+        let filters = Buffer::collect(
+            filters.iter().map(|spec| {
+                let range = spec.range.clone().unwrap_or(0..data.len());
+                FilterSpec::range(spec.kind, offset + range.start..offset + range.end)
+            }),
+            self.allowance(),
+        )?;
+        let mut filtered = self.filtered_bytes(&padded, &filters)?;
+        filtered.discard_prefix(offset);
+        Ok(filtered)
+    }
     fn encode_plain(
         &self,
         data: &[u8],
@@ -231,8 +290,21 @@ impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.0.screen_options(options)
     }
+    fn exhaustive(&self) -> bool {
+        self.0.exhaustive()
+    }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>> {
         self.0.filtered_bytes(data, filters).map(Buffer::from_vec)
+    }
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8>> {
+        self.0
+            .filtered_window(data, offset, filters)
+            .map(Buffer::from_vec)
     }
     fn encode_plain(
         &self,
@@ -310,8 +382,19 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)
     }
+    fn exhaustive(&self) -> bool {
+        self.search.exhaustive()
+    }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
+    }
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.search.filtered_window(data, offset, filters)
     }
     fn encode_plain(
         &self,
@@ -587,6 +670,18 @@ fn x86_screened_regions<S: OwnedSearch>(
     regions: &[Range<usize>],
     options: S::Options,
 ) -> Result<X86Screen<S::Memory>> {
+    // At the screens' settings, unless the search is exhaustive. This used to
+    // run at the caller's own, on the grounds that it is a yes or no with no
+    // margin under it. But a tar of `/usr` has a region for nearly every
+    // file, and these samples came to 60% as many bytes as the member; at
+    // level 3 every one of them went through the shortest-path parse. At the
+    // screens' settings, 64 MiB of `/usr` at level 3 packed to within 75
+    // bytes of what it did, as files and as a tar.
+    let options = if search.exhaustive() {
+        options
+    } else {
+        search.screen_options(options)
+    };
     // The packed size of a region's samples under `kind`, or left alone.
     let priced = |region: &Range<usize>, kind: Option<FilterKind>| -> Result<usize> {
         let mut packed = 0;
@@ -609,11 +704,6 @@ fn x86_screened_regions<S: OwnedSearch>(
             // member is too short to provide a useful x86 sample.
             continue;
         }
-        // Measured at the caller's real settings, not the cheaper screen ones.
-        // The detectorless screens rank many candidates against each other,
-        // where a reduced parse ranks them the same way; this is a yes or no
-        // with no margin under it, and a sample encode is cheap enough to get
-        // right.
         let baseline = priced(region, None)?;
         let pair = priced(region, Some(FilterKind::E8E9))?;
         // No margin here, unlike the detectorless filters: the scanner has
@@ -1112,6 +1202,180 @@ fn finalists<S: OwnedSearch>(
     Ok(finalists)
 }
 
+/// How much of the member each trial window stands for. The trial encodes one
+/// [`TRIAL_WINDOW_LEN`] window from the middle of each part this long.
+const TRIAL_SPAN: usize = 256 * 1024;
+
+/// How long each trial window is.
+///
+/// A quarter of the member. On 1 MiB pieces of a tar of `/usr` at level 1, the
+/// filter this picked came to 0.07% more than the best finalist encoded in
+/// full; an eighth of the member, as 64 KiB in each 512 KiB or 32 KiB in each
+/// 256 KiB, came to 0.11%.
+const TRIAL_WINDOW_LEN: usize = 64 * 1024;
+
+/// Where the trial encodes a member this long: the middle of each
+/// [`TRIAL_SPAN`] of it.
+fn trial_windows(len: usize) -> impl Iterator<Item = Range<usize>> {
+    let parts = len.div_ceil(TRIAL_SPAN).max(1);
+    (0..parts).map(move |part| {
+        let start = len * part / parts;
+        let end = len * (part + 1) / parts;
+        let middle = start + (end - start).saturating_sub(TRIAL_WINDOW_LEN) / 2;
+        middle..(middle + TRIAL_WINDOW_LEN).min(end)
+    })
+}
+
+/// What the finalist with these specs packs to over the trial windows, at
+/// `trial_options`.
+///
+/// Each window is filtered on its own, where it lies in the member, with the
+/// finalist's ranges cut to it, as the screens filter their samples. Cutting a
+/// window out of the member filtered whole would cut it out of delta's planes,
+/// and a window of one plane is no measure of the whole: on a binary that was
+/// mostly a relocation table, delta 4 over the member won such a trial against
+/// delta 24 over the table that it lost to in full.
+///
+/// `seen` holds every window already encoded, as its index, a hash of its
+/// bytes and what it packed to. A window that comes out the same bytes under
+/// two finalists, as a ranged filter leaves the bytes outside its ranges, is
+/// encoded once.
+fn trial_size<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    specs: &[FilterSpec],
+    trial_options: S::Options,
+    seen: &mut Buffer<(usize, u64, usize), S::Memory>,
+) -> Result<usize> {
+    let mut total = 0;
+    for (index, window) in trial_windows(data.len()).enumerate() {
+        let mut cut = Buffer::new(search.allowance());
+        for spec in specs {
+            let range = spec.range.clone().unwrap_or(0..data.len());
+            let start = range.start.max(window.start);
+            let end = range.end.min(window.end);
+            if start < end {
+                cut.try_push(FilterSpec::range(
+                    spec.kind,
+                    start - window.start..end - window.start,
+                ))?;
+            }
+        }
+        let filtered;
+        let window_bytes = &data[window.clone()];
+        let bytes = if cut.is_empty() {
+            window_bytes
+        } else {
+            filtered = search.filtered_window(window_bytes, window.start, &cut)?;
+            &filtered[..]
+        };
+        let hash = {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            bytes.hash(&mut hasher);
+            hasher.finish()
+        };
+        let known = seen
+            .iter()
+            .find(|&&(seen_index, seen_hash, _)| seen_index == index && seen_hash == hash)
+            .map(|&(_, _, packed)| packed);
+        total += match known {
+            Some(packed) => packed,
+            None => {
+                let packed = search.encode_plain(bytes, trial_options, None)?.len();
+                seen.try_push((index, hash, packed))?;
+                packed
+            }
+        };
+    }
+    Ok(total)
+}
+
+/// The one finalist worth encoding at the caller's settings, or `None` when
+/// they should all be encoded in full and the smallest kept.
+///
+/// Encoding every finalist in full was most of the time spent writing a
+/// binary: up to six encodes of the member to keep one. On 64 MiB of a tar of
+/// `/usr` the search was 70% of level 1 and half of level 3, for filters
+/// worth 7% to 8%. So the finalists are ranked by a trial, and only the winner
+/// is encoded.
+///
+/// The trial encodes a window from each [`TRIAL_SPAN`] of the member under
+/// each finalist, at the screens' settings (see [`trial_size`]). The smallest
+/// total wins and the earliest takes a tie.
+///
+/// Leaving the member alone is not one of the candidates the windows rank.
+/// Every finalist but the plain member is there because a screen saw its
+/// filter win, and a window without the member's history behind it undersells
+/// the filters: x86 code converted to absolute addresses gains from calls to
+/// the same place far apart. Ranked with the others, the plain member won the
+/// trial on 1 MiB pieces of a tar of `/usr` that it lost by 7% in full, and
+/// the choice came to 0.35% more than the best finalist; left out, 0.07%. So
+/// when the screens pass only one filter, it is taken without a trial.
+///
+/// A member no longer than one span has no history to lose. It is encoded
+/// whole under each finalist, the plain member included, and at the caller's
+/// own settings that is the full comparison, so that is what it gets. So does
+/// a search that is [`OwnedSearch::exhaustive`].
+fn trial_winner<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    finalists: &mut Buffer<Finalist<S::Memory>, S::Memory>,
+) -> Result<Option<Finalist<S::Memory>>> {
+    if finalists.len() <= 1 {
+        return Ok(finalists.pop());
+    }
+    let trial_options = search.screen_options(options);
+    let whole = data.len() <= TRIAL_SPAN;
+    if search.exhaustive()
+        || (whole && trial_options == options)
+        || finalists.iter().any(|(_, measured)| measured.is_some())
+    {
+        return Ok(None);
+    }
+    let mut seen = Buffer::new(search.allowance());
+    let mut best: Option<(usize, usize)> = None;
+    for (index, (specs, _)) in finalists.iter().enumerate() {
+        let packed = match (whole, specs.is_empty()) {
+            (true, true) => search.encode_plain(data, trial_options, None)?.len(),
+            (true, false) => search
+                .encode_filtered(data, specs, trial_options, None)?
+                .len(),
+            (false, true) => continue,
+            // The only filter a screen passed.
+            (false, false) if finalists.len() == 2 => {
+                best = Some((index, 0));
+                break;
+            }
+            (false, false) => trial_size(search, data, specs, trial_options, &mut seen)?,
+        };
+        if best.is_none_or(|(_, best)| packed < best) {
+            best = Some((index, packed));
+        }
+    }
+    let (best, _) = best.expect("a trial has a candidate");
+    Ok(
+        std::mem::replace(finalists, Buffer::new(search.allowance()))
+            .into_iter()
+            .nth(best),
+    )
+}
+
+/// The finalists worth encoding at the caller's settings: the trial's winner
+/// alone, or all of them when the search compares them in full.
+fn ranked_finalists<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+) -> Result<Buffer<Finalist<S::Memory>, S::Memory>> {
+    let mut finalists = finalists(search, data, options)?;
+    Ok(match trial_winner(search, data, options, &mut finalists)? {
+        Some(winner) => Buffer::collect([winner], search.allowance())?,
+        None => finalists,
+    })
+}
+
 /// The candidate filter lists, screened but not ranked.
 ///
 /// The screens still run: whether a filter has any chance on this member is a
@@ -1169,10 +1433,12 @@ pub(crate) fn choose_filter<S: FilterSearch>(
 /// screen cannot measure on anything but a member one sample long, so beyond
 /// that it is encoded while the screens run.
 ///
-/// The choice is [`choose_filter`]'s: the finalists are the same, each is
-/// encoded the same way whatever runs beside it, and they are compared in
-/// order, the smallest winning and a tie going to the earlier. A failure is the
-/// one the earliest failing finalist met, as when they ran in turn.
+/// The choice is [`choose_filter`]'s: the finalists are the same, the trial
+/// that ranks them is the same, each is encoded the same way whatever runs
+/// beside it, and they are compared in order, the smallest winning and a tie
+/// going to the earlier. A failure is the one the earliest failing finalist
+/// met, as when they ran in turn. When the trial picks the winner, there is
+/// only that one to encode.
 ///
 /// `admit` is asked for room before each encode beyond the first that would
 /// run at once, and the room it hands back is held until that encode's bytes
@@ -1255,8 +1521,19 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)
     }
+    fn exhaustive(&self) -> bool {
+        self.search.exhaustive()
+    }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
+    }
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.search.filtered_window(data, offset, filters)
     }
     fn encode_plain(
         &self,
@@ -1301,13 +1578,15 @@ where
     // finalist, and nothing the screen decides changes it, so it can start at
     // once. The room taken for the screens beside it then goes to the
     // finalists after it, one at a time, for as long as it runs.
-    let early = if at_once > 1 && data.len() > SCREEN_SAMPLE_LEN {
+    // Only a search that encodes every finalist in full is sure to encode the
+    // plain member at these settings.
+    let early = if at_once > 1 && data.len() > SCREEN_SAMPLE_LEN && search.exhaustive() {
         admit()
     } else {
         None
     };
     let Some(room) = early else {
-        let finalists = finalists(search, data, options)?.into_iter();
+        let finalists = ranked_finalists(search, data, options)?.into_iter();
         return Ok(smallest(search, data, options, finalists, at_once, admit)?
             .expect("the unfiltered member is always a finalist"));
     };
@@ -1413,6 +1692,40 @@ where
     Ok(best)
 }
 
+/// The filters [`choose_owned`] would pick, for a caller that throws the
+/// bytes away. A winner picked by the trial is not encoded at all.
+pub(crate) fn choose_owned_specs<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+) -> Result<Buffer<FilterSpec, S::Memory>> {
+    match progress {
+        Some(progress) => specs_only(
+            &ReportingSearch {
+                search,
+                progress: std::cell::RefCell::new(progress),
+            },
+            data,
+            options,
+        ),
+        None => specs_only(search, data, options),
+    }
+}
+
+fn specs_only<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+) -> Result<Buffer<FilterSpec, S::Memory>> {
+    let mut finalists = ranked_finalists(search, data, options)?;
+    if finalists.len() == 1 {
+        let (specs, _) = finalists.pop().expect("one finalist");
+        return Ok(specs);
+    }
+    choose_filter_inner_from(search, data, options, finalists).map(|(specs, _)| specs)
+}
+
 pub(crate) fn choose_owned<S: OwnedSearch>(
     search: &S,
     data: &[u8],
@@ -1437,8 +1750,20 @@ fn choose_filter_inner<S: OwnedSearch>(
     data: &[u8],
     options: S::Options,
 ) -> Result<FilterChoice<S::Memory>> {
+    let finalists = ranked_finalists(search, data, options)?;
+    choose_filter_inner_from(search, data, options, finalists)
+}
+
+/// The smallest of `finalists`, each encoded in full at `options`, the
+/// earliest on a tie.
+fn choose_filter_inner_from<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    finalists: Buffer<Finalist<S::Memory>, S::Memory>,
+) -> Result<FilterChoice<S::Memory>> {
     let mut best: Option<FilterChoice<S::Memory>> = None;
-    for (specs, measured) in finalists(search, data, options)? {
+    for (specs, measured) in finalists {
         let packed = match measured {
             Some(packed) => packed,
             None if specs.is_empty() => search.encode_plain(data, options, None)?,
@@ -1491,6 +1816,14 @@ pub(crate) fn walk_bytes_for_kinds(data: &[u8], screened: u64, encoder_candidate
     // whether this format screens at full effort, which needs the caller's
     // settings; RAR 5 is the only format that reports progress through here
     // and it always does.
+    if member > TRIAL_SPAN as u64 {
+        // Past one span the trial ranks the filters on a window from each,
+        // leaving out the unfiltered member, and only the winner is encoded.
+        let windows = trial_windows(data.len())
+            .map(|window| window.len() as u64)
+            .sum::<u64>();
+        return screen + windows * (1 + x86_finalists) + member * encoder_candidates;
+    }
     let finalists = if sample == member {
         x86_finalists
     } else {
