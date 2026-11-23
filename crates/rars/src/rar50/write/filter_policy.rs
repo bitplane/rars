@@ -161,25 +161,35 @@ pub(super) fn should_store_compressed_payload(
 
 /// How hard each level looks for a match, and where the default sits.
 ///
-/// Each level searches more than the one below. Measured on 4 MiB of man pages,
-/// packed bytes against seconds, at lookahead 2:
+/// Each rung packs smaller than the one below. Up to level 4 each costs about
+/// half again to twice the one below; level 5 costs two and a half to three
+/// and a half times level 4. Over the bench corpus at one thread, whose
+/// members are at most 4 MiB, and 256 MiB of a tar of `/usr` at ten threads,
+/// where the wider windows of the upper levels show:
 ///
 /// ```text
-/// candidates     64     128     256     512    1024
-/// packed     686,891 680,315 675,746 672,645 670,061
-/// seconds       1.67    2.35    3.53    4.71    6.65
+///          bench corpus, 1 thread           /usr, 10 threads
+/// level     packed     vs 1    seconds      packed    seconds
+///   1    9,432,440       -       1.53    85,816,858     4.05
+///   2    9,085,836   -3.67%      2.84    81,000,174     7.02
+///   3    8,979,738   -4.80%      4.01    78,682,219    13.22
+///   4    8,961,647   -4.99%      5.58    77,616,826    22.68
+///   5    8,958,038   -5.03%     19.27    74,775,536    56.74
 /// ```
 ///
-/// It flattens out: the last doubling buys 0.4% for another two seconds. So
-/// the top of the ladder sits at 512 rather than chasing it, and level 3 stays
-/// near what the default already cost.
+/// Level 3 is the default because it is the knee. Climbing to it from level 2
+/// saves 91 KB a second on the corpus and 374 KB a second on the tar; climbing
+/// on to level 4 saves 12 KB and 113 KB a second, an eighth and under a third
+/// as much. Level 5 searches filters exhaustively, which is most of what it
+/// costs over level 4 on the corpus, and its 16 MiB window is most of what it
+/// buys on the tar.
 fn match_candidates_for_level(level: u8) -> Result<usize> {
     match level {
         0 => Ok(0),
         1 => Ok(8),
-        2 => Ok(32),
-        3 => Ok(128),
-        4 => Ok(256),
+        2 => Ok(16),
+        3 => Ok(32),
+        4 => Ok(128),
         5 => Ok(512),
         _ => Err(Error::InvalidArgument(
             "RAR 5 compression level must be in the range 0..5",
@@ -215,6 +225,15 @@ pub(super) fn encode_options_for_level(
         // 4,383 bytes and half a second off, because a longer match covers
         // ground the finder then does not have to search. A lookahead of four
         // is worse than one.
+        //
+        // A deeper lazy rung between levels 1 and 2 loses to the shortest-path
+        // parse at a shallow search. At 64 candidates, nice length 256, it
+        // took 1.95% off level 1 on the bench corpus for 2.36 s against
+        // level 2's 3.68% for 2.91 s, and on 64 MiB of `/usr` at ten threads
+        // it packed to 21,212,799 bytes in 3.47 s against level 2's
+        // 20,789,115 in 1.74 s: chains over a 4 MiB window cost the lazy
+        // parse more than the tree costs the shortest-path one. With a 1 MiB
+        // window it was as quick as level 2 with one, and 2.7% larger.
         .with_lazy_matching(level >= 1)
         .with_lazy_lookahead(2)
         // Everything above level 1 parses by shortest path. Gap to each
@@ -248,24 +267,16 @@ pub(super) fn encode_options_for_level(
 /// The nice match length and parse passes for a level.
 ///
 /// Search depth alone barely separates the parsing levels on a member that
-/// fits one window: over eight 4 MiB slices of the bench tars, levels 2, 3 and
-/// 5 packed within 0.07% of each other. These two are what does, on that set
-/// at one thread:
-///
-/// ```text
-/// level  nice  passes       size     time
-///   2      64       2   8,500,998   15.0s
-///   3     512       3   8,447,596   38.6s
-///   4     512       4   8,444,136   47.2s
-///   5    1024       6   8,440,881   75.5s
-/// ```
-///
-/// Past level 3, larger members gain more from
-/// the dictionary the level fits than from either of these.
+/// fits one window. These two are what does. A single pass at level 2 parses
+/// each block once, on guessed prices, rather than again on the prices the
+/// pass before produced: at level 3's other settings over the bench corpus,
+/// one pass and two took 3.32 s and 4.06 s and packed 0.43% apart. Nice
+/// length 256 at level 4 is 7% quicker than 512 on the corpus for 0.01%.
 fn parse_effort_for_level(level: u8) -> (usize, usize) {
     match level {
-        2 => (64, 2),
-        4 => (512, 4),
+        2 => (32, 1),
+        3 => (64, 2),
+        4 => (256, 3),
         5.. => (1024, 6),
         _ => (512, 3),
     }
@@ -330,13 +341,13 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
 /// Text keeps paying up to about 8 MiB; binaries stop at 4 and are slightly
 /// worse by 16.
 ///
-/// Level 2 was raised off the 1 MiB floor when it gained the shortest-path
-/// parse: on 4 MiB of manpage text it took 24,315 bytes off for a tenth of a
-/// second, which is the same trade level 3 was already making.
+/// Level 2 sits between. On 64 MiB of a tar of `/usr` at ten threads, 1, 2
+/// and 4 MiB packed to 20,978,680, 20,789,115 and 20,570,079 bytes in 1.61,
+/// 1.74 and 2.42 seconds; 4 MiB is most of the way to level 3's time.
 fn fitted_dictionary_cap(level: u8) -> u64 {
     let megabytes = match level {
         0..=1 => 1,
-        2 => 4,
+        2 => 2,
         3 => 4,
         4 => 8,
         _ => 16,
@@ -881,33 +892,34 @@ fn piece_filters<B: Budget>(
 }
 
 /// The parse a run's filter search measures with: the member's own, but no
-/// more than level 2's.
+/// more than level 3's.
 ///
 /// The search only ranks filters. Its encodes are thrown away, and the run is
 /// coded again later against its history. Over 16 binary and 16 text 32 MiB
-/// slices of the bench tars at level 3, total packed size and search time:
+/// slices of the bench tars, total packed size and search time, searching
+/// with what were then levels 3, 2 and 1:
 ///
 /// ```text
-/// search at     binary                text
-/// level 3     167,933,642  367s    121,100,147  373s
-/// level 2     167,919,441  219s    121,075,675  213s
-/// level 1     167,767,504  140s    121,255,533  163s
+/// search parse              binary                text
+/// 128 candidates, 3 passes  167,933,642  367s    121,100,147  373s
+///  32 candidates, 2 passes  167,919,441  219s    121,075,675  213s
+/// lazy, 8 candidates        167,767,504  140s    121,255,533  163s
 /// ```
 ///
-/// Level 2 changed eight members by at most 0.17% either way. Level 1's parse,
-/// then greedy, passes over delta filters the shortest-path parse uses:
+/// Level 3's parse changed eight members by at most 0.17% either way. Level
+/// 1's, then greedy, passes over delta filters the shortest-path parse uses:
 /// one text slice came out 1.05% larger.
 fn run_search_options(options: EncodeOptions) -> EncodeOptions {
     if !options.optimal_parse {
         return options;
     }
-    let (nice, passes) = parse_effort_for_level(2);
+    let (nice, passes) = parse_effort_for_level(3);
     let mut search = options
         .with_nice_match_length(options.nice_match_length.min(nice))
         .with_parse_passes(options.parse_passes.min(passes));
     search.max_match_candidates = options
         .max_match_candidates
-        .min(match_candidates_for_level(2).expect("level 2 is a level"));
+        .min(match_candidates_for_level(3).expect("level 3 is a level"));
     search
 }
 
@@ -1443,14 +1455,16 @@ mod run_search_tests {
     }
 
     #[test]
-    fn run_searches_parse_no_harder_than_level_two() {
+    fn run_searches_parse_no_harder_than_level_three() {
         let dictionary = 4 << 20;
-        let two = encode_options_for_level(Some(2), dictionary).unwrap();
-        for level in 2..=5 {
+        let three = encode_options_for_level(Some(3), dictionary).unwrap();
+        for level in 3..=5 {
             let options = encode_options_for_level(Some(level), dictionary).unwrap();
-            assert_eq!(run_search_options(options), two);
+            assert_eq!(run_search_options(options), three);
         }
-        let one = encode_options_for_level(Some(1), dictionary).unwrap();
-        assert_eq!(run_search_options(one), one);
+        for level in 1..=2 {
+            let options = encode_options_for_level(Some(level), dictionary).unwrap();
+            assert_eq!(run_search_options(options), options);
+        }
     }
 }

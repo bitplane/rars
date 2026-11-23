@@ -1923,7 +1923,7 @@ mod tests {
         };
 
         assert_eq!(capped(1), 1024 * 1024);
-        assert_eq!(capped(2), 4 * 1024 * 1024);
+        assert_eq!(capped(2), 2 * 1024 * 1024);
         assert_eq!(capped(3), 4 * 1024 * 1024);
         assert_eq!(capped(4), 8 * 1024 * 1024);
         assert_eq!(capped(5), 16 * 1024 * 1024);
@@ -2045,7 +2045,7 @@ mod tests {
     #[test]
     fn every_level_keeps_its_dictionary_under_the_default_plan() {
         let limit = crate::WriterResources::default().planning_memory_limit();
-        for (level, megabytes) in [(1, 1), (2, 4), (3, 4), (4, 8), (5, 16)] {
+        for (level, megabytes) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16)] {
             let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
                 .with_compression_level(level);
             assert_eq!(
