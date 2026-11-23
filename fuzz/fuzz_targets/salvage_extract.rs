@@ -11,11 +11,11 @@
 //! extracts a second time with a small buffered limit, so RAR 5 members
 //! stream, or for half the inputs decode through scratch files.
 //!
-//! The salvaging read is done twice more: from a seekable reader, which takes
-//! the parsers' other path, and on a copy with a stretch a quarter of the way
-//! in overwritten, so that most inputs have a block header that doesn't parse
-//! with the fuzzer's bytes after it. That drives the resync scan and, in
-//! RAR 5, the quick-open fallback.
+//! The salvaging read is done twice more: parsing only from a seekable
+//! reader, which takes the parsers' other path, and on a copy with a stretch
+//! a quarter of the way in overwritten, so that most inputs have a block
+//! header that doesn't parse with the fuzzer's bytes after it. That drives
+//! the resync scan and, in RAR 5, the quick-open fallback.
 
 use libfuzzer_sys::fuzz_target;
 use rars::{
@@ -72,18 +72,20 @@ fn read(data: &[u8], salvage: bool) {
     };
     extract(&archive, data.len(), salvage);
     if salvage {
+        // Only the parse differs from a seekable reader.
         if let Ok(archive) =
             ArchiveReader::read_reader_with_options(Cursor::new(data.to_vec()), options(true))
         {
             let _ = archive.header_damage();
-            let _ = archive.test_with_options_and_callback(options(true), |_| Ok(()));
         }
     }
 }
 
 /// Salvages a copy with 12 bytes a quarter of the way in set to 0xff: a
 /// RAR 1.5-4 header size under its fixed fields, or a RAR 5 one that never
-/// ends, wherever a header starts there.
+/// ends, wherever a header starts there. RAR 3 VM programs stay refused
+/// here: one that runs to the instruction limit is slow enough already in
+/// the passes above.
 fn read_damaged(data: &[u8]) {
     let at = data.len() / 4;
     if at < 16 {
@@ -92,10 +94,11 @@ fn read_damaged(data: &[u8]) {
     let mut damaged = data.to_vec();
     let end = (at + 12).min(damaged.len());
     damaged[at..end].fill(0xff);
-    if let Ok(archive) = ArchiveReader::read_with_options(&damaged, options(true)) {
+    let options = || options(true).with_rar3_vm_programs(false);
+    if let Ok(archive) = ArchiveReader::read_with_options(&damaged, options()) {
         let _ = archive.header_damage();
         let _ = archive.extract_with_links(
-            options(true)
+            options()
                 .with_threads(1)
                 .with_max_total_output_bytes(4 * 1024 * 1024),
             |_| Ok(Box::new(std::io::sink())),
