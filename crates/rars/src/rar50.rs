@@ -754,7 +754,7 @@ impl Archive {
 
         let control = crate::read_control::ReadControl::for_options(&options);
         let file_cell =
-            std::cell::RefCell::new(control.reader(crate::io_util::ReadAhead::new(file)));
+            std::cell::RefCell::new(crate::io_util::ReadAhead::new(control.reader(file)));
         let data_limit = usize::MAX - sfx_offset;
         let (main, blocks, truncation) = parse_archive_blocks(
             archive_len,
@@ -4682,7 +4682,9 @@ mod tests {
         };
         assert_eq!(parse(usize::MAX, None).unwrap().blocks, source.blocks);
         let count = operations.load(Ordering::Relaxed);
-        assert!(count > 4);
+        // A seek and a read for the signature, and the same for the window
+        // of read-ahead every header of this small archive falls in.
+        assert!(count >= 4);
         let pre_cancelled = crate::ReadCancellation::new();
         pre_cancelled.cancel();
         assert!(matches!(

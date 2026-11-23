@@ -120,7 +120,7 @@ mod tests {
             (3, 40),
             (READ_AHEAD - 5, 20),
             (100, 7),
-            (2 * READ_AHEAD, READ_AHEAD + 9),
+            (2 * READ_AHEAD - 9, READ_AHEAD + 9),
             (3 * READ_AHEAD - 4, 4),
         ] {
             assert_eq!(
