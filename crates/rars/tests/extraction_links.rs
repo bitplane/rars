@@ -465,3 +465,229 @@ fn rar50_links_match_sequential_extraction_at_any_thread_count() {
         }
     }
 }
+
+/// A writer whose output is read back once it is dropped, from any thread.
+struct SharedCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl Write for SharedCapture {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What a settled extraction reported: its callbacks other than opens, in
+/// order, the output of each member settled as verified, and the error that
+/// ended it.
+type SettledRun = (Vec<String>, Vec<(Vec<u8>, Vec<u8>)>, Result<(), String>);
+
+/// Also returns the most members open and not yet settled at once.
+fn run_settled(
+    archive: &Archive,
+    options: ArchiveReadOptions<'_>,
+    handler: bool,
+) -> (SettledRun, usize) {
+    let Archive::Rar50Plus(rar50) = archive else {
+        unreachable!("settled extraction is RAR 5 only")
+    };
+    let order: Vec<Vec<u8>> = archive.members().map(|m| m.meta.name.clone()).collect();
+    let events = std::sync::Mutex::new(Vec::new());
+    let opened = RefCell::new(Vec::new());
+    let unsettled = RefCell::new(std::collections::VecDeque::new());
+    let most_unsettled = std::cell::Cell::new(0);
+    let verified = RefCell::new(Vec::new());
+    let on_error = |member: &rars::ArchiveMember, error: &rars::Error| {
+        let name = String::from_utf8_lossy(&member.meta.name);
+        let event = format!("fail {name} {:?}", error.kind());
+        events.lock().unwrap().push(event);
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let options = options.with_rar50_buffered_decode_limit(4096);
+    let options = if handler {
+        options.with_member_error_handler(&on_error)
+    } else {
+        options
+    };
+    let result = rars::output_links::extract_rar50_settled_with_links(
+        rar50,
+        options,
+        |meta| {
+            let data = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut opened = opened.borrow_mut();
+            opened.push((meta.name.clone(), data.clone()));
+            let mut unsettled = unsettled.borrow_mut();
+            unsettled.push_back(opened.len() - 1);
+            most_unsettled.set(most_unsettled.get().max(unsettled.len()));
+            Ok(Box::new(SharedCapture(data)))
+        },
+        |meta, link| {
+            assert!(
+                unsettled.borrow().is_empty(),
+                "a link waits for the members opened before it to settle"
+            );
+            let name = String::from_utf8_lossy(&meta.name);
+            let target = String::from_utf8_lossy(link.target());
+            events.lock().unwrap().push(format!("link {name} {target}"));
+            Ok(())
+        },
+        |meta, ok| {
+            let index = unsettled
+                .borrow_mut()
+                .pop_front()
+                .expect("only opened members settle");
+            let opened = opened.borrow();
+            let (name, data) = &opened[index];
+            assert_eq!(*name, meta.name, "members settle in the order they open");
+            let shown = String::from_utf8_lossy(name);
+            events.lock().unwrap().push(format!("settle {shown} {ok}"));
+            if ok {
+                assert_eq!(
+                    std::sync::Arc::strong_count(data),
+                    1,
+                    "a verified member's writer is dropped before it settles"
+                );
+                let output = data.lock().unwrap().clone();
+                verified.borrow_mut().push((name.clone(), output));
+            }
+            Ok(())
+        },
+    );
+    // Members open in archive order, each once.
+    let positions: Vec<usize> = opened
+        .borrow()
+        .iter()
+        .map(|(name, _)| order.iter().position(|n| n == name).unwrap())
+        .collect();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+    let mut events = events.into_inner().unwrap();
+    // A failed member settles just before the handler hears of it.
+    for (index, event) in events.iter().enumerate() {
+        if let Some(rest) = event.strip_prefix("fail ") {
+            let name = rest.split(' ').next().unwrap();
+            let settled = format!("settle {name} false");
+            if events.contains(&settled) {
+                assert_eq!(events[index - 1], settled, "{events:?}");
+            }
+        }
+    }
+    // Sequential extraction opens a member before it fails, and the publishing
+    // batches never do, so only the members that verified are compared.
+    events.retain(|event| !event.ends_with(" false"));
+    let result = result.map_err(|error| format!("{:?} {error}", error.kind()));
+    (
+        (events, verified.into_inner(), result),
+        most_unsettled.get(),
+    )
+}
+
+/// Settled extraction writes members on workers and opens later ones before
+/// earlier ones verify, so what verifies, the links and the failures must
+/// match sequential extraction at any thread count, with members buffered
+/// and streamed and failures in both.
+#[test]
+fn rar50_settled_extraction_matches_sequential_at_any_thread_count() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let mut sources = Vec::new();
+    for index in 0..24u32 {
+        let name = format!("file{index:02}").into_bytes();
+        // Most of them stream, past the buffered limit used.
+        let len = if index % 3 == 2 {
+            300 + 37 * index
+        } else {
+            20_000 + 1_000 * index
+        };
+        let data: Vec<u8> = (0..len)
+            .map(|n| (n * 7 / (index + 3) + index) as u8)
+            .collect();
+        builder
+            .add_bytes(name.clone(), data.clone(), None, None)
+            .unwrap();
+        if index % 7 == 1 {
+            let link = format!("link{index:02}").into_bytes();
+            builder
+                .add_unix_symlink(link, name.clone(), false, None, None)
+                .unwrap();
+        }
+        sources.push((name, data));
+    }
+    let clean = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let mut damaged = clean.clone();
+    if let Archive::Rar50Plus(archive) = &mut damaged {
+        for block in &mut archive.blocks {
+            if let rars::rar50::Block::File(file) = block {
+                // Streamed members amid others fail, and one buffered one.
+                if [&b"file06"[..], b"file07", b"file11", b"file19"].contains(&&file.name[..]) {
+                    file.hash = None;
+                    file.data_crc32 = Some(file.data_crc32.unwrap() ^ 1);
+                }
+            }
+        }
+    }
+
+    for (archive, handler) in [(&clean, false), (&damaged, true), (&damaged, false)] {
+        let sequential = run_settled(
+            archive,
+            // A total output limit keeps extraction sequential.
+            ArchiveReadOptions::new().with_max_total_output_bytes(u64::MAX),
+            handler,
+        )
+        .0;
+        let fails: Vec<&String> = sequential
+            .0
+            .iter()
+            .filter(|event| event.starts_with("fail"))
+            .collect();
+        if std::ptr::eq(archive, &clean) {
+            assert_eq!(sequential.2, Ok(()));
+            assert_eq!(sequential.1, sources);
+            assert!(fails.is_empty());
+        } else if handler {
+            assert_eq!(sequential.2, Ok(()));
+            assert_eq!(
+                fails,
+                [
+                    "fail file06 ChecksumMismatch",
+                    "fail file07 ChecksumMismatch",
+                    "fail file11 ChecksumMismatch",
+                    "fail file19 ChecksumMismatch",
+                ]
+            );
+            let expected: Vec<_> = sources
+                .iter()
+                .filter(|(name, _)| {
+                    !fails
+                        .iter()
+                        .any(|f| f.contains(&*String::from_utf8_lossy(name)))
+                })
+                .cloned()
+                .collect();
+            assert_eq!(sequential.1, expected);
+        } else {
+            assert!(sequential.2.as_ref().unwrap_err().contains("file06"));
+            assert_eq!(sequential.1, sources[..6]);
+        }
+        for threads in [1, 2, 8] {
+            for limited in [false, true] {
+                let options = ArchiveReadOptions::new().with_threads(threads);
+                let options = if limited {
+                    options.with_max_reader_workspace_bytes(64 * 1024 * 1024)
+                } else {
+                    options
+                };
+                let (run, most_unsettled) = run_settled(archive, options, handler);
+                assert_eq!(
+                    run, sequential,
+                    "threads={threads} limited={limited} handler={handler}"
+                );
+                // Unlimited, later members are opened while earlier ones run.
+                if threads > 1 && !limited && std::ptr::eq(archive, &clean) {
+                    assert!(most_unsettled > 1, "threads={threads}");
+                } else if threads == 1 || limited {
+                    assert_eq!(most_unsettled, 1, "threads={threads}");
+                }
+            }
+        }
+    }
+}

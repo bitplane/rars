@@ -324,3 +324,155 @@ fn in_place_refuses_a_hard_link_or_fifo_at_the_destination() {
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
     }
 }
+
+/// What one `x` run left: its exit code, its output with the destination
+/// written as `OUT`, and every entry under the destination with its contents.
+type Extracted = (Option<i32>, String, String, Vec<(String, Vec<u8>)>);
+
+fn extract_tree(archive: &Path, destination: &Path, args: &[&str]) -> Extracted {
+    let result = Command::new(env!("CARGO_BIN_EXE_rars"))
+        .arg("x")
+        .args(args)
+        .arg(archive)
+        .arg(destination)
+        .output()
+        .unwrap();
+    let mut files = Vec::new();
+    let mut pending = vec![destination.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(destination).unwrap();
+            let relative = relative.to_string_lossy().into_owned();
+            if path.is_dir() {
+                files.push((format!("{relative}/"), Vec::new()));
+                pending.push(path);
+            } else {
+                files.push((relative, fs::read(&path).unwrap()));
+            }
+        }
+    }
+    files.sort();
+    let shown = destination.to_string_lossy();
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).replace(&*shown, "OUT");
+    (
+        result.status.code(),
+        text(&result.stdout),
+        text(&result.stderr),
+        files,
+    )
+}
+
+/// Members over the buffered limit used, with small ones among them, for the
+/// tests of members decoded and written side by side.
+fn large_members() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let mut sources = Vec::new();
+    for index in 0..10u32 {
+        let name = format!("dir{}/member{index}.bin", index % 3);
+        let len = if index % 4 == 3 {
+            200 + index
+        } else {
+            30_000 + 1_000 * index
+        };
+        let data: Vec<u8> = (0..len)
+            .map(|n| (n * 7 / (index + 3) + index * 11) as u8)
+            .collect();
+        builder
+            .add_bytes(name.clone().into_bytes(), data.clone(), None, None)
+            .unwrap();
+        sources.push((name, data));
+    }
+    (builder.to_bytes().unwrap(), sources)
+}
+
+/// The entries `sources` extract to, without those left out.
+fn expected_files(sources: &[(String, Vec<u8>)], left_out: &[&str]) -> Vec<(String, Vec<u8>)> {
+    let mut files: Vec<_> = sources
+        .iter()
+        .filter(|(name, _)| !left_out.contains(&name.as_str()))
+        .cloned()
+        .collect();
+    for directory in ["dir0/", "dir1/", "dir2/"] {
+        if files.iter().any(|(name, _)| name.starts_with(directory)) {
+            files.push((directory.to_string(), Vec::new()));
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Runs `x` at one, two and eight threads, and checks every run reports,
+/// exits and leaves exactly what the one-thread run does.
+fn extract_at_thread_counts(
+    archive: &Path,
+    root: &Path,
+    args: &[&str],
+    prepare: impl Fn(&Path),
+) -> Extracted {
+    let mut runs = Vec::new();
+    for threads in ["1", "2", "8"] {
+        let destination = root.join(format!("out-{threads}"));
+        prepare(&destination);
+        let mut args = args.to_vec();
+        args.extend([
+            "--threads",
+            threads,
+            "--rar50-buffered-decode-limit",
+            "4096",
+        ]);
+        runs.push((threads, extract_tree(archive, &destination, &args)));
+    }
+    let (_, one) = runs.remove(0);
+    for (threads, run) in runs {
+        assert_eq!(run, one, "threads={threads}");
+    }
+    one
+}
+
+/// Large members decode and are written side by side, and the members after
+/// one are opened before it fails its checksum. It must still never be
+/// published, and the run must report and exit exactly as at one thread.
+#[test]
+fn a_failing_member_among_concurrent_large_members_is_never_published() {
+    let root = scratch::case("extraction-concurrent-checksum");
+    let archive = root.join("archive.rar");
+    let (mut bytes, sources) = large_members();
+    let parsed = rars::rar50::Archive::parse(&bytes).unwrap();
+    let failing = parsed
+        .files()
+        .find(|file| file.name == b"dir1/member4.bin")
+        .unwrap()
+        .block
+        .data_range
+        .clone();
+    bytes[(failing.start + failing.end) / 2] ^= 0x55;
+    fs::write(&archive, &bytes).unwrap();
+
+    let run = extract_at_thread_counts(&archive, &root, &[], |_| {});
+    assert_ne!(run.0, Some(0), "{}", run.2);
+    assert!(run.2.contains("member4.bin"), "{}", run.2);
+    assert!(!run.1.contains("member4.bin"), "{}", run.1);
+    assert_eq!(run.3, expected_files(&sources, &["dir1/member4.bin"]));
+}
+
+/// A member whose output cannot be opened, among large members already
+/// decoding, ends the run as it does at one thread: the members before it
+/// are published, the existing file is kept, and none after it is published.
+#[test]
+fn a_refused_output_among_concurrent_large_members_ends_the_run_there() {
+    let root = scratch::case("extraction-concurrent-refusal");
+    let archive = root.join("archive.rar");
+    let (bytes, sources) = large_members();
+    fs::write(&archive, &bytes).unwrap();
+
+    let run = extract_at_thread_counts(&archive, &root, &["--overwrite=never"], |out| {
+        fs::create_dir_all(out.join("dir2")).unwrap();
+        fs::write(out.join("dir2/member5.bin"), b"keep me").unwrap();
+    });
+    assert_ne!(run.0, Some(0), "{}", run.2);
+    let mut expected = expected_files(&sources[..5], &[]);
+    expected.push(("dir2/member5.bin".to_string(), b"keep me".to_vec()));
+    expected.sort();
+    assert_eq!(run.3, expected, "{}", run.2);
+}
