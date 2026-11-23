@@ -2941,36 +2941,57 @@ impl TokenPrices<'_> {
     }
 }
 
-/// Length-slot prices are invariant throughout one pass. A run also keeps the
-/// same distance and arriving state while it prices every possible endpoint.
+/// Length prices are invariant throughout one pass. A run also keeps the same
+/// distance and arriving state while it prices every possible endpoint.
+///
+/// Lengths are priced one by one rather than a slot at a time, so the loop
+/// that offers every endpoint of a run reads its costs in step with the
+/// endpoints and has no branch to mispredict. A code is at most 15 bits and a
+/// length slot's extra bits at most 9, so each cost fits a byte.
 struct OptimalMatchPrices {
-    new_lengths: [u32; LENGTH_TABLE_SIZE],
-    repeat_lengths: [u32; LENGTH_TABLE_SIZE],
+    /// What a fresh distance's match length costs, by encoded length.
+    new_lengths: [u8; MAX_ENCODER_MATCH_LENGTH + 1],
+    /// What a remembered distance's match length costs, by length.
+    repeat_lengths: [u8; MAX_ENCODER_MATCH_LENGTH + 1],
     repeats: [u32; 4],
     last_repeat: u32,
 }
 
 struct MatchRunPrice<'a> {
-    lengths: &'a [u32; LENGTH_TABLE_SIZE],
+    lengths: &'a [u8; MAX_ENCODER_MATCH_LENGTH + 1],
     distance: u32,
     bonus: usize,
     last_length: Option<usize>,
     last_repeat: u32,
 }
 
+/// The cost of every encodable length under one length table, indexed by the
+/// length as coded. The two shortest cannot be coded and cost nothing here;
+/// [`MatchRunPrice`] never asks for them.
+fn length_costs(slot_code: impl Fn(usize) -> usize) -> [u8; MAX_ENCODER_MATCH_LENGTH + 1] {
+    let slots: [u8; LENGTH_TABLE_SIZE] = std::array::from_fn(|slot| {
+        let cost = slot_code(slot) + usize::from(length_slot_extra_bits(slot));
+        u8::try_from(cost).expect("a length code and its extra bits fit a byte")
+    });
+    std::array::from_fn(|encoded| {
+        if encoded < 2 {
+            0
+        } else {
+            slots[length_slot_for_valid_match(encoded).0]
+        }
+    })
+}
+
 impl OptimalMatchPrices {
     fn new(prices: Option<&TokenPrices<'_>>) -> Self {
         Self {
-            new_lengths: std::array::from_fn(|slot| {
-                let code = prices.map_or(0, |prices| {
+            new_lengths: length_costs(|slot| {
+                prices.map_or(0, |prices| {
                     TokenPrices::code(prices.lengths.main[262 + slot])
-                });
-                (code + usize::from(length_slot_extra_bits(slot))) as u32
+                })
             }),
-            repeat_lengths: std::array::from_fn(|slot| {
-                let code =
-                    prices.map_or(0, |prices| TokenPrices::code(prices.lengths.length[slot]));
-                (code + usize::from(length_slot_extra_bits(slot))) as u32
+            repeat_lengths: length_costs(|slot| {
+                prices.map_or(0, |prices| TokenPrices::code(prices.lengths.length[slot]))
             }),
             repeats: std::array::from_fn(|index| {
                 prices.map_or(5, |prices| {
@@ -3023,33 +3044,107 @@ impl OptimalMatchPrices {
     }
 }
 
+/// The cheapest arrival found so far at each position of a block: its price,
+/// and the length and distance of the match that reached it, zero for a
+/// literal.
+struct Arrivals<'a> {
+    price: &'a mut [u32],
+    length: &'a mut [u32],
+    distance: &'a mut [u32],
+}
+
 impl MatchRunPrice<'_> {
-    /// The cost of `length`, and the longest length from there that costs the
-    /// same: the end of its length slot, or just short of the remembered last
-    /// length, which is priced on its own.
-    #[inline]
-    fn span(&self, length: usize) -> Option<(u32, usize)> {
-        if self.last_length == Some(length) {
-            return Some((self.last_repeat, length));
+    /// Offers the endpoint of every length in `lengths`, at `distance`, from
+    /// the position `index` that was reached for `here`. An endpoint takes an
+    /// offer only if it is strictly cheaper, so the first offer of a price
+    /// keeps it.
+    #[inline(always)]
+    fn relax(
+        &self,
+        here: u32,
+        index: usize,
+        lengths: std::ops::RangeInclusive<usize>,
+        distance: u32,
+        mut paths: Arrivals<'_>,
+    ) {
+        // A length the distance bonus leaves under two cannot be coded.
+        let first = (*lengths.start()).max(self.bonus + 2);
+        let last = *lengths.end();
+        if first > last {
+            return;
         }
-        let encoded = length.checked_sub(self.bonus)?;
-        if encoded < 2 {
-            return None;
-        }
-        let (slot, _) = length_slot_for_valid_match(encoded);
-        let value = encoded - 2;
-        let slot_last = if value < 8 {
-            value
-        } else {
-            value | ((1 << (value.ilog2() - 2)) - 1)
-        };
-        let mut last = slot_last + 2 + self.bonus;
-        if let Some(repeat) = self.last_length {
-            if repeat > length && repeat <= last {
-                last = repeat - 1;
+        let base = here.saturating_add(self.distance);
+        match self.last_length {
+            // The remembered last length is coded on its own, for its own
+            // price, and the lengths either side of it as usual.
+            Some(repeat) if (first..=last).contains(&repeat) => {
+                self.relax_lengths(base, index, first, repeat - 1, distance, &mut paths);
+                let reached = here.saturating_add(self.last_repeat);
+                let target = index + repeat;
+                if reached < paths.price[target] {
+                    paths.price[target] = reached;
+                    paths.length[target] = repeat as u32;
+                    paths.distance[target] = distance;
+                }
+                self.relax_lengths(base, index, repeat + 1, last, distance, &mut paths);
             }
+            _ => self.relax_lengths(base, index, first, last, distance, &mut paths),
         }
-        Some((self.distance + self.lengths[slot], last))
+    }
+
+    /// The loop every endpoint goes through.
+    ///
+    /// Endpoints are compared eight at a time, which the compiler does in
+    /// vector registers, and only a group with a winner is updated. On 64 MiB
+    /// of C headers at level 3 that was 3% quicker overall than a branch per
+    /// endpoint, and a branch-free update of all three arrays, which the
+    /// compiler vectorizes too, was no quicker than the branch: it stores
+    /// every endpoint where few of them win.
+    #[inline(always)]
+    fn relax_lengths(
+        &self,
+        base: u32,
+        index: usize,
+        first: usize,
+        last: usize,
+        distance: u32,
+        paths: &mut Arrivals<'_>,
+    ) {
+        const GROUP: usize = 8;
+        if first > last {
+            return;
+        }
+        let count = last + 1 - first;
+        let costs = &self.lengths[first - self.bonus..][..count];
+        let price = &mut paths.price[index + first..][..count];
+        let arrive_length = &mut paths.length[index + first..][..count];
+        let arrive_distance = &mut paths.distance[index + first..][..count];
+        let mut offset = 0;
+        while offset < count {
+            let group = GROUP.min(count - offset);
+            if group == GROUP {
+                let costs: &[u8; GROUP] = costs[offset..offset + GROUP].try_into().unwrap();
+                let prices: &[u32; GROUP] = price[offset..offset + GROUP].try_into().unwrap();
+                let mut wins = false;
+                for (&cost, &price) in costs.iter().zip(prices) {
+                    wins |= base.saturating_add(u32::from(cost)) < price;
+                }
+                if !wins {
+                    offset += GROUP;
+                    continue;
+                }
+            }
+            for at in offset..offset + group {
+                let reached = base.saturating_add(u32::from(costs[at]));
+                if reached < price[at] {
+                    price[at] = reached;
+                    // Lengths stop at MAX_ENCODER_MATCH_LENGTH, far inside a u32.
+                    arrive_length[at] = (first + at) as u32;
+                    arrive_distance[at] = distance;
+                }
+            }
+            offset += group;
+        }
     }
 
     #[cfg(test)]
@@ -3063,8 +3158,7 @@ impl MatchRunPrice<'_> {
             return None;
         }
         debug_assert!(length <= MAX_ENCODER_MATCH_LENGTH);
-        let (slot, _) = length_slot_for_valid_match(encoded);
-        Some(self.distance + self.lengths[slot])
+        Some(self.distance + u32::from(self.lengths[encoded]))
     }
 }
 
@@ -3215,6 +3309,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
 
         let mut reaches_len = 0;
         let mut longest = 0usize;
+        let mut farthest = 0usize;
 
         // A match at a remembered distance is priced out of the main table
         // alone, a handful of bits against twenty for a fresh distance, so it
@@ -3239,6 +3334,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
             if length >= 4 {
                 reaches[reaches_len] = (4, length, repeat);
                 reaches_len += 1;
+                farthest = farthest.max(length);
             }
         }
 
@@ -3247,25 +3343,36 @@ fn price_optimal_paths_with_state<const RING: bool>(
         // the longest so far owns one run of lengths. The tree measures
         // against the whole member where the chains stopped at the block, so
         // a length is capped here to what this block can still hold.
+        //
+        // A run at a remembered distance offers what that distance's own
+        // reach above already offered, at the same prices: the reach was
+        // measured out to the real end of the match, which is as far as any
+        // run at that distance gets. On text that was a fifth of every
+        // endpoint priced, so such a run is left out.
+        let repeat_reaches = reaches_len;
         for &(length, distance) in &runs[starts[index] as usize..starts[index + 1] as usize] {
             let length = (length as usize).min(max_length);
             if length > longest {
-                reaches[reaches_len] = (longest + 1, length, distance as usize);
-                reaches_len += 1;
+                let distance = distance as usize;
+                if !reaches[..repeat_reaches]
+                    .iter()
+                    .any(|&(_, reach, repeat)| repeat == distance && reach >= length)
+                {
+                    reaches[reaches_len] = (longest + 1, length, distance);
+                    reaches_len += 1;
+                }
                 longest = length;
             }
         }
 
         let reaches = &reaches[..reaches_len];
+        // A run left out above reached no further than its distance's reach.
+        let farthest = farthest.max(longest);
 
         // Equal token prices do not make shorter matches redundant: their
         // endpoints can expose a better continuation. Price every endpoint
         // unless the explicit long-match heuristic commits past all of them.
-        let committed_reach = reaches
-            .iter()
-            .map(|&(_, end, _)| end)
-            .max()
-            .filter(|&length| length >= nice);
+        let committed_reach = (farthest >= nice).then_some(farthest);
         for &(run_start, run_end, distance) in reaches.iter() {
             let mut length = run_start.max(4);
             if let Some(committed) = committed_reach {
@@ -3277,35 +3384,24 @@ fn price_optimal_paths_with_state<const RING: bool>(
             let Ok(run_price) = match_prices.run(&state, distance, distance_size, prices) else {
                 continue;
             };
-            // Lengths in one slot cost the same, so each span of them is
-            // priced once and its targets only compared.
-            while length <= run_end {
-                let Some((cost, last)) = run_price.span(length) else {
-                    length += 1;
-                    continue;
-                };
-                let reached = here.saturating_add(cost);
-                let last = last.min(run_end);
-                for reach in length..=last {
-                    let target = index + reach;
-                    if reached < price[target] {
-                        price[target] = reached;
-                        arrive_length[target] = reach as u32;
-                        arrive_distance[target] = distance as u32;
-                    }
-                }
-                length = last + 1;
-            }
+            run_price.relax(
+                here,
+                index,
+                length..=run_end,
+                distance as u32,
+                Arrivals {
+                    price: &mut *price,
+                    length: &mut *arrive_length,
+                    distance: &mut *arrive_distance,
+                },
+            );
         }
 
         // A committed match is at least eight bytes long. Even after the
         // distance bonus, that length and every collected u32 distance fit
         // their encoder tables, so the endpoint has already been priced.
-        let longest_reach = reaches.iter().map(|&(_, length, _)| length).max();
-        if let Some(reach) = longest_reach {
-            if reach >= nice {
-                committed_through = index + reach;
-            }
+        if let Some(reach) = committed_reach {
+            committed_through = index + reach;
         }
     }
 }

@@ -38,7 +38,6 @@ fn prepared_run_prices_preserve_every_length_and_distance_boundary() {
                 for state in states {
                     for distance in distances {
                         let run = prepared.run(&state, distance, distance_size, prices).ok();
-                        let mut checked_span = None;
                         for length in 1..=MAX_ENCODER_MATCH_LENGTH {
                             let expected = match prices {
                                 Some(prices) => {
@@ -56,26 +55,6 @@ fn prepared_run_prices_preserve_every_length_and_distance_boundary() {
                                 "seed={seed}, actual={}, state={state:?}, distance={distance}, length={length}, table={distance_size}",
                                 prices.is_some(),
                             );
-                            // Every length a span covers costs what it says.
-                            let span = run.as_ref().and_then(|run| run.span(length));
-                            assert_eq!(span.map(|(cost, _)| cost), expected);
-                            if let (Some(run), Some((cost, last))) = (&run, span) {
-                                assert!(last >= length);
-                                // A shorter length that reported this same span
-                                // already checked every length from here to its
-                                // end, so each span is walked once, not once per
-                                // length in it.
-                                if checked_span != Some((cost, last)) {
-                                    for covered in length..=last.min(MAX_ENCODER_MATCH_LENGTH) {
-                                        assert_eq!(
-                                            run.cost(covered),
-                                            Some(cost),
-                                            "length={length}, covered={covered}"
-                                        );
-                                    }
-                                    checked_span = Some((cost, last));
-                                }
-                            }
                         }
                     }
                 }
