@@ -6736,7 +6736,9 @@ mod tests {
 
     #[test]
     fn an_incompressible_member_in_a_set_is_stored_with_nothing_left_over() {
-        let noise = noise(1024 * 1024 + 7);
+        // Under the size members are sampled at, so it is coded as it goes and
+        // judged on what that writes.
+        let noise = noise(crate::incompressible::MIN_MEMBER as usize - 7);
         let large = binary_member(512 * 1024);
         let coding = || crate::MemberCoding::Compressed;
         // A stored lead leaves the noise most of a volume, or a few bytes, to start in.
@@ -6794,7 +6796,9 @@ mod tests {
 
     #[test]
     fn an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin() {
-        let noise = noise(1024 * 1024 + 7);
+        // Under the size members are sampled at, so it is coded as it goes and
+        // judged on what that writes.
+        let noise = noise(crate::incompressible::MIN_MEMBER as usize - 7);
         let total = |set: &[Vec<u8>]| set.iter().map(Vec::len).sum::<usize>();
         for (options, margin) in [
             (rar40(), 128),
