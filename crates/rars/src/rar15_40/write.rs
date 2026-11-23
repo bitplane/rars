@@ -9308,42 +9308,17 @@ mod tests {
     /// stored. Coding it first read it whole twice.
     #[test]
     fn a_streamed_noise_member_is_not_coded_before_it_is_stored() {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        use std::sync::Arc;
-        struct Counted(std::io::Cursor<Vec<u8>>, Arc<AtomicU64>);
-        impl std::io::Read for Counted {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                let read = self.0.read(buffer)?;
-                self.1.fetch_add(read as u64, Ordering::Relaxed);
-                Ok(read)
-            }
-        }
-        impl std::io::Seek for Counted {
-            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
-                self.0.seek(from)
-            }
-        }
         let data = noise(4 * 1024 * 1024);
         for options in sampled_targets() {
-            let read = Arc::new(AtomicU64::new(0));
-            let source = {
-                let (data, read) = (data.clone(), read.clone());
-                crate::EntrySource::from_opener(data.len() as u64, move || {
-                    Ok(Box::new(Counted(
-                        std::io::Cursor::new(data.clone()),
-                        read.clone(),
-                    )))
-                })
-            };
-            let members = [super::StreamingEntry::new(b"noise.bin".to_vec(), source)];
+            let (members, read) = read_counted(&[("noise.bin", &data)]);
             let archive = streamed_with(&members, options, crate::MemberCoding::Compressed, None)
                 .unwrap()
                 .inner
                 .into_inner();
-            let read = read.load(Ordering::Relaxed);
-            let samples = 16 * crate::incompressible::SAMPLE_LEN as u64;
+            let read = read.load(std::sync::atomic::Ordering::Relaxed);
+            let samples = 16 * crate::incompressible::SAMPLE_LEN;
             assert!(
-                read <= data.len() as u64 + samples,
+                read <= data.len() + samples,
                 "{:?}: {read} bytes read",
                 options.target
             );
