@@ -913,6 +913,7 @@ impl Archive {
             Redirections::Skip,
             None,
             None,
+            None,
         )
         .map(|_| ())
     }
@@ -935,6 +936,7 @@ impl Archive {
             Redirections::Emit,
             None,
             None,
+            None,
         )
         .map(|_| ())
     }
@@ -952,9 +954,11 @@ impl Archive {
             Redirections::Skip,
             Some(selector),
             on_error,
+            None,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn extract_to_impl<F, R>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -963,6 +967,7 @@ impl Archive {
         redirections: Redirections,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        settling: Option<&Settling<'_>>,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -976,6 +981,7 @@ impl Archive {
                 redirections,
                 selector,
                 on_error,
+                settling,
                 &crate::codec::workspace::Allowance::limited(limit),
             );
         }
@@ -986,6 +992,7 @@ impl Archive {
             redirections,
             selector,
             on_error,
+            settling,
             &Allowance::default(),
         )
     }
@@ -999,6 +1006,7 @@ impl Archive {
         redirections: Redirections,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+        settling: Option<&Settling<'_>>,
         allowance: &B,
     ) -> Result<crate::ExtractionOutcome>
     where
@@ -1062,6 +1070,7 @@ impl Archive {
                     }
                 })
             })();
+            let result = settled(settling, result);
             match crate::extraction_control::finish_member(
                 &mut on_error,
                 options,
@@ -1155,7 +1164,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.parallel_to_impl(options, &mut open, None, false)
+        self.parallel_to_impl(options, &mut open, None, false, None)
     }
 
     /// As [`Self::extract_to_parallel_buffered`], and reports each redirection
@@ -1171,7 +1180,42 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
-        self.parallel_to_impl(options, &mut open, Some(&mut redirect), false)
+        self.parallel_to_impl(options, &mut open, Some(&mut redirect), false, None)
+    }
+
+    /// As [`Self::extract_parallel_with_redirections`], and tells `settled`
+    /// about every member `open` was called for, in archive order: `true` once
+    /// its output is written and verified and its writer dropped, `false` when
+    /// the open or the member failed, before the member error handler hears of
+    /// it. Writers can be written and dropped on worker threads, and members
+    /// after one can be opened before it settles, so a member is verified only
+    /// once it has settled. Redirections are reported only once every member
+    /// opened before them has settled. An error from `settled` is the member's
+    /// own. When the call fails, members opened and not settled are unverified.
+    pub(crate) fn extract_settled<F, R, S>(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        mut open: F,
+        mut redirect: R,
+        mut settled: S,
+    ) -> Result<()>
+    where
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + Send>>,
+        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+        S: FnMut(&ExtractedEntryMeta, bool) -> Result<()>,
+    {
+        let settling = Settling {
+            open: std::cell::RefCell::new(&mut open),
+            settled: std::cell::RefCell::new(&mut settled),
+            opened: std::cell::RefCell::new(None),
+        };
+        self.parallel_to_impl(
+            options,
+            &mut |meta| settling.open_tracked(meta),
+            Some(&mut redirect),
+            false,
+            Some(&settling),
+        )
     }
 
     pub(crate) fn test_to<F>(
@@ -1190,6 +1234,7 @@ impl Archive {
             },
             None,
             true,
+            None,
         )
     }
 
@@ -1199,6 +1244,7 @@ impl Archive {
         open: &mut F,
         mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
+        settling: Option<&Settling<'_>>,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1229,6 +1275,7 @@ impl Archive {
                     redirections,
                     None,
                     None,
+                    settling,
                 )
                 .map(|_| ());
         }
@@ -1239,21 +1286,29 @@ impl Archive {
                 open,
                 redirect,
                 verification,
+                settling,
                 &Allowance::limited(limit),
             ),
-            None => {
-                self.parallel_with(options, open, redirect, verification, &Allowance::default())
-            }
+            None => self.parallel_with(
+                options,
+                open,
+                redirect,
+                verification,
+                settling,
+                &Allowance::default(),
+            ),
         }?;
         options.check_cancelled()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn parallel_with<F, B: member_batches::Workers>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
+        settling: Option<&Settling<'_>>,
         allowance: &B,
     ) -> Result<()>
     where
@@ -1266,13 +1321,18 @@ impl Archive {
         } else {
             Redirections::Skip
         };
+        // Outputs opened as members start and written on the workers. A
+        // limited workspace keeps writing each member as it is published.
+        let on_workers = settling.filter(|_| {
+            !B::LIMITED && crate::parallel::default_window() > 1 && crate::parallel::may_spawn()
+        });
         let plan = |file: &FileHeader| {
             if file.is_split_before() || file.is_split_after() {
                 // Fails inline, as sequential extraction does.
                 Plan::Inline
             } else if file.is_directory()
                 || redirections.redirects(file)
-                || (verification
+                || ((verification || on_workers.is_some())
                     && (file.is_stored() || file.should_stream_decode(buffered_decode_limit)))
             {
                 // Nothing buffered: verified as it is read or streamed to a sink.
@@ -1290,7 +1350,7 @@ impl Archive {
                 0
             } else if file.is_stored() {
                 // Verified as it is read; otherwise buffered whole.
-                if verification {
+                if verification || on_workers.is_some() {
                     0
                 } else {
                     file.unpacked_size
@@ -1309,6 +1369,17 @@ impl Archive {
             &mut (open, &mut redirect),
             plan,
             |ctx, members| {
+                if let Some(settling) = on_workers {
+                    return self.write_on_workers(
+                        members,
+                        options,
+                        buffered_decode_limit,
+                        allowance,
+                        &hint,
+                        settling,
+                        ctx.1.as_deref_mut(),
+                    );
+                }
                 allowance.batches(
                     members,
                     buffered_decode_limit,
@@ -1349,6 +1420,7 @@ impl Archive {
                                 ),
                             }
                         });
+                        let published = settled(settling, published);
                         finish_independent(options, || crate::rar50_member(file), published)
                     },
                 )
@@ -1362,9 +1434,244 @@ impl Archive {
                     *open,
                     redirect.as_deref_mut(),
                 );
+                let extracted = settled(settling, extracted);
                 finish_independent(options, || crate::rar50_member(file), extracted)
             },
         )
+    }
+
+    /// Runs `members` as [`member_batches::Workers::batches`] does for an
+    /// unlimited workspace, except that each member's output is opened on this
+    /// thread as the member is admitted, in archive order, and written and
+    /// closed on its worker; publishing it only settles it. A redirection
+    /// waits until every member before it has settled and is reported as it
+    /// is admitted, so the caller sees each link once the members before it
+    /// are verified and before any member after it is opened, as in
+    /// sequential extraction.
+    #[allow(clippy::too_many_arguments)]
+    fn write_on_workers<B: member_batches::Workers>(
+        &self,
+        members: &[(&FileHeader, u64)],
+        options: crate::ArchiveReadOptions<'_>,
+        buffered_decode_limit: u64,
+        allowance: &B,
+        hint: &impl Fn(&FileHeader) -> u64,
+        settling: &Settling<'_>,
+        mut redirect: Option<&mut Redirect<'_>>,
+    ) -> Result<usize> {
+        options.check_cancelled()?;
+        let window = crate::parallel::default_window().max(1);
+        let running_limit = member_batches::running_workspace();
+        // The buffered output and the workspace of the members running.
+        // Nothing is held once a member is written.
+        let held = std::cell::Cell::new((0u128, 0u128));
+        let fits = |held: u128, more: u64, limit: u64| {
+            held == 0 || held + u128::from(more) <= u128::from(limit)
+        };
+        // Once a member fails before it is decoded, as when its output cannot
+        // be opened, nothing after it is opened until it has settled.
+        let failed = std::cell::Cell::new(false);
+        crate::parallel::map_ordered_with_tickets(
+            members,
+            window,
+            |(file, cost), idle| {
+                let workspace = hint(file);
+                let (bytes, running) = held.get();
+                let admitted = idle
+                    || (!failed.get()
+                        && file.redirection.is_none()
+                        && fits(bytes, cost, buffered_decode_limit)
+                        && fits(running, workspace, running_limit));
+                if !admitted {
+                    return None;
+                }
+                held.set((bytes + u128::from(cost), running + u128::from(workspace)));
+                let ticket = Ticket::admit(file, options, settling, redirect.as_deref_mut());
+                failed.set(ticket.failed());
+                Some(ticket)
+            },
+            |(file, cost)| {
+                let (bytes, running) = held.get();
+                held.set((bytes - u128::from(cost), running - u128::from(hint(file))));
+            },
+            |_| {},
+            |(file, _), ticket| {
+                let written = match ticket {
+                    Ticket::Refused(error) => Written::Unopened(Err(error)),
+                    Ticket::Linked(result) => Written::Unopened(result),
+                    Ticket::Opened(meta, Ok(writer)) => {
+                        let result = write_opened_entry(
+                            self,
+                            file,
+                            &meta,
+                            writer,
+                            buffered_decode_limit,
+                            options,
+                            allowance,
+                        );
+                        Written::Opened(meta, result)
+                    }
+                    // Raised as the member settles, as when it was published.
+                    Ticket::Opened(meta, Err(error)) => {
+                        return Ok((file, Written::Opened(meta, Err(error))))
+                    }
+                };
+                match written {
+                    Written::Unopened(Err(error)) | Written::Opened(_, Err(error))
+                        if !holds_for_handler(&options, &error) =>
+                    {
+                        Err(error)
+                    }
+                    written => Ok((file, written)),
+                }
+            },
+            |(file, written)| {
+                let result = match written {
+                    Written::Unopened(result) => result,
+                    Written::Opened(meta, result) => settling.settle(&meta, result),
+                };
+                finish_independent(options, || crate::rar50_member(file), result)
+            },
+        )?;
+        Ok(members.len())
+    }
+}
+
+/// What a member admitted by [`Archive::write_on_workers`] takes to its worker.
+enum Ticket {
+    /// Failed before its output was opened.
+    Refused(Error),
+    /// A redirection, reported as it was admitted.
+    Linked(Result<()>),
+    /// Its output, or why that could not be opened.
+    Opened(ExtractedEntryMeta, Result<Box<dyn Write + Send>>),
+}
+
+impl Ticket {
+    /// Checks a member and opens its output, or reports its redirection, with
+    /// the checks sequential extraction makes first.
+    fn admit(
+        file: &FileHeader,
+        options: crate::ArchiveReadOptions<'_>,
+        settling: &Settling<'_>,
+        redirect: Option<&mut Redirect<'_>>,
+    ) -> Self {
+        let checked = options.check_cancelled().and_then(|()| {
+            file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+            file.check_output_limit(&crate::output_limit::OutputBudget::new(options))
+        });
+        if let Err(error) = checked {
+            return Self::Refused(error);
+        }
+        if let Some(redirection) = &file.redirection {
+            return Self::Linked(match redirect {
+                Some(redirect) => publish_redirection(file, redirection, redirect, &options),
+                None => Ok(()),
+            });
+        }
+        let meta = file.metadata();
+        let opened = settling
+            .open(&meta)
+            .and_then(|writer| options.check_cancelled().map(|()| writer));
+        Self::Opened(meta, opened)
+    }
+
+    fn failed(&self) -> bool {
+        matches!(
+            self,
+            Self::Refused(_) | Self::Linked(Err(_)) | Self::Opened(_, Err(_))
+        )
+    }
+}
+
+/// What a worker hands back to [`Archive::write_on_workers`].
+enum Written {
+    /// A redirection, or a member that failed before its output was opened.
+    Unopened(Result<()>),
+    /// A member whose output was opened, and whether it was written and verified.
+    Opened(ExtractedEntryMeta, Result<()>),
+}
+
+/// Writes one member to the output opened for it and closes it, on a worker.
+fn write_opened_entry<B: Budget>(
+    archive: &Archive,
+    file: &FileHeader,
+    meta: &ExtractedEntryMeta,
+    mut writer: Box<dyn Write + Send>,
+    buffered_decode_limit: u64,
+    options: crate::ArchiveReadOptions<'_>,
+    allowance: &B,
+) -> Result<()> {
+    options.check_cancelled()?;
+    if meta.is_directory {
+        return Ok(());
+    }
+    let mut budget = crate::output_limit::OutputBudget::new(options);
+    let mut session =
+        DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
+    session.decoder.read_control = budget.control.clone();
+    // As for a buffered worker in `decode_parallel_entry`: the output is
+    // written from the decoded copy, so the dictionary need not keep it.
+    let history = if !B::LIMITED
+        && !archive.main.is_solid()
+        && !file.is_stored()
+        && !file.should_stream_decode(buffered_decode_limit)
+    {
+        HistoryRetention::DiscardIndependent
+    } else {
+        HistoryRetention::Retain
+    };
+    budget.run(&file.name, &mut writer, |writer| {
+        session.write_file_to_with_history(archive, file, writer, history)
+    })?;
+    drop(writer);
+    options.check_cancelled()
+}
+
+/// The caller's callbacks for [`Archive::extract_settled`].
+pub(crate) struct Settling<'a> {
+    open: std::cell::RefCell<&'a mut OpenSend<'a>>,
+    settled: std::cell::RefCell<&'a mut Settle<'a>>,
+    /// The member a path writing on this thread opened last, until it settles.
+    opened: std::cell::RefCell<Option<ExtractedEntryMeta>>,
+}
+
+type OpenSend<'a> = dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + Send>> + 'a;
+type Settle<'a> = dyn FnMut(&ExtractedEntryMeta, bool) -> Result<()> + 'a;
+
+impl Settling<'_> {
+    fn open(&self, meta: &ExtractedEntryMeta) -> Result<Box<dyn Write + Send>> {
+        (self.open.borrow_mut())(meta)
+    }
+
+    /// Opens a member's output for a path that writes it on this thread, and
+    /// remembers to settle it.
+    fn open_tracked(&self, meta: &ExtractedEntryMeta) -> Result<Box<dyn Write>> {
+        *self.opened.borrow_mut() = Some(meta.clone());
+        self.open(meta).map(|writer| writer as Box<dyn Write>)
+    }
+
+    fn settle(&self, meta: &ExtractedEntryMeta, result: Result<()>) -> Result<()> {
+        let mut settled = self.settled.borrow_mut();
+        match result {
+            Ok(()) => settled(meta, true),
+            Err(error) => {
+                settled(meta, false)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+/// Settles the member a path writing on this thread opened, if it opened one.
+fn settled(settling: Option<&Settling<'_>>, result: Result<()>) -> Result<()> {
+    let Some(settling) = settling else {
+        return result;
+    };
+    let opened = settling.opened.borrow_mut().take();
+    match opened {
+        Some(meta) => settling.settle(&meta, result),
+        None => result,
     }
 }
 

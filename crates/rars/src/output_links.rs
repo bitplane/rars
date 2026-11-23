@@ -53,6 +53,40 @@ where
     first.extract_arriving(volumes, options, &mut open, Some(&mut link))
 }
 
+/// Extracts a RAR 5 archive as [`crate::Archive::extract_with_links`] does,
+/// except that outputs are `Send`: a member's output can be written and closed
+/// on a worker thread, and members after it opened before it is verified.
+///
+/// `settled(meta, verified)` follows every call to `open`, on the calling
+/// thread and in archive order: `true` once that member is written, verified
+/// and its output dropped, `false` when the open or the member failed, before
+/// the member error handler hears of it. An error from `settled` is the
+/// member's own. A link is reported once every member opened before it has
+/// settled, and before any member after it is opened. Only a member that has
+/// settled `true` is verified; when the call fails, those opened and not
+/// settled are not.
+pub fn extract_rar50_settled_with_links<F, L, S>(
+    archive: &crate::rar50::Archive,
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    mut link: L,
+    mut settled: S,
+) -> Result<()>
+where
+    F: FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write + Send>>,
+    L: FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
+    S: FnMut(&crate::ExtractedEntryMeta, bool) -> Result<()>,
+{
+    let _cap = crate::parallel::ThreadCap::set(options.threads);
+    options.check_cancelled()?;
+    archive.extract_settled(
+        options,
+        |meta| open(&crate::rar50_meta(meta)),
+        |meta, redirection| crate::extraction_links::emit_rar50_link(meta, redirection, &mut link),
+        |meta, verified| settled(&crate::rar50_meta(meta), verified),
+    )
+}
+
 pub fn check_legacy_symlink_target(name: &[u8], size: u64, target: Option<&[u8]>) -> Result<()> {
     if size > crate::extraction_links::LEGACY_TARGET_LIMIT {
         return Err(
