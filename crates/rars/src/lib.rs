@@ -52,6 +52,7 @@ pub mod features;
 pub mod filename;
 pub mod filter;
 mod header_damage;
+mod resync;
 pub use header_damage::{HeaderDamage, HeaderDamageKind};
 #[cfg(feature = "write")]
 mod filter_search;
@@ -495,9 +496,18 @@ impl<'a> ArchiveReadOptions<'a> {
     ///   parses ([`HeaderDamageKind::Checksum`]);
     /// - a malformed optional record, such as a RAR 5 redirection or hash
     ///   record, is dropped and the rest of its header kept
-    ///   ([`HeaderDamageKind::DroppedRecord`]).
-    ///
-    /// A header that doesn't parse still ends the walk with its error.
+    ///   ([`HeaderDamageKind::DroppedRecord`]);
+    /// - a plaintext block header that doesn't parse, or a damaged one that
+    ///   sends the walk astray, is resynced past: the walk scans on for the
+    ///   next header whose checksum and fields check out, and carries on there
+    ///   ([`HeaderDamageKind::Resynced`]). With nothing to resync to, the walk
+    ///   ends there ([`HeaderDamageKind::Unreadable`]). A RAR 5 main header
+    ///   that doesn't parse is resynced past as well, and the archive read as
+    ///   a plain one;
+    /// - when members were lost that way, a RAR 5 member whose header is in
+    ///   the quick-open block is read from that copy
+    ///   ([`HeaderDamageKind::QuickOpenCopy`]). The copies are never read
+    ///   otherwise.
     ///
     /// Testing and extraction deliver each member's bytes even when it fails:
     ///
@@ -513,7 +523,10 @@ impl<'a> ArchiveReadOptions<'a> {
     ///   of the stream is decoded into the window only, so that a solid
     ///   successor starts where the stream ends. For RAR 5 that run-on stops
     ///   at [`Self::max_member_output_bytes`] in all, if it is set; bound the
-    ///   time with [`Self::cancellation`] otherwise.
+    ///   time with [`Self::cancellation`] otherwise;
+    /// - a solid member after members of its stream were lost to header
+    ///   damage gets what decodes without their history, then
+    ///   [`Error::SolidHistoryLost`], even if it passed its checksum.
     ///
     /// The error goes where it always does: to the
     /// [`Self::with_member_error_handler`] handler, which can carry on to the

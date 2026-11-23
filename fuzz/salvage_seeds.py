@@ -40,6 +40,7 @@ FORMATS = [
     ("rar50_e8e9", ["--format", "rar50", "--e8e9-filter"], False),
     ("rar50_delta", ["--format", "rar50", "--delta-filter", "3"], False),
     ("rar50_rr", ["--format", "rar50", "--recovery-percent", "5"], True),
+    ("rar50_qo", ["--format", "rar50", "--quick-open"], True),
     ("rar20_store", ["--format", "rar20", "--store"], False),
     ("rar50_store", ["--format", "rar50", "--store"], False),
 ]

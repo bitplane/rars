@@ -175,6 +175,7 @@ where
                         &mut reader,
                         first.header.unp_size as usize,
                         solid,
+                        false,
                         &mut checksum_writer,
                     )?;
                 }

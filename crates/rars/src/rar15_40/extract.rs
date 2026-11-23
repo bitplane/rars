@@ -841,6 +841,7 @@ mod tests {
     fn file(name: &[u8], flags: u16) -> FileHeader {
         FileHeader {
             cut_short: false,
+            history_lost: false,
             block: block(flags),
             pack_size: 0,
             unp_size: 0,

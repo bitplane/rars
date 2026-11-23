@@ -240,6 +240,12 @@ impl FileHeader {
     /// Under salvage, a member the file ends partway through fails as that,
     /// whatever else stopped it, once what decoded is delivered.
     fn cut_short_result(&self, result: Result<()>) -> Result<()> {
+        // A solid member whose history was lost is never taken as verified.
+        let result = match result {
+            Err(error) if !crate::header_damage::decoding_failure(&error) => Err(error),
+            _ if self.history_lost => Err(self.entry_error("decoding", Error::SolidHistoryLost)),
+            result => result,
+        };
         match result {
             Err(error) if self.is_cut_short() && error.kind() != crate::ErrorKind::Cancelled => {
                 Err(self.entry_error(
@@ -472,6 +478,7 @@ impl FileHeader {
         }
         let payload = FileHeader {
             cut_short: false,
+            history_lost: false,
             block: self.block.clone(),
             file_flags: self.file_flags,
             rewrite_metadata_complete: self.rewrite_metadata_complete,
@@ -2758,6 +2765,7 @@ mod tests {
     fn plain_file(name: &[u8], data: &[u8], hash: Option<FileHash>) -> FileHeader {
         FileHeader {
             cut_short: false,
+            history_lost: false,
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
@@ -3444,6 +3452,7 @@ mod tests {
         let data = b"hash me";
         let file = FileHeader {
             cut_short: false,
+            history_lost: false,
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
@@ -3772,6 +3781,7 @@ mod tests {
             },
             blocks: vec![Block::File(FileHeader {
                 cut_short: false,
+                history_lost: false,
                 block: empty_block(HEAD_FILE, flags, 0..data.len()),
                 file_flags: 0,
                 rewrite_metadata_complete: true,
@@ -3823,6 +3833,7 @@ mod tests {
     fn split_fragment_file(name: &[u8], hfl_flags: u64) -> FileHeader {
         FileHeader {
             cut_short: false,
+            history_lost: false,
             block: empty_block(HEAD_FILE, hfl_flags, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
