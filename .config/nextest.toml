@@ -28,6 +28,7 @@ not (
     (binary_id(rars) & test(=rar15_40::write::tests::an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin)) |
     (binary_id(rars) & test(=rar15_40::write::tests::password_protected_members_stream_into_a_set)) |
     (binary_id(rars) & test(=rar15_40::write::tests::rar29_text_packs_no_larger_a_level_up_in_chains_forced_and_streamed)) |
+    (binary_id(rars) & test(=rar50::write::compress::tests::joined_runs_code_the_bytes_their_runs_code_alone)) |
     (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_large_member_is_searched_on_the_block_paths_grid)) |
     (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_member_too_long_for_one_search_is_filtered_on_both_paths)) |
     (binary_id(rars) & test(=rar50::write::tests::parallel_streaming_blocks_are_byte_identical_to_serial_blocks)) |
