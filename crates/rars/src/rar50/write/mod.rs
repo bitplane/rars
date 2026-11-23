@@ -622,6 +622,9 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
         observed += read as u64;
         crc.update(&buffer[..read]);
         hash.update(&buffer[..read]);
+        if !progress.advance(read as u64) {
+            return Err(Error::Cancelled);
+        }
     }
     crate::write_stream::check_source_length(
         &mut *reader,
