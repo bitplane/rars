@@ -478,9 +478,19 @@ impl Unpack50Decoder {
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         self.state.read_control = self.read_control.clone();
-        self.state
-            .decode_member(input, algorithm_version, output_size, solid, mode)
-            .map(Buffer::into_vec)
+        let decoded = self
+            .state
+            .decode_member(input, algorithm_version, output_size, solid, mode);
+        self.whole(decoded).map(Buffer::into_vec)
+    }
+
+    /// A stream that ends before `output_size` is truncated here; members
+    /// weigh it against their checksum instead.
+    fn whole<T>(&self, decoded: Result<T>) -> Result<T> {
+        match decoded {
+            Ok(_) if self.state.ended_early.is_some() => Err(Error::NeedMoreInput),
+            decoded => decoded,
+        }
     }
     pub fn decode_member_with_dictionary(
         &mut self,
@@ -492,16 +502,15 @@ impl Unpack50Decoder {
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         self.state.read_control = self.read_control.clone();
-        self.state
-            .decode_member_with_dictionary(
-                input,
-                algorithm_version,
-                output_size,
-                dictionary_size,
-                solid,
-                mode,
-            )
-            .map(Buffer::into_vec)
+        let decoded = self.state.decode_member_with_dictionary(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            mode,
+        );
+        self.whole(decoded).map(Buffer::into_vec)
     }
     pub fn decode_member_from_reader(
         &mut self,
@@ -512,9 +521,14 @@ impl Unpack50Decoder {
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         self.state.read_control = self.read_control.clone();
-        self.state
-            .decode_member_from_reader(input, algorithm_version, output_size, solid, mode)
-            .map(Buffer::into_vec)
+        let decoded = self.state.decode_member_from_reader(
+            input,
+            algorithm_version,
+            output_size,
+            solid,
+            mode,
+        );
+        self.whole(decoded).map(Buffer::into_vec)
     }
     pub fn decode_member_from_reader_with_dictionary(
         &mut self,
@@ -526,16 +540,15 @@ impl Unpack50Decoder {
         mode: DecodeMode,
     ) -> Result<Vec<u8>> {
         self.state.read_control = self.read_control.clone();
-        self.state
-            .decode_member_from_reader_with_dictionary(
-                input,
-                algorithm_version,
-                output_size,
-                dictionary_size,
-                solid,
-                mode,
-            )
-            .map(Buffer::into_vec)
+        let decoded = self.state.decode_member_from_reader_with_dictionary(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            mode,
+        );
+        self.whole(decoded).map(Buffer::into_vec)
     }
     pub fn decode_member_from_reader_with_dictionary_to_sink<E>(
         &mut self,
@@ -555,7 +568,11 @@ impl Unpack50Decoder {
                 dictionary_size,
                 solid,
                 sink,
-            )
+            )?;
+        match self.state.ended_early {
+            Some(_) => Err(Error::NeedMoreInput.into()),
+            None => Ok(()),
+        }
     }
     #[cfg(all(test, feature = "write"))]
     #[allow(clippy::too_many_arguments)]
@@ -578,7 +595,11 @@ impl Unpack50Decoder {
             solid,
             sink,
             filters,
-        )
+        )?;
+        match self.state.ended_early {
+            Some(_) => Err(Error::NeedMoreInput.into()),
+            None => Ok(()),
+        }
     }
 }
 
@@ -601,6 +622,10 @@ pub(crate) struct ReaderState<B: Budget> {
     streamed_history: Option<StreamedHistory<B>>,
     // Only this tail is reachable. Older bytes may remain as physical slack.
     history_window: usize,
+    // Set when the last member's final block ended before its declared size,
+    // to the length it did produce. Its output and history are kept, and the
+    // member's checksum decides whether it is whole.
+    ended_early: Option<usize>,
 }
 
 impl<B: Budget> ReaderState<B> {
@@ -616,7 +641,14 @@ impl<B: Budget> ReaderState<B> {
             history: Buffer::new(allowance),
             streamed_history: None,
             history_window: 0,
+            ended_early: None,
         }
+    }
+
+    /// The length the last member decoded to, if its stream ended before its
+    /// declared size.
+    pub(crate) fn ended_early(&self) -> Option<usize> {
+        self.ended_early
     }
 
     fn flatten_streamed_history(&mut self, dictionary_size: usize) -> Result<()> {
@@ -685,6 +717,7 @@ impl<B: Budget> ReaderState<B> {
                 None => Buffer::copied(self.reachable_history(), &self.history.allowance())?,
             },
             streamed_history: None,
+            ended_early: self.ended_early,
         })
     }
 
@@ -824,6 +857,7 @@ impl<B: Budget> ReaderState<B> {
         mode: DecodeMode,
         history: HistoryRetention,
     ) -> Result<Buffer<u8, B>> {
+        self.ended_early = None;
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -970,39 +1004,42 @@ impl<B: Budget> ReaderState<B> {
             }
         }
 
-        if output.len() == output_size {
-            let retain_history = B::LIMITED || solid || history == HistoryRetention::Retain;
-            let history_output = if retain_history && mode.applies_filters() && !filters.is_empty()
-            {
-                Some(Buffer::copied(
-                    &output[output.len().saturating_sub(dictionary_size)..],
-                    &allowance,
-                )?)
-            } else {
-                None
-            };
-            if mode.applies_filters() {
-                self.read_control.check_codec()?;
-                apply_filters_with_allowance(
-                    &mut output,
-                    &filters,
-                    &self.read_control,
-                    &allowance,
-                )?;
+        // The loop ends at the declared size or at the stream's last block.
+        if output.len() < output_size {
+            // A filter reaching past the stream's end leaves it truncated.
+            if filters.iter().any(|filter| {
+                filter
+                    .start
+                    .checked_add(filter.length)
+                    .is_none_or(|end| end > output.len())
+            }) {
+                return Err(Error::NeedMoreInput);
             }
-            if retain_history {
-                self.remember_history(
-                    history_output.as_deref().unwrap_or(&output),
-                    dictionary_size,
-                )?;
-                if let Some(overrun) = overrun {
-                    self.remember_overrun(overrun, dictionary_size)?;
-                }
-            }
-            Ok(output)
-        } else {
-            Err(Error::NeedMoreInput)
+            self.ended_early = Some(output.len());
         }
+        let retain_history = B::LIMITED || solid || history == HistoryRetention::Retain;
+        let history_output = if retain_history && mode.applies_filters() && !filters.is_empty() {
+            Some(Buffer::copied(
+                &output[output.len().saturating_sub(dictionary_size)..],
+                &allowance,
+            )?)
+        } else {
+            None
+        };
+        if mode.applies_filters() {
+            self.read_control.check_codec()?;
+            apply_filters_with_allowance(&mut output, &filters, &self.read_control, &allowance)?;
+        }
+        if retain_history {
+            self.remember_history(
+                history_output.as_deref().unwrap_or(&output),
+                dictionary_size,
+            )?;
+            if let Some(overrun) = overrun {
+                self.remember_overrun(overrun, dictionary_size)?;
+            }
+        }
+        Ok(output)
     }
 
     pub fn decode_member_from_reader_with_dictionary_to_sink<E>(
@@ -1063,6 +1100,7 @@ impl<B: Budget> ReaderState<B> {
         mut filters: Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
         checked: bool,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.ended_early = None;
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -1134,15 +1172,20 @@ impl<B: Budget> ReaderState<B> {
         mut output: StreamingOutput<B>,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
-        if output.written() == output.output_limit {
-            output.finish(sink)?;
-            let history = output.into_history();
-            self.history_window = history.window();
-            self.streamed_history = Some(history);
-            Ok(())
-        } else {
-            Err(Error::NeedMoreInput.into())
+        // Decoding stops at the declared size or at the stream's last block.
+        if output.written() < output.output_limit {
+            // A filter reaching past the stream's end leaves it truncated.
+            output.flush(sink)?;
+            if !output.stage.is_complete() {
+                return Err(Error::NeedMoreInput.into());
+            }
+            self.ended_early = Some(output.written());
         }
+        output.finish(sink)?;
+        let history = output.into_history();
+        self.history_window = history.window();
+        self.streamed_history = Some(history);
+        Ok(())
     }
 
     fn decode_blocks<E>(
@@ -2165,9 +2208,14 @@ impl<B: Budget> FilterStage<B> {
         Ok(())
     }
 
+    /// Whether every filter has been applied and released.
+    fn is_complete(&self) -> bool {
+        self.next().is_none() && self.held.is_empty()
+    }
+
     /// Every byte has arrived: each filter has been applied and released.
     fn finish<E>(&self) -> std::result::Result<(), StreamDecodeError<E>> {
-        if self.next().is_none() && self.held.is_empty() {
+        if self.is_complete() {
             Ok(())
         } else {
             Err(Error::InvalidData("RAR 5 filter range exceeds output").into())

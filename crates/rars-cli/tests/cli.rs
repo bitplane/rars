@@ -332,26 +332,20 @@ fn a_damaged_member_is_reported_and_the_others_test_and_extract() {
     }
 }
 
-/// Issue #444: a header whose name field starts with a NUL gives its member
-/// no name. Extraction leaves that member out, as UnRAR does, and still
-/// decodes it, so the solid members after it come out whole.
-#[test]
-fn a_member_with_no_name_is_skipped_and_the_solid_stream_stays_in_step() {
-    let dir = scratch("unnamed-member");
-    let path = dir.join("solid.rar");
-    let (members, _) = salvage_fixture(&path, rars::ArchiveVersion::Rar29, true);
-    let mut bytes = fs::read(&path).unwrap();
-    // Blank m1's name: its header CRC is repaired, so only the name is odd.
-    let name = bytes.windows(6).position(|v| v == b"m1.txt").unwrap();
-    bytes[name] = 0;
+/// Edits the RAR 1.5-4 file header of the member named `name`, then reseals
+/// the header's CRC, so only the edit is odd. `edit` gets the header and the
+/// offset of the name in it.
+fn edit_rar15_40_header(bytes: &mut [u8], name: &[u8], edit: impl FnOnce(&mut [u8], usize)) {
+    let at_name = bytes.windows(name.len()).position(|v| v == name).unwrap();
     let mut at = 7;
     loop {
         let flags = u16::from_le_bytes([bytes[at + 3], bytes[at + 4]]);
         let size = usize::from(u16::from_le_bytes([bytes[at + 5], bytes[at + 6]]));
-        if (at..at + size).contains(&name) {
+        if (at..at + size).contains(&at_name) {
+            edit(&mut bytes[at..at + size], at_name - at);
             let crc = crc32(&bytes[at + 2..at + size]) as u16;
             bytes[at..at + 2].copy_from_slice(&crc.to_le_bytes());
-            break;
+            return;
         }
         let packed = if flags & 0x8000 != 0 {
             u32::from_le_bytes(bytes[at + 7..at + 11].try_into().unwrap()) as usize
@@ -360,10 +354,131 @@ fn a_member_with_no_name_is_skipped_and_the_solid_stream_stays_in_step() {
         };
         at += size + packed;
     }
+}
+
+fn rar50_vint(mut value: u64) -> Vec<u8> {
+    let mut out = Vec::new();
+    loop {
+        let byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value == 0 {
+            out.push(byte);
+            return out;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+fn read_rar50_vint(bytes: &[u8], at: &mut usize) -> u64 {
+    let mut value = 0;
+    for shift in (0..).step_by(7) {
+        let byte = bytes[*at];
+        *at += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            break;
+        }
+    }
+    value
+}
+
+/// The fields of a RAR 5 file header that the edits below touch, as offsets
+/// into the header after its size field.
+struct Rar50FileFields {
+    flags: u64,
+    extra_size: Option<std::ops::Range<usize>>,
+    unpacked_size: std::ops::Range<usize>,
+}
+
+fn rar50_file_fields(header: &[u8]) -> Rar50FileFields {
+    let mut at = 0;
+    read_rar50_vint(header, &mut at);
+    let flags = read_rar50_vint(header, &mut at);
+    let extra_size = (flags & 1 != 0).then(|| {
+        let start = at;
+        read_rar50_vint(header, &mut at);
+        start..at
+    });
+    if flags & 2 != 0 {
+        read_rar50_vint(header, &mut at);
+    }
+    read_rar50_vint(header, &mut at);
+    let start = at;
+    read_rar50_vint(header, &mut at);
+    Rar50FileFields {
+        flags,
+        extra_size,
+        unpacked_size: start..at,
+    }
+}
+
+/// Rewrites the header of RAR 5 member `index` with `edit`, which gets the
+/// header after its size field, and reseals it.
+fn edit_rar50_header(path: &Path, index: usize, edit: impl FnOnce(&mut Vec<u8>)) {
+    let rars::Archive::Rar50Plus(archive) = rars::ArchiveReader::read_path(path).unwrap() else {
+        unreachable!("a RAR 5 archive");
+    };
+    let offset = archive.files().nth(index).unwrap().block.offset;
+    let bytes = fs::read(path).unwrap();
+    let mut at = offset + 4;
+    let size = read_rar50_vint(&bytes, &mut at) as usize;
+    let mut header = bytes[at..at + size].to_vec();
+    edit(&mut header);
+    let mut sealed = rar50_vint(header.len() as u64);
+    sealed.extend_from_slice(&header);
+    let crc = crc32(&sealed).to_le_bytes();
+    fs::write(
+        path,
+        [&bytes[..offset], &crc, &sealed, &bytes[at + size..]].concat(),
+    )
+    .unwrap();
+}
+
+/// Raises member `index`'s declared size by `delta`, in either family.
+fn raise_declared_size(path: &Path, index: usize, delta: u64) {
+    match rars::ArchiveReader::read_path(path).unwrap() {
+        rars::Archive::Rar50Plus(_) => edit_rar50_header(path, index, |header| {
+            let fields = rar50_file_fields(header);
+            let mut at = fields.unpacked_size.start;
+            let size = read_rar50_vint(header, &mut at);
+            header.splice(fields.unpacked_size, rar50_vint(size + delta));
+        }),
+        _ => {
+            let name = format!("m{index}.txt");
+            let mut bytes = fs::read(path).unwrap();
+            edit_rar15_40_header(&mut bytes, name.as_bytes(), |header, _| {
+                let size = u32::from_le_bytes(header[11..15].try_into().unwrap());
+                let size = size + u32::try_from(delta).unwrap();
+                header[11..15].copy_from_slice(&size.to_le_bytes());
+            });
+            fs::write(path, bytes).unwrap();
+        }
+    }
+}
+
+/// Issue #444: a header whose name field starts with a NUL gives its member
+/// no name. Extraction leaves that member out, as UnRAR does, and still
+/// decodes it, so the solid members after it come out whole. Issue #488:
+/// `test` reports it too, and fails as `x` does.
+#[test]
+fn a_member_with_no_name_is_skipped_and_the_solid_stream_stays_in_step() {
+    let dir = scratch("unnamed-member");
+    let path = dir.join("solid.rar");
+    let (members, _) = salvage_fixture(&path, rars::ArchiveVersion::Rar29, true);
+    let mut bytes = fs::read(&path).unwrap();
+    // Blank m1's name: its header CRC is repaired, so only the name is odd.
+    edit_rar15_40_header(&mut bytes, b"m1.txt", |header, name| header[name] = 0);
     fs::write(&path, &bytes).unwrap();
 
     let output = rars().arg("test").arg(&path).output().unwrap();
-    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(errors.contains("a member has no name"), "{errors}");
+    assert!(errors.contains("1 member(s) with no name"), "{errors}");
+    assert_eq!(
+        stdout(&output),
+        "OK m0.txt\nOK m2.txt\nOK m3.txt\nOK m4.txt\n"
+    );
 
     let out = dir.join("out");
     let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
@@ -387,6 +502,195 @@ fn a_member_with_no_name_is_skipped_and_the_solid_stream_stays_in_step() {
         if name != "m1.txt" {
             assert_eq!(&fs::read(out.join(name)).unwrap(), data, "{name}");
         }
+    }
+}
+
+/// Issue #488: `test` checks the archive comment, and fails on a damaged one,
+/// as unrar does. A RAR 5 comment's checksum is checked too. `info` still
+/// shows a RAR 5 comment whose checksum is wrong, with a warning.
+#[test]
+fn test_fails_on_a_damaged_archive_comment() {
+    let dir = scratch("damaged-comment");
+    let comment = "a comment long enough to be packed, a comment long enough to be packed";
+    for version in [rars::ArchiveVersion::Rar29, rars::ArchiveVersion::Rar50] {
+        let path = dir.join(format!("{version:?}.rar"));
+        let mut builder = rars::Builder::new(version).comment(Some(comment.as_bytes().to_vec()));
+        for (name, data) in salvage_members() {
+            builder
+                .add_bytes(name.into_bytes(), data, None, None)
+                .unwrap();
+        }
+        builder.write_to_path(&path, None).unwrap();
+        let output = rars().arg("test").arg(&path).output().unwrap();
+        assert!(output.status.success(), "{version:?}: {}", stderr(&output));
+
+        let comment_data = match rars::ArchiveReader::read_path(&path).unwrap() {
+            rars::Archive::Rar15To40(archive) => archive
+                .new_subs()
+                .find(|sub| sub.kind == rar15_40::NewSubKind::ArchiveComment)
+                .map(|sub| sub.file.packed_range.clone()),
+            rars::Archive::Rar50Plus(archive) => {
+                archive.blocks.iter().find_map(|block| match block {
+                    rars::rar50::Block::Service(service) if service.name == b"CMT" => {
+                        Some(service.block.data_range.clone())
+                    }
+                    _ => None,
+                })
+            }
+            _ => unreachable!("only RAR 2.9 and 5 are written here"),
+        }
+        .unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[comment_data.start + comment_data.len() / 2] ^= 0x01;
+        fs::write(&path, &bytes).unwrap();
+
+        let output = rars().arg("test").arg(&path).output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{version:?}: {}",
+            stderr(&output)
+        );
+        let errors = stderr(&output);
+        assert!(
+            errors.contains("archive comment: "),
+            "{version:?}: {errors}"
+        );
+        assert!(
+            errors.contains("a damaged archive comment in"),
+            "{version:?}: {errors}"
+        );
+        assert_eq!(stdout(&output).lines().count(), 5, "{version:?}");
+
+        if version == rars::ArchiveVersion::Rar50 {
+            let output = rars().arg("info").arg(&path).output().unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+            assert!(stdout(&output).contains("a comment long enough"));
+            let errors = stderr(&output);
+            assert!(errors.contains("archive comment in"), "{errors}");
+            assert!(errors.contains("checksum mismatch"), "{errors}");
+        }
+    }
+}
+
+/// Issue #488: a member whose data ends before its declared size, but matches
+/// its checksum, passes in every family (#451), and `test` warns about it.
+/// The solid members after it read whole, and `x` writes it.
+#[test]
+fn test_warns_about_a_member_whose_data_ends_before_its_declared_size() {
+    let dir = scratch("ends-early");
+    for (version, solid) in [
+        (rars::ArchiveVersion::Rar20, true),
+        (rars::ArchiveVersion::Rar29, true),
+        (rars::ArchiveVersion::Rar50, false),
+        (rars::ArchiveVersion::Rar50, true),
+    ] {
+        let case = format!("{version:?} solid={solid}");
+        let path = dir.join(format!("{version:?}-{solid}.rar"));
+        let (members, _) = salvage_fixture(&path, version, solid);
+        raise_declared_size(&path, 2, 10);
+        let len = members[2].1.len();
+        for threads in ["1", "4"] {
+            let output = rars()
+                .args(["test", "--threads", threads])
+                .arg(&path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{case}: {}", stderr(&output));
+            assert_eq!(
+                stdout(&output),
+                "OK m0.txt\nOK m1.txt\nOK m2.txt\nOK m3.txt\nOK m4.txt\n",
+                "{case}"
+            );
+            let errors = stderr(&output);
+            let warning = format!(
+                "'m2.txt': its data ends after {len} of its declared {} bytes",
+                len + 10
+            );
+            assert!(errors.contains(&warning), "{case}: {errors}");
+        }
+
+        let out = dir.join(format!("out-{version:?}-{solid}"));
+        let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
+        assert!(output.status.success(), "{case}: {}", stderr(&output));
+        for (name, data) in &members {
+            assert_eq!(&fs::read(out.join(name)).unwrap(), data, "{case}: {name}");
+        }
+    }
+}
+
+/// Issue #488: a RAR 5 redirection that carries a data area has that data
+/// checked by `test`, though extraction never writes it.
+#[test]
+fn test_checks_the_data_area_of_a_redirection() {
+    let dir = scratch("redirection-data");
+    for solid in [false, true] {
+        let path = dir.join(format!("solid-{solid}.rar"));
+        salvage_fixture(&path, rars::ArchiveVersion::Rar50, solid);
+        // Make m1 a symbolic link to `target`, keeping its data.
+        edit_rar50_header(&path, 1, |header| {
+            let fields = rar50_file_fields(header);
+            let target = b"target";
+            let mut record = rar50_vint(5);
+            record.extend(rar50_vint(1));
+            record.extend(rar50_vint(0));
+            record.extend(rar50_vint(target.len() as u64));
+            record.extend_from_slice(target);
+            let mut sized = rar50_vint(record.len() as u64);
+            sized.extend(record);
+            let extra = match &fields.extra_size {
+                Some(range) => {
+                    let mut at = range.start;
+                    read_rar50_vint(header, &mut at)
+                }
+                None => 0,
+            };
+            let new_extra = rar50_vint(extra + sized.len() as u64);
+            header.extend_from_slice(&sized);
+            match fields.extra_size {
+                Some(range) => {
+                    header.splice(range, new_extra);
+                }
+                None => {
+                    let mut at = 0;
+                    read_rar50_vint(header, &mut at);
+                    let flags_at = at;
+                    read_rar50_vint(header, &mut at);
+                    header.splice(flags_at..at, rar50_vint(fields.flags | 1));
+                    let after_flags = flags_at + rar50_vint(fields.flags | 1).len();
+                    header.splice(after_flags..after_flags, new_extra);
+                }
+            }
+        });
+        let output = rars().arg("test").arg(&path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "solid={solid}: {}",
+            stderr(&output)
+        );
+        assert!(stdout(&output).contains("OK m1.txt\n"), "solid={solid}");
+        assert!(stderr(&output).contains("redirection entry 'm1.txt'"));
+
+        let data = match rars::ArchiveReader::read_path(&path).unwrap() {
+            rars::Archive::Rar50Plus(archive) => {
+                let file = archive.files().nth(1).unwrap();
+                assert!(file.redirection.is_some(), "solid={solid}");
+                file.block.data_range.clone()
+            }
+            _ => unreachable!("a RAR 5 archive"),
+        };
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[data.start + data.len() / 2] ^= 0x55;
+        fs::write(&path, &bytes).unwrap();
+        let output = rars().arg("test").arg(&path).output().unwrap();
+        assert_eq!(output.status.code(), Some(1), "solid={solid}");
+        assert!(!stdout(&output).contains("OK m1.txt"), "solid={solid}");
+        let errors = stderr(&output);
+        assert!(errors.contains("entry 'm1.txt'"), "solid={solid}: {errors}");
+        assert!(
+            errors.contains("damaged member(s)"),
+            "solid={solid}: {errors}"
+        );
     }
 }
 

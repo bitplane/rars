@@ -2,7 +2,9 @@
 //! only hands bytes on. The thread starts at the member's first filter; it
 //! takes the bytes and filter records in the order the decoder's own filter
 //! stage would, so output and errors match it.
-use super::{Budget, DecodedChunk, FilterStage, PendingFilter, ReaderState, StreamDecodeError};
+use super::{
+    Budget, DecodedChunk, Error, FilterStage, PendingFilter, ReaderState, StreamDecodeError,
+};
 use std::cell::RefCell;
 use std::io::Read;
 use std::sync::mpsc;
@@ -24,8 +26,12 @@ enum Piece {
         len: usize,
     },
     Filter(PendingFilter),
-    /// The decoder finished, so every filter must be complete.
-    Done,
+    /// The decoder finished, so every filter must be complete. If its stream
+    /// ended before the declared size, one reaching past that end leaves the
+    /// member truncated, as the decoder's own stage judges it.
+    Done {
+        ended_early: bool,
+    },
 }
 
 /// The filter thread stopped taking pieces, which only its failure does.
@@ -90,9 +96,9 @@ impl Pieces {
         self.send(Piece::Filter(filter))
     }
 
-    fn finish(&mut self) -> Result<(), Stopped> {
+    fn finish(&mut self, ended_early: bool) -> Result<(), Stopped> {
         self.flush()?;
-        self.send(Piece::Done)
+        self.send(Piece::Done { ended_early })
     }
 }
 
@@ -115,7 +121,10 @@ fn run_filters<B: Budget, E>(
                 stage.emit(DecodedChunk::Repeated { byte, len }, sink)?;
             }
             Piece::Filter(filter) => stage.hold(filter)?,
-            Piece::Done => return stage.finish(),
+            Piece::Done { ended_early: true } if !stage.is_complete() => {
+                return Err(Error::NeedMoreInput.into());
+            }
+            Piece::Done { .. } => return stage.finish(),
         }
     }
     // The decoder failed, and its error is the one to report.
@@ -212,7 +221,7 @@ impl<B: Budget> ReaderState<B> {
                 Route::Aside(mut pieces, filtering) => {
                     // Bytes emitted before a failure still reach the sink, as they would have.
                     let handed = match decoded {
-                        Ok(()) => pieces.finish(),
+                        Ok(()) => pieces.finish(self.ended_early.is_some()),
                         Err(_) => pieces.flush(),
                     };
                     // Closing the channel ends the filter thread if the decoder failed.

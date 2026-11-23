@@ -56,7 +56,14 @@ impl ReadCancellation {
 /// Per-operation cancellation, plus the read policy decoders need to see
 /// without each one taking the whole of [`crate::ArchiveReadOptions`].
 #[derive(Clone, Debug, Default)]
-pub(crate) struct ReadControl(Option<Arc<Observation>>, Rar3VmPrograms, DecodeWorkers);
+pub(crate) struct ReadControl(
+    Option<Arc<Observation>>,
+    Rar3VmPrograms,
+    DecodeWorkers,
+    /// Fails a member whose stream ends short of its declared size even when
+    /// its checksum matches; see `ArchiveReadOptions::strict_member_sizes`.
+    bool,
+);
 
 /// Whether RAR 3 decoding may run filter programs other than the six
 /// standard ones, which always run as native code.
@@ -100,7 +107,17 @@ impl ReadControl {
         control.2 = options
             .rar50_decode_workers
             .map_or(DecodeWorkers::Auto, DecodeWorkers::AtMost);
+        control.3 = options.strict_member_sizes;
         control
+    }
+    /// Checks a member that passed its checksum, but whose stream ended after
+    /// `decoded` of its `declared` bytes. It passes unless sizes are strict.
+    pub(crate) fn ended_early(&self, declared: u64, decoded: u64) -> Result<()> {
+        if self.3 {
+            Err(Error::MemberEndedEarly { declared, decoded })
+        } else {
+            Ok(())
+        }
     }
     #[cfg_attr(
         any(
@@ -133,6 +150,7 @@ impl ReadControl {
             }),
             Rar3VmPrograms::Refuse,
             DecodeWorkers::Serial,
+            false,
         )
     }
     pub(crate) fn check(&self) -> Result<()> {

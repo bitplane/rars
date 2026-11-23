@@ -30,9 +30,9 @@ pub(crate) mod producer;
 #[cfg(feature = "write")]
 pub(crate) mod write;
 
-pub(crate) use extract::extract_from_feed;
 pub(crate) use extract::test_volumes_to;
 pub(crate) use extract::CommentChecksum;
+pub(crate) use extract::{extract_from_feed, Redirections};
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
 #[cfg(feature = "write")]
 pub use write::{
@@ -852,9 +852,28 @@ impl Archive {
     }
 
     /// Decodes the archive comment under the same policy as [`crate::Archive::comment_with_options`].
+    /// Its checksum is not checked; [`Self::test_archive_comment_with_options`] checks it.
     pub fn archive_comment_with_options(
         &self,
         options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.decoded_archive_comment(options, CommentChecksum::Skip)
+    }
+
+    /// Decodes the archive comment, if there is one, and checks it against
+    /// its checksum, as [`crate::Archive::test_comment_with_options`] does.
+    pub fn test_archive_comment_with_options(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+    ) -> Result<()> {
+        self.decoded_archive_comment(options, CommentChecksum::Verify)
+            .map(drop)
+    }
+
+    fn decoded_archive_comment(
+        &self,
+        options: crate::ArchiveReadOptions<'_>,
+        checksum: CommentChecksum,
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         for block in &self.blocks {
@@ -862,7 +881,7 @@ impl Archive {
                 Block::File(_) => return Ok(None),
                 Block::Service(service) if service.name == b"CMT" => {
                     return service
-                        .decoded_comment_with_options(self, options, CommentChecksum::Skip)
+                        .decoded_comment_with_options(self, options, checksum)
                         .map(Some);
                 }
                 _ => {}

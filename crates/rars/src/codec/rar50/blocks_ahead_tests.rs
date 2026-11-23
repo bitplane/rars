@@ -242,8 +242,11 @@ fn workers_stop_at_the_declared_size_as_the_serial_decoder_does() {
             "output_size={output_size}"
         );
     }
+    // A stream whose last block ends before the declared size stops there,
+    // and the member's checksum decides whether that is the whole file.
     let serial = assert_workers_match_serial(&stream, data.len() + 1);
-    assert_eq!(serial.error.as_deref(), Some("Decode(NeedMoreInput)"));
+    assert_eq!(serial.error, None);
+    assert_eq!(serial.bytes(), data);
 }
 
 #[test]

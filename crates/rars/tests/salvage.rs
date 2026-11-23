@@ -302,8 +302,13 @@ fn build_rar29(method: Rar29Method) -> Vec<u8> {
 /// Moves member `index`'s declared unpacked size by `delta` and reseals its
 /// header.
 fn shift_declared_size(bytes: &mut [u8], index: usize, delta: i64) {
-    let Archive::Rar15To40(archive) = ArchiveReader::read(bytes).unwrap() else {
-        unreachable!("a RAR 1.5-4 archive");
+    let archive = match ArchiveReader::read(bytes).unwrap() {
+        Archive::Rar15To40(archive) => archive,
+        Archive::Rar50Plus(archive) => {
+            let file = archive.files().nth(index).unwrap();
+            return shift_rar50_declared_size(bytes, &file.block, delta);
+        }
+        _ => unreachable!("a RAR 1.5-5 archive"),
     };
     let file = archive.files().nth(index).unwrap();
     let header = file.block.offset..file.block.offset + usize::from(file.block.head_size);
@@ -311,6 +316,39 @@ fn shift_declared_size(bytes: &mut [u8], index: usize, delta: i64) {
     bytes[header.start + 11..header.start + 15].copy_from_slice(&size.to_le_bytes());
     let crc = rars::crc32::crc32(&bytes[header.start + 2..header.end]) as u16;
     bytes[header.start..header.start + 2].copy_from_slice(&crc.to_le_bytes());
+}
+
+/// RAR 5 keeps the size as a variable-length number after the file flags.
+/// The new size is written in as many bytes as the old one took.
+fn shift_rar50_declared_size(bytes: &mut [u8], block: &rars::rar50::BlockHeader, delta: i64) {
+    fn read_vint(bytes: &[u8], at: &mut usize) -> u64 {
+        let mut value = 0;
+        for shift in (0..).step_by(7) {
+            let byte = bytes[*at];
+            *at += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+        }
+        value
+    }
+    let mut at = block.header_range.start;
+    read_vint(bytes, &mut at);
+    let start = at;
+    let size = read_vint(bytes, &mut at);
+    let width = at - start;
+    let mut size = u64::try_from(size as i64 + delta).unwrap();
+    for (index, byte) in bytes[start..at].iter_mut().enumerate() {
+        *byte = (size & 0x7f) as u8 | if index + 1 < width { 0x80 } else { 0 };
+        size >>= 7;
+    }
+    assert_eq!(size, 0, "the new size needs more bytes");
+    let mut end = block.offset + 4;
+    let header_size = read_vint(bytes, &mut end);
+    let end = end + usize::try_from(header_size).unwrap();
+    let crc = rars::crc32::crc32(&bytes[block.offset + 4..end]);
+    bytes[block.offset..block.offset + 4].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Reads `archive`, whose member 2 has had its declared size moved by `delta`,
@@ -393,6 +431,62 @@ fn a_solid_member_whose_declared_size_is_wrong_leaves_the_rest_readable() {
             let archive = ArchiveReader::read_owned(bytes).unwrap();
             let case = format!("{version:?} declared size {delta:+}");
             check_shifted_member_two(&case, &archive, &expected, delta);
+        }
+    }
+}
+
+/// Issue #488: a member whose stream ends before its declared size, but whose
+/// checksum matches what it produced, passes. With strict sizes, as `rars
+/// test` asks for, it is reported with what it decoded, and the members after
+/// it, solid or not, still read.
+#[test]
+fn strict_sizes_report_a_member_whose_stream_ends_before_its_declared_size() {
+    let expected = members();
+    let len = expected[2].1.len() as u64;
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
+        for solid in [false, true] {
+            let mut bytes = build(version, solid);
+            shift_declared_size(&mut bytes, 2, 10);
+            let archive = ArchiveReader::read_owned(bytes).unwrap();
+            let case = format!("{version:?} solid={solid}");
+            for strict in [false, true] {
+                let errors = Mutex::new(Vec::new());
+                let handler = |member: &ArchiveMember, error: &Error| {
+                    let error = error.root_cause().clone();
+                    errors
+                        .lock()
+                        .unwrap()
+                        .push((member.meta.name.clone(), error));
+                    Ok(ExtractionErrorAction::Continue)
+                };
+                let options = ArchiveReadOptions::new()
+                    .with_strict_member_sizes(strict)
+                    .with_member_error_handler(&handler);
+                let tested = test(&archive, options).unwrap();
+                let errors = errors.into_inner().unwrap();
+                if strict {
+                    let ended_early = Error::MemberEndedEarly {
+                        declared: len + 10,
+                        decoded: len,
+                    };
+                    assert_eq!(errors, [(b"m2.txt".to_vec(), ended_early)], "{case}");
+                } else {
+                    assert_eq!(errors, [], "{case}");
+                }
+                for (name, _) in &expected {
+                    if strict && name == b"m2.txt" {
+                        continue;
+                    }
+                    assert!(tested.contains(name), "{case} strict={strict}: {name:?}");
+                }
+            }
+            let outputs = extract(&archive, ArchiveReadOptions::new()).unwrap();
+            assert_eq!(outputs, expected, "{case}");
         }
     }
 }

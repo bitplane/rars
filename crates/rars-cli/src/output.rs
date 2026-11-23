@@ -195,10 +195,14 @@ pub(crate) fn refused_path(error: Error, name: &[u8]) -> Error {
 }
 
 pub(crate) fn print_ok_entry(entry: &ExtractedEntryMeta) {
+    print_ok_name(&entry.name, entry.is_directory);
+}
+
+pub(crate) fn print_ok_name(name: &[u8], is_directory: bool) {
     println!(
         "OK {}{}",
-        display_archive_bytes(&entry.name),
-        if entry.is_directory { "/" } else { "" }
+        display_archive_bytes(name),
+        if is_directory { "/" } else { "" }
     );
 }
 

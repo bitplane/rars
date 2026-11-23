@@ -211,6 +211,27 @@ impl FileHeader {
         self.data_crc32.is_some() && !self.blake2sp_supersedes_crc32()
     }
 
+    /// Weighs a member whose stream ended before its declared size, as RAR
+    /// 1.5-4 members are: it passes if what it produced matches its checksum,
+    /// since the whole file is there and the declared size is what is wrong.
+    /// Without a checksum to say so (#44), or if it fails, the member is
+    /// truncated, as it always was.
+    fn ended_early_result<B: Budget>(
+        &self,
+        decoder: &ReaderState<B>,
+        verified: Result<()>,
+    ) -> Result<()> {
+        let Some(decoded) = decoder.ended_early() else {
+            return verified;
+        };
+        if verified.is_err() || (self.data_crc32.is_none() && self.hash.is_none()) {
+            return Err(Error::from(crate::codec::Error::NeedMoreInput));
+        }
+        decoder
+            .read_control
+            .ended_early(self.unpacked_size, decoded as u64)
+    }
+
     pub(super) fn verify_integrity_with_keys(
         &self,
         data: &[u8],
@@ -362,6 +383,9 @@ impl FileHeader {
         let decoded =
             control.finish(self.decoded_data_with_decoder(archive, &mut decoder, password))?;
         control.check()?;
+        if decoder.ended_early().is_some() {
+            return Err(Error::from(crate::codec::Error::NeedMoreInput));
+        }
         Ok(decoded.data.into_vec())
     }
 
@@ -848,6 +872,34 @@ fn write_repeated_chunk_with_optional_crc(
     Ok(())
 }
 
+/// What extraction does with a redirection entry.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Redirections {
+    /// Leaves it out.
+    Skip,
+    /// Reports it to the redirect callback.
+    Emit,
+    /// Leaves it out, but decodes and checks a data area it carries, as
+    /// testing does. Extraction never writes one.
+    Verify,
+}
+
+impl Redirections {
+    pub(crate) fn emit(emit: bool) -> Self {
+        if emit {
+            Self::Emit
+        } else {
+            Self::Skip
+        }
+    }
+
+    /// Whether `file` is a redirection handled as such, rather than decoded
+    /// like a regular member.
+    fn redirects(self, file: &FileHeader) -> bool {
+        file.redirection.is_some() && !(self == Self::Verify && file.packed_size() > 0)
+    }
+}
+
 impl Archive {
     pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, mut open: F) -> Result<()>
     where
@@ -858,7 +910,7 @@ impl Archive {
             options,
             &mut open,
             &mut |_, _| Ok(()),
-            false,
+            Redirections::Skip,
             None,
             None,
             None,
@@ -877,8 +929,16 @@ impl Archive {
         R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     {
         options.check_cancelled()?;
-        self.extract_to_impl(options, &mut open, &mut redirect, true, None, None, None)
-            .map(|_| ())
+        self.extract_to_impl(
+            options,
+            &mut open,
+            &mut redirect,
+            Redirections::Emit,
+            None,
+            None,
+            None,
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn extract_controlled(
@@ -891,7 +951,7 @@ impl Archive {
             options,
             &mut |_| unreachable!("controlled selection supplies writer"),
             &mut |_, _| Ok(()),
-            false,
+            Redirections::Skip,
             Some(selector),
             on_error,
             None,
@@ -904,7 +964,7 @@ impl Archive {
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         redirect: &mut R,
-        emit_redirections: bool,
+        redirections: Redirections,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         settling: Option<&Settling<'_>>,
@@ -918,7 +978,7 @@ impl Archive {
                 options,
                 open,
                 redirect,
-                emit_redirections,
+                redirections,
                 selector,
                 on_error,
                 settling,
@@ -929,7 +989,7 @@ impl Archive {
             options,
             open,
             redirect,
-            emit_redirections,
+            redirections,
             selector,
             on_error,
             settling,
@@ -943,7 +1003,7 @@ impl Archive {
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         redirect: &mut R,
-        emit_redirections: bool,
+        redirections: Redirections,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         settling: Option<&Settling<'_>>,
@@ -982,7 +1042,11 @@ impl Archive {
             let result = (|| {
                 options.check_cancelled()?;
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-                if let Some(redirection) = &file.redirection {
+                if let Some(redirection) = file
+                    .redirection
+                    .as_ref()
+                    .filter(|_| redirections.redirects(file))
+                {
                     if selected_writer.is_some() {
                         return Err(file.entry_error(
                             "selecting",
@@ -992,7 +1056,7 @@ impl Archive {
                             },
                         ));
                     }
-                    if emit_redirections {
+                    if redirections == Redirections::Emit {
                         options.check_cancelled()?;
                         redirect(&file.metadata(), redirection)?;
                         options.check_cancelled()?;
@@ -1178,7 +1242,7 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
-        redirect: Option<&mut Redirect<'_>>,
+        mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
         settling: Option<&Settling<'_>>,
     ) -> Result<()>
@@ -1195,21 +1259,20 @@ impl Archive {
                 .files()
                 .any(|file| file.decoded_compression_info().is_ok_and(|info| info.solid))
         {
-            let emit_redirections = redirect.is_some();
-            let mut redirect = redirect;
-            let mut forward =
-                |meta: &ExtractedEntryMeta, redirection: &FileRedirection| match redirect
-                    .as_deref_mut()
-                {
-                    Some(redirect) => redirect(meta, redirection),
-                    None => Ok(()),
-                };
+            let redirections = match &redirect {
+                Some(_) => Redirections::Emit,
+                None if verification => Redirections::Verify,
+                None => Redirections::Skip,
+            };
             return self
                 .extract_to_impl(
                     options,
                     open,
-                    &mut forward,
-                    emit_redirections,
+                    &mut |meta, redirection| match redirect.as_deref_mut() {
+                        Some(redirect) => redirect(meta, redirection),
+                        None => Ok(()),
+                    },
+                    redirections,
                     None,
                     None,
                     settling,
@@ -1253,6 +1316,11 @@ impl Archive {
     {
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let publication = crate::read_control::ReadControl::for_options(&options);
+        let redirections = if verification {
+            Redirections::Verify
+        } else {
+            Redirections::Skip
+        };
         // Outputs opened as members start and written on the workers. A
         // limited workspace keeps writing each member as it is published.
         let on_workers = settling.filter(|_| {
@@ -1263,7 +1331,7 @@ impl Archive {
                 // Fails inline, as sequential extraction does.
                 Plan::Inline
             } else if file.is_directory()
-                || file.redirection.is_some()
+                || redirections.redirects(file)
                 || ((verification || on_workers.is_some())
                     && (file.is_stored() || file.should_stream_decode(buffered_decode_limit)))
             {
@@ -1278,7 +1346,7 @@ impl Archive {
         };
         // What a member holds while it decodes, for workspace admission.
         let hint = |file: &FileHeader| {
-            if file.is_directory() || file.redirection.is_some() {
+            if file.is_directory() || redirections.redirects(file) {
                 0
             } else if file.is_stored() {
                 // Verified as it is read; otherwise buffered whole.
@@ -1335,7 +1403,11 @@ impl Archive {
                     },
                     |(open, redirect), (file, entry)| {
                         let published = entry.and_then(|entry| {
-                            match (&file.redirection, redirect.as_deref_mut()) {
+                            let redirection = file
+                                .redirection
+                                .as_ref()
+                                .filter(|_| redirections.redirects(file));
+                            match (redirection, redirect.as_deref_mut()) {
                                 (Some(redirection), Some(redirect)) => {
                                     publish_redirection(file, redirection, redirect, &options)
                                 }
@@ -1632,7 +1704,12 @@ fn decode_parallel_entry<B: Budget>(
     let mut budget = crate::output_limit::OutputBudget::new(options);
     file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
     file.check_output_limit(&budget)?;
-    if file.redirection.is_some() {
+    let redirections = if verification {
+        Redirections::Verify
+    } else {
+        Redirections::Skip
+    };
+    if redirections.redirects(file) {
         // Redirections are not extracted here, as in sequential extraction.
         return Ok(ParallelExtractedEntry::Nothing);
     }
@@ -1764,12 +1841,22 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             let decoded = session
                 .decoded_file_data(archive, file, history)
                 .map_err(|error| file.entry_error("decoding", error))?;
-            file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref())
-                .map_err(|error| file.entry_error("verifying", error))?;
+            let verified = file.ended_early_result(
+                &session.decoder,
+                file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()),
+            );
+            // A whole member that strict sizes fail is still written.
+            if verified
+                .as_ref()
+                .is_err_and(|error| !matches!(error, Error::MemberEndedEarly { .. }))
+            {
+                return verified.map_err(|error| file.entry_error("verifying", error));
+            }
             writer
                 .write_all(&decoded.data)
                 .map_err(Error::from)
-                .map_err(|error| file.entry_error("writing", error))
+                .map_err(|error| file.entry_error("writing", error))?;
+            verified.map_err(|error| file.entry_error("verifying", error))
         })
     }
 
@@ -1800,6 +1887,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             None,
             writer,
         );
+        let result = file.ended_early_result(&streaming_decoder, result);
         // A failed member's history is kept for a caller that goes past it.
         self.decoder = streaming_decoder;
         result.map_err(|error| file.entry_error("decoding", error))
@@ -1866,7 +1954,13 @@ where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
     options.check_cancelled()?;
-    extract_volumes_to_impl(volumes, options, &mut open, &mut |_, _| Ok(()), false)
+    extract_volumes_to_impl(
+        volumes,
+        options,
+        &mut open,
+        &mut |_, _| Ok(()),
+        Redirections::Skip,
+    )
 }
 
 pub(crate) fn test_volumes_to<F>(
@@ -1877,10 +1971,17 @@ pub(crate) fn test_volumes_to<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<()>,
 {
-    extract_volumes_to(volumes, options, |meta| {
-        tested(meta)?;
-        Ok(Box::new(std::io::sink()) as Box<dyn Write>)
-    })
+    options.check_cancelled()?;
+    extract_volumes_to_impl(
+        volumes,
+        options,
+        &mut |meta| {
+            tested(meta)?;
+            Ok(Box::new(std::io::sink()) as Box<dyn Write>)
+        },
+        &mut |_, _| Ok(()),
+        Redirections::Verify,
+    )
 }
 
 pub fn extract_volumes_to_with_redirections<F, R>(
@@ -1894,7 +1995,13 @@ where
     R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
 {
     options.check_cancelled()?;
-    extract_volumes_to_impl(volumes, options, &mut open, &mut redirect, true)
+    extract_volumes_to_impl(
+        volumes,
+        options,
+        &mut open,
+        &mut redirect,
+        Redirections::Emit,
+    )
 }
 
 fn extract_volumes_to_impl<F, R>(
@@ -1902,7 +2009,7 @@ fn extract_volumes_to_impl<F, R>(
     options: crate::ArchiveReadOptions<'_>,
     open: &mut F,
     redirect: &mut R,
-    emit_redirections: bool,
+    redirections: Redirections,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1910,7 +2017,7 @@ where
 {
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);
-    extract_from_feed(&mut feed, options, open, redirect, emit_redirections)
+    extract_from_feed(&mut feed, options, open, redirect, redirections)
 }
 
 pub(crate) fn extract_from_feed<F, R>(
@@ -1918,7 +2025,7 @@ pub(crate) fn extract_from_feed<F, R>(
     options: crate::ArchiveReadOptions<'_>,
     open: &mut F,
     redirect: &mut R,
-    emit_redirections: bool,
+    redirections: Redirections,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1930,7 +2037,7 @@ where
             options,
             open,
             redirect,
-            emit_redirections,
+            redirections,
             &Allowance::limited(limit),
         );
     }
@@ -1939,7 +2046,7 @@ where
         options,
         open,
         redirect,
-        emit_redirections,
+        redirections,
         &Allowance::default(),
     )
 }

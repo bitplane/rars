@@ -314,6 +314,13 @@ pub struct ArchiveReadOptions<'a> {
     /// run these programs either; WinRAR 3.x did. Enable this for trusted
     /// archives that need them. Parsing does not retain it.
     pub allow_rar3_vm_programs: bool,
+    /// Fail a member whose stream ends before its declared size with
+    /// [`Error::MemberEndedEarly`], even when the bytes it produced match its
+    /// checksum. Off by default: such a member passes, since its data is whole
+    /// and only the declared size is wrong. Either way the next member of a
+    /// solid archive continues from where the stream ended. `rars test` turns
+    /// this on to report such members.
+    pub strict_member_sizes: bool,
     /// Set by [`Self::with_member_error_handler`].
     pub(crate) member_errors: Option<extraction_control::MemberErrorHandler<'a>>,
 }
@@ -461,6 +468,13 @@ impl<'a> ArchiveReadOptions<'a> {
     /// run. See [`ArchiveReadOptions::allow_rar3_vm_programs`].
     pub fn with_rar3_vm_programs(mut self, allow: bool) -> Self {
         self.allow_rar3_vm_programs = allow;
+        self
+    }
+
+    /// Fails members whose stream ends before their declared size. See
+    /// [`ArchiveReadOptions::strict_member_sizes`].
+    pub fn with_strict_member_sizes(mut self, strict: bool) -> Self {
+        self.strict_member_sizes = strict;
         self
     }
 }
@@ -1077,7 +1091,7 @@ impl Archive {
                         Some(link) => extraction_links::emit_rar50_link(meta, redirection, link),
                         None => Ok(()),
                     },
-                    emit,
+                    rar50::Redirections::emit(emit),
                 )
                 .map_err(|error| error.in_member_volume(feed.current_index()))
             }
@@ -1321,14 +1335,17 @@ impl Archive {
     /// Verify all member payloads with cancellation and extraction resource policies.
     /// Discarding output does not exempt it from member or total output limits.
     /// Parsing-only limits are not reapplied; comments and recovery are outside
-    /// this payload test. Each call starts fresh output budgets.
+    /// this payload test ([`Self::test_comment_with_options`] checks the archive
+    /// comment). Each call starts fresh output budgets.
     pub fn test_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<()> {
         let _cap = crate::parallel::ThreadCap::set(options.threads);
         self.test_with_options_and_callback(options, |_| Ok(()))
     }
 
     /// Verifies payloads and reports regular entries and directories once, in
-    /// archive order. Redirections are skipped, as in ordinary extraction.
+    /// archive order. Redirections are skipped, as in ordinary extraction,
+    /// except that a RAR 5 redirection carrying a data area has that data
+    /// checked, and is reported like a regular entry.
     ///
     /// Callbacks do not receive payload bytes. A callback can precede that
     /// member's verification; earlier callbacks can have run when the call fails.
@@ -1393,6 +1410,18 @@ impl Archive {
             Self::Rar13(archive) => archive.archive_comment_with_options(options),
             Self::Rar15To40(archive) => archive.archive_comment_with_options(options),
             Self::Rar50Plus(archive) => archive.archive_comment_with_options(options),
+        }
+    }
+
+    /// Decodes the archive comment, if there is one, and checks it as far as
+    /// the format allows, as [`Self::test_with_options`] does for members.
+    /// [`Self::comment_with_options`] already checks RAR 1.5-4 comments; this
+    /// also checks a RAR 5 comment's checksum, which it skips. A RAR 1.3
+    /// comment has no checksum, so only its decoding is checked.
+    pub fn test_comment_with_options(&self, options: ArchiveReadOptions<'_>) -> Result<()> {
+        match self {
+            Self::Rar50Plus(archive) => archive.test_archive_comment_with_options(options),
+            _ => self.comment_with_options(options).map(drop),
         }
     }
 

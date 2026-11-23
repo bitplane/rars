@@ -11,7 +11,7 @@ pub(super) fn extract<F, R, B: Budget>(
     options: crate::ArchiveReadOptions<'_>,
     open: &mut F,
     redirect: &mut R,
-    emit_redirections: bool,
+    redirections: Redirections,
     allowance: &B,
 ) -> Result<()>
 where
@@ -63,8 +63,12 @@ where
                 )?);
                 break;
             }
-            if let Some(redirection) = &file.redirection {
-                if emit_redirections {
+            if let Some(redirection) = file
+                .redirection
+                .as_ref()
+                .filter(|_| redirections.redirects(file))
+            {
+                if redirections == Redirections::Emit {
                     options.check_cancelled()?;
                     redirect(&file.metadata(), redirection)?;
                     options.check_cancelled()?;
