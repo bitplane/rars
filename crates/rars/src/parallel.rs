@@ -389,7 +389,7 @@ mod threaded {
         rayon::current_thread_index().is_none() && threads() > 1
     }
 
-    const DEFAULT_BLOCK_DECODE_WORKERS: usize = 4;
+    const DEFAULT_BLOCK_DECODE_WORKERS: usize = 8;
 
     /// None under a cap of one. Members decoding side by side in the pool
     /// share one pool of these workers, so together they add only that many
