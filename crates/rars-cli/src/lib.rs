@@ -1241,7 +1241,7 @@ enum Pending {
 
 /// A file written in place through the output tree.
 struct InPlace {
-    /// The file, once the library is done writing it: see [`output::InPlaceFile`].
+    /// The file, once the library is done writing it: see [`rars::output_tree::HeldFile`].
     file: Arc<std::sync::OnceLock<fs::File>>,
     /// The directory it is in.
     dir: FileIdentity,
@@ -2033,7 +2033,7 @@ impl<'a> ExtractOutputState<'a> {
                 }
             }
         };
-        let (writer, done) = output::InPlaceFile::new(file);
+        let (writer, done) = rars::output_tree::HeldFile::new(file);
         self.staged_paths.push(path.clone());
         self.staged_files.push(Some(Pending::InPlace(InPlace {
             file: done,
