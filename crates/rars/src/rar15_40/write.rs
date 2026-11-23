@@ -4855,10 +4855,6 @@ mod tests {
     #[test]
     #[cfg(feature = "parallel")]
     fn finalists_run_side_by_side_only_in_room_the_budget_grants() {
-        use crate::atomic64::AtomicU64;
-        use std::sync::atomic::Ordering;
-        use std::sync::Arc;
-
         // Stereo 16-bit samples, so delta reaches the finalists beside the
         // plain member, and long enough that the plain one runs beside the screens.
         let mut data = Vec::with_capacity(1 << 20);
@@ -4886,23 +4882,24 @@ mod tests {
         // Level 5, whose search encodes every finalist in full. Below it the
         // trial picks one and only that one is encoded.
         options.compression_level = Some(5);
-        let charge = super::member_workspace(options, data.len() as u64, true);
         let lazy = super::rar29_encode_options_for_options(options)
             .unwrap()
             .with_optimal_parse_passes(0);
         let pool = crate::parallel::private_pool(4);
-        let room = pool.install(|| crate::codec::rar29::member_encode_workspace(data.len(), lazy));
+        // Both in the pool the member encodes in: the member's charge grows
+        // with the threads its shortest-path parse spreads over.
+        let (charge, room) = pool.install(|| {
+            (
+                super::member_workspace(options, data.len() as u64, true),
+                crate::codec::rar29::member_encode_workspace(data.len(), lazy),
+            )
+        });
         let encode = |limit: u64| {
             let resources = crate::WriterResources::new(limit);
-            let peak = Arc::new(AtomicU64::new(0));
-            let watch = {
-                let (resources, peak) = (resources.clone(), peak.clone());
-                move |_: crate::WriteProgressEvent<'_>| {
-                    peak.fetch_max(resources.workspace_in_use(), Ordering::SeqCst);
-                }
-            };
+            // The budget's own high-water mark: progress events come too
+            // seldom to be sure of catching a room while it is held.
             let work = super::WorkTracker::new(
-                Some(super::ProgressReporter(&watch)),
+                None,
                 crate::WriteOperation::Compression,
                 data.len() as u64,
             );
@@ -4926,7 +4923,7 @@ mod tests {
             let super::MemberPayload::Packed(packed) = encoded.payload else {
                 unreachable!("a member held in memory is packed in memory")
             };
-            (packed, encoded.method, peak.load(Ordering::SeqCst))
+            (packed, encoded.method, resources.workspace_peak())
         };
         // Room for nothing beside the member's own charge runs the finalists in turn.
         let (in_turn, method, alone) = encode(charge);
