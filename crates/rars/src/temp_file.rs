@@ -70,9 +70,9 @@ pub(crate) fn create_named_with_sequence<C>(
         path.push(directory);
         path.push(name);
         let mut options = File::options();
-        options.write(true).create_new(true);
+        // An archive is read back to build its recovery record.
+        options.read(true).write(true).create_new(true);
         if kind == TemporaryKind::Spool {
-            options.read(true);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::OpenOptionsExt;
@@ -161,21 +161,17 @@ mod tests {
             let mode = file.metadata().unwrap().permissions().mode() & 0o777;
             if kind == TemporaryKind::Spool {
                 assert_eq!(mode & 0o077, 0, "plaintext spool must remain private");
-                file.write_all(b"payload").unwrap();
-                file.rewind().unwrap();
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes).unwrap();
-                assert_eq!(bytes, b"payload");
             } else {
                 assert_eq!(
                     mode, default_mode,
                     "publication retains ordinary archive permissions"
                 );
-                assert!(
-                    file.read(&mut [0]).is_err(),
-                    "publication file remains write-only"
-                );
             }
+            file.write_all(b"payload").unwrap();
+            file.rewind().unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, b"payload");
         }
     }
 }

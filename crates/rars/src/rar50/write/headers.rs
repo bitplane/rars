@@ -212,7 +212,7 @@ mod tests {
         let mut refusals = 0;
         loop {
             let resources = WriterResources::default().with_max_preparation_bytes(limit);
-            match resolved_main_extra(Some(metadata), None, 0, None, &resources) {
+            match resolved_main_extra(Some(metadata), None, 0, None, 0, &resources) {
                 Ok(extra) => {
                     assert!(!extra.is_empty());
                     break;
@@ -401,6 +401,7 @@ pub(super) fn write_locator_record(
     quick_open_offset: Option<u64>,
     quick_open_width: usize,
     recovery_record_offset: Option<u64>,
+    recovery_width: usize,
 ) -> Result<()> {
     let mut flags = 0;
     if quick_open_offset.is_some() {
@@ -416,7 +417,7 @@ pub(super) fn write_locator_record(
         record.vint_padded(quick_open_offset, quick_open_width);
     }
     if let Some(recovery_record_offset) = recovery_record_offset {
-        record.vint(recovery_record_offset);
+        record.vint_padded(recovery_record_offset, recovery_width);
     }
     write_extra_record(out, MHEXTRA_LOCATOR, record.as_slice())?;
 
@@ -428,6 +429,7 @@ pub(super) fn resolved_main_extra(
     quick_open_offset: Option<u64>,
     quick_open_width: usize,
     recovery_offset: Option<u64>,
+    recovery_width: usize,
     resources: &WriterResources,
 ) -> Result<Bytes> {
     let mut main_extra = Bytes::new(resources);
@@ -438,6 +440,7 @@ pub(super) fn resolved_main_extra(
             locator_quick_open_offset,
             quick_open_width,
             recovery_offset,
+            recovery_width,
         )?;
     }
     if let Some(archive_metadata) = archive_metadata {
@@ -987,7 +990,7 @@ mod scratch_tests {
             buffered_record(super::super::super::FHEXTRA_HTIME, &body)
         );
         actual.clear();
-        write_locator_record(&mut actual, Some(u64::MAX), 0, Some(u64::MAX)).unwrap();
+        write_locator_record(&mut actual, Some(u64::MAX), 0, Some(u64::MAX), 0).unwrap();
         let mut body = Vec::new();
         write_vint(
             &mut body,

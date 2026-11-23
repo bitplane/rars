@@ -38,6 +38,8 @@ pub(super) struct LayoutInputs<'a> {
     /// Bytes the quick-open offset takes at least, so it can be patched in place.
     pub(super) quick_open_width: usize,
     pub(super) recovery_percent: Option<u64>,
+    /// Bytes the recovery offset takes at least, so it can be patched in place.
+    pub(super) recovery_width: usize,
 }
 
 #[derive(Debug)]
@@ -121,6 +123,7 @@ pub(super) fn settle_layout(
             quick_open_offset,
             inputs.quick_open_width,
             recovery_offset,
+            inputs.recovery_width,
             resources,
         )?;
         if let Some(metadata) = inputs.metadata_record {
@@ -265,6 +268,7 @@ mod tests {
             quick_open_payload_len: None,
             quick_open_width: 0,
             recovery_percent: Some(5),
+            recovery_width: 0,
         }
     }
 

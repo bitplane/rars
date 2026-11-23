@@ -574,3 +574,51 @@ fn an_in_place_explicit_filter_archive_does_not_depend_on_the_thread_count() {
         assert!(again == archive, "{threads} threads wrote another archive");
     }
 }
+
+#[test]
+#[cfg(feature = "recovery")]
+fn a_record_read_back_covers_headers_patched_in_place() {
+    let members = vec![
+        text(4096, 1),
+        text(1024 * 1024, 2),
+        noise(600 * 1024, 7),
+        text(4096, 3),
+    ];
+    for lock in header_encryption_cases() {
+        // Quick open is refused with encrypted headers.
+        for quick_open in [false, true]
+            .into_iter()
+            .filter(|&on| !(on && lock.headers))
+        {
+            let mut options = options(lock);
+            options.features.quick_open = quick_open;
+            let mut output = Cursor::new(Vec::new());
+            write_archive_reporting(
+                &entries(&members, lock),
+                options,
+                extras(lock).with_recovery_percent(Some(5)),
+                // Room for the packed windows, not a mirror of the archive.
+                &WriterResources::default().with_max_spool_bytes(1024 * 1024),
+                None,
+                CallerOutput::readable(&mut output).streaming_above(ABOVE),
+            )
+            .unwrap();
+            let archive = output.into_inner();
+            assert_holds(&archive, &members, lock);
+
+            let mut damaged = archive.clone();
+            // Inside the large compressed member.
+            damaged[300 * 1024..300 * 1024 + 64]
+                .iter_mut()
+                .for_each(|byte| *byte ^= 0xff);
+            let read_options = match lock.password() {
+                Some(password) => ArchiveReadOptions::with_password(password),
+                None => ArchiveReadOptions::new(),
+            };
+            let repaired =
+                crate::rar50::repair_inline_recovery_bytes_with_options(&damaged, read_options)
+                    .unwrap();
+            assert!(repaired.data == archive, "quick open {quick_open}");
+        }
+    }
+}

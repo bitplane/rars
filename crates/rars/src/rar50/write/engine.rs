@@ -4,10 +4,10 @@
 //! memory. Compression may load whole members; headers also allocate memory.
 //! Service payloads borrow input and are encrypted in chunks during emission.
 //! Quick-open data uses a quota-controlled spool. Members go out in order as
-//! their windows finish, unless recovery, or quick open on a stream output,
-//! needs every block length before the main header, in which case they are
-//! held until the last. Quick open on a seekable output reserves the main
-//! header's offset to its block and patches it at the end. On a seekable
+//! their windows finish, unless quick open on a stream output, or recovery on
+//! an output that cannot be read back, needs every block length before the
+//! main header, in which case they are held until the last. Otherwise the main
+//! header reserves its locator offsets and they are patched at the end. On a seekable
 //! output, a large non-solid member goes out as it is packed, encrypted on the
 //! way if it has a password, behind a header patched once it is done, or
 //! stored over its attempt when packing does not pay and no filter was named.
@@ -15,8 +15,9 @@
 //!
 //! Stored payloads are reread and verified during emission, or, when the output
 //! can seek and every member is stored, read once behind a header patched
-//! with the checksums of what was copied. Recovery requires
-//! a further pass over the preceding archive bytes, mirrored into a spool.
+//! with the checksums of what was copied. Recovery requires a further pass
+//! over the preceding archive bytes, read back from the output when it can be
+//! and otherwise mirrored into a spool.
 
 use super::compress::{self, ClosedMember, CompressPlan, CompressedMember, Handed};
 #[cfg(test)]
@@ -47,7 +48,7 @@ use crate::streaming::Spool;
 use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, WorkTracker};
 use crate::write_stream::{patch_header, CallerOutput, CancellableOutput};
 use crate::{Error, Result, WriterResources};
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 pub(super) struct EnginePlan<'a> {
     pub(super) compress: CompressPlan,
@@ -255,12 +256,21 @@ pub(super) fn write_archive<'a>(
     // A seekable archive lets stored members be read once and their headers
     // patched. Every member is stored, so none is read before it is copied.
     let hash_on_copy = sink.can_seek() && plan.compress.method == 0;
+    // A recovery record reads the archive back from an output that can, and
+    // otherwise from a copy mirrored into a spool as it is written.
+    let read_back = plan.recovery_percent.is_some()
+        && sink
+            .as_seekable()
+            .is_some_and(|output| output.inner.readable().is_some());
     // Members go out as their windows finish unless the main header has to
-    // locate blocks after them and cannot be patched. Stored members hashed on
-    // their copy already go out in one pass.
-    let in_order =
-        !hash_on_copy && plan.recovery_percent.is_none() && (!plan.quick_open || sink.can_seek());
-    // The main header goes out first and its quick-open offset is patched.
+    // locate blocks after them and cannot be patched, or a recovery record
+    // would have to mirror them. Stored members hashed on their copy already
+    // go out in one pass.
+    let in_order = !hash_on_copy
+        && (plan.recovery_percent.is_none() || read_back)
+        && (!plan.quick_open || sink.can_seek());
+    // The main header goes out first and its locator offsets are patched.
+    let main_patched_in = in_order && (plan.quick_open || plan.recovery_percent.is_some());
     let quick_open_patched_in = plan.quick_open && in_order;
     for entry in entries {
         super::validate_entry(entry)?;
@@ -318,7 +328,7 @@ pub(super) fn write_archive<'a>(
         main_flags |= MHFL_RECOVERY;
     }
     let layout_inputs_at_width =
-        |body_len, quick_open_payload_len, quick_open_width| LayoutInputs {
+        |body_len, quick_open_payload_len, quick_open_width, recovery_width| LayoutInputs {
             header_encrypted: plan.header_encrypted,
             head_crypt_len: head_crypt.len() as u64,
             main_flags,
@@ -329,23 +339,48 @@ pub(super) fn write_archive<'a>(
             quick_open_payload_len,
             quick_open_width,
             recovery_percent: plan.recovery_percent,
+            recovery_width,
         };
-    // Settled before any member, so a seekable and a stream output agree.
-    let quick_open_width = if plan.quick_open {
+    // Settled before any member, so a seekable and a stream output agree. Only
+    // a compressed archive goes out in order, so a stored one's recovery offset
+    // keeps its exact width.
+    let reserves_recovery = plan.recovery_percent.is_some() && plan.compress.method != 0;
+    let (quick_open_width, recovery_width) = if plan.quick_open || reserves_recovery {
         // A vint takes at most ten bytes.
-        let widest_main = resolve_layout(&layout_inputs_at_width(0, Some(0), 10), resources)?;
-        widest_quick_open_offset(entries, &plan, widest_main.main_header_len)
+        let widest_main = resolve_layout(
+            &layout_inputs_at_width(0, plan.quick_open.then_some(0), 10, 10),
+            resources,
+        )?;
+        let widest = widest_body_end(entries, &plan, widest_main.main_header_len);
+        (
+            if plan.quick_open {
+                vint_width(widest)
+            } else {
+                0
+            },
+            // The quick-open block repeats headers, which the body bounds too.
+            if reserves_recovery {
+                vint_width(widest.saturating_mul(2))
+            } else {
+                0
+            },
+        )
     } else {
-        0
+        (0, 0)
     };
     let layout_inputs = |body_len, quick_open_payload_len| {
-        layout_inputs_at_width(body_len, quick_open_payload_len, quick_open_width)
+        layout_inputs_at_width(
+            body_len,
+            quick_open_payload_len,
+            quick_open_width,
+            recovery_width,
+        )
     };
 
-    // Only mirror the archive when a recovery record has to read it back.
+    // Only mirror the archive when a recovery record cannot read it back.
     let mut mirror = match plan.recovery_percent {
-        Some(_) => Some(Spool::create(resources)?),
-        None => None,
+        Some(_) if !read_back => Some(Spool::create(resources)?),
+        _ => None,
     };
     // Members hashed on their copy report it here, as compression skipped them.
     let copy_work = WorkTracker::new(
@@ -600,17 +635,29 @@ pub(super) fn write_archive<'a>(
         }
     }
 
-    if let Some(written) = written.take() {
+    let mut layout = None;
+    if main_patched_in {
         let output = sink
             .as_seekable()
-            .expect("headers are recorded only on a seekable output");
-        let quick_open_at = output.stream_position()?;
-        let (payload, checksum) = written.into_payload(quick_open_at, resources)?;
+            .expect("the main header is patched only on a seekable output");
+        let body_end = output.stream_position()?;
+        let quick_open = written
+            .take()
+            .map(|written| written.into_payload(body_end, resources))
+            .transpose()?;
         let main_at = archive_at.expect("a seekable archive knows where it starts")
             + (RAR50_SIGNATURE.len() + head_crypt.len()) as u64;
-        let main_len = resolve_layout(&layout_inputs(0, Some(0)), resources)?.main_header_len;
-        let body_len = quick_open_at - main_at - main_len;
-        let resolved = resolve_layout(&layout_inputs(body_len, Some(payload.len())), resources)?;
+        let quick_open_len = quick_open_patched_in.then_some(0);
+        let main_len =
+            resolve_layout(&layout_inputs(0, quick_open_len), resources)?.main_header_len;
+        let body_len = body_end - main_at - main_len;
+        let resolved = resolve_layout(
+            &layout_inputs(
+                body_len,
+                quick_open.as_ref().map(|(payload, _)| payload.len()),
+            ),
+            resources,
+        )?;
         let main = main_header_block(
             main_iv,
             &resolved.main_extra,
@@ -623,20 +670,22 @@ pub(super) fn write_archive<'a>(
             main_at,
             main_len,
             &main,
-            Error::InvalidArgument("RAR 5 quick-open offset outgrew its reserved width"),
+            Error::InvalidArgument("RAR 5 locator offset outgrew its reserved width"),
         )?;
-        let header = stored_service_header(
-            b"QO",
-            payload.len(),
-            checksum,
-            &[],
-            header_keys.as_ref(),
-            resources,
-        )?;
-        quick_open_payload = Some((header, payload));
+        if let Some((payload, checksum)) = quick_open {
+            let header = stored_service_header(
+                b"QO",
+                payload.len(),
+                checksum,
+                &[],
+                header_keys.as_ref(),
+                resources,
+            )?;
+            quick_open_payload = Some((header, payload));
+        }
+        layout = Some(resolved);
     }
 
-    let mut layout = None;
     if let Some(mut blocks) = held {
         let body_len = blocks.iter().try_fold(0u64, |total, block| {
             total
@@ -685,6 +734,10 @@ pub(super) fn write_archive<'a>(
             resources,
         )?;
         report_emission(plan.progress, true);
+        archive_at = sink
+            .as_seekable()
+            .map(|output| output.stream_position())
+            .transpose()?;
         write_archive_head(
             &mut sink,
             main_iv,
@@ -742,29 +795,60 @@ pub(super) fn write_archive<'a>(
         )?;
     }
 
-    let output = sink.writer();
     if let Some(recovery_percent) = plan.recovery_percent {
-        let mirror = mirror.as_mut().expect("recovery mirrors the archive");
         let layout = layout
             .as_ref()
-            .expect("recovery holds members for the layout");
+            .expect("recovery settles the layout before its record");
+        let (prefix_len, service) = match mirror.as_mut() {
+            Some(mirror) => {
+                let prefix_len = mirror.len();
+                mirror.rewind()?;
+                let service = recovery_service(
+                    recovery_percent,
+                    mirror,
+                    prefix_len,
+                    header_keys.as_ref(),
+                    resources,
+                    plan.progress,
+                )?;
+                (prefix_len, service)
+            }
+            None => {
+                let output = sink
+                    .as_seekable()
+                    .expect("recovery reads back only a seekable output");
+                let start = archive_at.expect("a seekable archive knows where it starts");
+                let end = output.stream_position()?;
+                let output = output
+                    .inner
+                    .readable()
+                    .expect("recovery reads back only a readable output");
+                let service = recovery_service(
+                    recovery_percent,
+                    &mut ReadBack {
+                        output: &mut *output,
+                        start,
+                    },
+                    end - start,
+                    header_keys.as_ref(),
+                    resources,
+                    plan.progress,
+                )?;
+                output.seek(SeekFrom::Start(end))?;
+                (end - start, service)
+            }
+        };
         // The recovery block has to start exactly where the locator in the
         // main header says it does.
-        debug_assert_eq!(layout.recovery_prefix_len, Some(mirror.len()));
+        debug_assert_eq!(layout.recovery_prefix_len, Some(prefix_len));
         debug_assert_eq!(
             layout.recovery_offset,
-            Some(mirror.len() - RAR50_SIGNATURE.len() as u64 - head_crypt.len() as u64),
+            Some(prefix_len - RAR50_SIGNATURE.len() as u64 - head_crypt.len() as u64),
             "recovery record is not where the locator points"
         );
-        write_recovery_service(
-            recovery_percent,
-            mirror,
-            header_keys.as_ref(),
-            resources,
-            plan.progress,
-            output,
-        )?;
+        service.write_to(sink.writer())?;
     }
+    let output = sink.writer();
 
     match &header_keys {
         Some(keys) => output.write_all(&encrypted_header_block(
@@ -838,11 +922,7 @@ fn main_header_block(
 }
 
 /// Twice a declared size covers members that cannot be stored when packing grows them.
-fn widest_quick_open_offset(
-    entries: &[ArchiveEntry],
-    plan: &EnginePlan<'_>,
-    main_header_len: u64,
-) -> usize {
+fn widest_body_end(entries: &[ArchiveEntry], plan: &EnginePlan<'_>, main_header_len: u64) -> u64 {
     // A block's fixed fields fit in a KiB.
     const BLOCK: u64 = 1024;
     let twice = |len: usize| (len as u64).saturating_mul(2);
@@ -856,7 +936,7 @@ fn widest_quick_open_offset(
     let leading = main_header_len
         .saturating_add(BLOCK)
         .saturating_add(comment);
-    let widest = entries.iter().fold(leading, |total, entry| {
+    entries.iter().fold(leading, |total, entry| {
         let declared = entry.source.len().unwrap_or(u64::MAX);
         let target = entry
             .redirection
@@ -876,8 +956,11 @@ fn widest_quick_open_offset(
                     .saturating_add(twice(service.data.len()))
                     .saturating_add(BLOCK)
             })
-    });
-    (u64::BITS - widest.leading_zeros()).div_ceil(7).max(1) as usize
+    })
+}
+
+fn vint_width(value: u64) -> usize {
+    (u64::BITS - value.leading_zeros()).div_ceil(7).max(1) as usize
 }
 
 /// Spooled, as headers for many members would not fit in memory.
@@ -1984,15 +2067,51 @@ fn write_recovery_service(
     progress: Option<ProgressReporter<'_>>,
     output: &mut dyn Write,
 ) -> Result<u64> {
+    let prefix_len = prefix.len();
+    prefix.rewind()?;
+    recovery_service(
+        recovery_percent,
+        prefix,
+        prefix_len,
+        header_keys,
+        resources,
+        progress,
+    )?
+    .write_to(output)
+}
+
+/// Built before it is written, as its prefix may be read from the same output.
+struct RecoveryService {
+    header: Bytes,
+    payload: Spool,
+}
+
+impl RecoveryService {
+    fn write_to(mut self, output: &mut dyn Write) -> Result<u64> {
+        output.write_all(&self.header)?;
+        let payload_len = self.payload.len();
+        self.payload.copy_to(output)?;
+        Ok(self.header.len() as u64 + payload_len)
+    }
+}
+
+fn recovery_service(
+    recovery_percent: u64,
+    prefix: &mut (impl Read + Seek),
+    prefix_len: u64,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<RecoveryService> {
     #[cfg(not(feature = "recovery"))]
     {
         let _ = (
             recovery_percent,
             prefix,
+            prefix_len,
             header_keys,
             resources,
             progress,
-            output,
         );
         Err(Error::FeatureDisabled {
             feature: "recovery",
@@ -2004,20 +2123,20 @@ fn write_recovery_service(
             return recovery_service_with_allowance(
                 recovery_percent,
                 prefix,
+                prefix_len,
                 header_keys,
                 resources,
                 progress,
-                output,
                 allowance,
             );
         }
         recovery_service_with_allowance(
             recovery_percent,
             prefix,
+            prefix_len,
             header_keys,
             resources,
             progress,
-            output,
             &crate::codec::workspace::Allowance::default(),
         )
     }
@@ -2026,14 +2145,13 @@ fn write_recovery_service(
 #[cfg(feature = "recovery")]
 fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
     recovery_percent: u64,
-    prefix: &mut Spool,
+    prefix: &mut (impl Read + Seek),
+    prefix_len: u64,
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
-    output: &mut dyn Write,
     allowance: &B,
-) -> Result<u64> {
-    let prefix_len = prefix.len();
+) -> Result<RecoveryService> {
     let plan = plan_inline_recovery(prefix_len, recovery_percent)?;
     let (mode, required) = choose_recovery_memory_mode(plan, resources.memory_limit())?;
     let (mode, required) = if let Some(allowance) = &resources.execution {
@@ -2056,7 +2174,6 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
         crate::recovery::rar5::RecoveryMemoryMode::Resident => None,
     };
     let mut payload = Spool::create(resources)?;
-    prefix.rewind()?;
     let built = streamed_recovery_with_allowance(
         &mut CancellableIo {
             inner: prefix,
@@ -2119,9 +2236,32 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
             resources,
         )?,
     };
-    output.write_all(&header)?;
-    payload.copy_to(output)?;
-    Ok(header.len() as u64 + built.payload_len)
+    Ok(RecoveryService { header, payload })
+}
+
+/// Positions count from the archive, as the output may hold a prefix before it.
+struct ReadBack<'a> {
+    output: &'a mut dyn crate::write_stream::ReadSeekWrite,
+    start: u64,
+}
+
+impl Read for ReadBack<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        self.output.read(buffer)
+    }
+}
+
+impl Seek for ReadBack<'_> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let from = match from {
+            SeekFrom::Start(at) => SeekFrom::Start(self.start + at),
+            relative => relative,
+        };
+        self.output
+            .seek(from)?
+            .checked_sub(self.start)
+            .ok_or_else(|| std::io::Error::other("read back before the archive"))
+    }
 }
 
 /// Writes to the archive and, when a recovery record is coming, keeps a copy
@@ -2779,6 +2919,7 @@ impl VolumeWriter<'_> {
             quick_open_payload_len: None,
             quick_open_width: 0,
             recovery_percent: self.recovery_percent,
+            recovery_width: 0,
         }
     }
 
