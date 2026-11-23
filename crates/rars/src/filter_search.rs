@@ -1355,9 +1355,11 @@ fn trial_winner<S: OwnedSearch>(
         }
     }
     let (best, _) = best.expect("a trial has a candidate");
-    Ok(std::mem::replace(finalists, Buffer::new(search.allowance()))
-        .into_iter()
-        .nth(best))
+    Ok(
+        std::mem::replace(finalists, Buffer::new(search.allowance()))
+            .into_iter()
+            .nth(best),
+    )
 }
 
 /// The finalists worth encoding at the caller's settings: the trial's winner
