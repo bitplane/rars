@@ -2637,6 +2637,11 @@ where
         truncation = Some(Truncation::new(sfx_offset + pos, block, false));
     }
     main.rewrite_metadata_complete &= matches!(blocks.last(), Some(Block::End(_)));
+    // Writers put the quick-open block and recovery record after every member.
+    let past_trailing_block = blocks.iter().any(|block| {
+        matches!(block, Block::Service(service) if matches!(&service.name[..], b"QO" | b"RR"))
+    });
+    let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), past_trailing_block));
     Ok((main, blocks, truncation))
 }
 

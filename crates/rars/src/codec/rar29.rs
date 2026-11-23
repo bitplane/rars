@@ -56,8 +56,9 @@ const MAX_VM_GLOBAL_DATA: usize = 0x2000;
 const VM_SYSTEM_GLOBAL_SIZE: usize = 64;
 const MAX_VM_USER_GLOBAL_DATA: usize = MAX_VM_GLOBAL_DATA - VM_SYSTEM_GLOBAL_SIZE;
 const MAX_VM_CODE_SIZE: usize = 64 * 1024;
-const MAX_VM_PROGRAMS: usize = 8192;
-const MAX_VM_FILTERS: usize = 8192;
+// As many as unrar takes: it refuses the 8,194th program or queued filter.
+const MAX_VM_PROGRAMS: usize = 8193;
+const MAX_VM_FILTERS: usize = 8193;
 // A filter holds output until its block is decoded; a block larger than RARVM memory cannot be filtered.
 const MAX_VM_BLOCK_SIZE: usize = rarvm::MEMORY_SIZE;
 
@@ -910,7 +911,7 @@ impl<B: Budget> Reader29State<B> {
         loop {
             self.bits.top_up(src)?;
             let finished = match self.block_mode {
-                BlockMode::Lz => self.finish_lz_member()?,
+                BlockMode::Lz => self.finish_lz_member(src)?,
                 BlockMode::Ppmd => self.finish_ppmd_member(src)?,
             };
             if finished {
@@ -919,10 +920,11 @@ impl<B: Budget> Reader29State<B> {
         }
     }
 
-    fn finish_lz_member(&mut self) -> Result<bool> {
-        // Zero padding in the last byte is not a symbol: with the output
-        // complete, the member may end there without an end of block.
-        if !self.in_lz_block || self.bits.only_zero_padding_left() {
+    fn finish_lz_member(&mut self, src: &mut dyn Read) -> Result<bool> {
+        // Zero padding is not a symbol: with the output complete, the member
+        // may end in it without an end of block. Writers pad the last byte,
+        // and some add whole zero bytes. They add nothing the CRC would miss.
+        if !self.in_lz_block || self.bits.rest_is_zero_padding(src)? {
             return Ok(true);
         }
         let symbol_start = self.bits.bit_pos;
@@ -1601,9 +1603,26 @@ impl<B: Budget> BitReader<B> {
         self.bit_pos -= bytes * 8;
     }
 
-    fn only_zero_padding_left(&self) -> bool {
-        let left = (self.input.len() * 8).saturating_sub(self.bit_pos);
-        self.refill_at == DRAINED && left < 8 && self.peek_bits(left as u8) == Ok(0)
+    /// Whether all that is left of the packed data is zero bits. Reads on
+    /// through the source only while the window holds nothing but zeros. A
+    /// `false` after a refill has consumed those zeros (at least the 128 KiB
+    /// low-water mark of them, longer than any symbol), so what follows is
+    /// trailing data either way and the member CRC still decides.
+    fn rest_is_zero_padding(&mut self, src: &mut dyn Read) -> Result<bool> {
+        loop {
+            let rest = self.input.get(self.bit_pos / 8..).unwrap_or_default();
+            if let Some((&first, tail)) = rest.split_first() {
+                // The bits of the current byte not yet read.
+                if first << (self.bit_pos % 8) != 0 || tail.iter().any(|&byte| byte != 0) {
+                    return Ok(false);
+                }
+            }
+            if self.refill_at == DRAINED {
+                return Ok(true);
+            }
+            self.bit_pos = self.input.len() * 8;
+            self.refill(src)?;
+        }
     }
 
     fn align_byte(&mut self) {

@@ -205,6 +205,9 @@ struct Truncation {
     /// Whether any of that block is in the file.
     #[pyo3(get)]
     started: bool,
+    /// Whether the cut can have lost no member: see `rars::Truncation`.
+    #[pyo3(get)]
+    members_complete: bool,
     /// The volume cut short, counting the one opened as 0.
     #[pyo3(get)]
     volume_index: usize,
@@ -227,6 +230,7 @@ impl Truncation {
             block,
             name,
             started: truncation.started,
+            members_complete: truncation.members_complete,
             volume_index,
             text: truncation.to_string(),
         }

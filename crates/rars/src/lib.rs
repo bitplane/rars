@@ -149,6 +149,7 @@ pub use filter::{
 };
 #[cfg(any(feature = "write", feature = "recovery"))]
 pub use progress::{WriteOperation, WriteProgress, WriteProgressEvent};
+pub use rar15_40::SkippedBlock;
 pub use reader_scratch::Rar50Scratch;
 use std::io::{Read, Write};
 use std::path::Path;
@@ -824,6 +825,16 @@ impl Archive {
             Self::Rar13(archive) => archive.truncation(),
             Self::Rar15To40(archive) => archive.truncation(),
             Self::Rar50Plus(archive) => archive.truncation(),
+        }
+    }
+
+    /// The malformed optional blocks the reader passed over, in file order.
+    /// Only RAR 1.5 to 4.x archives have any: old authenticity, recovery and
+    /// signature blocks, which no member needs.
+    pub fn skipped_blocks(&self) -> &[rar15_40::SkippedBlock] {
+        match self {
+            Self::Rar15To40(archive) => archive.skipped_blocks(),
+            Self::Rar13(_) | Self::Rar50Plus(_) => &[],
         }
     }
 

@@ -1223,16 +1223,55 @@ fn an_lz_member_may_end_on_the_zero_padding_of_its_last_byte() {
     }
 }
 
+/// Issue #489: whole zero bytes after the last code are padding too, however
+/// many, including more than the packed window holds at once.
 #[test]
-fn a_whole_zero_byte_after_the_last_lz_code_is_trailing_data() {
+fn whole_zero_bytes_after_the_last_lz_code_are_padding() {
     let input = b"BAA";
-    let mut packed = literal_member_without_end_marker(input);
-    packed.push(0);
+    for zeros in [1, 2, 16, 3 * PACKED_WINDOW] {
+        let mut packed = literal_member_without_end_marker(input);
+        packed.resize(packed.len() + zeros, 0);
 
-    assert!(matches!(
-        unpack29_decode(&packed, input.len()),
-        Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"))
-    ));
+        assert_eq!(
+            unpack29_decode(&packed, input.len()).unwrap(),
+            input,
+            "{zeros}"
+        );
+        let mut streamed = Vec::new();
+        Unpack29::new()
+            .decode_member_from_reader(&mut &packed[..], input.len(), &mut streamed)
+            .unwrap();
+        assert_eq!(streamed, input, "{zeros}");
+    }
+}
+
+#[test]
+fn a_set_bit_after_the_last_lz_code_is_trailing_data() {
+    let input = b"BAA";
+    let window = PACKED_WINDOW;
+    for (zeros, last) in [(0, 1), (0, 0x80), (15, 1), (3 * window, 1)] {
+        let mut packed = literal_member_without_end_marker(input);
+        packed.resize(packed.len() + zeros, 0);
+        packed.push(last);
+
+        assert!(
+            matches!(
+                unpack29_decode(&packed, input.len()),
+                Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"))
+            ),
+            "{zeros} {last}"
+        );
+        let mut streamed = Vec::new();
+        let result =
+            Unpack29::new().decode_member_from_reader(&mut &packed[..], input.len(), &mut streamed);
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"))
+            ),
+            "{zeros} {last}: {result:?}"
+        );
+    }
 }
 
 #[test]
@@ -4547,26 +4586,43 @@ fn vm_code_size_is_capped_before_allocation() {
     );
 }
 
+/// A record declaring E8 as program `index`, new when it is the next one.
+fn new_e8_program_record(index: usize) -> Vec<u8> {
+    let mut record = BitWriter::default();
+    record.write_encoded_u32(index as u32 + 1);
+    record.write_encoded_u32(1);
+    record.write_encoded_u32(super::RAR3_E8_FILTER_BYTECODE.len() as u32);
+    for &byte in super::RAR3_E8_FILTER_BYTECODE {
+        record.write_bits(u32::from(byte), 8);
+    }
+    record.finish()
+}
+
+/// Issue #489: as in unrar, 8,193 programs and 8,193 queued filters are
+/// accepted and the 8,194th of either is refused.
 #[test]
 fn vm_program_and_filter_counts_are_capped() {
+    assert_eq!(
+        (super::MAX_VM_PROGRAMS, super::MAX_VM_FILTERS),
+        (8193, 8193)
+    );
     let mut decoder = Unpack29::new();
     decoder
         .programs
-        .resize_with(super::MAX_VM_PROGRAMS, || VmProgram {
+        .resize_with(super::MAX_VM_PROGRAMS - 1, || VmProgram {
             kind: VmProgramKind::Standard(StandardFilter::E8),
             block_size: 1,
             exec_count: 0,
             globals: Vec::new().into(),
         })
         .unwrap();
-
-    let mut new_program = BitWriter::default();
-    new_program.write_encoded_u32((super::MAX_VM_PROGRAMS + 1) as u32);
-    new_program.write_encoded_u32(1);
-    new_program.write_encoded_u32(1);
-    new_program.write_bits(0, 8);
+    decoder.filters.clear();
+    decoder
+        .parse_vm_code(0x80, new_e8_program_record(super::MAX_VM_PROGRAMS - 1))
+        .unwrap();
+    assert_eq!(decoder.programs.len(), super::MAX_VM_PROGRAMS);
     assert_eq!(
-        decoder.parse_vm_code(0x80, new_program.finish()),
+        decoder.parse_vm_code(0x80, new_e8_program_record(super::MAX_VM_PROGRAMS)),
         Err(Error::InvalidData("RAR 2.9 VM program limit exceeded"))
     );
 
@@ -4574,7 +4630,7 @@ fn vm_program_and_filter_counts_are_capped() {
     decoder.last_filter = 0;
     decoder
         .filters
-        .resize_with(super::MAX_VM_FILTERS, || VmFilter {
+        .resize_with(super::MAX_VM_FILTERS - 1, || VmFilter {
             program: 0,
             start: 0,
             size: 1,
@@ -4582,10 +4638,15 @@ fn vm_program_and_filter_counts_are_capped() {
             global_data: Vec::new().into(),
         })
         .unwrap();
-    let mut reused_program = BitWriter::default();
-    reused_program.write_encoded_u32(0);
+    let reused_program = || {
+        let mut record = BitWriter::default();
+        record.write_encoded_u32(0);
+        record.finish()
+    };
+    decoder.parse_vm_code(0, reused_program()).unwrap();
+    assert_eq!(decoder.filters.len(), super::MAX_VM_FILTERS);
     assert_eq!(
-        decoder.parse_vm_code(0, reused_program.finish()),
+        decoder.parse_vm_code(0, reused_program()),
         Err(Error::InvalidData("RAR 2.9 VM filter limit exceeded"))
     );
 }

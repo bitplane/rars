@@ -25,7 +25,7 @@ use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
     create_link_output, damaged_member_warning, incomplete_member_warning, open_output_writer,
     print_ok_entry, print_ok_name, rar50_output_relative_path, restore_output_metadata,
-    truncation_warning, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
+    warn_archive_structure, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
     OverwritePolicy,
 };
 use password::{
@@ -176,9 +176,7 @@ fn cmd_info(args: InfoArgs) -> CliResult<()> {
             } else {
                 print_terse_header(path, &archive);
             }
-            if let Some(truncation) = archive.truncation() {
-                eprintln!("{}", truncation_warning(Path::new(path), truncation));
-            }
+            warn_archive_structure(Path::new(path), &archive);
             let options = args.read_options.options(password, scratch.as_ref());
             match archive {
                 DetectedArchive::Rar13(archive) => {
@@ -821,15 +819,18 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Warns about each archive whose file ends early, returning their paths.
+/// Warns about each archive whose file ends early or that has malformed
+/// blocks passed over, returning the paths of those whose cut may have lost
+/// members. A cut that can't have, such as one inside the end block, stays a
+/// warning: the members decide whether the command fails.
 fn warn_truncated(paths: &[PathBuf], archives: &[DetectedArchive]) -> Vec<PathBuf> {
     paths
         .iter()
         .zip(archives)
         .filter_map(|(path, archive)| {
+            warn_archive_structure(path, archive);
             let truncation = archive.truncation()?;
-            eprintln!("{}", truncation_warning(path, truncation));
-            Some(path.clone())
+            (!truncation.members_complete).then(|| path.clone())
         })
         .collect()
 }

@@ -561,6 +561,11 @@ class Truncation:
     def started(self) -> bool:
         """Whether any of the block is in the file."""
     @property
+    def members_complete(self) -> bool:
+        """Whether the cut can have lost no member: the file ends in or just before
+        the end block, quick-open block or recovery record of an archive that is
+        not a volume."""
+    @property
     def volume_index(self) -> int: ...
 
 @final

@@ -1192,6 +1192,7 @@ mod tests {
         Archive {
             key_cache: Arc::default(),
             truncation: None,
+            skipped: Vec::new(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1216,6 +1217,7 @@ mod tests {
         Archive {
             key_cache: Arc::default(),
             truncation: None,
+            skipped: Vec::new(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1396,6 +1398,7 @@ mod tests {
         let archive = Archive {
             key_cache: Arc::default(),
             truncation: None,
+            skipped: Vec::new(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
