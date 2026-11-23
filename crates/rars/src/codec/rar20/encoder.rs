@@ -76,8 +76,9 @@ pub struct EncodeOptions {
     pub max_match_distance: usize,
     pub lazy_matching: bool,
     pub lazy_lookahead: usize,
-    /// Parse by shortest path rather than greedily. Costs several times the
-    /// encode time, so it belongs at the top of the level ladder.
+    /// Parse by shortest path rather than greedily. Searching a tree, it finds
+    /// with a few candidates what a greedy parse cannot at any depth, so it
+    /// runs from the default level up.
     pub optimal_parse: bool,
     /// Priced re-parses beyond the ones a block needs to settle its tables.
     /// Each is kept only if it packs the block smaller, so adding them never
@@ -256,15 +257,16 @@ impl Unpack20Encoder {
 
 /// Bytes coded per block. Each block is parsed against the dictionary before
 /// it and gets tables of its own, so the parse's working set (its tokens, and
-/// at levels 4–5 its steps and match lists) is sized by the block, not by the
+/// from level 3 up its steps and match lists) is sized by the block, not by the
 /// member.
 const BLOCK_SIZE: usize = 1024 * 1024;
 
 /// What coding one block holds beyond the member's own bytes: the window and
-/// block, the match finders, the tokens, and at levels 4–5 the shortest-path
+/// block, the match finders, the tokens, and from level 3 up the shortest-path
 /// parse's steps and match lists. Peak RSS on brett, coding 256 MiB streamed
-/// with 1 MiB blocks, was 18–26 MB at level 3. Level 5's live heap per block,
-/// at most 45 MiB on source, word text, random and zeros, gets the same headroom.
+/// with 1 MiB blocks, was 18–26 MB under the greedy parse. Level 5's live heap
+/// per block, at most 45 MiB on source, word text, random and zeros, gets the
+/// same headroom.
 const fn block_workspace(optimal_parse: bool) -> u64 {
     if optimal_parse {
         64 * 1024 * 1024
@@ -570,7 +572,7 @@ fn code_lz_block(
     // re-parse and a second buys 0.02%, but the shortest-path parse is far more
     // sensitive to its prices and a second pass is worth 0.12% to it. A third
     // and fourth buy another 0.06% on the bench's small members and 0.03% on its
-    // 4 MiB text and binaries, which is what level 5 is for.
+    // 4 MiB text and binaries, which is what levels 4 and 5 are for.
     let refinements = if options.optimal_parse { 2 } else { 1 } + options.extra_priced_passes;
     let span = window.len() - start;
     let mut poll = progress.map(|report| move |_: usize| report(span));
