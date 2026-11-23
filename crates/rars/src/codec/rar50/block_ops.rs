@@ -4,6 +4,7 @@ use super::{
     distance_from_slot_parts, distance_slot_bit_count, length_bonus, length_from_slot_parts,
     length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, DecodedChunk,
     Error, PendingFilter, ReaderTables, Result, StreamDecodeError, StreamingOutput, LITERAL_BURST,
+    SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
 };
 use crate::read_control::Poller;
 use std::hint::select_unpredictable;
@@ -322,6 +323,87 @@ impl BlockOps {
         *repeats.distances = reps;
         *repeats.last_length = last_length;
         walked
+    }
+}
+
+/// The replay's unchecked copies, which only replay can keep within a budget.
+impl<B: Budget> StreamingOutput<B> {
+    /// Bytes that can be written before a flush, a growth, the output limit
+    /// or a zero-filled window needs the checked path, with room left past
+    /// the newest byte for one fixed-width over-copy.
+    #[inline]
+    fn fast_budget(&self) -> usize {
+        if self.all_zero {
+            return 0;
+        }
+        let capacity = self.ring.capacity();
+        let budget = (self.output_limit - self.written)
+            .min((STREAM_FLUSH_THRESHOLD - 1).saturating_sub(self.pending))
+            .min(capacity.saturating_sub(self.ring.end + SHORT_MATCH));
+        if capacity < self.max_capacity {
+            budget.min(capacity.saturating_sub(self.ring.len + SHORT_MATCH))
+        } else {
+            budget
+        }
+    }
+
+    #[inline(always)]
+    fn advance_unflushed(&mut self, count: usize) {
+        self.ring.advance(count);
+        self.pending += count;
+        self.written += count;
+    }
+
+    /// Appends the first `count` bytes of `literals` within a [`Self::fast_budget`].
+    #[inline(always)]
+    fn push_literals_within_budget(&mut self, literals: &[u8], count: usize) {
+        let end = self.ring.end;
+        if let Some(bytes) = literals
+            .first_chunk::<SHORT_MATCH>()
+            .filter(|_| count <= SHORT_MATCH)
+        {
+            self.ring.bytes[end..end + SHORT_MATCH].copy_from_slice(bytes);
+        } else {
+            self.ring.bytes[end..end + count].copy_from_slice(&literals[..count]);
+        }
+        self.advance_unflushed(count);
+    }
+
+    /// A match within a [`Self::fast_budget`] whose source is stored and
+    /// contiguous; false leaves it to [`Self::copy_match`].
+    #[inline(always)]
+    fn copy_within_budget(&mut self, distance: usize, length: usize) -> bool {
+        let end = self.ring.end;
+        if distance == 0
+            || distance > end
+            || distance > self.ring.len
+            || distance > self.dictionary_size
+        {
+            return false;
+        }
+        let source = end - distance;
+        if length <= SHORT_MATCH && distance >= length {
+            let bytes: [u8; SHORT_MATCH] = self.ring.bytes[source..source + SHORT_MATCH]
+                .try_into()
+                .expect("fixed-width slice");
+            self.ring.bytes[end..end + SHORT_MATCH].copy_from_slice(&bytes);
+        } else if distance >= length {
+            self.ring.bytes.copy_within(source..source + length, end);
+        } else if distance >= SHORT_MATCH {
+            // Each piece reads only bytes already written, so the overlap repeats.
+            for offset in (0..length).step_by(SHORT_MATCH) {
+                let from = source + offset;
+                let bytes: [u8; SHORT_MATCH] = self.ring.bytes[from..from + SHORT_MATCH]
+                    .try_into()
+                    .expect("fixed-width slice");
+                let to = end + offset;
+                self.ring.bytes[to..to + SHORT_MATCH].copy_from_slice(&bytes);
+            }
+        } else {
+            return false;
+        }
+        self.advance_unflushed(length);
+        true
     }
 }
 
