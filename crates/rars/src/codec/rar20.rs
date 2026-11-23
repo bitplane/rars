@@ -275,6 +275,11 @@ impl<B: Budget> Reader20State<B> {
                     // the whole file and only the declared size is wrong.
                     out.write_all(self.raw_range(flushed, self.current_pos()))
                         .map_err(Error::from)?;
+                } else if self.read_control.salvage() {
+                    // Salvage delivers what decoded before the failure.
+                    let end = self.current_pos().clamp(flushed, end);
+                    out.write_all(self.raw_range(flushed, end))
+                        .map_err(Error::from)?;
                 }
                 return Err(error);
             }

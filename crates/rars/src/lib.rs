@@ -51,6 +51,8 @@ pub mod error;
 pub mod features;
 pub mod filename;
 pub mod filter;
+mod header_damage;
+pub use header_damage::{HeaderDamage, HeaderDamageKind};
 #[cfg(feature = "write")]
 mod filter_search;
 #[cfg(feature = "write")]
@@ -321,6 +323,9 @@ pub struct ArchiveReadOptions<'a> {
     /// solid archive continues from where the stream ended. `rars test` turns
     /// this on to report such members.
     pub strict_member_sizes: bool,
+    /// Read a damaged archive for what it still holds. Off by default; see
+    /// [`Self::with_salvage`].
+    pub salvage: bool,
     /// Set by [`Self::with_member_error_handler`].
     pub(crate) member_errors: Option<extraction_control::MemberErrorHandler<'a>>,
 }
@@ -459,9 +464,10 @@ impl<'a> ArchiveReadOptions<'a> {
         self
     }
 
-    /// Whether a member error handler is set, so parsing reads up to a cut member.
+    /// Whether a member error handler or salvage is set, so parsing reads up
+    /// to a cut member.
     pub(crate) fn salvages(&self) -> bool {
-        self.member_errors.is_some()
+        self.member_errors.is_some() || self.salvage
     }
 
     /// Allows RAR 2.9-4.x filter programs other than the six standard ones to
@@ -475,6 +481,47 @@ impl<'a> ArchiveReadOptions<'a> {
     /// [`ArchiveReadOptions::strict_member_sizes`].
     pub fn with_strict_member_sizes(mut self, strict: bool) -> Self {
         self.strict_member_sizes = strict;
+        self
+    }
+
+    /// Reads a damaged archive for what it still holds, rather than refusing
+    /// what fails a check. Off by default.
+    ///
+    /// Pass the same options to parsing and to the test or extraction call.
+    /// Parsing then reads past header damage and records it in
+    /// [`Archive::header_damage`]:
+    ///
+    /// - a header whose checksum fails is read as it is stored, if it still
+    ///   parses ([`HeaderDamageKind::Checksum`]);
+    /// - a malformed optional record, such as a RAR 5 redirection or hash
+    ///   record, is dropped and the rest of its header kept
+    ///   ([`HeaderDamageKind::DroppedRecord`]).
+    ///
+    /// A header that doesn't parse still ends the walk with its error.
+    ///
+    /// Testing and extraction deliver each member's bytes even when it fails:
+    ///
+    /// - a member whose checksum fails is written whole, then its error is
+    ///   reported;
+    /// - a member that fails partway through gets every byte decoded before
+    ///   the failure, then the error;
+    /// - a RAR 5 member whose stream decodes past its declared size gets its
+    ///   declared bytes, and [`Error::MemberRanPastDeclaredSize`].
+    ///
+    /// The error goes where it always does: to the
+    /// [`Self::with_member_error_handler`] handler, which can carry on to the
+    /// next member, or else it ends the call. So a member is complete and
+    /// verified when its output was opened and the handler was not called for
+    /// it, and salvaged when the handler was called after its output was
+    /// opened. A member that fails before any of it is decoded, such as one
+    /// needing a password or above a limit, gets no bytes, as before.
+    ///
+    /// Bytes past the point of damage are whatever the decoder made of the
+    /// damaged stream; only the bytes before it are the member's own. Test
+    /// and extraction run members one at a time on the calling thread under
+    /// this option, so the bytes a failed member gets don't depend on timing.
+    pub fn with_salvage(mut self, salvage: bool) -> Self {
+        self.salvage = salvage;
         self
     }
 }
@@ -825,6 +872,18 @@ impl Archive {
             Self::Rar13(archive) => archive.truncation(),
             Self::Rar15To40(archive) => archive.truncation(),
             Self::Rar50Plus(archive) => archive.truncation(),
+        }
+    }
+
+    /// The header damage that parsing with
+    /// [`ArchiveReadOptions::with_salvage`] read past, in file order. Empty
+    /// for an archive whose headers are whole, and always without salvage,
+    /// which fails on such damage instead.
+    pub fn header_damage(&self) -> &[HeaderDamage] {
+        match self {
+            Self::Rar13(_) => &[],
+            Self::Rar15To40(archive) => archive.header_damage(),
+            Self::Rar50Plus(archive) => archive.header_damage(),
         }
     }
 

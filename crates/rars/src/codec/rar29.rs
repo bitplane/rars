@@ -523,6 +523,15 @@ impl<B: Budget> Reader29State<B> {
                     if safe_end > flushed {
                         self.write_range(flushed, safe_end, start, out)?;
                     }
+                } else if self.read_control.salvage() {
+                    // Salvage delivers what decoded before the failure,
+                    // short of a filter's block that never completed.
+                    let end = self.current_pos().min(final_target);
+                    if let Ok(safe_end) = self.safe_flush_end(flushed, end, final_target) {
+                        if safe_end > flushed {
+                            self.write_range(flushed, safe_end, start, out)?;
+                        }
+                    }
                 }
                 return Err(match error {
                     Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),

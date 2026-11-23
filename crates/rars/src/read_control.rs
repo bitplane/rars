@@ -63,6 +63,9 @@ pub(crate) struct ReadControl(
     /// Fails a member whose stream ends short of its declared size even when
     /// its checksum matches; see `ArchiveReadOptions::strict_member_sizes`.
     bool,
+    /// Set under `ArchiveReadOptions::salvage`, to collect the header damage
+    /// a parse reads past.
+    Option<Arc<crate::header_damage::DamageLog>>,
 );
 
 /// Whether RAR 3 decoding may run filter programs other than the six
@@ -108,7 +111,30 @@ impl ReadControl {
             .rar50_decode_workers
             .map_or(DecodeWorkers::Auto, DecodeWorkers::AtMost);
         control.3 = options.strict_member_sizes;
+        if options.salvage {
+            // A failed member's bytes must not depend on how far ahead
+            // workers had decoded.
+            control.2 = DecodeWorkers::Serial;
+            control.4 = Some(crate::header_damage::DamageLog::new());
+        }
         control
+    }
+    /// Whether to salvage: deliver what decodes and read past header damage.
+    pub(crate) fn salvage(&self) -> bool {
+        self.4.is_some()
+    }
+    /// Records header damage a salvaging parse read past.
+    pub(crate) fn report_damage(&self, offset: usize, kind: crate::HeaderDamageKind) {
+        if let Some(log) = &self.4 {
+            log.push(crate::HeaderDamage {
+                offset: offset as u64,
+                kind,
+            });
+        }
+    }
+    /// The header damage recorded so far, in file order.
+    pub(crate) fn take_damage(&self) -> Vec<crate::HeaderDamage> {
+        self.4.as_ref().map(|log| log.take()).unwrap_or_default()
     }
     /// Checks a member that passed its checksum, but whose stream ended after
     /// `decoded` of its `declared` bytes. It passes unless sizes are strict.
@@ -151,6 +177,7 @@ impl ReadControl {
             Rar3VmPrograms::Refuse,
             DecodeWorkers::Serial,
             false,
+            None,
         )
     }
     pub(crate) fn check(&self) -> Result<()> {

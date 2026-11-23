@@ -345,6 +345,10 @@ impl<B: Budget> Reader15State<B> {
                     // the whole file and only the declared size is wrong.
                     self.roll_back_to_tail(&mut chunk, chunk_start);
                     out.write_all(&chunk).map_err(Error::from)?;
+                } else if self.read_control.salvage() {
+                    // Salvage delivers what decoded before the failure.
+                    chunk.truncate(chunk_target - chunk_start);
+                    out.write_all(&chunk).map_err(Error::from)?;
                 }
                 return Err(error);
             }

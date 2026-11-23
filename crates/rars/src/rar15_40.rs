@@ -116,6 +116,7 @@ pub struct Archive {
     pub(crate) key_cache: Arc<KeyCache>,
     truncation: Option<Truncation>,
     skipped: Vec<SkippedBlock>,
+    damage: Vec<crate::HeaderDamage>,
 }
 
 /// An optional block the reader passed over because it is malformed: an old
@@ -636,6 +637,7 @@ impl FileHeader {
             | Error::MissingVolume
             | Error::VolumeOutOfOrder
             | Error::MemberEndedEarly { .. }
+            | Error::MemberRanPastDeclaredSize { .. }
             | Error::Cancelled
             | Error::InvalidArgument(_)
             | Error::WriterFailure(_)
@@ -916,7 +918,12 @@ impl Archive {
         // fixed MARK_HEAD type and seven-byte header length.
         let marker_size = RAR15_SIGNATURE.len();
         admit_plain_header(archive, marker_size, &mut budget)?;
-        let main_block = parse_block_header(archive, marker_size)?;
+        let main_block = parse_block_header_salvaging(
+            archive,
+            marker_size,
+            &budget.control,
+            sig.offset + marker_size,
+        )?;
         if main_block.head_type != MAIN_HEAD {
             return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
         }
@@ -956,15 +963,26 @@ impl Archive {
                 )?;
                 (encrypted.block, encrypted.header, encrypted.total_size)
             } else {
-                let block = admit_plain_header(archive, pos, &mut budget)
-                    .and_then(|()| parse_block_header(archive, pos));
+                let block = admit_plain_header(archive, pos, &mut budget).and_then(|()| {
+                    parse_block_header_salvaging(archive, pos, &budget.control, sig.offset + pos)
+                });
                 let block = match block {
                     Err(Error::TooShort) => {
-                        truncation = Some(cut_block_header(
+                        match cut_block_header(
                             &archive[pos..],
                             sig.offset + pos,
                             options.salvages(),
-                        )?);
+                        ) {
+                            // A whole header whose sizes run past the file.
+                            Err(error) if options.salvage => {
+                                unreadable(&budget.control, sig.offset + pos, &error);
+                            }
+                            cut => truncation = Some(cut?),
+                        }
+                        break;
+                    }
+                    Err(error) if salvage_stops(&options, &error) => {
+                        unreadable(&budget.control, sig.offset + pos, &error);
                         break;
                     }
                     block => block?,
@@ -975,7 +993,20 @@ impl Archive {
             };
             match block.head_type {
                 FILE_HEAD => {
-                    let mut file = parse_file_like_header(&header, relative_block(&block), 0)?;
+                    let mut file = match parse_file_like_header(&header, relative_block(&block), 0)
+                    {
+                        Err(error) if salvage_skips(&options, &error) => {
+                            unreadable(&budget.control, sig.offset + pos, &error);
+                            match checked_block_next(&block, total, archive.len()) {
+                                Ok(next) => {
+                                    pos = next;
+                                    continue;
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        file => file?,
+                    };
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = match checked_block_next(&block, total, archive.len()) {
                         Err(Error::TooShort) if options.salvages() => {
@@ -1069,6 +1100,7 @@ impl Archive {
             key_cache,
             truncation,
             skipped,
+            damage: budget.control.take_damage(),
         })
     }
 
@@ -1163,11 +1195,17 @@ impl Archive {
                             // A header cut short is under 64 KiB, as HEAD_SIZE is a u16.
                             let rest =
                                 read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
-                            truncation = Some(cut_block_header(
-                                &rest,
-                                sfx_offset + pos,
-                                options.salvages(),
-                            )?);
+                            match cut_block_header(&rest, sfx_offset + pos, options.salvages()) {
+                                // A whole header whose sizes run past the file.
+                                Err(error) if options.salvage => {
+                                    unreadable(&budget.control, sfx_offset + pos, &error);
+                                }
+                                cut => truncation = Some(cut?),
+                            }
+                            break;
+                        }
+                        Err(error) if salvage_stops(&options, &error) => {
+                            unreadable(&budget.control, sfx_offset + pos, &error);
                             break;
                         }
                         block => block?,
@@ -1179,7 +1217,19 @@ impl Archive {
             match block.head_type {
                 FILE_HEAD => {
                     let mut file_header =
-                        parse_file_like_header(&header, relative_block(&block), 0)?;
+                        match parse_file_like_header(&header, relative_block(&block), 0) {
+                            Err(error) if salvage_skips(&options, &error) => {
+                                unreadable(&budget.control, sfx_offset + pos, &error);
+                                match checked_file_block_next(sfx_offset, &block, total, file_len) {
+                                    Ok(next) => {
+                                        pos = next;
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
+                            }
+                            file => file?,
+                        };
                     let total = file_block_total_size(&block, total, file_header.pack_size)?;
                     let next = match checked_file_block_next(sfx_offset, &block, total, file_len) {
                         Err(Error::TooShort) if options.salvages() => {
@@ -1277,6 +1327,7 @@ impl Archive {
             key_cache,
             truncation,
             skipped,
+            damage: budget.control.take_damage(),
         })
     }
 
@@ -1560,6 +1611,11 @@ impl Archive {
     /// end block, and later versions can leave it out.
     pub fn truncation(&self) -> Option<&Truncation> {
         self.truncation.as_ref()
+    }
+
+    /// The header damage a salvaging parse read past, in file order.
+    pub fn header_damage(&self) -> &[crate::HeaderDamage] {
+        &self.damage
     }
 
     /// The malformed optional blocks the reader passed over, in file order.
@@ -1925,8 +1981,9 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         options.check_cancelled()?;
-        // Solid chains and ordered total-output charging need one session.
+        // Solid chains, ordered total-output charging and salvage need one session.
         if options.max_total_output_bytes.is_some()
+            || options.salvage
             || self.main.is_solid()
             || self.files().any(|file| file.is_solid())
         {
@@ -3143,7 +3200,7 @@ fn read_block_header_at(
         }
         header = read_exact_at(file, absolute, head_size + names)?;
     }
-    let mut block = parse_block_header(&header, 0)?;
+    let mut block = parse_block_header_salvaging(&header, 0, &budget.control, absolute)?;
     block.offset = offset;
     Ok(block)
 }
@@ -3172,6 +3229,43 @@ impl<W: Write + ?Sized> Write for CrcWriter<'_, W> {
 }
 
 fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
+    let (block, mismatch) = parse_block_header_unchecked(input, offset)?;
+    match mismatch {
+        Some((expected, actual)) => Err(Error::CrcMismatch { expected, actual }),
+        None => Ok(block),
+    }
+}
+
+/// [`parse_block_header`], except that under salvage a header whose CRC
+/// fails is read as stored, and the damage recorded at `report_offset`.
+fn parse_block_header_salvaging(
+    input: &[u8],
+    offset: usize,
+    control: &crate::read_control::ReadControl,
+    report_offset: usize,
+) -> Result<BlockHeader> {
+    let (block, mismatch) = parse_block_header_unchecked(input, offset)?;
+    match mismatch {
+        Some((expected, actual)) if control.salvage() => {
+            control.report_damage(
+                report_offset,
+                crate::HeaderDamageKind::Checksum {
+                    expected: expected.into(),
+                    actual: actual.into(),
+                },
+            );
+            Ok(block)
+        }
+        Some((expected, actual)) => Err(Error::CrcMismatch { expected, actual }),
+        None => Ok(block),
+    }
+}
+
+/// A block header, and its stored and computed CRCs if they differ.
+fn parse_block_header_unchecked(
+    input: &[u8],
+    offset: usize,
+) -> Result<(BlockHeader, Option<(u16, u16)>)> {
     if input.len() < offset + 7 {
         return Err(Error::TooShort);
     }
@@ -3191,24 +3285,25 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
     if offset + head_size as usize > input.len() {
         return Err(Error::TooShort);
     }
+    let mut mismatch = None;
     if should_validate_header_crc(head_type) {
         let header_end = header_crc_end(input, offset, head_type, flags, head_size)?;
         let actual = (crc32(&input[offset + 2..header_end]) & 0xffff) as u16;
         if actual != head_crc {
-            return Err(Error::CrcMismatch {
-                expected: head_crc,
-                actual,
-            });
+            mismatch = Some((head_crc, actual));
         }
     }
-    Ok(BlockHeader {
-        head_crc,
-        head_type,
-        flags,
-        head_size,
-        add_size,
-        offset,
-    })
+    Ok((
+        BlockHeader {
+            head_crc,
+            head_type,
+            flags,
+            head_size,
+            add_size,
+            offset,
+        },
+        mismatch,
+    ))
 }
 
 fn header_crc_end(
@@ -3375,6 +3470,31 @@ fn service_block_next(block: &BlockHeader, next: Result<usize>) -> Result<Option
 /// Fewer than seven bytes is a cut too, but too few to trust the type byte:
 /// old self-extractors often end in a few bytes that are no header at all. Only
 /// an end block is named then, and nothing is an error.
+/// Whether a salvaging parse passes over a header whose block was read
+/// whole but whose own fields fail with `error`. Here even a field that runs
+/// past the header is damage, not a cut.
+fn salvage_skips(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
+    options.salvage && error.kind() == crate::ErrorKind::InvalidArchive
+}
+
+/// Whether a salvaging parse goes past `error` in a header, rather than
+/// failing: damage, not cancellation, a limit or a missing password.
+fn salvage_stops(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
+    options.salvage
+        && error.kind() == crate::ErrorKind::InvalidArchive
+        && !matches!(error.root_cause(), Error::TooShort)
+}
+
+/// Records a header that doesn't parse, which a salvaging parse passes over.
+fn unreadable(control: &crate::read_control::ReadControl, offset: usize, error: &Error) {
+    control.report_damage(
+        offset,
+        crate::HeaderDamageKind::Unreadable {
+            reason: crate::header_damage::record_reason(error),
+        },
+    );
+}
+
 fn cut_block_header(rest: &[u8], offset: usize, salvage: bool) -> Result<Truncation> {
     let Some(&[size_low, size_high]) = rest.get(5..7) else {
         let block = match rest.get(2) {

@@ -1193,6 +1193,7 @@ mod tests {
             key_cache: Arc::default(),
             truncation: None,
             skipped: Vec::new(),
+            damage: Vec::new(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1218,6 +1219,7 @@ mod tests {
             key_cache: Arc::default(),
             truncation: None,
             skipped: Vec::new(),
+            damage: Vec::new(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,
@@ -1399,6 +1401,7 @@ mod tests {
             key_cache: Arc::default(),
             truncation: None,
             skipped: Vec::new(),
+            damage: Vec::new(),
             sfx_offset: 0,
             main: MainHeader {
                 head_crc: 0,

@@ -247,6 +247,12 @@ pub enum Error {
         declared: u64,
         decoded: u64,
     },
+    /// A member's stream decodes to more than its declared size. Reported
+    /// only under `ArchiveReadOptions::salvage`, after the member's declared
+    /// bytes were delivered; otherwise the member fails as invalid data.
+    MemberRanPastDeclaredSize {
+        declared: u64,
+    },
     Codec(crate::codec::Error),
     Rar3Recovery(crate::recovery::rar3::Error),
     Rar5Recovery(crate::recovery::rar5::Error),
@@ -390,6 +396,10 @@ impl std::fmt::Display for Error {
             Self::MemberEndedEarly { declared, decoded } => write!(
                 f,
                 "its data ends after {decoded} of its declared {declared} bytes, though what is there matches its checksum"
+            ),
+            Self::MemberRanPastDeclaredSize { declared } => write!(
+                f,
+                "its data runs past its declared {declared} bytes; only those were delivered"
             ),
             Self::Codec(error) => write!(f, "{error}"),
             Self::Rar3Recovery(error) => write!(f, "{error}"),
@@ -549,6 +559,7 @@ impl Error {
             | Self::MissingVolume
             | Self::VolumeOutOfOrder
             | Self::MemberEndedEarly { .. }
+            | Self::MemberRanPastDeclaredSize { .. }
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)

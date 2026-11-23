@@ -626,6 +626,12 @@ pub(crate) struct ReaderState<B: Budget> {
     // to the length it did produce. Its output and history are kept, and the
     // member's checksum decides whether it is whole.
     ended_early: Option<usize>,
+    // Under salvage: set when the last member's stream went on past its
+    // declared size, which was all it delivered.
+    ran_past: bool,
+    // Under salvage: what a buffered member that failed decoded before the
+    // failure, up to the first filter it couldn't apply.
+    salvaged: Option<Buffer<u8, B>>,
 }
 
 impl<B: Budget> ReaderState<B> {
@@ -642,6 +648,8 @@ impl<B: Budget> ReaderState<B> {
             streamed_history: None,
             history_window: 0,
             ended_early: None,
+            ran_past: false,
+            salvaged: None,
         }
     }
 
@@ -649,6 +657,29 @@ impl<B: Budget> ReaderState<B> {
     /// declared size.
     pub(crate) fn ended_early(&self) -> Option<usize> {
         self.ended_early
+    }
+
+    /// Whether the last member's stream went on past its declared size,
+    /// which salvage lets it stop at.
+    pub(crate) fn ran_past(&self) -> bool {
+        self.ran_past
+    }
+
+    /// What a buffered member that failed under salvage decoded first.
+    pub(crate) fn take_salvaged(&mut self) -> Option<Buffer<u8, B>> {
+        self.salvaged.take()
+    }
+
+    /// A stream that goes on past the declared size fails the member,
+    /// unless salvaging, which stops there and remembers it.
+    fn note_past_declared(&mut self, past: Result<()>) -> Result<()> {
+        match past {
+            Err(error) if error == PAST_DECLARED && self.read_control.salvage() => {
+                self.ran_past = true;
+                Ok(())
+            }
+            past => past,
+        }
     }
 
     fn flatten_streamed_history(&mut self, dictionary_size: usize) -> Result<()> {
@@ -718,6 +749,8 @@ impl<B: Budget> ReaderState<B> {
             },
             streamed_history: None,
             ended_early: self.ended_early,
+            ran_past: self.ran_past,
+            salvaged: None,
         })
     }
 
@@ -858,6 +891,8 @@ impl<B: Budget> ReaderState<B> {
         history: HistoryRetention,
     ) -> Result<Buffer<u8, B>> {
         self.ended_early = None;
+        self.ran_past = false;
+        self.salvaged = None;
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -876,132 +911,154 @@ impl<B: Budget> ReaderState<B> {
         let mut literals = [0; LITERAL_BURST];
         let mut overrun = None;
 
-        loop {
-            let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
-            let payload = &*block.payload;
-            let mut payload_bit_pos = 0;
-            if block.header.has_tables {
-                let (lengths, table_bits) = read_table_lengths_with_allowance(
-                    payload,
-                    algorithm_version,
-                    &block.payload.allowance(),
-                )?;
-                self.tables = Some(ReaderTables::from_lengths(
-                    &lengths,
-                    &block.payload.allowance(),
-                )?);
-                payload_bit_pos = table_bits;
-            }
-            let tables = self
-                .tables
-                .take()
-                .ok_or(Error::InvalidData("RAR 5 block reuses missing tables"))?;
-            let mut bits = BitReader::at(payload, payload_bit_pos);
-            let payload_bits = block.header.payload_bits;
+        let blocks = (|| -> Result<()> {
+            loop {
+                let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
+                let payload = &*block.payload;
+                let mut payload_bit_pos = 0;
+                if block.header.has_tables {
+                    let (lengths, table_bits) = read_table_lengths_with_allowance(
+                        payload,
+                        algorithm_version,
+                        &block.payload.allowance(),
+                    )?;
+                    self.tables = Some(ReaderTables::from_lengths(
+                        &lengths,
+                        &block.payload.allowance(),
+                    )?);
+                    payload_bit_pos = table_bits;
+                }
+                let tables = self
+                    .tables
+                    .take()
+                    .ok_or(Error::InvalidData("RAR 5 block reuses missing tables"))?;
+                let mut bits = BitReader::at(payload, payload_bit_pos);
+                let payload_bits = block.header.payload_bits;
 
-            let mut poller = self.read_control.poller();
-            while bits.position() < payload_bits && output.len() < output_size {
-                poller.check_codec(output.len())?;
-                let symbol = tables.main.decode(&mut bits)?;
-                match symbol {
-                    0..=255 => {
-                        output.try_push(symbol as u8)?;
-                        let room = (output_size - output.len()).min(LITERAL_BURST);
-                        let count =
-                            bits.literal_burst(&tables.main, payload_bits, &mut literals[..room]);
-                        if count != 0 {
-                            output
-                                .extend_from_slice(&literals[..count])
-                                .map_err(Into::into)?;
+                let mut poller = self.read_control.poller();
+                while bits.position() < payload_bits && output.len() < output_size {
+                    poller.check_codec(output.len())?;
+                    let symbol = tables.main.decode(&mut bits)?;
+                    match symbol {
+                        0..=255 => {
+                            output.try_push(symbol as u8)?;
+                            let room = (output_size - output.len()).min(LITERAL_BURST);
+                            let count = bits.literal_burst(
+                                &tables.main,
+                                payload_bits,
+                                &mut literals[..room],
+                            );
+                            if count != 0 {
+                                output
+                                    .extend_from_slice(&literals[..count])
+                                    .map_err(Into::into)?;
+                            }
                         }
-                    }
-                    256 if mode.uses_lz() => {
-                        filters.try_push(read_filter(&mut bits, output.len())?)?;
-                    }
-                    257 if mode.uses_lz() => {
-                        if self.last_length != 0 {
+                        256 if mode.uses_lz() => {
+                            filters.try_push(read_filter(&mut bits, output.len())?)?;
+                        }
+                        257 if mode.uses_lz() => {
+                            if self.last_length != 0 {
+                                overrun = self.copy_match(
+                                    &mut output,
+                                    self.reps[0],
+                                    self.last_length,
+                                    output_size,
+                                    dictionary_size,
+                                )?;
+                            }
+                        }
+                        258..=261 if mode.uses_lz() => {
+                            let rep_index = symbol - 258;
+                            let distance = self.reps[rep_index];
+                            if distance == 0 {
+                                return Err(Error::InvalidData(
+                                    "RAR 5 repeat distance is not initialized",
+                                ));
+                            }
+                            let length_slot = tables.length.decode(&mut bits)?;
+                            let length_extra =
+                                bits.read_bits(length_slot_extra_bits(length_slot))?;
+                            // The length table has 44 symbols and read_bits limits
+                            // the extra value to this slot's declared width.
+                            let length = length_from_slot_parts(length_slot, length_extra);
+                            self.reps[..=rep_index].rotate_right(1);
+                            self.reps[0] = distance;
+                            self.last_length = length;
                             overrun = self.copy_match(
                                 &mut output,
-                                self.reps[0],
-                                self.last_length,
+                                distance,
+                                length,
                                 output_size,
                                 dictionary_size,
                             )?;
                         }
-                    }
-                    258..=261 if mode.uses_lz() => {
-                        let rep_index = symbol - 258;
-                        let distance = self.reps[rep_index];
-                        if distance == 0 {
+                        262.. if mode.uses_lz() => {
+                            let length_slot = symbol - 262;
+                            let length_extra =
+                                bits.read_bits(length_slot_extra_bits(length_slot))?;
+                            // Main symbols end at slot 43 and read_bits limits the
+                            // extra value to this slot's declared width.
+                            let mut length = length_from_slot_parts(length_slot, length_extra);
+                            let distance_slot = tables.distance.decode(&mut bits)?;
+                            let distance_bit_count = distance_slot_bit_count(distance_slot)?;
+                            let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
+                                let high = bits.read_wide_bits(distance_bit_count - 4)?;
+                                let low = tables.align.decode(&mut bits)? as u64;
+                                (high << 4) | low
+                            } else {
+                                bits.read_wide_bits(distance_bit_count)?
+                            };
+                            // distance_slot_bit_count rejected slots above 79 and
+                            // the extra value was read at exactly that width.
+                            let distance = distance_from_slot_parts(
+                                distance_slot,
+                                distance_bit_count,
+                                distance_extra,
+                            );
+                            length += length_bonus(distance);
+                            self.reps.rotate_right(1);
+                            self.reps[0] = distance;
+                            self.last_length = length;
+                            overrun = self.copy_match(
+                                &mut output,
+                                distance,
+                                length,
+                                output_size,
+                                dictionary_size,
+                            )?;
+                        }
+                        _ => {
                             return Err(Error::InvalidData(
-                                "RAR 5 repeat distance is not initialized",
+                                "RAR 5 literal-only decoder encountered non-literal symbol",
                             ));
                         }
-                        let length_slot = tables.length.decode(&mut bits)?;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                        // The length table has 44 symbols and read_bits limits
-                        // the extra value to this slot's declared width.
-                        let length = length_from_slot_parts(length_slot, length_extra);
-                        self.reps[..=rep_index].rotate_right(1);
-                        self.reps[0] = distance;
-                        self.last_length = length;
-                        overrun = self.copy_match(
-                            &mut output,
-                            distance,
-                            length,
-                            output_size,
-                            dictionary_size,
-                        )?;
-                    }
-                    262.. if mode.uses_lz() => {
-                        let length_slot = symbol - 262;
-                        let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
-                        // Main symbols end at slot 43 and read_bits limits the
-                        // extra value to this slot's declared width.
-                        let mut length = length_from_slot_parts(length_slot, length_extra);
-                        let distance_slot = tables.distance.decode(&mut bits)?;
-                        let distance_bit_count = distance_slot_bit_count(distance_slot)?;
-                        let distance_extra = if distance_bit_count >= 4 && tables.align_mode {
-                            let high = bits.read_wide_bits(distance_bit_count - 4)?;
-                            let low = tables.align.decode(&mut bits)? as u64;
-                            (high << 4) | low
-                        } else {
-                            bits.read_wide_bits(distance_bit_count)?
-                        };
-                        // distance_slot_bit_count rejected slots above 79 and
-                        // the extra value was read at exactly that width.
-                        let distance = distance_from_slot_parts(
-                            distance_slot,
-                            distance_bit_count,
-                            distance_extra,
-                        );
-                        length += length_bonus(distance);
-                        self.reps.rotate_right(1);
-                        self.reps[0] = distance;
-                        self.last_length = length;
-                        overrun = self.copy_match(
-                            &mut output,
-                            distance,
-                            length,
-                            output_size,
-                            dictionary_size,
-                        )?;
-                    }
-                    _ => {
-                        return Err(Error::InvalidData(
-                            "RAR 5 literal-only decoder encountered non-literal symbol",
-                        ));
                     }
                 }
-            }
 
-            if output.len() >= output_size {
-                refuse_stream_past_declared(&tables, bits, payload_bits)?;
+                if output.len() >= output_size {
+                    let past = refuse_stream_past_declared(&tables, bits, payload_bits);
+                    self.note_past_declared(past)?;
+                    self.tables = Some(tables);
+                    break;
+                }
+                self.tables = Some(tables);
+                if block.header.is_last {
+                    break;
+                }
             }
-            self.tables = Some(tables);
-            if block.header.is_last || output.len() >= output_size {
-                break;
+            Ok(())
+        })();
+        if let Err(error) = blocks {
+            if self.read_control.salvage() {
+                self.salvaged = Some(salvaged_prefix(
+                    output,
+                    &filters,
+                    &self.read_control,
+                    &allowance,
+                ));
             }
+            return Err(error);
         }
 
         // The loop ends at the declared size or at the stream's last block.
@@ -1101,6 +1158,7 @@ impl<B: Budget> ReaderState<B> {
         checked: bool,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         self.ended_early = None;
+        self.ran_past = false;
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -1157,13 +1215,21 @@ impl<B: Budget> ReaderState<B> {
                 return self.finish_stream(output, &mut sink);
             }
         }
-        self.decode_blocks(
+        let decoded = self.decode_blocks(
             input,
             algorithm_version,
             &mut output,
             &mut sink,
             &mut filters,
-        )?;
+        );
+        if let Err(error) = decoded {
+            if self.read_control.salvage() && matches!(error, StreamDecodeError::Decode(_)) {
+                // What decoded before the failure, short of a filter's
+                // block that never completed.
+                let _ = output.flush(&mut sink);
+            }
+            return Err(error);
+        }
         self.finish_stream(output, &mut sink)
     }
 
@@ -1296,10 +1362,13 @@ impl<B: Budget> ReaderState<B> {
             }
 
             if output.written() >= output_size {
-                refuse_stream_past_declared(&tables, bits, payload_bits)?;
+                let past = refuse_stream_past_declared(&tables, bits, payload_bits);
+                self.note_past_declared(past)?;
+                self.tables = Some(tables);
+                return Ok(());
             }
             self.tables = Some(tables);
-            if block.header.is_last || output.written() >= output_size {
+            if block.header.is_last {
                 return Ok(());
             }
         }
@@ -2419,6 +2488,41 @@ fn apply_filters_with_control(
 ) -> Result<()> {
     apply_filters_with_allowance(output, filters, control, &Allowance::default())
 }
+/// The part of a failed member's raw output that is final: up to the first
+/// filter the output doesn't cover, with the filters before it applied. A
+/// filter that fails leaves its block as decoded.
+fn salvaged_prefix<B: Budget>(
+    mut output: Buffer<u8, B>,
+    filters: &[PendingFilter],
+    control: &crate::read_control::ReadControl,
+    allowance: &B,
+) -> Buffer<u8, B> {
+    let ends_by = |filter: &PendingFilter, len: usize| {
+        filter
+            .start
+            .checked_add(filter.length)
+            .is_some_and(|end| end <= len)
+    };
+    let len = output.len();
+    let cut = filters
+        .iter()
+        .filter(|filter| !ends_by(filter, len))
+        .map(|filter| filter.start)
+        .min()
+        .unwrap_or(len)
+        .min(len);
+    output.truncate(cut);
+    for filter in filters.iter().filter(|filter| ends_by(filter, cut)) {
+        let _ = apply_filters_with_allowance(
+            &mut output,
+            std::slice::from_ref(filter),
+            control,
+            allowance,
+        );
+    }
+    output
+}
+
 fn apply_filters_with_allowance<B: Budget>(
     output: &mut [u8],
     filters: &[PendingFilter],
