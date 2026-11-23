@@ -7506,6 +7506,12 @@ mod tests {
                         format!("{target:?}, password {}, solid {solid}", password.is_some());
                     let mut options = super::WriterOptions::new(target, FeatureSet::default());
                     options.features.solid = solid;
+                    // The packed form's charge does not depend on the parse, so
+                    // RAR 2.0 codes greedily, not by the default's slower
+                    // shortest path.
+                    if target == ArchiveVersion::Rar20 {
+                        options.compression_level = Some(2);
+                    }
                     let entries: Vec<_> = datas
                         .iter()
                         .enumerate()
