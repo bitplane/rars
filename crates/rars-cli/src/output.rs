@@ -128,6 +128,57 @@ fn early_metadata(meta: &ExtractedEntryMeta) -> Option<EarlyMetadata> {
     Some((modified, mode))
 }
 
+/// Whether creating a file in one directory with given permission bits
+/// gives it exactly those bits, for each set of bits a file there was created
+/// with: the umask or a default ACL may clear some. Learnt from the first file
+/// created with each, so the others need no change when they are kept. The
+/// CLI never changes its umask.
+#[derive(Clone)]
+pub(crate) struct CreatedModes(std::sync::Arc<[std::sync::atomic::AtomicU8]>);
+
+impl Default for CreatedModes {
+    fn default() -> Self {
+        Self((0..=0o7777).map(|_| Default::default()).collect())
+    }
+}
+
+impl CreatedModes {
+    // Not known yet is 0, as each starts.
+    const KEPT: u8 = 1;
+    const CHANGED: u8 = 2;
+
+    /// Whether `file`, created here with the permission bits `mode` and not
+    /// changed since, has them.
+    #[cfg(unix)]
+    fn kept(&self, file: &fs::File, mode: u32) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+        let Some(known) = self.0.get(mode as usize) else {
+            return false;
+        };
+        match known.load(Ordering::Relaxed) {
+            Self::KEPT => true,
+            Self::CHANGED => false,
+            _ => {
+                let Ok(metadata) = file.metadata() else {
+                    return false;
+                };
+                let kept = metadata.permissions().mode() & 0o7777 == mode;
+                known.store(
+                    if kept { Self::KEPT } else { Self::CHANGED },
+                    Ordering::Relaxed,
+                );
+                kept
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kept(&self, _file: &fs::File, _mode: u32) -> bool {
+        false
+    }
+}
+
 /// A staged file, created and finished on whichever thread writes it. It is
 /// created on its first write or flush, or as it is dropped, so the thread
 /// that opens it pays for no system call. As it is closed it takes its early
@@ -137,21 +188,22 @@ pub(crate) struct StagedFile {
     file: Result<fs::File, Option<(rars::output_tree::FileDir, std::ffi::OsString)>>,
     early: Option<EarlyMetadata>,
     set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The permission bits it is created with: its member's, when known.
+    create_mode: u32,
+    created_modes: CreatedModes,
 }
 
 impl StagedFile {
-    /// A file created already.
+    /// A file created now as `name` in `dir`.
     pub(crate) fn new(
-        file: fs::File,
+        dir: rars::output_tree::FileDir,
+        name: std::ffi::OsString,
         meta: &ExtractedEntryMeta,
-    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
-        let set = std::sync::Arc::default();
-        let staged = Self {
-            file: Ok(file),
-            early: early_metadata(meta),
-            set: std::sync::Arc::clone(&set),
-        };
-        (staged, set)
+        created_modes: CreatedModes,
+    ) -> std::io::Result<(Self, std::sync::Arc<std::sync::atomic::AtomicBool>)> {
+        let (mut staged, set) = Self::deferred(dir, name, meta, created_modes);
+        staged.file()?;
+        Ok((staged, set))
     }
 
     /// A file to create as `name` in `dir` once it is first used.
@@ -159,12 +211,16 @@ impl StagedFile {
         dir: rars::output_tree::FileDir,
         name: std::ffi::OsString,
         meta: &ExtractedEntryMeta,
+        created_modes: CreatedModes,
     ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let set = std::sync::Arc::default();
+        let early = early_metadata(meta);
         let staged = Self {
             file: Err(Some((dir, name))),
-            early: early_metadata(meta),
+            early,
             set: std::sync::Arc::clone(&set),
+            create_mode: early.and_then(|(_, mode)| mode).unwrap_or(0o666),
+            created_modes,
         };
         (staged, set)
     }
@@ -174,7 +230,7 @@ impl StagedFile {
             let (dir, name) = pending
                 .take()
                 .ok_or_else(|| std::io::Error::other("the staged file could not be created"))?;
-            self.file = Ok(dir.create_file(&name)?);
+            self.file = Ok(dir.create_file(&name, self.create_mode)?);
         }
         match &mut self.file {
             Ok(file) => Ok(file),
@@ -200,6 +256,8 @@ impl std::io::Write for StagedFile {
 impl Drop for StagedFile {
     fn drop(&mut self) {
         let early = self.early;
+        let create_mode = self.create_mode;
+        let created_modes = self.created_modes.clone();
         // An empty member nothing flushed is still a file.
         let Ok(file) = self.file() else {
             return;
@@ -211,7 +269,9 @@ impl Drop for StagedFile {
             if let Some(modified) = modified {
                 file.set_modified(modified)?;
             }
-            if let Some(mode) = mode {
+            // Created with its mode, it keeps it unless the umask cleared some.
+            let kept = |mode| mode == create_mode && created_modes.kept(file, mode);
+            if let Some(mode) = mode.filter(|&mode| !kept(mode)) {
                 set_file_mode(file, mode)?;
             }
             std::io::Result::Ok(())
@@ -449,6 +509,43 @@ mod tests {
 
     fn scratch(name: &str) -> crate::scratch::Scratch {
         crate::scratch::case(&format!("rars-output-{name}"))
+    }
+
+    /// Staged files are created with their member's permission bits. Each
+    /// ends with exactly those bits, whether the umask kept them, so that
+    /// nothing changes them after, or cleared some, so that they are set.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    #[test]
+    fn staged_files_end_with_their_members_mode_whatever_the_umask_clears() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("created-modes");
+        let mut tree = rars::output_tree::OutputTree::open(&root).unwrap().unwrap();
+        let dir = tree.file_dir(std::path::Path::new("files")).unwrap();
+        let created_modes = super::CreatedModes::default();
+        let modes = [
+            0o600, 0o644, 0o777, 0o755, 0o664, 0o600, 0o777, 0o644, 0o400,
+        ];
+        for (index, mode) in modes.into_iter().enumerate() {
+            let name = std::ffi::OsString::from(index.to_string());
+            let meta =
+                ExtractedEntryMeta::new(b"member".to_vec(), None, 0o100000 | mode as u64, false)
+                    .with_attr_source(rars::AttrSource::Unix);
+            let (mut file, set) = if index % 2 == 0 {
+                super::StagedFile::deferred(dir.clone(), name, &meta, created_modes.clone())
+            } else {
+                super::StagedFile::new(dir.clone(), name, &meta, created_modes.clone()).unwrap()
+            };
+            file.write_all(b"data").unwrap();
+            drop(file);
+            assert!(set.load(std::sync::atomic::Ordering::Acquire), "{mode:o}");
+            let path = root.join("files").join(index.to_string());
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
+                mode,
+                "{index}: {mode:o}"
+            );
+        }
     }
 
     #[test]

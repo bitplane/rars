@@ -1093,7 +1093,7 @@ impl Archive {
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::parse_budget::ParseBudget::new(options);
-        let mut file = budget.control.reader(file);
+        let mut file = crate::io_util::ReadAhead::new(budget.control.reader(file));
         let marker = read_block_header_at(&mut file, file_len, sfx_offset, 0, &mut budget)?;
         if marker.head_type != MARK_HEAD || marker.head_size != RAR15_SIGNATURE.len() as u16 {
             return Err(Error::InvalidHeader("RAR 1.5 marker block is invalid"));

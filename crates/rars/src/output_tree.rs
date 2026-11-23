@@ -86,17 +86,22 @@ mod imp {
     pub struct FileDir(Arc<OwnedFd>);
 
     impl FileDir {
-        /// Creates a new file called `name`. An existing entry of any kind
-        /// fails with `AlreadyExists`.
-        pub fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
-            create_file_at(self.0.as_fd(), name)
+        /// Creates a new file called `name` with the permission bits `mode`,
+        /// less what the umask clears. An existing entry of any kind fails
+        /// with `AlreadyExists`.
+        pub fn create_file(&self, name: &OsStr, mode: u32) -> std::io::Result<std::fs::File> {
+            create_file_at(self.0.as_fd(), name, mode)
         }
     }
 
-    fn create_file_at(parent: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<std::fs::File> {
+    fn create_file_at(
+        parent: BorrowedFd<'_>,
+        name: &OsStr,
+        mode: u32,
+    ) -> std::io::Result<std::fs::File> {
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let file = rustix::fs::openat(parent, name, flags, Mode::from_raw_mode(0o666))?;
+        let file = rustix::fs::openat(parent, name, flags, Mode::from_raw_mode(mode as _))?;
         Ok(std::fs::File::from(file))
     }
 
@@ -351,11 +356,28 @@ mod imp {
 
         /// What `relative` is, refusing a symlink on the way to it.
         pub fn lstat(&mut self, relative: &Path) -> crate::Result<TreeEntry> {
+            self.lstat_with(relative, false)
+        }
+
+        /// As [`Self::lstat`], but [`TreeEntry::Missing`] without looking
+        /// when a walk here created the directory holding `relative`. Nothing
+        /// was there before this run, so what is there now was put there
+        /// during it: by this run, or by something racing it that only a
+        /// publication refusing to follow or replace it keeps out.
+        pub fn lstat_unless_created(&mut self, relative: &Path) -> crate::Result<TreeEntry> {
+            self.lstat_with(relative, true)
+        }
+
+        fn lstat_with(&mut self, relative: &Path, skip_created: bool) -> crate::Result<TreeEntry> {
             let (parts, name) = split(relative)?;
-            let Some((parent, _)) = self.dir(&parts, false)? else {
+            let Some((parent, parent_identity)) = self.walk(&parts, false)? else {
                 return Ok(TreeEntry::Missing);
             };
-            let Some(stat) = lstat_at(parent, name)? else {
+            let (parent, parent_identity) = (Arc::clone(parent), *parent_identity);
+            if skip_created && self.created.contains(&parent_identity) {
+                return Ok(TreeEntry::Missing);
+            }
+            let Some(stat) = lstat_at(parent.as_fd(), name)? else {
                 return Ok(TreeEntry::Missing);
             };
             let file_type = FileType::from_raw_mode(stat.st_mode as _);
@@ -407,7 +429,7 @@ mod imp {
         pub fn create_file(&mut self, relative: &Path) -> crate::Result<std::fs::File> {
             let (parts, name) = split(relative)?;
             let (parent, _) = self.dir(&parts, true)?.expect("created parents exist");
-            Ok(create_file_at(parent, name)?)
+            Ok(create_file_at(parent, name, 0o666)?)
         }
     }
 
@@ -506,7 +528,7 @@ mod unsupported {
     pub struct FileDir(std::convert::Infallible);
 
     impl FileDir {
-        pub fn create_file(&self, _name: &OsStr) -> std::io::Result<std::fs::File> {
+        pub fn create_file(&self, _name: &OsStr, _mode: u32) -> std::io::Result<std::fs::File> {
             match self.0 {}
         }
 
@@ -554,6 +576,10 @@ mod unsupported {
         }
 
         pub fn lstat(&mut self, _relative: &Path) -> crate::Result<TreeEntry> {
+            match self.0 {}
+        }
+
+        pub fn lstat_unless_created(&mut self, _relative: &Path) -> crate::Result<TreeEntry> {
             match self.0 {}
         }
 
@@ -646,7 +672,7 @@ mod tests {
         let files = storage.file_dir(Path::new("files")).unwrap();
         let mut renames = RenameCounters::default();
         let mut publish = |tree: &mut OutputTree, name: &str, to: &str, overwrite| {
-            let mut file = files.create_file(OsStr::new(name)).unwrap();
+            let mut file = files.create_file(OsStr::new(name), 0o666).unwrap();
             file.write_all(name.as_bytes()).unwrap();
             drop(file);
             files.publish(
@@ -695,6 +721,32 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("a/b")).unwrap();
         publish(&mut tree, "3", "a/b/later", OverwritePolicy::Never).unwrap();
         assert_eq!(fs::read(scratch.join("moved/later")).unwrap(), b"3");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+
+        // In a directory a walk made, only a real lstat looks.
+        tree.create_dirs(Path::new("m/n")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("m/n/planted")).unwrap();
+        let planted = Path::new("m/n/planted");
+        assert_eq!(tree.lstat(planted).unwrap(), TreeEntry::Symlink);
+        assert_eq!(
+            tree.lstat_unless_created(planted).unwrap(),
+            TreeEntry::Missing
+        );
+        assert!(matches!(
+            publish(&mut tree, "p", "m/n/planted", OverwritePolicy::Never),
+            Err(crate::Error::Io(error)) if error.kind == std::io::ErrorKind::AlreadyExists
+        ));
+        fs::remove_file(root.join("m/n/planted")).unwrap();
+        fs::create_dir(root.join("kept")).unwrap();
+        fs::write(root.join("kept/file"), b"kept").unwrap();
+        assert!(matches!(
+            tree.lstat_unless_created(Path::new("kept/file")).unwrap(),
+            TreeEntry::Other(_)
+        ));
+        assert_eq!(
+            tree.lstat_unless_created(Path::new("link-free")).unwrap(),
+            TreeEntry::Missing
+        );
         assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 }

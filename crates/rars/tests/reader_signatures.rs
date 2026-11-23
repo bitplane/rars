@@ -223,16 +223,19 @@ fn seekable_legacy_parser_retains_historical_protection_headers() {
 }
 
 #[test]
-fn source_failure_while_rereading_legacy_main_header_stays_an_io_error() {
+fn source_failure_while_reading_legacy_main_header_stays_an_io_error() {
     struct Reader {
         bytes: std::io::Cursor<Vec<u8>>,
         main_reads: usize,
     }
     impl std::io::Read for Reader {
         fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-            if self.bytes.position() == 7 {
+            // The main header starts at byte 7. Detecting the signature reads
+            // it once; the next read that reaches it is the parser's.
+            let start = self.bytes.position();
+            if start <= 7 && start + output.len() as u64 > 7 {
                 self.main_reads += 1;
-                if self.main_reads == 3 {
+                if self.main_reads == 2 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::PermissionDenied,
                         "main header read failed",
