@@ -2158,6 +2158,23 @@ fn match_length_and_offset_slots_have_no_gaps() {
 }
 
 #[test]
+fn every_offset_lands_in_the_slot_that_covers_it() {
+    let mut slot = 0;
+    for offset in 1..=super::MAX_HISTORY {
+        let adjusted = offset - 1;
+        while adjusted >= super::OFFSET_BASES[slot] + (1usize << super::OFFSET_BITS[slot]) {
+            slot += 1;
+        }
+        assert_eq!(
+            super::offset_slot_for_match(offset),
+            Ok((slot, adjusted - super::OFFSET_BASES[slot])),
+            "offset {offset}"
+        );
+    }
+    assert_eq!(slot, OFFSET_COUNT - 1);
+}
+
+#[test]
 fn match_search_respects_fresh_distance_length_adjustments() {
     for distance in [0x1fff, 0x2000, 0x3ffff, 0x40000] {
         let mut input = vec![0xff; distance + 4];
