@@ -10,6 +10,7 @@ mod block_ops;
 mod blocks_ahead;
 #[cfg(feature = "write")]
 mod encoder;
+mod filter_thread;
 #[cfg(feature = "write")]
 pub use encoder::{
     encode_compressed_block, encode_literal_only, encode_lz_member, encode_lz_member_with_history,
@@ -27,6 +28,7 @@ pub(crate) use encoder::{
 pub(crate) use encoder::{
     encode_lz_member_with_options_and_progress, encode_lz_reader_to, filtered_lz_member,
 };
+pub(crate) use filter_thread::FILTER_THREAD_BYTES;
 
 use super::filters::{self, DeltaErrorMessages};
 use super::workspace::{Allowance, Budget, Buffer};
@@ -1069,8 +1071,34 @@ impl<B: Budget> ReaderState<B> {
         output_size: usize,
         dictionary_size: usize,
         solid: bool,
+        sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
+        filters: Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        self.decode_to_sink_handing_filters(
+            input,
+            algorithm_version,
+            output_size,
+            dictionary_size,
+            solid,
+            sink,
+            filters,
+            false,
+        )
+    }
+
+    /// With `checked`, the filters handed on are first refused, and the
+    /// member's end judged, exactly where the decoder's own stage would.
+    #[allow(clippy::too_many_arguments)]
+    fn decode_to_sink_handing_filters<E>(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output_size: usize,
+        dictionary_size: usize,
+        solid: bool,
         mut sink: impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
         mut filters: Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
+        checked: bool,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         self.ended_early = None;
         self.read_control.check_codec()?;
@@ -1109,6 +1137,7 @@ impl<B: Budget> ReaderState<B> {
         let mut output =
             StreamingOutput::new(history, output_size, dictionary_size, history_limit)?;
         output.stage.control = self.read_control.clone();
+        output.stage.pass_through = checked && filters.is_some();
         #[cfg(all(
             feature = "parallel",
             not(all(target_arch = "wasm32", target_os = "unknown"))
@@ -1679,7 +1708,12 @@ impl<B: Budget> StreamingOutput<B> {
             return Err(Error::InvalidData("RAR 5 filter range exceeds output").into());
         }
         match filters.as_mut() {
-            Some(filters) => filters(filter).map_err(StreamDecodeError::Sink),
+            Some(filters) => {
+                if self.stage.pass_through {
+                    self.stage.hold(filter)?;
+                }
+                filters(filter).map_err(StreamDecodeError::Sink)
+            }
             None => self.stage.hold(filter),
         }
     }
@@ -2040,6 +2074,10 @@ struct FilterStage<B: Budget = Allowance> {
     /// End of the last filter accepted.
     filtered_to: usize,
     control: crate::read_control::ReadControl,
+    /// Only keeps the books: bytes pass through as they arrive, and filters
+    /// are refused and counted complete as they would be, for a caller that
+    /// applies them elsewhere.
+    pass_through: bool,
 }
 
 impl<B: Budget> FilterStage<B> {
@@ -2051,6 +2089,7 @@ impl<B: Budget> FilterStage<B> {
             position: 0,
             filtered_to: 0,
             control: crate::read_control::ReadControl::default(),
+            pass_through: false,
         }
     }
 
@@ -2072,6 +2111,23 @@ impl<B: Budget> FilterStage<B> {
         chunk: DecodedChunk<'_>,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
+        if self.pass_through {
+            sink(chunk).map_err(StreamDecodeError::Sink)?;
+            self.position += chunk_len(chunk);
+            // As release, without the bytes: each filter that has all of its
+            // bytes counts as applied.
+            while let Some(&filter) = self.next() {
+                if filter.start + filter.length > self.position {
+                    break;
+                }
+                self.applied += 1;
+                if self.applied * 2 >= self.filters.len() {
+                    self.filters.discard_prefix(self.applied);
+                    self.applied = 0;
+                }
+            }
+            return Ok(());
+        }
         let mut chunk = chunk;
         loop {
             let Some(&next) = self.next() else {
