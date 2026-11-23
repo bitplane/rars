@@ -60,6 +60,10 @@ rustix.workspace = true
 
 # Criterion pulls in alloca, which builds C; the benches only target hosts with
 # 64-bit atomics, so targets without them skip it and need no C cross-compiler.
+[dev-dependencies]
+# Tests ask the global pool how many threads extraction can really use.
+rayon = { workspace = true }
+
 [target.'cfg(target_has_atomic = "64")'.dev-dependencies]
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
