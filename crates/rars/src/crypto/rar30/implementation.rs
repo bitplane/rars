@@ -1,7 +1,5 @@
 use super::{Error, Result};
 
-#[cfg(any(test, feature = "write"))]
-use aes::cipher::BlockCipherEncrypt;
 use aes::cipher::KeyInit;
 use aes::Aes128;
 use sha1::{Digest, Sha1 as FastSha1};
@@ -42,20 +40,8 @@ impl Rar30Cipher {
         if !data.len().is_multiple_of(16) {
             return Err(Error::UnalignedInput);
         }
-        for block in data.as_chunks_mut::<16>().0.iter_mut() {
-            self.encrypt_block(block);
-        }
+        crate::crypto::cbc_encrypt(&self.cipher, &mut self.iv, data.as_chunks_mut().0);
         Ok(())
-    }
-
-    #[cfg(any(test, feature = "write"))]
-    fn encrypt_block(&mut self, block: &mut [u8]) {
-        for (byte, iv_byte) in block.iter_mut().zip(self.iv) {
-            *byte ^= iv_byte;
-        }
-        let block: &mut [u8; 16] = block.try_into().expect("AES block size");
-        self.cipher.encrypt_block(block.into());
-        self.iv.copy_from_slice(block);
     }
 
     pub(crate) fn decrypt_block(&mut self, block: &mut [u8; 16]) {
