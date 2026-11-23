@@ -49,7 +49,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use time::{current_filetime, format_filetime_utc};
 use volumes::{
     discover_sibling_volumes, rar50_volume_part_path, sort_volume_paths, split_at_gaps,
@@ -1095,23 +1095,41 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let state = state.into_inner();
     let skipped_links = state.skipped_links;
     let skipped_unnamed = state.skipped_unnamed;
-    let outputs = state.publish()?;
+    // Publishing the last members writes them where they belong, and can
+    // fail as writing any member can.
+    let outputs = state.publish().map_err(|err| {
+        classify_rars_error(err, |err| {
+            format!(
+                "failed to write extracted entry to '{}': {err}{}",
+                out_dir.display(),
+                retry_hint(err)
+            )
+        })
+    })?;
     restore_output_metadata(&outputs).map_err(|err| {
         CliError::general(format!(
             "failed to restore extracted metadata under '{}': {err}",
             out_dir.display()
         ))
     })?;
+    // Buffered, so the listing is a few writes rather than one per entry.
+    let listed =
+        |err: std::io::Error| CliError::general(format!("failed to list extracted entries: {err}"));
+    let mut listing = std::io::BufWriter::new(std::io::stdout().lock());
     for output in &outputs {
         match output.path.strip_prefix(&out_dir) {
-            Ok(relative) if relative != output.stored => println!(
+            Ok(relative) if relative != output.stored => writeln!(
+                listing,
                 "x {} -> {}",
                 display_bytes_lossy(&output.name),
                 relative.display()
             ),
-            _ => println!("x {}", display_bytes_lossy(&output.name)),
+            _ => writeln!(listing, "x {}", display_bytes_lossy(&output.name)),
         }
+        .map_err(listed)?;
     }
+    listing.flush().map_err(listed)?;
+    drop(listing);
     if skipped_links > 0 {
         return Err(CliError::general(format!(
             "skipped {skipped_links} link(s) that would point outside '{}'",
@@ -1129,6 +1147,20 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
 }
 
 type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + 'a;
+
+/// Where files stage in a staging storage walked by descriptor.
+const STAGED_FILES: &str = "files";
+/// Where links stage in a staging storage walked by descriptor.
+const STAGED_LINKS: &str = "links";
+
+/// A file staged under a name of its own in a directory held open.
+struct Staged {
+    dir: rars::output_tree::FileDir,
+    name: std::ffi::OsString,
+    /// Whether it took its early metadata as it closed: see [`output::StagedFile`].
+    early_set: Arc<AtomicBool>,
+}
+
 type PublishReport<'a> = dyn FnMut(&ExtractedOutput) + 'a;
 
 struct ExtractOutputState<'a> {
@@ -1147,8 +1179,16 @@ struct ExtractOutputState<'a> {
     /// The output directory, walked by descriptor where the platform allows.
     out_tree: Option<OutputTree>,
     /// The staging storage, walked the same way; present only with `out_tree`.
+    /// Files stage there under names of their own in [`STAGED_FILES`], and
+    /// links under their own paths in [`STAGED_LINKS`].
     staging_tree: Option<OutputTree>,
+    /// [`STAGED_FILES`], once a file has staged there.
+    staging_files: Option<rars::output_tree::FileDir>,
+    /// Names taken in [`STAGED_FILES`].
+    staged_count: u64,
     staged_paths: Vec<PathBuf>,
+    /// For each staged path, the file staged by descriptor there.
+    staged_files: Vec<Option<Staged>>,
     hardlink_targets: HashMap<PathBuf, PathBuf>,
     staged_redirections: HashSet<PathBuf>,
     staged_directories: HashSet<FileIdentity>,
@@ -1213,7 +1253,10 @@ impl<'a> ExtractOutputState<'a> {
             staging: None,
             out_tree: None,
             staging_tree: None,
+            staging_files: None,
+            staged_count: 0,
             staged_paths: Vec::new(),
+            staged_files: Vec::new(),
             hardlink_targets: HashMap::new(),
             staged_redirections: HashSet::new(),
             staged_directories: HashSet::new(),
@@ -1260,9 +1303,8 @@ impl<'a> ExtractOutputState<'a> {
     }
 
     /// The library is done with the oldest member opened and not settled.
-    /// A verified member's output now counts as verified; a failed one's is
-    /// dropped. Members verified before it are published, as they are before
-    /// the next member is opened when members do not settle explicitly.
+    /// A verified member's output now counts as verified and is published,
+    /// so a failure to publish it is its own; a failed one's is dropped.
     /// Returns whether its open had failed.
     fn settle(&mut self, verified: bool) -> rars::Result<bool> {
         let opened = self
@@ -1290,6 +1332,7 @@ impl<'a> ExtractOutputState<'a> {
             let (path, meta) = (output.path.clone(), output.meta.clone());
             self.remember_directory_time(&path, &meta)?;
             self.settled += 1;
+            self.publish_verified()?;
         }
         Ok(false)
     }
@@ -1308,6 +1351,7 @@ impl<'a> ExtractOutputState<'a> {
         self.outputs.remove(index);
         self.archive_names.remove(index);
         let staged = self.staged_paths.remove(index);
+        self.staged_files.remove(index);
         self.hardlink_targets.remove(&staged);
         self.staged_redirections.remove(&staged);
         self.created_paths.retain(|_, path| *path != staged);
@@ -1372,24 +1416,39 @@ impl<'a> ExtractOutputState<'a> {
             self.prepare_staged_path(&destination, meta.is_directory, existing.as_ref())?;
         let (path, writer) = match &mut self.staging_tree {
             Some(tree) => {
-                let path = staging.join(&relative);
-                let writer: Box<dyn Write + Send> = if meta.is_directory {
-                    self.staged_directories.insert(tree.create_dirs(&relative)?);
-                    Box::new(std::io::sink())
+                // Each member stages under a name of its own, so only
+                // publishing it can meet another member's output.
+                let index = self.staged_count;
+                self.staged_count += 1;
+                let name = std::ffi::OsString::from(index.to_string());
+                let path = staging.join(STAGED_FILES).join(&name);
+                let (writer, staged): (Box<dyn Write + Send>, _) = if meta.is_directory {
+                    // Publishing creates it.
+                    (Box::new(std::io::sink()), None)
                 } else {
-                    // Any staged entry already there is another member's.
-                    Box::new(tree.create_file(&relative).map_err(|error| match error {
-                        rars::Error::Io(error)
-                            if error.kind == std::io::ErrorKind::AlreadyExists =>
-                        {
-                            rars::Error::InvalidHeader(
-                                "multiple archive entries map to the same output path",
-                            )
-                        }
-                        error => error,
-                    })?)
+                    let dir = match &self.staging_files {
+                        Some(dir) => dir.clone(),
+                        None => self
+                            .staging_files
+                            .insert(tree.file_dir(Path::new(STAGED_FILES))?)
+                            .clone(),
+                    };
+                    let (file, early_set) = if self.settling {
+                        // Created where it is written: the library may
+                        // write it on another thread.
+                        output::StagedFile::deferred(dir.clone(), name.clone(), meta)
+                    } else {
+                        output::StagedFile::new(dir.create_file(&name)?, meta)
+                    };
+                    let staged = Staged {
+                        dir,
+                        name,
+                        early_set,
+                    };
+                    (Box::new(file), Some(staged))
                 };
                 self.staged_paths.push(path.clone());
+                self.staged_files.push(staged);
                 (path, writer)
             }
             None => {
@@ -1453,7 +1512,10 @@ impl<'a> ExtractOutputState<'a> {
         };
         self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
-        let staging = self.prepare_staged_path(&destination, false, None)?;
+        let mut staging = self.prepare_staged_path(&destination, false, None)?;
+        if self.staging_tree.is_some() {
+            staging.push(STAGED_LINKS);
+        }
         let (path, restore_metadata) = create_link_output(
             &staging,
             &relative,
@@ -1600,6 +1662,15 @@ impl<'a> ExtractOutputState<'a> {
                 None => fs::symlink_metadata(destination).is_ok(),
             }
         {
+            // As publishing it would find, if it opened before the
+            // directory there was made.
+            if let Some(TreeEntry::Directory(identity)) = existing {
+                if self.made_here(identity) {
+                    return Err(rars::Error::InvalidHeader(
+                        "multiple archive entries map to the same output path",
+                    ));
+                }
+            }
             return Err(
                 std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists").into(),
             );
@@ -1645,14 +1716,9 @@ impl<'a> ExtractOutputState<'a> {
             ));
         }
         let staged = root.join(relative);
-        let collides = match &mut self.staging_tree {
-            // Creating the file refuses anything already staged there.
-            Some(_) if !directory => false,
-            Some(tree) => match tree.lstat(relative)? {
-                TreeEntry::Missing => false,
-                TreeEntry::Directory(identity) => self.staged_directories.contains(&identity),
-                TreeEntry::Symlink | TreeEntry::Other(_) => true,
-            },
+        let collides = match &self.staging_tree {
+            // Nothing stages at its own path: publishing finds any collision.
+            Some(_) => false,
             None => match fs::symlink_metadata(&staged) {
                 Ok(metadata) => {
                     !metadata.is_dir()
@@ -1672,6 +1738,15 @@ impl<'a> ExtractOutputState<'a> {
         Ok(root.clone())
     }
 
+    /// Whether this run published or made the directory `identity`.
+    fn made_here(&self, identity: &FileIdentity) -> bool {
+        self.published_identities.contains(identity)
+            || self
+                .out_tree
+                .as_ref()
+                .is_some_and(|tree| tree.created(identity))
+    }
+
     /// Staged outputs are always new files; in-place ones follow the caller's policy.
     fn staged_policy(&self) -> OverwritePolicy {
         if self.in_place {
@@ -1686,6 +1761,7 @@ impl<'a> ExtractOutputState<'a> {
             self.staged_directories.insert(FileIdentity::of(path)?);
         }
         self.staged_paths.push(path.to_path_buf());
+        self.staged_files.push(None);
         Ok(())
     }
 
@@ -1751,8 +1827,7 @@ impl<'a> ExtractOutputState<'a> {
     /// rename it into place.
     fn publish_by_descriptor(&mut self, staged: &Path, relative: &Path) -> rars::Result<bool> {
         let repeats_allowed = self.repeats_allowed();
-        let (Some(out_tree), Some(staging_tree)) = (&mut self.out_tree, &mut self.staging_tree)
-        else {
+        let (Some(out_tree), Some(_)) = (&mut self.out_tree, &self.staging_tree) else {
             return Ok(false);
         };
         if self.staged_redirections.contains(staged) {
@@ -1765,36 +1840,71 @@ impl<'a> ExtractOutputState<'a> {
         // Under `Never` an existing file already stops the rename, so only
         // `Always` needs to know which files this run wrote.
         let tracked = !repeats_allowed && self.overwrite == OverwritePolicy::Always;
-        if tracked || (directory && !repeats_allowed) {
+        let repeated = || {
+            Err(rars::Error::InvalidHeader(
+                "multiple archive entries map to the same output path",
+            ))
+        };
+        if directory {
+            // Creating a directory already there changes nothing.
+            let identity = match out_tree.create_dirs(relative) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    let ours = |identity| self.published_identities.contains(&identity);
+                    if !repeats_allowed
+                        && out_tree
+                            .identity_of(relative)
+                            .is_ok_and(|identity| identity.is_some_and(ours))
+                    {
+                        return repeated();
+                    }
+                    return Err(refuse(error));
+                }
+            };
+            if !self.published_identities.insert(identity) && !repeats_allowed {
+                return repeated();
+            }
+            return Ok(true);
+        }
+        if tracked {
             if let Some(identity) = out_tree.identity_of(relative).map_err(refuse)? {
-                if self.published_identities.contains(&identity) {
-                    return Err(rars::Error::InvalidHeader(
-                        "multiple archive entries map to the same output path",
-                    ));
+                if self.published_identities.contains(&identity) || out_tree.created(&identity) {
+                    return repeated();
                 }
             }
         }
-        if directory {
-            let identity = out_tree.create_dirs(relative).map_err(refuse)?;
-            self.published_identities.insert(identity);
-            return Ok(true);
-        }
+        let Some(staged) = &self.staged_files[self.published] else {
+            return Ok(false);
+        };
         let early = output::early_file_metadata(output);
-        if let Some((modified, mode)) = early {
-            staging_tree.set_metadata(relative, modified, mode)?;
+        if let (Some((modified, mode)), false) = (early, staged.early_set.load(Ordering::Acquire)) {
+            staged.dir.set_metadata(&staged.name, modified, mode)?;
         }
         let destination = self.out_dir.join(relative);
-        let Some(published) = staging_tree
+        let published = staged
+            .dir
             .publish(
-                relative,
+                &staged.name,
                 out_tree,
                 relative,
                 &destination,
                 self.overwrite,
                 &mut self.renames,
             )
-            .map_err(refuse)?
-        else {
+            .map_err(|error| match error {
+                // Opening it refused anything already there, so another
+                // member was published there since.
+                rars::Error::Io(error)
+                    if error.kind == std::io::ErrorKind::AlreadyExists
+                        && self.overwrite == OverwritePolicy::Never =>
+                {
+                    rars::Error::InvalidHeader(
+                        "multiple archive entries map to the same output path",
+                    )
+                }
+                error => refuse(error),
+            })?;
+        let Some(published) = published else {
             return Ok(false);
         };
         output.path = published;
@@ -1898,6 +2008,7 @@ impl<'a> ExtractOutputState<'a> {
                 .staged_paths
                 .pop()
                 .expect("every output has a staged path");
+            self.staged_files.pop();
             self.hardlink_targets.remove(&staged);
             self.staged_redirections.remove(&staged);
             self.created_paths.retain(|_, path| *path != staged);

@@ -476,3 +476,98 @@ fn a_refused_output_among_concurrent_large_members_ends_the_run_there() {
     expected.sort();
     assert_eq!(run.3, expected, "{}", run.2);
 }
+
+/// Files are created, written, given their times and modes and closed where
+/// they are written, empty ones included, and keep all of it once published.
+#[test]
+fn files_written_on_workers_keep_their_contents_times_and_modes() {
+    let root = scratch::case("extraction-worker-metadata");
+    let archive = root.join("archive.rar");
+    let seconds = 1_600_000_000;
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let mut sources = Vec::new();
+    for index in 0..12u32 {
+        let name = format!("dir{}/file{index}.txt", index % 3);
+        let data = if index % 4 == 0 {
+            Vec::new()
+        } else {
+            format!("contents of member {index}; ")
+                .repeat(index as usize * 50)
+                .into_bytes()
+        };
+        builder
+            .add_bytes(
+                name.clone().into_bytes(),
+                data.clone(),
+                Some(rars::Timestamp::from_unix_seconds(seconds)),
+                Some(0o100640),
+            )
+            .unwrap();
+        sources.push((name, data));
+    }
+    fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+
+    let run = extract_at_thread_counts(&archive, &root, &[], |_| {});
+    assert_eq!(run.0, Some(0), "{}", run.2);
+    assert_eq!(run.3, expected_files(&sources, &[]));
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds as u64);
+    for threads in ["1", "2", "8"] {
+        for (name, _) in &sources {
+            let path = root.join(format!("out-{threads}")).join(name);
+            let metadata = fs::metadata(&path).unwrap();
+            assert_eq!(metadata.modified().unwrap(), modified, "{}", path.display());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    metadata.permissions().mode() & 0o777,
+                    0o640,
+                    "{}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+/// A file member landing on a directory an earlier member's path made is
+/// refused as another member's output, whether the earlier member was
+/// published before it opened or only after, so every thread count reports
+/// it alike; the earlier member is kept and none after it is published.
+/// Where outputs are checked by path instead, a member that opens after
+/// the directory was made still finds only an existing file.
+#[cfg(unix)]
+#[test]
+fn a_file_landing_on_an_earlier_members_directory_is_refused_alike() {
+    for overwrite in ["--overwrite=never", "--overwrite=always"] {
+        let root = scratch::case("extraction-file-over-made-directory");
+        let archive = root.join("archive.rar");
+        write_archive(
+            &archive,
+            ArchiveVersion::Rar50,
+            &[
+                (b"a/b/c", b"inner"),
+                (b"a/b", b"outer"),
+                (b"z.txt", b"after"),
+            ],
+        );
+        let run = extract_at_thread_counts(&archive, &root, &[overwrite], |_| {});
+        assert_ne!(run.0, Some(0), "{overwrite}: {}", run.2);
+        assert!(
+            run.2
+                .contains("multiple archive entries map to the same output path"),
+            "{overwrite}: {}",
+            run.2
+        );
+        assert_eq!(
+            run.3,
+            [
+                ("a/".to_string(), Vec::new()),
+                ("a/b/".to_string(), Vec::new()),
+                ("a/b/c".to_string(), b"inner".to_vec()),
+            ],
+            "{overwrite}: {}",
+            run.2
+        );
+    }
+}

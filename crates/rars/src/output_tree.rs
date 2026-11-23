@@ -18,10 +18,10 @@ pub enum TreeEntry {
 }
 
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-pub use imp::OutputTree;
+pub use imp::{FileDir, OutputTree};
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-pub use unsupported::OutputTree;
+pub use unsupported::{FileDir, OutputTree};
 
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 mod imp {
@@ -29,22 +29,90 @@ mod imp {
     use crate::Error;
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags, Stat, Timespec, Timestamps};
     use rustix::io::Errno;
+    use std::collections::HashSet;
     use std::ffi::{OsStr, OsString};
     use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
     use std::path::Component;
+    use std::sync::Arc;
 
     /// Directories below this depth are opened for each use instead of kept.
     const CACHED_DEPTH: usize = 32;
+    /// Walks kept at once. Extraction alternates between the member it is
+    /// opening and an earlier one it is publishing, often in different
+    /// directories, and a single walk would reopen both every time.
+    const CURSORS: usize = 2;
+
+    /// An open directory and its identity.
+    type Opened = (Arc<OwnedFd>, FileIdentity);
+
+    /// One cached walk from the root.
+    #[derive(Default)]
+    struct Cursor {
+        /// The directories of the last path walked, outermost first.
+        chain: Vec<(OsString, Opened)>,
+        /// The directory a walk deeper than the chain ended in.
+        deep: Option<Opened>,
+    }
+
+    impl Cursor {
+        /// How many of `parts` this walk already holds open.
+        fn kept(&self, parts: &[&OsStr]) -> usize {
+            self.chain
+                .iter()
+                .zip(parts)
+                .take_while(|((cached, _), part)| cached.as_os_str() == **part)
+                .count()
+        }
+
+        /// The directory this walk holds `depth` levels down, or `root`.
+        fn at<'a>(&'a self, depth: usize, root: &'a Opened) -> &'a Opened {
+            match depth.checked_sub(1) {
+                Some(index) => &self.chain[index].1,
+                None => root,
+            }
+        }
+
+        /// The directory this walk ended in, or `root`.
+        fn end<'a>(&'a self, root: &'a Opened) -> &'a Opened {
+            match &self.deep {
+                Some(deep) => deep,
+                None => self.at(self.chain.len(), root),
+            }
+        }
+    }
+
+    /// A directory new files can be created in from any thread.
+    #[derive(Clone)]
+    pub struct FileDir(Arc<OwnedFd>);
+
+    impl FileDir {
+        /// Creates a new file called `name`. An existing entry of any kind
+        /// fails with `AlreadyExists`.
+        pub fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
+            create_file_at(self.0.as_fd(), name)
+        }
+    }
+
+    fn create_file_at(parent: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<std::fs::File> {
+        let flags =
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let file = rustix::fs::openat(parent, name, flags, Mode::from_raw_mode(0o666))?;
+        Ok(std::fs::File::from(file))
+    }
 
     pub struct OutputTree {
-        root: OwnedFd,
-        root_identity: FileIdentity,
+        root: Opened,
         /// A directory no path in this tree may reach: the extraction storage.
         forbidden: Option<FileIdentity>,
-        /// The directories of the last path walked, outermost first.
-        chain: Vec<(OsString, OwnedFd)>,
-        /// The directory a walk deeper than the chain ended in.
-        deep: Option<OwnedFd>,
+        cursors: [Cursor; CURSORS],
+        /// The cursor the last walk used.
+        last: usize,
+        /// A directory the last walk found missing, until a walk may create
+        /// one: what is below it is missing too. Extraction looks up each
+        /// member's destination before the directory holding it is made.
+        missing: Vec<OsString>,
+        /// The directories walks have created.
+        created: HashSet<FileIdentity>,
     }
 
     #[allow(clippy::unnecessary_cast)]
@@ -80,6 +148,54 @@ mod imp {
             Err(Errno::NOENT) => Ok(None),
             Err(error) => Err(error.into()),
         }
+    }
+
+    fn check(forbidden: Option<FileIdentity>, identity: FileIdentity) -> crate::Result<()> {
+        if forbidden == Some(identity) {
+            return Err(conflicts_with_storage());
+        }
+        Ok(())
+    }
+
+    /// Opens one directory below `parent`, creating it first if asked, and
+    /// adding it to `created` if it did. `None` when it is missing.
+    fn open_dir(
+        forbidden: Option<FileIdentity>,
+        created: &mut HashSet<FileIdentity>,
+        parent: BorrowedFd<'_>,
+        name: &OsStr,
+        create: bool,
+    ) -> crate::Result<Option<Opened>> {
+        let made = create
+            && match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o777)) {
+                Ok(()) => true,
+                Err(Errno::EXIST) => false,
+                Err(error) => return Err(std::io::Error::from(error).into()),
+            };
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let directory = match rustix::fs::openat(parent, name, flags, Mode::empty()) {
+            Ok(directory) => directory,
+            Err(Errno::NOENT) if !create => return Ok(None),
+            Err(error @ (Errno::LOOP | Errno::NOTDIR | Errno::MLINK)) => {
+                if lstat_at(parent, name)?
+                    .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode as _).is_symlink())
+                {
+                    return Err(crosses_symlink());
+                }
+                // Below a file nothing exists yet; creating it is what fails.
+                if error == Errno::NOTDIR && !create {
+                    return Ok(None);
+                }
+                return Err(std::io::Error::from(error).into());
+            }
+            Err(error) => return Err(std::io::Error::from(error).into()),
+        };
+        let identity = identity(&rustix::fs::fstat(&directory).map_err(std::io::Error::from)?);
+        check(forbidden, identity)?;
+        if made {
+            created.insert(identity);
+        }
+        Ok(Some((Arc::new(directory), identity)))
     }
 
     /// Whether a rename failed for want of support rather than because of what is there.
@@ -128,16 +244,17 @@ mod imp {
             };
             let root_identity = identity(&rustix::fs::fstat(&root)?);
             Ok(Some(Self {
-                root,
-                root_identity,
+                root: (Arc::new(root), root_identity),
                 forbidden: None,
-                chain: Vec::new(),
-                deep: None,
+                cursors: Default::default(),
+                last: 0,
+                missing: Vec::new(),
+                created: HashSet::new(),
             }))
         }
 
         pub fn identity(&self) -> FileIdentity {
-            self.root_identity
+            self.root.1
         }
 
         /// Refuses any path in this tree that reaches `directory`.
@@ -145,84 +262,97 @@ mod imp {
             self.forbidden = Some(directory);
         }
 
+        /// Whether a walk here created the directory `identity`.
+        pub fn created(&self, identity: &FileIdentity) -> bool {
+            self.created.contains(identity)
+        }
+
         /// Drops the cached directories, after something else changed the tree.
         pub fn forget(&mut self) {
-            self.chain.clear();
-            self.deep = None;
+            self.cursors = Default::default();
+            self.missing.clear();
         }
 
         fn check(&self, identity: FileIdentity) -> crate::Result<()> {
-            if self.forbidden == Some(identity) {
-                return Err(conflicts_with_storage());
-            }
-            Ok(())
+            check(self.forbidden, identity)
         }
 
-        /// Opens one directory below `parent`, creating it first if asked. `None` when it is missing.
-        fn open_dir(
-            &self,
-            parent: BorrowedFd<'_>,
-            name: &OsStr,
+        /// The directory `parts` names and its identity. A directory a cursor
+        /// holds is used as it is, leaving what that cursor holds below it.
+        /// Any other walk moves the cursor whose end was used less recently,
+        /// starting from the longest part of the path either cursor holds, so
+        /// two walks that alternate keep a cursor each.
+        fn dir(
+            &mut self,
+            parts: &[&OsStr],
             create: bool,
-        ) -> crate::Result<Option<OwnedFd>> {
-            if create {
-                match rustix::fs::mkdirat(parent, name, Mode::from_raw_mode(0o777)) {
-                    Ok(()) | Err(Errno::EXIST) => {}
-                    Err(error) => return Err(std::io::Error::from(error).into()),
-                }
-            }
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let directory = match rustix::fs::openat(parent, name, flags, Mode::empty()) {
-                Ok(directory) => directory,
-                Err(Errno::NOENT) if !create => return Ok(None),
-                Err(error @ (Errno::LOOP | Errno::NOTDIR | Errno::MLINK)) => {
-                    if lstat_at(parent, name)?
-                        .is_some_and(|stat| FileType::from_raw_mode(stat.st_mode as _).is_symlink())
-                    {
-                        return Err(crosses_symlink());
-                    }
-                    // Below a file nothing exists yet; creating it is what fails.
-                    if error == Errno::NOTDIR && !create {
-                        return Ok(None);
-                    }
-                    return Err(std::io::Error::from(error).into());
-                }
-                Err(error) => return Err(std::io::Error::from(error).into()),
-            };
-            self.check(identity(
-                &rustix::fs::fstat(&directory).map_err(std::io::Error::from)?,
-            ))?;
-            Ok(Some(directory))
+        ) -> crate::Result<Option<(BorrowedFd<'_>, FileIdentity)>> {
+            Ok(self
+                .walk(parts, create)?
+                .map(|(directory, identity)| (directory.as_fd(), *identity)))
         }
 
-        /// The directory `parts` names, walking from the deepest cached one.
-        fn dir(&mut self, parts: &[&OsStr], create: bool) -> crate::Result<Option<BorrowedFd<'_>>> {
-            let kept = self
-                .chain
-                .iter()
-                .zip(parts)
-                .take_while(|((cached, _), part)| cached.as_os_str() == **part)
-                .count();
-            self.chain.truncate(kept);
-            self.deep = None;
+        /// As [`Self::dir`], keeping the directory's handle.
+        fn walk(&mut self, parts: &[&OsStr], create: bool) -> crate::Result<Option<&Opened>> {
+            if !create
+                && !self.missing.is_empty()
+                && parts.len() >= self.missing.len()
+                && self
+                    .missing
+                    .iter()
+                    .zip(parts)
+                    .all(|(missing, part)| missing == part)
+            {
+                return Ok(None);
+            }
+            let kept = self.cursors.each_ref().map(|cursor| cursor.kept(parts));
+            if let Some(index) = (0..CURSORS).find(|&index| kept[index] == parts.len()) {
+                let cursor = &self.cursors[index];
+                if parts.len() == cursor.chain.len() && cursor.deep.is_none() {
+                    self.last = index;
+                }
+                return Ok(Some(cursor.at(parts.len(), &self.root)));
+            }
+            let target = (self.last + 1) % CURSORS;
+            let source = (0..CURSORS)
+                .max_by_key(|&index| (kept[index], index == target))
+                .expect("there is a cursor");
+            let kept = kept[source];
+            if source != target {
+                let prefix = self.cursors[source].chain[..kept].to_vec();
+                self.cursors[target].chain = prefix;
+            }
+            self.last = target;
+            if create {
+                self.missing.clear();
+            }
+            let cursor = &mut self.cursors[target];
+            cursor.chain.truncate(kept);
+            cursor.deep = None;
             for (depth, part) in parts.iter().enumerate().skip(kept) {
-                let parent = self.current();
-                let Some(directory) = self.open_dir(parent, part, create)? else {
+                let parent = cursor.end(&self.root).0.as_fd();
+                let Some(directory) =
+                    open_dir(self.forbidden, &mut self.created, parent, part, create)?
+                else {
+                    self.missing = parts[..=depth]
+                        .iter()
+                        .map(|part| part.to_os_string())
+                        .collect();
                     return Ok(None);
                 };
                 if depth < CACHED_DEPTH {
-                    self.chain.push((part.to_os_string(), directory));
+                    cursor.chain.push((part.to_os_string(), directory));
                 } else {
-                    self.deep = Some(directory);
+                    cursor.deep = Some(directory);
                 }
             }
-            Ok(Some(self.current()))
+            Ok(Some(cursor.end(&self.root)))
         }
 
         /// What `relative` is, refusing a symlink on the way to it.
         pub fn lstat(&mut self, relative: &Path) -> crate::Result<TreeEntry> {
             let (parts, name) = split(relative)?;
-            let Some(parent) = self.dir(&parts, false)? else {
+            let Some((parent, _)) = self.dir(&parts, false)? else {
                 return Ok(TreeEntry::Missing);
             };
             let Some(stat) = lstat_at(parent, name)? else {
@@ -245,7 +375,7 @@ mod imp {
         /// [`FileIdentity::of`] does. `None` when it does not exist.
         pub fn identity_of(&mut self, relative: &Path) -> crate::Result<Option<FileIdentity>> {
             let (parts, name) = split(relative)?;
-            let Some(parent) = self.dir(&parts, false)? else {
+            let Some((parent, _)) = self.dir(&parts, false)? else {
                 return Ok(None);
             };
             match rustix::fs::statat(parent, name, AtFlags::empty()) {
@@ -259,43 +389,38 @@ mod imp {
         pub fn create_dirs(&mut self, relative: &Path) -> crate::Result<FileIdentity> {
             let (mut parts, name) = split(relative)?;
             parts.push(name);
-            self.dir(&parts, true)?;
-            let stat = rustix::fs::fstat(self.current()).map_err(std::io::Error::from)?;
-            Ok(identity(&stat))
+            let (_, identity) = self.dir(&parts, true)?.expect("created directories exist");
+            Ok(identity)
         }
 
-        /// The directory the last walk ended in.
-        fn current(&self) -> BorrowedFd<'_> {
-            match (&self.deep, self.chain.last()) {
-                (Some(deep), _) => deep.as_fd(),
-                (None, Some((_, cached))) => cached.as_fd(),
-                (None, None) => self.root.as_fd(),
-            }
+        /// Creates the directory `relative` and any missing parents, for
+        /// creating files in from other threads.
+        pub fn file_dir(&mut self, relative: &Path) -> crate::Result<FileDir> {
+            let (mut parts, name) = split(relative)?;
+            parts.push(name);
+            let (directory, _) = self.walk(&parts, true)?.expect("created directories exist");
+            Ok(FileDir(Arc::clone(directory)))
         }
 
         /// Creates a new file at `relative`, and any missing parents. An
         /// existing entry of any kind fails with `AlreadyExists`.
         pub fn create_file(&mut self, relative: &Path) -> crate::Result<std::fs::File> {
             let (parts, name) = split(relative)?;
-            let parent = self.dir(&parts, true)?.expect("created parents exist");
-            let flags =
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let file = rustix::fs::openat(parent, name, flags, Mode::from_raw_mode(0o666))
-                .map_err(std::io::Error::from)?;
-            Ok(std::fs::File::from(file))
+            let (parent, _) = self.dir(&parts, true)?.expect("created parents exist");
+            Ok(create_file_at(parent, name)?)
         }
+    }
 
-        /// Sets a file's modified time and mode, leaving its access time alone.
+    impl FileDir {
+        /// Sets the modified time and mode of the file `name` here, leaving
+        /// its access time alone.
         pub fn set_metadata(
-            &mut self,
-            relative: &Path,
+            &self,
+            name: &OsStr,
             modified: Option<SystemTime>,
             mode: Option<u32>,
         ) -> crate::Result<()> {
-            let (parts, name) = split(relative)?;
-            let parent = self
-                .dir(&parts, false)?
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
+            let parent = self.0.as_fd();
             if let Some(modified) = modified {
                 let times = Timestamps {
                     last_access: Timespec {
@@ -319,25 +444,22 @@ mod imp {
             Ok(())
         }
 
-        /// Renames `relative` here to `to_relative` in `to` by the overwrite
+        /// Renames `name` here to `to_relative` in `to` by the overwrite
         /// policy, returning where it landed. `destination` is
         /// `to_relative`'s full path, which `Rename` numbers. `None` when the
         /// filesystem cannot do it, leaving the caller to publish by path.
         pub fn publish(
-            &mut self,
-            relative: &Path,
+            &self,
+            name: &OsStr,
             to: &mut OutputTree,
             to_relative: &Path,
             destination: &Path,
             overwrite: OverwritePolicy,
             renames: &mut RenameCounters,
         ) -> crate::Result<Option<PathBuf>> {
-            let (parts, name) = split(relative)?;
             let (to_parts, to_name) = split(to_relative)?;
-            let from = self
-                .dir(&parts, false)?
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-            let into = to.dir(&to_parts, true)?.expect("created parents exist");
+            let from = self.0.as_fd();
+            let (into, _) = to.dir(&to_parts, true)?.expect("created parents exist");
             let fell_back = std::cell::Cell::new(false);
             let renamed = |to_name: &OsStr, flags: RenameFlags| -> std::io::Result<()> {
                 rustix::fs::renameat_with(from, name, into, to_name, flags).map_err(|error| {
@@ -374,9 +496,41 @@ mod imp {
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
 mod unsupported {
     use super::*;
+    use std::ffi::OsStr;
 
     /// Never constructed: [`OutputTree::open`] returns `None` here, and callers check paths instead.
     pub struct OutputTree(std::convert::Infallible);
+
+    /// Never constructed, as [`OutputTree`].
+    #[derive(Clone)]
+    pub struct FileDir(std::convert::Infallible);
+
+    impl FileDir {
+        pub fn create_file(&self, _name: &OsStr) -> std::io::Result<std::fs::File> {
+            match self.0 {}
+        }
+
+        pub fn set_metadata(
+            &self,
+            _name: &OsStr,
+            _modified: Option<SystemTime>,
+            _mode: Option<u32>,
+        ) -> crate::Result<()> {
+            match self.0 {}
+        }
+
+        pub fn publish(
+            &self,
+            _name: &OsStr,
+            _to: &mut OutputTree,
+            _to_relative: &Path,
+            _destination: &Path,
+            _overwrite: OverwritePolicy,
+            _renames: &mut RenameCounters,
+        ) -> crate::Result<Option<PathBuf>> {
+            match self.0 {}
+        }
+    }
 
     impl OutputTree {
         pub fn open(_root: &Path) -> std::io::Result<Option<Self>> {
@@ -388,6 +542,10 @@ mod unsupported {
         }
 
         pub fn forbid(&mut self, _directory: FileIdentity) {
+            match self.0 {}
+        }
+
+        pub fn created(&self, _identity: &FileIdentity) -> bool {
             match self.0 {}
         }
 
@@ -407,28 +565,11 @@ mod unsupported {
             match self.0 {}
         }
 
+        pub fn file_dir(&mut self, _relative: &Path) -> crate::Result<FileDir> {
+            match self.0 {}
+        }
+
         pub fn create_file(&mut self, _relative: &Path) -> crate::Result<std::fs::File> {
-            match self.0 {}
-        }
-
-        pub fn set_metadata(
-            &mut self,
-            _relative: &Path,
-            _modified: Option<SystemTime>,
-            _mode: Option<u32>,
-        ) -> crate::Result<()> {
-            match self.0 {}
-        }
-
-        pub fn publish(
-            &mut self,
-            _relative: &Path,
-            _to: &mut OutputTree,
-            _to_relative: &Path,
-            _destination: &Path,
-            _overwrite: OverwritePolicy,
-            _renames: &mut RenameCounters,
-        ) -> crate::Result<Option<PathBuf>> {
             match self.0 {}
         }
     }
@@ -487,5 +628,73 @@ mod tests {
             tree.lstat(Path::new("a/b/file/below")).unwrap(),
             TreeEntry::Missing
         );
+    }
+
+    #[test]
+    fn staged_files_publish_through_walks_that_refuse_planted_symlinks() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+
+        let scratch = crate::scratch::case("output-tree-staged-files");
+        let root = scratch.join("root");
+        let outside = scratch.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(scratch.join("storage")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let mut tree = OutputTree::open(&root).unwrap().unwrap();
+        let mut storage = OutputTree::open(&scratch.join("storage")).unwrap().unwrap();
+        let files = storage.file_dir(Path::new("files")).unwrap();
+        let mut renames = RenameCounters::default();
+        let mut publish = |tree: &mut OutputTree, name: &str, to: &str, overwrite| {
+            let mut file = files.create_file(OsStr::new(name)).unwrap();
+            file.write_all(name.as_bytes()).unwrap();
+            drop(file);
+            files.publish(
+                OsStr::new(name),
+                tree,
+                Path::new(to),
+                &root.join(to),
+                overwrite,
+                &mut renames,
+            )
+        };
+
+        // A directory found missing is found once it is made.
+        let missing = Path::new("a/b/file");
+        assert_eq!(tree.lstat(missing).unwrap(), TreeEntry::Missing);
+        assert_eq!(tree.lstat(missing).unwrap(), TreeEntry::Missing);
+        let made = tree.create_dirs(Path::new("a/b")).unwrap();
+        assert!(tree.created(&made));
+        assert_eq!(
+            tree.lstat(Path::new("a/b")).unwrap(),
+            TreeEntry::Directory(made)
+        );
+        assert_eq!(
+            publish(&mut tree, "0", "a/b/file", OverwritePolicy::Never).unwrap(),
+            Some(root.join("a/b/file"))
+        );
+        assert_eq!(fs::read(root.join("a/b/file")).unwrap(), b"0");
+        assert!(matches!(tree.lstat(missing).unwrap(), TreeEntry::Other(_)));
+        assert!(matches!(
+            publish(&mut tree, "1", "a/b/file", OverwritePolicy::Never),
+            Err(crate::Error::Io(error)) if error.kind == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(fs::read(root.join("a/b/file")).unwrap(), b"0");
+
+        // A symlink planted mid-extraction where a directory goes is refused.
+        std::os::unix::fs::symlink(&outside, root.join("c")).unwrap();
+        assert!(matches!(
+            publish(&mut tree, "2", "c/file", OverwritePolicy::Always),
+            Err(crate::Error::UnsafePath(
+                "unsafe archive path crosses symlink"
+            ))
+        ));
+        // A directory already walked and then swapped for one is never
+        // written through: the walk still holds the directory it opened.
+        fs::rename(root.join("a/b"), scratch.join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("a/b")).unwrap();
+        publish(&mut tree, "3", "a/b/later", OverwritePolicy::Never).unwrap();
+        assert_eq!(fs::read(scratch.join("moved/later")).unwrap(), b"3");
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
     }
 }

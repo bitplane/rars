@@ -107,18 +107,129 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
 /// The modified time and mode a regular file can take before it is
 /// published, or `None` when they wait for the end: a mode that denies its
 /// owner reading would stop a later member copying from it.
-pub(crate) fn early_file_metadata(
-    output: &ExtractedOutput,
-) -> Option<(Option<std::time::SystemTime>, Option<u32>)> {
-    let meta = &output.meta;
+pub(crate) fn early_file_metadata(output: &ExtractedOutput) -> Option<EarlyMetadata> {
+    output
+        .restore_metadata
+        .then(|| early_metadata(&output.meta))
+        .flatten()
+}
+
+/// A file's modified time and mode, set before it is published.
+pub(crate) type EarlyMetadata = (Option<std::time::SystemTime>, Option<u32>);
+
+fn early_metadata(meta: &ExtractedEntryMeta) -> Option<EarlyMetadata> {
     let mode = extracted_mode(meta.file_attr, meta.attr_source, false);
-    if !output.restore_metadata || mode.is_some_and(|mode| mode & 0o400 == 0) {
+    if mode.is_some_and(|mode| mode & 0o400 == 0) {
         return None;
     }
     let modified = meta
         .modified
         .and_then(|time| std::time::SystemTime::try_from(time).ok());
     Some((modified, mode))
+}
+
+/// A staged file, created and finished on whichever thread writes it. It is
+/// created on its first write or flush, or as it is dropped, so the thread
+/// that opens it pays for no system call. As it is closed it takes its early
+/// metadata through its own descriptor; `set` records whether it did, and
+/// publication sets anything it did not.
+pub(crate) struct StagedFile {
+    file: Result<fs::File, Option<(rars::output_tree::FileDir, std::ffi::OsString)>>,
+    early: Option<EarlyMetadata>,
+    set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl StagedFile {
+    /// A file created already.
+    pub(crate) fn new(
+        file: fs::File,
+        meta: &ExtractedEntryMeta,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let set = std::sync::Arc::default();
+        let staged = Self {
+            file: Ok(file),
+            early: early_metadata(meta),
+            set: std::sync::Arc::clone(&set),
+        };
+        (staged, set)
+    }
+
+    /// A file to create as `name` in `dir` once it is first used.
+    pub(crate) fn deferred(
+        dir: rars::output_tree::FileDir,
+        name: std::ffi::OsString,
+        meta: &ExtractedEntryMeta,
+    ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let set = std::sync::Arc::default();
+        let staged = Self {
+            file: Err(Some((dir, name))),
+            early: early_metadata(meta),
+            set: std::sync::Arc::clone(&set),
+        };
+        (staged, set)
+    }
+
+    fn file(&mut self) -> std::io::Result<&mut fs::File> {
+        if let Err(pending) = &mut self.file {
+            let (dir, name) = pending
+                .take()
+                .ok_or_else(|| std::io::Error::other("the staged file could not be created"))?;
+            self.file = Ok(dir.create_file(&name)?);
+        }
+        match &mut self.file {
+            Ok(file) => Ok(file),
+            Err(_) => unreachable!("created above"),
+        }
+    }
+}
+
+impl std::io::Write for StagedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file()?.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.file()?.write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file()?.flush()
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let early = self.early;
+        // An empty member nothing flushed is still a file.
+        let Ok(file) = self.file() else {
+            return;
+        };
+        let Some((modified, mode)) = early else {
+            return;
+        };
+        let set = (|| {
+            if let Some(modified) = modified {
+                file.set_modified(modified)?;
+            }
+            if let Some(mode) = mode {
+                set_file_mode(file, mode)?;
+            }
+            std::io::Result::Ok(())
+        })();
+        self.set
+            .store(set.is_ok(), std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+fn set_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+fn set_file_mode(_file: &fs::File, _mode: u32) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 #[cfg(unix)]
@@ -376,8 +487,15 @@ mod tests {
                     "archive path conflicts with extraction storage"
                 ))
             ));
-            // The earlier member was published before the alias was refused.
-            assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
+            // The earlier member was published before the alias was refused,
+            // leaving nothing staged, only perhaps the empty directory files
+            // stage in.
+            let staged: Vec<_> = fs::read_dir(&storage)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| !path.is_dir() || fs::read_dir(path).unwrap().next().is_some())
+                .collect();
+            assert!(staged.is_empty(), "{staged:?}");
             assert!(root.join("ordinary").exists());
         } else {
             assert!(result.is_ok());

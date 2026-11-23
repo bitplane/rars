@@ -1624,6 +1624,9 @@ fn write_opened_entry<B: Budget>(
     budget.run(&file.name, &mut writer, |writer| {
         session.write_file_to_with_history(archive, file, writer, history)
     })?;
+    // An output can be created only once it is used, as one with nothing
+    // written; flushing it makes its failure this member's.
+    writer.flush()?;
     drop(writer);
     options.check_cancelled()
 }
