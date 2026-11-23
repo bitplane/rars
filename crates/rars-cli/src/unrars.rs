@@ -645,7 +645,12 @@ where
         archive,
         volumes,
         options,
-        |meta| state.borrow_mut().open_entry(meta),
+        |meta| {
+            state
+                .borrow_mut()
+                .open_entry(meta)
+                .map(|writer| writer as Box<dyn Write>)
+        },
         |meta, link| state.borrow_mut().create_link(meta, link),
     );
     if let Err(error) = result {

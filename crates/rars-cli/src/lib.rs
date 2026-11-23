@@ -43,7 +43,7 @@ use rars::{
 };
 use repair::cmd_repair;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1077,6 +1077,24 @@ struct ExtractOutputState<'a> {
     selected: Option<Box<Selection<'a>>>,
     /// Told about each output once it is verified and in place.
     on_published: Option<Box<PublishReport<'a>>>,
+    /// The library says when each member it opened has verified, rather than
+    /// opening the next one only once it has: see [`Self::settle`].
+    settling: bool,
+    /// While `settling`, outputs before this index have verified.
+    settled: usize,
+    /// While `settling`, what each member opened and not yet settled left.
+    unsettled: VecDeque<Opened>,
+}
+
+/// What opening a member left, until it settles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Opened {
+    /// A staged output.
+    Output,
+    /// Nothing to publish; `unnamed` if left out for having no name.
+    Nothing { unnamed: bool },
+    /// The open failed.
+    Refused,
 }
 
 impl<'a> ExtractOutputState<'a> {
@@ -1117,6 +1135,91 @@ impl<'a> ExtractOutputState<'a> {
             kept_existing: 0,
             selected: None,
             on_published: None,
+            settling: false,
+            settled: 0,
+            unsettled: VecDeque::new(),
+        }
+    }
+
+    /// Whether the next run's members settle explicitly. Outputs left from an
+    /// earlier run have verified.
+    fn settle_explicitly(&mut self, settling: bool) {
+        self.settling = settling;
+        self.settled = self.outputs.len();
+        self.unsettled.clear();
+    }
+
+    /// Opens a member's output, when its members settle explicitly.
+    fn open_settled(
+        &mut self,
+        meta: &rars::ExtractedEntryMeta,
+    ) -> rars::Result<Box<dyn Write + Send>> {
+        let outputs = self.outputs.len();
+        let opened = self.open_entry(meta);
+        self.unsettled.push_back(match &opened {
+            Ok(_) if self.outputs.len() > outputs => Opened::Output,
+            Ok(_) => Opened::Nothing {
+                unnamed: meta.name.is_empty(),
+            },
+            Err(_) => Opened::Refused,
+        });
+        opened
+    }
+
+    /// The library is done with the oldest member opened and not settled.
+    /// A verified member's output now counts as verified; a failed one's is
+    /// dropped. Members verified before it are published, as they are before
+    /// the next member is opened when members do not settle explicitly.
+    /// Returns whether its open had failed.
+    fn settle(&mut self, verified: bool) -> rars::Result<bool> {
+        let opened = self
+            .unsettled
+            .pop_front()
+            .expect("the library settles only members it opened");
+        match opened {
+            Opened::Refused => return Ok(true),
+            Opened::Output if !verified => {
+                self.discard_output(self.settled);
+                return Ok(false);
+            }
+            Opened::Nothing { .. } if !verified => return Ok(false),
+            Opened::Nothing { unnamed: true } => {
+                eprintln!("warning: skipping a member with no name");
+                self.skipped_unnamed += 1;
+            }
+            Opened::Output | Opened::Nothing { .. } => {}
+        }
+        self.publish_verified()?;
+        if opened == Opened::Output {
+            // Every member before this one is published now, as it is when
+            // a member opens without settling.
+            let output = &self.outputs[self.settled];
+            let (path, meta) = (output.path.clone(), output.meta.clone());
+            self.remember_directory_time(&path, &meta)?;
+            self.settled += 1;
+        }
+        Ok(false)
+    }
+
+    /// Outputs from `published` up to this one are verified.
+    fn verified_end(&self) -> usize {
+        if self.settling {
+            self.settled
+        } else {
+            self.outputs.len()
+        }
+    }
+
+    /// Drops an output that is not to be published, and what it staged.
+    fn discard_output(&mut self, index: usize) {
+        self.outputs.remove(index);
+        self.archive_names.remove(index);
+        let staged = self.staged_paths.remove(index);
+        self.hardlink_targets.remove(&staged);
+        self.staged_redirections.remove(&staged);
+        self.created_paths.retain(|_, path| *path != staged);
+        if !self.in_place {
+            let _ = fs::remove_file(&staged);
         }
     }
 
@@ -1143,8 +1246,14 @@ impl<'a> ExtractOutputState<'a> {
         }
     }
 
-    fn open_entry(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write>> {
-        self.publish_verified()?;
+    fn open_entry(
+        &mut self,
+        meta: &rars::ExtractedEntryMeta,
+    ) -> rars::Result<Box<dyn Write + Send>> {
+        // Settling, members opened before this one can still be unverified.
+        if self.verified_end() == self.outputs.len() {
+            self.publish_verified()?;
+        }
         if self.unnamed(meta) {
             return Ok(Box::new(std::io::sink()));
         }
@@ -1161,13 +1270,17 @@ impl<'a> ExtractOutputState<'a> {
         }
         self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
-        self.remember_directory_time(&destination, meta)?;
+        // Settling, members before this one may not be published yet: the
+        // time is taken when it settles.
+        if !self.settling {
+            self.remember_directory_time(&destination, meta)?;
+        }
         let staging =
             self.prepare_staged_path(&destination, meta.is_directory, existing.as_ref())?;
         let (path, writer) = match &mut self.staging_tree {
             Some(tree) => {
                 let path = staging.join(&relative);
-                let writer: Box<dyn Write> = if meta.is_directory {
+                let writer: Box<dyn Write + Send> = if meta.is_directory {
                     self.staged_directories.insert(tree.create_dirs(&relative)?);
                     Box::new(std::io::sink())
                 } else {
@@ -1216,6 +1329,11 @@ impl<'a> ExtractOutputState<'a> {
         meta: &rars::ExtractedEntryMeta,
         link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
+        if self.settling && !self.unsettled.is_empty() {
+            return Err(rars::Error::InvalidArgument(
+                "a link was reported before the members ahead of it settled",
+            ));
+        }
         self.publish_verified()?;
         if self.unnamed(meta) {
             return Ok(());
@@ -1268,6 +1386,10 @@ impl<'a> ExtractOutputState<'a> {
             meta: meta.clone(),
             restore_metadata,
         });
+        // The library reports a link once every member before it has settled.
+        if self.settling && self.unsettled.is_empty() {
+            self.settled = self.outputs.len();
+        }
         Ok(())
     }
 
@@ -1277,6 +1399,10 @@ impl<'a> ExtractOutputState<'a> {
     fn unnamed(&mut self, meta: &rars::ExtractedEntryMeta) -> bool {
         if !meta.name.is_empty() {
             return false;
+        }
+        if self.settling {
+            // Warned about once it settles, in archive order.
+            return true;
         }
         eprintln!("warning: skipping a member with no name");
         self.skipped_unnamed += 1;
@@ -1488,14 +1614,14 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
-    /// Move every staged output to its destination. The library extracts
-    /// members one at a time and verifies each before asking for the next
-    /// output, so everything staged before a new callback has passed its
-    /// checksum. Publishing here keeps verified members when a later one fails
-    /// and holds at most one member in staging.
+    /// Move every verified staged output to its destination. Unless members
+    /// settle explicitly, the library extracts them one at a time and verifies
+    /// each before asking for the next output, so everything staged before a
+    /// new callback has passed its checksum. Publishing here keeps verified
+    /// members when a later one fails and holds few members in staging.
     fn publish_verified(&mut self) -> rars::Result<()> {
         // Publish new inodes rather than truncating any existing hard-link target.
-        while self.published < self.outputs.len() {
+        while self.published < self.verified_end() {
             let staged = self.staged_paths[self.published].clone();
             if self.in_place {
                 // Checked and written at its destination when it was opened.
@@ -1665,6 +1791,10 @@ impl<'a> ExtractOutputState<'a> {
     /// reports a failure before it opens the next output, so only the last
     /// output staged can be such a member's. In place, what it wrote stays.
     fn discard_failed(&mut self, failed: &[Vec<u8>]) {
+        if self.settling {
+            // Dropped as they settled.
+            return;
+        }
         for name in failed {
             if self.outputs.len() == self.published || self.archive_names.last() != Some(name) {
                 continue;
@@ -1688,6 +1818,12 @@ impl<'a> ExtractOutputState<'a> {
     /// asking for another output, so the last staged member is verified only
     /// when the error names a different entry. Without a name it is discarded.
     fn publish_before_failure(&mut self, error: &rars::Error) -> rars::Result<()> {
+        if self.settling {
+            while self.outputs.len() > self.settled {
+                self.discard_output(self.outputs.len() - 1);
+            }
+            return self.publish_verified();
+        }
         let last_verified = matches!(
             (failed_entry_name(error), self.archive_names.last()),
             (Some(failed), Some(last)) if failed != last.as_slice()
@@ -1715,6 +1851,29 @@ fn extract_single_archive(
     damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
     state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
+    // In place, a member opened after a failure would already be at its
+    // destination. Flattened, a member can stage where an earlier one is
+    // still staged. Both keep opening each member once the last verified.
+    let one_at_a_time = state.borrow().in_place || state.borrow().flatten;
+    if let (DetectedArchive::Rar50Plus(archive), false) = (archive, one_at_a_time) {
+        // Members are written on workers, so each is verified only once the
+        // library settles it.
+        state.borrow_mut().settle_explicitly(true);
+        return rars::output_links::extract_rar50_settled_with_links(
+            archive,
+            options,
+            |meta| state.borrow_mut().open_settled(meta),
+            |meta, link| damaged.callback(state.borrow_mut().create_link(meta, link)),
+            |_, verified| {
+                // A failed open ends the run once the members before it settle.
+                if damaged.callback(state.borrow_mut().settle(verified))? {
+                    damaged.callback_failed.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            },
+        );
+    }
+    state.borrow_mut().settle_explicitly(false);
     archive.extract_with_links(
         options,
         |meta| open_after_damage(state, damaged, meta),
@@ -1729,6 +1888,7 @@ fn extract_volume_archives(
     damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
     state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
+    state.borrow_mut().settle_explicitly(false);
     extract_volumes_with_links(
         archives,
         options,
@@ -1745,7 +1905,9 @@ fn open_after_damage(
 ) -> rars::Result<Box<dyn Write>> {
     let mut state = state.borrow_mut();
     state.discard_failed(&damaged.take_failed());
-    damaged.callback(state.open_entry(meta))
+    damaged
+        .callback(state.open_entry(meta))
+        .map(|writer| writer as Box<dyn Write>)
 }
 
 fn link_after_damage(

@@ -175,10 +175,10 @@ mod threaded {
         items: &[T],
         window: usize,
         mut admit: A,
-        mut finished: D,
-        mut consumed: R,
+        finished: D,
+        consumed: R,
         map: F,
-        mut consume: C,
+        consume: C,
     ) -> Result<(), E>
     where
         T: Copy + Send,
@@ -186,6 +186,41 @@ mod threaded {
         E: Send,
         F: Fn(T) -> Result<O, E> + Sync,
         A: FnMut(T, bool) -> bool,
+        D: FnMut(T),
+        R: FnMut(T),
+        C: FnMut(O) -> Result<(), E>,
+    {
+        map_ordered_with_tickets(
+            items,
+            window,
+            |item, idle| admit(item, idle).then_some(()),
+            finished,
+            consumed,
+            |item, ()| map(item),
+            consume,
+        )
+    }
+
+    /// As [`map_ordered`], with `admit` handing each item it admits a ticket,
+    /// on the calling thread and in order, which goes with the item to `map`:
+    /// an output opened for it, say. A ticket of an item skipped after a
+    /// failure is dropped unmapped.
+    pub(crate) fn map_ordered_with_tickets<T, K, O, E, F, A, D, R, C>(
+        items: &[T],
+        window: usize,
+        mut admit: A,
+        mut finished: D,
+        mut consumed: R,
+        map: F,
+        mut consume: C,
+    ) -> Result<(), E>
+    where
+        T: Copy + Send,
+        K: Send,
+        O: Send,
+        E: Send,
+        F: Fn(T, K) -> Result<O, E> + Sync,
+        A: FnMut(T, bool) -> Option<K>,
         D: FnMut(T),
         R: FnMut(T),
         C: FnMut(O) -> Result<(), E>,
@@ -240,14 +275,12 @@ mod threaded {
                 while next < items.len() && running < window && next - head < ahead {
                     let item = items[next];
                     let idle = next == head;
-                    if !admit(item, idle) {
-                        debug_assert!(!idle, "an idle call always admits");
-                        if !idle {
-                            break;
-                        }
-                    }
+                    let Some(ticket) = admit(item, idle) else {
+                        assert!(!idle, "an idle call always admits");
+                        break;
+                    };
                     if next + 1 == items.len() {
-                        slots.push_back(Slot::Done(Some(map(item))));
+                        slots.push_back(Slot::Done(Some(map(item, ticket))));
                         finished(item);
                     } else {
                         slots.push_back(Slot::Running);
@@ -259,7 +292,7 @@ mod threaded {
                         scope.spawn(move |_| {
                             let _cap = super::ThreadCap::set(cap);
                             let stopped = stop.load(Ordering::Acquire);
-                            reporter.send((!stopped).then(|| map(item)));
+                            reporter.send((!stopped).then(|| map(item, ticket)));
                         });
                     }
                     next += 1;
@@ -450,12 +483,12 @@ mod sequential {
     #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
     pub(crate) fn map_ordered<T, O, E, F, A, D, R, C>(
         items: &[T],
-        _window: usize,
+        window: usize,
         mut admit: A,
-        mut finished: D,
-        mut consumed: R,
+        finished: D,
+        consumed: R,
         map: F,
-        mut consume: C,
+        consume: C,
     ) -> Result<(), E>
     where
         T: Copy + Send,
@@ -467,10 +500,42 @@ mod sequential {
         R: FnMut(T),
         C: FnMut(O) -> Result<(), E>,
     {
+        map_ordered_with_tickets(
+            items,
+            window,
+            |item, idle| admit(item, idle).then_some(()),
+            finished,
+            consumed,
+            |item, ()| map(item),
+            consume,
+        )
+    }
+
+    /// One at a time, in order.
+    #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
+    pub(crate) fn map_ordered_with_tickets<T, K, O, E, F, A, D, R, C>(
+        items: &[T],
+        _window: usize,
+        mut admit: A,
+        mut finished: D,
+        mut consumed: R,
+        map: F,
+        mut consume: C,
+    ) -> Result<(), E>
+    where
+        T: Copy + Send,
+        K: Send,
+        O: Send,
+        E: Send,
+        F: Fn(T, K) -> Result<O, E> + Sync,
+        A: FnMut(T, bool) -> Option<K>,
+        D: FnMut(T),
+        R: FnMut(T),
+        C: FnMut(O) -> Result<(), E>,
+    {
         for &item in items {
-            let admitted = admit(item, true);
-            debug_assert!(admitted, "an idle call always admits");
-            let output = map(item);
+            let ticket = admit(item, true).expect("an idle call always admits");
+            let output = map(item, ticket);
             finished(item);
             consume(output?)?;
             consumed(item);

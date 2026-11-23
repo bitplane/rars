@@ -27,7 +27,7 @@ pub(crate) fn open_output_writer(
     directory: bool,
     overwrite: OverwritePolicy,
     renames: &mut rars::output_staging::RenameCounters,
-) -> rars::Result<(PathBuf, Box<dyn std::io::Write>)> {
+) -> rars::Result<(PathBuf, Box<dyn std::io::Write + Send>)> {
     let mut out_path = checked_output_path(out_dir, relative)?;
     if directory {
         fs::create_dir_all(&out_path)?;
@@ -778,6 +778,7 @@ mod tests {
             overwrite,
             &mut Default::default(),
         )
+        .map(|(path, writer)| (path, writer as Box<dyn std::io::Write>))
     }
 
     fn redirection_fixture() -> (

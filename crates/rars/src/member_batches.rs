@@ -137,7 +137,7 @@ pub(crate) trait Workers: Budget<Charge: Send> + Sync {
 /// may use when that is less. Sequential extraction holds one member's; this
 /// lets several streaming members, each with its own window, run side by side
 /// without one window per thread. One member can always run alone.
-fn running_workspace() -> u64 {
+pub(crate) fn running_workspace() -> u64 {
     scaled_running_workspace(crate::memory_limit::physical_memory())
 }
 
