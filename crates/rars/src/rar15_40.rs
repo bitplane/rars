@@ -3945,8 +3945,9 @@ mod tests {
         ));
     }
 
+    /// Issue #489: such a block is passed over, like other malformed ones.
     #[test]
-    fn protection_header_requires_a_declared_data_size() {
+    fn protection_header_without_a_declared_data_size_is_skipped() {
         let mut bytes = RAR15_SIGNATURE.to_vec();
         test_write_main_header(&mut bytes, 0);
         let start = bytes.len();
@@ -3965,12 +3966,14 @@ mod tests {
                 crate::ArchiveReadOptions::new(),
             ),
         ] {
-            assert!(matches!(
-                result,
-                Err(Error::InvalidHeader(
-                    "RAR 2.x recovery header is missing data size"
-                ))
-            ));
+            let archive = result.unwrap();
+            let skipped = archive.skipped_blocks();
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(
+                (skipped[0].offset, skipped[0].reason),
+                (start as u64, "RAR 2.x recovery header is missing data size")
+            );
+            assert!(matches!(archive.blocks[..], [Block::Unknown(_)]));
         }
     }
 
