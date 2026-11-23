@@ -1630,7 +1630,10 @@ impl<'a> ExtractOutputState<'a> {
     }
 
     /// Where a member goes, refusing a symlink on the way. With the output
-    /// directory open by descriptor, also what is there now.
+    /// directory open by descriptor, also what is there now; except in a
+    /// directory this run made, where nothing was before it began. There a
+    /// path this run used already is caught as it is reserved, or as it is
+    /// published, which refuses anything else put there meanwhile.
     fn checked_destination(
         &mut self,
         relative: &Path,
@@ -1644,7 +1647,13 @@ impl<'a> ExtractOutputState<'a> {
                 None,
             ));
         };
-        match tree.lstat(relative)? {
+        // Skipping existing files needs to see this run's own directories.
+        let entry = if self.skip_existing {
+            tree.lstat(relative)?
+        } else {
+            tree.lstat_unless_created(relative)?
+        };
+        match entry {
             TreeEntry::Symlink => Err(rars::Error::UnsafePath(
                 "unsafe archive path crosses symlink",
             )),
@@ -4347,6 +4356,97 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// A member in a directory this run made is opened without looking at
+    /// its destination. Something planted there after the directory was made
+    /// is still never written through, and only `Always` replaces it.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_planted_in_a_directory_made_by_the_run_is_never_written_through() {
+        use std::io::Write;
+        let policies = [
+            super::OverwritePolicy::Never,
+            super::OverwritePolicy::Always,
+            super::OverwritePolicy::Rename,
+        ];
+        for plant in ["symlink", "file"] {
+            for overwrite in policies {
+                let scratch = crate::scratch::case("rars-planted-in-made-directory");
+                let root = scratch.join("out");
+                let outside = scratch.join("outside");
+                std::fs::create_dir_all(&outside).unwrap();
+                std::fs::write(outside.join("target"), b"outside").unwrap();
+                let mut state = super::ExtractOutputState::new(
+                    &root,
+                    overwrite,
+                    false,
+                    false,
+                    rars::ArchiveFamily::Rar50Plus,
+                );
+                let meta = |name: &str| {
+                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
+                };
+                let write = |state: &mut super::ExtractOutputState, name: &str| {
+                    let mut writer = state.open_entry(&meta(name))?;
+                    writer.write_all(name.as_bytes())?;
+                    rars::Result::Ok(())
+                };
+                // Opening `other` publishes `one`, which makes `d`.
+                write(&mut state, "d/one").unwrap();
+                write(&mut state, "d/other").unwrap();
+                assert_eq!(std::fs::read(root.join("d/one")).unwrap(), b"d/one");
+                let planted = root.join("d/two");
+                if plant == "symlink" {
+                    std::os::unix::fs::symlink(outside.join("target"), &planted).unwrap();
+                } else {
+                    std::fs::write(&planted, b"planted").unwrap();
+                }
+                let finished = write(&mut state, "d/two").and_then(|()| state.publish().map(drop));
+
+                let context = format!("{plant} {overwrite:?}: {finished:?}");
+                assert_eq!(
+                    std::fs::read(outside.join("target")).unwrap(),
+                    b"outside",
+                    "{context}"
+                );
+                assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "{context}");
+                let found = std::fs::symlink_metadata(&planted).unwrap();
+                match overwrite {
+                    super::OverwritePolicy::Never => {
+                        assert!(
+                            matches!(
+                                &finished,
+                                Err(Error::InvalidHeader(
+                                    "multiple archive entries map to the same output path"
+                                ))
+                            ),
+                            "{context}"
+                        );
+                        assert_eq!(found.file_type().is_symlink(), plant == "symlink");
+                        assert_eq!(std::fs::read_dir(root.join("d")).unwrap().count(), 3);
+                    }
+                    super::OverwritePolicy::Always => {
+                        assert!(finished.is_ok(), "{context}");
+                        assert!(found.file_type().is_file(), "{context}");
+                        assert_eq!(std::fs::read(&planted).unwrap(), b"d/two");
+                    }
+                    super::OverwritePolicy::Rename => {
+                        assert!(finished.is_ok(), "{context}");
+                        assert_eq!(found.file_type().is_symlink(), plant == "symlink");
+                        let renamed: Vec<_> = std::fs::read_dir(root.join("d"))
+                            .unwrap()
+                            .map(|entry| entry.unwrap().file_name())
+                            .filter(|name| name.to_string_lossy().starts_with("two"))
+                            .collect();
+                        assert_eq!(renamed.len(), 2, "{context}: {renamed:?}");
+                        let ours = renamed.iter().find(|name| *name != "two").unwrap();
+                        assert_eq!(std::fs::read(root.join("d").join(ours)).unwrap(), b"d/two");
+                    }
+                }
+                assert_eq!(std::fs::read(root.join("d/other")).unwrap(), b"d/other");
             }
         }
     }
