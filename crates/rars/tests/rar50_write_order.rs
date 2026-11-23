@@ -80,7 +80,10 @@ fn the_first_member_is_written_before_the_last_is_read() {
             .unwrap()
             .install(write);
         #[cfg(not(feature = "parallel"))]
-        let written_archive = write();
+        let written_archive = {
+            let mut write = write;
+            write()
+        };
         written_archive.unwrap();
 
         let archive = output.0;
