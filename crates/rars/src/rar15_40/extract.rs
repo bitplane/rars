@@ -129,33 +129,78 @@ impl<B: Budget> CodecState<B> {
         out: &mut impl Write,
     ) -> Result<Decoded> {
         let mut crc = Crc32::new();
-        let mut crc_writer = CrcWriter {
+        let mut counted = CountingWriter {
             inner: out,
+            written: 0,
+        };
+        let mut crc_writer = CrcWriter {
+            inner: &mut counted,
             crc: &mut crc,
         };
         let ended_early = self.decode_to(input, file, solid, password, &mut crc_writer)?;
         Ok(Decoded {
             crc: crc.finish(),
+            len: counted.written,
             ended_early,
+            control: self.read_control().clone(),
         })
+    }
+
+    fn read_control(&self) -> &crate::read_control::ReadControl {
+        match self {
+            Self::Unpack15(decoder) => &decoder.read_control,
+            Self::Unpack20(decoder) => &decoder.read_control,
+            Self::Unpack29(decoder) => &decoder.read_control,
+        }
     }
 }
 
-/// A decoded member's CRC, and the error that ended its stream before its
-/// declared size, if one did.
+/// Counts what passes through, for a stream that ends before its declared size.
+struct CountingWriter<'a, W: Write + ?Sized> {
+    inner: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write + ?Sized> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(buf)?;
+        self.written += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A decoded member's CRC and length, and the error that ended its stream
+/// before its declared size, if one did.
 pub(super) struct Decoded {
     crc: u32,
+    len: u64,
     ended_early: Option<Error>,
+    control: crate::read_control::ReadControl,
+}
+
+impl Decoded {
+    /// Passes a stream that ends early whatever the strict-sizes option says.
+    pub(super) fn lenient(self) -> Self {
+        Self {
+            control: crate::read_control::ReadControl::default(),
+            ..self
+        }
+    }
 }
 
 impl FileHeader {
     /// Checks a decoded member against its CRC. A stream that ended before
     /// its declared size passes if what it produced matches: the whole file
-    /// is there, and the declared size is what is wrong.
+    /// is there, and the declared size is what is wrong. Strict sizes fail it.
     pub(super) fn decoded_result(&self, decoded: Decoded, password: Option<&[u8]>) -> Result<()> {
         match (self.crc_result(decoded.crc, password), decoded.ended_early) {
             (Err(_), Some(error)) => Err(error),
-            (result, _) => result,
+            (Ok(()), Some(_)) => decoded.control.ended_early(self.unp_size, decoded.len),
+            (result, None) => result,
         }
     }
 }

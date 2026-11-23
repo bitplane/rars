@@ -294,14 +294,15 @@ fn filtered_member_above_the_default_buffer_limit_streams_once() {
             file.unpacked_size = required;
         }
     }
-    let error = archive.test(None).unwrap_err();
     // The size claims more output than the packed stream holds, so streaming
-    // it runs out of input, and the reader does not go back for a second pass.
-    assert!(matches!(
-        cause(&error),
-        Error::Codec(rars::codec::Error::NeedMoreInput)
-    ));
-    assert_eq!(attempts.load(Ordering::Relaxed), 1);
+    // it ends early. What it produced matches the checksum, so the member
+    // passes (#488), and the reader does not go back for a second pass.
+    archive.test(None).unwrap();
+    let error = archive
+        .test_with_options(ArchiveReadOptions::new().with_strict_member_sizes(true))
+        .unwrap_err();
+    assert!(matches!(cause(&error), Error::MemberEndedEarly { .. }));
+    assert_eq!(attempts.load(Ordering::Relaxed), 2);
 }
 
 #[cfg(feature = "encryption")]

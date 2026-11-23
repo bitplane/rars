@@ -609,6 +609,7 @@ impl FileHeader {
             | Error::InVolume { .. }
             | Error::MissingVolume
             | Error::VolumeOutOfOrder
+            | Error::MemberEndedEarly { .. }
             | Error::Cancelled
             | Error::InvalidArgument(_)
             | Error::WriterFailure(_)

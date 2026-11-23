@@ -217,7 +217,9 @@ where
                 let last = walk
                     .finish()
                     .map_err(|error| first.entry_error("extracting", error))?;
-                last.decoded_result(decoded, password)
+                // A member error handler cannot go past a split member, so
+                // strict sizes would end the whole run for it.
+                last.decoded_result(decoded.lenient(), password)
                     .map_err(|error| first.entry_error("extracting", error))
             })
         },

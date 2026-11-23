@@ -240,6 +240,13 @@ pub enum Error {
     HashMismatch {
         hash_type: u64,
     },
+    /// A member's stream ended before its declared size, and the bytes it
+    /// did produce match its checksum. Reported only under
+    /// `ArchiveReadOptions::strict_member_sizes`; otherwise such a member passes.
+    MemberEndedEarly {
+        declared: u64,
+        decoded: u64,
+    },
     Codec(crate::codec::Error),
     Rar3Recovery(crate::recovery::rar3::Error),
     Rar5Recovery(crate::recovery::rar5::Error),
@@ -380,6 +387,10 @@ impl std::fmt::Display for Error {
             Self::HashMismatch { hash_type } => {
                 write!(f, "hash mismatch for hash type {hash_type}")
             }
+            Self::MemberEndedEarly { declared, decoded } => write!(
+                f,
+                "its data ends after {decoded} of its declared {declared} bytes, though what is there matches its checksum"
+            ),
             Self::Codec(error) => write!(f, "{error}"),
             Self::Rar3Recovery(error) => write!(f, "{error}"),
             Self::Rar5Recovery(error) => write!(f, "{error}"),
@@ -537,6 +548,7 @@ impl Error {
             | Self::InvalidHeader(_)
             | Self::MissingVolume
             | Self::VolumeOutOfOrder
+            | Self::MemberEndedEarly { .. }
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)

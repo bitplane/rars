@@ -24,8 +24,9 @@ use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
     create_link_output, damaged_member_warning, incomplete_member_warning, open_output_writer,
-    print_ok_entry, rar50_output_relative_path, restore_output_metadata, truncation_warning,
-    warn_rar50_redirections, ExtractedOutput, ExtractionStaging, OverwritePolicy,
+    print_ok_entry, print_ok_name, rar50_output_relative_path, restore_output_metadata,
+    truncation_warning, warn_rar50_redirections, ExtractedOutput, ExtractionStaging,
+    OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -296,6 +297,18 @@ fn display_legacy_name(
     )?))
 }
 
+/// `info` shows a RAR 5 comment whatever its checksum says, then warns if
+/// it is wrong.
+fn warn_damaged_rar50_comment(
+    path: &str,
+    archive: &rars::rar50::Archive,
+    options: ArchiveReadOptions<'_>,
+) {
+    if let Err(err) = archive.test_archive_comment_with_options(options) {
+        eprintln!("warning: archive comment in '{path}' is damaged: {err}");
+    }
+}
+
 fn info_rar13_terse(
     path: &str,
     archive: &rars::rar13::Archive,
@@ -487,6 +500,7 @@ fn info_rar50_terse(
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?;
     if let Some(comment) = &archive_comment {
         print_comment("  ", comment);
+        warn_damaged_rar50_comment(path, archive, options);
     }
     print_entry_table(archive.files().map(|file| {
         let mut name = display_text(file.name_lossy());
@@ -550,6 +564,7 @@ fn info_rar50_verbose(
         .map_err(|err| format!("failed to decode archive comment '{path}': {err}"))?;
     if let Some(ref comment) = archive_comment {
         println!("  comment: {}", display_bytes_lossy(comment));
+        warn_damaged_rar50_comment(path, archive, options);
     }
     for (index, file) in archive.files().enumerate() {
         let compression_info = file.decoded_compression_info().map_err(|err| {
@@ -635,16 +650,21 @@ fn cmd_test(args: TestArgs) -> CliResult<()> {
 }
 
 /// Members a command went past: damaged, or locked without a password.
+/// `test` also counts members with no name, and damaged archive comments.
 #[derive(Default, Clone, Copy)]
 struct PassedOver {
     damaged: usize,
     locked: usize,
+    unnamed: usize,
+    comments: usize,
 }
 
 impl std::ops::AddAssign for PassedOver {
     fn add_assign(&mut self, other: Self) {
         self.damaged += other.damaged;
         self.locked += other.locked;
+        self.unnamed += other.unnamed;
+        self.comments += other.comments;
     }
 }
 
@@ -659,13 +679,23 @@ impl PassedOver {
                 self.locked
             )));
         }
+        let mut problems = Vec::new();
         if self.damaged > 0 {
-            return Err(CliError::general(format!(
-                "{} damaged member(s) in '{paths}'",
-                self.damaged
-            )));
+            problems.push(format!("{} damaged member(s)", self.damaged));
         }
-        Ok(())
+        if self.unnamed > 0 {
+            problems.push(format!("{} member(s) with no name", self.unnamed));
+        }
+        if self.comments > 0 {
+            problems.push("a damaged archive comment".to_string());
+        }
+        if problems.is_empty() {
+            return Ok(());
+        }
+        Err(CliError::general(format!(
+            "{} in '{paths}'",
+            problems.join(", ")
+        )))
     }
 }
 
@@ -679,6 +709,8 @@ struct DamagedMembers<'p> {
     count: AtomicUsize,
     /// Members that need the password no one gave.
     locked: AtomicUsize,
+    /// Members `test` found with no name, which `x` cannot write.
+    unnamed: AtomicUsize,
     /// Names of members gone past whose output `x` has yet to drop.
     failed: Mutex<Vec<Vec<u8>>>,
     /// The member `test` last started, not yet known to pass.
@@ -693,6 +725,7 @@ impl<'p> DamagedMembers<'p> {
             path,
             count: AtomicUsize::new(0),
             locked: AtomicUsize::new(0),
+            unnamed: AtomicUsize::new(0),
             failed: Mutex::new(Vec::new()),
             testing: Mutex::new(None),
             callback_failed: AtomicBool::new(false),
@@ -715,6 +748,15 @@ impl<'p> DamagedMembers<'p> {
         {
             return Ok(rars::ExtractionErrorAction::Abort);
         }
+        if matches!(error.root_cause(), rars::Error::MemberEndedEarly { .. }) {
+            // Only `test` asks for this: the member is whole, its size is wrong.
+            print_ok_name(&member.meta.name, false);
+            eprintln!(
+                "{}",
+                damaged_member_warning(self.path, &member.meta.name, error, "")
+            );
+            return Ok(rars::ExtractionErrorAction::Continue);
+        }
         eprintln!(
             "{}",
             damaged_member_warning(self.path, &member.meta.name, error, &retry_hint(error))
@@ -729,9 +771,15 @@ impl<'p> DamagedMembers<'p> {
         Ok(rars::ExtractionErrorAction::Continue)
     }
 
-    /// `test`'s callback, as each member starts.
+    /// `test`'s callback, as each member starts. A member with no name is
+    /// still checked, but reported, since `x` has no name to write it under.
     fn testing(&self, meta: &rars::ExtractedEntryMeta) {
         self.settle(None);
+        if meta.name.is_empty() {
+            eprintln!("warning: {}: a member has no name", self.path.display());
+            self.unnamed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         *lock(&self.testing) = Some(meta.clone());
     }
 
@@ -760,6 +808,8 @@ impl<'p> DamagedMembers<'p> {
         PassedOver {
             damaged: self.count.load(Ordering::Relaxed),
             locked: self.locked.load(Ordering::Relaxed),
+            unnamed: self.unnamed.load(Ordering::Relaxed),
+            comments: 0,
         }
     }
 }
@@ -819,6 +869,7 @@ fn test_volume_run(
         warn_rar50_redirections(archive);
         let options = read_options
             .options(password_bytes(password), scratch)
+            .with_strict_member_sizes(true)
             .with_member_error_handler(&handler);
         archive
             .test_with_options_and_callback(options, tested)
@@ -838,6 +889,7 @@ fn test_volume_run(
         }
         let options = read_options
             .options(password_bytes(password), scratch)
+            .with_strict_member_sizes(true)
             .with_member_error_handler(&handler);
         test_volumes_with_options_and_callback(archives, options, tested).map_err(|err| {
             classify_rars_error(err, |err| {
@@ -850,7 +902,48 @@ fn test_volume_run(
         })?;
     }
     damaged.settle(None);
-    Ok(damaged.passed_over())
+    let mut passed_over = damaged.passed_over();
+    passed_over += test_archive_comment(&paths[0], &archives[0], password, read_options, scratch)?;
+    Ok(passed_over)
+}
+
+/// Checks the archive comment, which `test` reports like a damaged member.
+/// A run that starts past the first volume has none.
+fn test_archive_comment(
+    path: &Path,
+    archive: &DetectedArchive,
+    password: &Option<Password>,
+    read_options: &cli::ReadOptionsArgs,
+    scratch: Option<&rars::Rar50Scratch>,
+) -> CliResult<PassedOver> {
+    let options = read_options.options(password_bytes(password), scratch);
+    let Err(error) = archive.test_comment_with_options(options) else {
+        return Ok(PassedOver::default());
+    };
+    if matches!(
+        error.kind(),
+        rars::ErrorKind::Cancelled | rars::ErrorKind::Io
+    ) {
+        return Err(classify_rars_error(error, |error| {
+            format!("failed to test archive '{}': {error}", path.display())
+        }));
+    }
+    eprintln!(
+        "warning: {}: archive comment: {error}{}",
+        path.display(),
+        retry_hint(&error)
+    );
+    Ok(if error_is_password_class(&error) {
+        PassedOver {
+            locked: 1,
+            ..PassedOver::default()
+        }
+    } else {
+        PassedOver {
+            comments: 1,
+            ..PassedOver::default()
+        }
+    })
 }
 
 /// The volumes `test` and `x` read: the named archive's whole set, or the paths given, in volume order.
