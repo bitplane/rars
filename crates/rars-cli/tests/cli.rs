@@ -98,7 +98,10 @@ fn info_lists_rar13_entries() {
 }
 
 /// Issue #433: test and extract finish every member of an archive cut after
-/// its last one, warn where it ends, then fail. info warns and succeeds.
+/// its last one and warn where it ends. Issue #489: a cut that can't have lost
+/// a member, as one inside the recovery record, is only a warning; one that
+/// may have, as one at a block boundary nothing names, fails. info warns and
+/// succeeds.
 #[test]
 fn truncated_archive_tests_and_extracts_its_members_then_fails() {
     let dir = scratch("truncated-archive");
@@ -127,10 +130,10 @@ fn truncated_archive_tests_and_extracts_its_members_then_fails() {
     );
 
     let output = rars().arg("test").arg(&path).output().unwrap();
-    assert!(!output.status.success());
+    assert!(output.status.success(), "{}", stderr(&output));
     let errors = stderr(&output);
     assert!(errors.contains(&warning), "{errors}");
-    assert!(errors.contains("is truncated"), "{errors}");
+    assert!(!errors.contains("error"), "{errors}");
     let text = stdout(&output);
     assert!(
         text.contains("first.txt") && text.contains("second.bin"),
@@ -139,7 +142,7 @@ fn truncated_archive_tests_and_extracts_its_members_then_fails() {
 
     let out = dir.join("out");
     let output = rars().arg("x").arg(&path).arg(&out).output().unwrap();
-    assert!(!output.status.success());
+    assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
     assert_eq!(fs::read(out.join("first.txt")).unwrap(), first);
     assert_eq!(fs::read(out.join("second.bin")).unwrap(), second);
@@ -147,6 +150,30 @@ fn truncated_archive_tests_and_extracts_its_members_then_fails() {
     let output = rars().arg("info").arg(&path).output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
+
+    // With no recovery record or quick-open block before it, a file that
+    // stops where the end block was due may have lost a member there too.
+    let plain = dir.join("plain.rar");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"first.txt".to_vec(), first.clone(), None, None)
+        .unwrap();
+    builder.write_to_path(&plain, None).unwrap();
+    let plain_bytes = fs::read(&plain).unwrap();
+    // RAR 5's end block is eight bytes here: CRC, size, type, flags and end flags.
+    let end = plain_bytes.len() - 8;
+    fs::write(&plain, &plain_bytes[..end]).unwrap();
+    let output = rars().arg("test").arg(&plain).output().unwrap();
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    let errors = stderr(&output);
+    assert!(
+        errors.contains(&format!(
+            "archive is truncated at offset {end}, before the end of archive block"
+        )),
+        "{errors}"
+    );
+    assert!(errors.contains("is truncated"), "{errors}");
+    assert_eq!(stdout(&output), "OK first.txt\n");
 
     // A cut through member data loses that member, and the one before it still tests.
     let last = archive.files().last().unwrap().block.clone();
@@ -160,6 +187,45 @@ fn truncated_archive_tests_and_extracts_its_members_then_fails() {
     );
     assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
     assert_eq!(stdout(&output), "OK first.txt\n");
+}
+
+/// Issue #489: zero padding after a RAR 2.9 member's last code tests clean,
+/// and a malformed old authenticity block is skipped with a warning.
+#[test]
+fn zero_padding_and_a_short_old_block_test_clean() {
+    let output = rars()
+        .arg("test")
+        .arg(fixture_rar15_40("zero_padding/rar29.rar"))
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "OK first.bin\nOK second.txt\n");
+
+    let dir = scratch("short-old-block");
+    let path = dir.join("av.rar");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar20);
+    builder
+        .add_bytes(b"a.txt".to_vec(), b"issue 489\n".repeat(50), None, None)
+        .unwrap();
+    let mut bytes = builder.to_bytes().unwrap();
+    // A 20-byte authenticity block after the main header, one byte short.
+    let at = 7 + usize::from(u16::from_le_bytes([bytes[12], bytes[13]]));
+    let mut block = vec![0u8; 20];
+    block[2] = 0x76;
+    block[5] = 20;
+    let crc = (crc32(&block[2..]) & 0xffff) as u16;
+    block[..2].copy_from_slice(&crc.to_le_bytes());
+    bytes.splice(at..at, block);
+    fs::write(&path, &bytes).unwrap();
+
+    let output = rars().arg("test").arg(&path).output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "OK a.txt\n");
+    let warning = format!(
+        "warning: {}: skipped malformed block 0x76 at offset {at}: RAR legacy authenticity block is too short",
+        path.display()
+    );
+    assert!(stderr(&output).contains(&warning), "{}", stderr(&output));
 }
 
 /// Members by name, in archive order.

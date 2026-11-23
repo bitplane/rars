@@ -6668,33 +6668,46 @@ fn rar250_recovery_rejects_protected_range_past_archive_end() {
     ));
 }
 
+/// Issue #489: a RAR 2.x recovery block whose header size or data size is
+/// wrong is passed over and reported, and every member still extracts.
 #[test]
-fn rar250_parser_rejects_inconsistent_recovery_header_geometry() {
+fn rar250_parser_skips_inconsistent_recovery_header_geometry() {
     let original = std::fs::read(fixture("rar250_protect_head_rr5.rar")).unwrap();
     let clean = Archive::parse(&original).unwrap();
     let protect = clean.protect_records().next().unwrap();
     let start = protect.block.offset;
+    let members = collect_extract(&clean).unwrap();
 
     let mut short_header = original.clone();
     short_header[start + 5..start + 7].copy_from_slice(&25u16.to_le_bytes());
     rewrite_recovery_header_crc(&mut short_header, start, 25);
-    assert!(matches!(
-        Archive::parse(&short_header),
-        Err(Error::InvalidHeader(
-            "RAR 2.x recovery header size is invalid"
-        ))
-    ));
 
     let mut wrong_data_size = original;
     let add_size = protect.block.add_size.unwrap() as u32 - 1;
     wrong_data_size[start + 7..start + 11].copy_from_slice(&add_size.to_le_bytes());
     rewrite_recovery_header_crc(&mut wrong_data_size, start, 26);
-    assert!(matches!(
-        Archive::parse(&wrong_data_size),
-        Err(Error::InvalidHeader(
-            "RAR 2.x recovery data size does not match header"
-        ))
-    ));
+
+    for (bytes, reason) in [
+        (short_header, "RAR 2.x recovery header size is invalid"),
+        (
+            wrong_data_size,
+            "RAR 2.x recovery data size does not match header",
+        ),
+    ] {
+        let archive = Archive::parse(&bytes).unwrap();
+        let skipped = archive.skipped_blocks();
+        assert_eq!(skipped.len(), 1, "{reason}");
+        assert_eq!(
+            (skipped[0].offset, skipped[0].reason),
+            (start as u64, reason)
+        );
+        assert_eq!(archive.protect_records().count(), 0, "{reason}");
+        let extracted = collect_extract(&archive).unwrap();
+        assert_eq!(extracted.len(), members.len(), "{reason}");
+        for (got, want) in extracted.iter().zip(&members) {
+            assert_eq!((&got.name, &got.data), (&want.name, &want.data), "{reason}");
+        }
+    }
 }
 
 #[test]
@@ -6962,6 +6975,12 @@ fn cut_after_the_last_member_reads_it_and_says_where() {
                 let archive = archive.expect(&context);
                 let truncation = archive.truncation().map(|truncation: &Truncation| {
                     assert!(truncation.started, "{context}");
+                    // Issue #489: only these blocks follow every member.
+                    let after_members = matches!(
+                        truncation.block,
+                        TruncatedBlock::End | TruncatedBlock::RecoveryRecord
+                    );
+                    assert_eq!(truncation.members_complete, after_members, "{context}");
                     (truncation.block.clone(), truncation.offset as usize)
                 });
                 assert_eq!(truncation, expected, "{context}");

@@ -717,10 +717,16 @@ where
 }
 
 /// Says that an archive ends early, as unrar does, after its members are done.
+///
+/// unrar says nothing about a file that stops at a block boundary, so neither
+/// does this when the cut can't have lost a member.
 fn report_truncation(out: Out, truncation: Option<&rars::Truncation>) -> bool {
     let Some(truncation) = truncation else {
         return false;
     };
+    if truncation.members_complete && !truncation.started {
+        return false;
+    }
     out.error("Unexpected end of archive");
     match &truncation.block {
         rars::TruncatedBlock::RecoveryRecord => {

@@ -4,7 +4,7 @@ mod scratch;
 mod volumes;
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
 use crate::codec::rar50::{
-    DecodeMode, DecodedChunk, HistoryRetention, ReaderState, StreamDecodeError,
+    DecodeMode, DecodedChunk, HistoryRetention, ReaderState, StreamDecodeError, FILTER_THREAD_BYTES,
 };
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::crc32::{crc32, Crc32};
@@ -583,9 +583,17 @@ impl FileHeader {
         mut outer_check: Option<OuterCheck<'_>>,
         writer: &mut dyn Write,
     ) -> Result<()> {
+        // The pipeline's buffers and the filter thread's are charged together.
+        let allowance = decoder.allowance();
         let pipelined = scratch_policy
             .is_none()
-            .then(|| output_pipeline::admit(self.unpacked_size, &decoder.allowance()))
+            .then(|| {
+                output_pipeline::admit_with(self.unpacked_size, |bytes| {
+                    let mut charge = allowance.charge();
+                    B::resize(&mut charge, bytes.checked_add(FILTER_THREAD_BYTES)?).ok()?;
+                    Some(charge)
+                })
+            })
             .flatten();
         let mut checked;
         let inline_writer: &mut dyn Write = match outer_check.as_deref_mut() {
@@ -624,7 +632,7 @@ impl FileHeader {
             let mut crc_bytes = 0;
             let decoded = output_pipeline::run(
                 |chunks| {
-                    decoder.decode_member_from_reader_with_dictionary_to_sink(
+                    decoder.decode_member_filtering_aside(
                         packed,
                         info.algorithm_version,
                         output_size,

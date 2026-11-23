@@ -1780,7 +1780,8 @@ fn a_rar5_archive_whose_locator_points_past_the_end_is_refused() {
 /// Issue #433: a RAR 5 archive cut after its last member, inside or before
 /// the recovery record or the end block, still reads every member, from memory
 /// and from a path, and says where it ends. A cut through a member's header or
-/// data is still an error.
+/// data is still an error. Issue #489: it says whether the cut can have lost a
+/// member.
 #[test]
 #[cfg(all(feature = "write", feature = "recovery"))]
 fn rar5_archive_cut_after_its_members_reads_them_and_says_where() {
@@ -1815,13 +1816,18 @@ fn rar5_archive_cut_after_its_members_reads_them_and_says_where() {
     let end = end_of(&whole);
     let plain_end = end_of(&Archive::parse(&plain).unwrap());
 
-    let cases: [(&[u8], usize, TruncatedBlock, bool, usize); 8] = [
+    // The bytes, where to cut them, and what the cut reports: the block,
+    // whether it started, its offset, and whether no member can be lost
+    // (issue #489).
+    type Case<'a> = (&'a [u8], usize, TruncatedBlock, bool, usize, bool);
+    let cases: [Case; 8] = [
         (
             &recovered,
             rr_data + 100,
             TruncatedBlock::RecoveryRecord,
             true,
             rr,
+            true,
         ),
         // The name is still there one byte short of the header's end.
         (
@@ -1830,6 +1836,7 @@ fn rar5_archive_cut_after_its_members_reads_them_and_says_where() {
             TruncatedBlock::RecoveryRecord,
             true,
             rr,
+            true,
         ),
         (
             &recovered,
@@ -1837,18 +1844,42 @@ fn rar5_archive_cut_after_its_members_reads_them_and_says_where() {
             TruncatedBlock::Service(Vec::new()),
             true,
             rr,
+            false,
         ),
         // The locator says the recovery record was due here.
-        (&recovered, rr, TruncatedBlock::RecoveryRecord, false, rr),
-        (&recovered, end, TruncatedBlock::End, false, end),
+        (
+            &recovered,
+            rr,
+            TruncatedBlock::RecoveryRecord,
+            false,
+            rr,
+            true,
+        ),
+        // The recovery record before it follows every member.
+        (&recovered, end, TruncatedBlock::End, false, end, true),
         // Enough of the end block to read its type.
-        (&recovered, end + 6, TruncatedBlock::End, true, end),
-        (&recovered, end + 3, TruncatedBlock::Unknown, true, end),
-        (&plain, plain_end, TruncatedBlock::End, false, plain_end),
+        (&recovered, end + 6, TruncatedBlock::End, true, end, true),
+        (
+            &recovered,
+            end + 3,
+            TruncatedBlock::Unknown,
+            true,
+            end,
+            false,
+        ),
+        // Nothing says the next block was the end block, not another member.
+        (
+            &plain,
+            plain_end,
+            TruncatedBlock::End,
+            false,
+            plain_end,
+            false,
+        ),
     ];
     let root = scratch::case("rar5-cut-after-members");
     let path = root.join("cut.rar");
-    for (bytes, cut, block, started, offset) in cases {
+    for (bytes, cut, block, started, offset, complete) in cases {
         let context = format!("cut at {cut} of {}", bytes.len());
         fs::write(&path, &bytes[..cut]).unwrap();
         let from_memory = Archive::parse(&bytes[..cut]).unwrap();
@@ -1858,6 +1889,7 @@ fn rar5_archive_cut_after_its_members_reads_them_and_says_where() {
             assert_eq!(truncation.block, block, "{context}");
             assert_eq!(truncation.started, started, "{context}");
             assert_eq!(truncation.offset, offset as u64, "{context}");
+            assert_eq!(truncation.members_complete, complete, "{context}");
             let extracted = collect_extract(archive).unwrap();
             assert_eq!(extracted.len(), 2, "{context}");
             assert_eq!(extracted[0].data, first, "{context}");
