@@ -2,7 +2,7 @@
 //! reads ahead and replays them, so output and errors match the serial decoder.
 use super::block_ops::{skip_symbols, BlockOps, Reached, Repeats, Stop};
 use super::{
-    read_compressed_block_with_allowance, read_table_lengths_with_allowance,
+    read_compressed_block_salvaging, read_table_lengths_with_allowance,
     refuse_stream_past_declared, Budget, DecodedChunk, Error, OwnedCompressedBlock, PendingFilter,
     ReaderState, ReaderTables, Result, StreamDecodeError, StreamingOutput,
 };
@@ -163,7 +163,7 @@ impl<R: Read, B: Budget> Scan<'_, R, B> {
         let mut bytes = 0;
         let mut failure = None;
         while !self.done && bytes < BATCH_BYTES {
-            match read_compressed_block_with_allowance(self.input, &self.allowance) {
+            match read_compressed_block_salvaging(self.input, &self.allowance, false) {
                 Ok(block) => {
                     bytes += held_bytes(&block);
                     self.done = block.header.is_last;

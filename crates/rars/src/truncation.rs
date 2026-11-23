@@ -8,7 +8,9 @@ use std::fmt;
 /// extracted. A cut through a file header or member data is an error instead,
 /// unless the archive was read with a member error handler (see
 /// [`crate::ArchiveReadOptions::with_member_error_handler`]); then it ends the
-/// archive here as [`TruncatedBlock::Member`].
+/// archive here as [`TruncatedBlock::Member`]. Under
+/// [`crate::ArchiveReadOptions::with_salvage`] that member is listed too, with
+/// the part of its data the file holds.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Truncation {

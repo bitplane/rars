@@ -249,9 +249,18 @@ pub enum Error {
     },
     /// A member's stream decodes to more than its declared size. Reported
     /// only under `ArchiveReadOptions::salvage`, after the member's declared
-    /// bytes were delivered; otherwise the member fails as invalid data.
+    /// bytes were delivered; otherwise the member fails as invalid data, or
+    /// in RAR 1.5 and 2.0, which have no end-of-file marker, its checksum.
     MemberRanPastDeclaredSize {
         declared: u64,
+    },
+    /// The archive's file ends `present` bytes into a member's `packed`
+    /// bytes of data. Reported only under `ArchiveReadOptions::salvage`,
+    /// after what decoded from those bytes was delivered; otherwise parsing
+    /// ends before the member.
+    MemberCutShort {
+        packed: u64,
+        present: u64,
     },
     Codec(crate::codec::Error),
     Rar3Recovery(crate::recovery::rar3::Error),
@@ -400,6 +409,10 @@ impl std::fmt::Display for Error {
             Self::MemberRanPastDeclaredSize { declared } => write!(
                 f,
                 "its data runs past its declared {declared} bytes; only those were delivered"
+            ),
+            Self::MemberCutShort { packed, present } => write!(
+                f,
+                "the archive ends {present} bytes into its {packed} bytes of data"
             ),
             Self::Codec(error) => write!(f, "{error}"),
             Self::Rar3Recovery(error) => write!(f, "{error}"),
@@ -560,6 +573,7 @@ impl Error {
             | Self::VolumeOutOfOrder
             | Self::MemberEndedEarly { .. }
             | Self::MemberRanPastDeclaredSize { .. }
+            | Self::MemberCutShort { .. }
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)

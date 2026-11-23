@@ -62,26 +62,46 @@ impl<B: Budget> CodecState<B> {
         let mut packed = file
             .packed_reader_with_allowance(archive, password, allowance)
             .map_err(|error| file.map_encrypted_payload_error(password, error))?;
-        let decoded = self.decode_split_to(&mut packed, file, solid, password, out)?;
+        let decoded = match self.decode_split_to(&mut packed, file, solid, password, out) {
+            Ok(decoded) => decoded,
+            Err(error) => return Err(self.past_declared(file, false).unwrap_or(error)),
+        };
         let ended_early = decoded.ended_early.is_some();
         let result = file.decoded_result(decoded, password);
         if result.is_err() && !ended_early {
             // The member reached its declared size and is still wrong. A
             // solid successor starts where this member's packed data ends,
             // which may be further on, if the size is what is wrong.
-            self.run_on(&mut packed);
+            let ran_past = self.run_on(&mut packed);
+            if let Some(error) = self.past_declared(file, ran_past) {
+                return Err(error);
+            }
         }
         result
     }
 
+    /// Under salvage, the error for a member whose stream went on past its
+    /// declared size, which is all it delivered. RAR 2.9 knows by its
+    /// end-of-file marker; RAR 1.5 and 2.0 by a run-on that ends cleanly.
+    fn past_declared(&self, file: &FileHeader, ran_on: bool) -> Option<Error> {
+        let ran_past = match self {
+            Self::Unpack29(decoder) => decoder.ran_past(),
+            Self::Unpack15(_) | Self::Unpack20(_) => ran_on,
+        };
+        (ran_past && self.read_control().salvage()).then_some(Error::MemberRanPastDeclaredSize {
+            declared: file.unp_size,
+        })
+    }
+
     /// Decodes the rest of a failed member's packed data into the window
-    /// only, keeping it if it ends cleanly. RAR 2.9 does this itself, up to
-    /// its end-of-file marker.
-    fn run_on(&mut self, input: &mut impl Read) {
+    /// only, keeping it if it ends cleanly, and returns whether it did and
+    /// went past the declared size. RAR 2.9 does this itself, up to its
+    /// end-of-file marker.
+    fn run_on(&mut self, input: &mut impl Read) -> bool {
         match self {
             Self::Unpack15(decoder) => decoder.run_on(input),
             Self::Unpack20(decoder) => decoder.run_on(input),
-            Self::Unpack29(_) => {}
+            Self::Unpack29(_) => false,
         }
     }
 
@@ -98,7 +118,10 @@ impl<B: Budget> CodecState<B> {
         let target = usize::try_from(file.unp_size)
             .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
         let result = match self {
-            Self::Unpack15(decoder) => decoder.decode_member_from_reader(input, target, solid, out),
+            Self::Unpack15(decoder) => {
+                decoder.input_cut = file.is_cut_short();
+                decoder.decode_member_from_reader(input, target, solid, out)
+            }
             Self::Unpack20(decoder) => decoder.decode_member_from_reader(input, target, out),
             Self::Unpack29(decoder) => {
                 if solid {
@@ -248,8 +271,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         let solid = self.file_is_solid(file);
         let password = self.password;
         let allowance = self.allowance.clone();
-        self.codec_for(file)?
-            .write_file_to(archive, file, solid, password, &allowance, out)?;
+        let result = self
+            .codec_for(file)
+            .and_then(|codec| codec.write_file_to(archive, file, solid, password, &allowance, out));
+        file.cut_short_result(result)?;
         self.decoded_files += 1;
         Ok(())
     }
@@ -815,6 +840,7 @@ mod tests {
 
     fn file(name: &[u8], flags: u16) -> FileHeader {
         FileHeader {
+            cut_short: false,
             block: block(flags),
             pack_size: 0,
             unp_size: 0,

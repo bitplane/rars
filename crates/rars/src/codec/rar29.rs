@@ -241,6 +241,8 @@ pub(crate) struct Reader29State<B: Budget> {
     base_offset: usize,
     output: Buffer<u8, B>,
     last_block_end: Option<LzBlockEnd>,
+    // Set when the last member's stream went on past its declared size.
+    ran_past: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,6 +257,10 @@ enum LzBlockEnd {
     NewFileKeepTables,
     NewFileNewTables,
 }
+
+/// A member whose stream goes on past its declared size.
+const LZ_TRAILING: Error = Error::InvalidData("RAR 2.9 LZ member has trailing data");
+const PPMD_TRAILING: Error = Error::InvalidData("RAR 2.9 PPMd member has trailing data");
 
 fn require_ppmd_symbol(symbol: Option<u8>) -> Result<u8> {
     symbol.ok_or(Error::InvalidData("RAR 2.9 PPMd model is corrupt"))
@@ -329,6 +335,7 @@ impl<B: Budget> Reader29State<B> {
             base_offset: 0,
             output: Buffer::new(allowance),
             last_block_end: None,
+            ran_past: false,
         }
     }
 
@@ -384,6 +391,7 @@ impl<B: Budget> Reader29State<B> {
             base_offset: self.base_offset,
             output: Buffer::copied(&self.output, &allowance)?,
             last_block_end: self.last_block_end,
+            ran_past: self.ran_past,
         })
     }
     pub fn reset_non_solid(&mut self) {
@@ -419,6 +427,7 @@ impl<B: Budget> Reader29State<B> {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.ran_past = false;
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -451,6 +460,7 @@ impl<B: Budget> Reader29State<B> {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.ran_past = false;
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -466,6 +476,7 @@ impl<B: Budget> Reader29State<B> {
         output_size: usize,
         out: &mut impl Write,
     ) -> Result<()> {
+        self.ran_past = false;
         self.read_control.check_codec()?;
         self.bits = BitReader::from_bytes_with_allowance(packed, &self.output.allowance())?;
         self.decode_bits_member_to(output_size, out, &mut std::io::empty())
@@ -564,6 +575,7 @@ impl<B: Budget> Reader29State<B> {
             // were packed. The member has failed, but a solid successor
             // starts from the tables, PPMd model and window at this member's
             // end marker, so decode on to it.
+            self.ran_past = error == LZ_TRAILING || error == PPMD_TRAILING;
             self.run_on_to_member_end(src);
             return Err(match error {
                 Error::NeedMoreInput => Error::InvalidData("RAR 2.9 bitstream is truncated"),
@@ -571,6 +583,12 @@ impl<B: Budget> Reader29State<B> {
             });
         }
         Ok(())
+    }
+
+    /// Whether the last member's stream went on past its declared size: its
+    /// end marker didn't follow its last byte.
+    pub(crate) fn ran_past(&self) -> bool {
+        self.ran_past
     }
 
     /// Writes decoded positions `start..end` to `out`, applying the filters
@@ -875,7 +893,7 @@ impl<B: Budget> Reader29State<B> {
         // Output past the declared size goes to the window only, so that
         // the decoder stays in step with the stream (see
         // `run_on_to_member_end`).
-        const TRAILING: Error = Error::InvalidData("RAR 2.9 PPMd member has trailing data");
+        const TRAILING: Error = PPMD_TRAILING;
         let symbol = require_ppmd_symbol(self.ppmd.decode_symbol(&mut self.bits)?)?;
         if symbol != self.ppmd_esc {
             self.output.try_push(symbol)?;
@@ -949,7 +967,7 @@ impl<B: Budget> Reader29State<B> {
         if symbol != 256 {
             // Left unread, for `run_on_to_member_end`.
             self.bits.bit_pos = symbol_start;
-            return Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
+            return Err(LZ_TRAILING);
         }
         match self.read_end_of_block()? {
             LzBlockEnd::SameFileNewTable => {

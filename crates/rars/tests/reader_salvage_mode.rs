@@ -3,9 +3,16 @@
 //! still holds, with each problem reported beside the bytes. Every archive
 //! here is written by rars and then damaged.
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[path = "support/scratch.rs"]
+mod scratch;
+
+use rars::rar15_40::{write_compressed_archive, FileEntry, Rar29Method, WriterOptions};
+use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions as Rar50WriterOptions};
 use rars::{
-    Archive, ArchiveMember, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error,
-    ExtractionErrorAction, HeaderDamageKind,
+    Archive, ArchiveMember, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder,
+    EntrySource, Error, ExtractionErrorAction, FeatureSet, FilterKind, FilterPolicy, FilterSpec,
+    HeaderDamageKind, Rar50Scratch,
 };
 use std::io::{self, Write};
 use std::ops::Range;
@@ -267,6 +274,16 @@ fn salvage(
     bytes: &[u8],
     buffered_limit: Option<u64>,
 ) -> (Archive, Outputs, Vec<(Vec<u8>, String)>) {
+    salvage_with(bytes, buffered_limit, None)
+}
+
+/// [`salvage`], decoding RAR 5 members past the buffered limit through
+/// `scratch` if given.
+fn salvage_with(
+    bytes: &[u8],
+    buffered_limit: Option<u64>,
+    scratch: Option<&Rar50Scratch>,
+) -> (Archive, Outputs, Vec<(Vec<u8>, String)>) {
     let failures = Failures::default();
     let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
     let mut options = ArchiveReadOptions::new()
@@ -274,6 +291,9 @@ fn salvage(
         .with_member_error_handler(&handler);
     if let Some(limit) = buffered_limit {
         options = options.with_rar50_buffered_decode_limit(limit);
+    }
+    if let Some(scratch) = scratch {
+        options = options.with_rar50_scratch(scratch);
     }
     let archive = ArchiveReader::read_with_options(bytes, options).unwrap();
     let outputs = extract(&archive, options).unwrap();
@@ -350,10 +370,10 @@ fn rar50_blocks(packed: &[u8]) -> Vec<usize> {
 
 #[test]
 fn a_member_that_fails_partway_delivers_what_decoded_before_the_failure() {
-    let members = members(400_000);
+    let members = members(150_000);
     for solid in [false, true] {
-        for streaming in [false, true] {
-            let case = format!("solid={solid} streaming={streaming}");
+        for &path in RAR50_PATHS {
+            let case = format!("solid={solid} {path:?}");
             let mut bytes = build(ArchiveVersion::Rar50, solid, &members);
             let (_, packed) = member_ranges(&bytes, 2);
             let blocks = rar50_blocks(&bytes[packed.clone()]);
@@ -362,7 +382,7 @@ fn a_member_that_fails_partway_delivers_what_decoded_before_the_failure() {
             // decoder fails once the first block is out.
             bytes[packed.start + blocks[1] + 1] ^= 0x01;
 
-            if !streaming {
+            if path == Rar50Path::Buffered {
                 let failures = Failures::default();
                 let handler =
                     |member: &ArchiveMember, error: &Error| failures.handle(member, error);
@@ -372,7 +392,7 @@ fn a_member_that_fails_partway_delivers_what_decoded_before_the_failure() {
                 assert!(opened_empty(&outputs, b"m2.txt"), "{case}");
             }
 
-            let (_, outputs, failed) = salvage(&bytes, streaming.then_some(1024));
+            let (_, outputs, failed) = salvage_on(&bytes, path, 1024);
             assert_eq!(failed[0].0, b"m2.txt", "{case}");
             assert!(
                 failed[0].1.contains("checksum mismatch"),
@@ -457,29 +477,103 @@ fn declare_rar50_size(bytes: &mut [u8], index: usize, size: u64) {
     reseal(bytes, header.start, true);
 }
 
+/// How a RAR 5 member is decoded: whole in memory, streamed, or streamed
+/// through a scratch file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rar50Path {
+    Buffered,
+    Streaming,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    Scratch,
+}
+
+const RAR50_PATHS: &[Rar50Path] = &[
+    Rar50Path::Buffered,
+    Rar50Path::Streaming,
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    Rar50Path::Scratch,
+];
+
+/// [`salvage`] down `path`, for members larger than `streamed_above`.
+fn salvage_on(
+    bytes: &[u8],
+    path: Rar50Path,
+    streamed_above: u64,
+) -> (Archive, Outputs, Vec<(Vec<u8>, String)>) {
+    match path {
+        Rar50Path::Buffered => salvage(bytes, None),
+        Rar50Path::Streaming => salvage(bytes, Some(streamed_above)),
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        Rar50Path::Scratch => {
+            let dir = scratch::case("reader-salvage-mode");
+            let policy = Rar50Scratch::new(&*dir, 64 * 1024 * 1024);
+            salvage_with(bytes, Some(streamed_above), Some(&policy))
+        }
+    }
+}
+
+/// A solid successor starts where the stream ended, not at the declared
+/// size, as it does in unrar: the rest of the stream is decoded into the
+/// window only.
 #[test]
 fn a_rar50_member_that_runs_past_its_declared_size_delivers_the_declared_bytes() {
     let members = members(6000);
-    for streaming in [false, true] {
-        let case = format!("streaming={streaming}");
-        let mut bytes = build(ArchiveVersion::Rar50, false, &members);
-        declare_rar50_size(&mut bytes, 2, 1000);
+    for &path in RAR50_PATHS {
+        for solid in [false, true] {
+            let case = format!("{path:?} solid={solid}");
+            let mut bytes = build(ArchiveVersion::Rar50, solid, &members);
+            declare_rar50_size(&mut bytes, 2, 1000);
 
-        let archive = ArchiveReader::read(&bytes).unwrap();
-        assert!(extract(&archive, ArchiveReadOptions::new()).is_err());
+            let archive = ArchiveReader::read(&bytes).unwrap();
+            assert!(extract(&archive, ArchiveReadOptions::new()).is_err());
 
-        let (_, outputs, failed) = salvage(&bytes, streaming.then_some(100));
-        assert_eq!(
-            failed,
-            [(
-                b"m2.txt".to_vec(),
-                "MemberRanPastDeclaredSize { declared: 1000 }".to_string()
-            )],
-            "{case}"
-        );
-        assert_eq!(output(&outputs, b"m2.txt"), &members[2].1[..1000], "{case}");
-        for (name, data) in members.iter().filter(|(name, _)| name != b"m2.txt") {
-            assert_eq!(output(&outputs, name), data, "{case}: {name:?}");
+            let (_, outputs, failed) = salvage_on(&bytes, path, 100);
+            assert_eq!(
+                failed,
+                [(
+                    b"m2.txt".to_vec(),
+                    "MemberRanPastDeclaredSize { declared: 1000 }".to_string()
+                )],
+                "{case}"
+            );
+            assert_eq!(output(&outputs, b"m2.txt"), &members[2].1[..1000], "{case}");
+            for (name, data) in members.iter().filter(|(name, _)| name != b"m2.txt") {
+                assert_eq!(output(&outputs, name), data, "{case}: {name:?}");
+            }
+        }
+    }
+}
+
+/// The member output ceiling bounds how far the stream is decoded on: past
+/// it, the successor decodes from wherever the run-on stopped.
+#[test]
+fn the_member_output_ceiling_bounds_a_rar50_run_on() {
+    let mut members = members(60_000);
+    for (index, (_, data)) in members.iter_mut().enumerate() {
+        if index != 2 {
+            data.truncate(800);
+        }
+    }
+    let mut bytes = build(ArchiveVersion::Rar50, true, &members);
+    declare_rar50_size(&mut bytes, 2, 1000);
+    for limit in [1000, 100_000] {
+        let failures = Failures::default();
+        let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+        let options = ArchiveReadOptions::new()
+            .with_salvage(true)
+            .with_member_error_handler(&handler)
+            .with_max_member_output_bytes(limit);
+        let archive = ArchiveReader::read_with_options(&bytes, options).unwrap();
+        let outputs = extract(&archive, options).unwrap();
+        let failed = failures.take();
+        assert_eq!(output(&outputs, b"m2.txt"), &members[2].1[..1000]);
+        let names: Vec<_> = failed.iter().map(|(name, _)| name.as_slice()).collect();
+        if limit == 1000 {
+            // Not run on at all, so the successor can't be read.
+            assert_eq!(names[..2], [b"m2.txt".as_slice(), b"m3.txt"], "{failed:?}");
+        } else {
+            assert_eq!(names, [b"m2.txt"], "{failed:?}");
+            assert_eq!(output(&outputs, b"m3.txt"), members[3].1);
         }
     }
 }
@@ -618,6 +712,246 @@ fn salvage_changes_nothing_for_a_whole_archive() {
             assert!(archive.header_damage().is_empty());
             assert!(failed.is_empty());
             assert_eq!(outputs, members);
+        }
+    }
+}
+
+/// The scratch path writes a member that fails its checksum whole, and a
+/// filtered member that fails partway up to the first filter it didn't
+/// finish, with the filters before it applied.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+#[test]
+fn the_rar50_scratch_path_delivers_a_failed_member() {
+    let members = members(6000);
+    for solid in [false, true] {
+        let case = format!("solid={solid}");
+        let mut bytes = build(ArchiveVersion::Rar50, solid, &members);
+        let at = data_crc_at(&bytes, ArchiveVersion::Rar50, 2);
+        let (header, _) = member_ranges(&bytes, 2);
+        bytes[at] ^= 0x01;
+        reseal(&mut bytes, header.start, true);
+        let (_, outputs, failed) = salvage_on(&bytes, Rar50Path::Scratch, 100);
+        assert_eq!(failed.len(), 1, "{case}: {failed:?}");
+        assert!(failed[0].1.contains("Crc32Mismatch"), "{case}: {failed:?}");
+        assert_eq!(outputs, members, "{case}");
+    }
+
+    // E8 filters over all but the start of the member, so one is still open
+    // when a later block fails: the bytes before it are final, and its own
+    // aren't, until it is applied.
+    let mut seed = 488u32;
+    let mut code = members[0].1.clone();
+    code.extend((0..1_000_000).map(|index| {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        match index % 7 {
+            0 => 0xe8,
+            1 | 2 => (seed >> 16) as u8 & 0x0f,
+            _ => (seed >> 24) as u8 & 0x3f,
+        }
+    }));
+    let entry = ArchiveEntry::new(
+        b"code.bin".to_vec(),
+        EntrySource::from_bytes(Arc::<[u8]>::from(code.clone())),
+    );
+    let mut bytes = Rar50Writer::new(
+        Rar50WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+            .with_compression_level(1),
+    )
+    .entries([entry])
+    .filter_policy(FilterPolicy::Explicit(FilterSpec::range(
+        FilterKind::E8,
+        6000..code.len(),
+    )))
+    .finish()
+    .unwrap();
+    let (_, packed) = member_ranges(&bytes, 0);
+    let blocks = rar50_blocks(&bytes[packed.clone()]);
+    assert!(blocks.len() > 2, "the member needs a later block to damage");
+    // The last block, cut to half its size, ends partway through a filter.
+    // Its header still checks out.
+    let last = packed.start + blocks[blocks.len() - 1];
+    let flags = bytes[last];
+    let width = usize::from((flags >> 3) & 3) + 1;
+    let size_at = last + 2..last + 2 + width;
+    let size = bytes[size_at.clone()]
+        .iter()
+        .rev()
+        .fold(0usize, |size, &byte| size << 8 | usize::from(byte));
+    bytes[size_at.clone()].copy_from_slice(&(size / 2).to_le_bytes()[..width]);
+    bytes[last + 1] = bytes[size_at]
+        .iter()
+        .fold(0x5a ^ flags, |sum, &byte| sum ^ byte);
+    // The streaming decoder can't hold filters this long.
+    let mut first = None;
+    for path in [Rar50Path::Buffered, Rar50Path::Scratch] {
+        let (_, outputs, failed) = salvage_on(&bytes, path, 1024);
+        assert_eq!(failed.len(), 1, "{path:?}: {failed:?}");
+        let delivered = output(&outputs, b"code.bin");
+        assert!(delivered.len() > 6000, "{path:?}");
+        assert!(delivered.len() < code.len(), "{path:?}");
+        assert!(code.starts_with(delivered), "{path:?}");
+        // Both stop at the same filter.
+        match &first {
+            None => first = Some(delivered.to_vec()),
+            Some(first) => assert_eq!(delivered, first, "{path:?}"),
+        }
+    }
+}
+
+/// Lowers RAR 1.5-4 member `index`'s declared size to `size`, and reseals
+/// its header.
+fn declare_legacy_size(bytes: &mut [u8], index: usize, size: u32) {
+    let (header, _) = member_ranges(bytes, index);
+    bytes[header.start + 11..header.start + 15].copy_from_slice(&size.to_le_bytes());
+    reseal(bytes, header.start, false);
+}
+
+/// A RAR 2.9 archive of `members` written with `method`.
+fn build_rar29(method: Rar29Method, solid: bool, members: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let entries: Vec<_> = members
+        .iter()
+        .map(|(name, data)| FileEntry {
+            name,
+            data,
+            file_time: 0,
+            file_attr: 0x20,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        })
+        .collect();
+    let mut features = FeatureSet::store_only();
+    features.solid = solid;
+    let options = WriterOptions::new(ArchiveVersion::Rar29, features).with_method(method);
+    write_compressed_archive(&entries, options).unwrap()
+}
+
+/// RAR 1.5 to 2.9 report a stream that runs past its declared size as RAR 5
+/// does, under salvage only. RAR 2.9 knows it by the end-of-file marker that
+/// doesn't follow the last byte; RAR 1.5 and 2.0, which have none, by the
+/// rest of the packed data decoding on cleanly. Either way the declared bytes
+/// are delivered and a solid successor reads whole.
+#[test]
+fn a_legacy_member_that_runs_past_its_declared_size_is_reported_as_such() {
+    let members = members(6000);
+    let cases = [
+        ("RAR 1.5", ArchiveVersion::Rar15, None),
+        ("RAR 2.0", ArchiveVersion::Rar20, None),
+        ("RAR 2.9 LZ", ArchiveVersion::Rar29, Some(Rar29Method::Lz)),
+        (
+            "RAR 2.9 PPMd",
+            ArchiveVersion::Rar29,
+            Some(Rar29Method::Ppmd),
+        ),
+    ];
+    for (format, version, method) in cases {
+        for solid in [false, true] {
+            let case = format!("{format} solid={solid}");
+            let mut bytes = match method {
+                Some(method) => build_rar29(method, solid, &members),
+                None => build(version, solid, &members),
+            };
+            declare_legacy_size(&mut bytes, 2, 1000);
+
+            // Without salvage, the error it always had.
+            let failures = Failures::default();
+            let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+            let strict = ArchiveReadOptions::new().with_member_error_handler(&handler);
+            let archive = ArchiveReader::read_with_options(&bytes, strict).unwrap();
+            extract(&archive, strict).unwrap();
+            let failed = failures.take();
+            assert_eq!(failed.len(), 1, "{case}: {failed:?}");
+            let expected = if version == ArchiveVersion::Rar29 {
+                "has trailing data"
+            } else {
+                "Crc32Mismatch"
+            };
+            assert!(failed[0].1.contains(expected), "{case}: {failed:?}");
+
+            let (_, outputs, failed) = salvage(&bytes, None);
+            assert_eq!(
+                failed,
+                [(
+                    b"m2.txt".to_vec(),
+                    "MemberRanPastDeclaredSize { declared: 1000 }".to_string()
+                )],
+                "{case}"
+            );
+            assert_eq!(output(&outputs, b"m2.txt"), &members[2].1[..1000], "{case}");
+            for (name, data) in members.iter().filter(|(name, _)| name != b"m2.txt") {
+                assert_eq!(output(&outputs, name), data, "{case}: {name:?}");
+            }
+        }
+    }
+}
+
+/// A file cut partway through a member's data: salvage offers the member,
+/// delivers what decodes from the bytes there are, and reports the cut.
+/// Without salvage the parse ends before it, as before.
+#[test]
+fn a_member_the_file_ends_partway_through_delivers_what_is_there() {
+    let members = members(30_000);
+    let cases = [
+        ("RAR 1.5", ArchiveVersion::Rar15, None),
+        ("RAR 2.0", ArchiveVersion::Rar20, None),
+        ("RAR 2.9 LZ", ArchiveVersion::Rar29, Some(Rar29Method::Lz)),
+        (
+            "RAR 2.9 PPMd",
+            ArchiveVersion::Rar29,
+            Some(Rar29Method::Ppmd),
+        ),
+        ("RAR 5", ArchiveVersion::Rar50, None),
+    ];
+    for (format, version, method) in cases {
+        for solid in [false, true] {
+            let bytes = match method {
+                Some(method) => build_rar29(method, solid, &members),
+                None => build(version, solid, &members),
+            };
+            let (_, packed) = member_ranges(&bytes, 2);
+            let cut = &bytes[..packed.start + packed.len() / 2];
+            let present = (packed.len() / 2) as u64;
+
+            // Without salvage the member is lost.
+            let failures = Failures::default();
+            let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+            let strict = ArchiveReadOptions::new().with_member_error_handler(&handler);
+            let archive = ArchiveReader::read_with_options(cut, strict).unwrap();
+            let outputs = extract(&archive, strict).unwrap();
+            assert_eq!(outputs, members[..2], "{format} solid={solid}");
+
+            let paths: &[Rar50Path] = if version == ArchiveVersion::Rar50 {
+                RAR50_PATHS
+            } else {
+                &[Rar50Path::Buffered]
+            };
+            for &path in paths {
+                let case = format!("{format} solid={solid} {path:?}");
+                let (archive, outputs, failed) = salvage_on(cut, path, 1024);
+                assert!(archive.truncation().is_some(), "{case}");
+                assert_eq!(
+                    failed,
+                    [(
+                        b"m2.txt".to_vec(),
+                        format!(
+                            "MemberCutShort {{ packed: {}, present: {present} }}",
+                            packed.len()
+                        )
+                    )],
+                    "{case}"
+                );
+                assert_eq!(outputs[..2], members[..2], "{case}");
+                let delivered = output(&outputs, b"m2.txt");
+                let whole = &members[2].1;
+                assert!(
+                    delivered.len() > whole.len() / 8,
+                    "{case}: {}",
+                    delivered.len()
+                );
+                assert!(delivered.len() < whole.len(), "{case}");
+                assert!(whole.starts_with(delivered), "{case}");
+                assert_eq!(outputs.len(), 3, "{case}");
+            }
         }
     }
 }

@@ -155,7 +155,12 @@ impl FileHeader {
         PackedReader<crate::source::RangeReader<'a>, B>,
         Option<Rar50Keys>,
     )> {
-        let reader = archive.range_reader(self.block.data_range.clone())?;
+        let mut range = self.block.data_range.clone();
+        if self.encrypted && self.is_cut_short() {
+            // Whole cipher blocks only.
+            range.end -= range.len() % 16;
+        }
+        let reader = archive.range_reader(range)?;
         if !self.encrypted {
             return Ok((PackedReader::Plain(reader), None));
         }
@@ -230,6 +235,23 @@ impl FileHeader {
         decoder
             .read_control
             .ended_early(self.unpacked_size, decoded as u64)
+    }
+
+    /// Under salvage, a member the file ends partway through fails as that,
+    /// whatever else stopped it, once what decoded is delivered.
+    fn cut_short_result(&self, result: Result<()>) -> Result<()> {
+        match result {
+            Err(error) if self.is_cut_short() && error.kind() != crate::ErrorKind::Cancelled => {
+                Err(self.entry_error(
+                    "reading",
+                    Error::MemberCutShort {
+                        packed: self.packed_size(),
+                        present: self.block.data_range.len() as u64,
+                    },
+                ))
+            }
+            result => result,
+        }
     }
 
     /// Under salvage, a member whose stream went on past its declared size
@@ -449,6 +471,7 @@ impl FileHeader {
             }
         }
         let payload = FileHeader {
+            cut_short: false,
             block: self.block.clone(),
             file_flags: self.file_flags,
             rewrite_metadata_complete: self.rewrite_metadata_complete,
@@ -1844,6 +1867,17 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         writer: &mut dyn Write,
         history: HistoryRetention,
     ) -> Result<()> {
+        let result = self.write_whole_file_to(archive, file, writer, history);
+        file.cut_short_result(result)
+    }
+
+    fn write_whole_file_to(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+        writer: &mut dyn Write,
+        history: HistoryRetention,
+    ) -> Result<()> {
         self.decoder.read_control.check()?;
         if file.is_stored() {
             return file.write_stored_with_allowance(
@@ -2723,6 +2757,7 @@ mod tests {
 
     fn plain_file(name: &[u8], data: &[u8], hash: Option<FileHash>) -> FileHeader {
         FileHeader {
+            cut_short: false,
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
@@ -3408,6 +3443,7 @@ mod tests {
     fn constant_time_hash_comparison_keeps_hash_validation_behaviour() {
         let data = b"hash me";
         let file = FileHeader {
+            cut_short: false,
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
@@ -3735,6 +3771,7 @@ mod tests {
                 rewrite_metadata_complete: true,
             },
             blocks: vec![Block::File(FileHeader {
+                cut_short: false,
                 block: empty_block(HEAD_FILE, flags, 0..data.len()),
                 file_flags: 0,
                 rewrite_metadata_complete: true,
@@ -3785,6 +3822,7 @@ mod tests {
 
     fn split_fragment_file(name: &[u8], hfl_flags: u64) -> FileHeader {
         FileHeader {
+            cut_short: false,
             block: empty_block(HEAD_FILE, hfl_flags, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,

@@ -243,6 +243,8 @@ pub struct FileHeader {
     pub file_comment: Vec<u8>,
     pub ext_time: Vec<u8>,
     pub packed_range: Range<usize>,
+    /// Set by a salvaging parse on a member the file ends partway through.
+    pub(crate) cut_short: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,6 +325,12 @@ impl FileHeader {
         let unknown =
             self.is_split_after() && self.block.flags & FHD_LARGE != 0 && self.unp_size == u64::MAX;
         (!unknown).then_some(self.unp_size)
+    }
+
+    /// Whether the file ends before this member's packed data does, which
+    /// only a salvaging parse keeps.
+    pub(crate) fn is_cut_short(&self) -> bool {
+        self.cut_short
     }
 
     pub fn is_encrypted(&self) -> bool {
@@ -416,7 +424,12 @@ impl FileHeader {
         password: Option<&[u8]>,
         allowance: &B,
     ) -> Result<PackedReader<crate::source::RangeReader<'a>, B>> {
-        let reader = archive.range_reader(self.packed_range.clone())?;
+        let mut range = self.packed_range.clone();
+        if self.is_encrypted() && self.is_cut_short() {
+            // Whole cipher blocks only.
+            range.end -= range.len() % 16;
+        }
+        let reader = archive.range_reader(range.clone())?;
         if !self.is_encrypted() {
             return Ok(PackedReader::Plain(reader));
         }
@@ -425,7 +438,7 @@ impl FileHeader {
             return Err(Error::NeedPassword);
         };
         if (self.unp_ver == 20 || self.unp_ver == 26 || self.unp_ver >= 29)
-            && !self.packed_range.len().is_multiple_of(16)
+            && !range.len().is_multiple_of(16)
         {
             return Err(Error::InvalidHeader(
                 "RAR encrypted payload is not block aligned",
@@ -535,6 +548,31 @@ impl FileHeader {
         out: &mut impl Write,
         allowance: &B,
     ) -> Result<()> {
+        let result = self.write_whole_stored_with_allowance(archive, password, out, allowance);
+        self.cut_short_result(result)
+    }
+
+    /// Under salvage, a member the file ends partway through fails as that,
+    /// whatever else stopped it, once what decoded is delivered.
+    pub(crate) fn cut_short_result(&self, result: Result<()>) -> Result<()> {
+        match result {
+            Err(error) if self.is_cut_short() && error.kind() != crate::ErrorKind::Cancelled => {
+                Err(Error::MemberCutShort {
+                    packed: self.pack_size,
+                    present: self.packed_range.len() as u64,
+                })
+            }
+            result => result,
+        }
+    }
+
+    fn write_whole_stored_with_allowance<B: crate::codec::workspace::Budget>(
+        &self,
+        archive: &Archive,
+        password: Option<&[u8]>,
+        out: &mut impl Write,
+        allowance: &B,
+    ) -> Result<()> {
         if !self.is_encrypted() && self.pack_size != self.unp_size {
             return Err(Error::InvalidHeader(
                 "RAR 1.5 stored file has mismatched packed and unpacked sizes",
@@ -638,6 +676,7 @@ impl FileHeader {
             | Error::VolumeOutOfOrder
             | Error::MemberEndedEarly { .. }
             | Error::MemberRanPastDeclaredSize { .. }
+            | Error::MemberCutShort { .. }
             | Error::Cancelled
             | Error::InvalidArgument(_)
             | Error::WriterFailure(_)
@@ -1010,7 +1049,15 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file.pack_size)?;
                     let next = match checked_block_next(&block, total, archive.len()) {
                         Err(Error::TooShort) if options.salvages() => {
-                            let cut = TruncatedBlock::Member(file.name);
+                            let cut = TruncatedBlock::Member(file.name.clone());
+                            if salvages_cut_member(&options, &file) {
+                                file.cut_short = true;
+                                file.block.offset = block.offset;
+                                let start =
+                                    sig.offset + block.offset + total - file.pack_size as usize;
+                                file.packed_range = start..sig.offset + archive.len();
+                                blocks.push(Block::File(file));
+                            }
                             truncation =
                                 Some(Truncation::new(sig.offset + block.offset, cut, true));
                             break;
@@ -1233,7 +1280,15 @@ impl Archive {
                     let total = file_block_total_size(&block, total, file_header.pack_size)?;
                     let next = match checked_file_block_next(sfx_offset, &block, total, file_len) {
                         Err(Error::TooShort) if options.salvages() => {
-                            let cut = TruncatedBlock::Member(file_header.name);
+                            let cut = TruncatedBlock::Member(file_header.name.clone());
+                            if salvages_cut_member(&options, &file_header) {
+                                file_header.cut_short = true;
+                                file_header.block.offset = block.offset;
+                                let start = sfx_offset + block.offset + total
+                                    - file_header.pack_size as usize;
+                                file_header.packed_range = start..file_len as usize;
+                                blocks.push(Block::File(file_header));
+                            }
                             truncation =
                                 Some(Truncation::new(sfx_offset + block.offset, cut, true));
                             break;
@@ -3004,6 +3059,7 @@ fn parse_file_like_header(
             "RAR 1.5 packed file size overflows usize",
         ))?;
     Ok(FileHeader {
+        cut_short: false,
         block,
         pack_size,
         unp_size,
@@ -3436,6 +3492,12 @@ fn file_block_total_size(
     header_prefix
         .checked_add(pack_size)
         .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))
+}
+
+/// Whether a salvaging parse keeps a member the file ends partway through,
+/// to decode as far as it goes: one that isn't split across volumes.
+fn salvages_cut_member(options: &crate::ArchiveReadOptions<'_>, file: &FileHeader) -> bool {
+    options.salvage && !file.is_split_before() && !file.is_split_after()
 }
 
 fn checked_block_next(block: &BlockHeader, total: usize, archive_len: usize) -> Result<usize> {
@@ -4895,6 +4957,7 @@ mod tests {
 
     fn file_header_with(flags: u16) -> FileHeader {
         FileHeader {
+            cut_short: false,
             block: block_header_with(flags),
             pack_size: 0,
             unp_size: 0,

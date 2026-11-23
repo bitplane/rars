@@ -67,22 +67,50 @@ impl Seek for ScratchFile {
     }
 }
 
+/// Copies the first `limit` bytes of `source`, or all of it if shorter.
 fn copy(
     source: &mut ScratchFile,
     mut destination: &mut dyn Write,
+    limit: u64,
     control: &crate::read_control::ReadControl,
 ) -> Result<()> {
     source.rewind()?;
     let mut buffer = [0; 64 * 1024];
-    loop {
+    let mut left = limit;
+    while left != 0 {
         control.check()?;
-        let count = source.read(&mut buffer)?;
+        let want = buffer
+            .len()
+            .min(usize::try_from(left).unwrap_or(usize::MAX));
+        let count = source.read(&mut buffer[..want])?;
         if count == 0 {
             break;
         }
         control.write_all(&mut destination, &buffer[..count])?;
+        left -= count as u64;
     }
     control.check()
+}
+
+/// Where a member that failed after `decoded` bytes stops being final: the
+/// start of the first filter its output doesn't cover.
+fn first_unfinished_filter(
+    records: &mut ScratchFile,
+    decoded: u64,
+    output_size: usize,
+    filter_memory_limit: u64,
+) -> Result<u64> {
+    records.rewind()?;
+    let mut cut = decoded;
+    while records.pos < records.len {
+        let mut bytes = [0; 24];
+        records.read_exact(&mut bytes)?;
+        let filter = decode_filter(bytes, output_size, filter_memory_limit)?;
+        if (filter.start + filter.length) as u64 > decoded {
+            cut = cut.min(filter.start as u64);
+        }
+    }
+    Ok(cut)
 }
 
 fn verify(
@@ -201,7 +229,7 @@ pub(super) fn decode<R: Read, B: Budget>(
     let output_size = checked_unpacked_size(file.unpacked_size)?;
     let dictionary_size = usize::try_from(info.dictionary_size)
         .map_err(|_| Error::InvalidHeader("RAR 5 dictionary size overflows host address size"))?;
-    decoder
+    let decoded = decoder
         .decode_to_sink_with_filters(
             packed,
             info.algorithm_version,
@@ -257,13 +285,42 @@ pub(super) fn decode<R: Read, B: Budget>(
             StreamDecodeError::Decode(error) => Error::from(error),
             StreamDecodeError::Sink(error) => error,
             StreamDecodeError::FilteredMember => unreachable!("scratch supplies a filter handler"),
-        })?;
+        });
+    // Salvage delivers what decoded before a failure, short of a filter's
+    // block that never completed, and a member that fails its checksum
+    // whole; then the error.
+    let salvage = control.salvage();
+    let failed = match decoded {
+        Ok(()) => None,
+        Err(error) if salvage => Some(error),
+        Err(error) => return Err(error),
+    };
+    let cut = match failed {
+        Some(_) => first_unfinished_filter(
+            &mut records,
+            raw.len,
+            output_size,
+            policy.filter_memory_limit,
+        )?,
+        None => raw.len,
+    };
+    let deliver = |source: &mut ScratchFile, writer: &mut dyn Write| -> Result<()> {
+        if let Some(error) = failed {
+            copy(source, writer, cut, &control)?;
+            return Err(error);
+        }
+        let verified = verify(file, source, keys, &control);
+        if verified.is_err() && !salvage {
+            return verified;
+        }
+        copy(source, writer, cut, &control)?;
+        verified
+    };
     if records.len == 0 {
-        verify(file, &mut raw, keys, &control)?;
-        return copy(&mut raw, writer, &control);
+        return deliver(&mut raw, writer);
     }
     let mut transformed = ScratchFile::create(policy, &budget)?;
-    copy(&mut raw, &mut transformed, &control)?;
+    copy(&mut raw, &mut transformed, u64::MAX, &control)?;
     records.rewind()?;
     while records.pos < records.len {
         control.check()?;
@@ -272,6 +329,10 @@ pub(super) fn decode<R: Read, B: Budget>(
         // These bytes came back from disk. Revalidate them before allocating
         // or seeking, even though the codec admitted the original record.
         let filter = decode_filter(bytes, output_size, policy.filter_memory_limit)?;
+        if (filter.start + filter.length) as u64 > cut {
+            // Past the bytes a failed member delivers.
+            continue;
+        }
         transformed.seek(SeekFrom::Start(filter.start as u64))?;
         let mut data = Buffer::filled(filter.length, 0, &decoder.allowance())?;
         control.reader(&mut transformed).read_exact(&mut data)?;
@@ -279,8 +340,7 @@ pub(super) fn decode<R: Read, B: Budget>(
         transformed.seek(SeekFrom::Start(filter.start as u64))?;
         control.write_all(&mut transformed, &data)?;
     }
-    verify(file, &mut transformed, keys, &control)?;
-    copy(&mut transformed, writer, &control)
+    deliver(&mut transformed, writer)
 }
 
 #[cfg(test)]

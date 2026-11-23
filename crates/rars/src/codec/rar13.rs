@@ -112,6 +112,11 @@ pub(crate) struct Reader15State<B: Budget> {
     bits: ReaderBits<B>,
     target: usize,
     output_written: usize,
+    // Where the last step began, to drop a step that ran past the end of a
+    // member the file is cut through.
+    step_start: usize,
+    /// Set for a member the file ends partway through, under salvage.
+    pub(crate) input_cut: bool,
     window: Buffer<u8, B>,
     unp_ptr: usize,
     prev_ptr: usize,
@@ -199,6 +204,8 @@ impl<B: Budget> Reader15State<B> {
             bits: ReaderBits::with_allowance(&[], allowance)?,
             target: 0,
             output_written: 0,
+            step_start: 0,
+            input_cut: false,
             window: Buffer::filled(0x10000, 0, allowance)?,
             unp_ptr: 0,
             prev_ptr: 0,
@@ -244,6 +251,8 @@ impl<B: Budget> Reader15State<B> {
             bits: self.bits.try_clone()?,
             target: self.target,
             output_written: self.output_written,
+            step_start: self.step_start,
+            input_cut: self.input_cut,
             window: Buffer::copied(&self.window, &self.window.allowance())?,
             unp_ptr: self.unp_ptr,
             prev_ptr: self.prev_ptr,
@@ -343,6 +352,10 @@ impl<B: Budget> Reader15State<B> {
                     // The packed data holds no more of this member. Write
                     // what it did hold, for its CRC to say whether that is
                     // the whole file and only the declared size is wrong.
+                    if self.tail.is_none() && self.input_cut && self.bits.read_past_end() {
+                        // The last step ran on past the bytes there are.
+                        chunk.truncate(self.step_start.saturating_sub(chunk_start));
+                    }
                     self.roll_back_to_tail(&mut chunk, chunk_start);
                     out.write_all(&chunk).map_err(Error::from)?;
                 } else if self.read_control.salvage() {
@@ -394,11 +407,14 @@ impl<B: Budget> Reader15State<B> {
     /// that pad the last byte are left. Damage that has thrown the decoder
     /// out of step with the stream usually ends some other way, and then the
     /// declared size is the better guess at where the next member starts.
-    pub(crate) fn run_on(&mut self, input: &mut impl Read) {
+    ///
+    /// Returns whether the stream went on cleanly past the declared size.
+    pub(crate) fn run_on(&mut self, input: &mut impl Read) -> bool {
         let saved = self.checkpoint();
         let control = self.read_control.clone();
         let src = &mut control.reader(input);
         let mut sink = std::io::sink();
+        let mut decoded = false;
         let clean = loop {
             if self.bits.top_up(src).is_err() || self.bits.read_past_end() {
                 break false;
@@ -409,10 +425,12 @@ impl<B: Budget> Reader15State<B> {
             if self.decode_step(&mut sink).is_err() {
                 break false;
             }
+            decoded = true;
         };
         if let Some(mut saved) = saved.filter(|_| !clean) {
             std::mem::swap(&mut *saved, self);
         }
+        clean && decoded
     }
 
     fn init_member(&mut self, target: usize, solid: bool) {
@@ -461,6 +479,7 @@ impl<B: Budget> Reader15State<B> {
             if self.tail.is_none() && self.bits.only_zero_padding_left() {
                 self.tail = self.checkpoint();
             }
+            self.step_start = self.output_written;
             self.decode_step(out)?;
         }
         if self.output_written == self.target && self.bits.read_past_end() {

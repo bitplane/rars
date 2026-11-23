@@ -66,6 +66,10 @@ pub(crate) struct ReadControl(
     /// Set under `ArchiveReadOptions::salvage`, to collect the header damage
     /// a parse reads past.
     Option<Arc<crate::header_damage::DamageLog>>,
+    /// `ArchiveReadOptions::max_member_output_bytes`, which under salvage
+    /// also bounds how far a stream that runs past its declared size is
+    /// decoded on into the window.
+    Option<u64>,
 );
 
 /// Whether RAR 3 decoding may run filter programs other than the six
@@ -116,12 +120,21 @@ impl ReadControl {
             // workers had decoded.
             control.2 = DecodeWorkers::Serial;
             control.4 = Some(crate::header_damage::DamageLog::new());
+            control.5 = options.max_member_output_bytes;
         }
         control
     }
     /// Whether to salvage: deliver what decodes and read past header damage.
     pub(crate) fn salvage(&self) -> bool {
         self.4.is_some()
+    }
+    /// How many bytes a member's stream may decode to in all, under salvage,
+    /// when it runs past its declared size and is decoded on into the window
+    /// for a solid successor: the member output ceiling, if there is one.
+    pub(crate) fn run_on_limit(&self) -> usize {
+        self.5.map_or(usize::MAX, |limit| {
+            usize::try_from(limit).unwrap_or(usize::MAX)
+        })
     }
     /// Records header damage a salvaging parse read past.
     pub(crate) fn report_damage(&self, offset: usize, kind: crate::HeaderDamageKind) {
@@ -177,6 +190,7 @@ impl ReadControl {
             Rar3VmPrograms::Refuse,
             DecodeWorkers::Serial,
             false,
+            None,
             None,
         )
     }

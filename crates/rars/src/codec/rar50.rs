@@ -910,10 +910,15 @@ impl<B: Budget> ReaderState<B> {
         let mut filters = Buffer::new(&allowance);
         let mut literals = [0; LITERAL_BURST];
         let mut overrun = None;
+        let mut resume = None;
 
         let blocks = (|| -> Result<()> {
             loop {
-                let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
+                let block = read_compressed_block_salvaging(
+                    input,
+                    &self.history.allowance(),
+                    self.read_control.salvage(),
+                )?;
                 let payload = &*block.payload;
                 let mut payload_bit_pos = 0;
                 if block.header.has_tables {
@@ -1037,9 +1042,13 @@ impl<B: Budget> ReaderState<B> {
                 }
 
                 if output.len() >= output_size {
+                    let bit_pos = bits.position();
                     let past = refuse_stream_past_declared(&tables, bits, payload_bits);
                     self.note_past_declared(past)?;
                     self.tables = Some(tables);
+                    if self.ran_past && mode == DecodeMode::Lz {
+                        resume = Some(Resume { block, bit_pos });
+                    }
                     break;
                 }
                 self.tables = Some(tables);
@@ -1070,6 +1079,15 @@ impl<B: Budget> ReaderState<B> {
                     .checked_add(filter.length)
                     .is_none_or(|end| end > output.len())
             }) {
+                if self.read_control.salvage() {
+                    // As streaming does: the bytes before that filter.
+                    self.salvaged = Some(salvaged_prefix(
+                        output,
+                        &filters,
+                        &self.read_control,
+                        &allowance,
+                    ));
+                }
                 return Err(Error::NeedMoreInput);
             }
             self.ended_early = Some(output.len());
@@ -1095,8 +1113,50 @@ impl<B: Budget> ReaderState<B> {
             if let Some(overrun) = overrun {
                 self.remember_overrun(overrun, dictionary_size)?;
             }
+            if let Some(resume) = resume {
+                self.run_on_from_history(
+                    input,
+                    algorithm_version,
+                    output_size,
+                    dictionary_size,
+                    resume,
+                );
+            }
         }
         Ok(output)
+    }
+
+    /// [`Self::run_on`] for a buffered member, whose history is flat: it runs
+    /// on in a streaming window, which the next member takes over.
+    /// A window that can't be set up leaves the successor no history.
+    fn run_on_from_history(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        declared: usize,
+        dictionary_size: usize,
+        resume: Resume<B>,
+    ) {
+        let retained = self.history_window.min(dictionary_size);
+        self.history.discard_prefix(self.history.len() - retained);
+        let allowance = self.history.allowance();
+        let history = StreamedHistory::from(std::mem::replace(
+            &mut self.history,
+            Buffer::new(&allowance),
+        ));
+        self.history_window = 0;
+        let Ok(mut output) =
+            StreamingOutput::new(history, declared, dictionary_size, dictionary_size)
+        else {
+            return;
+        };
+        output.stage.control = self.read_control.clone();
+        // As if the declared bytes had just been decoded here.
+        output.written = declared;
+        self.run_on(input, algorithm_version, &mut output, resume);
+        let history = output.into_history();
+        self.history_window = history.window();
+        self.streamed_history = Some(history);
     }
 
     pub fn decode_member_from_reader_with_dictionary_to_sink<E>(
@@ -1221,14 +1281,23 @@ impl<B: Budget> ReaderState<B> {
             &mut output,
             &mut sink,
             &mut filters,
+            None,
         );
-        if let Err(error) = decoded {
-            if self.read_control.salvage() && matches!(error, StreamDecodeError::Decode(_)) {
-                // What decoded before the failure, short of a filter's
-                // block that never completed.
-                let _ = output.flush(&mut sink);
+        match decoded {
+            Err(error) => {
+                if self.read_control.salvage() && matches!(error, StreamDecodeError::Decode(_)) {
+                    // What decoded before the failure, short of a filter's
+                    // block that never completed.
+                    let _ = output.flush(&mut sink);
+                }
+                return Err(error);
             }
-            return Err(error);
+            Ok(Some(resume)) => {
+                // The declared bytes go out first; the rest only feeds the window.
+                output.flush(&mut sink)?;
+                self.run_on(input, algorithm_version, &mut output, resume);
+            }
+            Ok(None) => {}
         }
         self.finish_stream(output, &mut sink)
     }
@@ -1254,6 +1323,9 @@ impl<B: Budget> ReaderState<B> {
         Ok(())
     }
 
+    /// Decodes blocks until the output limit or the stream's last block,
+    /// starting partway into a block with `resume`. Returns where a stream
+    /// that goes on past the limit stopped, when salvage lets it.
     fn decode_blocks<E>(
         &mut self,
         input: &mut impl Read,
@@ -1261,15 +1333,26 @@ impl<B: Budget> ReaderState<B> {
         output: &mut StreamingOutput<B>,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
         filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
-    ) -> std::result::Result<(), StreamDecodeError<E>> {
+        mut resume: Option<Resume<B>>,
+    ) -> std::result::Result<Option<Resume<B>>, StreamDecodeError<E>> {
         let output_size = output.output_limit;
         let mut literals = [0; LITERAL_BURST];
 
         loop {
-            let block = read_compressed_block_with_allowance(input, &output.ring.allowance())?;
+            let (block, resumed_at) = match resume.take() {
+                Some(resume) => (resume.block, Some(resume.bit_pos)),
+                None => (
+                    read_compressed_block_salvaging(
+                        input,
+                        &output.ring.allowance(),
+                        self.read_control.salvage(),
+                    )?,
+                    None,
+                ),
+            };
             let payload = &*block.payload;
-            let mut payload_bit_pos = 0;
-            if block.header.has_tables {
+            let mut payload_bit_pos = resumed_at.unwrap_or(0);
+            if block.header.has_tables && resumed_at.is_none() {
                 let (lengths, table_bits) = read_table_lengths_with_allowance(
                     payload,
                     algorithm_version,
@@ -1362,16 +1445,54 @@ impl<B: Budget> ReaderState<B> {
             }
 
             if output.written() >= output_size {
+                let bit_pos = bits.position();
                 let past = refuse_stream_past_declared(&tables, bits, payload_bits);
                 self.note_past_declared(past)?;
                 self.tables = Some(tables);
-                return Ok(());
+                return Ok(self.ran_past.then_some(Resume { block, bit_pos }));
             }
             self.tables = Some(tables);
             if block.header.is_last {
-                return Ok(());
+                return Ok(None);
             }
         }
+    }
+
+    /// Under salvage, decodes the rest of a stream that went on past its
+    /// declared size into the window only, from `resume` to the stream's
+    /// last block, so that a solid successor starts where the stream ends
+    /// rather than at the declared size. The bytes go nowhere else, and
+    /// filter records are read and dropped: the window holds unfiltered
+    /// bytes. It stops at the member output ceiling, if there is one, and at
+    /// the first error, keeping what decoded; the member has already failed.
+    fn run_on(
+        &mut self,
+        input: &mut impl Read,
+        algorithm_version: u8,
+        output: &mut StreamingOutput<B>,
+        resume: Resume<B>,
+    ) {
+        let declared = output.output_limit;
+        debug_assert_eq!(output.written, declared);
+        debug_assert_eq!(output.pending, 0);
+        output.output_limit = self.read_control.run_on_limit().max(declared);
+        let pass_through = std::mem::replace(&mut output.stage.pass_through, false);
+        let mut sink = |_: DecodedChunk<'_>| Ok::<(), std::convert::Infallible>(());
+        let mut drop_filter = |_: PendingFilter| Ok::<(), std::convert::Infallible>(());
+        let mut filters: Option<&mut dyn FnMut(PendingFilter) -> _> = Some(&mut drop_filter);
+        let _ = self.decode_blocks(
+            input,
+            algorithm_version,
+            output,
+            &mut sink,
+            &mut filters,
+            Some(resume),
+        );
+        let _ = output.flush(&mut sink);
+        // The member is still its declared bytes, all of them delivered.
+        output.output_limit = declared;
+        output.written = declared;
+        output.stage.pass_through = pass_through;
     }
 
     fn remember_history(&mut self, output: &[u8], dictionary_size: usize) -> Result<()> {
@@ -1692,6 +1813,13 @@ impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
             zeros: 0,
         }
     }
+}
+
+/// Where a stream that went on past its declared size stopped: in `block`,
+/// `bit_pos` bits into its payload.
+struct Resume<B: Budget> {
+    block: OwnedCompressedBlock<B>,
+    bit_pos: usize,
 }
 
 /// A final match's bytes past the declared size, kept for the next solid member.
@@ -2320,9 +2448,27 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     read_compressed_block_with_allowance(input, &Allowance::default())
 }
 
+#[cfg(all(test, feature = "write"))]
 fn read_compressed_block_with_allowance<B: Budget>(
     input: &mut impl Read,
     allowance: &B,
+) -> Result<OwnedCompressedBlock<B>> {
+    read_compressed_block_salvaging(input, allowance, false)
+}
+
+/// Bits kept back from the end of a block the input ends in, so that every
+/// symbol decoded from it lies wholly in the bytes there are. No symbol with
+/// its extra bits, nor a filter record, is longer.
+const CUT_BLOCK_MARGIN_BITS: usize = 128;
+
+/// With `salvage`, a block whose payload the input ends partway through is
+/// read as the last, holding the bits there are, short of
+/// [`CUT_BLOCK_MARGIN_BITS`]: a symbol that runs on past them can't be
+/// decoded.
+fn read_compressed_block_salvaging<B: Budget>(
+    input: &mut impl Read,
+    allowance: &B,
+    salvage: bool,
 ) -> Result<OwnedCompressedBlock<B>> {
     let mut fixed = [0u8; 2];
     input
@@ -2355,20 +2501,42 @@ fn read_compressed_block_with_allowance<B: Budget>(
             acc | (usize::from(byte) << (index * 8))
         });
     let mut payload = Buffer::filled(payload_size, 0, allowance)?;
-    input
-        .read_exact(&mut payload)
-        .map_err(Error::from_read_error)?;
     let final_byte_bits = ((flags & 0x07) + 1).min(8);
-    let payload_bits = if payload_size == 0 {
+    let mut payload_bits = if payload_size == 0 {
         0
     } else {
         (payload_size - 1) * 8 + usize::from(final_byte_bits)
     };
+    let mut is_last = flags & 0x40 != 0;
+    if salvage {
+        let mut read = 0;
+        while read < payload_size {
+            match input.read(&mut payload[read..]) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(Error::from_read_error(error)),
+            }
+        }
+        if read < payload_size {
+            if read == 0 {
+                return Err(Error::NeedMoreInput);
+            }
+            payload.truncate(read);
+            payload_bits = (read * 8).saturating_sub(CUT_BLOCK_MARGIN_BITS);
+            is_last = true;
+        }
+    } else {
+        input
+            .read_exact(&mut payload)
+            .map_err(Error::from_read_error)?;
+    }
+    let payload_size = payload.len();
 
     Ok(OwnedCompressedBlock {
         header: CompressedBlockHeader {
             flags,
-            is_last: flags & 0x40 != 0,
+            is_last,
             has_tables: flags & 0x80 != 0,
             final_byte_bits,
             payload_size,
