@@ -32,6 +32,8 @@ create_exception!(rars, PasswordRequired, Error);
 create_exception!(rars, MissingVolume, Error);
 create_exception!(rars, VolumeOrderError, Error);
 create_exception!(rars, ChecksumError, BadRarFile);
+create_exception!(rars, MemberCutShort, BadRarFile);
+create_exception!(rars, MemberRanPastDeclaredSize, BadRarFile);
 create_exception!(rars, UnsupportedRarFeature, Error);
 create_exception!(rars, NotRarFile, Error);
 create_exception!(rars, UnsafeArchivePath, Error);
@@ -101,6 +103,12 @@ class MissingPart(str, enum.Enum):
     BOTH = 'both'
 
 
+class HeaderDamageKind(str, enum.Enum):
+    CHECKSUM = 'checksum'
+    DROPPED_RECORD = 'dropped_record'
+    UNREADABLE = 'unreadable'
+
+
 ENUMS = (
     ArchiveVersion,
     ArchiveFamily,
@@ -109,6 +117,7 @@ ENUMS = (
     ProgressPhase,
     TruncatedBlock,
     MissingPart,
+    HeaderDamageKind,
 )
 for cls in ENUMS:
     cls.__str__ = str.__str__
@@ -122,6 +131,7 @@ static PROGRESS_PHASE: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static ATTRIBUTE_KIND: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static TRUNCATED_BLOCK: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 static MISSING_PART: PyOnceLock<Py<PyType>> = PyOnceLock::new();
+static HEADER_DAMAGE_KIND: PyOnceLock<Py<PyType>> = PyOnceLock::new();
 
 fn enum_member<'py>(
     py: Python<'py>,
@@ -259,6 +269,61 @@ impl Truncation {
         format!(
             "Truncation(block={:?}, offset={}, started={}, volume_index={})",
             self.block, self.offset, self.started, self.volume_index
+        )
+    }
+}
+
+/// A damaged header that `salvage=True` read past.
+#[pyclass(frozen, module = "rars")]
+#[derive(Debug, Clone)]
+struct HeaderDamage {
+    /// File offset of the header, in its volume.
+    #[pyo3(get)]
+    offset: u64,
+    kind: &'static str,
+    /// The volume it is in, counting the one opened as 0.
+    #[pyo3(get)]
+    volume_index: usize,
+    text: String,
+}
+
+impl HeaderDamage {
+    fn list<'a>(volumes: impl IntoIterator<Item = &'a rars_rs::Archive>) -> Vec<Self> {
+        use rars_rs::HeaderDamageKind as Kind;
+        volumes
+            .into_iter()
+            .enumerate()
+            .flat_map(|(volume_index, volume)| {
+                volume.header_damage().iter().map(move |damage| Self {
+                    offset: damage.offset,
+                    kind: match damage.kind {
+                        Kind::Checksum { .. } => "checksum",
+                        Kind::DroppedRecord { .. } => "dropped_record",
+                        _ => "unreadable",
+                    },
+                    volume_index,
+                    text: damage.to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
+#[pymethods]
+impl HeaderDamage {
+    #[getter]
+    fn kind<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        enum_member(py, &HEADER_DAMAGE_KIND, "HeaderDamageKind", self.kind)
+    }
+
+    fn __str__(&self) -> &str {
+        &self.text
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "HeaderDamage(kind={:?}, offset={}, volume_index={})",
+            self.kind, self.offset, self.volume_index
         )
     }
 }
@@ -503,14 +568,6 @@ impl ReadOptions {
     }
 }
 
-/// The member error handler parsing with `salvage` needs; parsing never calls it.
-fn carry_on(
-    _: &rars_rs::ArchiveMember,
-    _: &rars_rs::Error,
-) -> rars_rs::Result<rars_rs::ExtractionErrorAction> {
-    Ok(rars_rs::ExtractionErrorAction::Continue)
-}
-
 fn python_read_options<'a>(
     settings: Option<&'a ReadOptions>,
     password: Option<&'a [u8]>,
@@ -528,9 +585,7 @@ fn python_read_options<'a>(
         options.rar50_buffered_decode_limit = settings.max_rar50_buffered_member_bytes;
         options.allow_rar3_vm_programs = settings.allow_rar3_vm_programs;
         options.threads = settings.threads;
-        if settings.salvage {
-            options = options.with_member_error_handler(&carry_on);
-        }
+        options.salvage = settings.salvage;
     }
     options
 }
@@ -543,12 +598,16 @@ struct MemberErrors {
     raised: Mutex<Option<PyErr>>,
     /// Members gone past, whose output is not to be published.
     failed: Mutex<Vec<Vec<u8>>>,
+    /// `keep_broken=True`: a failed member's output is published, unless it
+    /// failed on its password, before any of it was decoded.
+    keep_broken: bool,
 }
 
 impl MemberErrors {
     fn new(
         callback: Option<&Bound<'_, PyAny>>,
         encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+        keep_broken: bool,
     ) -> PyResult<Option<Self>> {
         let Some(callback) = callback else {
             return Ok(None);
@@ -561,6 +620,7 @@ impl MemberErrors {
             encoding,
             raised: Mutex::new(None),
             failed: Mutex::new(Vec::new()),
+            keep_broken,
         }))
     }
 
@@ -582,12 +642,29 @@ impl MemberErrors {
             Err(_) => String::from_utf8_lossy(&member.meta.name).into_owned(),
         };
         let called = Python::attach(|py| {
-            let exception = with_attribute(py, map_error(error.clone()), "member", name);
+            // The error is about this member even when the library's error doesn't name it.
+            let exception = match set_fault(error, is_checksum_mismatch) {
+                Some(fault) if fault.member.is_none() => with_attribute(
+                    py,
+                    ChecksumError::new_err(error.to_string()),
+                    "volume_index",
+                    fault.volume_index,
+                ),
+                _ => map_error(error.clone()),
+            };
+            let exception = with_attribute(py, exception, "member", name);
             self.callback.call1(py, (exception.value(py),)).map(drop)
         });
         match called {
             Ok(()) => {
-                lock(&self.failed).push(member.meta.name.clone());
+                let kept = self.keep_broken
+                    && !matches!(
+                        error.kind(),
+                        rars_rs::ErrorKind::PasswordRequired | rars_rs::ErrorKind::BadPassword
+                    );
+                if !kept {
+                    lock(&self.failed).push(member.meta.name.clone());
+                }
                 Ok(rars_rs::ExtractionErrorAction::Continue)
             }
             Err(raised) => {
@@ -1185,6 +1262,9 @@ struct RarFile {
     salvaged: Option<Vec<rars_rs::Archive>>,
     incomplete: Vec<IncompleteMember>,
     truncation: Option<Truncation>,
+    /// Opened with `salvage=True`, which every later call reads with too.
+    salvage: bool,
+    header_damage: Vec<HeaderDamage>,
 }
 
 struct SetListing {
@@ -1265,11 +1345,13 @@ impl RarFile {
     /// `options` cover opening and are the defaults for every later call; a call's own
     /// `options` replace them whole. `cancellation` covers opening alone.
     ///
-    /// `salvage=True` reads what survives: a file cut short inside a member is read
-    /// up to that member, as `truncation` says, and a volume set may begin late or
-    /// end early, its later volumes read now, from `volumes` or found by name until
-    /// one is missing. Split members with a part outside them are left out and
-    /// listed in `incomplete_members`.
+    /// `salvage=True` reads what survives. Opening reads past damaged headers,
+    /// listed in `header_damage`, and lists a member the file is cut short
+    /// inside, as `truncation` says. A volume set may begin late or end early,
+    /// its later volumes read now, from `volumes` or found by name until one is
+    /// missing. Split members with a part outside them are left out and listed
+    /// in `incomplete_members`. Every later call delivers a damaged member's
+    /// bytes, then reports its error to `on_member_error` or raises it.
     #[new]
     #[pyo3(signature = (source, *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None, salvage = false))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
@@ -1332,7 +1414,12 @@ impl RarFile {
     }
 
     /// `volumes` works as in `extractall`, for a member that continues into later volumes.
-    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    ///
+    /// `on_member_error` reports a member that fails instead of raising, as in
+    /// `testrar`, and the call returns what was delivered for it: everything
+    /// decoded before the failure under `salvage=True`, and `b""` otherwise.
+    /// It can't be combined with a member in a later volume.
+    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None, on_member_error = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read(
         &self,
@@ -1343,20 +1430,22 @@ impl RarFile {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
+        on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
         self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
-        let data = self.read_indices(py, &[index], password, options, volumes)?;
+        let data = self.read_indices(py, &[index], password, options, volumes, on_member_error)?;
         match data.into_iter().next().flatten() {
             Some(data) => Ok(data),
             None => Err(no_payload(self.info_at(py, index)?)),
         }
     }
 
-    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    /// `on_member_error` works as in `read`.
+    #[pyo3(signature = (member, *, password = None, options = None, progress = None, cancellation = None, volumes = None, on_member_error = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn open(
         &self,
@@ -1367,10 +1456,20 @@ impl RarFile {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
+        on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
         let call_options = self.call_options(options, progress, cancellation)?;
         let options = call_options.as_ref();
-        let data = self.read(py, member, password, options, None, None, volumes)?;
+        let data = self.read(
+            py,
+            member,
+            password,
+            options,
+            None,
+            None,
+            volumes,
+            on_member_error,
+        )?;
         let io = py.import("io")?;
         let bytes = PyBytes::new(py, &data);
         Ok(io.getattr("BytesIO")?.call1((bytes,))?.unbind())
@@ -1378,7 +1477,8 @@ impl RarFile {
 
     /// Read selected members in one session, preserving request order and duplicates.
     /// Output limits apply to the whole call, including required solid predecessors.
-    #[pyo3(signature = (members, *, password = None, options = None, progress = None, cancellation = None, volumes = None))]
+    /// `on_member_error` works as in `read`, for each member that fails.
+    #[pyo3(signature = (members, *, password = None, options = None, progress = None, cancellation = None, volumes = None, on_member_error = None))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn read_many(
         &self,
@@ -1389,6 +1489,7 @@ impl RarFile {
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
+        on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
         self.check_open()?;
         let call_options = self.call_options(options, progress, cancellation)?;
@@ -1398,7 +1499,7 @@ impl RarFile {
             .try_iter()?
             .map(|member| self.resolve_index(py, &member?))
             .collect::<PyResult<Vec<_>>>()?;
-        self.read_indices(py, &indices, password, options, volumes)?
+        self.read_indices(py, &indices, password, options, volumes, on_member_error)?
             .into_iter()
             .zip(&indices)
             .map(|(bytes, &index)| match bytes {
@@ -1510,7 +1611,10 @@ impl RarFile {
     ///
     /// `on_member_error` carries on past members that fail, as `testrar` does,
     /// and none of their output is kept. It can't be combined with `members`.
-    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false, on_member_error = None))]
+    /// `keep_broken=True`, on a `RarFile` opened with `salvage=True`, keeps
+    /// it: each member `on_member_error` is given keeps its file under its own
+    /// name, holding what was delivered for it, unless it failed on its password.
+    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1527,8 +1631,19 @@ impl RarFile {
         in_place: bool,
         flatten: bool,
         on_member_error: Option<&Bound<'_, PyAny>>,
+        keep_broken: bool,
     ) -> PyResult<Vec<PathBuf>> {
         self.check_open()?;
+        if keep_broken && !self.salvage {
+            return Err(PyValueError::new_err(
+                "keep_broken=True needs a RarFile opened with salvage=True",
+            ));
+        }
+        if keep_broken && on_member_error.is_none() {
+            return Err(PyValueError::new_err(
+                "keep_broken=True needs on_member_error, which reports each member kept",
+            ));
+        }
         if members.is_some() && on_member_error.is_some() {
             // Selection counts the outputs opened, which a member failing before its output would upset.
             return Err(PyValueError::new_err(
@@ -1559,7 +1674,8 @@ impl RarFile {
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
-        let member_errors = MemberErrors::new(on_member_error, options.legacy_name_encoding)?;
+        let member_errors =
+            MemberErrors::new(on_member_error, options.legacy_name_encoding, keep_broken)?;
         let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
             member_errors
                 .as_ref()
@@ -1637,7 +1753,8 @@ impl RarFile {
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
-        let member_errors = MemberErrors::new(on_member_error, options.legacy_name_encoding)?;
+        let member_errors =
+            MemberErrors::new(on_member_error, options.legacy_name_encoding, false)?;
         let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
             member_errors
                 .as_ref()
@@ -1698,6 +1815,13 @@ impl RarFile {
     #[getter]
     fn incomplete_members(&self) -> Vec<IncompleteMember> {
         self.incomplete.clone()
+    }
+
+    /// The damaged headers `salvage=True` read past, in file order. Always
+    /// empty without salvage, which refuses such an archive instead.
+    #[getter]
+    fn header_damage(&self) -> Vec<HeaderDamage> {
+        self.header_damage.clone()
     }
 
     #[getter]
@@ -2211,6 +2335,7 @@ impl RarFile {
                 },
             })
             .collect();
+        self.header_damage = HeaderDamage::list(&run);
         self.truncation = run.iter().enumerate().find_map(|(index, volume)| {
             volume
                 .truncation()
@@ -2381,14 +2506,36 @@ impl RarFile {
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         volumes: Option<&Bound<'_, PyAny>>,
+        on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Option<Vec<u8>>>> {
+        let in_set = indices.iter().any(|&index| self.needs_later_volumes(index));
+        if in_set && on_member_error.is_some() {
+            // A set's reads count the outputs opened, which a member failing before its output would upset.
+            return Err(PyValueError::new_err(
+                "on_member_error can't be combined with reading a member in a later volume; testrar and extractall can carry on past those",
+            ));
+        }
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "reading");
         let options = watched(
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
-        let data = if indices.iter().any(|&index| self.needs_later_volumes(index)) {
+        let salvage = options.salvage;
+        let member_errors =
+            MemberErrors::new(on_member_error, options.legacy_name_encoding, false)?;
+        let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
+            member_errors
+                .as_ref()
+                .map_or(Ok(rars_rs::ExtractionErrorAction::Abort), |errors| {
+                    errors.handle(member, error)
+                })
+        };
+        let options = match &member_errors {
+            Some(_) => options.with_member_error_handler(&handler),
+            None => options,
+        };
+        let data = if in_set {
             self.read_from_set(py, volumes, options, indices, progress.as_ref())
         } else {
             let selected: HashSet<usize> = indices.iter().copied().collect();
@@ -2403,7 +2550,20 @@ impl RarFile {
             })
             .map_err(map_error)
         };
-        finished(&progress, data)
+        let mut data = finished(&progress, MemberErrors::finish(&member_errors, data))?;
+        // Without salvage, what a failed member wrote before the failure was found isn't its own.
+        if let Some(errors) = member_errors.as_ref().filter(|_| !salvage) {
+            let failed = lock(&errors.failed);
+            for (bytes, &index) in data.iter_mut().zip(indices) {
+                let name = &self.info_at(py, index)?.orig_filename_bytes;
+                if failed.iter().any(|failed| **failed == **name) {
+                    if let Some(bytes) = bytes {
+                        bytes.clear();
+                    }
+                }
+            }
+        }
+        Ok(data)
     }
 
     fn resolve_index(&self, py: Python<'_>, member: &Bound<'_, PyAny>) -> PyResult<usize> {
@@ -2492,6 +2652,7 @@ impl RarFile {
     ) -> rars_rs::ArchiveReadOptions<'a> {
         let mut options = python_read_options(settings, password);
         options.legacy_name_encoding = options.legacy_name_encoding.or(self.encoding);
+        options.salvage |= self.salvage;
         options
     }
 
@@ -2536,6 +2697,7 @@ impl RarFile {
         let truncation = archive
             .truncation()
             .map(|truncation| Truncation::new(truncation, 0));
+        let header_damage = HeaderDamage::list([&archive]);
         Ok(Self {
             identity,
             encoding,
@@ -2554,6 +2716,8 @@ impl RarFile {
             salvaged: None,
             incomplete: Vec::new(),
             truncation,
+            salvage: options.is_some_and(|options| options.salvage),
+            header_damage,
         })
     }
 }
@@ -3021,6 +3185,8 @@ impl RarBuilder {
                 salvaged: archive.salvaged.clone(),
                 incomplete: archive.incomplete.clone(),
                 truncation: archive.truncation.clone(),
+                salvage: archive.salvage,
+                header_damage: archive.header_damage.clone(),
             },
             Err(_) => RarFile::new(
                 py,
@@ -3737,6 +3903,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PasswordCheck>()?;
     m.add_class::<Truncation>()?;
     m.add_class::<IncompleteMember>()?;
+    m.add_class::<HeaderDamage>()?;
     m.add_function(wrap_pyfunction!(check_password, m)?)?;
     m.add_function(wrap_pyfunction!(is_rarfile, m)?)?;
     m.add_function(wrap_pyfunction!(is_rarfile_sfx, m)?)?;
@@ -3759,6 +3926,15 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     checksum_error.setattr("member", py.None())?;
     checksum_error.setattr("volume_index", py.None())?;
     m.add("ChecksumError", checksum_error)?;
+    let cut_short = py.get_type::<MemberCutShort>();
+    cut_short.setattr("member", py.None())?;
+    cut_short.setattr("packed", py.None())?;
+    cut_short.setattr("present", py.None())?;
+    m.add("MemberCutShort", cut_short)?;
+    let ran_past = py.get_type::<MemberRanPastDeclaredSize>();
+    ran_past.setattr("member", py.None())?;
+    ran_past.setattr("declared", py.None())?;
+    m.add("MemberRanPastDeclaredSize", ran_past)?;
     m.add(
         "UnsupportedRarFeature",
         py.get_type::<UnsupportedRarFeature>(),
@@ -3777,6 +3953,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "ProgressPhase",
         "TruncatedBlock",
         "MissingPart",
+        "HeaderDamageKind",
     ] {
         m.add(name, enums.getattr(name)?)?;
     }
@@ -5218,6 +5395,13 @@ fn is_checksum_mismatch(error: &rars_rs::Error) -> bool {
     )
 }
 
+fn is_salvage_report(error: &rars_rs::Error) -> bool {
+    matches!(
+        error,
+        rars_rs::Error::MemberCutShort { .. } | rars_rs::Error::MemberRanPastDeclaredSize { .. }
+    )
+}
+
 /// `error` as Python would raise it, with `detail` appended to its message.
 fn map_error_with(error: rars_rs::Error, detail: &str) -> PyErr {
     let message = format!("{error}{detail}");
@@ -5684,6 +5868,27 @@ fn typed_error(error: rars_rs::Error, message: String) -> PyErr {
             with_attribute(py, error, "volume_index", fault.volume_index)
         });
     }
+    // Only salvage reports these, after the member's bytes were delivered.
+    match *error.root_cause() {
+        rars_rs::Error::MemberCutShort { packed, present } => {
+            let fault = set_fault(&error, is_salvage_report).unwrap_or_default();
+            return Python::attach(|py| {
+                let error = MemberCutShort::new_err(message);
+                let error = with_attribute(py, error, "member", fault.member);
+                let error = with_attribute(py, error, "packed", packed);
+                with_attribute(py, error, "present", present)
+            });
+        }
+        rars_rs::Error::MemberRanPastDeclaredSize { declared } => {
+            let fault = set_fault(&error, is_salvage_report).unwrap_or_default();
+            return Python::attach(|py| {
+                let error = MemberRanPastDeclaredSize::new_err(message);
+                let error = with_attribute(py, error, "member", fault.member);
+                with_attribute(py, error, "declared", declared)
+            });
+        }
+        _ => {}
+    }
     use rars_rs::ErrorKind;
     match error.kind() {
         ErrorKind::UnsupportedFormat | ErrorKind::UnsupportedFeature => {
@@ -5749,7 +5954,7 @@ mod tests {
                 .unwrap();
             let first = PyString::new(py, &file.first.infos[0].filename);
             for _ in 0..2 {
-                file.read(py, &first, None, Some(&options), None, None, None)
+                file.read(py, &first, None, Some(&options), None, None, None, None)
                     .unwrap();
                 file.extract(
                     py,
@@ -5780,6 +5985,7 @@ mod tests {
                     false,
                     false,
                     None,
+                    false,
                 )
                 .unwrap();
             }
@@ -5901,6 +6107,7 @@ mod tests {
                     false,
                     false,
                     None,
+                    false,
                 )
                 .unwrap();
             }
@@ -5928,7 +6135,7 @@ mod tests {
             for _ in 0..2 {
                 file.testrar(py, None, Some(&options), None, None, None, None)
                     .unwrap();
-                file.read(py, &first, None, Some(&options), None, None, None)
+                file.read(py, &first, None, Some(&options), None, None, None, None)
                     .unwrap();
                 file.extract(
                     py,
@@ -6207,6 +6414,8 @@ mod tests {
                     salvaged: None,
                     incomplete: Vec::new(),
                     truncation: None,
+                    salvage: false,
+                    header_damage: Vec::new(),
                 };
                 let token = CancellationToken::new();
                 let options =
@@ -6232,12 +6441,13 @@ mod tests {
                         None,
                         Some(&cancellation),
                         None,
+                        None,
                     )
                     .unwrap_err();
                 py.detach(|| worker.join().unwrap());
                 assert!(error.is_instance_of::<Cancelled>(py), "{format}: {error}");
                 assert_eq!(
-                    file.read(py, name.as_any(), None, None, None, None, None)
+                    file.read(py, name.as_any(), None, None, None, None, None, None)
                         .unwrap(),
                     b"payload"
                 );
@@ -6442,6 +6652,8 @@ mod tests {
                             salvaged: None,
                             incomplete: Vec::new(),
                             truncation: None,
+                            salvage: false,
+                            header_damage: Vec::new(),
                         },
                     )
                     .unwrap();
