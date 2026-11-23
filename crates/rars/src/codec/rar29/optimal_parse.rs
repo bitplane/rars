@@ -142,12 +142,23 @@ fn block_bits(
     Ok(bits)
 }
 
+/// The longest match a remembered offset can code; a longer one is coded
+/// as a fresh match.
+const MAX_REPEAT_LENGTH: usize = MAX_ENCODER_MATCH_LENGTH - 1;
+
 /// Bits per symbol under one block's tables.
 struct Prices {
     main: [u8; MAIN_COUNT],
     offsets: [u8; OFFSET_COUNT],
     low_offsets: [u8; LOW_OFFSET_COUNT],
     lengths: [u8; LENGTH_COUNT],
+    /// What a match at a remembered offset spends on its length, code and
+    /// extra bits, by length. The parse offers a length as a lookup here
+    /// rather than a search of the slot table.
+    repeat_lengths: [u32; MAX_REPEAT_LENGTH + 1],
+    /// What a fresh match spends on its length, by the length its offset's
+    /// adjustment leaves.
+    fresh_lengths: [u32; MAX_ENCODER_MATCH_LENGTH + 1],
 }
 
 impl Prices {
@@ -157,6 +168,8 @@ impl Prices {
             offsets: [0; OFFSET_COUNT],
             low_offsets: [0; LOW_OFFSET_COUNT],
             lengths: [0; LENGTH_COUNT],
+            repeat_lengths: [0; MAX_REPEAT_LENGTH + 1],
+            fresh_lengths: [0; MAX_ENCODER_MATCH_LENGTH + 1],
         };
         let (main, rest) = table.split_at(MAIN_COUNT);
         let (offsets, rest) = rest.split_at(OFFSET_COUNT);
@@ -165,6 +178,17 @@ impl Prices {
         prices.offsets.copy_from_slice(offsets);
         prices.low_offsets.copy_from_slice(low_offsets);
         prices.lengths.copy_from_slice(lengths);
+        let length_cost = |slot: usize, code: u8| Self::bits(code) + u32::from(LENGTH_BITS[slot]);
+        for (length, cost) in prices.repeat_lengths.iter_mut().enumerate() {
+            if let Ok((slot, _)) = length_slot_for_repeat_match(length) {
+                *cost = length_cost(slot, prices.lengths[slot]);
+            }
+        }
+        for (length, cost) in prices.fresh_lengths.iter_mut().enumerate() {
+            if let Ok((slot, _)) = length_slot_for_match(length) {
+                *cost = length_cost(slot, prices.main[271 + slot]);
+            }
+        }
         prices
     }
 
@@ -198,18 +222,89 @@ impl Prices {
                 offset_extra,
                 ..
             } => {
-                let offset_bits = if offset_slot > 9 {
-                    u32::from(OFFSET_BITS[offset_slot].saturating_sub(4))
-                        + Self::bits(self.low_offsets[offset_extra & 0x0f])
-                } else {
-                    u32::from(OFFSET_BITS[offset_slot])
-                };
                 Self::bits(self.main[271 + length_slot])
                     + u32::from(LENGTH_BITS[length_slot])
-                    + Self::bits(self.offsets[offset_slot])
-                    + offset_bits
+                    + self.offset(offset_slot, offset_extra)
             }
         }
+    }
+
+    /// A fresh match's offset: its slot's code and its extra bits, the low
+    /// four of which are coded on their own past slot 9.
+    fn offset(&self, slot: usize, extra: usize) -> u32 {
+        let extra_bits = if slot > 9 {
+            u32::from(OFFSET_BITS[slot].saturating_sub(4))
+                + Self::bits(self.low_offsets[extra & 0x0f])
+        } else {
+            u32::from(OFFSET_BITS[slot])
+        };
+        Self::bits(self.offsets[slot]) + extra_bits
+    }
+}
+
+/// What a match at one offset costs at each length, coming in with one
+/// repeat state: [`Prices::of`] of [`EncoderMatchState::encode_match`], with
+/// everything that depends only on the offset worked out once.
+struct OffsetPrices<'a> {
+    prices: &'a Prices,
+    offset: usize,
+    /// The length that repeats the last match outright at this offset, or
+    /// zero if it is not the last match's offset.
+    last_length: usize,
+    /// The code naming this offset, if it is a remembered one.
+    repeat: Option<u32>,
+    /// What a fresh match takes off its length at this offset.
+    adjustment: usize,
+    /// A fresh match's offset bits, `None` past the slot table.
+    fresh: Option<u32>,
+}
+
+impl<'a> OffsetPrices<'a> {
+    fn new(prices: &'a Prices, state: &EncoderMatchState, offset: usize) -> Self {
+        let last_length = match state.last_length != 0 && offset == state.last_offset {
+            true => state.last_length,
+            false => 0,
+        };
+        let repeat = state
+            .old_offsets
+            .iter()
+            .position(|&old_offset| old_offset == offset && old_offset != 0)
+            .map(|index| Prices::bits(prices.main[259 + index]));
+        let fresh = offset_slot_for_match(offset)
+            .ok()
+            .map(|(slot, extra)| prices.offset(slot, extra));
+        Self {
+            prices,
+            offset,
+            last_length,
+            repeat,
+            adjustment: match_length_adjustment(offset),
+            fresh,
+        }
+    }
+
+    /// The bits a match of `length` here codes to, `None` where it cannot be
+    /// coded. Takes the same turns as `encode_match`, in the same order.
+    #[inline]
+    fn of(&self, length: usize) -> Option<u32> {
+        debug_assert!((2..=MAX_ENCODER_MATCH_LENGTH).contains(&length));
+        if length == self.last_length {
+            return Some(Prices::bits(self.prices.main[258]));
+        }
+        if let Some(repeat) = self.repeat {
+            if length <= MAX_REPEAT_LENGTH {
+                return Some(repeat + self.prices.repeat_lengths[length]);
+            }
+        }
+        if length == 2 {
+            let (slot, _) = short_slot_for_match(self.offset).ok()?;
+            return Some(Prices::bits(self.prices.main[263 + slot]) + u32::from(SHORT_BITS[slot]));
+        }
+        let encoded = length.checked_sub(self.adjustment)?;
+        if encoded < 3 {
+            return None;
+        }
+        Some(self.prices.fresh_lengths[encoded] + self.fresh?)
     }
 }
 
@@ -364,24 +459,38 @@ impl Node {
     };
 }
 
-/// Lengths worth trying for a match, from just past `covered` to `longest`.
-///
-/// Every length inside a length slot is priced the same, so only the longest
-/// length in each slot can be cheapest to reach its end, plus the longest
-/// match found. `base` is what the slot table counts from.
-fn candidate_lengths(covered: usize, longest: usize, base: usize, out: &mut Vec<usize>) {
-    out.clear();
-    for slot in 0..LENGTH_COUNT {
-        let widest = LENGTH_BASES[slot] + (1usize << LENGTH_BITS[slot]) - 1 + base;
-        if widest > covered && widest <= longest {
-            out.push(widest);
+/// The widest length in each length slot, counted from what the slot table
+/// counts from. Every length inside a slot is priced the same, so only the
+/// widest in each can be cheapest to reach its end, plus the longest match
+/// found.
+const SLOT_ENDS: [usize; LENGTH_COUNT] = {
+    let mut ends = [0; LENGTH_COUNT];
+    let mut slot = 0;
+    while slot < LENGTH_COUNT {
+        ends[slot] = LENGTH_BASES[slot] + (1 << LENGTH_BITS[slot]) - 1;
+        slot += 1;
+    }
+    ends
+};
+
+/// Offers each length worth trying for a match, from just past `covered` to
+/// `longest`: the widest of each slot counted from `base`, then `longest`
+/// itself, which may come twice. A length offered again changes nothing,
+/// since an endpoint only takes a strictly cheaper offer.
+#[inline(always)]
+fn candidate_lengths(covered: usize, longest: usize, base: usize, mut offer: impl FnMut(usize)) {
+    for &end in &SLOT_ENDS {
+        let length = end + base;
+        if length > longest {
+            break;
+        }
+        if length > covered {
+            offer(length);
         }
     }
     if longest > covered {
-        out.push(longest);
+        offer(longest);
     }
-    out.sort_unstable();
-    out.dedup();
 }
 
 /// The cheapest route through `start..end` under `prices`.
@@ -398,7 +507,6 @@ fn shortest_path(
     let mut nodes = vec![Node::UNREACHED; span + 1];
     nodes[0].cost = 0;
     nodes[0].state = RouteState::of(&state);
-    let mut lengths = Vec::new();
     let mut next_run = 0usize;
     let mut committed_through = 0usize;
     // The newest position of each two-byte pair, for the short-offset tokens.
@@ -459,23 +567,24 @@ fn shortest_path(
             if reach < 2 {
                 continue;
             }
-            candidate_lengths(1, reach, 2, &mut lengths);
-            if offset == state.last_offset && state.last_length != 0 && state.last_length <= reach {
-                lengths.push(state.last_length);
-            }
-            for &length in &lengths {
-                if let Ok(encoded) = state.encode_match(length, offset) {
-                    relax(&mut nodes, length, offset, prices.of(encoded));
+            let at = OffsetPrices::new(prices, &state, offset);
+            let mut offer = |length| {
+                if let Some(price) = at.of(length) {
+                    relax(&mut nodes, length, offset, price);
                     longest = longest.max(length);
                 }
+            };
+            candidate_lengths(1, reach, 2, &mut offer);
+            if at.last_length != 0 && at.last_length <= reach {
+                offer(at.last_length);
             }
         }
 
         if cap >= 2 && nearest_pair != u32::MAX {
             let offset = pos - nearest_pair as usize;
             if offset <= 256 && offset <= max_offset {
-                if let Ok(encoded) = state.encode_match(2, offset) {
-                    relax(&mut nodes, 2, offset, prices.of(encoded));
+                if let Some(price) = OffsetPrices::new(prices, &state, offset).of(2) {
+                    relax(&mut nodes, 2, offset, price);
                 }
             }
         }
@@ -483,18 +592,13 @@ fn shortest_path(
         let mut covered = 2usize;
         for run in runs {
             let (reach, offset) = (run.length().min(cap), run.offset());
-            candidate_lengths(
-                covered,
-                reach,
-                3 + match_length_adjustment(offset),
-                &mut lengths,
-            );
-            for &length in &lengths {
-                if let Ok(encoded) = state.encode_match(length, offset) {
-                    relax(&mut nodes, length, offset, prices.of(encoded));
+            let at = OffsetPrices::new(prices, &state, offset);
+            candidate_lengths(covered, reach, 3 + at.adjustment, |length| {
+                if let Some(price) = at.of(length) {
+                    relax(&mut nodes, length, offset, price);
                     longest = longest.max(length);
                 }
-            }
+            });
             covered = covered.max(reach);
         }
 

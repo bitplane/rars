@@ -3539,20 +3539,22 @@ fn offset_slot_for_match(offset: usize) -> Result<(usize, usize)> {
     if offset == 0 {
         return Err(Error::InvalidData("RAR 2.9 match offset is zero"));
     }
+    // Worked out rather than searched for, since the shortest-path parse asks
+    // for every match it prices. Below 256 KiB two slots share each power of
+    // two, split by the bit below the top one. Past that the slots are 64 KiB
+    // wide up to 1 MiB, then 256 KiB wide.
     let adjusted = offset - 1;
-    for (slot, &base) in OFFSET_BASES.iter().enumerate() {
-        let extra_bits = OFFSET_BITS[slot];
-        let max = base
-            + if extra_bits == 0 {
-                0
-            } else {
-                (1usize << extra_bits) - 1
-            };
-        if adjusted <= max {
-            return Ok((slot, adjusted - base));
+    let slot = match adjusted {
+        0..4 => adjusted,
+        4..0x40000 => {
+            let top = adjusted.ilog2() as usize;
+            2 * top + ((adjusted >> (top - 1)) & 1)
         }
-    }
-    Err(Error::InvalidData("RAR 2.9 match offset is too large"))
+        0x40000..0x100000 => 32 + (adjusted >> 16),
+        0x100000..0x400000 => 44 + (adjusted >> 18),
+        _ => return Err(Error::InvalidData("RAR 2.9 match offset is too large")),
+    };
+    Ok((slot, adjusted - OFFSET_BASES[slot]))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

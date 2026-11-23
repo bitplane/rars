@@ -194,3 +194,73 @@ fn a_block_of_two_byte_matches_decodes() {
     .unwrap();
     assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
 }
+
+/// The parse prices each match from tables built once a pass. Every length at
+/// every kind of offset must cost what the coder's own encoding of it does.
+#[test]
+fn offset_prices_agree_with_pricing_the_encoded_match() {
+    let mut table = [0u8; TABLE_COUNT];
+    for (index, length) in table.iter_mut().enumerate() {
+        *length = (index * 7 % 16) as u8;
+    }
+    let prices = Prices::new(&table);
+    let mut remembered = EncoderMatchState::default();
+    for (length, offset) in [(5, 0x40000), (9, 0x2000), (3, 300), (7, 5)] {
+        remembered.remember(length, offset);
+    }
+    let mut repeated = EncoderMatchState::default();
+    for (length, offset) in [(4, 70_000), (2, 9), (258, 9)] {
+        repeated.remember(length, offset);
+    }
+    let mut states = vec![EncoderMatchState::default(), remembered, repeated];
+    let mut two = remembered;
+    two.remember(2, 12);
+    states.push(two);
+    let mut offsets: Vec<usize> = (1..=300).collect();
+    offsets.extend([
+        0x1fff,
+        0x2000,
+        0x2001,
+        0x3ffff,
+        0x40000,
+        0x40001,
+        70_000,
+        MAX_HISTORY,
+        MAX_HISTORY + 1,
+    ]);
+    for state in &states {
+        for &offset in &offsets {
+            let at = OffsetPrices::new(&prices, state, offset);
+            for length in 2..=MAX_ENCODER_MATCH_LENGTH {
+                let encoded = state.encode_match(length, offset).ok();
+                assert_eq!(
+                    at.of(length),
+                    encoded.map(|encoded| prices.of(encoded)),
+                    "length {length} at offset {offset} from {state:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn slot_ends_are_the_widest_length_each_slot_codes() {
+    for base in [2, 3, 4, 5] {
+        let mut offered = Vec::new();
+        candidate_lengths(1, MAX_ENCODER_MATCH_LENGTH, base, |length| {
+            offered.push(length)
+        });
+        for pair in offered.windows(2) {
+            assert!(pair[0] <= pair[1], "{offered:?}");
+        }
+        let slot = |length: usize| match base {
+            2 => length_slot_for_repeat_match(length).map(|(slot, _)| slot),
+            _ => length_slot_for_match(length - (base - 3)).map(|(slot, _)| slot),
+        };
+        for &length in &offered[..offered.len() - 1] {
+            if length < MAX_ENCODER_MATCH_LENGTH {
+                assert_ne!(slot(length), slot(length + 1), "base {base}, {length}");
+            }
+        }
+    }
+}
