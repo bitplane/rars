@@ -2649,7 +2649,7 @@ where
             // Salvage passes over a file or service header whose block reads
             // but whose own fields don't.
             let file_header = |parsed: &ParsedBlockHeader| match parse_file_header_bytes(parsed) {
-                Err(error) if salvage_stops(&options, &error) => {
+                Err(error) if salvage_skips(&options, &error) => {
                     parsed.control.report_damage(
                         sfx_offset + pos,
                         crate::HeaderDamageKind::Unreadable {
@@ -2739,6 +2739,13 @@ where
     });
     let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), past_trailing_block));
     Ok((main, blocks, truncation, budget.control.take_damage()))
+}
+
+/// Whether a salvaging parse passes over a header whose block was read
+/// whole but whose own fields fail with `error`. Here even a field that runs
+/// past the header is damage, not a cut.
+fn salvage_skips(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
+    options.salvage && error.kind() == crate::ErrorKind::InvalidArchive
 }
 
 /// Whether a salvaging parse goes past `error` in a header, rather than

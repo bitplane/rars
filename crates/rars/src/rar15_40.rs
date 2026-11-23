@@ -995,7 +995,7 @@ impl Archive {
                 FILE_HEAD => {
                     let mut file = match parse_file_like_header(&header, relative_block(&block), 0)
                     {
-                        Err(error) if salvage_stops(&options, &error) => {
+                        Err(error) if salvage_skips(&options, &error) => {
                             unreadable(&budget.control, sig.offset + pos, &error);
                             match checked_block_next(&block, total, archive.len()) {
                                 Ok(next) => {
@@ -1218,7 +1218,7 @@ impl Archive {
                 FILE_HEAD => {
                     let mut file_header =
                         match parse_file_like_header(&header, relative_block(&block), 0) {
-                            Err(error) if salvage_stops(&options, &error) => {
+                            Err(error) if salvage_skips(&options, &error) => {
                                 unreadable(&budget.control, sfx_offset + pos, &error);
                                 match checked_file_block_next(sfx_offset, &block, total, file_len) {
                                     Ok(next) => {
@@ -3470,6 +3470,13 @@ fn service_block_next(block: &BlockHeader, next: Result<usize>) -> Result<Option
 /// Fewer than seven bytes is a cut too, but too few to trust the type byte:
 /// old self-extractors often end in a few bytes that are no header at all. Only
 /// an end block is named then, and nothing is an error.
+/// Whether a salvaging parse passes over a header whose block was read
+/// whole but whose own fields fail with `error`. Here even a field that runs
+/// past the header is damage, not a cut.
+fn salvage_skips(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
+    options.salvage && error.kind() == crate::ErrorKind::InvalidArchive
+}
+
 /// Whether a salvaging parse goes past `error` in a header, rather than
 /// failing: damage, not cancellation, a limit or a missing password.
 fn salvage_stops(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
