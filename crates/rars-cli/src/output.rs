@@ -128,6 +128,74 @@ fn early_metadata(meta: &ExtractedEntryMeta) -> Option<EarlyMetadata> {
     Some((modified, mode))
 }
 
+/// The permission bits a member's file is created with: its own, when they
+/// can be set before it is published, else 0666.
+pub(crate) fn create_mode(meta: &ExtractedEntryMeta) -> u32 {
+    create_mode_for(early_metadata(meta))
+}
+
+fn create_mode_for(early: Option<EarlyMetadata>) -> u32 {
+    early.and_then(|(_, mode)| mode).unwrap_or(0o666)
+}
+
+/// Whether `file` has exactly the permission bits `mode`.
+#[cfg(unix)]
+pub(crate) fn has_mode(file: &fs::File, mode: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    file.metadata()
+        .is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == mode)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn has_mode(_file: &fs::File, _mode: u32) -> bool {
+    false
+}
+
+/// A member's file written at its destination. Dropped, it hands the file
+/// over to `done` rather than closing it, so that its time and mode can be
+/// set through its own descriptor once it verifies.
+pub(crate) struct InPlaceFile {
+    file: Option<fs::File>,
+    done: std::sync::Arc<std::sync::OnceLock<fs::File>>,
+}
+
+impl InPlaceFile {
+    pub(crate) fn new(file: fs::File) -> (Self, std::sync::Arc<std::sync::OnceLock<fs::File>>) {
+        let done = std::sync::Arc::default();
+        let writer = Self {
+            file: Some(file),
+            done: std::sync::Arc::clone(&done),
+        };
+        (writer, done)
+    }
+
+    fn file(&mut self) -> &mut fs::File {
+        self.file.as_mut().expect("held until dropped")
+    }
+}
+
+impl std::io::Write for InPlaceFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file().write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.file().write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file().flush()
+    }
+}
+
+impl Drop for InPlaceFile {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = self.done.set(file);
+        }
+    }
+}
+
 /// Whether creating a file in one directory with given permission bits
 /// gives it exactly those bits, for each set of bits a file there was created
 /// with: the umask or a default ACL may clear some. Learnt from the first file
@@ -219,7 +287,7 @@ impl StagedFile {
             file: Err(Some((dir, name))),
             early,
             set: std::sync::Arc::clone(&set),
-            create_mode: early.and_then(|(_, mode)| mode).unwrap_or(0o666),
+            create_mode: create_mode_for(early),
             created_modes,
         };
         (staged, set)
@@ -282,13 +350,13 @@ impl Drop for StagedFile {
 }
 
 #[cfg(unix)]
-fn set_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
+pub(crate) fn set_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     file.set_permissions(fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-fn set_file_mode(_file: &fs::File, _mode: u32) -> std::io::Result<()> {
+pub(crate) fn set_file_mode(_file: &fs::File, _mode: u32) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
