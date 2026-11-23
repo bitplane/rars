@@ -86,17 +86,22 @@ mod imp {
     pub struct FileDir(Arc<OwnedFd>);
 
     impl FileDir {
-        /// Creates a new file called `name`. An existing entry of any kind
-        /// fails with `AlreadyExists`.
-        pub fn create_file(&self, name: &OsStr) -> std::io::Result<std::fs::File> {
-            create_file_at(self.0.as_fd(), name)
+        /// Creates a new file called `name` with the permission bits `mode`,
+        /// less what the umask clears. An existing entry of any kind fails
+        /// with `AlreadyExists`.
+        pub fn create_file(&self, name: &OsStr, mode: u32) -> std::io::Result<std::fs::File> {
+            create_file_at(self.0.as_fd(), name, mode)
         }
     }
 
-    fn create_file_at(parent: BorrowedFd<'_>, name: &OsStr) -> std::io::Result<std::fs::File> {
+    fn create_file_at(
+        parent: BorrowedFd<'_>,
+        name: &OsStr,
+        mode: u32,
+    ) -> std::io::Result<std::fs::File> {
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let file = rustix::fs::openat(parent, name, flags, Mode::from_raw_mode(0o666))?;
+        let file = rustix::fs::openat(parent, name, flags, Mode::from_raw_mode(mode as _))?;
         Ok(std::fs::File::from(file))
     }
 
@@ -424,7 +429,7 @@ mod imp {
         pub fn create_file(&mut self, relative: &Path) -> crate::Result<std::fs::File> {
             let (parts, name) = split(relative)?;
             let (parent, _) = self.dir(&parts, true)?.expect("created parents exist");
-            Ok(create_file_at(parent, name)?)
+            Ok(create_file_at(parent, name, 0o666)?)
         }
     }
 
@@ -523,7 +528,7 @@ mod unsupported {
     pub struct FileDir(std::convert::Infallible);
 
     impl FileDir {
-        pub fn create_file(&self, _name: &OsStr) -> std::io::Result<std::fs::File> {
+        pub fn create_file(&self, _name: &OsStr, _mode: u32) -> std::io::Result<std::fs::File> {
             match self.0 {}
         }
 
@@ -667,7 +672,7 @@ mod tests {
         let files = storage.file_dir(Path::new("files")).unwrap();
         let mut renames = RenameCounters::default();
         let mut publish = |tree: &mut OutputTree, name: &str, to: &str, overwrite| {
-            let mut file = files.create_file(OsStr::new(name)).unwrap();
+            let mut file = files.create_file(OsStr::new(name), 0o666).unwrap();
             file.write_all(name.as_bytes()).unwrap();
             drop(file);
             files.publish(

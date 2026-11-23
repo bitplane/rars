@@ -1189,6 +1189,8 @@ struct ExtractOutputState<'a> {
     staging_files: Option<(rars::output_tree::FileDir, PathBuf)>,
     /// Names taken in [`STAGED_FILES`].
     staged_count: u64,
+    /// Which permission bits files created in [`STAGED_FILES`] keep.
+    created_modes: output::CreatedModes,
     staged_paths: Vec<PathBuf>,
     /// For each staged path, the file staged by descriptor there.
     staged_files: Vec<Option<Staged>>,
@@ -1257,6 +1259,7 @@ impl<'a> ExtractOutputState<'a> {
             staging_tree: None,
             staging_files: None,
             staged_count: 0,
+            created_modes: Default::default(),
             staged_paths: Vec::new(),
             staged_files: Vec::new(),
             hardlink_targets: HashMap::new(),
@@ -1439,9 +1442,19 @@ impl<'a> ExtractOutputState<'a> {
                     let (file, early_set) = if self.settling {
                         // Created where it is written: the library may
                         // write it on another thread.
-                        output::StagedFile::deferred(dir.clone(), name.clone(), meta)
+                        output::StagedFile::deferred(
+                            dir.clone(),
+                            name.clone(),
+                            meta,
+                            self.created_modes.clone(),
+                        )
                     } else {
-                        output::StagedFile::new(dir.create_file(&name)?, meta)
+                        output::StagedFile::new(
+                            dir.clone(),
+                            name.clone(),
+                            meta,
+                            self.created_modes.clone(),
+                        )?
                     };
                     let staged = Staged {
                         dir,
