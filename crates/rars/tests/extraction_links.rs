@@ -669,6 +669,13 @@ fn rar50_settled_extraction_matches_sequential_at_any_thread_count() {
             assert_eq!(sequential.1, sources[..6]);
         }
         for threads in [1, 2, 8] {
+            // `with_threads` caps the global pool, which has one thread per
+            // CPU: on one CPU, two threads still run one member at a time.
+            let usable = if cfg!(feature = "parallel") {
+                threads.min(rayon::current_num_threads())
+            } else {
+                1
+            };
             for limited in [false, true] {
                 let options = ArchiveReadOptions::new().with_threads(threads);
                 let options = if limited {
@@ -682,10 +689,10 @@ fn rar50_settled_extraction_matches_sequential_at_any_thread_count() {
                     "threads={threads} limited={limited} handler={handler}"
                 );
                 // Unlimited, later members are opened while earlier ones run.
-                if threads > 1 && !limited && std::ptr::eq(archive, &clean) {
-                    assert!(most_unsettled > 1, "threads={threads}");
-                } else if threads == 1 || limited {
-                    assert_eq!(most_unsettled, 1, "threads={threads}");
+                if usable > 1 && !limited && std::ptr::eq(archive, &clean) {
+                    assert!(most_unsettled > 1, "threads={threads} usable={usable}");
+                } else if usable == 1 || limited {
+                    assert_eq!(most_unsettled, 1, "threads={threads} usable={usable}");
                 }
             }
         }
