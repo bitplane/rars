@@ -133,15 +133,23 @@ pub(crate) trait Workers: Budget<Charge: Send> + Sync {
 }
 
 /// Workspace, by the members' hints, that the members an unlimited policy has
-/// running may hold together. Sequential extraction holds one member's; this
+/// running may hold together: 1 GiB, or a quarter of the memory this process
+/// may use when that is less. Sequential extraction holds one member's; this
 /// lets several streaming members, each with its own window, run side by side
-/// without one window per thread.
-const RUNNING_WORKSPACE: u64 = 1024 * 1024 * 1024;
+/// without one window per thread. One member can always run alone.
+fn running_workspace() -> u64 {
+    scaled_running_workspace(crate::memory_limit::physical_memory())
+}
+
+fn scaled_running_workspace(physical: Option<u64>) -> u64 {
+    const CEILING: u64 = 1024 * 1024 * 1024;
+    physical.map_or(CEILING, |total| CEILING.min(total / 4))
+}
 
 /// At most one member per worker. Members start as soon as there is room, not
 /// a batch at a time, so a slow member holds back only the publication of
 /// those after it. The results not yet published hold at most `capacity`
-/// bytes of cost, and the running members [`RUNNING_WORKSPACE`] by their
+/// bytes of cost, and the running members [`running_workspace`] by their
 /// hints; a member over either waits until that one is empty.
 impl Workers for Allowance {
     fn batches<T: Copy + Send, O: Send, C: ?Sized>(
@@ -158,6 +166,7 @@ impl Workers for Allowance {
         let window = crate::parallel::default_window().max(1);
         if window > 1 && members.len() > 1 && crate::parallel::may_spawn() {
             check()?;
+            let running_limit = running_workspace();
             // Bytes of unpublished cost, and the running members' workspace.
             let held = std::cell::Cell::new((0u128, 0u128));
             let fits = |held: u128, more: u64, limit: u64| {
@@ -170,8 +179,7 @@ impl Workers for Allowance {
                     let workspace = hint(member);
                     let (bytes, running) = held.get();
                     let admitted = idle
-                        || (fits(bytes, cost, capacity)
-                            && fits(running, workspace, RUNNING_WORKSPACE));
+                        || (fits(bytes, cost, capacity) && fits(running, workspace, running_limit));
                     if admitted {
                         held.set((bytes + u128::from(cost), running + u128::from(workspace)));
                     }
@@ -344,6 +352,17 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, Error::Cancelled));
         assert_eq!(seen, [1]);
+    }
+
+    #[test]
+    fn running_workspace_is_a_quarter_of_memory_up_to_a_gibibyte() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(scaled_running_workspace(None), 1024 * MIB);
+        assert_eq!(scaled_running_workspace(Some(64 * 1024 * MIB)), 1024 * MIB);
+        assert_eq!(scaled_running_workspace(Some(4096 * MIB)), 1024 * MIB);
+        // A 512 MiB container, as SABnzbd often runs in.
+        assert_eq!(scaled_running_workspace(Some(512 * MIB)), 128 * MIB);
+        assert_eq!(scaled_running_workspace(Some(0)), 0);
     }
 
     #[test]
