@@ -6707,7 +6707,8 @@ mod tests {
         let contents = [("small.txt", small), ("large.bin", &large[..])];
         let (members, opens) = counted_entries(&contents);
         let coding = || crate::MemberCoding::Compressed;
-        // RAR 2.0 has one engine, so it opens a member once either way.
+        // RAR 2.0 has one engine, so it opens a member once to sample it and
+        // once to code it either way.
         let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
         let streams = super::streams_member(&routed[1], rar20(3, false), &coding(), 256 * 1024);
         assert!(streams.unwrap());
@@ -6722,7 +6723,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 3);
         let whole =
             volume_set(&members, rar20(3, false), coding(), 100_000, u64::MAX, None).unwrap();
         assert!(streamed.len() > 2);
@@ -9034,17 +9035,18 @@ mod tests {
 
     #[test]
     fn streamed_rar20_noise_is_stored_without_coding_it_first() {
-        // Sixteen dictionaries long, so the probe runs.
+        // Sixteen dictionaries long or more, so RAR 2.0's own probe runs, and
+        // long enough that the shared samples are a small part of it.
         let mut options = rar20(1, false);
         options.dictionary_size = Some(64 * 1024);
-        let len = 16 * 64 * 1024 + 4321;
+        let len = 64 * 64 * 1024 + 4321;
         let coding = || crate::MemberCoding::Compressed;
 
         let noise = noise(len);
         let (members, read) = read_counted(&[("noise.bin", &noise)]);
         let out = streamed_with(&members, options, coding(), None).unwrap();
         assert!(out.seeks > 0, "the member was not streamed");
-        // Four samples and one copy, not a whole coding pass and a copy.
+        // Its samples and one copy, not a whole coding pass and a copy.
         let read = read.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             read < len + len / 2,
