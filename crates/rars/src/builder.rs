@@ -256,6 +256,7 @@ pub struct Builder {
     recovery_percent: Option<u64>,
     locked: bool,
     quick_open: bool,
+    blake2sp: bool,
     archive_metadata: Option<rar50::ArchiveMetadataRecord>,
     legacy_archive_comment_metadata: Option<(u32, u8)>,
     legacy_unpack_version: Option<u8>,
@@ -281,6 +282,7 @@ impl Builder {
             recovery_percent: None,
             locked: false,
             quick_open: false,
+            blake2sp: false,
             archive_metadata: None,
             legacy_archive_comment_metadata: None,
             legacy_unpack_version: None,
@@ -326,6 +328,14 @@ impl Builder {
     /// a password.
     pub fn header_encryption(mut self, encrypt: bool) -> Self {
         self.encrypt_headers = encrypt;
+        self
+    }
+
+    /// Store a BLAKE2sp hash of each member beside its CRC32, the hash rar's
+    /// `-htb` writes. RAR 5 and later only. Off by default, as in rar: readers
+    /// check the hash rather than the CRC32, and it costs more to compute.
+    pub fn blake2sp(mut self, blake2sp: bool) -> Self {
+        self.blake2sp = blake2sp;
         self
     }
 
@@ -1612,6 +1622,7 @@ impl Builder {
         features.solid = self.solid;
         features.header_encryption = self.encrypt_headers;
         features.quick_open = self.quick_open;
+        features.blake2sp = self.blake2sp;
         features
     }
 

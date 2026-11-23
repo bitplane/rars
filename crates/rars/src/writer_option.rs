@@ -23,10 +23,11 @@ pub enum WriterOption {
 }
 
 impl WriterOption {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Feature(Feature::Solid),
         Self::Feature(Feature::HeaderEncryption),
         Self::Feature(Feature::QuickOpen),
+        Self::Feature(Feature::Blake2sp),
         Self::CompressionLevel,
         Self::CompressionMethod,
         Self::DictionarySize,

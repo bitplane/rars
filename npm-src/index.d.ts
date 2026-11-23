@@ -68,6 +68,8 @@ export interface RarWriterOptions {
   solid?: boolean;
   password?: string | Uint8Array;
   encryptHeaders?: boolean;
+  /** Store a BLAKE2sp hash of each member beside its CRC32, like rar's `-htb`. RAR 5 and later. */
+  blake2sp?: boolean;
   comment?: string | Uint8Array;
   recoveryPercent?: number;
   /** Hard RAR5/7 managed writer capacity; caller inputs and runtime overhead are excluded. */

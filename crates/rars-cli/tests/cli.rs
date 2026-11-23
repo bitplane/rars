@@ -5157,6 +5157,54 @@ fn creates_rar50_quick_open_archive_that_can_be_tested_and_listed() {
 }
 
 #[test]
+fn rar50_members_carry_a_blake2sp_hash_only_when_asked_for() {
+    let dir = scratch("create-rar50-checksum");
+    let source = dir.join("payload.txt");
+    let payload = b"rar50 checksum cli payload\n".repeat(64);
+    fs::write(&source, &payload).unwrap();
+
+    for blake2sp in [false, true] {
+        let archive = dir.join(format!("created-{blake2sp}.rar"));
+        let mut create = rars();
+        create.args(["a", "--store"]);
+        if blake2sp {
+            create.arg("--blake2sp");
+        }
+        let create = create.arg(&archive).arg(&source).output().unwrap();
+        assert!(create.status.success(), "stderr: {}", stderr(&create));
+
+        let mut bytes = fs::read(&archive).unwrap();
+        let parsed = rars::rar50::Archive::parse(&bytes).unwrap();
+        let file = parsed.files().next().unwrap();
+        assert_eq!(file.hash.is_some(), blake2sp);
+        assert_eq!(file.data_crc32, Some(crc32(&payload)));
+        let middle = file.block.data_range.start + payload.len() / 2;
+
+        let test = rars().arg("test").arg(&archive).output().unwrap();
+        assert!(test.status.success(), "stderr: {}", stderr(&test));
+        assert!(stdout(&test).contains("OK payload.txt"));
+
+        bytes[middle] ^= 0x20;
+        fs::write(&archive, &bytes).unwrap();
+        let test = rars().arg("test").arg(&archive).output().unwrap();
+        assert!(!test.status.success(), "blake2sp={blake2sp}");
+    }
+
+    let refused = rars()
+        .args(["a", "--format", "rar40", "--blake2sp"])
+        .arg(dir.join("legacy.rar"))
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(
+        stderr(&refused).contains("--blake2sp"),
+        "{}",
+        stderr(&refused)
+    );
+}
+
+#[test]
 fn creates_rar50_recovery_archive_that_can_be_tested_and_listed() {
     let dir = scratch("create-rar50-recovery");
     let source = dir.join("payload.txt");

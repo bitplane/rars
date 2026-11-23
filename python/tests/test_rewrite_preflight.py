@@ -55,7 +55,8 @@ def test_preservation_default_accepts_supported_rar5_metadata():
 
 @pytest.mark.parametrize("damage", ["unknown", "incomplete"])
 def test_skipped_extra_metadata_cannot_pass_preservation_preflight(damage):
-    data = bytearray(archive_bytes(level=0))
+    # The hash record gives each member header an extra area to damage.
+    data = bytearray(archive_bytes(level=0, blake2sp=True))
     for crc_at, body_at, body_end in _headers(data):
         _, cursor = _read_vint(data, body_at)
         kind, cursor = _read_vint(data, cursor)

@@ -267,6 +267,8 @@ def test_repair_reports_repaired_data(tmp_path):
         {"recovery_percent": 5},
         {"password": "secret", "encrypt_headers": True},
         {"solid": True, "password": "secret", "encrypt_headers": True, "recovery_percent": 5},
+        {"blake2sp": True},
+        {"blake2sp": True, "password": "secret"},
     ],
 )
 def test_builder_writes_every_supported_feature_combination(tmp_path, kwargs):

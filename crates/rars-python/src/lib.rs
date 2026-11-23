@@ -2856,6 +2856,7 @@ impl RarBuilder {
         solid = false,
         password = None,
         encrypt_headers = false,
+        blake2sp = false,
         comment = None,
         recovery_percent = None,
         volume_size = None,
@@ -2868,6 +2869,7 @@ impl RarBuilder {
         solid: bool,
         password: Option<&Bound<'_, PyAny>>,
         encrypt_headers: bool,
+        blake2sp: bool,
         comment: Option<&Bound<'_, PyAny>>,
         recovery_percent: Option<u64>,
         volume_size: Option<usize>,
@@ -2915,6 +2917,11 @@ impl RarBuilder {
                 rars_rs::Feature::HeaderEncryption,
             ))?;
         }
+        if blake2sp {
+            refuse_unless(rars_rs::write_plan::WriterOption::Feature(
+                rars_rs::Feature::Blake2sp,
+            ))?;
+        }
         if comment.is_some() {
             refuse_unless(rars_rs::write_plan::WriterOption::ArchiveComment)?;
         }
@@ -2937,6 +2944,7 @@ impl RarBuilder {
                 .solid(solid)
                 .password(password)
                 .header_encryption(encrypt_headers)
+                .blake2sp(blake2sp)
                 .comment(comment)
                 .recovery_percent(recovery_percent)
                 .volume_size(volume_size),

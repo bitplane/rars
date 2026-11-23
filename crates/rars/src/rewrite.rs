@@ -388,10 +388,13 @@ impl Archive {
                     }
                     _ => None,
                 });
+                // Keep the checksum the members were written with.
+                let blake2sp = archive.files().any(|file| file.hash.is_some());
                 crate::Builder::new(version)
                     .compression_level(Some(3))
                     .rar50_dictionary_size(rar7_dictionary_size)
                     .solid(archive.main.is_solid())
+                    .blake2sp(blake2sp)
                     .password(password.clone())
                     .header_encryption(archive.main.encrypted_headers)
                     .archive_comment_password(if archive_comment_encrypted {

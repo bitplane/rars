@@ -30,6 +30,7 @@ def test_level_zero_stores(format):
     dict(version="rar29", recovery_percent=5),
     dict(encrypt_headers=True),
     dict(version="rar20", password="pw", encrypt_headers=True),
+    dict(version="rar40", blake2sp=True),
     dict(volume_size=0),
     dict(comment="note", volume_size=4096),
     dict(version="rar29", resources=rars.WriterResources(max_memory_bytes=1 << 20)),

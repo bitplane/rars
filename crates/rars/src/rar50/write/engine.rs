@@ -136,7 +136,8 @@ struct PreparedSource {
     source: crate::EntrySource,
     len: u64,
     crc32: u32,
-    hash: [u8; 32],
+    /// Present only when the archive stores BLAKE2sp hashes.
+    hash: Option<[u8; 32]>,
     /// Not hashed yet: the copy's checksums go into a patched header.
     hashed_on_copy: bool,
 }
@@ -155,9 +156,14 @@ impl PreparedSource {
     fn open<'w, 'p>(&self, work: Option<&'w WorkTracker<'p>>) -> Result<CheckedReader<'w, 'p>> {
         Ok(CheckedReader {
             reader: self.source.open()?,
-            integrity: ChecksumSink::default(),
+            integrity: self.checksum_sink(),
             work,
         })
+    }
+
+    /// A sink computing the checksums this member's header carries.
+    fn checksum_sink(&self) -> ChecksumSink {
+        ChecksumSink::new(self.hash.is_some())
     }
 
     /// The copy's checksums for a member hashed on its copy; otherwise
@@ -171,7 +177,8 @@ impl PreparedSource {
     }
 
     fn verify(&self, integrity: ChecksumSink) -> Result<()> {
-        if integrity.crc.finish() != self.crc32 || integrity.hash.finalize() != self.hash {
+        let (crc32, hash) = integrity.finish();
+        if crc32 != self.crc32 || hash != self.hash {
             return Err(Error::SourceChanged(
                 "entry source contents changed while writing",
             ));
@@ -490,7 +497,7 @@ pub(super) fn write_archive<'a>(
     if let Some((prepared, mut payload)) = quick_open_payload {
         let patched = if quick_open_patched {
             let payload_len = payload.len();
-            let mut checksum = ChecksumSink::default();
+            let mut checksum = ChecksumSink::new(false);
             payload.copy_to(&mut checksum)?;
             let (specific, extra) =
                 stored_service_parts(b"QO", payload_len, checksum.crc.finish(), &[], resources)?;
@@ -625,10 +632,11 @@ fn emit_block(
     };
     let patched = match (patch, checksums) {
         (Some((patch, index, header_at)), Some(checksums)) => {
+            let (crc32, hash) = checksums.finish();
             let patched = patch.render(
                 &entries[index],
-                checksums.crc.finish(),
-                checksums.hash.finalize(),
+                crc32,
+                hash,
                 &prepared,
                 header_keys,
                 resources,
@@ -879,10 +887,7 @@ fn encrypted_service_block<'a>(
     let mut extra = Bytes::new(resources);
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, service_data)?;
     write_file_encryption_record(&mut extra, salt, iv, keys.checked_password_record()?, true)?;
-    write_hash_record_with_value(
-        &mut extra,
-        keys.checked_hash_mac(crate::rar50::blake2sp::hash(data))?,
-    )?;
+    // Like plain services, an encrypted one carries a CRC32 only, here as a MAC.
     let specific = stored_file_specific(
         name,
         data.len() as u64,
@@ -999,7 +1004,7 @@ fn prepare_member<'a>(
     let (specific, extra) = recipe.parts(entry, crc32, hash, resources)?;
     let header = prepared_header_image(
         HEAD_FILE,
-        HFL_EXTRA | HFL_DATA,
+        member_header_flags(&extra),
         Some(recipe.payload_len),
         &specific,
         &extra,
@@ -1018,6 +1023,16 @@ fn prepare_member<'a>(
     })
 }
 
+/// A plain member with a CRC32 and its time in the base header has no extra
+/// records, and then no extra area either.
+fn member_header_flags(extra: &[u8]) -> u64 {
+    if extra.is_empty() {
+        HFL_DATA
+    } else {
+        HFL_DATA | HFL_EXTRA
+    }
+}
+
 /// Everything in a member's header but its checksums.
 struct MemberHeader {
     compression_info: u64,
@@ -1033,11 +1048,13 @@ struct MemberEncryption {
 }
 
 impl MemberHeader {
+    /// The CRC32 always goes in; the BLAKE2sp hash record only when the
+    /// archive keeps hashes.
     fn parts(
         &self,
         entry: &ArchiveEntry,
         crc32: u32,
-        hash: [u8; 32],
+        hash: Option<[u8; 32]>,
         resources: &WriterResources,
     ) -> Result<(Bytes, Bytes)> {
         let mut extra = Bytes::new(resources);
@@ -1052,13 +1069,14 @@ impl MemberHeader {
                 )?;
                 (
                     encryption.keys.checked_crc_mac(crc32)?,
-                    encryption.keys.checked_hash_mac(hash)?,
+                    hash.map(|hash| encryption.keys.checked_hash_mac(hash))
+                        .transpose()?,
                 )
             }
             None => (crc32, hash),
         };
         // A link has no file payload to hash; its target is protected by the header CRC.
-        if entry.redirection.is_none() {
+        if let Some(hash) = hash.filter(|_| entry.redirection.is_none()) {
             write_hash_record_with_value(&mut extra, hash)?;
         }
         super::headers::write_mtime_record(&mut extra, entry.mtime, entry.mtime_nanoseconds)?;
@@ -1098,7 +1116,7 @@ impl MemberHeader {
         &self,
         entry: &ArchiveEntry,
         crc32: u32,
-        hash: [u8; 32],
+        hash: Option<[u8; 32]>,
         prepared: &[u8],
         header_keys: Option<&HeaderEncryptionKeys>,
         resources: &WriterResources,
@@ -1107,7 +1125,7 @@ impl MemberHeader {
         repeated_header_image(
             prepared,
             HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
+            member_header_flags(&extra),
             Some(self.payload_len),
             &specific,
             &extra,
@@ -1240,15 +1258,14 @@ fn copy_stored_pipelined(
     output: &mut dyn Write,
     work: Option<&WorkTracker<'_>>,
 ) -> Result<Option<ChecksumSink>> {
-    let mut integrity = ChecksumSink::default();
+    let mut integrity = source.checksum_sink();
     // The producer and the checksum thread already fill a cap of two, so BLAKE2sp gets no split helper.
     let hash_cap = (crate::parallel::threads() <= 2).then_some(1);
     crate::output_pipeline::run(
         |chunks| produce_stored(source, work, chunks),
         &mut |chunk: &[u8]| {
             let _cap = crate::parallel::ThreadCap::set(hash_cap);
-            integrity.crc.update(chunk);
-            integrity.hash.update(chunk);
+            integrity.update(chunk);
         },
         output,
     )
@@ -1505,9 +1522,10 @@ impl FragmentSource {
         len: u64,
         output: &mut dyn Write,
         want_checksums: bool,
+        blake2sp: bool,
         resources: &WriterResources,
     ) -> Result<Option<FragmentChecksums>> {
-        let mut fragment = want_checksums.then(ChecksumSink::default);
+        let mut fragment = want_checksums.then(|| ChecksumSink::new(blake2sp));
         match self {
             Self::Packed(spool) => {
                 spool.copy_range_to(
@@ -1548,13 +1566,17 @@ impl FragmentSource {
                         prepared.len,
                         "entry source size changed while writing",
                     )?;
-                    prepared.verify(std::mem::take(&mut **emitted))?;
+                    let blake2sp = prepared.hash.is_some();
+                    prepared.verify(std::mem::replace(
+                        &mut **emitted,
+                        ChecksumSink::new(blake2sp),
+                    ))?;
                 }
             }
         }
-        Ok(fragment.map(|sink| FragmentChecksums {
-            crc32: sink.crc.finish(),
-            hash: sink.hash.finalize(),
+        Ok(fragment.map(|sink| {
+            let (crc32, hash) = sink.finish();
+            FragmentChecksums { crc32, hash }
         }))
     }
 }
@@ -1563,28 +1585,42 @@ impl FragmentSource {
 #[derive(Clone, Copy)]
 struct FragmentChecksums {
     crc32: u32,
-    hash: [u8; 32],
+    hash: Option<[u8; 32]>,
 }
 
-/// Discards what it is given and keeps the running checksums.
+/// Discards what it is given and keeps the running checksums: a CRC32, and a
+/// BLAKE2sp hash only for an archive that stores one.
 struct ChecksumSink {
     crc: crate::crc32::Crc32,
-    hash: crate::rar50::blake2sp::Hasher,
+    hash: Option<crate::rar50::blake2sp::Hasher>,
 }
 
-impl Default for ChecksumSink {
-    fn default() -> Self {
+impl ChecksumSink {
+    fn new(blake2sp: bool) -> Self {
         Self {
             crc: crate::crc32::Crc32::new(),
-            hash: crate::rar50::blake2sp::Hasher::new(),
+            hash: blake2sp.then(crate::rar50::blake2sp::Hasher::new),
         }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        self.crc.update(bytes);
+        if let Some(hash) = &mut self.hash {
+            hash.update(bytes);
+        }
+    }
+
+    fn finish(self) -> (u32, Option<[u8; 32]>) {
+        (
+            self.crc.finish(),
+            self.hash.map(crate::rar50::blake2sp::Hasher::finalize),
+        )
     }
 }
 
 impl Write for ChecksumSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.crc.update(buf);
-        self.hash.update(buf);
+        self.update(buf);
         Ok(buf.len())
     }
 
@@ -1604,7 +1640,7 @@ struct VolumeMember<'a> {
     host_os: u64,
     unpacked_size: u64,
     crc32: u32,
-    hash: [u8; 32],
+    hash: Option<[u8; 32]>,
     compression_info: u64,
     payload_len: u64,
     source: FragmentSource,
@@ -1813,7 +1849,10 @@ fn prepare_volume_member<'a>(
                 host_os: entry.host_os,
                 unpacked_size: member.input_size,
                 crc32: keys.checked_crc_mac(member.crc32)?,
-                hash: keys.checked_hash_mac(member.hash)?,
+                hash: member
+                    .hash
+                    .map(|hash| keys.checked_hash_mac(hash))
+                    .transpose()?,
                 compression_info,
                 payload_len,
                 source: FragmentSource::Packed(encrypted),
@@ -1835,8 +1874,8 @@ fn prepare_volume_member<'a>(
             payload_len: plain_len,
             source: if member.store {
                 FragmentSource::Stored {
+                    emitted: Owned::new(ChecksumSink::new(member.hash.is_some()), resources)?,
                     prepared: PreparedSource::new(&entry.source, &member, false),
-                    emitted: Owned::new(ChecksumSink::default(), resources)?,
                 }
             } else {
                 FragmentSource::Packed(member.packed)
@@ -1906,6 +1945,7 @@ impl VolumeWriter<'_> {
             let body = self.body.as_mut().expect("volume started");
             let header_at = body.len();
             body.write_all(&vec![0; header_len as usize])?;
+            let blake2sp = member.hash.is_some();
             let fragment_checksums = member.source.emit_range(
                 start,
                 fragment_len,
@@ -1914,6 +1954,7 @@ impl VolumeWriter<'_> {
                     progress: self.progress,
                 },
                 split_after,
+                blake2sp,
                 self.resources,
             )?;
             let header = fragment_header(
@@ -2275,11 +2316,11 @@ impl VolumeWriter<'_> {
 /// no password, and like WinRAR they leave the hash-MAC flag off; with it set,
 /// unrar MACs the checksum it computes and reports a packed data checksum error.
 ///
-/// Both a CRC32 and a hash record go on every fragment. A reader takes the hash
-/// record as the member's checksum type when it has one, and unrar picks that
-/// type from the first fragment and compares it against the last, so a fragment
-/// that offered only a CRC32 while the last offered a hash would fail a member
-/// that is perfectly intact.
+/// Every fragment carries a CRC32, and a hash record too when the archive keeps
+/// hashes. A reader takes the hash record as the member's checksum type when it
+/// has one, and unrar picks that type from the first fragment and compares it
+/// against the last, so a fragment that offered only a CRC32 while the last
+/// offered a hash would fail a member that is perfectly intact.
 fn fragment_header(
     member: &VolumeMember,
     fragment_len: u64,
@@ -2293,7 +2334,9 @@ fn fragment_header(
     if let Some((salt, iv, check_value)) = member.encryption {
         write_file_encryption_record(&mut extra, salt, iv, check_value, !split_after)?;
     }
-    write_hash_record_with_value(&mut extra, fragment.map_or(member.hash, |f| f.hash))?;
+    if let Some(hash) = fragment.map_or(member.hash, |f| f.hash) {
+        write_hash_record_with_value(&mut extra, hash)?;
+    }
     super::headers::write_mtime_record(&mut extra, member.mtime, member.mtime_nanoseconds)?;
     if let Some(times) = member.file_times {
         write_extra_record(&mut extra, super::super::FHEXTRA_HTIME, &times.encode()?)?;
@@ -2310,8 +2353,7 @@ fn fragment_header(
         resources,
     )?;
 
-    // Every fragment has a hash record, so its extra area is never empty.
-    let mut flags = HFL_DATA | HFL_EXTRA;
+    let mut flags = member_header_flags(&extra);
     if split_before {
         flags |= crate::rar50::HFL_SPLIT_BEFORE;
     }
@@ -2431,7 +2473,7 @@ mod input_size_tests {
         );
         assert_eq!(output.flushes, 2);
 
-        let mut checksum = ChecksumSink::default();
+        let mut checksum = ChecksumSink::new(false);
         checksum.write_all(b"payload").unwrap();
         checksum.flush().unwrap();
         assert_eq!(checksum.crc.finish(), crate::crc32::crc32(b"payload"));
@@ -3360,6 +3402,7 @@ mod emission_ledger_tests {
                 method: 0,
                 filter_policy: super::super::FilterPolicy::None,
                 candidates: vec![options].into(),
+                blake2sp: true,
             },
             recovery_percent: cfg!(feature = "recovery").then_some(10),
             header_encrypted: encrypted,
@@ -4076,6 +4119,13 @@ mod stored_pipe_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    fn hashed() -> crate::FeatureSet {
+        crate::FeatureSet {
+            blake2sp: true,
+            ..crate::FeatureSet::store_only()
+        }
+    }
+
     fn data(len: usize, seed: usize) -> Vec<u8> {
         (0..len)
             .map(|at| (at.wrapping_mul(31) ^ (at >> 9) ^ seed) as u8)
@@ -4120,11 +4170,21 @@ mod stored_pipe_tests {
     #[test]
     fn stored_pipe_archives_match_fingerprints_captured_from_master() {
         let entries = entries();
-        let plain = crate::FeatureSet::store_only();
+        // Captured when every member carried a BLAKE2sp hash, which is what
+        // asking for one still writes, byte for byte.
+        let plain = hashed();
         let mut quick_open = plain;
         quick_open.quick_open = true;
         let mut cases = Vec::new();
         cases.extend([
+            (
+                "crc32_only",
+                piped(
+                    &entries,
+                    store(crate::FeatureSet::store_only()),
+                    ArchiveExtras::default(),
+                ),
+            ),
             (
                 "one",
                 piped(&entries[..1], store(plain), ArchiveExtras::default()),
@@ -4174,6 +4234,7 @@ mod stored_pipe_tests {
             ));
         }
         let expected = [
+            ("crc32_only", "2570159:a0e203b26c17284a"),
             ("one", "2500141:214930c9491ae64f"),
             ("empty", "135:48c92c5a1d765e8b"),
             ("several", "2570267:4b7664377148b4e7"),
@@ -4212,11 +4273,19 @@ mod stored_pipe_tests {
     #[test]
     fn stored_seekable_archives_match_fingerprints_captured_before_the_pipelined_copy() {
         let entries = entries();
-        let plain = crate::FeatureSet::store_only();
+        let plain = hashed();
         let mut quick_open = plain;
         quick_open.quick_open = true;
         let mut cases = Vec::new();
         cases.extend([
+            (
+                "crc32_only".to_string(),
+                seekable(
+                    &entries,
+                    store(crate::FeatureSet::store_only()),
+                    ArchiveExtras::default(),
+                ),
+            ),
             (
                 "one".to_string(),
                 seekable(&entries[..1], store(plain), ArchiveExtras::default()),
@@ -4244,6 +4313,7 @@ mod stored_pipe_tests {
             .map(|(name, bytes)| (name, crate::write_stream::fingerprint([&bytes[..]])))
             .collect();
         let expected = [
+            ("crc32_only", "2570159:30ddf3ad"),
             ("one", "2500141:a6c68802"),
             ("several", "2570267:a6dc6e09"),
             ("quick_open", "2570524:d5eb5a67"),
@@ -4260,7 +4330,7 @@ mod stored_pipe_tests {
             .into_iter()
             .map(|entry| entry.with_password(b"secret".to_vec()))
             .collect();
-        let mut headers = crate::FeatureSet::store_only();
+        let mut headers = hashed();
         headers.header_encryption = true;
         let seekable = crate::entropy::seeded::with(|| {
             let mut output = std::io::Cursor::new(Vec::new());

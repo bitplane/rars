@@ -1324,6 +1324,8 @@ export interface RarBuilderOptions {
   password?: Uint8Array | string;
   /** Encrypt the headers too, hiding member names. Requires `password`. */
   encryptHeaders?: boolean;
+  /** Store a BLAKE2sp hash of each member beside its CRC32. RAR 5 and later. */
+  blake2sp?: boolean;
   /** Archive comment. */
   comment?: Uint8Array | string;
   /** Add a recovery record covering this percentage of the archive. */
@@ -1449,6 +1451,7 @@ impl RarBuilder {
                 .solid(opt_bool(&options, "solid")?)
                 .password(opt_bytes(&options, "password")?)
                 .header_encryption(opt_bool(&options, "encryptHeaders")?)
+                .blake2sp(opt_bool(&options, "blake2sp")?)
                 .comment(opt_bytes(&options, "comment")?)
                 .recovery_percent(opt_number(&options, "recoveryPercent")?.map(|n| n as u64))
                 .volume_size(opt_number(&options, "volumeSize")?.map(|n| n as usize)),

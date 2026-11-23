@@ -560,6 +560,7 @@ fn compression_plan(
             candidates.into_iter().map(Ok),
             resources,
         )?,
+        blake2sp: options.features.blake2sp,
     })
 }
 
@@ -570,18 +571,21 @@ fn stored_block_len(len: u64) -> usize {
     len.clamp(1, STORED_BLOCK) as usize
 }
 
+/// The source's CRC32, and its BLAKE2sp hash when `blake2sp` asks for one.
 fn source_integrity(
     source: &EntrySource,
     expected_size: u64,
+    blake2sp: bool,
     progress: &dyn compress::CompressionProgress,
     resources: &WriterResources,
-) -> Result<(u32, [u8; 32])> {
+) -> Result<(u32, Option<[u8; 32]>)> {
     let block_size = stored_block_len(expected_size);
     if let Some(allowance) = &resources.execution {
         return source_integrity_with_allowance(
             source,
             expected_size,
             block_size,
+            blake2sp,
             progress,
             allowance,
         );
@@ -590,6 +594,7 @@ fn source_integrity(
         source,
         expected_size,
         block_size,
+        blake2sp,
         progress,
         &crate::codec::workspace::Allowance::default(),
     )
@@ -599,14 +604,15 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
     source: &EntrySource,
     expected_size: u64,
     block_size: usize,
+    blake2sp: bool,
     progress: &dyn compress::CompressionProgress,
     allowance: &B,
-) -> Result<(u32, [u8; 32])> {
+) -> Result<(u32, Option<[u8; 32]>)> {
     if progress.is_cancelled() {
         return Err(Error::Cancelled);
     }
     let mut crc = Crc32::new();
-    let mut hash = blake2sp::Hasher::new();
+    let mut hash = blake2sp.then(blake2sp::Hasher::new);
     let mut buffer = crate::codec::workspace::Buffer::filled(block_size, 0u8, allowance)?;
     let mut reader = source.open()?;
     let mut observed = 0u64;
@@ -621,7 +627,9 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
         }
         observed += read as u64;
         crc.update(&buffer[..read]);
-        hash.update(&buffer[..read]);
+        if let Some(hash) = &mut hash {
+            hash.update(&buffer[..read]);
+        }
         if !progress.advance(read as u64) {
             return Err(Error::Cancelled);
         }
@@ -632,7 +640,7 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
         expected_size,
         "entry source size changed while reading",
     )?;
-    Ok((crc.finish(), hash.finalize()))
+    Ok((crc.finish(), hash.map(blake2sp::Hasher::finalize)))
 }
 
 /// What one compression job holds, for admitting jobs against the memory limit
@@ -1098,7 +1106,7 @@ mod tests {
             crate::EntrySource::from_opener(1, || panic!("cancelled scan opened the source"));
         let allowance = crate::codec::workspace::Allowance::default();
         assert!(matches!(
-            super::source_integrity_with_allowance(&unopened, 1, 16, &Cancelled, &allowance),
+            super::source_integrity_with_allowance(&unopened, 1, 16, true, &Cancelled, &allowance),
             Err(crate::Error::Cancelled)
         ));
 
@@ -1107,7 +1115,7 @@ mod tests {
         });
         let progress = |_: u64| true;
         assert_eq!(
-            super::source_integrity_with_allowance(&short, 2, 16, &progress, &allowance)
+            super::source_integrity_with_allowance(&short, 2, 16, true, &progress, &allowance)
                 .unwrap_err()
                 .kind(),
             crate::ErrorKind::SourceChanged
@@ -2418,6 +2426,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::None,
             candidates: vec![encode_options].into(),
+            blake2sp: true,
         };
         // A job stops at the first block ending past run_size, and a block
         // spans at most MAX_LZ_BLOCK_SIZE, so this much input needs two jobs.

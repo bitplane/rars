@@ -125,7 +125,7 @@ const parts = await split.volumes();
 `atime` and `birthtime`. `addDirectory(name)` queues an explicit directory and
 `addSymlink(name, target)` a Unix symbolic link, stored as given. `level` runs
 from 0 (stored) to 5. Other writer options are `solid`, `password`,
-`encryptHeaders`, `comment`, `recoveryPercent` and `volumeSize`. With
+`encryptHeaders`, `blake2sp`, `comment`, `recoveryPercent` and `volumeSize`. With
 `volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
 additionally provides `addFile()` and `writeTo(path)`, which writes the archive,
 or every part of a set, and returns the paths written. It refuses an existing

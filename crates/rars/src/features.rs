@@ -16,6 +16,10 @@ pub struct FeatureSet {
     /// Write an index so a reader can list the archive without walking every
     /// header.
     pub quick_open: bool,
+    /// Store a BLAKE2sp hash of each member beside its CRC32, the hash rar's
+    /// `-htb` writes. Readers then check the hash rather than the CRC32. RAR 5
+    /// and later only.
+    pub blake2sp: bool,
 }
 
 /// One writer feature, in the order a rejection prefers to report them.
@@ -25,10 +29,16 @@ pub enum Feature {
     Solid,
     HeaderEncryption,
     QuickOpen,
+    Blake2sp,
 }
 
 impl Feature {
-    pub const ALL: [Self; 3] = [Self::Solid, Self::HeaderEncryption, Self::QuickOpen];
+    pub const ALL: [Self; 4] = [
+        Self::Solid,
+        Self::HeaderEncryption,
+        Self::QuickOpen,
+        Self::Blake2sp,
+    ];
 
     /// How this feature is named when a writer has to refuse it.
     pub const fn name(self) -> &'static str {
@@ -36,6 +46,7 @@ impl Feature {
             Self::Solid => "solid compression",
             Self::HeaderEncryption => "header encryption",
             Self::QuickOpen => "a quick-open index",
+            Self::Blake2sp => "BLAKE2sp file hashes",
         }
     }
 
@@ -44,6 +55,7 @@ impl Feature {
             Self::Solid => set.solid,
             Self::HeaderEncryption => set.header_encryption,
             Self::QuickOpen => set.quick_open,
+            Self::Blake2sp => set.blake2sp,
         }
     }
 }
@@ -54,6 +66,7 @@ impl FeatureSet {
             solid: false,
             header_encryption: false,
             quick_open: false,
+            blake2sp: false,
         }
     }
 
@@ -78,10 +91,12 @@ mod tests {
             solid,
             header_encryption,
             quick_open,
+            blake2sp,
         } = &mut all;
         *solid = true;
         *header_encryption = true;
         *quick_open = true;
+        *blake2sp = true;
 
         let reported: Vec<_> = Feature::ALL
             .into_iter()
@@ -96,6 +111,7 @@ mod tests {
             solid: true,
             header_encryption: true,
             quick_open: true,
+            blake2sp: true,
         };
         assert_eq!(
             asked.first_unsupported(FeatureSet::store_only()),

@@ -205,11 +205,15 @@ fn run_jobs_admitted<T: Send, O: Send>(
     result
 }
 
+/// A member's size, CRC32 and, when the archive asks for one, BLAKE2sp hash.
+pub(super) type Integrity = (u64, u32, Option<[u8; 32]>);
+
 /// A member that has been compressed and is waiting to be framed.
 pub(super) struct CompressedMember {
     pub(super) input_size: u64,
     pub(super) crc32: u32,
-    pub(super) hash: [u8; 32],
+    /// Only computed when the archive stores BLAKE2sp hashes.
+    pub(super) hash: Option<[u8; 32]>,
     pub(super) packed: Spool,
     /// True when the payload should be written as-is from the source because
     /// compressing it did not pay.
@@ -524,7 +528,7 @@ struct MemberStream<B: Budget> {
     /// How much of the member has gone into jobs so far.
     placed: usize,
     crc: Crc32,
-    hash: blake2sp::Hasher,
+    hash: Option<blake2sp::Hasher>,
 }
 
 impl<B: Budget> MemberStream<B> {
@@ -532,6 +536,7 @@ impl<B: Budget> MemberStream<B> {
         member: usize,
         source: &EntrySource,
         size: u64,
+        blake2sp: bool,
         resources: &WriterResources,
         progress: &dyn CompressionProgress,
         allowance: &B,
@@ -555,7 +560,7 @@ impl<B: Budget> MemberStream<B> {
             pushback: Buffer::new(allowance),
             placed: 0,
             crc: Crc32::new(),
-            hash: blake2sp::Hasher::new(),
+            hash: blake2sp.then(blake2sp::Hasher::new),
         })
     }
 
@@ -631,11 +636,12 @@ fn compress_members(
         let size = source
             .len()
             .map_err(|error| error_context(stored[member], error))?;
-        stored_integrity.push((size, 0, [0; 32]))?;
+        stored_integrity.push((size, 0, None))?;
     }
     hash_stored_members(
         &stored_sources,
         &mut stored_integrity,
+        plan.blake2sp,
         resources,
         &Remapped::new(&stored, advance),
         &|member, error| error_context(stored[member], error),
@@ -811,8 +817,10 @@ fn compress_members_as_planned(
     let mut integrity = Records::new(sources.len(), resources)?;
     for (index, source) in sources.iter().enumerate() {
         let input_size = source.len().map_err(|error| error_context(index, error))?;
-        // Compression fills these checksums while consuming the source.
-        integrity.push((input_size, 0, [0; 32]))?;
+        // Compression fills these checksums while consuming the source. A
+        // member hashed on its copy keeps the placeholder, which sizes its
+        // header until the real hash is patched in.
+        integrity.push((input_size, 0, plan.blake2sp.then_some([0; 32])))?;
     }
 
     let execution =
@@ -836,7 +844,14 @@ fn compress_members_as_planned(
             resources,
         )?,
         ExecutionPlan::Stored => {
-            hash_stored_members(sources, &mut integrity, resources, advance, error_context)?;
+            hash_stored_members(
+                sources,
+                &mut integrity,
+                plan.blake2sp,
+                resources,
+                advance,
+                error_context,
+            )?;
             Records::collect(
                 integrity.iter().map(|_| Spool::create_parked(resources)),
                 resources,
@@ -891,7 +906,8 @@ fn compress_members_as_planned(
 /// Members' checksums are independent, so a window of them is hashed across the pool.
 fn hash_stored_members(
     sources: &[EntrySource],
-    integrity: &mut [(u64, u32, [u8; 32])],
+    integrity: &mut [Integrity],
+    blake2sp: bool,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
@@ -926,6 +942,7 @@ fn hash_stored_members(
             Ok(super::source_integrity(
                 &sources[index],
                 size,
+                blake2sp,
                 advance,
                 resources,
             ))
@@ -943,7 +960,7 @@ fn hash_stored_members(
 #[allow(clippy::too_many_arguments)]
 fn compress_streaming_members(
     sources: &[EntrySource],
-    integrity: &mut [(u64, u32, [u8; 32])],
+    integrity: &mut [Integrity],
     plan: &CompressPlan,
     run_filters: bool,
     required: u64,
@@ -1055,7 +1072,7 @@ fn streaming_wave_capacity(
 #[allow(clippy::too_many_arguments)]
 fn compress_members_whole(
     sources: &[EntrySource],
-    integrity: &[(u64, u32, [u8; 32])],
+    integrity: &[Integrity],
     plan: &CompressPlan,
     members: &[MemberPlan],
     resources: &WriterResources,
@@ -1226,7 +1243,7 @@ fn whole_member_wave_with_slots(
 fn compress_whole_member<B: Budget>(
     index: usize,
     source: &EntrySource,
-    integrity: (u64, u32, [u8; 32]),
+    integrity: Integrity,
     plan: &CompressPlan,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
@@ -1234,7 +1251,7 @@ fn compress_whole_member<B: Budget>(
 ) -> Result<CompressedMember> {
     let (input_size, _, _) = integrity;
     let mut crc = Crc32::new();
-    let mut hasher = blake2sp::Hasher::new();
+    let mut hasher = plan.blake2sp.then(blake2sp::Hasher::new);
 
     let mut packed_spool = Spool::create(resources)?;
     let mut stored = input_size == 0;
@@ -1253,7 +1270,9 @@ fn compress_whole_member<B: Budget>(
             }
             reader.read_exact(chunk)?;
             crc.update(chunk);
-            hasher.update(chunk);
+            if let Some(hasher) = &mut hasher {
+                hasher.update(chunk);
+            }
         }
         check_source_end(&mut *reader)?;
         // The filter search walks the member many times over, so
@@ -1323,7 +1342,7 @@ fn compress_whole_member<B: Budget>(
     Ok(CompressedMember {
         input_size,
         crc32: crc.finish(),
-        hash: hasher.finalize(),
+        hash: hasher.map(blake2sp::Hasher::finalize),
         store: stored,
         packed: packed_spool,
         solid_continuation: false,
@@ -1337,7 +1356,7 @@ fn compress_whole_member<B: Budget>(
 fn compress_fallback_members(
     first: usize,
     sources: &[EntrySource],
-    integrity: &[(u64, u32, [u8; 32])],
+    integrity: &[Integrity],
     plan: &CompressPlan,
     run_filters: bool,
     required: u64,
@@ -1419,7 +1438,7 @@ fn compress_fallback_members(
 #[allow(clippy::too_many_arguments)]
 fn compress_independent_members<B: Budget + Send + Sync>(
     sources: &[EntrySource],
-    integrity: &mut [(u64, u32, [u8; 32])],
+    integrity: &mut [Integrity],
     plan: &CompressPlan,
     filter_runs: bool,
     batch_capacity: usize,
@@ -1446,6 +1465,7 @@ where
                     group_start + offset,
                     source,
                     integrity[group_start + offset].0,
+                    plan.blake2sp,
                     resources,
                     advance,
                     allowance,
@@ -1567,7 +1587,7 @@ where
         for stream in streams {
             let slot = &mut integrity[stream.member];
             slot.1 = stream.crc.finish();
-            slot.2 = stream.hash.finalize();
+            slot.2 = stream.hash.map(blake2sp::Hasher::finalize);
             packed.push(stream.packed)?;
         }
         group_start = group_end;
@@ -1579,7 +1599,7 @@ where
 #[allow(clippy::too_many_arguments)]
 fn compress_solid_chain<B: Budget + Send + Sync>(
     sources: &[EntrySource],
-    integrity: &mut [(u64, u32, [u8; 32])],
+    integrity: &mut [Integrity],
     plan: &CompressPlan,
     filter_runs: bool,
     batch_capacity: usize,
@@ -1598,6 +1618,7 @@ where
                 member,
                 source,
                 integrity[member].0,
+                plan.blake2sp,
                 resources,
                 advance,
                 allowance,
@@ -1725,7 +1746,7 @@ where
         streams.into_iter().map(|stream| {
             let slot = &mut integrity[stream.member];
             slot.1 = stream.crc.finish();
-            slot.2 = stream.hash.finalize();
+            slot.2 = stream.hash.map(blake2sp::Hasher::finalize);
             Ok(stream.packed)
         }),
         resources,
@@ -1790,7 +1811,9 @@ fn read_chunk<B: Budget>(
     let reader = stream.reader.as_mut().expect("opened above");
     reader.read_exact(&mut data)?;
     stream.crc.update(&data);
-    stream.hash.update(&data);
+    if let Some(hash) = &mut stream.hash {
+        hash.update(&data);
+    }
     stream.remaining -= wanted as u64;
     if stream.remaining == 0 {
         check_source_end(&mut **reader)?;
@@ -2255,6 +2278,7 @@ mod tests {
                 method: 1,
                 filter_policy: FilterPolicy::None,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
             let source = EntrySource::from_opener(1, || {
                 panic!("spool creation must fail before opening the source")
@@ -2312,6 +2336,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let execution = ExecutionPlan::with_resources(&plan, [32].into_iter(), &resources).unwrap();
         let ExecutionPlan::IndependentMembers(members) = execution else {
@@ -2324,7 +2349,7 @@ mod tests {
         let progress = CancelAfterObservation(crate::WriteCancellation::new());
         let error = compress_members_whole(
             &[source],
-            &[(32, 0, [0; 32])],
+            &[(32, 0, None)],
             &plan,
             &members,
             &resources,
@@ -2362,6 +2387,7 @@ mod tests {
                 method: 1,
                 filter_policy: FilterPolicy::None,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
             let run = |resources: &WriterResources| -> Result<()> {
                 let packed =
@@ -2406,6 +2432,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::None,
             candidates: vec![options, options].into(),
+            blake2sp: true,
         };
         let source = EntrySource::from_opener(1024, || {
             Err(std::io::Error::other("injected worker source failure").into())
@@ -2432,9 +2459,10 @@ mod tests {
             method: 0,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let source = EntrySource::from_bytes(b"payload".to_vec());
-        let limit = std::mem::size_of::<(u64, u32, [u8; 32])>() as u64;
+        let limit = std::mem::size_of::<Integrity>() as u64;
         let resources = WriterResources::default().with_max_preparation_bytes(limit);
         let error = compress_members_reporting(&[source], plan, &resources, &|_| true)
             .err()
@@ -2483,6 +2511,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         for size in [0, 16] {
             let source = EntrySource::from_opener(size, || {
@@ -2493,7 +2522,7 @@ mod tests {
                 compress_whole_member(
                     0,
                     &source,
-                    (size, 0, [0; 32]),
+                    (size, 0, None),
                     &plan,
                     &resources,
                     &progress,
@@ -2555,6 +2584,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let scratch = crate::scratch::case("whole-member-cancel-between-waves");
         let pool = rayon::ThreadPoolBuilder::new()
@@ -2662,6 +2692,7 @@ mod tests {
                 0,
                 &source,
                 0,
+                true,
                 &WriterResources::default(),
                 &Cancelled,
                 &crate::codec::workspace::Allowance::default(),
@@ -2752,6 +2783,7 @@ mod tests {
             method: 0,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let resources = WriterResources::default();
         let source = EntrySource::from_factory(Untouched);
@@ -2802,7 +2834,7 @@ mod tests {
                 compress_fallback_members(
                     0,
                     &[EntrySource::from_factory(Untouched)],
-                    &[(7, 0, [0; 32])],
+                    &[(7, 0, None)],
                     &plan,
                     false,
                     0,
@@ -2862,7 +2894,7 @@ mod tests {
         });
         let allowance = Allowance::limited(3);
         let mut stream =
-            MemberStream::new(0, &source, 8, &resources, &|_| true, &allowance).unwrap();
+            MemberStream::new(0, &source, 8, true, &resources, &|_| true, &allowance).unwrap();
         assert_eq!(
             read_chunk(&mut stream, 4, &|_| true).unwrap_err().kind(),
             crate::ErrorKind::ResourceLimit
@@ -2874,7 +2906,7 @@ mod tests {
 
         let allowance = Allowance::limited(8);
         let mut stream =
-            MemberStream::new(0, &source, 8, &resources, &|_| true, &allowance).unwrap();
+            MemberStream::new(0, &source, 8, true, &resources, &|_| true, &allowance).unwrap();
         stream.pushback = read_chunk(&mut stream, 4, &|_| true).unwrap();
         assert_eq!(allowance.used(), 4);
         let first = read_chunk(&mut stream, 4, &|_| true).unwrap();
@@ -2907,13 +2939,14 @@ mod tests {
                 method: 1,
                 filter_policy: FilterPolicy::None,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
             let sources = [
                 EntrySource::from_bytes(data.clone()),
                 EntrySource::from_bytes(data[..2048].to_vec()),
                 EntrySource::from_bytes(Vec::new()),
             ];
-            let initial = [(8192, 0, [0; 32]), (2048, 0, [0; 32]), (0, 0, [0; 32])];
+            let initial = [(8192, 0, None), (2048, 0, None), (0, 0, None)];
             let mut expected_integrity = initial;
             let encode = if solid {
                 compress_solid_chain::<Allowance>
@@ -3033,8 +3066,9 @@ mod tests {
                 method: 1,
                 filter_policy: FilterPolicy::None,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
-            let mut expected_integrity = [(size as u64, 0, [0; 32]); 2];
+            let mut expected_integrity = [(size as u64, 0, None); 2];
             let mut actual_integrity = expected_integrity;
             let encode = if solid {
                 compress_solid_chain::<Allowance>
@@ -3118,6 +3152,7 @@ mod tests {
                 method: 1,
                 filter_policy,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
             let required = super::super::streaming_lz_workspace(
                 plan.dictionary_size,
@@ -3204,6 +3239,7 @@ mod tests {
                 method: 1,
                 filter_policy: FilterPolicy::None,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
             let ledger = Allowance::limited(256 * 1024 * 1024);
             let resources = WriterResources::default()
@@ -3281,6 +3317,7 @@ mod tests {
             method: 0,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let opens = Arc::new(AtomicUsize::new(0));
         for limit in [32768, 131072] {
@@ -3327,7 +3364,7 @@ mod tests {
                 EntrySource::from_opener(8, move || Ok(Box::new(std::io::Cursor::new(bytes))));
             let allowance = Allowance::limited(128);
             let mut stream =
-                MemberStream::new(0, &source, 8, &resources, &|_| true, &allowance).unwrap();
+                MemberStream::new(0, &source, 8, true, &resources, &|_| true, &allowance).unwrap();
             let error = read_block(&mut stream, 4, &|_| true).unwrap_err();
             assert!(matches!(error, Error::Io(_) | Error::SourceChanged(_)));
             drop(stream);
@@ -3420,6 +3457,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let data: Arc<[u8]> = (0..1024u32)
             .flat_map(|n| n.to_le_bytes())
@@ -3624,6 +3662,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options, options.with_optimal_parse(true)].into(),
+            blake2sp: true,
         };
         let data: Vec<u8> = (0..1024u32).flat_map(|n| n.to_le_bytes()).collect();
         let opens = Arc::new(AtomicUsize::new(0));
@@ -3635,7 +3674,7 @@ mod tests {
                 Ok(Box::new(std::io::Cursor::new(data.clone())))
             }
         });
-        let integrity = (data.len() as u64, 0, [0; 32]);
+        let integrity = (data.len() as u64, 0, None);
         let allowance = Allowance::limited(data.len() as u64 - 1);
         let error = compress_whole_member(
             0,
@@ -3668,7 +3707,7 @@ mod tests {
         .unwrap();
         assert!(!packed.store);
         assert_eq!(packed.crc32, crate::crc32::crc32(&data));
-        assert_eq!(packed.hash, blake2sp::hash(&data));
+        assert_eq!(packed.hash, Some(blake2sp::hash(&data)));
         assert_eq!(allowance.used(), 0);
         let expected = candidates_with_allowance(
             &data,
@@ -3715,7 +3754,7 @@ mod tests {
             let result = compress_whole_member(
                 0,
                 &changed,
-                (8, 0, [0; 32]),
+                (8, 0, None),
                 &plan,
                 &resources,
                 &|_| true,
@@ -3747,6 +3786,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![encode_options].into(),
+            blake2sp: true,
         };
         let required = whole_member_workspace(32, &plan);
         let scratch = crate::scratch::case("coordinator-admission");
@@ -3795,6 +3835,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let execution =
             ExecutionPlan::with_resources(&plan, std::iter::once(length), &resources).unwrap();
@@ -3878,6 +3919,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![encode_options].into(),
+            blake2sp: true,
         };
         let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
         for cancel in [false, true] {
@@ -3910,13 +3952,14 @@ mod tests {
                         1
                     );
                 }
-                assert_eq!(members[1].hash, blake2sp::hash(&data));
+                assert_eq!(members[1].hash, Some(blake2sp::hash(&data)));
                 let mut fallback_bytes = Vec::new();
                 members[1].packed.copy_to(&mut fallback_bytes).unwrap();
                 let mut plain = compress_members_reporting(
                     &sources[1..2],
                     CompressPlan {
                         filter_policy: FilterPolicy::None,
+                        blake2sp: true,
                         ..plan.clone()
                     },
                     &resources,
@@ -3952,6 +3995,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![encode_options].into(),
+            blake2sp: true,
         };
         let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
         let members = ExecutionPlan::with_resources(
@@ -3974,8 +4018,8 @@ mod tests {
         };
         let mut together =
             compress_members_reporting(&sources, plan.clone(), &resources, &|_| true).unwrap();
-        assert_eq!(together[0].hash, blake2sp::hash(&first));
-        assert_eq!(together[1].hash, blake2sp::hash(&second));
+        assert_eq!(together[0].hash, Some(blake2sp::hash(&first)));
+        assert_eq!(together[1].hash, Some(blake2sp::hash(&second)));
         for index in 0..2 {
             let mut alone = compress_members_reporting(
                 &sources[index..index + 1],
@@ -4076,13 +4120,14 @@ mod tests {
                 method,
                 filter_policy,
                 candidates: vec![options].into(),
+                blake2sp: true,
             };
             let mut members =
                 compress_members_reporting(&sources, plan, &resources, &|_| true).unwrap();
             assert_eq!(members.len(), sources.len());
             for member in &mut members {
                 assert_eq!(member.input_size, data.len() as u64);
-                assert_eq!(member.hash, blake2sp::hash(&data));
+                assert_eq!(member.hash, Some(blake2sp::hash(&data)));
                 let mut bytes = Vec::new();
                 assert_eq!(
                     member.packed.copy_to(&mut bytes).unwrap(),
@@ -4146,6 +4191,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let scratch = crate::scratch::case("lazy-solid-inputs");
         let resources = WriterResources::default().with_temp_dir(&*scratch);
@@ -4174,6 +4220,7 @@ mod tests {
             method: 3,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let required = whole_member_workspace(size as u64, &plan);
         assert!(required >= (size * 12) as u64);
@@ -4214,6 +4261,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let run = |threads: usize, budget| {
             let workers = Mutex::new(HashSet::new());
@@ -4294,6 +4342,7 @@ mod tests {
                     method: 1,
                     filter_policy: policy.clone(),
                     candidates: vec![options].into(),
+                    blake2sp: true,
                 };
                 let members = compress_members_reporting(
                     &sources,
@@ -4311,7 +4360,7 @@ mod tests {
                     let mut crc = Crc32::new();
                     crc.update(input);
                     assert_eq!(member.crc32, crc.finish());
-                    assert_eq!(member.hash, blake2sp::hash(input));
+                    assert_eq!(member.hash, Some(blake2sp::hash(input)));
                 }
             }
         }
@@ -4357,6 +4406,7 @@ mod tests {
             method: 1,
             filter_policy: FilterPolicy::Auto,
             candidates: vec![options].into(),
+            blake2sp: true,
         };
         let run = run_size(&plan);
         assert_eq!(run as u64, MIB);
@@ -4430,6 +4480,7 @@ mod stored_hashing_tests {
             method: 0,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         }
     }
 
@@ -4479,7 +4530,7 @@ mod stored_hashing_tests {
             "one member waited for the other"
         );
         let expected = crate::rar50::blake2sp::hash(b"data");
-        assert!(members.iter().all(|member| member.hash == expected));
+        assert!(members.iter().all(|member| member.hash == Some(expected)));
     }
 
     #[cfg(all(
@@ -4598,6 +4649,7 @@ mod incompressible_probe_tests {
             method: 1,
             filter_policy: FilterPolicy::None,
             candidates: vec![options].into(),
+            blake2sp: true,
         }
     }
 
@@ -4606,12 +4658,59 @@ mod incompressible_probe_tests {
         WriterResources::new(16 * 1024 * 1024)
     }
 
-    fn checksums(data: &[u8]) -> (u32, [u8; 32]) {
+    fn checksums(data: &[u8]) -> (u32, Option<[u8; 32]>) {
         let mut crc = Crc32::new();
         crc.update(data);
         let mut hash = blake2sp::Hasher::new();
         hash.update(data);
-        (crc.finish(), hash.finalize())
+        (crc.finish(), Some(hash.finalize()))
+    }
+
+    /// An archive that keeps no BLAKE2sp hashes does not compute them, on any
+    /// of the paths a member can take: stored, coded, solid, or stored from
+    /// its samples.
+    #[test]
+    fn members_are_not_hashed_unless_the_archive_keeps_hashes() {
+        let text = b"the quick brown fox jumps over the lazy dog\n".repeat(2000);
+        let random = noise(2 * 1024 * 1024, 0x9e37_79b9_7f4a_7c15);
+        let stored_plan = CompressPlan {
+            method: 0,
+            ..level_one_plan(false)
+        };
+        let cases = [
+            (stored_plan, WriterResources::default()),
+            (level_one_plan(false), WriterResources::default()),
+            (level_one_plan(true), WriterResources::default()),
+            (level_one_plan(false), too_small_to_code()),
+        ];
+        for (mut plan, resources) in cases {
+            plan.blake2sp = false;
+            for stored_later in [false, true] {
+                let compress = if stored_later {
+                    compress_members_hashing_stored_later
+                } else {
+                    compress_members_with_context
+                };
+                let members = compress(
+                    &[
+                        EntrySource::from_bytes(text.clone()),
+                        EntrySource::from_bytes(random.clone()),
+                    ],
+                    &plan,
+                    &resources,
+                    &|_| true,
+                    &|_, error| error,
+                )
+                .unwrap();
+                for (member, data) in members.iter().zip([&text, &random]) {
+                    assert_eq!(member.hash, None);
+                    // A stored member hashed on its copy has no checksums yet.
+                    if !(stored_later && plan.method == 0) {
+                        assert_eq!(member.crc32, checksums(data).0);
+                    }
+                }
+            }
+        }
     }
 
     /// A noise member is stored from its samples, so it never needs the memory

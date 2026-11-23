@@ -440,6 +440,7 @@ class RarBuilder:
         solid: bool = False,
         password: _Password | None = None,
         encrypt_headers: bool = False,
+        blake2sp: bool = False,
         comment: str | bytes | None = None,
         recovery_percent: int | None = None,
         volume_size: int | None = None,
