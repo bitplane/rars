@@ -4933,6 +4933,8 @@ mod tests {
             (vec![0], None, None, true),
             (vec![1, 0], Some(0), None, true),
             (vec![1, 127], Some(127), None, true),
+            // A writer reserves the offset's width before it is known.
+            (vec![1, 0x85, 0x80, 0], Some(5), None, true),
             (vec![2, 0x80, 1], None, Some(128), true),
             (vec![3, 12, 34], Some(12), Some(34), true),
             (vec![4], None, None, false),

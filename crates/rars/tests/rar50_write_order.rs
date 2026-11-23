@@ -3,20 +3,27 @@
 use rars::atomic64::AtomicU64;
 use rars::rar50::{self, ArchiveEntry, ArchiveExtras, WriterOptions};
 use rars::{ArchiveVersion, EntrySource, FeatureSet, WriterResources};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
-struct Counted(Vec<u8>, Arc<AtomicU64>);
+struct Counted(Cursor<Vec<u8>>, Arc<AtomicU64>);
 
 impl Write for Counted {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.extend_from_slice(bytes);
-        self.1.store(self.0.len() as u64, Ordering::SeqCst);
-        Ok(bytes.len())
+        let written = self.0.write(bytes)?;
+        self.1
+            .store(self.0.get_ref().len() as u64, Ordering::SeqCst);
+        Ok(written)
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+impl Seek for Counted {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.0.seek(to)
     }
 }
 
@@ -34,72 +41,94 @@ fn member(index: usize) -> Vec<u8> {
         .collect()
 }
 
+fn written_when_the_last_is_opened(options: WriterOptions, seekable: bool) -> (Vec<u8>, u64) {
+    let count = 200;
+    let written = Arc::new(AtomicU64::new(0));
+    let at_last_open = Arc::new(OnceLock::new());
+    let entries: Vec<_> = (0..count)
+        .map(|index| {
+            let data = member(index);
+            let source = if index + 1 == count {
+                let (written, seen) = (Arc::clone(&written), Arc::clone(&at_last_open));
+                EntrySource::from_opener(data.len() as u64, move || {
+                    seen.get_or_init(|| written.load(Ordering::SeqCst));
+                    Ok(Box::new(Cursor::new(data.clone())))
+                })
+            } else {
+                EntrySource::from_bytes(data)
+            };
+            ArchiveEntry::new(format!("member{index:04}.txt").into_bytes(), source)
+                .with_mtime(Some(0x5000_0000))
+        })
+        .collect();
+    let mut output = Counted(Cursor::new(Vec::new()), Arc::clone(&written));
+    let write = || {
+        let (extras, resources) = (ArchiveExtras::default(), WriterResources::default());
+        if seekable {
+            rar50::write_seekable_archive_to(&entries, options, extras, &resources, &mut output)
+        } else {
+            rar50::write_streaming_archive_to(&entries, options, extras, &resources, &mut output)
+        }
+    };
+    #[cfg(feature = "parallel")]
+    let written_archive = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap()
+        .install(write);
+    #[cfg(not(feature = "parallel"))]
+    let written_archive = {
+        let mut write = write;
+        write()
+    };
+    written_archive.unwrap();
+
+    let archive = output.0.into_inner();
+    rars::ArchiveReader::read(&archive)
+        .unwrap()
+        .test(None)
+        .unwrap();
+    let at_last_open = *at_last_open.get().unwrap();
+    (archive, at_last_open)
+}
+
+fn first_member_at(archive: &[u8]) -> u64 {
+    archive
+        .windows(14)
+        .position(|window| window == b"member0000.txt")
+        .unwrap() as u64
+}
+
 #[test]
 fn the_first_member_is_written_before_the_last_is_read() {
     // A solid wave is a run per thread, each at least 1 MiB, so two threads
     // and a small dictionary take these members in several waves.
-    let count = 200;
     for (level, solid) in [(3, false), (3, true), (0, false)] {
-        let written = Arc::new(AtomicU64::new(0));
-        let at_last_open = Arc::new(OnceLock::new());
-        let entries: Vec<_> = (0..count)
-            .map(|index| {
-                let data = member(index);
-                let source = if index + 1 == count {
-                    let (written, seen) = (Arc::clone(&written), Arc::clone(&at_last_open));
-                    EntrySource::from_opener(data.len() as u64, move || {
-                        seen.get_or_init(|| written.load(Ordering::SeqCst));
-                        Ok(Box::new(Cursor::new(data.clone())))
-                    })
-                } else {
-                    EntrySource::from_bytes(data)
-                };
-                ArchiveEntry::new(format!("member{index:04}.txt").into_bytes(), source)
-                    .with_mtime(Some(0x5000_0000))
-            })
-            .collect();
         let mut features = FeatureSet::store_only();
         features.solid = solid;
         let options = WriterOptions::new(ArchiveVersion::Rar50, features)
             .with_compression_level(level)
             .with_dictionary_size(256 * 1024);
-        let mut output = Counted(Vec::new(), Arc::clone(&written));
-        let write = || {
-            rar50::write_streaming_archive_to(
-                &entries,
-                options,
-                ArchiveExtras::default(),
-                &WriterResources::default(),
-                &mut output,
-            )
-        };
-        #[cfg(feature = "parallel")]
-        let written_archive = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap()
-            .install(write);
-        #[cfg(not(feature = "parallel"))]
-        let written_archive = {
-            let mut write = write;
-            write()
-        };
-        written_archive.unwrap();
-
-        let archive = output.0;
-        let first = archive
-            .windows(14)
-            .position(|window| window == b"member0000.txt")
-            .unwrap() as u64;
+        let (archive, at_last_open) = written_when_the_last_is_opened(options, false);
         assert!(
-            *at_last_open.get().unwrap() > first,
+            at_last_open > first_member_at(&archive),
             "level {level}, solid {solid}: nothing of the first member was written before the last was opened"
         );
-        rars::ArchiveReader::read(&archive)
-            .unwrap()
-            .test(None)
-            .unwrap();
     }
+}
+
+#[test]
+fn with_quick_open_the_first_member_reaches_a_seekable_output_before_the_last_is_read() {
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar50, features)
+        .with_compression_level(3)
+        .with_dictionary_size(256 * 1024);
+    let (archive, at_last_open) = written_when_the_last_is_opened(options, true);
+    assert!(
+        at_last_open > first_member_at(&archive),
+        "nothing of the first member was written before the last was opened"
+    );
 }
 
 fn seekable_and_streamed(
@@ -194,6 +223,45 @@ fn seekable_and_stream_outputs_extract_the_same_with_every_layout_feature() {
                     }
                 }
             }
+        }
+    }
+}
+
+#[test]
+fn with_quick_open_comments_services_and_empty_archives_match_a_stream_output() {
+    let mut features = FeatureSet::store_only();
+    features.quick_open = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1);
+    let with_services: Vec<_> = (0..3)
+        .map(|index| {
+            ArchiveEntry::new(
+                format!("member{index}.txt").into_bytes(),
+                EntrySource::from_bytes(member(index)),
+            )
+            .with_mtime(Some(0x5000_0000))
+            .with_service(rar50::ServiceEntry::new(
+                b"CMT".to_vec(),
+                b"a file comment".to_vec(),
+            ))
+        })
+        .collect();
+    for entries in [Vec::new(), with_services] {
+        for comment in [None, Some(b"an archive comment".as_slice())] {
+            let extras = match comment {
+                Some(comment) => ArchiveExtras::default().with_comment(comment),
+                None => ArchiveExtras::default(),
+            };
+            let (seekable, streamed) = seekable_and_streamed(&entries, options, extras);
+            assert!(
+                seekable == streamed,
+                "{} members, comment {}: outputs differ",
+                entries.len(),
+                comment.is_some()
+            );
+            rars::ArchiveReader::read(&seekable)
+                .unwrap()
+                .test(None)
+                .unwrap();
         }
     }
 }
