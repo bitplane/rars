@@ -1095,7 +1095,17 @@ fn cmd_extract(args: ExtractArgs) -> CliResult<()> {
     let state = state.into_inner();
     let skipped_links = state.skipped_links;
     let skipped_unnamed = state.skipped_unnamed;
-    let outputs = state.publish()?;
+    // Publishing the last members writes them where they belong, and can
+    // fail as writing any member can.
+    let outputs = state.publish().map_err(|err| {
+        classify_rars_error(err, |err| {
+            format!(
+                "failed to write extracted entry to '{}': {err}{}",
+                out_dir.display(),
+                retry_hint(err)
+            )
+        })
+    })?;
     restore_output_metadata(&outputs).map_err(|err| {
         CliError::general(format!(
             "failed to restore extracted metadata under '{}': {err}",
