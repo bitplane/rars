@@ -814,8 +814,8 @@ struct MemoryBudget {
     used: Mutex<u64>,
     changed: Condvar,
     /// The most ever in use at once, for tests that bound it.
-    #[cfg(test)]
-    peak: std::sync::atomic::AtomicU64,
+    #[cfg(all(test, feature = "parallel"))]
+    peak: crate::atomic64::AtomicU64,
 }
 
 impl MemoryBudget {
@@ -824,8 +824,8 @@ impl MemoryBudget {
             limit,
             used: Mutex::new(0),
             changed: Condvar::new(),
-            #[cfg(test)]
-            peak: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(all(test, feature = "parallel"))]
+            peak: crate::atomic64::AtomicU64::new(0),
         }
     }
 
@@ -872,7 +872,7 @@ impl MemoryBudget {
             return Err(used);
         }
         *used += bytes;
-        #[cfg(test)]
+        #[cfg(all(test, feature = "parallel"))]
         self.peak
             .fetch_max(*used, std::sync::atomic::Ordering::Relaxed);
         Ok(MemoryPermit {
