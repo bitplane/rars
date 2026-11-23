@@ -753,7 +753,8 @@ impl Archive {
         }
 
         let control = crate::read_control::ReadControl::for_options(&options);
-        let file_cell = std::cell::RefCell::new(control.reader(file));
+        let file_cell =
+            std::cell::RefCell::new(control.reader(crate::io_util::ReadAhead::new(file)));
         let data_limit = usize::MAX - sfx_offset;
         let (main, blocks, truncation) = parse_archive_blocks(
             archive_len,
