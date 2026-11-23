@@ -652,6 +652,7 @@ pub(super) fn prepared_header_image(
 ) -> Result<PreparedHeader> {
     prepared_header_image_at_least(
         0,
+        None,
         header_type,
         flags,
         data_size,
@@ -662,10 +663,11 @@ pub(super) fn prepared_header_image(
     )
 }
 
-/// A header written over a longer one is padded to cover it.
+/// A header written over a longer one is padded to cover it, and may take its IV.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn prepared_header_image_at_least(
     len: usize,
+    iv: Option<[u8; 16]>,
     header_type: u64,
     flags: u64,
     data_size: Option<u64>,
@@ -697,7 +699,7 @@ pub(super) fn prepared_header_image_at_least(
     };
     let length = image.header_len(keys.is_some())?;
     let charge = resources.reserve_prepared_header(length as u64)?;
-    let bytes = image.render(keys.map(|keys| &keys.keys), &[], resources)?;
+    let bytes = image.render_with_iv(keys.map(|keys| &keys.keys), iv, &[], resources)?;
     Ok(PreparedHeader {
         bytes,
         _charge: charge,

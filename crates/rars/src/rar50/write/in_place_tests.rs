@@ -4,6 +4,7 @@ use crate::{ArchiveReadOptions, ArchiveReader, EntrySource, Error, FeatureSet, W
 use std::io::Cursor;
 
 const ABOVE: u64 = 256 * 1024;
+const PASSWORD: &[u8] = b"secret";
 
 fn text(len: usize, seed: u32) -> Vec<u8> {
     let mut state = seed;
@@ -31,44 +32,68 @@ fn noise(len: usize, seed: u32) -> Vec<u8> {
         .collect()
 }
 
-fn entries(members: &[Vec<u8>]) -> Vec<ArchiveEntry> {
+#[derive(Clone, Copy)]
+struct Encryption {
+    headers: bool,
+    members: bool,
+}
+
+impl Encryption {
+    fn headers_only(headers: bool) -> Self {
+        Self {
+            headers,
+            members: false,
+        }
+    }
+
+    fn password(self) -> Option<&'static [u8]> {
+        (self.headers || self.members).then_some(PASSWORD)
+    }
+}
+
+fn entries(members: &[Vec<u8>], lock: Encryption) -> Vec<ArchiveEntry> {
     members
         .iter()
         .enumerate()
         .map(|(index, data)| {
-            ArchiveEntry::new(
+            let entry = ArchiveEntry::new(
                 format!("member{index}.bin").into_bytes(),
                 EntrySource::from_bytes(data.clone()),
             )
-            .with_mtime(Some(0x5000_0000))
+            .with_mtime(Some(0x5000_0000));
+            if lock.members {
+                entry.with_password(PASSWORD)
+            } else {
+                entry
+            }
         })
         .collect()
 }
 
-fn options(header_encryption: bool) -> WriterOptions {
+fn options(lock: Encryption) -> WriterOptions {
     let mut features = FeatureSet::store_only();
-    features.header_encryption = header_encryption;
+    features.header_encryption = lock.headers;
     WriterOptions::new(crate::ArchiveVersion::Rar50, features).with_compression_level(1)
 }
 
-fn extras(header_encryption: bool) -> ArchiveExtras<'static> {
+fn extras(lock: Encryption) -> ArchiveExtras<'static> {
     let mut extras = ArchiveExtras::default();
-    if header_encryption {
-        extras.header_password = Some(b"secret");
+    if lock.headers {
+        extras.header_password = Some(PASSWORD);
     }
     extras
 }
 
 fn seekable(
     members: &[Vec<u8>],
-    header_encryption: bool,
+    lock: Encryption,
     resources: &WriterResources,
 ) -> crate::Result<Vec<u8>> {
     let mut output = Cursor::new(Vec::new());
     write_archive_reporting(
-        &entries(members),
-        options(header_encryption),
-        extras(header_encryption),
+        &entries(members, lock),
+        options(lock),
+        extras(lock),
         resources,
         None,
         CallerOutput::seekable(&mut output).streaming_above(ABOVE),
@@ -78,14 +103,14 @@ fn seekable(
 
 fn streamed(
     members: &[Vec<u8>],
-    header_encryption: bool,
+    lock: Encryption,
     resources: &WriterResources,
 ) -> crate::Result<Vec<u8>> {
     let mut output = Vec::new();
     write_archive_reporting(
-        &entries(members),
-        options(header_encryption),
-        extras(header_encryption),
+        &entries(members, lock),
+        options(lock),
+        extras(lock),
         resources,
         None,
         CallerOutput::stream(&mut output).streaming_above(ABOVE),
@@ -93,11 +118,12 @@ fn streamed(
     Ok(output)
 }
 
-fn assert_holds(archive: &[u8], members: &[Vec<u8>], header_encryption: bool) {
-    let password = header_encryption.then_some(b"secret".as_slice());
-    let options = match password {
-        Some(password) => ArchiveReadOptions::with_password(password),
-        None => ArchiveReadOptions::new(),
+fn assert_holds(archive: &[u8], members: &[Vec<u8>], lock: Encryption) {
+    let password = lock.password();
+    let options = if lock.headers {
+        ArchiveReadOptions::with_password(PASSWORD)
+    } else {
+        ArchiveReadOptions::new()
     };
     let reader = ArchiveReader::read_with_options(archive, options).unwrap();
     reader.test(password).unwrap();
@@ -114,30 +140,41 @@ fn assert_holds(archive: &[u8], members: &[Vec<u8>], header_encryption: bool) {
     }
 }
 
-fn header_encryption_cases() -> Vec<bool> {
+fn header_encryption_cases() -> Vec<Encryption> {
     if cfg!(feature = "encryption") {
-        vec![false, true]
+        vec![
+            Encryption::headers_only(false),
+            Encryption::headers_only(true),
+        ]
     } else {
-        vec![false]
+        vec![Encryption::headers_only(false)]
     }
+}
+
+#[cfg(feature = "encryption")]
+fn member_encryption_cases() -> [Encryption; 2] {
+    [false, true].map(|headers| Encryption {
+        headers,
+        members: true,
+    })
 }
 
 #[test]
 fn a_large_member_is_spooled_only_on_a_stream_output() {
     let members = vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)];
-    for header_encryption in header_encryption_cases() {
+    for lock in header_encryption_cases() {
         // Room for the small members, not the large one's packed bytes.
         let resources = WriterResources::default().with_max_spool_bytes(64 * 1024);
-        let archive = seekable(&members, header_encryption, &resources).unwrap();
-        assert_holds(&archive, &members, header_encryption);
+        let archive = seekable(&members, lock, &resources).unwrap();
+        assert_holds(&archive, &members, lock);
 
-        let error = streamed(&members, header_encryption, &resources).unwrap_err();
+        let error = streamed(&members, lock, &resources).unwrap_err();
         assert!(
             matches!(error.root_cause(), Error::WriterSpoolLimitExceeded { .. }),
             "{error}"
         );
-        let unlimited = streamed(&members, header_encryption, &WriterResources::default());
-        assert_holds(&unlimited.unwrap(), &members, header_encryption);
+        let unlimited = streamed(&members, lock, &WriterResources::default());
+        assert_holds(&unlimited.unwrap(), &members, lock);
     }
 }
 
@@ -148,11 +185,11 @@ fn a_large_member_that_does_not_pack_is_stored_over_its_attempt() {
         vec![text(4096, 1), large.clone(), text(4096, 3)],
         vec![text(4096, 1), large.clone()],
     ] {
-        for header_encryption in header_encryption_cases() {
+        for lock in header_encryption_cases() {
             let resources = WriterResources::default();
-            let archive = seekable(&members, header_encryption, &resources).unwrap();
-            assert_holds(&archive, &members, header_encryption);
-            let streamed = streamed(&members, header_encryption, &resources).unwrap();
+            let archive = seekable(&members, lock, &resources).unwrap();
+            assert_holds(&archive, &members, lock);
+            let streamed = streamed(&members, lock, &resources).unwrap();
             // The stored header may carry a padded size; nothing else differs.
             assert!(archive.len() >= streamed.len() && archive.len() <= streamed.len() + 32);
         }
@@ -163,8 +200,8 @@ fn a_large_member_that_does_not_pack_is_stored_over_its_attempt() {
 fn an_in_place_archive_does_not_depend_on_the_thread_count() {
     let members = vec![text(4096, 1), text(1024 * 1024, 2), text(300 * 1024, 4)];
     let resources = WriterResources::default();
-    let archive = seekable(&members, false, &resources).unwrap();
-    assert_holds(&archive, &members, false);
+    let archive = seekable(&members, Encryption::headers_only(false), &resources).unwrap();
+    assert_holds(&archive, &members, Encryption::headers_only(false));
     #[cfg(feature = "parallel")]
     for threads in [1, 3] {
         let pool = rayon::ThreadPoolBuilder::new()
@@ -172,7 +209,7 @@ fn an_in_place_archive_does_not_depend_on_the_thread_count() {
             .build()
             .unwrap();
         let again = pool
-            .install(|| seekable(&members, false, &resources))
+            .install(|| seekable(&members, Encryption::headers_only(false), &resources))
             .unwrap();
         assert!(again == archive, "{threads} threads wrote another archive");
     }
@@ -188,12 +225,12 @@ fn a_member_packed_smaller_than_its_reserved_size_field_reads_back() {
         .take(1 << 20)
         .collect();
     let members = vec![text(4096, 1), repeated, text(4096, 3)];
-    for header_encryption in header_encryption_cases() {
+    for lock in header_encryption_cases() {
         let resources = WriterResources::default();
-        let archive = seekable(&members, header_encryption, &resources).unwrap();
-        assert_holds(&archive, &members, header_encryption);
-        if !header_encryption {
-            let streamed = streamed(&members, false, &resources).unwrap();
+        let archive = seekable(&members, lock, &resources).unwrap();
+        assert_holds(&archive, &members, lock);
+        if !lock.headers {
+            let streamed = streamed(&members, lock, &resources).unwrap();
             assert!(archive.len() > streamed.len(), "the size field is padded");
         }
     }
@@ -211,7 +248,7 @@ fn a_large_member_with_a_blake2sp_record_is_patched_and_stored_over() {
     ] {
         let mut output = Cursor::new(Vec::new());
         write_archive_reporting(
-            &entries(&members),
+            &entries(&members, Encryption::headers_only(false)),
             options,
             ArchiveExtras::default(),
             &WriterResources::default(),
@@ -219,6 +256,83 @@ fn a_large_member_with_a_blake2sp_record_is_patched_and_stored_over() {
             CallerOutput::seekable(&mut output).streaming_above(ABOVE),
         )
         .unwrap();
-        assert_holds(&output.into_inner(), &members, false);
+        assert_holds(
+            &output.into_inner(),
+            &members,
+            Encryption::headers_only(false),
+        );
+    }
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn a_large_encrypted_member_is_spooled_only_on_a_stream_output() {
+    let members = vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)];
+    for lock in member_encryption_cases() {
+        let resources = WriterResources::default().with_max_spool_bytes(64 * 1024);
+        let archive = seekable(&members, lock, &resources).unwrap();
+        assert_holds(&archive, &members, lock);
+
+        let error = streamed(&members, lock, &resources).unwrap_err();
+        assert!(
+            matches!(error.root_cause(), Error::WriterSpoolLimitExceeded { .. }),
+            "{error}"
+        );
+    }
+}
+
+#[cfg(feature = "encryption")]
+fn members_as_read(archive: &[u8], lock: Encryption) -> Vec<impl PartialEq + std::fmt::Debug> {
+    let password = lock.headers.then_some(PASSWORD);
+    let archive = crate::rar50::Archive::parse_with_password(archive, password).unwrap();
+    archive
+        .files()
+        .map(|file| {
+            (
+                file.name.clone(),
+                file.unpacked_size,
+                file.compression_info,
+                file.data_crc32,
+                file.hash.clone(),
+                file.encryption.clone(),
+                {
+                    let packed = file.packed_data(&archive).unwrap();
+                    let mut crc = crate::crc32::Crc32::new();
+                    crc.update(&packed);
+                    (packed.len(), crc.finish())
+                },
+            )
+        })
+        .collect()
+}
+
+#[cfg(feature = "encryption")]
+#[test]
+fn seeded_encrypted_outputs_differ_only_in_the_padded_size_field() {
+    for members in [
+        vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)],
+        vec![text(4096, 1), noise(600 * 1024, 7), text(4096, 3)],
+        vec![text(4096, 1), noise(600 * 1024, 7)],
+    ] {
+        for lock in member_encryption_cases() {
+            let resources = WriterResources::default();
+            let archive =
+                crate::entropy::seeded::with(|| seekable(&members, lock, &resources).unwrap());
+            assert_holds(&archive, &members, lock);
+            let streamed =
+                crate::entropy::seeded::with(|| streamed(&members, lock, &resources).unwrap());
+            assert_holds(&streamed, &members, lock);
+            assert_eq!(
+                members_as_read(&archive, lock),
+                members_as_read(&streamed, lock)
+            );
+            assert!(archive.len() >= streamed.len() && archive.len() <= streamed.len() + 32);
+            // The main header and the end block draw after the members, so they pin the order too.
+            assert_eq!(archive[..64], streamed[..64]);
+            assert_eq!(
+                archive[archive.len() - 48..],
+                streamed[streamed.len() - 48..]
+            );
+        }
     }
 }

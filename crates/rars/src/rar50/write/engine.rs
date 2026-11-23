@@ -6,9 +6,9 @@
 //! Quick-open data uses a quota-controlled spool. Members go out in order as
 //! their windows finish, unless quick open or recovery needs every block
 //! length before the main header, in which case they are held until the
-//! last. On a seekable output, a large unencrypted non-solid member goes out
-//! as it is packed, behind a header patched once it is done, or stored over
-//! its attempt when packing does not pay. The
+//! last. On a seekable output, a large non-solid member goes out as it is
+//! packed, encrypted on the way if it has a password, behind a header patched
+//! once it is done, or stored over its attempt when packing does not pay. The
 //! workspace admission budget is not an aggregate RAM or disk quota.
 //!
 //! Stored payloads are reread and verified during emission, or, when the output
@@ -411,7 +411,8 @@ pub(super) fn write_archive<'a>(
     // Large members go out as they are packed, behind a header patched once
     // they are done, when the archive can seek and nothing is held. Only a
     // member that would be stored rather than grow does: its payload never
-    // outgrows its declared size, which sizes the header's reserved field.
+    // outgrows its declared size, padded to the cipher block if encrypted,
+    // which sizes the header's reserved field.
     let straight_above = sink.stream_above.filter(|_| {
         in_order
             && sink.can_seek()
@@ -421,9 +422,7 @@ pub(super) fn write_archive<'a>(
                 super::FilterPolicy::Explicit(_)
             )
     });
-    let straight = |index: usize, size: u64| {
-        straight_above.is_some_and(|above| size > above) && entries[index].password.is_none()
-    };
+    let straight = |_: usize, size: u64| straight_above.is_some_and(|above| size > above);
     let mut in_place: Option<InPlace> = None;
     compress::compress_members_in_order(
         &sources,
@@ -456,7 +455,7 @@ pub(super) fn write_archive<'a>(
                         member,
                         &plan,
                         hash_on_copy,
-                        0,
+                        None,
                         &mut write_keys,
                         header_keys.as_ref(),
                         resources,
@@ -474,7 +473,7 @@ pub(super) fn write_archive<'a>(
                             closed.stored(resources)?,
                             &plan,
                             false,
-                            member.header_len(),
+                            Some(&member),
                             &mut write_keys,
                             header_keys.as_ref(),
                             resources,
@@ -511,6 +510,7 @@ pub(super) fn write_archive<'a>(
                     input_size,
                     &plan,
                     &mut sink,
+                    &mut write_keys,
                     header_keys.as_ref(),
                     resources,
                 );
@@ -1110,7 +1110,7 @@ fn prepare_member<'a>(
     member: CompressedMember,
     plan: &EnginePlan<'_>,
     hash_on_copy: bool,
-    header_at_least: usize,
+    over: Option<&InPlace>,
     write_keys: &mut WriteKeys<'a>,
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
@@ -1132,12 +1132,17 @@ fn prepare_member<'a>(
     let (payload, recipe) = match entry.password.as_deref() {
         Some(password) => {
             let (salt, keys) = write_keys.for_password(password)?;
-            let iv = fresh_iv()?;
+            // Stored over its attempt, which overwrites every byte under
+            // this IV, a member keeps the IV drawn for it, as a spooled one does.
+            let iv = match over.and_then(|member| member.recipe.encryption.as_ref()) {
+                Some(attempt) => attempt.iv,
+                None => fresh_iv()?,
+            };
             let recipe = MemberHeader {
                 compression_info,
                 input_size,
                 // Encryption pads the payload up to the cipher block size.
-                payload_len: plain_len.div_ceil(16) * 16,
+                payload_len: padded_to_cipher_block(plain_len)?,
                 encryption: Some(MemberEncryption {
                     salt,
                     iv,
@@ -1165,7 +1170,8 @@ fn prepare_member<'a>(
     };
     let (specific, extra) = recipe.parts(entry, crc32, hash, resources)?;
     let header = prepared_header_image_at_least(
-        header_at_least,
+        over.map_or(0, InPlace::header_len),
+        over.and_then(|member| member.iv),
         HEAD_FILE,
         member_header_flags(&extra),
         Some(recipe.payload_len),
@@ -1199,6 +1205,7 @@ fn member_header_flags(extra: &[u8]) -> u64 {
 /// Spooling a large member costs as much temp disk as it packs to.
 struct InPlace {
     recipe: MemberHeader,
+    cipher: Option<OutgoingCipher>,
     header_at: u64,
     header_len: usize,
     /// The provisional header's, so the patched one draws no entropy.
@@ -1209,15 +1216,32 @@ struct InPlace {
 }
 
 impl InPlace {
-    fn open(
-        entry: &ArchiveEntry,
+    fn open<'a>(
+        entry: &'a ArchiveEntry,
         input_size: u64,
         plan: &EnginePlan<'_>,
         sink: &mut CancellableOutput<'_, '_>,
+        write_keys: &mut WriteKeys<'a>,
         header_keys: Option<&HeaderEncryptionKeys>,
         resources: &WriterResources,
     ) -> Result<Self> {
         let compress = &plan.compress;
+        // Drawn where a spooled member draws them, so both outputs draw alike.
+        let encryption = match entry.password.as_deref() {
+            Some(password) => {
+                let (salt, keys) = write_keys.for_password(password)?;
+                Some(MemberEncryption {
+                    salt,
+                    iv: fresh_iv()?,
+                    keys,
+                })
+            }
+            None => None,
+        };
+        let cipher = encryption
+            .as_ref()
+            .map(|encryption| OutgoingCipher::new(&encryption.keys, encryption.iv, resources))
+            .transpose()?;
         let recipe = MemberHeader {
             compression_info: super::filter_policy::compression_info(
                 compress.algorithm_version,
@@ -1227,11 +1251,15 @@ impl InPlace {
             )?,
             input_size,
             payload_len: 0,
-            encryption: None,
+            encryption,
         };
         // A payload as long as the member is stored instead, so the packed
-        // size always fits the width of the declared one.
-        let width = (u64::BITS - input_size.leading_zeros()).div_ceil(7).max(1) as usize;
+        // size always fits the width of the declared one, padded if encrypted.
+        let widest = match cipher {
+            Some(_) => padded_to_cipher_block(input_size)?,
+            None => input_size,
+        };
+        let width = (u64::BITS - widest.leading_zeros()).div_ceil(7).max(1) as usize;
         // A placeholder hash keeps the provisional header as long as its patch.
         let placeholder = compress.blake2sp.then_some([0; 32]);
         let header = Self::header(
@@ -1252,6 +1280,7 @@ impl InPlace {
         output.write_all(&header)?;
         Ok(Self {
             recipe,
+            cipher,
             header_at,
             header_len: header.len(),
             iv: header_keys.map(|_| header[..16].try_into().expect("sixteen bytes")),
@@ -1294,7 +1323,10 @@ impl InPlace {
     fn write(&mut self, bytes: &[u8], sink: &mut CancellableOutput<'_, '_>) -> Result<()> {
         let written = self.written + bytes.len() as u64;
         if written < self.recipe.input_size {
-            sink.writer().write_all(bytes)?;
+            match self.cipher.as_mut() {
+                Some(cipher) => cipher.write(bytes, sink.writer())?,
+                None => sink.writer().write_all(bytes)?,
+            }
             self.written = written;
         } else {
             self.written = self.recipe.input_size;
@@ -1303,7 +1335,7 @@ impl InPlace {
     }
 
     fn close(
-        self,
+        mut self,
         entry: &ArchiveEntry,
         closed: &ClosedMember,
         sink: &mut CancellableOutput<'_, '_>,
@@ -1322,12 +1354,19 @@ impl InPlace {
                 "RAR 5 member packed in place is not the size written",
             ));
         }
+        let payload_len = match self.cipher.take() {
+            Some(cipher) => {
+                cipher.finish(output)?;
+                padded_to_cipher_block(closed.packed_len)?
+            }
+            None => closed.packed_len,
+        };
         let header = Self::header(
             &self.recipe,
             entry,
             closed.crc32,
             closed.hash,
-            closed.packed_len,
+            payload_len,
             self.width,
             header_keys,
             self.iv,
@@ -1340,6 +1379,83 @@ impl InPlace {
             &header,
             Error::InvalidArgument("RAR 5 header changed length when patched"),
         )
+    }
+}
+
+fn padded_to_cipher_block(len: u64) -> Result<u64> {
+    len.checked_next_multiple_of(16)
+        .ok_or(Error::InvalidArgument(
+            "RAR 5 encrypted data size overflows",
+        ))
+}
+
+/// Encrypting as the bytes go out means a packed member is never spooled.
+#[cfg(feature = "encryption")]
+struct OutgoingCipher {
+    cipher: crate::crypto::rar50::Rar50Cipher,
+    buffer: Bytes,
+    pending: usize,
+}
+
+#[cfg(feature = "encryption")]
+impl OutgoingCipher {
+    const CHUNK: usize = 64 * 1024;
+
+    fn new(keys: &Rar50Keys, iv: [u8; 16], resources: &WriterResources) -> Result<Self> {
+        Ok(Self {
+            cipher: crate::crypto::rar50::Rar50Cipher::new(keys.key, iv),
+            buffer: Bytes::zeroed(Self::CHUNK, resources)?,
+            pending: 0,
+        })
+    }
+
+    fn write(&mut self, mut bytes: &[u8], output: &mut dyn Write) -> Result<()> {
+        while !bytes.is_empty() {
+            let take = bytes.len().min(Self::CHUNK - self.pending);
+            self.buffer[self.pending..self.pending + take].copy_from_slice(&bytes[..take]);
+            self.pending += take;
+            bytes = &bytes[take..];
+            let whole = self.pending & !15;
+            self.cipher
+                .encrypt_in_place(&mut self.buffer[..whole])
+                .map_err(super::map_rar50_crypto_error)?;
+            output.write_all(&self.buffer[..whole])?;
+            self.buffer.copy_within(whole..self.pending, 0);
+            self.pending -= whole;
+        }
+        Ok(())
+    }
+
+    /// Zero padding, as a spooled member gets, so both outputs match.
+    fn finish(mut self, output: &mut dyn Write) -> Result<()> {
+        let padded = padded_to_cipher_block(self.pending as u64)? as usize;
+        self.buffer[self.pending..padded].fill(0);
+        self.cipher
+            .encrypt_in_place(&mut self.buffer[..padded])
+            .map_err(super::map_rar50_crypto_error)?;
+        output.write_all(&self.buffer[..padded])?;
+        Ok(())
+    }
+}
+
+/// Without encryption no member has a password, so none is encrypted in place.
+#[cfg(not(feature = "encryption"))]
+enum OutgoingCipher {}
+
+#[cfg(not(feature = "encryption"))]
+impl OutgoingCipher {
+    fn new(_: &Rar50Keys, _: [u8; 16], _: &WriterResources) -> Result<Self> {
+        Err(Error::FeatureDisabled {
+            feature: "encryption",
+        })
+    }
+
+    fn write(&mut self, _: &[u8], _: &mut dyn Write) -> Result<()> {
+        match *self {}
+    }
+
+    fn finish(self, _: &mut dyn Write) -> Result<()> {
+        match self {}
     }
 }
 
