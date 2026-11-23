@@ -541,6 +541,15 @@ fn encode_member<'a>(
             held: None,
         });
     }
+    // A member its samples say will not compress is stored the way `--store`
+    // stores it, never loaded or packed.
+    let coding = if solid_encoder.is_none()
+        && samples_say_store(member, options, coding, unpacked_size, resources, work)?
+    {
+        &MemberCoding::Stored
+    } else {
+        coding
+    };
     // A large member read from a source is packed into a spool a window at a
     // time, and a stored fallback copied from the source.
     if let (true, Some(source)) = (
@@ -642,6 +651,55 @@ fn encode_member<'a>(
         held: None,
     }
     .holding(permit))
+}
+
+/// Whether to store an independent member without packing it, judged from
+/// samples of it as the later formats judge theirs (#509).
+///
+/// A solid member is packed against the ones before it, so a sample packed
+/// alone says nothing about it. A rewrite's sources are staged a window at a
+/// time, in order, and opening one ahead to sample it can need staging the
+/// members before it still hold.
+fn samples_say_store(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    unpacked_size: usize,
+    resources: &WriterResources,
+    work: &WorkTracker<'_>,
+) -> Result<bool> {
+    let len = unpacked_size as u64;
+    if !coding.compresses()
+        || options.features.solid
+        || options.compression_level == Some(0)
+        || crate::incompressible::sample_ranges(len).is_none()
+        || member
+            .bytes
+            .source()
+            .is_some_and(|source| source.max_preparation_window() != usize::MAX)
+    {
+        return Ok(false);
+    }
+    // A sample, what it packs to, and the coder's index.
+    let sample = crate::incompressible::SAMPLE_LEN as u64;
+    let _permit = resources.acquire_serialising_cancellable(
+        (2 * sample).saturating_add(crate::codec::rar13::ENCODER_WORKSPACE),
+        &|| work.is_cancelled(),
+    )?;
+    let mut reader = member.bytes.open()?;
+    crate::incompressible::looks_incompressible(&mut *reader, len, |sample| {
+        work.check()?;
+        // Packed alone at level 1, the cheapest packing there is.
+        match unpack15_encode_with_options_and_progress(
+            sample,
+            rar15_encode_options_for_level(Some(1)),
+            &mut |_| !work.is_cancelled(),
+        ) {
+            Ok(packed) => Ok(packed.len()),
+            Err(crate::codec::Error::Cancelled) => Err(Error::Cancelled),
+            Err(error) => Err(error.into()),
+        }
+    })
 }
 
 /// [`encode_member`] for a member packed into a spool: the same attempts,
