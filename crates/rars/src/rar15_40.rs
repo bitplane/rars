@@ -973,7 +973,8 @@ impl Archive {
                             sig.offset + pos,
                             options.salvages(),
                         ) {
-                            Err(error) if salvage_stops(&options, &error) => {
+                            // A whole header whose sizes run past the file.
+                            Err(error) if options.salvage => {
                                 unreadable(&budget.control, sig.offset + pos, &error);
                             }
                             cut => truncation = Some(cut?),
@@ -1195,7 +1196,8 @@ impl Archive {
                             let rest =
                                 read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
                             match cut_block_header(&rest, sfx_offset + pos, options.salvages()) {
-                                Err(error) if salvage_stops(&options, &error) => {
+                                // A whole header whose sizes run past the file.
+                                Err(error) if options.salvage => {
                                     unreadable(&budget.control, sfx_offset + pos, &error);
                                 }
                                 cut => truncation = Some(cut?),

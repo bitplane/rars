@@ -93,11 +93,11 @@ impl DamageLog {
     }
 }
 
-/// The reason to give for a record that failed to parse.
+/// The reason to give for a header or record that failed to parse.
 pub(crate) fn record_reason(error: &crate::Error) -> &'static str {
     match error.root_cause() {
         crate::Error::InvalidHeader(reason) => reason,
-        crate::Error::TooShort => "the record is too short",
-        _ => "the record doesn't parse",
+        crate::Error::TooShort => "it runs past the end of its data",
+        _ => "it doesn't parse",
     }
 }
