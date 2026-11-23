@@ -21,6 +21,9 @@ all-features = true
 [features]
 # Default builds retain all capabilities; each optional feature is independent.
 default = ["write", "parallel", "recovery", "encryption"]
+# Deprecated: does nothing beyond enabling `write`. Kept so 0.13.x stays
+# compatible with 0.13.0; removed in 0.14.0 (#536).
+experimental-ring-state = ["write"]
 parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
 write = ["dep:getrandom"]
