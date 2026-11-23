@@ -10,8 +10,8 @@
 //! header's offset to its block and patches it at the end. On a seekable
 //! output, a large non-solid member goes out as it is packed, encrypted on the
 //! way if it has a password, behind a header patched once it is done, or
-//! stored over its attempt when packing does not pay. The workspace admission
-//! budget is not an aggregate RAM or disk quota.
+//! stored over its attempt when packing does not pay and no filter was named.
+//! The workspace admission budget is not an aggregate RAM or disk quota.
 //!
 //! Stored payloads are reread and verified during emission, or, when the output
 //! can seek and every member is stored, read once behind a header patched
@@ -450,19 +450,10 @@ pub(super) fn write_archive<'a>(
     };
 
     // Large members go out as they are packed, behind a header patched once
-    // they are done, when the archive can seek and nothing is held. Only a
-    // member that would be stored rather than grow does: its payload never
-    // outgrows its declared size, padded to the cipher block if encrypted,
-    // which sizes the header's reserved field.
-    let straight_above = sink.stream_above.filter(|_| {
-        in_order
-            && sink.can_seek()
-            && !plan.compress.solid
-            && !matches!(
-                plan.compress.filter_policy,
-                super::FilterPolicy::Explicit(_)
-            )
-    });
+    // they are done, when the archive can seek and nothing is held.
+    let straight_above = sink
+        .stream_above
+        .filter(|_| in_order && sink.can_seek() && !plan.compress.solid);
     let straight = |_: usize, size: u64| straight_above.is_some_and(|above| size > above);
     let mut in_place: Option<InPlace> = None;
     compress::compress_members_in_order(
@@ -1407,6 +1398,21 @@ fn member_header_flags(extra: &[u8]) -> u64 {
     }
 }
 
+/// Only a member that is never stored instead needs room past its size.
+fn reserved_width(input_size: u64, may_store: bool, encrypted: bool) -> Result<usize> {
+    let most = if may_store {
+        input_size
+    } else {
+        crate::codec::rar50::packed_most(input_size)
+    };
+    let most = if encrypted {
+        padded_to_cipher_block(most)?
+    } else {
+        most
+    };
+    Ok((u64::BITS - most.leading_zeros()).div_ceil(7).max(1) as usize)
+}
+
 /// Spooling a large member costs as much temp disk as it packs to.
 struct InPlace {
     recipe: MemberHeader,
@@ -1417,6 +1423,8 @@ struct InPlace {
     iv: Option<[u8; 16]>,
     /// Fixed by the declared size, so the archive does not depend on threads.
     width: usize,
+    /// Not under an explicit filter, which keeps whatever it packs to.
+    may_store: bool,
     written: u64,
 }
 
@@ -1458,13 +1466,13 @@ impl InPlace {
             payload_len: 0,
             encryption,
         };
-        // A payload as long as the member is stored instead, so the packed
-        // size always fits the width of the declared one, padded if encrypted.
-        let widest = match cipher {
-            Some(_) => padded_to_cipher_block(input_size)?,
-            None => input_size,
-        };
-        let width = (u64::BITS - widest.leading_zeros()).div_ceil(7).max(1) as usize;
+        let may_store = super::filter_policy::should_store_compressed_payload(
+            input_size,
+            input_size,
+            false,
+            &compress.filter_policy,
+        );
+        let width = reserved_width(input_size, may_store, cipher.is_some())?;
         // A placeholder hash keeps the provisional header as long as its patch.
         let placeholder = compress.blake2sp.then_some([0; 32]);
         let header = Self::header(
@@ -1490,6 +1498,7 @@ impl InPlace {
             header_len: header.len(),
             iv: header_keys.map(|_| header[..16].try_into().expect("sixteen bytes")),
             width,
+            may_store,
             written: 0,
         })
     }
@@ -1524,10 +1533,10 @@ impl InPlace {
         self.header_len
     }
 
-    /// Those reaching the member's size are not written: it will be stored over them.
+    /// Bytes that reach the size of a member that may be stored are not written.
     fn write(&mut self, bytes: &[u8], sink: &mut CancellableOutput<'_, '_>) -> Result<()> {
         let written = self.written + bytes.len() as u64;
-        if written < self.recipe.input_size {
+        if !self.may_store || written < self.recipe.input_size {
             match self.cipher.as_mut() {
                 Some(cipher) => cipher.write(bytes, sink.writer())?,
                 None => sink.writer().write_all(bytes)?,

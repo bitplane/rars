@@ -6463,3 +6463,134 @@ fn pipelined_optimal_parse_matches_the_sequential_walk() {
         .unwrap();
     assert!(decoded == data);
 }
+
+fn xorshift(len: usize, mut state: u32) -> Vec<u8> {
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect()
+}
+
+// Noise, call opcodes the x86 filters rewrite, and noise whose deltas are
+// noisier still, at sizes on both sides of a block.
+fn worst_inputs() -> Vec<Vec<u8>> {
+    let mut inputs = Vec::new();
+    for len in [0, 1, 2, 3, 17, 4096, LZ_BLOCK_SIZE + 1] {
+        let noise = xorshift(len, 0x9e37_79b9 ^ len as u32);
+        let calls = noise
+            .iter()
+            .enumerate()
+            .map(|(at, &byte)| if at % 5 == 0 { 0xe8 } else { byte })
+            .collect();
+        let swings = noise
+            .iter()
+            .enumerate()
+            .map(|(at, &byte)| if at % 2 == 0 { byte } else { !byte })
+            .collect();
+        inputs.extend([noise, calls, swings]);
+    }
+    inputs
+}
+
+#[test]
+fn no_member_packs_past_the_most_its_size_allows() {
+    let filters = [
+        None,
+        Some(crate::FilterKind::E8),
+        Some(crate::FilterKind::E8E9),
+        Some(crate::FilterKind::Arm),
+        Some(crate::FilterKind::Delta { channels: 1 }),
+        Some(crate::FilterKind::Delta { channels: 32 }),
+    ];
+    let parses = [
+        EncodeOptions::new(1),
+        EncodeOptions::new(64).with_lazy_matching(true),
+        EncodeOptions::new(256).with_optimal_parse(true),
+    ];
+    for data in worst_inputs() {
+        let most = packed_most(data.len() as u64);
+        for version in [0, 1] {
+            for options in parses {
+                for kind in filters {
+                    let mut encoder = Unpack50Encoder::with_options(options);
+                    let packed = match kind {
+                        Some(kind) if !data.is_empty() => encoder
+                            .encode_member_with_filter(
+                                &data,
+                                version,
+                                crate::FilterSpec::whole(kind),
+                            )
+                            .unwrap(),
+                        _ => encoder.encode_member(&data, version).unwrap(),
+                    };
+                    assert!(
+                        packed.len() as u64 <= most,
+                        "{} bytes {kind:?} packed to {}",
+                        data.len(),
+                        packed.len()
+                    );
+                }
+                for kind in filters.iter().flatten().filter(|_| !data.is_empty()) {
+                    let half = data.len().div_ceil(2);
+                    let allowance = Allowance::default();
+                    let packed = [(0..half, false), (half..data.len(), true)]
+                        .into_iter()
+                        .filter(|(run, last)| !run.is_empty() || *last)
+                        .map(|(run, last)| {
+                            let filters = [crate::FilterSpec::range(*kind, 0..run.len())];
+                            let filters = if run.is_empty() {
+                                &[][..]
+                            } else {
+                                &filters[..]
+                            };
+                            encode_filtered_run(
+                                &data[run.clone()],
+                                filters,
+                                &data[..run.start],
+                                run.start,
+                                last,
+                                version,
+                                options,
+                                None,
+                                &allowance,
+                            )
+                            .unwrap()
+                            .len()
+                        })
+                        .sum::<usize>();
+                    assert!(
+                        packed as u64 <= most,
+                        "{} bytes in {kind:?} runs packed to {packed}",
+                        data.len()
+                    );
+                }
+                for block_size in [1, 2, 7, 4096, LZ_BLOCK_SIZE] {
+                    if data.len() / block_size > 1024 {
+                        continue;
+                    }
+                    let mut packed = Vec::new();
+                    encode_lz_reader_to(
+                        &mut data.as_slice(),
+                        data.len() as u64,
+                        &mut packed,
+                        version,
+                        options,
+                        block_size,
+                        None,
+                    )
+                    .unwrap();
+                    assert!(
+                        packed.len() as u64 <= most,
+                        "{} bytes in {block_size}-byte blocks packed to {}",
+                        data.len(),
+                        packed.len()
+                    );
+                }
+            }
+        }
+    }
+}
