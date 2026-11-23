@@ -2448,7 +2448,7 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     read_compressed_block_with_allowance(input, &Allowance::default())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "write"))]
 fn read_compressed_block_with_allowance<B: Budget>(
     input: &mut impl Read,
     allowance: &B,
