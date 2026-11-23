@@ -232,6 +232,21 @@ impl FileHeader {
             .ended_early(self.unpacked_size, decoded as u64)
     }
 
+    /// Under salvage, a member whose stream went on past its declared size
+    /// delivered only those bytes, whatever its checksum says.
+    fn salvaged_result<B: Budget>(
+        &self,
+        decoder: &ReaderState<B>,
+        result: Result<()>,
+    ) -> Result<()> {
+        if decoder.ran_past() {
+            return Err(Error::MemberRanPastDeclaredSize {
+                declared: self.unpacked_size,
+            });
+        }
+        result
+    }
+
     pub(super) fn verify_integrity_with_keys(
         &self,
         data: &[u8],
@@ -609,8 +624,9 @@ impl FileHeader {
     ) -> Result<()> {
         // The pipeline's buffers and the filter thread's are charged together.
         let allowance = decoder.allowance();
-        let pipelined = scratch_policy
-            .is_none()
+        // Salvage decodes on this thread, so a failure is followed at once by
+        // what decoded before it.
+        let pipelined = (scratch_policy.is_none() && !decoder.read_control.salvage())
             .then(|| {
                 output_pipeline::admit_with(self.unpacked_size, |bytes| {
                     let mut charge = allowance.charge();
@@ -1251,9 +1267,10 @@ impl Archive {
     {
         options.check_cancelled()?;
         // Solid chains, ordered total-output charging and the shared scratch
-        // all need one session in archive order.
+        // all need one session in archive order, as does salvage.
         if options.rar50_scratch.is_some()
             || options.max_total_output_bytes.is_some()
+            || options.salvage
             || self.main.is_solid()
             || self
                 .files()
@@ -1841,18 +1858,32 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             if file.should_stream_decode(session.buffered_decode_limit) {
                 return session.stream_file_to(archive, file, writer);
             }
-            let decoded = session
-                .decoded_file_data(archive, file, history)
-                .map_err(|error| file.entry_error("decoding", error))?;
-            let verified = file.ended_early_result(
+            let decoded = match session.decoded_file_data(archive, file, history) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    // Salvage delivers what decoded before the failure.
+                    if let Some(partial) = session.decoder.take_salvaged() {
+                        writer
+                            .write_all(&partial)
+                            .map_err(Error::from)
+                            .map_err(|error| file.entry_error("writing", error))?;
+                    }
+                    return Err(file.entry_error("decoding", error));
+                }
+            };
+            let verified = file.salvaged_result(
                 &session.decoder,
-                file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()),
+                file.ended_early_result(
+                    &session.decoder,
+                    file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()),
+                ),
             );
-            // A whole member that strict sizes fail is still written.
-            if verified
-                .as_ref()
-                .is_err_and(|error| !matches!(error, Error::MemberEndedEarly { .. }))
-            {
+            // A whole member that strict sizes fail is still written, and
+            // salvage writes every member.
+            if verified.as_ref().is_err_and(|error| {
+                !matches!(error, Error::MemberEndedEarly { .. })
+                    && !session.decoder.read_control.salvage()
+            }) {
                 return verified.map_err(|error| file.entry_error("verifying", error));
             }
             writer
@@ -1890,7 +1921,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             None,
             writer,
         );
-        let result = file.ended_early_result(&streaming_decoder, result);
+        let result = file.salvaged_result(
+            &streaming_decoder,
+            file.ended_early_result(&streaming_decoder, result),
+        );
         // A failed member's history is kept for a caller that goes past it.
         self.decoder = streaming_decoder;
         result.map_err(|error| file.entry_error("decoding", error))
@@ -3727,6 +3761,7 @@ mod tests {
             source: ArchiveSource::Memory(source),
             key_cache: Arc::default(),
             truncation: None,
+            damage: Vec::new(),
         }
     }
 
@@ -3788,6 +3823,7 @@ mod tests {
             source: ArchiveSource::Memory(bytes),
             key_cache: Arc::default(),
             truncation: None,
+            damage: Vec::new(),
         }
     }
 

@@ -94,6 +94,7 @@ pub struct Archive {
     // Shared with later volumes parsed in the same session, so keys outlive one call.
     pub(crate) key_cache: Arc<KeyCache>,
     truncation: Option<Truncation>,
+    damage: Vec<crate::HeaderDamage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,7 +682,7 @@ impl Archive {
         // parse_shared supplies the exact signature found in this buffer.
         let archive_len = input.len();
         let data_limit = usize::MAX - sfx_offset;
-        let (main, blocks, truncation) = parse_archive_blocks(
+        let (main, blocks, truncation, damage) = parse_archive_blocks(
             archive_len,
             sfx_offset,
             options,
@@ -718,6 +719,7 @@ impl Archive {
             source,
             key_cache,
             truncation,
+            damage,
         })
     }
 
@@ -756,7 +758,7 @@ impl Archive {
         let file_cell =
             std::cell::RefCell::new(crate::io_util::ReadAhead::new(control.reader(file)));
         let data_limit = usize::MAX - sfx_offset;
-        let (main, blocks, truncation) = parse_archive_blocks(
+        let (main, blocks, truncation, damage) = parse_archive_blocks(
             archive_len,
             sfx_offset,
             options,
@@ -796,6 +798,7 @@ impl Archive {
             source,
             key_cache,
             truncation,
+            damage,
         })
     }
 
@@ -814,6 +817,11 @@ impl Archive {
 
     /// Where the file ends early, when it is cut short after its last whole
     /// member, such as inside the recovery record or before the end block.
+    /// The header damage a salvaging parse read past, in file order.
+    pub fn header_damage(&self) -> &[crate::HeaderDamage] {
+        &self.damage
+    }
+
     pub fn truncation(&self) -> Option<&Truncation> {
         self.truncation.as_ref()
     }
@@ -1910,75 +1918,108 @@ fn parse_file_extra_area(
             file.rewrite_metadata_complete = false;
         }
         seen |= bit;
-        match record_type {
-            FHEXTRA_CRYPT => {
-                let encryption = parse_file_encryption_record(input, data)?;
-                file.rewrite_metadata_complete &=
-                    encryption.version == 0 && encryption.flags & !3 == 0;
-                file.encrypted = true;
-                file.encryption = Some(encryption);
-            }
-            FHEXTRA_HASH => {
-                let (hash_type, hash_type_len) = read_vint_at(input, data.start, data.end)?;
-                file.rewrite_metadata_complete &=
-                    hash_type == 0 && data.len() == hash_type_len + 32;
-                file.hash = Some(FileHash {
-                    hash_type,
-                    data: input[data.start + hash_type_len..data.end].to_vec(),
-                });
-            }
-            FHEXTRA_REDIR => {
-                let link = parse_file_redirection_record(input, data)?;
-                file.rewrite_metadata_complete &= !is_service && link.is_supported();
-                file.redirection = Some(link);
-            }
-            FHEXTRA_HTIME => {
-                let flags = read_vint_at(input, data.start, data.end).ok();
-                let times = flags.and_then(|(flags, len)| {
-                    crate::file_times::TimeRecord::parse(flags, &input[data.start + len..data.end])
-                });
-                let parsed = parse_htime_mtime(input, data);
-                file.rewrite_metadata_complete &= times.is_some()
-                    && !(file.mtime.is_some()
-                        && times.is_some_and(|times| times.modified.is_some()));
-                file.file_times = times;
-                file.htime_mtime = parsed.map(|(seconds, _)| seconds);
-                file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
-            }
-            FHEXTRA_VERSION => {
-                // RAR 5 file versioning: the record carries a flags vint
-                // (no flags are defined) then the version-number vint.
-                // Adopt the record by appending ";N" to the member name;
-                // the newest version has no record at all. Version 0 is
-                // "no version" and gets no suffix either. Service blocks
-                // never carry versions, so those names must stay untouched.
-                // Reference readers do not fail an archive over a record
-                // they cannot read, so a short record counts as version 0.
-                let flags_len = read_vint_at(input, data.start, data.end)
-                    .map(|(_, len)| len)
-                    .unwrap_or_default();
-                let version = read_vint_at(input, data.start + flags_len, data.end)
-                    .map(|(version, _)| version)
-                    .unwrap_or_default();
-                if !is_service && version != 0 {
-                    file.name
-                        .extend_from_slice(format!(";{version}").as_bytes());
+        let parsed = (|| -> Result<()> {
+            match record_type {
+                FHEXTRA_CRYPT => {
+                    let encryption = parse_file_encryption_record(input, data)?;
+                    file.rewrite_metadata_complete &=
+                        encryption.version == 0 && encryption.flags & !3 == 0;
+                    file.encrypted = true;
+                    file.encryption = Some(encryption);
                 }
-                // The in-memory name no longer matches the stored header
-                // bytes, and the writer does not re-emit this record, so a
-                // rewrite could not reproduce the archive faithfully.
+                FHEXTRA_HASH => {
+                    let (hash_type, hash_type_len) = read_vint_at(input, data.start, data.end)?;
+                    if hash_type == 0 && data.len() != hash_type_len + 32 && control.salvage() {
+                        // Without salvage, verification refuses the member.
+                        return Err(Error::InvalidHeader(
+                            "RAR 5 BLAKE2sp hash record has invalid length",
+                        ));
+                    }
+                    file.rewrite_metadata_complete &=
+                        hash_type == 0 && data.len() == hash_type_len + 32;
+                    file.hash = Some(FileHash {
+                        hash_type,
+                        data: input[data.start + hash_type_len..data.end].to_vec(),
+                    });
+                }
+                FHEXTRA_REDIR => {
+                    let link = parse_file_redirection_record(input, data)?;
+                    if link.target_name.is_empty() && control.salvage() {
+                        // Without salvage, extraction refuses the link.
+                        return Err(Error::InvalidHeader(
+                            "RAR 5 file redirection has an empty target",
+                        ));
+                    }
+                    file.rewrite_metadata_complete &= !is_service && link.is_supported();
+                    file.redirection = Some(link);
+                }
+                FHEXTRA_HTIME => {
+                    let flags = read_vint_at(input, data.start, data.end).ok();
+                    let times = flags.and_then(|(flags, len)| {
+                        crate::file_times::TimeRecord::parse(
+                            flags,
+                            &input[data.start + len..data.end],
+                        )
+                    });
+                    let parsed = parse_htime_mtime(input, data);
+                    file.rewrite_metadata_complete &= times.is_some()
+                        && !(file.mtime.is_some()
+                            && times.is_some_and(|times| times.modified.is_some()));
+                    file.file_times = times;
+                    file.htime_mtime = parsed.map(|(seconds, _)| seconds);
+                    file.htime_mtime_refinement = parsed.and_then(|(_, detail)| detail);
+                }
+                FHEXTRA_VERSION => {
+                    // RAR 5 file versioning: the record carries a flags vint
+                    // (no flags are defined) then the version-number vint.
+                    // Adopt the record by appending ";N" to the member name;
+                    // the newest version has no record at all. Version 0 is
+                    // "no version" and gets no suffix either. Service blocks
+                    // never carry versions, so those names must stay untouched.
+                    // Reference readers do not fail an archive over a record
+                    // they cannot read, so a short record counts as version 0.
+                    let flags_len = read_vint_at(input, data.start, data.end)
+                        .map(|(_, len)| len)
+                        .unwrap_or_default();
+                    let version = read_vint_at(input, data.start + flags_len, data.end)
+                        .map(|(version, _)| version)
+                        .unwrap_or_default();
+                    if !is_service && version != 0 {
+                        file.name
+                            .extend_from_slice(format!(";{version}").as_bytes());
+                    }
+                    // The in-memory name no longer matches the stored header
+                    // bytes, and the writer does not re-emit this record, so a
+                    // rewrite could not reproduce the archive faithfully.
+                    file.rewrite_metadata_complete = false;
+                }
+                FHEXTRA_SUBDATA => {
+                    file.rewrite_metadata_complete &=
+                        is_service && (data.is_empty() || file.name == b"RR");
+                    file.service_data = Some(input[data].to_vec());
+                }
+                _ => {
+                    file.rewrite_metadata_complete = false;
+                }
+            }
+            Ok(())
+        })();
+        match parsed {
+            // Salvage drops a malformed optional record and keeps the rest of
+            // the header. An encryption record isn't optional.
+            Err(error) if control.salvage() && record_type != FHEXTRA_CRYPT => {
                 file.rewrite_metadata_complete = false;
+                control.report_damage(
+                    file.block.offset,
+                    crate::HeaderDamageKind::DroppedRecord {
+                        record: record_type,
+                        reason: crate::header_damage::record_reason(&error),
+                    },
+                );
+                Ok(())
             }
-            FHEXTRA_SUBDATA => {
-                file.rewrite_metadata_complete &=
-                    is_service && (data.is_empty() || file.name == b"RR");
-                file.service_data = Some(input[data].to_vec());
-            }
-            _ => {
-                file.rewrite_metadata_complete = false;
-            }
+            parsed => parsed,
         }
-        Ok(())
     })?;
     file.rewrite_metadata_complete &= complete;
     Ok(())
@@ -2443,6 +2484,15 @@ fn read_array_at<const N: usize>(input: &[u8], pos: &mut usize, end: usize) -> R
     Ok(out)
 }
 
+/// What [`parse_archive_blocks`] reads: the main header, the blocks, where
+/// the file is cut short and the header damage a salvaging parse went past.
+type ParsedArchive = (
+    MainHeader,
+    Vec<Block>,
+    Option<Truncation>,
+    Vec<crate::HeaderDamage>,
+);
+
 /// Reads the blocks of an archive `archive_len` bytes long that starts at file
 /// offset `sfx_offset`. `read_block` and `read_encrypted_block` read one block
 /// header without checking that its data fits, and `peek` returns up to
@@ -2456,7 +2506,7 @@ fn parse_archive_blocks<F, G, H>(
     mut read_block: F,
     mut read_encrypted_block: G,
     mut peek: H,
-) -> Result<(MainHeader, Vec<Block>, Option<Truncation>)>
+) -> Result<ParsedArchive>
 where
     F: FnMut(usize, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
     G: FnMut(usize, &Rar50Keys, &mut crate::parse_budget::ParseBudget) -> Result<ParsedBlockHeader>,
@@ -2526,6 +2576,17 @@ where
                 read_block(pos, &mut budget)
             };
             let parsed = match parsed {
+                // Salvage ends the walk at a plaintext header that doesn't
+                // parse, keeping the members before it.
+                Err(error) if header_keys.is_none() && salvage_stops(&options, &error) => {
+                    budget.control.report_damage(
+                        sfx_offset + pos,
+                        crate::HeaderDamageKind::Unreadable {
+                            reason: crate::header_damage::record_reason(&error),
+                        },
+                    );
+                    break;
+                }
                 // Only plaintext headers can be read when cut short.
                 Err(Error::TooShort) if header_keys.is_none() => {
                     let rest = peek(pos).map_err(|error| at_offset(error, pos))?;
@@ -2536,6 +2597,15 @@ where
                         }
                         Some(block) => {
                             truncation = Some(Truncation::new(sfx_offset + pos, block, true));
+                            break;
+                        }
+                        None if options.salvage => {
+                            budget.control.report_damage(
+                                sfx_offset + pos,
+                                crate::HeaderDamageKind::Unreadable {
+                                    reason: "the header's sizes run past the end of the file",
+                                },
+                            );
                             break;
                         }
                         None => return Err(at_offset(Error::TooShort, pos)),
@@ -2554,11 +2624,20 @@ where
                         TruncatedBlock::service(&service.name)
                     }
                     HEAD_END => TruncatedBlock::End,
-                    HEAD_FILE if options.salvages() => {
-                        let file = parse_file_header_bytes(&parsed)
-                            .map_err(|error| at_offset(error, pos))?;
-                        TruncatedBlock::Member(file.name)
-                    }
+                    HEAD_FILE if options.salvages() => match parse_file_header_bytes(&parsed) {
+                        Ok(file) => TruncatedBlock::Member(file.name),
+                        // A damaged header whose fields run on into its data.
+                        Err(error) if options.salvage => {
+                            parsed.control.report_damage(
+                                sfx_offset + pos,
+                                crate::HeaderDamageKind::Unreadable {
+                                    reason: crate::header_damage::record_reason(&error),
+                                },
+                            );
+                            break;
+                        }
+                        Err(error) => return Err(at_offset(error, pos)),
+                    },
                     HEAD_FILE | HEAD_MAIN | HEAD_CRYPT => {
                         return Err(at_offset(Error::TooShort, pos))
                     }
@@ -2567,16 +2646,32 @@ where
                 truncation = Some(Truncation::new(sfx_offset + pos, block, true));
                 break;
             }
+            // Salvage passes over a file or service header whose block reads
+            // but whose own fields don't.
+            let file_header = |parsed: &ParsedBlockHeader| match parse_file_header_bytes(parsed) {
+                Err(error) if salvage_stops(&options, &error) => {
+                    parsed.control.report_damage(
+                        sfx_offset + pos,
+                        crate::HeaderDamageKind::Unreadable {
+                            reason: crate::header_damage::record_reason(&error),
+                        },
+                    );
+                    Ok(None)
+                }
+                parsed => parsed.map(Some).map_err(|error| at_offset(error, pos)),
+            };
             match parsed.block.header_type {
                 HEAD_FILE => {
-                    let file =
-                        parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
-                    crypto_headers.push((blocks.len(), pos));
-                    blocks.push(Block::File(file));
+                    if let Some(file) = file_header(&parsed)? {
+                        crypto_headers.push((blocks.len(), pos));
+                        blocks.push(Block::File(file));
+                    }
                 }
                 HEAD_SERVICE => {
-                    let service =
-                        parse_file_header_bytes(&parsed).map_err(|error| at_offset(error, pos))?;
+                    let Some(service) = file_header(&parsed)? else {
+                        pos = next;
+                        continue;
+                    };
                     crypto_headers.push((blocks.len(), pos));
                     blocks.push(Block::Service(service));
                 }
@@ -2643,7 +2738,15 @@ where
         matches!(block, Block::Service(service) if matches!(&service.name[..], b"QO" | b"RR"))
     });
     let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), past_trailing_block));
-    Ok((main, blocks, truncation))
+    Ok((main, blocks, truncation, budget.control.take_damage()))
+}
+
+/// Whether a salvaging parse goes past `error` in a header, rather than
+/// failing: damage, not cancellation, a limit or a missing password.
+fn salvage_stops(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
+    options.salvage
+        && error.kind() == crate::ErrorKind::InvalidArchive
+        && !matches!(error.root_cause(), Error::TooShort)
 }
 
 /// How many bytes [`cut_header_block`] reads to name a block cut short.
@@ -2776,6 +2879,8 @@ struct HeaderPrefix {
     crc: u32,
     size: u64,
     size_len: usize,
+    /// Whether the header was stored as is, rather than encrypted.
+    plaintext: bool,
 }
 
 fn parse_block_header_bytes(
@@ -2830,6 +2935,7 @@ fn parse_block_header_bytes_to(
             crc: header_crc,
             size: header_size,
             size_len: header_size_len,
+            plaintext: true,
         },
         header_total,
         &budget.control,
@@ -2933,6 +3039,7 @@ fn parse_encrypted_block_header_bytes_to(
                 crc: header_crc,
                 size: header_size,
                 size_len: header_size_len,
+                plaintext: false,
             },
             disk_header_len,
             &budget.control,
@@ -2988,6 +3095,7 @@ fn read_block_header_at_to(
             crc: header_crc,
             size: header_size,
             size_len: header_size_len,
+            plaintext: true,
         },
         header_total,
         &budget.control,
@@ -3089,6 +3197,7 @@ fn read_encrypted_block_header_at_to(
                 crc: header_crc,
                 size: header_size,
                 size_len: header_size_len,
+                plaintext: false,
             },
             disk_header_len,
             &budget.control,
@@ -3109,7 +3218,18 @@ fn parse_block_header_image(
     let header_total = header.len();
     // All four callers decoded this same immutable size prefix before reading
     // or decrypting the complete header image.
-    validate_block_header_crc(&header, prefix.crc)?;
+    match validate_block_header_crc(&header, prefix.crc) {
+        // Salvage reads the header as stored, and the walk stops if it
+        // doesn't parse.
+        // An encrypted header that fails is more likely a wrong password.
+        Err(Error::Crc32Mismatch { expected, actual }) if prefix.plaintext && control.salvage() => {
+            control.report_damage(
+                sfx_offset + offset,
+                crate::HeaderDamageKind::Checksum { expected, actual },
+            )
+        }
+        checked => checked?,
+    }
     let type_start = 4 + prefix.size_len;
     let mut reader = SliceReader::new(&header, type_start, header_total);
     let header_type = reader.read_vint()?;
