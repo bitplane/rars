@@ -1301,7 +1301,7 @@ impl Builder {
     /// The completed archive replaces the destination only after writing and syncing succeed.
     /// Large compressed RAR 2.0-4.x members stream, and RAR 1.3 to 4.x, RAR 5
     /// and RAR 7 stored members are read once, as a file can seek back to fill
-    /// in their headers.
+    /// in their headers. A RAR 5 or RAR 7 recovery record reads the file back.
     ///
     /// Any spooling the writer needs goes beside the output rather than in the
     /// system temporary directory, which is often a memory-backed filesystem
@@ -1774,7 +1774,7 @@ impl Builder {
         }
         let converted = self.rar50_entries_with_resources(resources)?;
         match output {
-            SingleOutput::File(output) => rar50::write_seekable_archive_with_progress(
+            SingleOutput::File(output) => rar50::write_readable_archive_with_progress(
                 &converted.entries,
                 self.rar50_options(),
                 extras,

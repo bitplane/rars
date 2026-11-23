@@ -217,6 +217,47 @@ pub(crate) trait SeekWrite: Write + Seek {}
 
 impl<T: Write + Seek + ?Sized> SeekWrite for T {}
 
+pub(crate) trait ReadSeekWrite: Read + SeekWrite {}
+
+impl<T: Read + Write + Seek + ?Sized> ReadSeekWrite for T {}
+
+/// A file can be read back, so a writer need not keep its own copy of what it wrote.
+pub(crate) enum SeekableOutput<'a> {
+    WriteOnly(&'a mut dyn SeekWrite),
+    Readable(&'a mut dyn ReadSeekWrite),
+}
+
+impl SeekableOutput<'_> {
+    pub(crate) fn readable(&mut self) -> Option<&mut dyn ReadSeekWrite> {
+        match self {
+            Self::WriteOnly(_) => None,
+            Self::Readable(output) => Some(&mut **output),
+        }
+    }
+
+    fn output(&mut self) -> &mut dyn SeekWrite {
+        match self {
+            Self::WriteOnly(output) => &mut **output,
+            Self::Readable(output) => &mut **output as &mut dyn SeekWrite,
+        }
+    }
+}
+
+impl Write for SeekableOutput<'_> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.output().write(buffer)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output().flush()
+    }
+}
+
+impl Seek for SeekableOutput<'_> {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.output().seek(from)
+    }
+}
+
 /// Seeking lets a writer patch a header once the bytes behind it are known.
 pub(crate) enum Output<W, S> {
     Stream(W),
@@ -233,12 +274,12 @@ pub(crate) struct ArchiveOutput<W, S> {
 /// Smaller members keep the whole-member engine and filter trials.
 pub(crate) const STREAM_MEMBERS_ABOVE: u64 = 64 * 1024 * 1024;
 
-pub(crate) type CallerOutput<'a> = ArchiveOutput<&'a mut dyn Write, &'a mut dyn SeekWrite>;
+pub(crate) type CallerOutput<'a> = ArchiveOutput<&'a mut dyn Write, SeekableOutput<'a>>;
 
 /// Every write checks cancellation, so a large copy stops promptly.
 pub(crate) type CancellableOutput<'o, 'p> = ArchiveOutput<
     crate::write_progress::CancellableIo<'p, &'o mut dyn Write>,
-    crate::write_progress::CancellableIo<'p, &'o mut dyn SeekWrite>,
+    crate::write_progress::CancellableIo<'p, SeekableOutput<'o>>,
 >;
 
 impl<'a> CallerOutput<'a> {
@@ -251,7 +292,14 @@ impl<'a> CallerOutput<'a> {
 
     pub(crate) fn seekable(output: &'a mut dyn SeekWrite) -> Self {
         Self {
-            to: Output::Seekable(output),
+            to: Output::Seekable(SeekableOutput::WriteOnly(output)),
+            stream_above: None,
+        }
+    }
+
+    pub(crate) fn readable(output: &'a mut dyn ReadSeekWrite) -> Self {
+        Self {
+            to: Output::Seekable(SeekableOutput::Readable(output)),
             stream_above: None,
         }
     }

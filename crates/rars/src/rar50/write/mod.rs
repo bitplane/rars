@@ -436,6 +436,37 @@ pub fn write_seekable_archive_with_progress<W: Write + Seek>(
     )
 }
 
+/// As [`write_seekable_archive_to`], reading `output` back for a recovery record instead of spooling a copy.
+pub fn write_readable_archive_to<W: Read + Write + Seek>(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+    output: &mut W,
+) -> Result<()> {
+    write_readable_archive_with_progress(entries, options, extras, resources, None, output)
+}
+
+/// As [`write_readable_archive_to`], reporting progress as it goes.
+pub fn write_readable_archive_with_progress<W: Read + Write + Seek>(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    output: &mut W,
+) -> Result<()> {
+    write_archive_reporting(
+        entries,
+        options,
+        extras,
+        resources,
+        progress.map(ProgressReporter),
+        crate::write_stream::CallerOutput::readable(output)
+            .streaming_above(crate::write_stream::STREAM_MEMBERS_ABOVE),
+    )
+}
+
 pub(crate) fn write_streaming_archive_reporting(
     entries: &[ArchiveEntry],
     options: WriterOptions,

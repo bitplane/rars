@@ -114,3 +114,18 @@ def test_workspace_budget_reads_back_and_refuses_zero():
     assert (resources.max_workspace_bytes, resources.max_memory_bytes) == (1 << 30, 1 << 31)
     with pytest.raises(ValueError, match="max_workspace_bytes"):
         rars.WriterResources(max_workspace_bytes=0)
+
+
+@pytest.mark.parametrize("encrypt_headers", [False, True])
+def test_a_recovery_archive_written_to_a_path_matches_its_bytes(tmp_path, encrypt_headers):
+    password = "secret" if encrypt_headers else None
+    builder = rars.RarBuilder(version="rar50", level=3, recovery_percent=5,
+                              password=password, encrypt_headers=encrypt_headers)
+    for index in range(4):
+        builder.add_bytes(random.Random(index).randbytes(100000), f"member{index}")
+    [path] = builder.write(tmp_path / "protected.rar")
+    with rars.RarFile(path, password=password) as archive:
+        archive.testrar()
+        assert archive.read("member0") == random.Random(0).randbytes(100000)
+    if not encrypt_headers:
+        assert path.read_bytes() == builder.to_bytes()
