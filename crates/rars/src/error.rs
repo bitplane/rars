@@ -249,7 +249,8 @@ pub enum Error {
     },
     /// A member's stream decodes to more than its declared size. Reported
     /// only under `ArchiveReadOptions::salvage`, after the member's declared
-    /// bytes were delivered; otherwise the member fails as invalid data.
+    /// bytes were delivered; otherwise the member fails as invalid data, or
+    /// in RAR 1.5 and 2.0, which have no end-of-file marker, its checksum.
     MemberRanPastDeclaredSize {
         declared: u64,
     },

@@ -312,13 +312,16 @@ impl<B: Budget> Reader20State<B> {
     /// that pad the last byte are left. Damage that has thrown the decoder
     /// out of step with the stream usually ends some other way, and then the
     /// declared size is the better guess at where the next member starts.
-    pub(crate) fn run_on(&mut self, input: &mut impl Read) {
+    ///
+    /// Returns whether the stream went on cleanly past the declared size.
+    pub(crate) fn run_on(&mut self, input: &mut impl Read) -> bool {
         let allowance = self.output.allowance();
         let bits = std::mem::replace(&mut self.bits, BitReader::with_allowance(&allowance));
         let saved = self.try_clone().ok();
         self.bits = bits;
         let control = self.read_control.clone();
         let src: &mut dyn Read = &mut control.reader(input);
+        let mut decoded = false;
         let clean = loop {
             if self.pending_match.is_none() {
                 if self.bits.top_up(src).is_err() {
@@ -332,6 +335,7 @@ impl<B: Budget> Reader20State<B> {
             if self.decode_until(pos + 1, src).is_err() || self.current_pos() == pos {
                 break false;
             }
+            decoded = true;
             if pos.saturating_sub(MAX_HISTORY) >= self.base_offset + MAX_HISTORY / 4 {
                 self.trim_history(pos, pos);
             }
@@ -344,6 +348,7 @@ impl<B: Budget> Reader20State<B> {
                 self.finish_history();
             }
         }
+        clean && decoded
     }
 
     fn decode_until(&mut self, target: usize, src: &mut dyn Read) -> Result<()> {

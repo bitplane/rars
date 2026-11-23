@@ -394,11 +394,14 @@ impl<B: Budget> Reader15State<B> {
     /// that pad the last byte are left. Damage that has thrown the decoder
     /// out of step with the stream usually ends some other way, and then the
     /// declared size is the better guess at where the next member starts.
-    pub(crate) fn run_on(&mut self, input: &mut impl Read) {
+    ///
+    /// Returns whether the stream went on cleanly past the declared size.
+    pub(crate) fn run_on(&mut self, input: &mut impl Read) -> bool {
         let saved = self.checkpoint();
         let control = self.read_control.clone();
         let src = &mut control.reader(input);
         let mut sink = std::io::sink();
+        let mut decoded = false;
         let clean = loop {
             if self.bits.top_up(src).is_err() || self.bits.read_past_end() {
                 break false;
@@ -409,10 +412,12 @@ impl<B: Budget> Reader15State<B> {
             if self.decode_step(&mut sink).is_err() {
                 break false;
             }
+            decoded = true;
         };
         if let Some(mut saved) = saved.filter(|_| !clean) {
             std::mem::swap(&mut *saved, self);
         }
+        clean && decoded
     }
 
     fn init_member(&mut self, target: usize, solid: bool) {

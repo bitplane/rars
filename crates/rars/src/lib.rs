@@ -505,8 +505,12 @@ impl<'a> ArchiveReadOptions<'a> {
     ///   reported;
     /// - a member that fails partway through gets every byte decoded before
     ///   the failure, then the error;
-    /// - a RAR 5 member whose stream decodes past its declared size gets its
-    ///   declared bytes, and [`Error::MemberRanPastDeclaredSize`].
+    /// - a member whose stream decodes past its declared size gets its
+    ///   declared bytes, and [`Error::MemberRanPastDeclaredSize`]. The rest
+    ///   of the stream is decoded into the window only, so that a solid
+    ///   successor starts where the stream ends. For RAR 5 that run-on stops
+    ///   at [`Self::max_member_output_bytes`] in all, if it is set; bound the
+    ///   time with [`Self::cancellation`] otherwise.
     ///
     /// The error goes where it always does: to the
     /// [`Self::with_member_error_handler`] handler, which can carry on to the
