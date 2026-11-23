@@ -487,8 +487,15 @@ mod tests {
                     "archive path conflicts with extraction storage"
                 ))
             ));
-            // The earlier member was published before the alias was refused.
-            assert_eq!(fs::read_dir(&storage).unwrap().count(), 0);
+            // The earlier member was published before the alias was refused,
+            // leaving nothing staged, only perhaps the empty directory files
+            // stage in.
+            let staged: Vec<_> = fs::read_dir(&storage)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .filter(|path| !path.is_dir() || fs::read_dir(path).unwrap().next().is_some())
+                .collect();
+            assert!(staged.is_empty(), "{staged:?}");
             assert!(root.join("ordinary").exists());
         } else {
             assert!(result.is_ok());
