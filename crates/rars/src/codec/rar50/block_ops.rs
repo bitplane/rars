@@ -6,6 +6,7 @@ use super::{
     Error, PendingFilter, ReaderTables, Result, StreamDecodeError, StreamingOutput, LITERAL_BURST,
 };
 use crate::read_control::Poller;
+use std::hint::select_unpredictable;
 
 // A list holds at most 4 MiB of each; a longer block takes several lists.
 // Tests and fuzzing use tiny lists so small inputs still split blocks.
@@ -23,7 +24,11 @@ const LITERAL_POLL: usize = 64 * 1024;
 const TAG_SHIFT: u32 = 61;
 const LENGTH_SHIFT: u32 = 48;
 const LENGTH_MASK: u64 = (1 << (TAG_SHIFT - LENGTH_SHIFT)) - 1;
-const VALUE_MASK: u64 = (1 << LENGTH_SHIFT) - 1;
+const PREFIX_SHIFT: u32 = 38;
+const PREFIX_MASK: u64 = (1 << (LENGTH_SHIFT - PREFIX_SHIFT)) - 1;
+const VALUE_MASK: u64 = (1 << PREFIX_SHIFT) - 1;
+// The longest literal run an operation carries ahead of itself.
+const MAX_PREFIX: usize = PREFIX_MASK as usize;
 
 const LITERALS: u64 = 0;
 const MATCH: u64 = 1;
@@ -33,16 +38,28 @@ const FILTER: u64 = 4;
 const REPEAT_CHECK: u64 = 5;
 const BLOCK: u64 = 6;
 
-/// Tag, a 13-bit length and a 48-bit distance, repeat index or literal count.
+/// Tag, a 13-bit length, the 10-bit count of literals decoded just before
+/// it, and a 38-bit distance, repeat index or literal count. Carrying the
+/// literals saves the replay a dispatch on most matches.
 #[derive(Clone, Copy)]
 struct Op(u64);
 
 impl Op {
     fn new(tag: u64, length: usize, value: usize) -> Self {
+        Self::after(0, tag, length, value)
+    }
+
+    fn after(prefix: usize, tag: u64, length: usize, value: usize) -> Self {
         debug_assert!(length as u64 <= LENGTH_MASK);
+        debug_assert!(prefix <= MAX_PREFIX);
         // A distance no window can hold only has to stay out of range.
         let value = (value as u64).min(VALUE_MASK);
-        Self((tag << TAG_SHIFT) | ((length as u64) << LENGTH_SHIFT) | value)
+        Self(
+            (tag << TAG_SHIFT)
+                | ((length as u64) << LENGTH_SHIFT)
+                | ((prefix as u64) << PREFIX_SHIFT)
+                | value,
+        )
     }
 
     fn tag(self) -> u64 {
@@ -51,6 +68,10 @@ impl Op {
 
     fn length(self) -> usize {
         ((self.0 >> LENGTH_SHIFT) & LENGTH_MASK) as usize
+    }
+
+    fn prefix(self) -> usize {
+        ((self.0 >> PREFIX_SHIFT) & PREFIX_MASK) as usize
     }
 
     fn value(self) -> usize {
@@ -109,11 +130,30 @@ impl BlockOps {
         bit_pos: usize,
         payload_bits: usize,
     ) -> Stop {
-        match self.decode_symbols(tables, payload, bit_pos, payload_bits) {
+        let mut run_start = self.literals.len();
+        let decoded = self.decode_symbols(tables, payload, bit_pos, payload_bits, &mut run_start);
+        // Literals no operation carried replay on their own, before any failure.
+        let run = self.literals.len() - run_start;
+        if run != 0 {
+            self.ops.push(Op::new(LITERALS, 0, run));
+        }
+        match decoded {
             Ok(None) => Stop::BlockEnd,
             Ok(Some(bit_pos)) => Stop::Full(bit_pos),
             Err(error) => Stop::Failed(error),
         }
+    }
+
+    /// Appends an operation, carrying the literals decoded since the last one.
+    #[inline(always)]
+    fn push(&mut self, run_start: &mut usize, tag: u64, length: usize, value: usize) {
+        let mut prefix = self.literals.len() - *run_start;
+        if prefix > MAX_PREFIX {
+            self.ops.push(Op::new(LITERALS, 0, prefix));
+            prefix = 0;
+        }
+        self.ops.push(Op::after(prefix, tag, length, value));
+        *run_start = self.literals.len();
     }
 
     fn decode_symbols<B: Budget>(
@@ -122,6 +162,7 @@ impl BlockOps {
         payload: &[u8],
         bit_pos: usize,
         payload_bits: usize,
+        run_start: &mut usize,
     ) -> Result<Option<usize>> {
         let mut bits = BitReader::at(payload, bit_pos);
         while bits.position() < payload_bits {
@@ -131,7 +172,6 @@ impl BlockOps {
             let symbol = tables.main.decode(&mut bits)?;
             match symbol {
                 0..=255 => {
-                    let start = self.literals.len();
                     self.literals.push(symbol as u8);
                     loop {
                         let len = self.literals.len();
@@ -146,28 +186,26 @@ impl BlockOps {
                             break;
                         }
                     }
-                    self.ops
-                        .push(Op::new(LITERALS, 0, self.literals.len() - start));
                 }
                 256 => {
                     self.filters.push(read_filter(&mut bits, 0)?);
-                    self.ops.push(Op::new(FILTER, 0, 0));
+                    self.push(run_start, FILTER, 0, 0);
                 }
-                257 => self.ops.push(Op::new(REPEAT_LAST, 0, 0)),
+                257 => self.push(run_start, REPEAT_LAST, 0, 0),
                 258..=261 => {
                     let index = symbol - 258;
                     match repeat_length(tables, &mut bits) {
-                        Ok(length) => self.ops.push(Op::new(REPEAT, length, index)),
+                        Ok(length) => self.push(run_start, REPEAT, length, index),
                         Err(error) => {
                             // An unset repeat distance is reported before the length is read.
-                            self.ops.push(Op::new(REPEAT_CHECK, 0, index));
+                            self.push(run_start, REPEAT_CHECK, 0, index);
                             return Err(error);
                         }
                     }
                 }
                 _ => {
                     let (length, distance) = new_match(tables, &mut bits, symbol)?;
-                    self.ops.push(Op::new(MATCH, length, distance));
+                    self.push(run_start, MATCH, length, distance);
                 }
             }
         }
@@ -185,71 +223,105 @@ impl BlockOps {
         reached: &mut Reached,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         let output_size = output.output_limit;
-        let Repeats {
-            distances: reps,
-            last_length,
-        } = repeats;
+        // Held in locals for the walk and stored back however it ends.
+        let mut reps = *repeats.distances;
+        let mut last_length = *repeats.last_length;
         let mut literals = self.literals.as_slice();
         let mut block_filters = self.filters.iter();
-        for &op in &self.ops {
-            if output.written() >= output_size {
-                break;
-            }
-            poller.check_codec(output.written())?;
-            match op.tag() {
-                LITERALS => {
-                    let (run, rest) = literals.split_at(op.value());
+        // Bytes the unchecked copies may write before the output needs a look.
+        let mut budget = output.fast_budget();
+        let mut walk = || {
+            for &op in &self.ops {
+                if output.written() >= output_size {
+                    break;
+                }
+                poller.check_codec(output.written())?;
+                // The literals before this symbol, then the symbol itself.
+                let prefix = op.prefix();
+                if prefix < budget {
+                    output.push_literals_within_budget(literals, prefix);
+                    literals = &literals[prefix..];
+                    reached.symbols += prefix;
+                    budget -= prefix;
+                } else {
+                    let (run, rest) = literals.split_at(prefix);
                     literals = rest;
                     let visible = run.len().min(output_size - output.written());
                     reached.symbols += visible;
-                    for piece in run[..visible].chunks(LITERAL_POLL) {
-                        poller.check_codec(output.written())?;
-                        output.push_literals(piece, sink)?;
+                    output.push_literals(&run[..visible], sink)?;
+                    budget = output.fast_budget();
+                    if output.written() >= output_size {
+                        break;
                     }
+                    poller.check_codec(output.written())?;
                 }
-                MATCH => {
+                let tag = op.tag();
+                if (MATCH..=REPEAT_LAST).contains(&tag) {
                     reached.symbols += 1;
-                    let (distance, length) = (op.value(), op.length());
-                    reps.rotate_right(1);
-                    reps[0] = distance;
-                    **last_length = length;
-                    output.copy_match(distance, length, sink)?;
-                }
-                REPEAT => {
-                    reached.symbols += 1;
-                    let (index, length) = (op.value(), op.length());
-                    let distance = initialized(reps[index])?;
-                    reps[..=index].rotate_right(1);
-                    reps[0] = distance;
-                    **last_length = length;
-                    output.copy_match(distance, length, sink)?;
-                }
-                REPEAT_LAST => {
-                    reached.symbols += 1;
-                    if **last_length != 0 {
-                        output.copy_match(reps[0], **last_length, sink)?;
+                    // A new distance pushes all four along; a repeat moves its own to the front.
+                    // Selects rather than branches, since the kinds of symbol interleave at random.
+                    let fresh = tag == MATCH;
+                    let index = select_unpredictable(fresh, 3, op.value());
+                    let distance = select_unpredictable(fresh, op.value(), pick(reps, index));
+                    if tag == REPEAT {
+                        initialized(distance)?;
                     }
+                    let length = select_unpredictable(tag == REPEAT_LAST, last_length, op.length());
+                    let [r0, r1, r2, r3] = reps;
+                    reps = [
+                        distance,
+                        select_unpredictable(index >= 1, r0, r1),
+                        select_unpredictable(index >= 2, r1, r2),
+                        select_unpredictable(index >= 3, r2, r3),
+                    ];
+                    last_length = length;
+                    if length <= budget && output.copy_within_budget(distance, length) {
+                        budget -= length;
+                        continue;
+                    }
+                    if length != 0 {
+                        output.copy_match(distance, length, sink)?;
+                    }
+                    budget = output.fast_budget();
+                    continue;
                 }
-                FILTER => {
-                    reached.symbols += 1;
-                    let mut filter = *block_filters.next().expect("one filter per filter op");
-                    filter.start = output
-                        .written()
-                        .checked_add(filter.start)
-                        .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?;
-                    output.accept_filter(filter, filters)?;
+                match tag {
+                    LITERALS => {
+                        let (run, rest) = literals.split_at(op.value());
+                        literals = rest;
+                        let visible = run.len().min(output_size - output.written());
+                        reached.symbols += visible;
+                        for piece in run[..visible].chunks(LITERAL_POLL) {
+                            poller.check_codec(output.written())?;
+                            output.push_literals(piece, sink)?;
+                        }
+                    }
+                    FILTER => {
+                        reached.symbols += 1;
+                        let mut filter = *block_filters.next().expect("one filter per filter op");
+                        filter.start = output
+                            .written()
+                            .checked_add(filter.start)
+                            .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?;
+                        output.accept_filter(filter, filters)?;
+                    }
+                    REPEAT_CHECK => {
+                        initialized(pick(reps, op.value()))?;
+                    }
+                    BLOCK => {
+                        reached.blocks += 1;
+                        reached.symbols = 0;
+                    }
+                    tag => unreachable!("operation tag {tag}"),
                 }
-                REPEAT_CHECK => {
-                    initialized(reps[op.value()])?;
-                }
-                BLOCK => {
-                    reached.blocks += 1;
-                    reached.symbols = 0;
-                }
-                tag => unreachable!("operation tag {tag}"),
+                budget = output.fast_budget();
             }
-        }
-        Ok(())
+            Ok(())
+        };
+        let walked = walk();
+        *repeats.distances = reps;
+        *repeats.last_length = last_length;
+        walked
     }
 }
 
@@ -301,6 +373,17 @@ fn repeat_length<B: Budget>(tables: &ReaderTables<B>, bits: &mut BitReader<'_>) 
     let length_slot = tables.length.decode(bits)?;
     let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
     Ok(length_from_slot_parts(length_slot, length_extra))
+}
+
+/// `reps[index]` for an index below four, without indexing memory.
+#[inline(always)]
+fn pick(reps: [usize; 4], index: usize) -> usize {
+    let [r0, r1, r2, r3] = reps;
+    select_unpredictable(
+        index < 2,
+        select_unpredictable(index == 0, r0, r1),
+        select_unpredictable(index == 2, r2, r3),
+    )
 }
 
 fn initialized(distance: usize) -> Result<usize> {
