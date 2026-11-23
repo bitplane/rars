@@ -3417,35 +3417,43 @@ fn rar29_encode_options_for_options(options: WriterOptions) -> Result<Rar29Encod
         .with_max_match_distance(dictionary_size_for_options(options)?))
 }
 
-/// RAR 2.0 levels, as candidates searched per position.
+/// RAR 2.0 levels: which parse, how many candidates it searches per position,
+/// how far a greedy parse looks ahead, and how many extra priced passes.
 ///
-/// Each level searches more than the one below. Measured on 4 MiB of man
-/// pages, packed bytes and seconds:
+/// Chosen from a sweep of all four over the bench corpus, ten small classes
+/// and six 4 MiB ones, one thread, interleaved min of five or more. Points on
+/// the frontier and the old levels, packed bytes over the corpus and seconds:
 ///
 /// ```text
-/// candidates       16       64      256      512     1024
-/// lazy off    937,906  878,958  848,790  840,496  835,622
-/// lazy on     886,854  837,531  813,252  806,728  803,006
-/// seconds        2.37     4.41     8.67    12.78    17.43
+/// parse     candidates  ahead  passes      bytes  seconds
+/// greedy            32      1       0  9,505,430     2.27  level 1, no audio trial
+/// greedy           128      1       0  9,421,925     5.49  level 2
+/// greedy           256      2       0  9,392,020     9.60  old level 3
+/// shortest           4      2       0  9,339,420     6.78
+/// shortest          16      2       0  9,163,014     8.16  level 3
+/// shortest         512      2       0  9,147,449     8.59  old level 4
+/// shortest          64      2       1  9,146,838    10.36  level 4
+/// shortest         256      2       2  9,146,446    12.03  level 5
 /// ```
 ///
-/// It is worth 4% on text and 3% on a stripped binary, at every count, for
-/// about half again the time. Candidates cost more and give less: the last
-/// doubling buys 0.5%. So lazy matching is on wherever anything is compressed,
-/// and the level chooses how far to search.
+/// The shortest-path parse searches a tree, not a chain, so a few candidates
+/// find most of what it can use: 16 is within 0.2% of 512, and a greedy parse
+/// gets nowhere near it at any depth. Past that, more candidates and passes buy
+/// under 0.01%, which is all levels 4 and 5 can still offer; they are spaced
+/// by time, as evenly as the levels below. A greedy parse is the faster choice
+/// below about six seconds, and there looking one byte ahead with twice the
+/// candidates beats looking two ahead in the same time. The shortest path
+/// keeps two: its greedy first pass only seeds the prices, and two seeds better
+/// on nine classes of the fifteen.
 fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOptions> {
     let level = level.unwrap_or(RAR20_DEFAULT_LEVEL);
-    let candidates = match level {
+    let (candidates, lookahead, shortest_path, extra_passes) = match level {
         0 => return Ok(Rar20EncodeOptions::new(0)),
-        1 => 16,
-        2 => 64,
-        3 => 256,
-        // Level 5 searches no further than 4. Under the shortest-path parse
-        // 1,024 candidates packed larger than 512 on every 4 MiB class of the
-        // bench and on its small binaries, so level 5 came out larger than
-        // level 4. It spends its time on more priced passes instead, which
-        // start from level 4's result and are kept only when smaller.
-        4 | 5 => 512,
+        1 => (32, 1, false, 0),
+        2 => (128, 1, false, 0),
+        3 => (16, 2, true, 0),
+        4 => (64, 2, true, 1),
+        5 => (256, 2, true, 2),
         _ => {
             return Err(Error::InvalidArgument(
                 "RAR compression level must be in the range 0..5",
@@ -3454,27 +3462,9 @@ fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOption
     };
     Ok(Rar20EncodeOptions::new(candidates)
         .with_lazy_matching(true)
-        // Look two positions ahead before committing to a match, not one. The
-        // class this moves is downloads: docx, jpeg, png, gif, a ZX Spectrum
-        // snapshot. High-entropy bytes with occasional short matches, where a
-        // three byte match often costs more than the literal it replaces and
-        // the better match starts two bytes later. Depth 1 cannot see that far.
-        // Measured on the small corpus, packed bytes:
-        //
-        // ```text
-        // depth        1        2        3        4
-        // total  657,072  654,162  656,242  659,161
-        // ```
-        //
-        // Worth 0.44% at every level for about a third more encode time. Depth
-        // 3 and 4 give it back: on text, deferring that long skips matches
-        // worth taking.
-        .with_lazy_lookahead(2)
-        // The shortest-path parse is worth another 1.5% and costs four times
-        // the encode time, so it goes where the ladder already means "spend
-        // whatever it takes". rar29 gates its lazy matching at the same rung.
-        .with_optimal_parse(level >= 4)
-        .with_extra_priced_passes(if level == 5 { 2 } else { 0 })
+        .with_lazy_lookahead(lookahead)
+        .with_optimal_parse(shortest_path)
+        .with_extra_priced_passes(extra_passes)
         // The audio trial is a second encode of the member, which is the one
         // thing level 1 is trying not to pay for.
         .with_try_audio(level > 1))
@@ -7516,6 +7506,12 @@ mod tests {
                         format!("{target:?}, password {}, solid {solid}", password.is_some());
                     let mut options = super::WriterOptions::new(target, FeatureSet::default());
                     options.features.solid = solid;
+                    // The packed form's charge does not depend on the parse, so
+                    // RAR 2.0 codes greedily, not by the default's slower
+                    // shortest path.
+                    if target == ArchiveVersion::Rar20 {
+                        options.compression_level = Some(2);
+                    }
                     let entries: Vec<_> = datas
                         .iter()
                         .enumerate()
@@ -7869,8 +7865,8 @@ mod tests {
         // each block it codes at once: one per thread, up to sixteen, and no
         // more than the member's eight. Pin one thread for the per-byte bound.
         let blocks = crate::parallel::threads().clamp(1, 16).min(8) as u64;
-        for level in [3, 4, 5] {
-            let block = crate::codec::rar20::coding_workspace(level > 3, 1);
+        for level in [2, 3, 4, 5] {
+            let block = crate::codec::rar20::coding_workspace(level >= 3, 1);
             let one = {
                 let _cap = crate::parallel::ThreadCap::set(Some(1));
                 charge(ArchiveVersion::Rar20, level)
@@ -8639,40 +8635,41 @@ mod tests {
         );
     }
     #[test]
-    fn only_the_top_two_levels_pay_for_the_rar20_optimal_parse() {
-        for level in 0..=3u8 {
+    fn rar20_levels_from_the_default_up_parse_by_shortest_path() {
+        for level in 0..=2u8 {
             let options = rar20_encode_options_for_level(Some(level)).unwrap();
             assert!(!options.optimal_parse, "level {level} priced every path");
         }
-        for level in 4..=5u8 {
+        for level in 3..=5u8 {
             let options = rar20_encode_options_for_level(Some(level)).unwrap();
             assert!(options.optimal_parse, "level {level} settled for greedy");
         }
-        assert!(
-            !rar20_encode_options_for_level(None).unwrap().optimal_parse,
-            "an absent level is the default level, which is not the top of the ladder",
-        );
-    }
-
-    #[test]
-    fn rar20_level_5_is_level_4_with_more_priced_passes() {
-        let four = rar20_encode_options_for_level(Some(4)).unwrap();
-        let five = rar20_encode_options_for_level(Some(5)).unwrap();
-        // Each extra pass is kept only if it packs smaller, so level 5 can
-        // never come out larger than level 4.
-        assert!(five.extra_priced_passes > four.extra_priced_passes);
         assert_eq!(
-            five.with_extra_priced_passes(four.extra_priced_passes),
-            four
+            rar20_encode_options_for_level(None).unwrap(),
+            rar20_encode_options_for_level(Some(3)).unwrap(),
+            "an absent level is the default level",
         );
     }
 
     #[test]
-    fn every_rar20_level_looks_two_positions_ahead() {
+    fn rar20_levels_spend_more_within_each_parse() {
+        let level = |level| rar20_encode_options_for_level(Some(level)).unwrap();
+        // Greedy: deeper search, then shortest path: deeper search and more
+        // priced passes, each at least what the level below spends.
+        assert!(level(2).max_match_candidates > level(1).max_match_candidates);
+        for (below, above) in [(3, 4), (4, 5)] {
+            assert!(level(above).max_match_candidates > level(below).max_match_candidates);
+            assert!(level(above).extra_priced_passes > level(below).extra_priced_passes);
+        }
+    }
+
+    #[test]
+    fn rar20_greedy_levels_look_one_position_ahead_and_seeds_two() {
         for level in 1..=5u8 {
             let options = rar20_encode_options_for_level(Some(level)).unwrap();
             assert!(options.lazy_matching, "level {level} stopped being lazy");
-            assert_eq!(options.lazy_lookahead, 2, "level {level}");
+            let ahead = if options.optimal_parse { 2 } else { 1 };
+            assert_eq!(options.lazy_lookahead, ahead, "level {level}");
         }
     }
 
