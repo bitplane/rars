@@ -1936,6 +1936,7 @@ impl Archive {
                 allowance.batches(
                     members,
                     member_batches::LEGACY_BATCH_BYTES,
+                    !verification,
                     ctx,
                     |file| parallel_hint(file, verification),
                     || options.check_cancelled(),

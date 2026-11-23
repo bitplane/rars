@@ -318,3 +318,150 @@ fn cancellation_stops_link_and_later_callbacks() {
     );
     assert_eq!(result.unwrap_err().kind(), rars::ErrorKind::Cancelled);
 }
+
+/// What one extraction reported: callbacks in order, the output of each member
+/// that did not fail, and the error that ended it.
+type Run = (Vec<String>, Vec<(Vec<u8>, Vec<u8>)>, Result<(), String>);
+
+fn run_with_links(archive: &Archive, options: ArchiveReadOptions<'_>, handler: bool) -> Run {
+    let events = std::sync::Mutex::new(Vec::new());
+    let failed = std::sync::Mutex::new(Vec::new());
+    let outputs = RefCell::new(Vec::new());
+    let on_error = |member: &rars::ArchiveMember, error: &rars::Error| {
+        let name = String::from_utf8_lossy(&member.meta.name);
+        let event = format!("fail {name} {:?}", error.kind());
+        events.lock().unwrap().push(event);
+        failed.lock().unwrap().push(member.meta.name.clone());
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let options = options.with_rar50_buffered_decode_limit(4096);
+    let options = if handler {
+        options.with_member_error_handler(&on_error)
+    } else {
+        options
+    };
+    let result = archive.extract_with_links(
+        options,
+        |meta| {
+            let name = String::from_utf8_lossy(&meta.name).into_owned();
+            events.lock().unwrap().push(format!("open {name}"));
+            let data = Rc::new(RefCell::new(Vec::new()));
+            outputs.borrow_mut().push((meta.name.clone(), data.clone()));
+            Ok(Box::new(Capture(data)))
+        },
+        |meta, link| {
+            let name = String::from_utf8_lossy(&meta.name);
+            let target = String::from_utf8_lossy(link.target());
+            events.lock().unwrap().push(format!("link {name} {target}"));
+            Ok(())
+        },
+    );
+    let mut failed = failed.into_inner().unwrap();
+    let result = result.map_err(|error| {
+        if let Some((name, _)) = error.entry_context() {
+            failed.push(name.to_vec());
+        }
+        format!("{:?} {error}", error.kind())
+    });
+    // Sequential extraction opens a buffered member before it fails, and the
+    // batches never do. Either way its output is unverified, so drop both.
+    let opened_failed = |name: &[u8]| format!("open {}", String::from_utf8_lossy(name));
+    let mut events = events.into_inner().unwrap();
+    events.retain(|event| !failed.iter().any(|name| *event == opened_failed(name)));
+    let outputs = outputs
+        .into_inner()
+        .into_iter()
+        .filter(|(name, _)| !failed.contains(name))
+        .map(|(name, data)| (name, data.take()))
+        .collect();
+    (events, outputs, result)
+}
+
+/// RAR 5 extraction with links decodes members in parallel, so its callbacks,
+/// output and failures must match sequential extraction at any thread count,
+/// with members both buffered and streamed, and failures in both.
+#[test]
+fn rar50_links_match_sequential_extraction_at_any_thread_count() {
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let mut sources = Vec::new();
+    for index in 0..24u32 {
+        let name = format!("file{index:02}").into_bytes();
+        // Every fifth member is over the buffered limit used, so it streams.
+        let len = if index % 5 == 0 {
+            40_000
+        } else {
+            300 + 37 * index
+        };
+        let data: Vec<u8> = (0..len)
+            .map(|n| (n * 7 / (index + 3) + index) as u8)
+            .collect();
+        builder
+            .add_bytes(name.clone(), data.clone(), None, None)
+            .unwrap();
+        if index % 4 == 1 {
+            let link = format!("link{index:02}").into_bytes();
+            builder
+                .add_unix_symlink(link, name.clone(), false, None, None)
+                .unwrap();
+        }
+        sources.push((name, data));
+    }
+    let clean = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let mut damaged = clean.clone();
+    if let Archive::Rar50Plus(archive) = &mut damaged {
+        for block in &mut archive.blocks {
+            if let rars::rar50::Block::File(file) = block {
+                // One buffered and one streamed member fail their checksums.
+                if file.name == b"file03" || file.name == b"file10" {
+                    file.hash = None;
+                    file.data_crc32 = Some(file.data_crc32.unwrap() ^ 1);
+                }
+            }
+        }
+    }
+
+    for (archive, handler) in [(&clean, false), (&damaged, true), (&damaged, false)] {
+        let sequential = run_with_links(
+            archive,
+            // A total output limit keeps extraction sequential.
+            ArchiveReadOptions::new().with_max_total_output_bytes(u64::MAX),
+            handler,
+        );
+        let fails: Vec<&String> = sequential
+            .0
+            .iter()
+            .filter(|event| event.starts_with("fail"))
+            .collect();
+        if std::ptr::eq(archive, &clean) {
+            assert_eq!(sequential.2, Ok(()));
+            assert_eq!(sequential.1, sources);
+            assert!(fails.is_empty());
+        } else if handler {
+            assert_eq!(sequential.2, Ok(()));
+            assert_eq!(
+                fails,
+                [
+                    "fail file03 ChecksumMismatch",
+                    "fail file10 ChecksumMismatch"
+                ]
+            );
+        } else {
+            assert!(sequential.2.as_ref().unwrap_err().contains("file03"));
+        }
+        for threads in [1, 2, 8] {
+            for limited in [false, true] {
+                let options = ArchiveReadOptions::new().with_threads(threads);
+                let options = if limited {
+                    options.with_max_reader_workspace_bytes(64 * 1024 * 1024)
+                } else {
+                    options
+                };
+                assert_eq!(
+                    run_with_links(archive, options, handler),
+                    sequential,
+                    "threads={threads} limited={limited} handler={handler}"
+                );
+            }
+        }
+    }
+}

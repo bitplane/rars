@@ -58,9 +58,9 @@ impl Archive {
     /// Link targets are not path-checked:
     /// the caller chooses its filesystem confinement and overwrite policies.
     ///
-    /// Independent legacy members may be decoded in parallel; callbacks arrive
-    /// in archive order. Solid archives and total-output-limited operations use
-    /// sequential decoding. RAR5 uses its streaming extraction path. Earlier
+    /// Independent members may be decoded in parallel; callbacks arrive in
+    /// archive order. Solid archives and total-output-limited operations use
+    /// sequential decoding, as does RAR5 with a scratch policy. Earlier
     /// callback side effects are retained on failure; ordinary file writers have
     /// the staging requirements of [`Archive::extract_to`]. Metadata retains raw
     /// archive names, including in errors. Existing byte-oriented APIs continue
@@ -94,7 +94,7 @@ impl Archive {
                     )
                 }),
             ),
-            Self::Rar50Plus(archive) => archive.extract_to_with_redirections(
+            Self::Rar50Plus(archive) => archive.extract_parallel_with_redirections(
                 options,
                 |meta| open(&crate::rar50_meta(meta)),
                 |meta, redirection| {
