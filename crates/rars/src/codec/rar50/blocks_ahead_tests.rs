@@ -48,6 +48,17 @@ fn decode_with(
     stream: &[u8],
     output_size: usize,
     solid: bool,
+    accept: impl FnMut(usize) -> std::result::Result<(), &'static str>,
+) -> Run {
+    decode_in(state, stream, output_size, DICTIONARY, solid, accept)
+}
+
+fn decode_in(
+    state: &mut ReaderState<Allowance>,
+    stream: &[u8],
+    output_size: usize,
+    dictionary: usize,
+    solid: bool,
     mut accept: impl FnMut(usize) -> std::result::Result<(), &'static str>,
 ) -> Run {
     let mut chunks = Vec::new();
@@ -55,7 +66,7 @@ fn decode_with(
         &mut &*stream,
         0,
         output_size,
-        DICTIONARY,
+        dictionary,
         solid,
         |chunk| {
             accept(chunks.len())?;
@@ -153,6 +164,63 @@ fn workers_decode_a_multi_block_member_as_the_serial_decoder_does() {
     let serial = assert_workers_match_serial(&stream, data.len());
     assert_eq!(serial.error, None);
     assert_eq!(serial.bytes(), data);
+}
+
+#[test]
+fn workers_replay_long_runs_through_a_wrapping_window_as_the_serial_decoder_does() {
+    // Literal runs longer than an operation carries, matches that overlap
+    // themselves at short and long periods, and a dictionary small enough
+    // that the window wraps many times, with some sources out of reach.
+    let mut data = Vec::new();
+    let mut state = 7u32;
+    for round in 0..40 {
+        data.extend_from_slice(&prose(3000, round));
+        for _ in 0..1500 + round as usize * 37 {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            data.push((state >> 24) as u8);
+        }
+        let period = [1, 3, 31, 32, 33, 100][round as usize % 6];
+        let start = data.len() - period;
+        for index in 0..700 {
+            data.push(data[start + index % period]);
+        }
+    }
+    let stream = lz_stream(&data, &[], 40_000);
+    let dictionary = 16 << 10;
+    for output_size in [data.len(), data.len() - 1, data.len() / 2 + 13, 70_001] {
+        let serial = decode_in(
+            &mut decoder(None),
+            &stream,
+            output_size,
+            dictionary,
+            false,
+            |_| Ok(()),
+        );
+        for workers in [1, 4] {
+            let ahead = decode_in(
+                &mut decoder(Some(workers)),
+                &stream,
+                output_size,
+                dictionary,
+                false,
+                |_| Ok(()),
+            );
+            assert_eq!(
+                ahead, serial,
+                "workers={workers}, output_size={output_size}"
+            );
+        }
+    }
+    let full = decode_in(
+        &mut decoder(Some(4)),
+        &stream,
+        data.len(),
+        1 << 20,
+        false,
+        |_| Ok(()),
+    );
+    assert_eq!(full.error, None);
+    assert_eq!(full.bytes(), data);
 }
 
 #[test]
