@@ -27,6 +27,8 @@ __all__ = [
     "TruncatedBlock",
     "IncompleteMember",
     "MissingPart",
+    "HeaderDamage",
+    "HeaderDamageKind",
     "check_password",
     "is_rarfile",
     "is_rarfile_sfx",
@@ -38,6 +40,8 @@ __all__ = [
     "MissingVolume",
     "VolumeOrderError",
     "ChecksumError",
+    "MemberCutShort",
+    "MemberRanPastDeclaredSize",
     "UnsupportedRarFeature",
     "NotRarFile",
     "UnsafeArchivePath",
@@ -114,6 +118,15 @@ class MissingPart(str, Enum):
     END = "end"
     BOTH = "both"
 
+class HeaderDamageKind(str, Enum):
+    def __new__(cls, value: str) -> Self: ...
+    CHECKSUM = "checksum"
+    """The header fails its checksum and was read as stored, so any field may be wrong."""
+    DROPPED_RECORD = "dropped_record"
+    """A malformed optional record was dropped and the rest of the header kept."""
+    UNREADABLE = "unreadable"
+    """The header doesn't parse; its member, or every member after it, is lost."""
+
 
 class Error(Exception):
     member: str | None
@@ -136,6 +149,19 @@ class VolumeOrderError(Error):
 class ChecksumError(BadRarFile):
     member: str | None
     volume_index: int | None
+
+class MemberCutShort(BadRarFile):
+    """The file ends `present` bytes into the member's `packed` bytes of data.
+    Only `salvage=True` reports it, after what decoded from those bytes was delivered."""
+    member: str | None
+    packed: int | None
+    present: int | None
+
+class MemberRanPastDeclaredSize(BadRarFile):
+    """The member's data decodes past its `declared` size. Only `salvage=True`
+    reports it, after the declared bytes were delivered."""
+    member: str | None
+    declared: int | None
 
 class UnsupportedRarFeature(Error): ...
 class NotRarFile(Error): ...
@@ -287,9 +313,12 @@ class RarFile:
         volumes: list[_Source] | tuple[_Source, ...] | None = None,
         salvage: bool = False,
     ) -> Self:
-        """`salvage=True` reads what survives: a file cut short inside a member up to that
-        member (see `truncation`), and a volume set that begins late or ends early, leaving
-        out the split members it holds only part of (see `incomplete_members`)."""
+        """`salvage=True` reads what survives. Opening reads past damaged headers (see
+        `header_damage`), lists a member the file is cut short inside (see `truncation`),
+        and reads a volume set that begins late or ends early, leaving out the split
+        members it holds only part of (see `incomplete_members`). Every later call
+        delivers a damaged member's bytes, then reports its error to `on_member_error`
+        or raises it."""
     def namelist(self) -> list[str]: ...
     def infolist(self) -> list[RarInfo]: ...
     def getinfo(self, member: _Member) -> RarInfo: ...
@@ -302,7 +331,11 @@ class RarFile:
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
-    ) -> bytes: ...
+        on_member_error: _MemberErrorHandler | None = None,
+    ) -> bytes:
+        """`on_member_error` reports a member that fails instead of raising, as in
+        `testrar`, and the member reads as what was delivered for it: everything decoded
+        before the failure with `salvage=True`, else `b""`. Not for a member in a later volume."""
     def open(
         self,
         member: _Member,
@@ -312,7 +345,9 @@ class RarFile:
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
-    ) -> IO[bytes]: ...
+        on_member_error: _MemberErrorHandler | None = None,
+    ) -> IO[bytes]:
+        """`on_member_error` works as in `read`."""
     def read_many(
         self,
         members: Iterable[_Member],
@@ -322,7 +357,9 @@ class RarFile:
         progress: _Progress | None = None,
         cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
-    ) -> list[bytes]: ...
+        on_member_error: _MemberErrorHandler | None = None,
+    ) -> list[bytes]:
+        """`on_member_error` works as in `read`, for each member that fails."""
     def extract(
         self,
         member: _Member,
@@ -353,8 +390,11 @@ class RarFile:
         in_place: bool = False,
         flatten: bool = False,
         on_member_error: _MemberErrorHandler | None = None,
+        keep_broken: bool = False,
     ) -> list[Path]:
-        """`on_member_error` works as in `testrar`, and no output of a failed member is kept."""
+        """`on_member_error` works as in `testrar`, and no output of a failed member is kept.
+        `keep_broken=True`, with `salvage=True`, keeps it under its own name, holding what
+        was delivered for it, unless it failed on its password."""
     def testrar(
         self,
         *,
@@ -374,6 +414,9 @@ class RarFile:
     @property
     def incomplete_members(self) -> list[IncompleteMember]:
         """The split members `salvage=True` left out of a volume set."""
+    @property
+    def header_damage(self) -> list[HeaderDamage]:
+        """The damaged headers `salvage=True` read past, in file order; empty without it."""
     @property
     def comment(self) -> bytes | None: ...
     def read_comment(
@@ -581,6 +624,18 @@ class IncompleteMember:
         """The first volume holding part of it, counting the one opened as 0."""
     @property
     def missing(self) -> MissingPart: ...
+
+@final
+class HeaderDamage:
+    """A damaged header `salvage=True` read past. `str()` describes it."""
+    @property
+    def offset(self) -> int:
+        """File offset of the header, in its volume."""
+    @property
+    def kind(self) -> HeaderDamageKind: ...
+    @property
+    def volume_index(self) -> int:
+        """The volume it is in, counting the one opened as 0."""
 
 def is_rarfile(source: _Source) -> bool: ...
 def is_rarfile_sfx(source: _Source) -> bool: ...
