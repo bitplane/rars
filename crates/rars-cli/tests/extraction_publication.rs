@@ -343,7 +343,7 @@ fn extract_tree(archive: &Path, destination: &Path, args: &[&str]) -> Extracted 
         for entry in fs::read_dir(&directory).unwrap() {
             let path = entry.unwrap().path();
             let relative = path.strip_prefix(destination).unwrap();
-            let relative = relative.to_string_lossy().into_owned();
+            let relative = relative.to_string_lossy().replace('\\', "/");
             if path.is_dir() {
                 files.push((format!("{relative}/"), Vec::new()));
                 pending.push(path);
