@@ -62,6 +62,7 @@ def test_an_archive_cut_through_a_member_reads_the_members_before_it(tmp_path, f
     assert truncation.block is rars.TruncatedBlock.MEMBER
     assert truncation.name == b"m1.bin"
     assert truncation.started
+    assert not truncation.members_complete
     assert truncation.volume_index == 0
     assert truncation.offset < len(data)
     assert "m1.bin" in str(truncation)
@@ -82,6 +83,7 @@ def test_an_archive_cut_in_its_recovery_record_reads_every_member(tmp_path, form
     assert archive.namelist() == list(MEMBERS)
     assert archive.truncation.block is rars.TruncatedBlock.RECOVERY_RECORD
     assert archive.truncation.name is None
+    assert archive.truncation.members_complete
     assert "recovery record" in str(archive.truncation)
     archive.testrar()
     archive.extractall(tmp_path)

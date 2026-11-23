@@ -115,6 +115,32 @@ pub struct Archive {
     // Shared with later volumes parsed in the same session, so keys outlive one call.
     pub(crate) key_cache: Arc<KeyCache>,
     truncation: Option<Truncation>,
+    skipped: Vec<SkippedBlock>,
+}
+
+/// An optional block the reader passed over because it is malformed: an old
+/// authenticity (0x76), recovery (0x78) or signature (0x79) block that is too
+/// short, or whose data does not fit its header. No member needs one, so the
+/// walk goes on past it by its declared size, as unrar does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SkippedBlock {
+    /// File offset of the block.
+    pub offset: u64,
+    /// The block's type byte.
+    pub head_type: u8,
+    /// What is wrong with it.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for SkippedBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "skipped malformed block {:#04x} at offset {}: {}",
+            self.head_type, self.offset, self.reason
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -905,6 +931,7 @@ impl Archive {
         }
         let blocks_before_first_header = blocks.len();
         let mut truncation = None;
+        let mut skipped = Vec::new();
 
         while pos < archive.len() {
             if main.has_encrypted_headers() && archive.len() - pos < 7 {
@@ -999,8 +1026,10 @@ impl Archive {
                         truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
-                    let protect = parse_protect_header(&header, &block, sig.offset, total)?;
-                    blocks.push(Block::Protect(protect));
+                    let offset = sig.offset + block.offset;
+                    let protect =
+                        protect_block(&header, block, sig.offset, total, offset, &mut skipped);
+                    blocks.push(protect?);
                     pos = next;
                 }
                 ENDARC_HEAD => {
@@ -1020,6 +1049,7 @@ impl Archive {
                         truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
                         break;
                     };
+                    skipped.extend(short_legacy_auth_block(&block, sig.offset + block.offset));
                     blocks.push(Block::Unknown(block));
                     pos = next;
                 }
@@ -1027,6 +1057,9 @@ impl Archive {
         }
 
         options.check_cancelled()?;
+        // The walk records no cut at a block boundary, so it passes no
+        // trailing block on the way to one.
+        let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), false));
         Ok(Self {
             sfx_offset: sig.offset,
             main,
@@ -1034,6 +1067,7 @@ impl Archive {
             source: ArchiveSource::Memory(input),
             key_cache,
             truncation,
+            skipped,
         })
     }
 
@@ -1095,6 +1129,7 @@ impl Archive {
         }
         let blocks_before_first_header = blocks.len();
         let mut truncation = None;
+        let mut skipped = Vec::new();
 
         while ((sfx_offset + pos) as u64) < file_len {
             let remaining = file_len - (sfx_offset + pos) as u64;
@@ -1201,8 +1236,10 @@ impl Archive {
                         truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
-                    let protect = parse_protect_header(&header, &block, sfx_offset, total)?;
-                    blocks.push(Block::Protect(protect));
+                    let offset = sfx_offset + block.offset;
+                    let protect =
+                        protect_block(&header, block, sfx_offset, total, offset, &mut skipped);
+                    blocks.push(protect?);
                     pos = next;
                 }
                 ENDARC_HEAD => {
@@ -1222,6 +1259,7 @@ impl Archive {
                         truncation = Some(Truncation::new(sfx_offset + block.offset, cut, true));
                         break;
                     };
+                    skipped.extend(short_legacy_auth_block(&block, sfx_offset + block.offset));
                     blocks.push(Block::Unknown(block));
                     pos = next;
                 }
@@ -1229,6 +1267,7 @@ impl Archive {
         }
 
         options.check_cancelled()?;
+        let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), false));
         Ok(Self {
             sfx_offset,
             main,
@@ -1236,6 +1275,7 @@ impl Archive {
             source,
             key_cache,
             truncation,
+            skipped,
         })
     }
 
@@ -1519,6 +1559,11 @@ impl Archive {
     /// end block, and later versions can leave it out.
     pub fn truncation(&self) -> Option<&Truncation> {
         self.truncation.as_ref()
+    }
+
+    /// The malformed optional blocks the reader passed over, in file order.
+    pub fn skipped_blocks(&self) -> &[SkippedBlock] {
+        &self.skipped
     }
 
     pub fn files(&self) -> impl Iterator<Item = &FileHeader> {
@@ -3155,8 +3200,6 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
             });
         }
     }
-    validate_legacy_auth_block_size(head_type, head_size)?;
-
     Ok(BlockHeader {
         head_crc,
         head_type,
@@ -3238,18 +3281,44 @@ fn should_validate_header_crc(head_type: u8) -> bool {
     !matches!(head_type, MARK_HEAD | 0x76 | 0x79)
 }
 
-fn validate_legacy_auth_block_size(head_type: u8, head_size: u16) -> Result<()> {
-    let minimum = match head_type {
+/// An old authenticity (0x76) or signature (0x79) block shorter than its fixed
+/// fields, as passed over. The walk keeps it as an unknown block either way.
+fn short_legacy_auth_block(block: &BlockHeader, offset: usize) -> Option<SkippedBlock> {
+    let minimum = match block.head_type {
         0x76 => 21,
         0x79 => 182,
-        _ => return Ok(()),
+        _ => return None,
     };
-    if head_size < minimum {
-        return Err(Error::InvalidHeader(
-            "RAR legacy authenticity block is too short",
-        ));
+    (block.head_size < minimum).then_some(SkippedBlock {
+        offset: offset as u64,
+        head_type: block.head_type,
+        reason: "RAR legacy authenticity block is too short",
+    })
+}
+
+/// A RAR 2.x recovery block at file offset `offset`. One whose header is
+/// malformed is kept as an unknown block and recorded as skipped: no other
+/// block depends on it.
+fn protect_block(
+    header: &[u8],
+    block: BlockHeader,
+    archive_offset: usize,
+    total_size: usize,
+    offset: usize,
+    skipped: &mut Vec<SkippedBlock>,
+) -> Result<Block> {
+    match parse_protect_header(header, &block, archive_offset, total_size) {
+        Ok(protect) => Ok(Block::Protect(protect)),
+        Err(Error::InvalidHeader(reason)) => {
+            skipped.push(SkippedBlock {
+                offset: offset as u64,
+                head_type: block.head_type,
+                reason,
+            });
+            Ok(Block::Unknown(block))
+        }
+        Err(error) => Err(error),
     }
-    Ok(())
 }
 
 fn block_total_size(block: &BlockHeader) -> Result<usize> {
@@ -3876,8 +3945,9 @@ mod tests {
         ));
     }
 
+    /// Issue #489: such a block is passed over, like other malformed ones.
     #[test]
-    fn protection_header_requires_a_declared_data_size() {
+    fn protection_header_without_a_declared_data_size_is_skipped() {
         let mut bytes = RAR15_SIGNATURE.to_vec();
         test_write_main_header(&mut bytes, 0);
         let start = bytes.len();
@@ -3896,12 +3966,14 @@ mod tests {
                 crate::ArchiveReadOptions::new(),
             ),
         ] {
-            assert!(matches!(
-                result,
-                Err(Error::InvalidHeader(
-                    "RAR 2.x recovery header is missing data size"
-                ))
-            ));
+            let archive = result.unwrap();
+            let skipped = archive.skipped_blocks();
+            assert_eq!(skipped.len(), 1);
+            assert_eq!(
+                (skipped[0].offset, skipped[0].reason),
+                (start as u64, "RAR 2.x recovery header is missing data size")
+            );
+            assert!(matches!(archive.blocks[..], [Block::Unknown(_)]));
         }
     }
 
@@ -4465,20 +4537,81 @@ mod tests {
         block
     }
 
+    /// Issue #489: short old authenticity, signature and recovery blocks, and
+    /// a recovery block whose data size doesn't match its header, are passed
+    /// over by their declared size and reported, in both walks.
     #[test]
-    fn rejects_too_short_legacy_auth_blocks_even_without_crc_check() {
-        assert!(matches!(
-            parse_block_header(&legacy_auth_block(0x76, 20), 0),
-            Err(Error::InvalidHeader(
-                "RAR legacy authenticity block is too short"
-            ))
-        ));
-        assert!(matches!(
-            parse_block_header(&legacy_auth_block(0x79, 181), 0),
-            Err(Error::InvalidHeader(
-                "RAR legacy authenticity block is too short"
-            ))
-        ));
+    fn malformed_optional_legacy_blocks_are_skipped_and_reported() {
+        const SHORT_AUTH: &str = "RAR legacy authenticity block is too short";
+        let mut bytes = RAR15_SIGNATURE.to_vec();
+        test_write_main_header(&mut bytes, 0);
+        let mut expected = Vec::new();
+        for (head_type, head_size, short) in [
+            (0x76, 20, true),
+            (0x79, 181, true),
+            (0x76, 21, false),
+            (0x79, 182, false),
+        ] {
+            if short {
+                expected.push((bytes.len() as u64, head_type, SHORT_AUTH));
+            }
+            bytes.extend_from_slice(&legacy_auth_block(head_type, head_size));
+        }
+        // Too short, then one whose data size doesn't add up.
+        for (head_size, add_size, reason) in [
+            (20u16, 8u32, "RAR 2.x recovery header size is invalid"),
+            (
+                26,
+                2 * 2 + 512 - 1,
+                "RAR 2.x recovery data size does not match header",
+            ),
+        ] {
+            let start = bytes.len();
+            let mut header = vec![0; usize::from(head_size)];
+            header[2] = PROTECT_HEAD;
+            header[3..5].copy_from_slice(&LONG_BLOCK.to_le_bytes());
+            header[5..7].copy_from_slice(&head_size.to_le_bytes());
+            header[7..11].copy_from_slice(&add_size.to_le_bytes());
+            if head_size == 26 {
+                header[12..14].copy_from_slice(&1u16.to_le_bytes());
+                header[14..18].copy_from_slice(&2u32.to_le_bytes());
+                header[18..26].copy_from_slice(b"Protect!");
+            }
+            test_write_header_crc(&mut header, 0);
+            bytes.extend_from_slice(&header);
+            bytes.resize(bytes.len() + add_size as usize, 0);
+            expected.push((start as u64, PROTECT_HEAD, reason));
+        }
+        let memory = Archive::parse(&bytes).unwrap();
+        let seekable = Archive::parse_seekable(
+            std::io::Cursor::new(&bytes),
+            bytes.len() as u64,
+            0,
+            ArchiveSource::Memory(Arc::from(bytes.clone())),
+            crate::ArchiveReadOptions::new(),
+        )
+        .unwrap();
+        for archive in [&memory, &seekable] {
+            let skipped: Vec<_> = archive
+                .skipped_blocks()
+                .iter()
+                .map(|skip| (skip.offset, skip.head_type, skip.reason))
+                .collect();
+            assert_eq!(skipped, expected);
+            assert_eq!(archive.blocks.len(), 6);
+            assert!(archive
+                .blocks
+                .iter()
+                .all(|block| matches!(block, Block::Unknown(_))));
+            assert_eq!(archive.truncation(), None);
+        }
+        assert_eq!(
+            memory.skipped_blocks()[0].to_string(),
+            format!(
+                "skipped malformed block 0x76 at offset {}: {SHORT_AUTH}",
+                expected[0].0
+            )
+        );
     }
 
     #[test]

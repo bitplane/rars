@@ -18,6 +18,16 @@ pub struct Truncation {
     pub block: TruncatedBlock,
     /// Whether any of that block is in the file.
     pub started: bool,
+    /// Whether the cut can have lost no member: the file ends in or just
+    /// before a block that only follows the members, and the archive is not
+    /// one volume of a set, whose end block says whether another follows.
+    ///
+    /// Those blocks are the end of archive block, the quick-open block and
+    /// the recovery record. A file that stops at a block boundary with
+    /// nothing to say what was due there may have lost members, unless a
+    /// quick-open block or recovery record comes before the cut. A reader can
+    /// treat a cut with this set as a warning once every member verifies.
+    pub members_complete: bool,
 }
 
 /// The kind of block an archive's file ends in.
@@ -47,7 +57,22 @@ impl Truncation {
             offset: offset as u64,
             block,
             started,
+            members_complete: false,
         }
+    }
+
+    /// Sets [`Self::members_complete`], once the walk knows whether the
+    /// archive is a volume and whether it passed a block that only follows
+    /// the members.
+    pub(crate) fn after_walk(mut self, volume: bool, past_trailing_block: bool) -> Self {
+        self.members_complete = !volume
+            && match &self.block {
+                TruncatedBlock::End => self.started || past_trailing_block,
+                TruncatedBlock::RecoveryRecord => true,
+                TruncatedBlock::Service(name) => name == b"QO",
+                _ => false,
+            };
+        self
     }
 }
 

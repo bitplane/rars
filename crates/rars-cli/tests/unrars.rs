@@ -124,6 +124,34 @@ fn a_truncated_archive_is_a_warning_after_every_member() {
     assert_eq!(fs::read(dir.join("out/sub/b.bin")).unwrap(), payload());
 }
 
+/// Issue #489: like unrar, nothing to say about a file that stops at its end
+/// block, when the recovery record before it shows no member can be missing.
+/// Where a member could be, the cut is still reported.
+#[test]
+fn a_file_stopping_at_its_end_block_after_every_member_tests_clean() {
+    let dir = scratch::case("unrars-end-block");
+    let path = dir.join("cut.rar");
+    builder(None)
+        .recovery_percent(Some(10))
+        .write_to_path(&path, None)
+        .unwrap();
+    let bytes = fs::read(&path).unwrap();
+    // RAR 5's end block is eight bytes here: CRC, size, type, flags and end flags.
+    fs::write(&path, &bytes[..bytes.len() - 8]).unwrap();
+    let output = unrars(&dir, &["t", "cut.rar"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    assert!(stdout(&output).trim_end().ends_with("All OK"));
+
+    let plain = dir.join("plain.rar");
+    builder(None).write_to_path(&plain, None).unwrap();
+    let bytes = fs::read(&plain).unwrap();
+    fs::write(&plain, &bytes[..bytes.len() - 8]).unwrap();
+    let output = unrars(&dir, &["t", "plain.rar"]);
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert!(stderr(&output).contains("Unexpected end of archive"));
+}
+
 #[test]
 fn keeps_or_replaces_existing_files() {
     let dir = scratch::case("unrars-overwrite");
