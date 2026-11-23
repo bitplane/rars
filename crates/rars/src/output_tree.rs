@@ -17,11 +17,26 @@ pub enum TreeEntry {
     Other(FileIdentity),
 }
 
+/// Whether [`OutputTree::open`] can open a tree on this platform.
+pub const AVAILABLE: bool = cfg!(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android"
+));
+
+/// A file [`FileDir::open_in_place`] opened to write over.
+pub struct InPlaceFile {
+    pub file: std::fs::File,
+    pub identity: FileIdentity,
+    /// Its length when opened: it is not truncated.
+    pub len: u64,
+}
+
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
-pub use imp::{FileDir, OutputTree};
+pub use imp::{file_identity, FileDir, OutputTree};
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
-pub use unsupported::{FileDir, OutputTree};
+pub use unsupported::{file_identity, FileDir, OutputTree};
 
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 mod imp {
@@ -92,6 +107,70 @@ mod imp {
         pub fn create_file(&self, name: &OsStr, mode: u32) -> std::io::Result<std::fs::File> {
             create_file_at(self.0.as_fd(), name, mode)
         }
+    }
+
+    impl FileDir {
+        /// Creates a new file for `destination` here, as [`Self::create_file`]
+        /// does, trying `name(N).ext` upwards while the name is taken, as
+        /// `Rename` does. Returns where it was created.
+        pub fn create_numbered(
+            &self,
+            destination: &Path,
+            mode: u32,
+            renames: &mut RenameCounters,
+        ) -> crate::Result<(PathBuf, std::fs::File)> {
+            renames.claim(destination, |candidate| {
+                self.create_file(candidate.file_name().expect("output path has a name"), mode)
+            })
+        }
+
+        /// Opens `name` here to write over, creating it with the permission
+        /// bits `mode` if it is missing. Only a regular file with one link is
+        /// opened: a symlink, a FIFO, a hard-linked file or anything else is
+        /// refused, and never written through. It is not truncated.
+        pub fn open_in_place(&self, name: &OsStr, mode: u32) -> std::io::Result<InPlaceFile> {
+            // O_NONBLOCK fails a FIFO with no reader instead of waiting for one.
+            let flags = OFlags::WRONLY
+                | OFlags::CREATE
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK
+                | OFlags::CLOEXEC;
+            let file =
+                rustix::fs::openat(self.0.as_fd(), name, flags, Mode::from_raw_mode(mode as _))
+                    .map_err(|error| match error {
+                        Errno::LOOP | Errno::NXIO => crate::output_staging::refused_in_place(),
+                        error => error.into(),
+                    })?;
+            let stat = rustix::fs::fstat(&file)?;
+            if !FileType::from_raw_mode(stat.st_mode as _).is_file() || stat.st_nlink > 1 {
+                return Err(crate::output_staging::refused_in_place());
+            }
+            Ok(InPlaceFile {
+                file: std::fs::File::from(file),
+                identity: identity(&stat),
+                len: stat.st_size as u64,
+            })
+        }
+
+        /// What `name` here is, without following a symlink.
+        pub fn entry(&self, name: &OsStr) -> std::io::Result<TreeEntry> {
+            let Some(stat) = lstat_at(self.0.as_fd(), name)? else {
+                return Ok(TreeEntry::Missing);
+            };
+            let file_type = FileType::from_raw_mode(stat.st_mode as _);
+            Ok(if file_type.is_symlink() {
+                TreeEntry::Symlink
+            } else if file_type.is_dir() {
+                TreeEntry::Directory(identity(&stat))
+            } else {
+                TreeEntry::Other(identity(&stat))
+            })
+        }
+    }
+
+    /// The identity of an open file.
+    pub fn file_identity(file: &std::fs::File) -> std::io::Result<FileIdentity> {
+        Ok(identity(&rustix::fs::fstat(file)?))
     }
 
     fn create_file_at(
@@ -424,6 +503,15 @@ mod imp {
             Ok(FileDir(Arc::clone(directory)))
         }
 
+        /// Creates the directories holding `relative`, and returns the one
+        /// it goes in and that directory's identity.
+        pub fn parent_dir(&mut self, relative: &Path) -> crate::Result<(FileDir, FileIdentity)> {
+            let (parts, _) = split(relative)?;
+            let (directory, identity) =
+                self.walk(&parts, true)?.expect("created directories exist");
+            Ok((FileDir(Arc::clone(directory)), *identity))
+        }
+
         /// Creates a new file at `relative`, and any missing parents. An
         /// existing entry of any kind fails with `AlreadyExists`.
         pub fn create_file(&mut self, relative: &Path) -> crate::Result<std::fs::File> {
@@ -527,8 +615,30 @@ mod unsupported {
     #[derive(Clone)]
     pub struct FileDir(std::convert::Infallible);
 
+    /// Never called: no tree opens a file here.
+    pub fn file_identity(_file: &std::fs::File) -> std::io::Result<FileIdentity> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+
     impl FileDir {
         pub fn create_file(&self, _name: &OsStr, _mode: u32) -> std::io::Result<std::fs::File> {
+            match self.0 {}
+        }
+
+        pub fn create_numbered(
+            &self,
+            _destination: &Path,
+            _mode: u32,
+            _renames: &mut RenameCounters,
+        ) -> crate::Result<(PathBuf, std::fs::File)> {
+            match self.0 {}
+        }
+
+        pub fn open_in_place(&self, _name: &OsStr, _mode: u32) -> std::io::Result<InPlaceFile> {
+            match self.0 {}
+        }
+
+        pub fn entry(&self, _name: &OsStr) -> std::io::Result<TreeEntry> {
             match self.0 {}
         }
 
@@ -595,6 +705,10 @@ mod unsupported {
             match self.0 {}
         }
 
+        pub fn parent_dir(&mut self, _relative: &Path) -> crate::Result<(FileDir, FileIdentity)> {
+            match self.0 {}
+        }
+
         pub fn create_file(&mut self, _relative: &Path) -> crate::Result<std::fs::File> {
             match self.0 {}
         }
@@ -654,6 +768,84 @@ mod tests {
             tree.lstat(Path::new("a/b/file/below")).unwrap(),
             TreeEntry::Missing
         );
+    }
+
+    #[test]
+    fn files_opened_in_place_are_only_ever_regular_files_with_one_link() {
+        use std::ffi::OsStr;
+        use std::io::Write;
+
+        let scratch = crate::scratch::case("output-tree-in-place");
+        let root = scratch.join("root");
+        let outside = scratch.join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("target"), b"outside").unwrap();
+        let mut tree = OutputTree::open(&root).unwrap().unwrap();
+
+        // The parent is made and recorded as made by this walk.
+        let (dir, identity) = tree.parent_dir(Path::new("a/b/file")).unwrap();
+        assert!(tree.created(&identity));
+        let (_, again) = tree.parent_dir(Path::new("a/b/other")).unwrap();
+        assert_eq!(again, identity);
+        let (_, top) = tree.parent_dir(Path::new("top")).unwrap();
+        assert_eq!(top, tree.identity());
+        assert!(!tree.created(&top));
+
+        // A file opened in place is the one there, not truncated.
+        let existing = root.join("a/b/file");
+        fs::write(&existing, b"old contents").unwrap();
+        let opened = dir.open_in_place(OsStr::new("file"), 0o644).unwrap();
+        assert_eq!(opened.len, 12);
+        assert_eq!(
+            Some(opened.identity),
+            tree.identity_of(Path::new("a/b/file")).unwrap()
+        );
+        drop(opened);
+        // A missing one is created.
+        let mut created = dir.open_in_place(OsStr::new("new"), 0o600).unwrap();
+        assert_eq!(created.len, 0);
+        created.file.write_all(b"new").unwrap();
+        assert_eq!(fs::read(root.join("a/b/new")).unwrap(), b"new");
+
+        // A symlink, a hard link or a FIFO is refused and left alone.
+        std::os::unix::fs::symlink(outside.join("target"), root.join("a/b/link")).unwrap();
+        fs::hard_link(outside.join("target"), root.join("a/b/hard")).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(root.join("a/b/fifo"))
+            .status()
+            .unwrap()
+            .success());
+        for name in ["link", "hard", "fifo"] {
+            let refused = dir.open_in_place(OsStr::new(name), 0o644).map(drop);
+            assert!(
+                refused
+                    .as_ref()
+                    .is_err_and(|error| error.to_string().contains("refusing to write in place")),
+                "{name}: {refused:?}"
+            );
+        }
+        assert_eq!(fs::read(outside.join("target")).unwrap(), b"outside");
+        assert_eq!(dir.entry(OsStr::new("link")).unwrap(), TreeEntry::Symlink);
+        assert!(matches!(
+            dir.entry(OsStr::new("hard")).unwrap(),
+            TreeEntry::Other(_)
+        ));
+        assert_eq!(
+            dir.entry(OsStr::new("missing")).unwrap(),
+            TreeEntry::Missing
+        );
+
+        // Numbered creation steps past any entry, a symlink included.
+        let mut renames = RenameCounters::default();
+        let (path, _) = dir
+            .create_numbered(&root.join("a/b/link"), 0o644, &mut renames)
+            .unwrap();
+        assert_eq!(path, root.join("a/b/link(1)"));
+        assert!(fs::symlink_metadata(root.join("a/b/link(1)"))
+            .unwrap()
+            .is_file());
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
     }
 
     #[test]

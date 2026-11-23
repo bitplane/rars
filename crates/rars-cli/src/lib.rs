@@ -1161,6 +1161,29 @@ struct Staged {
     early_set: Arc<AtomicBool>,
 }
 
+/// What a member opened by descriptor leaves to do once it verifies.
+enum Pending {
+    /// Publish the file it staged.
+    Staged(Staged),
+    /// Finish the file it wrote in place.
+    InPlace(InPlace),
+    /// Record the directory it made in place, whose identity this is.
+    InPlaceDirectory(FileIdentity),
+}
+
+/// A file written in place through the output tree.
+struct InPlace {
+    /// The file, once the library is done writing it: see [`output::InPlaceFile`].
+    file: Arc<std::sync::OnceLock<fs::File>>,
+    /// The directory it is in.
+    dir: FileIdentity,
+    /// The permission bits it was created with; `None` if it was there already.
+    created_mode: Option<u32>,
+    /// Its identity, under `Always`: a later member that reaches it by
+    /// another name must not write over it.
+    identity: Option<FileIdentity>,
+}
+
 type PublishReport<'a> = dyn FnMut(&ExtractedOutput) + 'a;
 
 struct ExtractOutputState<'a> {
@@ -1192,8 +1215,11 @@ struct ExtractOutputState<'a> {
     /// Which permission bits files created in [`STAGED_FILES`] keep.
     created_modes: output::CreatedModes,
     staged_paths: Vec<PathBuf>,
-    /// For each staged path, the file staged by descriptor there.
-    staged_files: Vec<Option<Staged>>,
+    /// For each staged path, what its member opened by descriptor left to do.
+    staged_files: Vec<Option<Pending>>,
+    /// Whether files created in place in a directory with given permission
+    /// bits have them, as [`output::CreatedModes`] says for staged files.
+    in_place_modes: HashMap<(FileIdentity, u32), bool>,
     hardlink_targets: HashMap<PathBuf, PathBuf>,
     staged_redirections: HashSet<PathBuf>,
     staged_directories: HashSet<FileIdentity>,
@@ -1262,6 +1288,7 @@ impl<'a> ExtractOutputState<'a> {
             created_modes: Default::default(),
             staged_paths: Vec::new(),
             staged_files: Vec::new(),
+            in_place_modes: HashMap::new(),
             hardlink_targets: HashMap::new(),
             staged_redirections: HashSet::new(),
             staged_directories: HashSet::new(),
@@ -1420,6 +1447,7 @@ impl<'a> ExtractOutputState<'a> {
             self.remember_directory_time(&destination, meta)?;
         }
         self.prepare_staged_path(&destination, meta.is_directory, existing.as_ref())?;
+        let by_descriptor = self.in_place && self.in_place_tree()?;
         let (path, writer) = match &mut self.staging_tree {
             Some(tree) => {
                 // Each member stages under a name of its own, so only
@@ -1464,8 +1492,13 @@ impl<'a> ExtractOutputState<'a> {
                     (Box::new(file), Some(staged))
                 };
                 self.staged_paths.push(path);
-                self.staged_files.push(staged);
+                self.staged_files.push(staged.map(Pending::Staged));
                 (None, writer)
+            }
+            None if by_descriptor => {
+                let (path, writer) =
+                    self.open_in_place(&relative, destination.clone(), meta, existing.as_ref())?;
+                (Some(path), writer)
             }
             None => {
                 let policy = self.staged_policy();
@@ -1547,7 +1580,7 @@ impl<'a> ExtractOutputState<'a> {
         self.created_paths();
         let policy = self.staged_policy();
         let created_paths = self.created_paths.as_mut().expect("built above");
-        let (path, restore_metadata) = create_link_output(
+        let created = create_link_output(
             &staging,
             &relative,
             &target,
@@ -1555,7 +1588,14 @@ impl<'a> ExtractOutputState<'a> {
             policy,
             created_paths,
             &mut self.renames,
-        )?;
+        );
+        if self.in_place {
+            // Made by path, which can remove a directory the walks hold.
+            if let Some(tree) = &mut self.out_tree {
+                tree.forget();
+            }
+        }
+        let (path, restore_metadata) = created?;
         if matches!(link, rars::ExtractedLink::HardLink { .. }) {
             let source = output::link_source_path(&target, created_paths)?;
             self.hardlink_targets
@@ -1651,10 +1691,10 @@ impl<'a> ExtractOutputState<'a> {
         &mut self,
         relative: &Path,
     ) -> rars::Result<(PathBuf, Option<TreeEntry>)> {
-        if !self.in_place && self.out_tree.is_none() {
+        if self.out_tree.is_none() {
             self.out_tree = OutputTree::open(self.out_dir)?;
         }
-        let Some(tree) = self.out_tree.as_mut().filter(|_| !self.in_place) else {
+        let Some(tree) = self.out_tree.as_mut() else {
             return Ok((
                 rars::filename::checked_output_path(self.out_dir, relative)?,
                 None,
@@ -1742,12 +1782,24 @@ impl<'a> ExtractOutputState<'a> {
         }
         if self.in_place {
             // A collision would otherwise overwrite an earlier member before any check.
-            if let Ok(identity) = FileIdentity::of(destination) {
-                if self.published_identities.contains(&identity) && !self.repeats_allowed() {
-                    return Err(rars::Error::InvalidHeader(
-                        "multiple archive entries map to the same output path",
-                    ));
+            let ours = |identity: &FileIdentity| {
+                // A directory a walk made for an earlier member's path is
+                // the run's own, but a directory member may land on it.
+                if directory {
+                    self.published_identities.contains(identity)
+                } else {
+                    self.made_here(identity)
                 }
+            };
+            let ours = match existing {
+                Some(TreeEntry::Directory(identity) | TreeEntry::Other(identity)) => ours(identity),
+                Some(_) => false,
+                None => FileIdentity::of(destination).is_ok_and(|identity| ours(&identity)),
+            };
+            if ours && !self.repeats_allowed() {
+                return Err(rars::Error::InvalidHeader(
+                    "multiple archive entries map to the same output path",
+                ));
             }
             return Ok(());
         }
@@ -1812,6 +1864,159 @@ impl<'a> ExtractOutputState<'a> {
                 .is_some_and(|tree| tree.created(identity))
     }
 
+    /// Whether members are written in place through [`Self::out_tree`],
+    /// creating the output directory and opening it if need be.
+    fn in_place_tree(&mut self) -> rars::Result<bool> {
+        if self.out_tree.is_none() && rars::output_tree::AVAILABLE {
+            fs::create_dir_all(self.out_dir)?;
+            self.out_tree = OutputTree::open(self.out_dir)?;
+        }
+        Ok(self.out_tree.is_some())
+    }
+
+    /// Opens a member at its destination, relative to the output directory
+    /// opened by descriptor, by the overwrite policy. Never follows a
+    /// symlink, and never writes through a hard link or anything but a
+    /// regular file. `existing` is what [`Self::checked_destination`] found
+    /// there. Returns where it was opened.
+    fn open_in_place(
+        &mut self,
+        relative: &Path,
+        destination: PathBuf,
+        meta: &rars::ExtractedEntryMeta,
+        existing: Option<&TreeEntry>,
+    ) -> rars::Result<(PathBuf, Box<dyn Write + Send>)> {
+        let tree = self.out_tree.as_mut().expect("opened by in_place_tree");
+        let refuse = |error| output::refused_path(error, &meta.name);
+        if meta.is_directory {
+            let identity = tree.create_dirs(relative).map_err(refuse)?;
+            self.staged_paths.push(destination.clone());
+            self.staged_files
+                .push(Some(Pending::InPlaceDirectory(identity)));
+            return Ok((destination, Box::new(std::io::sink())));
+        }
+        let (dir, dir_identity) = tree.parent_dir(relative).map_err(refuse)?;
+        // Nothing was in a directory this run made before it began: a name
+        // taken there was taken by this run, or by something racing it.
+        let fresh = tree.created(&dir_identity);
+        let name = relative.file_name().expect("output path has a name");
+        let mode = output::create_mode(meta);
+        let repeated =
+            || rars::Error::InvalidHeader("multiple archive entries map to the same output path");
+        // Only `Always` opens what is there, so only it needs to know which
+        // files this run wrote.
+        let tracked = self.overwrite == OverwritePolicy::Always && !self.repeats_allowed();
+        let (path, file, created_mode, identity) = match self.overwrite {
+            OverwritePolicy::Never => match dir.create_file(name, mode) {
+                Ok(file) => (destination, file, Some(mode), None),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // In a directory this run made, another member's
+                    // output, as publishing a staged file would say.
+                    // Elsewhere, what the checks before opening would have
+                    // said, had it been there then.
+                    if fresh {
+                        return Err(repeated());
+                    }
+                    return Err(match dir.entry(name)? {
+                        TreeEntry::Symlink => refuse(rars::Error::UnsafePath(
+                            "unsafe archive path crosses symlink",
+                        )),
+                        TreeEntry::Directory(identity) if self.made_here(&identity) => repeated(),
+                        _ => error.into(),
+                    });
+                }
+                Err(error) => return Err(error.into()),
+            },
+            OverwritePolicy::Rename => {
+                let (path, file) = dir.create_numbered(&destination, mode, &mut self.renames)?;
+                (path, file, Some(mode), None)
+            }
+            OverwritePolicy::Always => {
+                let created = match existing {
+                    Some(TreeEntry::Missing) => match dir.create_file(name, mode) {
+                        Ok(file) => Some(file),
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            if fresh && tracked {
+                                return Err(repeated());
+                            }
+                            None
+                        }
+                        Err(error) => return Err(error.into()),
+                    },
+                    _ => None,
+                };
+                match created {
+                    Some(file) => {
+                        let identity = tracked
+                            .then(|| rars::output_tree::file_identity(&file))
+                            .transpose()?;
+                        (destination, file, Some(mode), identity)
+                    }
+                    None => {
+                        let opened = dir.open_in_place(name, mode)?;
+                        if tracked && self.made_here(&opened.identity) {
+                            return Err(repeated());
+                        }
+                        if opened.len > 0 {
+                            opened.file.set_len(0)?;
+                        }
+                        (destination, opened.file, None, Some(opened.identity))
+                    }
+                }
+            }
+        };
+        let (writer, done) = output::InPlaceFile::new(file);
+        self.staged_paths.push(path.clone());
+        self.staged_files.push(Some(Pending::InPlace(InPlace {
+            file: done,
+            dir: dir_identity,
+            created_mode,
+            identity,
+        })));
+        Ok((path, Box::new(writer)))
+    }
+
+    /// Finishes a file written in place once it has verified: records its
+    /// identity and sets its time and mode through its descriptor. If it
+    /// can't, they wait for the end and are set by path.
+    fn finish_in_place(&mut self, pending: InPlace) {
+        let InPlace {
+            file,
+            dir,
+            created_mode,
+            identity,
+        } = pending;
+        if let Some(identity) = identity {
+            self.published_identities.insert(identity);
+        }
+        let output = &mut self.outputs[self.published];
+        // A writer the library still holds keeps the file to itself.
+        let (Some(file), Some((modified, mode))) =
+            (file.get(), output::early_file_metadata(output))
+        else {
+            return;
+        };
+        let modes = &mut self.in_place_modes;
+        let set = (|| {
+            if let Some(modified) = modified {
+                file.set_modified(modified)?;
+            }
+            if let Some(mode) = mode {
+                // Created with its mode, it keeps it unless the umask or the
+                // directory's default ACL cleared some.
+                let kept = created_mode == Some(mode)
+                    && *modes
+                        .entry((dir, mode))
+                        .or_insert_with(|| output::has_mode(file, mode));
+                if !kept {
+                    output::set_file_mode(file, mode)?;
+                }
+            }
+            std::io::Result::Ok(())
+        })();
+        output.restore_metadata &= set.is_err();
+    }
+
     /// Staged outputs are always new files; in-place ones follow the caller's policy.
     fn staged_policy(&self) -> OverwritePolicy {
         if self.in_place {
@@ -1851,8 +2056,16 @@ impl<'a> ExtractOutputState<'a> {
         while self.published < self.verified_end() {
             if self.in_place {
                 // Checked and written at its destination when it was opened.
-                let staged = self.staged_paths[self.published].clone();
-                self.record_identity(&staged)?;
+                match self.staged_files[self.published].take() {
+                    Some(Pending::InPlace(pending)) => self.finish_in_place(pending),
+                    Some(Pending::InPlaceDirectory(identity)) => {
+                        self.published_identities.insert(identity);
+                    }
+                    _ => {
+                        let staged = self.staged_paths[self.published].clone();
+                        self.record_identity(&staged)?;
+                    }
+                }
                 self.report_published();
                 self.published += 1;
                 continue;
@@ -1935,7 +2148,7 @@ impl<'a> ExtractOutputState<'a> {
                 }
             }
         }
-        let Some(staged) = &self.staged_files[self.published] else {
+        let Some(Pending::Staged(staged)) = &self.staged_files[self.published] else {
             return Ok(false);
         };
         let early = output::early_file_metadata(output);
@@ -4369,6 +4582,153 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    /// In place, each member is opened at its destination through the
+    /// directories the run opened. A directory swapped for a symlink
+    /// partway through is never written through: later members, in it or in
+    /// a new directory below it, land in the directory the run opened,
+    /// wherever it went.
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_swapped_for_a_symlink_mid_extraction_in_place_is_never_written_through() {
+        use std::io::Write;
+        let policies = [
+            super::OverwritePolicy::Never,
+            super::OverwritePolicy::Always,
+            super::OverwritePolicy::Rename,
+        ];
+        for planted in ["a", "a/b"] {
+            for overwrite in policies {
+                let scratch = crate::scratch::case("rars-planted-symlink-in-place");
+                let root = scratch.join("out");
+                let outside = scratch.join("outside");
+                std::fs::create_dir_all(&outside).unwrap();
+                let mut state = super::ExtractOutputState::new(
+                    &root,
+                    overwrite,
+                    true,
+                    false,
+                    rars::ArchiveFamily::Rar50Plus,
+                );
+                let meta = |name: &str| {
+                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
+                };
+                let write = |state: &mut super::ExtractOutputState, name: &str| {
+                    let mut writer = state.open_entry(&meta(name))?;
+                    writer.write_all(name.as_bytes())?;
+                    rars::Result::Ok(())
+                };
+                write(&mut state, "a/b/one").unwrap();
+                write(&mut state, "a/b/two").unwrap();
+                // Both are at their destinations when the directory is swapped.
+                assert_eq!(std::fs::read(root.join("a/b/one")).unwrap(), b"a/b/one");
+                let moved = root.join("moved");
+                std::fs::rename(root.join(planted), &moved).unwrap();
+                std::os::unix::fs::symlink(&outside, root.join(planted)).unwrap();
+                let finished = write(&mut state, "a/b/three")
+                    .and_then(|()| write(&mut state, "a/b/c/four"))
+                    .and_then(|()| state.publish().map(drop));
+
+                let context = format!("{planted} {overwrite:?}: {finished:?}");
+                let escaped: Vec<_> = std::fs::read_dir(&outside)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                assert!(escaped.is_empty(), "{context}: {escaped:?}");
+                assert!(finished.is_ok(), "{context}");
+                let moved = if planted == "a" {
+                    moved.join("b")
+                } else {
+                    moved
+                };
+                for name in ["one", "two", "three", "c/four"] {
+                    assert_eq!(
+                        std::fs::read(moved.join(name)).unwrap(),
+                        format!("a/b/{name}").into_bytes(),
+                        "{context}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// In place, a member in a directory this run made is opened without
+    /// looking at its destination first. Something planted there after the
+    /// directory was made is never written through or over: `Never` and
+    /// `Always` refuse it as another member's output, `Rename` goes beside it.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_planted_where_a_member_goes_in_place_is_never_written_through() {
+        use std::io::Write;
+        let policies = [
+            super::OverwritePolicy::Never,
+            super::OverwritePolicy::Always,
+            super::OverwritePolicy::Rename,
+        ];
+        for plant in ["symlink", "hard link", "file"] {
+            for overwrite in policies {
+                let scratch = crate::scratch::case("rars-planted-in-place");
+                let root = scratch.join("out");
+                let outside = scratch.join("outside");
+                std::fs::create_dir_all(&outside).unwrap();
+                std::fs::write(outside.join("target"), b"outside").unwrap();
+                let mut state = super::ExtractOutputState::new(
+                    &root,
+                    overwrite,
+                    true,
+                    false,
+                    rars::ArchiveFamily::Rar50Plus,
+                );
+                let meta = |name: &str| {
+                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
+                };
+                let write = |state: &mut super::ExtractOutputState, name: &str| {
+                    let mut writer = state.open_entry(&meta(name))?;
+                    writer.write_all(name.as_bytes())?;
+                    rars::Result::Ok(())
+                };
+                write(&mut state, "d/one").unwrap();
+                let planted = root.join("d/two");
+                match plant {
+                    "symlink" => {
+                        std::os::unix::fs::symlink(outside.join("target"), &planted).unwrap()
+                    }
+                    "hard link" => std::fs::hard_link(outside.join("target"), &planted).unwrap(),
+                    _ => std::fs::write(&planted, b"planted").unwrap(),
+                }
+                let finished = write(&mut state, "d/two").and_then(|()| state.publish().map(drop));
+
+                let context = format!("{plant} {overwrite:?}: {finished:?}");
+                assert_eq!(
+                    std::fs::read(outside.join("target")).unwrap(),
+                    b"outside",
+                    "{context}"
+                );
+                assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "{context}");
+                let found = std::fs::symlink_metadata(&planted).unwrap();
+                assert_eq!(found.file_type().is_symlink(), plant == "symlink");
+                if plant == "file" {
+                    assert_eq!(std::fs::read(&planted).unwrap(), b"planted", "{context}");
+                }
+                if overwrite == super::OverwritePolicy::Rename {
+                    assert!(finished.is_ok(), "{context}");
+                    assert_eq!(std::fs::read(root.join("d/two(1)")).unwrap(), b"d/two");
+                } else {
+                    assert!(
+                        matches!(
+                            &finished,
+                            Err(Error::InvalidHeader(
+                                "multiple archive entries map to the same output path"
+                            ))
+                        ),
+                        "{context}"
+                    );
+                    assert_eq!(std::fs::read_dir(root.join("d")).unwrap().count(), 2);
+                }
+                assert_eq!(std::fs::read(root.join("d/one")).unwrap(), b"d/one");
             }
         }
     }

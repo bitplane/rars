@@ -530,6 +530,67 @@ fn files_written_on_workers_keep_their_contents_times_and_modes() {
     }
 }
 
+/// In place, files take their times and modes whether they were created or
+/// were there already, with other contents and another mode.
+#[cfg(unix)]
+#[test]
+fn files_written_in_place_keep_their_times_and_modes() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch::case("extraction-in-place-metadata");
+    let archive = root.join("archive.rar");
+    let seconds = 1_600_000_000;
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    let mut sources = Vec::new();
+    for index in 0..6u32 {
+        let name = format!("dir{}/file{index}.txt", index % 2);
+        let data = format!("member {index}").into_bytes();
+        let mode = if index % 3 == 0 { 0o751 } else { 0o640 };
+        builder
+            .add_bytes(
+                name.clone().into_bytes(),
+                data.clone(),
+                Some(rars::Timestamp::from_unix_seconds(seconds)),
+                Some(0o100000 | mode),
+            )
+            .unwrap();
+        sources.push((name, data, mode));
+    }
+    fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+    let destination = root.join("out");
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds as u64);
+    for overwrite in ["--overwrite=never", "--overwrite=always"] {
+        if overwrite == "--overwrite=always" {
+            for (name, _, _) in &sources {
+                let path = destination.join(name);
+                fs::write(&path, b"a longer file that was there before").unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let result = Command::new(env!("CARGO_BIN_EXE_rars"))
+            .args(["x", "--in-place", overwrite])
+            .arg(&archive)
+            .arg(&destination)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{overwrite}: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        for (name, data, mode) in &sources {
+            let path = destination.join(name);
+            assert_eq!(&fs::read(&path).unwrap(), data, "{overwrite} {name}");
+            let metadata = fs::metadata(&path).unwrap();
+            assert_eq!(metadata.modified().unwrap(), modified, "{overwrite} {name}");
+            assert_eq!(
+                metadata.permissions().mode() & 0o777,
+                *mode,
+                "{overwrite} {name}"
+            );
+        }
+    }
+}
+
 /// A file member landing on a directory an earlier member's path made is
 /// refused as another member's output, whether the earlier member was
 /// published before it opened or only after, so every thread count reports
