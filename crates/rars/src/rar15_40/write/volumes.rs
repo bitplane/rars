@@ -316,7 +316,13 @@ pub(super) fn split_members_above(
             solid_run_has_member = method != 0x30;
             continue;
         }
-        let encoded = if codes && !member.is_directory {
+        // A member its samples say will not compress is copied into the set
+        // as a stored member is, never loaded.
+        let sampled_store = codes
+            && samples_say_store(member, options, coding, Some(resources), &work).map_err(
+                |error| crate::write_stream::member_error(error, name, "preparing volume member"),
+            )?;
+        let encoded = if codes && !member.is_directory && !sampled_store {
             Some(
                 encode_member(
                     member,
@@ -385,7 +391,7 @@ pub(super) fn split_members_above(
             })?;
         let packed_source_len = bytes.len()?;
         let packed_len = cipher.packed_len(packed_source_len)?;
-        let stored_work = (!codes).then_some(&work);
+        let stored_work = (!codes || sampled_store).then_some(&work);
         let payload = PackedStream::open(
             bytes,
             packed_source_len,

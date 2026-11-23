@@ -826,22 +826,37 @@ fn write_members_to(
                 .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))
             },
             |member, admitted| {
-                match admitted.unpacked_size {
-                    Some(unpacked_size) => encode_measured(
+                let prepare = || -> Result<Prepared<'_>> {
+                    let Some(unpacked_size) = admitted.unpacked_size else {
+                        return Ok(Prepared::Streams(admitted.permit));
+                    };
+                    let mut held = admitted.permit;
+                    // A member its samples say will not compress is stored
+                    // the way `--store` stores it, never loaded.
+                    let coding = if samples_say_store(member, options, coding, None, progress)? {
+                        if let Some(permit) = &mut held {
+                            permit.shrink_to(WRITE_WORKSPACE);
+                        }
+                        &MemberCoding::Stored
+                    } else {
+                        coding
+                    };
+                    encode_measured(
                         member,
                         options,
                         coding,
                         &mut None,
                         unpacked_size,
                         patches,
-                        admitted.permit,
+                        held,
                         resources,
                         progress,
                     )
-                    .map(Prepared::Coded),
-                    None => Ok(Prepared::Streams(admitted.permit)),
-                }
-                .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))
+                    .map(Prepared::Coded)
+                };
+                prepare().map_err(|error| {
+                    crate::write_stream::member_error(error, member.name, "preparing")
+                })
             },
             |member, prepared| {
                 match prepared {
@@ -2528,8 +2543,13 @@ fn stream_member_admitted(
                 progress.is_cancelled()
             })?,
     };
+    // A member its samples say will not compress is stored without coding
+    // any of it, and without choosing an engine for it.
+    let judged = samples_judge(member, options, coding)?;
+    let sampled_store = judged && samples_say_store(member, options, coding, None, progress)?;
     // RAR 1.5 and 2.0 have one engine; RAR 2.9 chooses before coding anything.
     let rar29 = match options.target {
+        _ if sampled_store => None,
         ArchiveVersion::Rar15 | ArchiveVersion::Rar20 => None,
         _ => {
             let encode_options = rar29_encode_options_for_options(options)?;
@@ -2606,6 +2626,7 @@ fn stream_member_admitted(
     };
     let unchained_storable = storable && solid.is_none();
     let flow = match rar29 {
+        _ if sampled_store => Ok(ControlFlow::Break(())),
         None => match solid.as_mut().and_then(|link| link.encoder.as_mut()) {
             Some(SolidEncoder::Rar15(encoder)) => {
                 encoder.encode_member_streamed(&mut counted, len, &mut advance, &mut write)
@@ -2619,7 +2640,12 @@ fn stream_member_admitted(
             .encode_member_streamed(&mut counted, len, &mut advance, &mut write),
             // Noise is stored without coding it first: the attempt would only
             // learn that at the end, which for gigabytes is half an hour.
-            _ if unchained_storable && rar20_samples_expand(member, len, options, progress)? => {
+            // A member the shared samples judged has had this probe already
+            // if it needed one.
+            _ if unchained_storable
+                && !judged
+                && rar20_samples_expand(member, len, options, progress)? =>
+            {
                 Ok(ControlFlow::Break(()))
             }
             _ => unpack20_encode_streamed(
@@ -2749,8 +2775,155 @@ fn stream_member_admitted(
     Ok(sizes.method)
 }
 
+/// Whether a member is one its samples can judge (#509), as a RAR 5 member is.
+///
+/// Only an independent member of [`crate::incompressible::MIN_MEMBER`] or more
+/// is sampled. One in a solid chain is coded against the members before it, so
+/// a sample coded alone says nothing about what it packs to there, and storing
+/// it would end the chain. A filter the caller named is applied whatever it
+/// does to the size, as it is when the sizes are compared after coding. A
+/// rewrite's sources are staged a window at a time, in order, and opening one
+/// ahead to sample it can need staging the members before it still hold.
+fn samples_judge(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+) -> Result<bool> {
+    let independent = !options.features.solid
+        && compression_method_for_level(options) != 0x30
+        && matches!(
+            coding,
+            MemberCoding::Compressed
+                | MemberCoding::Filtered(FilterPolicy::None | FilterPolicy::Auto)
+        );
+    if !independent
+        || member.is_directory
+        || member.is_symlink
+        || member
+            .bytes
+            .source()
+            .is_some_and(|source| source.max_preparation_window() != usize::MAX)
+    {
+        return Ok(false);
+    }
+    Ok(crate::incompressible::sample_ranges(member.unpacked_size()?).is_some())
+}
+
+/// Whether to store a member without coding it, judged from samples of it.
+///
+/// RAR 2.0 keeps its own probe beside the shared one where it applies. Its
+/// samples are a dictionary long, so they see data that repeats further apart
+/// than a shared sample reaches, and a member is stored only when both say so.
+///
+/// `charge` is the budget to take the probe's room from, for a caller that
+/// holds none for the member yet.
+fn samples_say_store(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    charge: Option<&WriterResources>,
+    progress: &WorkTracker<'_>,
+) -> Result<bool> {
+    if !samples_judge(member, options, coding)? {
+        return Ok(false);
+    }
+    let len = member.unpacked_size()?;
+    let _permit = match charge {
+        Some(resources) => Some(
+            resources.acquire_serialising_cancellable(probe_workspace(options)?, &|| {
+                progress.is_cancelled()
+            })?,
+        ),
+        None => None,
+    };
+    let mut reader = member.bytes.open()?;
+    let store = crate::incompressible::looks_incompressible(&mut *reader, len, |sample| {
+        progress.check()?;
+        probe_packed_len(options.target, sample, &|| progress.is_cancelled())
+    })?;
+    if !store || options.target != ArchiveVersion::Rar20 {
+        return Ok(store);
+    }
+    let len = usize::try_from(len)
+        .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
+    match rar20_probe_sample(len, options)? {
+        Some(_) => rar20_samples_expand(member, len, options, progress),
+        None => Ok(true),
+    }
+}
+
+/// What a probe holds: a sample, what it packs to, and the coder's index, or
+/// for RAR 2.0 its own probe's longer sample coded at the member's level.
+fn probe_workspace(options: WriterOptions) -> Result<u64> {
+    let sample = crate::incompressible::SAMPLE_LEN as u64;
+    let shared = |sample: u64, coder: u64| {
+        sample
+            .saturating_mul(2)
+            .saturating_add(coder)
+            .saturating_add(2 * 1024 * 1024)
+    };
+    Ok(match options.target {
+        ArchiveVersion::Rar15 => shared(sample, crate::codec::rar13::ENCODER_WORKSPACE),
+        ArchiveVersion::Rar20 => {
+            let encode_options = rar20_encode_options_for_options(options)?;
+            let long = rar20_probe_len(encode_options) as u64;
+            shared(
+                long,
+                crate::codec::rar20::coding_workspace(encode_options.optimal_parse, long),
+            )
+        }
+        _ => shared(sample, sample.saturating_mul(12)),
+    })
+}
+
+/// What a probe sample packs to coded on its own at level 1, unfiltered: the
+/// cheapest coding each format has, and about the least any level saves.
+fn probe_packed_len(
+    target: ArchiveVersion,
+    sample: &[u8],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<usize> {
+    let mut poll = |_| !cancelled();
+    // No match reaches past the sample, so no window is sized beyond it.
+    let reach = sample.len().max(1);
+    let packed = match target {
+        ArchiveVersion::Rar15 => unpack15_encode_with_options_and_progress(
+            sample,
+            rar15_encode_options_for_level(Some(1))?,
+            &mut poll,
+        ),
+        ArchiveVersion::Rar20 => unpack20_encode_auto_with_options_and_progress(
+            sample,
+            rar20_encode_options_for_level(Some(1))?.with_max_match_distance(reach),
+            &mut poll,
+        ),
+        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+            unpack29_encode_literals_with_options_and_progress(
+                sample,
+                rar29_encode_options_for_level(Some(1))?.with_max_match_distance(reach),
+                &mut poll,
+            )
+        }
+        target => return Err(Error::UnsupportedVersion(target)),
+    }
+    .map_err(map_codec_cancel)?;
+    Ok(packed.len())
+}
+
 /// Samples a streamed RAR 2.0 member codes before it is coded whole.
 const RAR20_PROBE_SAMPLES: usize = 4;
+
+/// How long each of RAR 2.0's own samples is: a dictionary.
+fn rar20_probe_len(encode_options: Rar20EncodeOptions) -> usize {
+    encode_options.max_match_distance.max(64 * 1024)
+}
+
+/// How long each of RAR 2.0's own samples of a member is, or `None` for a
+/// member under sixteen samples' worth, which that probe leaves alone.
+fn rar20_probe_sample(len: usize, options: WriterOptions) -> Result<Option<usize>> {
+    let sample = rar20_probe_len(rar20_encode_options_for_options(options)?);
+    Ok((len >= sample.saturating_mul(4 * RAR20_PROBE_SAMPLES)).then_some(sample))
+}
 
 /// Whether every sample of a large RAR 2.0 member packs no smaller than it
 /// is, so the member would be stored after coding it all.
@@ -2767,10 +2940,9 @@ fn rar20_samples_expand(
     progress: &WorkTracker<'_>,
 ) -> Result<bool> {
     let encode_options = rar20_encode_options_for_options(options)?;
-    let sample = encode_options.max_match_distance.max(64 * 1024);
-    if len < sample.saturating_mul(4 * RAR20_PROBE_SAMPLES) {
+    let Some(sample) = rar20_probe_sample(len, options)? else {
         return Ok(false);
-    }
+    };
     let mut source = member.bytes.open()?;
     let mut bytes = vec![0; sample];
     let stride = len / RAR20_PROBE_SAMPLES;
@@ -6535,7 +6707,8 @@ mod tests {
         let contents = [("small.txt", small), ("large.bin", &large[..])];
         let (members, opens) = counted_entries(&contents);
         let coding = || crate::MemberCoding::Compressed;
-        // RAR 2.0 has one engine, so it opens a member once either way.
+        // RAR 2.0 has one engine, so it opens a member once to sample it and
+        // once to code it either way.
         let routed: Vec<_> = members.iter().map(super::Member::from_streaming).collect();
         let streams = super::streams_member(&routed[1], rar20(3, false), &coding(), 256 * 1024);
         assert!(streams.unwrap());
@@ -6550,7 +6723,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert_eq!(opens.load(std::sync::atomic::Ordering::Relaxed), 3);
         let whole =
             volume_set(&members, rar20(3, false), coding(), 100_000, u64::MAX, None).unwrap();
         assert!(streamed.len() > 2);
@@ -6564,7 +6737,9 @@ mod tests {
 
     #[test]
     fn an_incompressible_member_in_a_set_is_stored_with_nothing_left_over() {
-        let noise = noise(1024 * 1024 + 7);
+        // Under the size members are sampled at, so it is coded as it goes and
+        // judged on what that writes.
+        let noise = noise(crate::incompressible::MIN_MEMBER as usize - 7);
         let large = binary_member(512 * 1024);
         let coding = || crate::MemberCoding::Compressed;
         // A stored lead leaves the noise most of a volume, or a few bytes, to start in.
@@ -6622,7 +6797,9 @@ mod tests {
 
     #[test]
     fn an_incompressible_member_in_a_set_grows_by_no_more_than_the_margin() {
-        let noise = noise(1024 * 1024 + 7);
+        // Under the size members are sampled at, so it is coded as it goes and
+        // judged on what that writes.
+        let noise = noise(crate::incompressible::MIN_MEMBER as usize - 7);
         let total = |set: &[Vec<u8>]| set.iter().map(Vec::len).sum::<usize>();
         for (options, margin) in [
             (rar40(), 128),
@@ -8858,17 +9035,18 @@ mod tests {
 
     #[test]
     fn streamed_rar20_noise_is_stored_without_coding_it_first() {
-        // Sixteen dictionaries long, so the probe runs.
+        // Sixteen dictionaries long or more, so RAR 2.0's own probe runs, and
+        // long enough that the shared samples are a small part of it.
         let mut options = rar20(1, false);
         options.dictionary_size = Some(64 * 1024);
-        let len = 16 * 64 * 1024 + 4321;
+        let len = 64 * 64 * 1024 + 4321;
         let coding = || crate::MemberCoding::Compressed;
 
         let noise = noise(len);
         let (members, read) = read_counted(&[("noise.bin", &noise)]);
         let out = streamed_with(&members, options, coding(), None).unwrap();
         assert!(out.seeks > 0, "the member was not streamed");
-        // Four samples and one copy, not a whole coding pass and a copy.
+        // Its samples and one copy, not a whole coding pass and a copy.
         let read = read.load(std::sync::atomic::Ordering::Relaxed);
         assert!(
             read < len + len / 2,
@@ -8940,5 +9118,216 @@ mod tests {
             Error::InvalidArgument("legacy file header changed length when patched")
         );
         assert_eq!(output.into_inner(), unpatched.into_inner());
+    }
+
+    /// Two megabytes of each kind of member the sampling has to tell apart.
+    fn sampled_kinds() -> [(&'static str, Vec<u8>); 3] {
+        let len = 2 * 1024 * 1024;
+        let mut half = word_text(len / 2);
+        half.extend_from_slice(&noise(len / 2));
+        [
+            ("noise.bin", noise(len)),
+            ("text.txt", word_text(len)),
+            ("half.bin", half),
+        ]
+    }
+
+    fn sampled_targets() -> [super::WriterOptions; 3] {
+        let mut rar40 = rar40();
+        rar40.compression_level = Some(1);
+        [rar15(1, false), rar20(1, false), rar40]
+    }
+
+    fn sampled_store(
+        entry: &super::StreamingEntry,
+        options: super::WriterOptions,
+        coding: &crate::MemberCoding,
+    ) -> bool {
+        let work = super::WorkTracker::new(None, super::WriteOperation::Compression, u64::MAX);
+        super::samples_say_store(
+            &super::Member::from_streaming(entry),
+            options,
+            coding,
+            Some(&crate::WriterResources::default()),
+            &work,
+        )
+        .unwrap()
+    }
+
+    /// Only an independent member of a megabyte or more, coded as the level or
+    /// the filter search chooses, is judged from its samples, and only noise
+    /// is stored.
+    #[test]
+    fn samples_store_independent_noise_and_nothing_else() {
+        use crate::FilterKind;
+        let [(_, noise), (_, text), (_, half)] = sampled_kinds();
+        let compressed = crate::MemberCoding::Compressed;
+        let entry = |data: &[u8]| entries(&[("member", data)]).remove(0);
+        for options in sampled_targets() {
+            let case = format!("{:?}", options.target);
+            assert!(
+                sampled_store(&entry(&noise), options, &compressed),
+                "{case}"
+            );
+            assert!(
+                !sampled_store(&entry(&text), options, &compressed),
+                "{case}"
+            );
+            assert!(
+                !sampled_store(&entry(&half), options, &compressed),
+                "{case}"
+            );
+            let small = &noise[..crate::incompressible::MIN_MEMBER as usize - 1];
+            assert!(
+                !sampled_store(&entry(small), options, &compressed),
+                "{case}"
+            );
+            let mut solid = options;
+            solid.features.solid = true;
+            assert!(!sampled_store(&entry(&noise), solid, &compressed), "{case}");
+            for policy in [crate::FilterPolicy::None, crate::FilterPolicy::Auto] {
+                let coding = crate::MemberCoding::Filtered(policy);
+                assert!(sampled_store(&entry(&noise), options, &coding), "{case}");
+            }
+            let named = named(FilterKind::E8E9);
+            assert!(!sampled_store(&entry(&noise), options, &named), "{case}");
+        }
+    }
+
+    /// A rewrite's scoped source is staged in order, so it is never opened
+    /// ahead to be sampled, however large it is.
+    #[test]
+    fn a_scoped_rewrite_source_is_not_sampled() {
+        struct Scoped;
+        impl crate::streaming::SourceFactory for Scoped {
+            fn max_preparation_window(&self) -> usize {
+                1
+            }
+            fn len(&self) -> crate::Result<u64> {
+                Ok(4 * crate::incompressible::MIN_MEMBER)
+            }
+            fn open(&self) -> crate::Result<Box<dyn crate::EntryReader>> {
+                panic!("a scoped rewrite source was opened to be sampled")
+            }
+        }
+        let entry = super::StreamingEntry::new(
+            b"member".to_vec(),
+            crate::EntrySource::from_factory(Scoped),
+        );
+        for options in sampled_targets() {
+            assert!(
+                !sampled_store(&entry, options, &crate::MemberCoding::Compressed),
+                "{:?}",
+                options.target
+            );
+        }
+    }
+
+    /// Noise in 100 KB blocks, each twice over, packs to half its size, but
+    /// no shared sample is long enough to hold a block and its repeat. RAR
+    /// 2.0's own samples are a dictionary long, so they see the repeats and
+    /// keep the member compressed; the other formats store it.
+    #[test]
+    fn rar20_keeps_a_member_its_dictionary_long_samples_see_repeat() {
+        let block = noise(100_000);
+        let mut data = Vec::new();
+        let mut index = 0u8;
+        while data.len() < 4 * 1024 * 1024 {
+            let block: Vec<u8> = block.iter().map(|byte| byte ^ index).collect();
+            data.extend_from_slice(&block);
+            data.extend_from_slice(&block);
+            index = index.wrapping_add(1);
+        }
+        let entry = entries(&[("repeats.bin", &data)]).remove(0);
+        let compressed = crate::MemberCoding::Compressed;
+        for mut options in sampled_targets() {
+            options.dictionary_size = Some(256 * 1024);
+            let store = sampled_store(&entry, options, &compressed);
+            assert_eq!(
+                store,
+                options.target != ArchiveVersion::Rar20,
+                "{:?}",
+                options.target
+            );
+        }
+    }
+
+    /// A noise member is stored on what its samples say, on every path a
+    /// member can take: whole, streamed and split into volumes. What compresses
+    /// is coded as before, and every member comes back.
+    #[test]
+    fn independent_noise_is_stored_from_its_samples_on_every_path() {
+        let kinds = sampled_kinds();
+        let files: Vec<(&str, &[u8])> = kinds
+            .iter()
+            .map(|(name, data)| (*name, data.as_slice()))
+            .collect();
+        let members = entries(&files);
+        let expected: Vec<_> = files
+            .iter()
+            .map(|(name, data)| (name.as_bytes().to_vec(), data.to_vec()))
+            .collect();
+        let coding = || crate::MemberCoding::Compressed;
+        for options in sampled_targets() {
+            let whole = in_memory_with(&members, options, coding());
+            let streamed = streamed_with(&members, options, coding(), None)
+                .unwrap()
+                .inner
+                .into_inner();
+            let volumes = |stream_above| {
+                volume_set(
+                    &members,
+                    options,
+                    coding(),
+                    3 * 1024 * 1024,
+                    stream_above,
+                    None,
+                )
+                .unwrap()
+            };
+            for (path, set) in [
+                ("whole", vec![whole]),
+                ("streamed", vec![streamed]),
+                ("whole volumes", volumes(u64::MAX)),
+                ("streamed volumes", volumes(256 * 1024)),
+            ] {
+                let case = format!("{:?}, {path}", options.target);
+                let methods: Vec<_> = crate::rar15_40::Archive::parse(&set[0])
+                    .unwrap()
+                    .files()
+                    .map(|file| file.method)
+                    .collect();
+                assert_eq!(methods[0], 0x30, "{case}");
+                assert!(methods[1..].iter().all(|&method| method != 0x30), "{case}");
+                assert_eq!(extracted_set(&set, None), expected, "{case}");
+            }
+        }
+    }
+
+    /// A streamed noise member is read for its samples and then once to be
+    /// stored. Coding it first read it whole twice.
+    #[test]
+    fn a_streamed_noise_member_is_not_coded_before_it_is_stored() {
+        let data = noise(4 * 1024 * 1024);
+        for options in sampled_targets() {
+            let (members, read) = read_counted(&[("noise.bin", &data)]);
+            let archive = streamed_with(&members, options, crate::MemberCoding::Compressed, None)
+                .unwrap()
+                .inner
+                .into_inner();
+            let read = read.load(std::sync::atomic::Ordering::Relaxed);
+            let samples = 16 * crate::incompressible::SAMPLE_LEN;
+            assert!(
+                read <= data.len() + samples,
+                "{:?}: {read} bytes read",
+                options.target
+            );
+            assert_eq!(
+                packed_members(&archive),
+                vec![(0x30, data.clone())],
+                "{:?}",
+                options.target
+            );
+        }
     }
 }
