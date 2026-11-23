@@ -1604,8 +1604,10 @@ impl<B: Budget> BitReader<B> {
     }
 
     /// Whether all that is left of the packed data is zero bits. Reads on
-    /// through the source only while the window holds nothing but zeros, so
-    /// a stream with more in it is left where it was.
+    /// through the source only while the window holds nothing but zeros. A
+    /// `false` after a refill has consumed those zeros (at least the 128 KiB
+    /// low-water mark of them, longer than any symbol), so what follows is
+    /// trailing data either way and the member CRC still decides.
     fn rest_is_zero_padding(&mut self, src: &mut dyn Read) -> Result<bool> {
         loop {
             let rest = self.input.get(self.bit_pos / 8..).unwrap_or_default();
