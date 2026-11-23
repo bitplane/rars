@@ -118,7 +118,10 @@ impl<B: Budget> CodecState<B> {
         let target = usize::try_from(file.unp_size)
             .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
         let result = match self {
-            Self::Unpack15(decoder) => decoder.decode_member_from_reader(input, target, solid, out),
+            Self::Unpack15(decoder) => {
+                decoder.input_cut = file.is_cut_short();
+                decoder.decode_member_from_reader(input, target, solid, out)
+            }
             Self::Unpack20(decoder) => decoder.decode_member_from_reader(input, target, out),
             Self::Unpack29(decoder) => {
                 if solid {
@@ -268,8 +271,10 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         let solid = self.file_is_solid(file);
         let password = self.password;
         let allowance = self.allowance.clone();
-        self.codec_for(file)?
-            .write_file_to(archive, file, solid, password, &allowance, out)?;
+        let result = self
+            .codec_for(file)
+            .and_then(|codec| codec.write_file_to(archive, file, solid, password, &allowance, out));
+        file.cut_short_result(result)?;
         self.decoded_files += 1;
         Ok(())
     }
@@ -835,6 +840,7 @@ mod tests {
 
     fn file(name: &[u8], flags: u16) -> FileHeader {
         FileHeader {
+            cut_short: false,
             block: block(flags),
             pack_size: 0,
             unp_size: 0,

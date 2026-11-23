@@ -914,7 +914,11 @@ impl<B: Budget> ReaderState<B> {
 
         let blocks = (|| -> Result<()> {
             loop {
-                let block = read_compressed_block_with_allowance(input, &self.history.allowance())?;
+                let block = read_compressed_block_salvaging(
+                    input,
+                    &self.history.allowance(),
+                    self.read_control.salvage(),
+                )?;
                 let payload = &*block.payload;
                 let mut payload_bit_pos = 0;
                 if block.header.has_tables {
@@ -1338,7 +1342,11 @@ impl<B: Budget> ReaderState<B> {
             let (block, resumed_at) = match resume.take() {
                 Some(resume) => (resume.block, Some(resume.bit_pos)),
                 None => (
-                    read_compressed_block_with_allowance(input, &output.ring.allowance())?,
+                    read_compressed_block_salvaging(
+                        input,
+                        &output.ring.allowance(),
+                        self.read_control.salvage(),
+                    )?,
                     None,
                 ),
             };
@@ -2440,9 +2448,27 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
     read_compressed_block_with_allowance(input, &Allowance::default())
 }
 
+#[cfg(test)]
 fn read_compressed_block_with_allowance<B: Budget>(
     input: &mut impl Read,
     allowance: &B,
+) -> Result<OwnedCompressedBlock<B>> {
+    read_compressed_block_salvaging(input, allowance, false)
+}
+
+/// Bits kept back from the end of a block the input ends in, so that every
+/// symbol decoded from it lies wholly in the bytes there are. No symbol with
+/// its extra bits, nor a filter record, is longer.
+const CUT_BLOCK_MARGIN_BITS: usize = 128;
+
+/// With `salvage`, a block whose payload the input ends partway through is
+/// read as the last, holding the bits there are, short of
+/// [`CUT_BLOCK_MARGIN_BITS`]: a symbol that runs on past them can't be
+/// decoded.
+fn read_compressed_block_salvaging<B: Budget>(
+    input: &mut impl Read,
+    allowance: &B,
+    salvage: bool,
 ) -> Result<OwnedCompressedBlock<B>> {
     let mut fixed = [0u8; 2];
     input
@@ -2475,20 +2501,42 @@ fn read_compressed_block_with_allowance<B: Budget>(
             acc | (usize::from(byte) << (index * 8))
         });
     let mut payload = Buffer::filled(payload_size, 0, allowance)?;
-    input
-        .read_exact(&mut payload)
-        .map_err(Error::from_read_error)?;
     let final_byte_bits = ((flags & 0x07) + 1).min(8);
-    let payload_bits = if payload_size == 0 {
+    let mut payload_bits = if payload_size == 0 {
         0
     } else {
         (payload_size - 1) * 8 + usize::from(final_byte_bits)
     };
+    let mut is_last = flags & 0x40 != 0;
+    if salvage {
+        let mut read = 0;
+        while read < payload_size {
+            match input.read(&mut payload[read..]) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(Error::from_read_error(error)),
+            }
+        }
+        if read < payload_size {
+            if read == 0 {
+                return Err(Error::NeedMoreInput);
+            }
+            payload.truncate(read);
+            payload_bits = (read * 8).saturating_sub(CUT_BLOCK_MARGIN_BITS);
+            is_last = true;
+        }
+    } else {
+        input
+            .read_exact(&mut payload)
+            .map_err(Error::from_read_error)?;
+    }
+    let payload_size = payload.len();
 
     Ok(OwnedCompressedBlock {
         header: CompressedBlockHeader {
             flags,
-            is_last: flags & 0x40 != 0,
+            is_last,
             has_tables: flags & 0x80 != 0,
             final_byte_bits,
             payload_size,

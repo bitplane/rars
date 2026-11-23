@@ -505,6 +505,9 @@ impl<'a> ArchiveReadOptions<'a> {
     ///   reported;
     /// - a member that fails partway through gets every byte decoded before
     ///   the failure, then the error;
+    /// - a member the file ends partway through, unless it is split across
+    ///   volumes, is listed, and gets what decodes from the bytes there are,
+    ///   then [`Error::MemberCutShort`]; [`Archive::truncation`] names it;
     /// - a member whose stream decodes past its declared size gets its
     ///   declared bytes, and [`Error::MemberRanPastDeclaredSize`]. The rest
     ///   of the stream is decoded into the window only, so that a solid

@@ -238,6 +238,8 @@ pub struct FileHeader {
     pub encrypted: bool,
     pub encryption: Option<FileEncryption>,
     crypto: Option<FileCryptoState>,
+    /// Set by a salvaging parse on a member the file ends partway through.
+    pub(crate) cut_short: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -426,6 +428,12 @@ impl FileHeader {
 
     pub fn packed_size(&self) -> u64 {
         self.block.data_size.unwrap_or(0)
+    }
+
+    /// Whether the file ends before this member's packed data does, which
+    /// only a salvaging parse keeps.
+    pub(crate) fn is_cut_short(&self) -> bool {
+        self.cut_short
     }
 
     pub fn packed_data(&self, archive: &Archive) -> Result<Vec<u8>> {
@@ -1868,6 +1876,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
     )?;
     let name = reader.read_bytes(name_len)?.to_vec();
     let mut file = FileHeader {
+        cut_short: false,
         block: parsed.block.clone(),
         file_flags,
         rewrite_metadata_complete: reader.pos == reader.range.end,
@@ -2625,6 +2634,20 @@ where
                     }
                     HEAD_END => TruncatedBlock::End,
                     HEAD_FILE if options.salvages() => match parse_file_header_bytes(&parsed) {
+                        // Salvage offers what is left of a member that isn't
+                        // split, to decode as far as it goes.
+                        Ok(mut file)
+                            if options.salvage
+                                && !file.is_split_before()
+                                && !file.is_split_after() =>
+                        {
+                            let name = file.name.clone();
+                            file.block.data_range.end = sfx_offset + archive_len;
+                            file.cut_short = true;
+                            crypto_headers.push((blocks.len(), pos));
+                            blocks.push(Block::File(file));
+                            TruncatedBlock::Member(name)
+                        }
                         Ok(file) => TruncatedBlock::Member(file.name),
                         // A damaged header whose fields run on into its data.
                         Err(error) if options.salvage => {
@@ -5525,6 +5548,7 @@ mod tests {
     #[test]
     fn file_header_name_bytes_preserve_non_utf8_names() {
         let file = FileHeader {
+            cut_short: false,
             block: BlockHeader {
                 header_crc: 0,
                 header_size: 0,

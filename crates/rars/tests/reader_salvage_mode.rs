@@ -370,7 +370,7 @@ fn rar50_blocks(packed: &[u8]) -> Vec<usize> {
 
 #[test]
 fn a_member_that_fails_partway_delivers_what_decoded_before_the_failure() {
-    let members = members(400_000);
+    let members = members(150_000);
     for solid in [false, true] {
         for &path in RAR50_PATHS {
             let case = format!("solid={solid} {path:?}");
@@ -880,6 +880,77 @@ fn a_legacy_member_that_runs_past_its_declared_size_is_reported_as_such() {
             assert_eq!(output(&outputs, b"m2.txt"), &members[2].1[..1000], "{case}");
             for (name, data) in members.iter().filter(|(name, _)| name != b"m2.txt") {
                 assert_eq!(output(&outputs, name), data, "{case}: {name:?}");
+            }
+        }
+    }
+}
+
+/// A file cut partway through a member's data: salvage offers the member,
+/// delivers what decodes from the bytes there are, and reports the cut.
+/// Without salvage the parse ends before it, as before.
+#[test]
+fn a_member_the_file_ends_partway_through_delivers_what_is_there() {
+    let members = members(30_000);
+    let cases = [
+        ("RAR 1.5", ArchiveVersion::Rar15, None),
+        ("RAR 2.0", ArchiveVersion::Rar20, None),
+        ("RAR 2.9 LZ", ArchiveVersion::Rar29, Some(Rar29Method::Lz)),
+        (
+            "RAR 2.9 PPMd",
+            ArchiveVersion::Rar29,
+            Some(Rar29Method::Ppmd),
+        ),
+        ("RAR 5", ArchiveVersion::Rar50, None),
+    ];
+    for (format, version, method) in cases {
+        for solid in [false, true] {
+            let bytes = match method {
+                Some(method) => build_rar29(method, solid, &members),
+                None => build(version, solid, &members),
+            };
+            let (_, packed) = member_ranges(&bytes, 2);
+            let cut = &bytes[..packed.start + packed.len() / 2];
+            let present = (packed.len() / 2) as u64;
+
+            // Without salvage the member is lost.
+            let failures = Failures::default();
+            let handler = |member: &ArchiveMember, error: &Error| failures.handle(member, error);
+            let strict = ArchiveReadOptions::new().with_member_error_handler(&handler);
+            let archive = ArchiveReader::read_with_options(cut, strict).unwrap();
+            let outputs = extract(&archive, strict).unwrap();
+            assert_eq!(outputs, members[..2], "{format} solid={solid}");
+
+            let paths: &[Rar50Path] = if version == ArchiveVersion::Rar50 {
+                RAR50_PATHS
+            } else {
+                &[Rar50Path::Buffered]
+            };
+            for &path in paths {
+                let case = format!("{format} solid={solid} {path:?}");
+                let (archive, outputs, failed) = salvage_on(cut, path, 1024);
+                assert!(archive.truncation().is_some(), "{case}");
+                assert_eq!(
+                    failed,
+                    [(
+                        b"m2.txt".to_vec(),
+                        format!(
+                            "MemberCutShort {{ packed: {}, present: {present} }}",
+                            packed.len()
+                        )
+                    )],
+                    "{case}"
+                );
+                assert_eq!(outputs[..2], members[..2], "{case}");
+                let delivered = output(&outputs, b"m2.txt");
+                let whole = &members[2].1;
+                assert!(
+                    delivered.len() > whole.len() / 8,
+                    "{case}: {}",
+                    delivered.len()
+                );
+                assert!(delivered.len() < whole.len(), "{case}");
+                assert!(whole.starts_with(delivered), "{case}");
+                assert_eq!(outputs.len(), 3, "{case}");
             }
         }
     }

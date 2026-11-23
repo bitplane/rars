@@ -254,6 +254,14 @@ pub enum Error {
     MemberRanPastDeclaredSize {
         declared: u64,
     },
+    /// The archive's file ends `present` bytes into a member's `packed`
+    /// bytes of data. Reported only under `ArchiveReadOptions::salvage`,
+    /// after what decoded from those bytes was delivered; otherwise parsing
+    /// ends before the member.
+    MemberCutShort {
+        packed: u64,
+        present: u64,
+    },
     Codec(crate::codec::Error),
     Rar3Recovery(crate::recovery::rar3::Error),
     Rar5Recovery(crate::recovery::rar5::Error),
@@ -401,6 +409,10 @@ impl std::fmt::Display for Error {
             Self::MemberRanPastDeclaredSize { declared } => write!(
                 f,
                 "its data runs past its declared {declared} bytes; only those were delivered"
+            ),
+            Self::MemberCutShort { packed, present } => write!(
+                f,
+                "the archive ends {present} bytes into its {packed} bytes of data"
             ),
             Self::Codec(error) => write!(f, "{error}"),
             Self::Rar3Recovery(error) => write!(f, "{error}"),
@@ -561,6 +573,7 @@ impl Error {
             | Self::VolumeOutOfOrder
             | Self::MemberEndedEarly { .. }
             | Self::MemberRanPastDeclaredSize { .. }
+            | Self::MemberCutShort { .. }
             | Self::Codec(_)
             | Self::Rar3Recovery(_)
             | Self::Rar5Recovery(_)
