@@ -38,26 +38,94 @@ pub fn unrars_main() {
 /// `unrars` command runs through this.
 #[doc(hidden)]
 pub fn unrars_run(args: impl IntoIterator<Item = OsString>) -> i32 {
+    STDOUT_CLOSED.store(false, Ordering::Relaxed);
     let code = match parse(args) {
         Ok(Some(invocation)) => run(&invocation),
         Ok(None) => {
-            print!("{}", usage());
+            write_stdout(format_args!("{}", usage()));
             OK
         }
         Err(Refused::Usage) => {
-            print!("{}", usage());
+            write_stdout(format_args!("{}", usage()));
             USAGE
         }
         Err(Refused::Switch(switch)) => {
-            eprintln!(
-                "ERROR: unrars does not support the -{} switch yet",
+            write_stderr(format_args!(
+                "ERROR: unrars does not support the -{} switch yet\n",
                 String::from_utf8_lossy(&switch)
-            );
+            ));
             USAGE
         }
     };
-    let _ = std::io::stdout().flush();
+    if let Err(error) = std::io::stdout().flush() {
+        note_stdout_error(&error);
+    }
+    if stdout_closed() {
+        return BROKEN_PIPE;
+    }
     code
+}
+
+/// The status unrar ends with when the reader of its stdout goes away: it
+/// dies of SIGPIPE, which a shell reports as 128 + 13. Raising the signal
+/// needs `unsafe`, so this exits with the number instead.
+const BROKEN_PIPE: i32 = 141;
+
+/// Set once whatever reads stdout has closed it. The run then writes
+/// nothing more, to stdout or stderr, and stops.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+
+fn stdout_closed() -> bool {
+    STDOUT_CLOSED.load(Ordering::Relaxed)
+}
+
+fn note_stdout_error(error: &std::io::Error) {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        STDOUT_CLOSED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Writes to stdout, noting a closed pipe rather than panicking as `print!` does.
+fn write_stdout(text: std::fmt::Arguments<'_>) {
+    if stdout_closed() {
+        return;
+    }
+    if let Err(error) = std::io::stdout().lock().write_fmt(text) {
+        note_stdout_error(&error);
+    }
+}
+
+/// Writes to stderr, quietly once stdout is gone, and never panicking.
+fn write_stderr(text: std::fmt::Arguments<'_>) {
+    if !stdout_closed() {
+        let _ = std::io::stderr().lock().write_fmt(text);
+    }
+}
+
+/// `p`'s output: stdout, which stops the run once its reader has gone.
+struct PrintedMember;
+
+impl Write for PrintedMember {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if stdout_closed() {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        std::io::stdout()
+            .write(bytes)
+            .inspect_err(note_stdout_error)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::stdout().flush().inspect_err(note_stdout_error)
+    }
+}
+
+/// Fails a member's open once stdout is gone, so the run stops there.
+fn check_stdout() -> rars::Result<()> {
+    if stdout_closed() {
+        return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe).into());
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -454,15 +522,15 @@ impl Out {
     /// Listings and the banner, which `-idq` leaves alone.
     fn print(self, text: std::fmt::Arguments<'_>) {
         if self.stderr_only {
-            eprint!("{text}");
+            write_stderr(text);
         } else {
-            print!("{text}");
+            write_stdout(text);
         }
     }
 
     fn error(self, line: &str) {
         if !self.silent {
-            eprintln!("{line}");
+            write_stderr(format_args!("{line}\n"));
         }
     }
 }
@@ -514,9 +582,15 @@ fn run(invocation: &Invocation) -> i32 {
     // Volumes already read as part of a set an earlier archive started.
     let mut read = HashSet::new();
     for path in archive_paths(&invocation.archive) {
+        if stdout_closed() {
+            return BROKEN_PIPE;
+        }
         if !read.contains(&path) {
             run_archive(invocation, out, &path, &mut password, &mut tally, &mut read);
         }
+    }
+    if stdout_closed() {
+        return BROKEN_PIPE;
     }
     if tally.errors > 0 {
         out.info(&format!("Total errors: {}", tally.errors));
@@ -672,7 +746,7 @@ fn prompt_password(name: Option<&str>) -> Option<Password> {
         let line = rpassword::prompt_password(prompt).ok()?;
         return Some(Zeroizing::new(line.into_bytes()));
     }
-    eprint!("{prompt}");
+    write_stderr(format_args!("{prompt}"));
     let _ = std::io::stderr().flush();
     let mut line = Zeroizing::new(String::new());
     match std::io::stdin().read_line(&mut line) {
@@ -1551,7 +1625,10 @@ enum Answer {
 /// volume is there.
 fn ask_for_volume(out: Out, next: &Path) -> Answer {
     if !out.silent {
-        eprint!("\nInsert disk with {} [C]ontinue, [Q]uit ", next.display());
+        write_stderr(format_args!(
+            "\nInsert disk with {} [C]ontinue, [Q]uit ",
+            next.display()
+        ));
         let _ = std::io::stderr().flush();
     }
     let mut answer = String::new();
@@ -1729,6 +1806,7 @@ where
         volumes,
         options.with_member_error_handler(&handler),
         |meta| {
+            check_stdout()?;
             let mut state = state.borrow_mut();
             state.discard_failed(&failures.take_failed());
             if !failures.wanted.choose(&meta.name) {
@@ -1844,9 +1922,10 @@ where
         volumes,
         options.with_member_error_handler(&handler),
         |meta| {
+            check_stdout()?;
             let chosen = visit(meta);
             Ok(if chosen && command == Command::Print {
-                Box::new(std::io::stdout()) as Box<dyn Write>
+                Box::new(PrintedMember) as Box<dyn Write>
             } else {
                 Box::new(std::io::sink())
             })
