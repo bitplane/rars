@@ -8,6 +8,67 @@ mod scratch;
 mod solid_ahead;
 #[path = "volumes.rs"]
 mod volumes;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[path = "write_lane.rs"]
+mod write_lane;
+#[cfg(not(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+)))]
+mod write_lane {
+    use super::{Archive, DecoderSession, FileHeader, Redirections, Settling};
+    use crate::codec::workspace::Budget;
+    use crate::error::Result;
+    use crate::output_limit::OutputBudget;
+    use std::convert::Infallible;
+    use std::marker::PhantomData;
+
+    pub(super) struct Decoded<'f, B>(Infallible, PhantomData<&'f B>);
+
+    /// Never started without threads to write on.
+    pub(super) struct Lane<'s, 'a, 'f, B>(Infallible, PhantomData<(&'s Settling<'a>, &'f B)>);
+
+    impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
+        pub(super) fn start(
+            _: Option<&'s Settling<'a>>,
+            _: bool,
+            _: crate::ArchiveReadOptions<'_>,
+            _: &OutputBudget,
+        ) -> Option<Self> {
+            None
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn decode(
+            &self,
+            _: &Archive,
+            _: &'f FileHeader,
+            _: crate::ArchiveReadOptions<'_>,
+            _: Redirections,
+            _: u64,
+            _: &OutputBudget,
+            _: &mut DecoderSession<'_, B>,
+        ) -> Option<Decoded<'f, B>> {
+            match self.0 {}
+        }
+
+        pub(super) fn write(
+            &mut self,
+            _: Decoded<'f, B>,
+            _: crate::ArchiveReadOptions<'_>,
+            _: &OutputBudget,
+        ) -> Option<Result<()>> {
+            match self.0 {}
+        }
+
+        pub(super) fn settle(&mut self, _: &OutputBudget) -> Option<(&'f FileHeader, Result<()>)> {
+            match self.0 {}
+        }
+    }
+}
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
 use crate::codec::rar50::{
     DecodeMode, DecodedChunk, HistoryRetention, ReaderState, StreamDecodeError, FILTER_THREAD_BYTES,
@@ -23,6 +84,7 @@ use crate::member_batches::{self, Plan};
 use crate::output_pipeline::{self, PipeError};
 use crate::volume_extract::VolumeFeed;
 use std::io::{Read, Write};
+use write_lane::Lane;
 
 // Members at or below this boundary use the buffered path, while larger members
 // stream once. The streaming decoder applies filters in place and rejects only a
@@ -44,6 +106,14 @@ mod solid_ahead_tests;
 #[cfg(all(test, feature = "write"))]
 #[path = "streaming_checks_tests.rs"]
 mod streaming_checks_tests;
+#[cfg(all(
+    test,
+    feature = "write",
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[path = "write_lane_tests.rs"]
+mod write_lane_tests;
 
 impl FileHeader {
     fn check_output_limit(&self, budget: &crate::output_limit::OutputBudget) -> Result<()> {
@@ -1085,13 +1155,18 @@ impl Archive {
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
-        let mut session =
-            DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
-        session.decoder.read_control = budget.control.clone();
-        session.scratch = options.rar50_scratch;
+        let new_session = |control: &crate::read_control::ReadControl| {
+            let mut session =
+                DecoderSession::with_allowance(options.password, buffered_decode_limit, allowance);
+            session.decoder.read_control = control.clone();
+            session.scratch = options.rar50_scratch;
+            session
+        };
+        let mut session = new_session(&budget.control);
         let archive_solid =
             self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0);
         let solid = selector.is_some() && archive_solid;
+        let mut lane = Lane::start(settling, selector.is_some(), options, &budget);
         let files: Vec<&FileHeader> = self.files().collect();
         for (index, &file) in files.iter().enumerate() {
             let selected = crate::extraction_control::select(
@@ -1110,57 +1185,99 @@ impl Archive {
                 None => None,
             };
             session.read_ahead(self, &files, index);
-            let result = (|| {
-                options.check_cancelled()?;
-                file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
-                if let Some(redirection) = file
-                    .redirection
-                    .as_ref()
-                    .filter(|_| redirections.redirects(file))
-                {
-                    if selected_writer.is_some() {
-                        return Err(file.entry_error(
-                            "selecting",
-                            Error::UnsupportedFeature {
-                                version: crate::ArchiveVersion::Rar50,
-                                feature: "extracting redirections through extraction control",
-                            },
-                        ));
+            let decoded = lane
+                .as_ref()
+                .filter(|_| selected_writer.is_none())
+                .and_then(|lane| {
+                    lane.decode(
+                        self,
+                        file,
+                        options,
+                        redirections,
+                        buffered_decode_limit,
+                        &budget,
+                        &mut session,
+                    )
+                });
+            // The member on the lane settles before anything of this one is seen.
+            if let Some((written, result)) = lane.as_mut().and_then(|lane| lane.settle(&budget)) {
+                finish_solid_member(
+                    &mut on_error,
+                    options,
+                    written,
+                    archive_solid,
+                    result,
+                    &mut session,
+                    || new_session(&budget.control),
+                )?;
+            }
+            let result = match decoded {
+                Some(decoded) => {
+                    match lane
+                        .as_mut()
+                        .expect("decoded on the lane")
+                        .write(decoded, options, &budget)
+                    {
+                        Some(result) => result,
+                        None => continue,
                     }
-                    if redirections == Redirections::Emit {
-                        options.check_cancelled()?;
-                        redirect(&file.metadata(), redirection)?;
-                        options.check_cancelled()?;
-                    }
-                    return Ok(());
                 }
-                self.stream_member(file, options, &mut budget, &mut session, |meta| {
-                    match selected_writer {
-                        Some(writer) => Ok(writer),
-                        None => open(meta),
-                    }
-                })
-            })();
-            let result = settled(settling, result);
-            match crate::extraction_control::finish_member(
+                None => {
+                    let result = (|| {
+                        options.check_cancelled()?;
+                        file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
+                        if let Some(redirection) = file
+                            .redirection
+                            .as_ref()
+                            .filter(|_| redirections.redirects(file))
+                        {
+                            if selected_writer.is_some() {
+                                return Err(file.entry_error(
+                                    "selecting",
+                                    Error::UnsupportedFeature {
+                                        version: crate::ArchiveVersion::Rar50,
+                                        feature:
+                                            "extracting redirections through extraction control",
+                                    },
+                                ));
+                            }
+                            if redirections == Redirections::Emit {
+                                options.check_cancelled()?;
+                                redirect(&file.metadata(), redirection)?;
+                                options.check_cancelled()?;
+                            }
+                            return Ok(());
+                        }
+                        self.stream_member(file, options, &mut budget, &mut session, |meta| {
+                            match selected_writer {
+                                Some(writer) => Ok(writer),
+                                None => open(meta),
+                            }
+                        })
+                    })();
+                    settled(settling, result)
+                }
+            };
+            finish_solid_member(
                 &mut on_error,
                 options,
-                || crate::rar50_member(file),
+                file,
                 archive_solid,
                 result,
-            )? {
-                Some(crate::extraction_control::Resume::Fresh) => {
-                    session = DecoderSession::with_allowance(
-                        options.password,
-                        buffered_decode_limit,
-                        allowance,
-                    );
-                    session.decoder.read_control = budget.control.clone();
-                    session.scratch = options.rar50_scratch;
-                }
-                Some(crate::extraction_control::Resume::Solid) => session.passed_over(),
-                None => {}
-            }
+                &mut session,
+                || new_session(&budget.control),
+            )?;
+        }
+        if let Some((written, result)) = lane.as_mut().and_then(|lane| lane.settle(&budget)) {
+            finish_solid_member(
+                &mut on_error,
+                options,
+                written,
+                archive_solid,
+                result,
+                &mut session,
+                || new_session(&budget.control),
+            )?;
         }
         options.check_cancelled()?;
         Ok(crate::ExtractionOutcome::Complete)
@@ -1738,6 +1855,31 @@ impl Settling<'_> {
     }
 }
 
+/// Hands a failed member to the error handler and carries the session on as it chose.
+fn finish_solid_member<'a, B: Budget>(
+    on_error: &mut Option<&mut crate::extraction_control::ErrorHandler<'_>>,
+    options: crate::ArchiveReadOptions<'_>,
+    file: &FileHeader,
+    archive_solid: bool,
+    result: Result<()>,
+    session: &mut DecoderSession<'a, B>,
+    fresh: impl FnOnce() -> DecoderSession<'a, B>,
+) -> Result<()> {
+    let resume = crate::extraction_control::finish_member(
+        on_error,
+        options,
+        || crate::rar50_member(file),
+        archive_solid,
+        result,
+    )?;
+    match resume {
+        Some(crate::extraction_control::Resume::Fresh) => *session = fresh(),
+        Some(crate::extraction_control::Resume::Solid) => session.passed_over(),
+        None => {}
+    }
+    Ok(())
+}
+
 /// Settles the member a path writing on this thread opened, if it opened one.
 fn settled(settling: Option<&Settling<'_>>, result: Result<()>) -> Result<()> {
     let Some(settling) = settling else {
@@ -1948,12 +2090,29 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         if file.should_stream_decode(self.buffered_decode_limit) {
             return self.stream_file_to(archive, file, writer);
         }
+        let (data, verified) = self.decode_checked(archive, file, history, writer)?;
+        writer
+            .write_all(&data)
+            .map_err(Error::from)
+            .map_err(|error| file.entry_error("writing", error))?;
+        verified
+    }
+
+    /// A buffered member's output, when it is to be written, and the result
+    /// to report once it has been.
+    fn decode_checked(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+        history: HistoryRetention,
+        salvaged: &mut dyn Write,
+    ) -> Result<(Buffer<u8, B>, Result<()>)> {
         let decoded = match self.decoded_file_data(archive, file, history) {
             Ok(decoded) => decoded,
             Err(error) => {
                 // Salvage delivers what decoded before the failure.
                 if let Some(partial) = self.decoder.take_salvaged() {
-                    writer
+                    salvaged
                         .write_all(&partial)
                         .map_err(Error::from)
                         .map_err(|error| file.entry_error("writing", error))?;
@@ -1970,16 +2129,18 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         );
         // A whole member that strict sizes fail is still written, and
         // salvage writes every member.
-        if verified.as_ref().is_err_and(|error| {
-            !matches!(error, Error::MemberEndedEarly { .. }) && !self.decoder.read_control.salvage()
-        }) {
-            return verified.map_err(|error| file.entry_error("verifying", error));
+        match verified {
+            Err(error)
+                if !matches!(error, Error::MemberEndedEarly { .. })
+                    && !self.decoder.read_control.salvage() =>
+            {
+                Err(file.entry_error("verifying", error))
+            }
+            verified => Ok((
+                decoded.data,
+                verified.map_err(|error| file.entry_error("verifying", error)),
+            )),
         }
-        writer
-            .write_all(&decoded.data)
-            .map_err(Error::from)
-            .map_err(|error| file.entry_error("writing", error))?;
-        verified.map_err(|error| file.entry_error("verifying", error))
     }
 
     fn stream_file_to(
