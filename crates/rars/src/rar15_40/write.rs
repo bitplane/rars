@@ -3797,6 +3797,13 @@ fn rar20_encode_options_for_options(options: WriterOptions) -> Result<Rar20Encod
         .with_max_match_distance(dictionary_size_for_options(options)?))
 }
 
+/// RAR 1.5 levels. Level 5 takes the priced parse RAR 1.4's level 5 has,
+/// since the two formats share the coder. Over the bench corpus it packs 3.5%
+/// smaller than the greedy parse level 5 had, and WinRAR 1.54's own archive
+/// of a text corpus 2.0% smaller where the greedy parse was 3.6% larger. One
+/// thread on 4 MiB inputs, it takes 2.4 to 3.2 times as long on binaries and
+/// 3.6 to 6.1 times on text, the same time RAR 1.4's level 5 takes; the greedy
+/// parse ran at level 4's speed.
 fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOptions> {
     let level = level.unwrap_or(5);
     match level {
@@ -3820,7 +3827,7 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOption
         4 => Ok(Rar15EncodeOptions::new()
             .with_lazy_matching(false)
             .with_max_long_match_distance(24 * 1024)),
-        5 => Ok(Rar15EncodeOptions::new().with_lazy_matching(false)),
+        5 => Ok(Rar15EncodeOptions::new().with_priced_parse(true)),
         _ => Err(Error::InvalidArgument(
             "RAR compression level must be in the range 0..5",
         )),
@@ -7555,6 +7562,21 @@ mod tests {
         );
         options.target = crate::ArchiveVersion::Rar30;
         assert!(super::validate_plan(options, shape, true, false).is_ok());
+    }
+
+    #[test]
+    fn rar15_level_five_alone_takes_the_priced_parse() {
+        let priced = |level| {
+            super::rar15_encode_options_for_level(level).unwrap()
+                == super::rar15_encode_options_for_level(level)
+                    .unwrap()
+                    .with_priced_parse(true)
+        };
+        assert!(priced(Some(5)));
+        assert!(priced(None));
+        for level in 0..5 {
+            assert!(!priced(Some(level)), "level {level}");
+        }
     }
 
     #[test]

@@ -60,7 +60,7 @@ fn level_sensitive_payload() -> Vec<u8> {
 }
 
 const RARS_GENERATED_FIXTURE_BYTES: &[(&str, usize, u32)] = &[
-    ("comments.rar", 133, 0x5694_01c1),
+    ("comments.rar", 134, 0x611f_64b3),
     ("compressed.rar", 87, 0x13ca_0571),
     ("encrypted.rar", 87, 0x04af_0eb7),
     ("solid.rar", 153, 0x8deb_98d1),

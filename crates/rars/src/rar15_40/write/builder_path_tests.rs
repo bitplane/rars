@@ -224,7 +224,7 @@ fn seekable_archives_match_fingerprints_captured_from_master() {
     }
     let expected = [
         ("Rar15_stored", "140205:92f2a959"),
-        ("Rar15_compressed", "112488:a05f666f"),
+        ("Rar15_compressed", "111093:306171e8"),
         ("Rar40_stored", "140212:db64ba84"),
         ("Rar40_compressed", "106764:65dd24f6"),
         ("Rar40_encrypted_headers", "106888:17bc5604"),
