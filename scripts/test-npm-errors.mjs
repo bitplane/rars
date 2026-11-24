@@ -40,6 +40,30 @@ assert.equal(missing.details.systemCode, "ENOENT");
 assert.equal(missing.details.syscall, "open");
 console.log("npm worker error-code and context checks passed");
 
+// A set opened by path names the volume it didn't find when that one is the missing one,
+// but not for volumes arriving from the caller, nor for another volume.
+for (const [extra, index, named] of [[{}, 1, true], [{ volumeFeed: {} }, 1, false], [{}, 2, false]]) {
+  let dispatch;
+  const replies = [];
+  class Archive {
+    test() {
+      throw Object.assign(new Error("in volume 2: volume is missing"), { code: "MISSING_VOLUME",
+        details: { contexts: [{ kind: "volume", index }], volumeIndex: index } });
+    }
+    free() {}
+  }
+  startWorker({ onMessage(callback) { dispatch = callback; }, post(message) { replies.push(structuredClone(message)); } },
+    { RarFile: Archive }, {});
+  await dispatch({ id: 1, operation: "test", payload: { sources: [new Uint8Array([0])],
+    volumeNotFound: { index: 1, path: "set.part2.rar" }, ...extra } });
+  const { error } = replies.find((reply) => reply.error);
+  assert.equal(error.code, "MISSING_VOLUME");
+  assert.equal(error.details.volumeIndex, index);
+  assert.equal(error.details.path, named ? "set.part2.rar" : undefined);
+  assert.equal(error.message, `in volume 2: volume is missing${named ? ": set.part2.rar" : ""}`);
+}
+console.log("npm missing-volume naming checks passed");
+
 // Every reader operation owns one parsed archive and frees it on success/failure.
 for (const operation of ["read", "readMany", "test", "readComment"]) {
   for (const fails of [false, true]) {

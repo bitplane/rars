@@ -33,6 +33,12 @@ reads its own payload by index. In a volume set, `entry.volumeIndex` is the
 volume the entry starts in, counting the first as 0. The archive says where it
 sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
 `volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
+Pass `salvage: true` to `open()` to read what survives of a damaged archive.
+`archive.truncation` says where the file ends early, `headerDamage` lists the
+damaged headers salvage read past, and `incompleteMembers` the split members it
+left out of a volume set.
+`entry.bytes()`, `readMany()`, `test()` and `extractAll()` take `onMemberError`,
+called with each member that fails instead of failing the call.
 `entry.readComment()` returns the comment attached to an entry, or undefined.
 `entry.isLink` says whether it is a link, and `entry.readLink()` returns its raw
 target from the headers without following it.
@@ -191,15 +197,18 @@ doesn't cover your inputs, runtime overhead, reading or rewrite staging.
 ```js
 const written = await archive.extractAll("out", { overwrite: "rename" });
 const one = await archive.get("docs/readme.txt").extract("out");
+const damaged = await RarArchive.open("damaged.rar", { salvage: true });
+await damaged.extractAll("out", { onMemberError: (error) => console.log(error.member, error.code), keepBroken: true });
 ```
 
 `extractAll()` decodes in one pass and writes each file only once it has been
 verified, under paths the core checks stay inside the directory. An existing
 file is refused unless `overwrite` is `true`, or kept with the new one written
 beside it as `name(N).ext` under `"rename"`. `members` selects entries,
-`flatten: true` drops stored directories, and `restoreTimes` (on by default)
-sets modification times. Symbolic links, hard links and file copies are written
-too, under the same overwrite rules. A symbolic link that could lead outside the
+`flatten: true` drops stored directories, `restoreTimes` (on by default)
+sets modification times, and `keepBroken: true`, with `salvage` and
+`onMemberError`, keeps each failed member's file. Symbolic links, hard links
+and file copies are written too, under the same overwrite rules. A symbolic link that could lead outside the
 directory, directly or through a link already there, is skipped with an
 `UnsafeLinkWarning` process warning. It returns the files and links written.
 

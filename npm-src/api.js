@@ -156,6 +156,8 @@ export function createApi(runtime) {
       this._defaults = defaults;
       this._legacyNameEncoding = defaults.legacyNameEncoding;
       this._sources = sources;
+      // The volume a set opened by path stopped short of, to name if it turns out missing.
+      this._volumeNotFound = metadata.volumeNotFound;
       if (sources.every((source) => source?.kind === "path")) {
         this.volumePaths = Object.freeze(sources.map((source) => source.path));
       }
@@ -198,7 +200,8 @@ export function createApi(runtime) {
 
     _request(operation, payload, options) {
       assertOpen(this);
-      return runtime.request(operation, { sources: this._sources, ...payload }, options);
+      return runtime.request(operation,
+        { sources: this._sources, volumeNotFound: this._volumeNotFound, ...payload }, options);
     }
 
     /**

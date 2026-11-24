@@ -597,6 +597,56 @@ await check("custom RAR 3 VM programs run only when allowed", async () => {
     (error) => error.code === "INVALID_OPTION");
 });
 
+await check("a missing volume rejects with MISSING_VOLUME, its index and, by path, its name", async () => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-missing-"));
+  try {
+    for (const version of ["rar20", "rar29", "rar50"]) {
+      const writer = new RarWriter({ version, level: 0, volumeSize: 4096 });
+      for (let index = 0; index < 4; index++) {
+        writer.add(`m${index}.bin`, new Uint8Array(3000).map((_, at) => (at * 31 + index) & 255));
+      }
+      const name = version === "rar50" ? `${version}.part1.rar` : `${version}.rar`;
+      const paths = await writer.writeTo(path.join(directory, name));
+      assert.ok(paths.length > 3);
+      const parts = await Promise.all(paths.map(async (file) => new Uint8Array(await readFile(file))));
+      // The second volume, then the third, gone: a first volume left alone, and a run of two.
+      for (const missing of [1, 2]) {
+        await rm(paths[missing]);
+        const inputs = [["path", paths[0], paths[missing]], ["bytes", parts[0], undefined],
+          ["volumes", parts.slice(0, missing), undefined]];
+        for (const [kind, input, named] of inputs) {
+          const label = `${version}, volume ${missing} missing, from ${kind}`;
+          const index = kind === "bytes" ? 1 : missing;
+          const refused = (error) => {
+            assert.ok(error instanceof RarError, label);
+            assert.equal(error.code, "MISSING_VOLUME", `${label}: ${error.message}`);
+            assert.equal(error.details.volumeIndex, index, label);
+            assert.equal(error.details.path, named, label);
+            if (named) assert.ok(error.message.endsWith(`: ${named}`), label);
+            return true;
+          };
+          const archive = await RarArchive.open(input);
+          if (kind === "path") assert.deepEqual(archive.volumePaths, paths.slice(0, missing), label);
+          // A volume on its own still reads what it holds whole.
+          if (kind === "bytes" || missing === 1) {
+            assert.equal((await archive.entries[0].bytes()).length, 3000, label);
+          }
+          const cut = archive.entries.find((entry) => entry.isSplitAfter);
+          assert.ok(cut, label);
+          await assert.rejects(cut.bytes(), refused);
+          await assert.rejects(archive.readMany(archive.entries), refused);
+          await assert.rejects(archive.test(), refused);
+          await assert.rejects(archive.extractAll(path.join(directory, `${version}-${missing}-${kind}`)), refused);
+          archive.close();
+        }
+        await writeFile(paths[missing], parts[missing]);
+      }
+    }
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 await check("volumes out of order reject with VOLUME_ORDER and the volume's index", async () => {
   const payload = new Uint8Array(180000).fill(5);
   const outOfOrder = (error) => error instanceof RarError && error.code === "VOLUME_ORDER"
