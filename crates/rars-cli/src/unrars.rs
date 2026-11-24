@@ -202,8 +202,7 @@ struct Invocation {
     include: Vec<Vec<u8>>,
     /// `-x`: never members these masks select.
     exclude: Vec<Vec<u8>>,
-    /// `-ap`: only members under this path in the archive, extracted
-    /// without it.
+    /// `-ap`: members under this path in the archive are extracted without it.
     inside: Option<Vec<u8>>,
     /// `-ad`: extract into a directory named after the archive.
     archive_directory: bool,
@@ -218,14 +217,17 @@ struct Invocation {
 }
 
 impl Invocation {
-    /// Whether the masks, `-n`, `-x` and `-ap` select a member.
+    /// Whether the masks, `-n` and `-x` select a member. As with unrar, `-ap`
+    /// leaves out only the directory it names; members outside it are
+    /// extracted where they are.
     fn selects(&self, name: &[u8]) -> bool {
         selected(&self.masks, name)
             && (self.include.is_empty() || selected(&self.include, name))
             && !(!self.exclude.is_empty() && selected(&self.exclude, name))
-            && self.inside.as_ref().is_none_or(|inside| {
-                strip_inside(inside, name).is_some_and(|rest| !rest.is_empty())
-            })
+            && self
+                .inside
+                .as_ref()
+                .is_none_or(|inside| strip_inside(inside, name).is_none_or(|rest| !rest.is_empty()))
     }
 
     /// The name a member is written under: without the `-ap` path.
@@ -484,7 +486,7 @@ Switches
   -vp     Ask before each later volume, and wait for the answer on stdin
   -x<f>   Exclude files matching <f>; -x@<list> for a list of masks
   -n<f>   Include only files matching <f>; -n@<list> for a list of masks
-  -ap<p>  Only files under <p> in the archive, extracted without it
+  -ap<p>  Extract files under <p> in the archive without it
   -ad     Extract into a directory named after the archive
   -ep     Extract without paths, as e does
   -op<p>  Extract into <p>
@@ -565,9 +567,20 @@ struct Tally {
     code: i32,
     /// Archives that had members to work on.
     worked: usize,
+    /// Stdin closed while unrar would still be asking on it: the run stops.
+    aborted: bool,
 }
 
 impl Tally {
+    /// Stops the run because stdin closed while asking on it, as unrar does.
+    /// `gap` is the blank lines unrar leaves before saying so.
+    fn abort(&mut self, out: Out, gap: &str) {
+        out.error("Read error in the file stdin");
+        out.info(&format!("{gap}Program aborted"));
+        self.fail(READ_ERROR);
+        self.aborted = true;
+    }
+
     fn fail(&mut self, code: i32) {
         if self.code == OK || (self.code == WARNING && code != OK) {
             self.code = code;
@@ -609,9 +622,15 @@ fn run(invocation: &Invocation) -> i32 {
         if !read.contains(&path) {
             run_archive(invocation, out, &path, &mut password, &mut tally, &mut read);
         }
+        if tally.aborted {
+            break;
+        }
     }
     if stdout_closed() {
         return BROKEN_PIPE;
+    }
+    if tally.aborted {
+        return tally.code;
     }
     if tally.errors > 0 {
         out.info(&format!("Total errors: {}", tally.errors));
@@ -640,9 +659,10 @@ fn run_archive(
 ) {
     let may_ask = invocation.password == PasswordSwitch::Unset;
     let mut path = path.to_path_buf();
-    let mut archive = match open_archive(&path, password, may_ask) {
-        Ok(archive) => archive,
-        Err(error) => {
+    let mut archive = match open_archive(out, &path, password, may_ask) {
+        Err(StdinClosed) => return tally.abort(out, "\n\n"),
+        Ok(Ok(archive)) => archive,
+        Ok(Err(error)) => {
             if let Some(code) = report_open_failure(out, &path, &error) {
                 tally.fail(code);
             }
@@ -659,8 +679,17 @@ fn run_archive(
     if !listing && archive.is_first_volume() == Some(false) {
         let first = first_volume(&path, &archive).filter(|first| first.is_file());
         if let Some(first) = first {
-            match open_archive(&first, password, may_ask) {
-                Ok(first_archive) if first_archive.is_first_volume() == Some(true) => {
+            match open_archive(out, &first, password, may_ask) {
+                Err(StdinClosed) => return tally.abort(out, "\n\n"),
+                Ok(Ok(first_archive)) if first_archive.is_first_volume() == Some(true) => {
+                    // unrar names the volume it was given before going back.
+                    match invocation.command {
+                        Command::Extract { .. } => {
+                            out.info(&format!("\nExtracting from {}", path.display()));
+                        }
+                        Command::Test => out.info(&format!("\nTesting archive {}", path.display())),
+                        _ => {}
+                    }
                     read.insert(path);
                     path = first;
                     archive = first_archive;
@@ -670,12 +699,38 @@ fn run_archive(
         }
     }
     let path = path.as_path();
+    if !listing {
+        // The archive comment, then the first volume's line, come before
+        // any password prompt for a member, as unrar prints them.
+        if matches!(invocation.command, Command::Extract { .. } | Command::Test) {
+            let given = password.as_deref().map(Vec::as_slice);
+            if let Some(comment) = comment_text(&archive, given) {
+                out.info(&format!("\nArchive comment:\n{comment}"));
+            }
+        }
+        announce(out, invocation.command, path);
+    }
     if may_ask && !listing && password.is_none() {
         let locked = archive
             .members()
             .find(|member| member.meta.is_encrypted && invocation.selects(&member.meta.name));
         if let Some(member) = locked {
-            *password = prompt_password(Some(&display_name(&member.meta.name)));
+            let name = display_name(&member.meta.name);
+            *password = prompt_password(Some(&name));
+            // unrar asks again while the password fails the member's check.
+            let file = archive
+                .as_rar50()
+                .and_then(|archive| archive.files().find(|file| file.name == member.meta.name));
+            while let (Some(given), Some(file)) = (password.as_deref(), file) {
+                if file.password_matches(given).ok().flatten() != Some(false) {
+                    break;
+                }
+                incorrect_password(out);
+                *password = prompt_password(Some(&name));
+                if password.is_none() {
+                    return tally.abort(out, "\n");
+                }
+            }
         }
     }
     match invocation.command {
@@ -790,23 +845,47 @@ fn salvaging(invocation: &Invocation, archive: &Archive) -> bool {
         || !archive.header_damage().is_empty()
 }
 
+/// Stdin closed while asking again for a password.
+struct StdinClosed;
+
+/// Opens an archive, asking for the password its headers need if it may, and
+/// asking again, as unrar does, while the password given is wrong.
 fn open_archive(
+    out: Out,
     path: &Path,
     password: &mut Option<Password>,
     may_ask: bool,
-) -> rars::Result<Archive> {
+) -> Result<rars::Result<Archive>, StdinClosed> {
     let read =
         |password: &Option<Password>| read_archive(path, password.as_deref().map(Vec::as_slice));
     match read(password) {
         Err(error) if may_ask && password.is_none() && needs_password(&error) => {
-            let name = path.file_name().unwrap_or(path.as_os_str());
-            *password = prompt_password(Some(&name.to_string_lossy()));
+            let name = path.as_os_str().to_string_lossy();
+            *password = prompt_password(Some(&name));
             if password.is_none() {
-                return Err(error);
+                return Ok(Err(error));
             }
-            read(password)
+            loop {
+                match read(password) {
+                    Err(error) if error.kind() == ErrorKind::BadPassword => {
+                        incorrect_password(out);
+                        *password = prompt_password(Some(&name));
+                        if password.is_none() {
+                            return Err(StdinClosed);
+                        }
+                    }
+                    result => return Ok(result),
+                }
+            }
         }
-        result => result,
+        result => Ok(result),
+    }
+}
+
+/// What unrar says before asking again for a password that was wrong.
+fn incorrect_password(out: Out) {
+    if !out.silent {
+        write_stderr(format_args!("\nThe specified password is incorrect."));
     }
 }
 
@@ -851,6 +930,17 @@ fn report_open_failure(out: Out, path: &Path, error: &rars::Error) -> Option<i32
         ErrorKind::UnsupportedFormat | ErrorKind::InvalidArchive => {
             out.error(&format!("{} is not RAR archive", path.display()));
             None
+        }
+        // RAR 1.5-4 headers carry no password check, so unrar can't tell a
+        // wrong password from damage.
+        ErrorKind::PasswordRequired | ErrorKind::BadPassword
+            if detected_family(path) == Some(rars::ArchiveFamily::Rar15To40) =>
+        {
+            out.error(&format!(
+                "Checksum error in the encrypted file {}. Corrupt file or wrong password.",
+                path.display()
+            ));
+            Some(CHECKSUM)
         }
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             out.error(&format!("Incorrect password for {}", path.display()));
@@ -903,21 +993,8 @@ fn list_volumes(
     tally: &mut Tally,
 ) {
     if style != ListStyle::Bare {
-        let options = ArchiveReadOptions::with_optional_password(password);
-        if let Ok(Some(comment)) = archive.comment_with_options(options) {
-            // Its lines as written, without control codes a terminal would act on.
-            let comment: String = String::from_utf8_lossy(&comment)
-                .chars()
-                .map(|c| {
-                    if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
-                        '?'
-                    } else {
-                        c
-                    }
-                })
-                .collect();
-            let newline = if comment.ends_with('\n') { "" } else { "\n" };
-            out.print(format_args!("\nArchive comment:\n{comment}{newline}\n"));
+        if let Some(comment) = comment_text(&archive, password) {
+            out.print(format_args!("\nArchive comment:\n{comment}\n"));
         }
     }
     let mut totals = Totals::default();
@@ -966,14 +1043,78 @@ fn list_volumes(
             ListStyle::Technical { .. } | ListStyle::Bare => {}
         }
     }
-    if style != ListStyle::Bare {
+    if !matches!(style, ListStyle::Bare | ListStyle::Technical { .. }) {
         out.print(format_args!("\n"));
     }
 }
 
+/// The archive comment as unrar shows it: control codes as they are, except
+/// escape, which shows as `'\033'`, and the C1 controls, which show as `?`,
+/// so the comment can't drive a terminal.
+fn comment_text(archive: &Archive, password: Option<&[u8]>) -> Option<String> {
+    let options = ArchiveReadOptions::with_optional_password(password);
+    let comment = archive.comment_with_options(options).ok()??;
+    let text = utf16_comment(archive.family(), &comment)
+        .unwrap_or_else(|| String::from_utf8_lossy(&comment).into_owned());
+    Some(shown_comment(&text))
+}
+
+/// Escape as unrar shows it, and C1 controls (U+0080–U+009F) as `?`: some
+/// terminals act on those, U+009B in particular, without an escape byte.
+fn shown_comment(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\u{1b}' => shown.push_str("'\\033'"),
+            '\u{80}'..='\u{9f}' => shown.push('?'),
+            c => shown.push(c),
+        }
+    }
+    shown
+}
+
+/// A RAR 3 comment written as UTF-16, as RAR 3.x on Linux writes it: an even
+/// number of bytes, at least half of whose high bytes are zero, which text in
+/// any byte encoding doesn't have.
+fn utf16_comment(family: rars::ArchiveFamily, bytes: &[u8]) -> Option<String> {
+    if family != rars::ArchiveFamily::Rar15To40
+        || bytes.is_empty()
+        || !bytes.len().is_multiple_of(2)
+    {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| u16::from_le_bytes(pair))
+        .collect();
+    let narrow = units.iter().filter(|&&unit| unit < 0x100).count();
+    if narrow * 2 < units.len() {
+        return None;
+    }
+    Some(
+        String::from_utf16_lossy(&units)
+            .trim_end_matches('\0')
+            .to_string(),
+    )
+}
+
 /// What `l` shows of an archive whose headers need a password it hasn't got.
 fn list_locked_headers(out: Out, path: &Path) {
-    let family = std::fs::File::open(path)
+    let format = match detected_family(path) {
+        Some(rars::ArchiveFamily::Rar50Plus) => "RAR 5",
+        _ => "RAR 1.5",
+    };
+    out.print(format_args!(
+        "\nArchive: {}\nDetails: {format}, encrypted headers\n  0 files\n\n",
+        path.display()
+    ));
+}
+
+/// The format family an archive's signature names, read from its start.
+fn detected_family(path: &Path) -> Option<rars::ArchiveFamily> {
+    std::fs::File::open(path)
         .and_then(|file| {
             use std::io::Read;
             let mut prefix = Vec::new();
@@ -982,15 +1123,7 @@ fn list_locked_headers(out: Out, path: &Path) {
         })
         .ok()
         .and_then(|prefix| ArchiveReader::detect(&prefix).ok())
-        .map(|signature| signature.family);
-    let format = match family {
-        Some(rars::ArchiveFamily::Rar50Plus) => "RAR 5",
-        _ => "RAR 4",
-    };
-    out.print(format_args!(
-        "\nArchive: {}\nDetails: {format}, encrypted headers\n  0 files\n\n",
-        path.display()
-    ));
+        .map(|signature| signature.family)
 }
 
 /// Lists one archive or volume, returning what the files that start in it
@@ -1030,7 +1163,9 @@ fn list(
     ));
     match style {
         ListStyle::Technical { all } => {
-            list_technical(out, archive, &members, all);
+            list_technical(out, archive, &members, all, &|name| {
+                invocation.selects(name)
+            });
             return totals;
         }
         ListStyle::Verbose => {
@@ -1134,16 +1269,61 @@ fn member_crc(member: rars::ArchiveMemberRef<'_>) -> Option<(u32, bool)> {
 
 /// `lt`: a block of fields for each member, and with `lta` for each RAR 5
 /// service block too.
-fn list_technical(out: Out, archive: &Archive, members: &[rars::ArchiveMemberRef<'_>], all: bool) {
-    for member in members {
-        technical_entry(out, *member, false);
-    }
-    if all {
-        if let Some(archive) = archive.as_rar50() {
-            for service in archive.services() {
-                technical_entry(out, rars::ArchiveMemberRef::Rar50Plus(service), true);
+fn list_technical(
+    out: Out,
+    archive: &Archive,
+    members: &[rars::ArchiveMemberRef<'_>],
+    all: bool,
+    selects: &dyn Fn(&[u8]) -> bool,
+) {
+    // As unrar does, `lta` lists services where they are among the files,
+    // then the archive's end.
+    let ended = match archive {
+        Archive::Rar50Plus(archive) if all => {
+            let mut ended = false;
+            for block in &archive.blocks {
+                match block {
+                    rars::rar50::Block::File(file) if selects(&file.name) => {
+                        technical_entry(out, rars::ArchiveMemberRef::Rar50Plus(file), false);
+                    }
+                    rars::rar50::Block::Service(service) => {
+                        technical_entry(out, rars::ArchiveMemberRef::Rar50Plus(service), true);
+                    }
+                    rars::rar50::Block::End(_) => ended = true,
+                    _ => {}
+                }
             }
+            ended
         }
+        Archive::Rar15To40(archive) if all => {
+            let mut ended = false;
+            for block in &archive.blocks {
+                match block {
+                    rars::rar15_40::Block::File(file) if selects(&file.name) => {
+                        technical_entry(out, rars::ArchiveMemberRef::Rar15To40(file), false);
+                    }
+                    rars::rar15_40::Block::NewSub(service) => {
+                        technical_entry(
+                            out,
+                            rars::ArchiveMemberRef::Rar15To40(&service.file),
+                            true,
+                        );
+                    }
+                    rars::rar15_40::Block::End(_) => ended = true,
+                    _ => {}
+                }
+            }
+            ended
+        }
+        _ => {
+            for member in members {
+                technical_entry(out, *member, false);
+            }
+            false
+        }
+    };
+    if ended {
+        out.print(format_args!("{:>12}: EOF\n\n", "Service"));
     }
 }
 
@@ -1181,10 +1361,22 @@ fn technical_entry(out: Out, member: rars::ArchiveMemberRef<'_>, service: bool) 
         field("Packed size", &meta.packed_size);
         field("Ratio", &split_ratio(&meta));
     }
-    if let Some((year, month, day, hour, minute, second)) = meta
-        .stored_modification_time()
-        .and_then(|time| time.local_calendar_fields())
-    {
+    if let rars::ArchiveMemberRef::Rar50Plus(file) = member {
+        if let Ok(Some(record)) = file.recovery_record() {
+            field("RR%", &format!("{}%", record.percent));
+        }
+    }
+    let calendar = match member {
+        // unrar reads a DOS time of 0, which services have, as day 0 of
+        // month 0 of 1980.
+        rars::ArchiveMemberRef::Rar15To40(file) if file.file_time == 0 => {
+            Some((1979, 11, 30, 0, 0, 0))
+        }
+        _ => meta
+            .stored_modification_time()
+            .and_then(|time| time.local_calendar_fields()),
+    };
+    if let Some((year, month, day, hour, minute, second)) = calendar {
         let nanoseconds = meta
             .modification_time()
             .map_or(0, rars::Timestamp::nanoseconds);
@@ -1195,11 +1387,16 @@ fn technical_entry(out: Out, member: rars::ArchiveMemberRef<'_>, service: bool) 
             ),
         );
     }
-    if !service {
+    if service {
+        field("Attributes", &".B");
+    } else {
         field("Attributes", &attributes(&meta));
     }
     if !meta.is_directory {
+        // A part that goes on into the next volume has the checksum of its
+        // packed data.
         match member_crc(member) {
+            Some((crc, _)) if meta.is_split_after => field("Pack-CRC32", &format!("{crc:08X}")),
             Some((crc, true)) => field("CRC32 MAC", &format!("{crc:08X}")),
             Some((crc, false)) => field("CRC32", &format!("{crc:08X}")),
             None => {}
@@ -1289,7 +1486,7 @@ fn dictionary_size(bytes: u64) -> String {
 fn details(archive: &Archive) -> String {
     let mut details = vec![match archive.family() {
         rars::ArchiveFamily::Rar13 => "RAR 1.4".to_string(),
-        rars::ArchiveFamily::Rar15To40 => "RAR 4".to_string(),
+        rars::ArchiveFamily::Rar15To40 => "RAR 1.5".to_string(),
         rars::ArchiveFamily::Rar50Plus => "RAR 5".to_string(),
         _ => "RAR".to_string(),
     }];
@@ -1529,12 +1726,8 @@ fn run_members(
     let options = ArchiveReadOptions::with_optional_password(password)
         .with_salvage(salvaging(invocation, archive));
     let command = invocation.command;
-    let announce = move |volume: &Path| match command {
-        Command::Extract { .. } => out.info(&format!("\nExtracting from {}\n", volume.display())),
-        Command::Test => out.info(&format!("\nTesting archive {}\n", volume.display())),
-        _ => {}
-    };
-    announce(path);
+    let announce = move |volume: &Path| announce(out, command, volume);
+    // The first volume's line is already out.
     read.insert(path.to_path_buf());
     let wanted = Wanted::new(invocation);
     wanted.note_versions(archive);
@@ -1600,6 +1793,13 @@ fn run_members(
             }
         }),
     };
+    // A split member a missing volume cut short, which unrar reports too.
+    let cut = match &result {
+        Err(error) if missing_volume(error).is_some() && !stdin_closed.load(Ordering::Relaxed) => {
+            progress.cut_short()
+        }
+        _ => None,
+    };
     progress.stop();
     read.extend(
         later_volumes
@@ -1629,20 +1829,29 @@ fn run_members(
                 tally.worked += 1;
             }
         }
-        Err(_) if stdin_closed.into_inner() => {
-            out.error("Read error in the file stdin");
-            out.info("Program aborted");
-            tally.fail(READ_ERROR);
-            tally.worked += 1;
-        }
+        Err(_) if stdin_closed.into_inner() => tally.abort(out, ""),
         Err(error) => {
             tally.errors += 1;
             tally.fail(report_failure(out, archive, path, &error));
+            if let Some(member) = cut {
+                out.error(&format!("{:<20} - checksum error", display_name(&member)));
+                tally.errors += 1;
+            }
             if header_errors > 0 {
                 tally.fail(CHECKSUM);
             }
             tally.worked += 1;
         }
+    }
+}
+
+/// The line that starts each volume's members: `Extracting from` or
+/// `Testing archive`.
+fn announce(out: Out, command: Command, volume: &Path) {
+    match command {
+        Command::Extract { .. } => out.info(&format!("\nExtracting from {}\n", volume.display())),
+        Command::Test => out.info(&format!("\nTesting archive {}\n", volume.display())),
+        _ => {}
     }
 }
 
@@ -1792,6 +2001,9 @@ where
         archive.family(),
     );
     state.skip_existing = policy == OverwritePolicy::Never;
+    // As with unrar, a later member on the same path replaces an earlier one,
+    // as `-ap` can make happen.
+    state.overwrite_repeats = true;
     let published = Arc::clone(progress);
     state.on_published = Some(Box::new(move |output: &ExtractedOutput| {
         published.published(&output.meta.name, &output.path);
@@ -1879,6 +2091,15 @@ where
                 progress.pass(&meta.name);
                 return Ok(());
             }
+            let link = match link {
+                rars::ExtractedLink::HardLink { target } => rars::ExtractedLink::HardLink {
+                    target: invocation.output_name(target),
+                },
+                rars::ExtractedLink::FileCopy { target } => rars::ExtractedLink::FileCopy {
+                    target: invocation.output_name(target),
+                },
+                link => link,
+            };
             let before = state.outputs.len();
             failures.callback(state.create_link(&written(invocation, meta), link))?;
             opened(&state, before, &meta.name, true);
@@ -2162,6 +2383,14 @@ fn missing_volume(error: &rars::Error) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comments_cannot_drive_a_terminal() {
+        assert_eq!(
+            super::shown_comment("a\u{1b}[2Jb\u{9b}2Jc\td\n"),
+            "a'\\033'[2Jb?2Jc\td\n"
+        );
+    }
+
     use super::*;
 
     fn invocation(args: &[&str]) -> Invocation {

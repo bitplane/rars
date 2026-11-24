@@ -1302,6 +1302,9 @@ struct ExtractOutputState<'a> {
     skipped_unnamed: usize,
     /// Leaves a file already at its destination alone instead of failing (`unrars -o-`).
     skip_existing: bool,
+    /// Lets members that land on one path overwrite each other with
+    /// [`OverwritePolicy::Always`], as flattening does (`unrars -o+`).
+    overwrite_repeats: bool,
     /// Members `skip_existing` left alone.
     kept_existing: usize,
     /// Members outside this set are decoded but not written.
@@ -1367,6 +1370,7 @@ impl<'a> ExtractOutputState<'a> {
             skipped_links: 0,
             skipped_unnamed: 0,
             skip_existing: false,
+            overwrite_repeats: false,
             kept_existing: 0,
             selected: None,
             on_published: None,
@@ -1744,10 +1748,12 @@ impl<'a> ExtractOutputState<'a> {
             .map_err(|error| refused_output(error, member))
     }
 
-    /// Whether a later member may land where an earlier one did: beside it, or over it when flattening.
+    /// Whether a later member may land where an earlier one did: beside it,
+    /// or over it when flattening or [`Self::overwrite_repeats`] allows.
     fn repeats_allowed(&self) -> bool {
         self.overwrite == OverwritePolicy::Rename
-            || (self.flatten && self.overwrite == OverwritePolicy::Always)
+            || ((self.flatten || self.overwrite_repeats)
+                && self.overwrite == OverwritePolicy::Always)
     }
 
     /// Where a member goes, refusing a symlink on the way. With the output
@@ -1810,7 +1816,8 @@ impl<'a> ExtractOutputState<'a> {
 
     fn reserve_output_path(&mut self, path: PathBuf) -> rars::Result<()> {
         if !self.planned_paths.insert(path)
-            && !(self.flatten && self.overwrite != OverwritePolicy::Never)
+            && !((self.flatten || self.overwrite_repeats)
+                && self.overwrite != OverwritePolicy::Never)
         {
             return Err(rars::Error::InvalidHeader(
                 "multiple archive entries map to the same output path",

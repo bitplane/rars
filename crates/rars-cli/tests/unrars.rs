@@ -682,12 +682,13 @@ fn masks_select_as_unrar_does() {
     }
 }
 
-/// A member for [`rar5_by_hand`]: name, data, file version, compression info.
-type HandMember<'a> = (&'a [u8], &'a [u8], Option<u64>, u64);
+/// A member for [`rar5_by_hand`]: name, data, one extra record (its type and
+/// body, or nothing), compression info.
+type HandMember<'a> = (&'a [u8], &'a [u8], &'a [u8], u64);
 
 /// A RAR 5 archive of members with the given headers, built by hand for
-/// headers rars doesn't write: file version records, or compression methods
-/// from later versions. Each member's CRC32 is of its data.
+/// headers rars doesn't write: file version records, hard links, or
+/// compression methods from later versions. Each member's CRC32 is of its data.
 fn rar5_by_hand(path: &Path, members: &[HandMember<'_>]) {
     fn vint(mut value: u64, out: &mut Vec<u8>) {
         loop {
@@ -709,14 +710,11 @@ fn rar5_by_hand(path: &Path, members: &[HandMember<'_>]) {
     }
     let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
     block(&[1, 0, 0], &mut bytes);
-    for &(name, data, version, compression) in members {
+    for &(name, data, record, compression) in members {
         let mut extra = Vec::new();
-        if let Some(version) = version {
-            // Type 4, no flags, then the version number.
-            let mut record = vec![4, 0];
-            vint(version, &mut record);
+        if !record.is_empty() {
             vint(record.len() as u64, &mut extra);
-            extra.extend_from_slice(&record);
+            extra.extend_from_slice(record);
         }
         // A file header with a data area, and an extra area if there is one.
         let mut header = vec![2];
@@ -749,9 +747,10 @@ fn write_versions(path: &Path) {
     rar5_by_hand(
         path,
         &[
-            (b"v.txt", b"one\n", Some(1), 0),
-            (b"v.txt", b"two\n", None, 0),
-            (b"x;1", b"semi\n", None, 0),
+            // Type 4, no flags, then the version number.
+            (b"v.txt", b"one\n", &[4, 0, 1], 0),
+            (b"v.txt", b"two\n", &[], 0),
+            (b"x;1", b"semi\n", &[], 0),
         ],
     );
 }
@@ -904,8 +903,8 @@ fn an_unknown_method_is_reported_as_unrar_does() {
     rar5_by_hand(
         &dir.join("new.rar"),
         &[
-            (b"a.txt", &[0; 64], None, 5 | 1 << 7),
-            (b"b.txt", b"plain\n", None, 0),
+            (b"a.txt", &[0; 64], &[], 5 | 1 << 7),
+            (b"b.txt", b"plain\n", &[], 0),
         ],
     );
     let output = unrars(&dir, &["x", "new.rar", "out/"]);
@@ -1143,8 +1142,18 @@ fn selection_and_destination_switches() {
             "nx",
             &["a.txt", "sub/a.txt", "sub/b.txt"],
         ),
-        (&["-apsub"], "ap", &["a.txt", "b.txt", "deeper/a.txt"]),
-        (&["-ap/sub/"], "ap2", &["a.txt", "b.txt", "deeper/a.txt"]),
+        // As with unrar, members outside the -ap path are extracted where
+        // they are; sub/a.txt meets the root a.txt, which stays (no -y).
+        (
+            &["-apsub"],
+            "ap",
+            &["a.txt", "b.txt", "deeper/a.txt", "info.nfo"],
+        ),
+        (
+            &["-ap/sub/"],
+            "ap2",
+            &["a.txt", "b.txt", "deeper/a.txt", "info.nfo"],
+        ),
         (&["-ad", "-x*.txt"], "ad", &["tree/info.nfo"]),
         (&["-ep", "-o+"], "ep", &["a.txt", "b.txt", "info.nfo"]),
     ] {
@@ -1162,6 +1171,11 @@ fn selection_and_destination_switches() {
         assert_eq!(files_under(&dir.join(out)), files, "{switches:?}");
     }
     assert_eq!(fs::read(dir.join("ap/b.txt")).unwrap(), b"sub/b.txt");
+    assert_eq!(fs::read(dir.join("ap/a.txt")).unwrap(), b"a.txt");
+    // With -y the later member on that path replaces the earlier.
+    let output = unrars(&dir, &["x", "-idq", "-y", "-apsub", "tree.rar", "apy/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(fs::read(dir.join("apy/a.txt")).unwrap(), b"sub/a.txt");
 
     let list = dir.join("excluded.lst");
     fs::write(&list, "*.nfo\r\nsub\n").unwrap();
@@ -1636,4 +1650,147 @@ fn or_names_the_renamed_file_on_its_line() {
         "{text}"
     );
     assert_eq!(fs::read(dir.join("out/a(1).txt")).unwrap(), b"hello\n");
+}
+
+/// The member a missing volume cut short is reported after the volume, and
+/// counted, as unrar does. Its line ends with five spaces.
+#[test]
+fn a_missing_volume_names_the_member_it_cuts() {
+    let dir = scratch::case("unrars-missing-volume-member");
+    let count = write_set(&dir);
+    fs::remove_file(dir.join(format!("set.part{count}.rar"))).unwrap();
+    let output = unrars(&dir, &["t", "set.part1.rar"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "Cannot find volume set.part{count}.rar\n{:<20} - checksum error\n",
+            "big.bin"
+        )
+    );
+    let raw = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(raw.contains("%     \nTotal errors: 2\n"), "{raw:?}");
+}
+
+/// A password piped in that fails a RAR 5 member's password check is asked
+/// for again, as unrar does; stdin closing then stops the run.
+#[test]
+fn a_wrong_piped_password_is_asked_for_again() {
+    let dir = scratch::case("unrars-password-again");
+    write(&dir, "enc.rar", Some(b"secret"));
+    let output = unrars_with_input(&dir, &["x", "-y", "enc.rar", "out/"], b"wrong\nsecret\n");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        "\nEnter password (will not be echoed) for a.txt: \
+         \nThe specified password is incorrect.\
+         \nEnter password (will not be echoed) for a.txt: "
+    );
+    assert_eq!(fs::read(dir.join("out/sub/b.bin")).unwrap(), payload());
+
+    let output = unrars_with_input(&dir, &["x", "-y", "enc.rar", "none/"], b"wrong\n");
+    assert_eq!(output.status.code(), Some(12), "{}", stderr(&output));
+    assert!(stderr(&output).ends_with("Read error in the file stdin\n"));
+    assert!(
+        stdout(&output).ends_with("\n\nProgram aborted\n"),
+        "{}",
+        stdout(&output)
+    );
+    assert!(!dir.join("none/a.txt").exists());
+
+    // With -p the password is asked for once, as unrar does.
+    let output = unrars_with_input(
+        &dir,
+        &["x", "-y", "-p", "enc.rar", "once/"],
+        b"wrong\nsecret\n",
+    );
+    assert_eq!(output.status.code(), Some(11), "{}", stderr(&output));
+
+    // Encrypted headers too.
+    builder(Some(b"secret"))
+        .header_encryption(true)
+        .write_to_path(&dir.join("henc.rar"), None)
+        .unwrap();
+    let output = unrars_with_input(&dir, &["lb", "henc.rar"], b"wrong\nsecret\n");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).contains("\nThe specified password is incorrect."));
+    assert_eq!(stdout(&output), "a.txt\nsub\nsub/b.bin\n");
+}
+
+/// RAR 1.5-4 archives are "RAR 1.5" to unrar, and `lta` lists services where
+/// they are and ends with the archive's end.
+#[test]
+fn technical_listings_end_as_unrar_does() {
+    let dir = scratch::case("unrars-lta");
+    write_three(&dir.join("old.rar"), ArchiveVersion::Rar29);
+    let output = unrars(&dir, &["l", "old.rar"]);
+    assert!(
+        stdout(&output).contains("\nDetails: RAR 1.5\n"),
+        "{}",
+        stdout(&output)
+    );
+
+    let mut builder = builder(None).comment(Some(b"note\n".to_vec()));
+    builder
+        .add_bytes(b"z.txt".to_vec(), b"z\n".to_vec(), None, None)
+        .unwrap();
+    builder.write_to_path(&dir.join("full.rar"), None).unwrap();
+    let raw = |args: &[&str]| String::from_utf8(unrars(&dir, args).stdout).unwrap();
+    let all = raw(&["lta", "-idc", "full.rar"]);
+    assert!(all.ends_with("\n\n     Service: EOF\n\n"), "{all:?}");
+    // The comment's service comes before the files, as it is in the archive.
+    let comment = all
+        .find("        Name: CMT\n        Type: Service\n")
+        .unwrap();
+    assert!(
+        comment < all.find("        Name: a.txt\n").unwrap(),
+        "{all}"
+    );
+    assert!(all[comment..].contains("  Attributes: .B\n"), "{all}");
+    let plain = raw(&["lt", "-idc", "full.rar"]);
+    assert!(!plain.contains("Service"), "{plain}");
+    assert!(
+        plain.ends_with("\n\n") && !plain.ends_with("\n\n\n"),
+        "{plain:?}"
+    );
+}
+
+/// `-ap` takes its path off a hard link's target as it does off the link.
+#[test]
+fn ap_rewrites_hard_link_targets() {
+    let dir = scratch::case("unrars-ap-hard-link");
+    // Redirection record: type 5, hard link (4), no flags, then the target.
+    let mut link = vec![5, 4, 0, 9];
+    link.extend_from_slice(b"sub/x.txt");
+    rar5_by_hand(
+        &dir.join("links.rar"),
+        &[
+            (b"sub/x.txt", b"shared\n", &[], 0),
+            (b"sub/y.txt", b"", &link, 0),
+            (b"a.txt", b"root\n", &[], 0),
+        ],
+    );
+    let output = unrars(&dir, &["x", "-y", "-apsub", "links.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(files_under(&dir.join("out")), ["a.txt", "x.txt", "y.txt"]);
+    assert_eq!(fs::read(dir.join("out/y.txt")).unwrap(), b"shared\n");
+}
+
+/// Archive comments show as unrar shows them, before the members in `x` and
+/// `t` too: control codes as they are, except escape.
+#[test]
+fn comments_show_as_unrar_shows_them() {
+    let dir = scratch::case("unrars-comment-codes");
+    builder(None)
+        .comment(Some(b"bell\x07 \x1b[31mred\x1b[0m\n".to_vec()))
+        .write_to_path(&dir.join("c.rar"), None)
+        .unwrap();
+    let shown = "\nArchive comment:\nbell\x07 '\\033'[31mred'\\033'[0m\n\n";
+    let listed = String::from_utf8(unrars(&dir, &["l", "-idc", "c.rar"]).stdout).unwrap();
+    assert!(listed.starts_with(shown), "{listed:?}");
+    let tested = String::from_utf8(unrars(&dir, &["t", "-idc", "c.rar"]).stdout).unwrap();
+    assert!(
+        tested.starts_with(&format!("{shown}\nTesting archive c.rar\n")),
+        "{tested:?}"
+    );
 }
