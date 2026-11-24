@@ -1476,6 +1476,10 @@ fn unrars_into_closed_pipe(dir: &Path, args: &[&str], keep: usize) -> (Option<i3
 
 /// Issue #574: a reader that closes stdout early ends the run quietly, with
 /// the status a shell gives a process SIGPIPE kills, never a panic.
+///
+/// Every command must write well past any pipe buffer (64 KiB by default,
+/// up to 1 MiB on a resized Linux pipe), or it can finish and exit 0 before
+/// the reader closes the pipe (#591). The names alone come to about 4 MB.
 #[cfg(unix)]
 #[test]
 fn a_closed_stdout_ends_the_run_quietly() {
@@ -1485,10 +1489,14 @@ fn a_closed_stdout_ends_the_run_quietly() {
     builder
         .add_bytes(b"big.bin".to_vec(), big, None, None)
         .unwrap();
-    for index in 0..3000 {
+    // Long names rather than more members: the builder's duplicate check is
+    // quadratic. Components stay short of eCryptfs' 143-byte name limit, and
+    // the index comes first so that check stops early.
+    let pad = "n".repeat(100);
+    for index in 0..10_000 {
         builder
             .add_bytes(
-                format!("many/{index:04}.txt").into_bytes(),
+                format!("many/{index:05}/{pad}/{pad}/{pad}/{pad}.txt").into_bytes(),
                 b"x\n".to_vec(),
                 None,
                 None,
