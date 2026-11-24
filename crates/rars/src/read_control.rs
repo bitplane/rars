@@ -3,7 +3,7 @@ use crate::{Error, Result};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 
 /// A shared one-way cancellation signal for archive readers.
@@ -70,6 +70,9 @@ pub(crate) struct ReadControl(
     /// also bounds how far a stream that runs past its declared size is
     /// decoded on into the window.
     Option<u64>,
+    /// What custom RAR 3 filter programs may still run in this operation,
+    /// across all its members; set when they may run at all.
+    Option<Arc<Mutex<crate::codec::rarvm::VmWork>>>,
 );
 
 /// Whether RAR 3 decoding may run filter programs other than the six
@@ -110,6 +113,9 @@ impl ReadControl {
         let mut control = Self::new(options.cancellation);
         if options.allow_rar3_vm_programs {
             control.1 = Rar3VmPrograms::Run;
+            control.6 = Some(Arc::new(Mutex::new(
+                crate::codec::rarvm::VmWork::with_floor(crate::codec::rarvm::VM_WORK_ARCHIVE_FLOOR),
+            )));
         }
         control.2 = options
             .rar50_decode_workers
@@ -183,6 +189,23 @@ impl ReadControl {
     pub(crate) fn set_rar3_vm_programs(&mut self, programs: Rar3VmPrograms) {
         self.1 = programs;
     }
+    /// Makes this control draw custom VM program work from the same
+    /// operation-wide budget as `other`, for members decoded under controls
+    /// of their own.
+    pub(crate) fn share_vm_work(&mut self, other: &Self) {
+        self.6.clone_from(&other.6);
+    }
+    /// Runs `f` on the operation-wide custom VM program budget, if there is
+    /// one.
+    pub(crate) fn with_vm_work<T>(
+        &self,
+        f: impl FnOnce(&mut crate::codec::rarvm::VmWork) -> T,
+    ) -> Option<T> {
+        self.6.as_ref().map(|work| {
+            let mut work = work.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            f(&mut work)
+        })
+    }
     pub(crate) fn new(token: Option<&ReadCancellation>) -> Self {
         Self(
             token.map(|token| {
@@ -196,6 +219,7 @@ impl ReadControl {
             Rar3VmPrograms::Refuse,
             DecodeWorkers::Serial,
             false,
+            None,
             None,
             None,
         )

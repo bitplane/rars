@@ -19,7 +19,7 @@ pub mod rar50;
 #[cfg(fuzzing)]
 pub mod rarvm;
 #[cfg(not(fuzzing))]
-mod rarvm;
+pub(crate) mod rarvm;
 pub(crate) mod workspace;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -33,6 +33,11 @@ pub enum Error {
     /// A RAR 2.9-4.x stream defines a filter program other than the six
     /// standard ones, and running such programs was not enabled.
     Rar3VmProgramRefused,
+    /// Custom RAR 2.9-4.x filter programs ran more instructions than the
+    /// bytes they filter allow; see `rarvm::VmWork`. Like a single run that
+    /// reaches its own limit, this is invalid data: no archive WinRAR wrote
+    /// comes near it.
+    Rar3VmWorkLimitExceeded,
     WorkspaceLimitExceeded(Box<WorkspaceLimitError>),
     /// An error carried by a reader or writer, including typed library errors
     /// transported through `io::Error`. Successful decoding allocates no
@@ -59,6 +64,11 @@ impl std::fmt::Display for Error {
             Self::Rar3VmProgramRefused => {
                 f.write_str("RAR 3 VM filter program refused: only standard filters are enabled")
             }
+            Self::Rar3VmWorkLimitExceeded => write!(
+                f,
+                "RAR 3 VM filter programs ran past their instruction budget of {} per filtered byte",
+                rarvm::VM_WORK_PER_BYTE
+            ),
             Self::WorkspaceLimitExceeded(details) => {
                 write!(f,
                 "codec workspace limit {} exceeded: owner requires {} bytes with {} bytes in use",
