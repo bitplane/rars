@@ -2377,6 +2377,59 @@ fn ppmd_match_finder_uses_the_declared_dictionary_past_one_megabyte() {
     );
 }
 
+/// Escape searches walk several chains in turn, a few positions ahead alone
+/// and a batch ahead on the pool. Each must find what a search there alone
+/// finds, so a member codes to the same bytes on any thread count.
+#[test]
+#[cfg(feature = "parallel")]
+fn ppmd_escape_searches_find_alike_together_and_on_any_thread_count() {
+    // Members of a few seeds, cut at varying lengths: repeats from 32 bytes to
+    // past 255, near and far, among lines that match nothing.
+    let mut input = Vec::new();
+    for i in 0..900u64 {
+        let member = related_text_member(i % 5, 3 + (i % 11) as usize);
+        input.extend_from_slice(&member[..member.len() - (i % 7) as usize]);
+        input.extend_from_slice(&related_text_member(1000 + i, 2));
+    }
+    // Past a batch at eight threads, so batches meet inside it.
+    assert!(input.len() > 256 * 1024, "{}", input.len());
+
+    let mut finder = super::PpmdMatchFinder::new(input.len());
+    for pos in 0..input.len() {
+        finder.insert(&input, pos);
+    }
+    let finder = super::FilledAhead(&finder);
+    let alone: Vec<_> = (0..input.len())
+        .map(|pos| {
+            best_ppmd_match(&input, pos, &finder, MAX_HISTORY)
+                .map(|(length, offset)| (length as u8, offset as u32))
+        })
+        .collect();
+    assert!(alone.iter().filter(|found| found.is_some()).count() > 1000);
+    let mut together = vec![Some((0, 0)); input.len()];
+    let searched = super::best_ppmd_matches(&input, 0, &finder, MAX_HISTORY, &mut together, false);
+    assert_eq!(searched, input.len());
+    assert!(together == alone);
+    // Stopping at the first match leaves every slot before it searched.
+    let first = alone.iter().position(Option::is_some).unwrap();
+    let searched = super::best_ppmd_matches(&input, 0, &finder, MAX_HISTORY, &mut together, true);
+    assert_eq!(searched, first + 1);
+    assert!(together[..searched] == alone[..searched]);
+
+    let pool = crate::parallel::private_pool(8);
+    let packed: Vec<_> = [1, 2, 8]
+        .into_iter()
+        .map(|threads| {
+            pool.install(|| {
+                let _cap = crate::parallel::ThreadCap::set(Some(threads));
+                unpack29_encode_ppmd(&input, MAX_HISTORY).unwrap()
+            })
+        })
+        .collect();
+    assert!(packed[0] == packed[1] && packed[0] == packed[2]);
+    assert!(unpack29_decode(&packed[0], input.len()).unwrap() == input);
+}
+
 #[test]
 fn lz_encoder_uses_weighted_rar29_huffman_tables() {
     let mut input = Vec::new();

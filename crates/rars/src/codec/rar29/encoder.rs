@@ -3443,29 +3443,45 @@ impl<'a> PpmdMatchSearch<'a> {
         }
     }
 
+    /// How many positions a search alone looks ahead, so their chain walks
+    /// overlap in memory. Searches the parse skips, inside a match or a
+    /// rejection's cooldown, are the price; the result at each position is the
+    /// one a search there alone would find.
+    const LOOKAHEAD: usize = 64;
+
     /// `pos` must not go back.
     fn best(&mut self, pos: usize) -> Option<(usize, usize)> {
         debug_assert!(pos >= self.found_from);
         if pos >= self.filled {
             self.fill_from(pos);
         }
-        match self.found.get(pos - self.found_from) {
-            Some(found) => found.map(|(length, offset)| (usize::from(length), offset as usize)),
-            None => self.search(pos),
+        if pos - self.found_from >= self.found.len() {
+            self.look_ahead(pos);
         }
+        self.found[pos - self.found_from]
+            .map(|(length, offset)| (usize::from(length), offset as usize))
     }
 
-    fn search(&self, pos: usize) -> Option<(usize, usize)> {
-        best_ppmd_match(
+    /// Searches from `pos` up to [`Self::LOOKAHEAD`] positions, within what the finder holds.
+    fn look_ahead(&mut self, pos: usize) {
+        let end = pos.saturating_add(Self::LOOKAHEAD).min(self.filled);
+        self.found_from = pos;
+        self.found.clear();
+        self.found.resize(end - pos, None);
+        let searched = best_ppmd_matches(
             self.input,
             pos,
             &FilledAhead(&self.finder),
             self.max_match_distance,
-        )
+            &mut self.found,
+            true,
+        );
+        self.found.truncate(searched);
     }
 
     // Searched ahead only when other threads share the batch; alone, searches
-    // inside a match or a rejection's cooldown would be wasted.
+    // inside a match or a rejection's cooldown would be wasted, so `best`
+    // looks only a few positions ahead.
     fn fill_from(&mut self, pos: usize) {
         let end = pos.saturating_add(self.batch).min(self.input.len());
         for history_pos in self.filled..end {
@@ -3482,11 +3498,7 @@ impl<'a> PpmdMatchSearch<'a> {
         let (input, finder, distance) = (self.input, &self.finder, self.max_match_distance);
         crate::parallel::for_each_mut(&mut chunks, |index, chunk| {
             let start = pos + index * Self::CHUNK;
-            for (at, found) in chunk.iter_mut().enumerate() {
-                // An escape match is at most 255 bytes long and 4 MiB back.
-                *found = best_ppmd_match(input, start + at, &FilledAhead(finder), distance)
-                    .map(|(length, offset)| (length as u8, offset as u32));
-            }
+            best_ppmd_matches(input, start, &FilledAhead(finder), distance, chunk, false);
         });
     }
 }
@@ -3502,59 +3514,162 @@ pub(crate) fn ppmd_search_workspace(max_match_distance: usize) -> u64 {
     (links as u64 + (1 << 20)) * 4 + found as u64
 }
 
+/// The longest escape match at `pos`, nearest first on a tie: up to
+/// [`MAX_MATCH_CANDIDATES`] of its chain's candidates, probed and measured.
+#[cfg(test)]
 fn best_ppmd_match(
     input: &[u8],
     pos: usize,
     finder: &impl Candidates,
     max_match_distance: usize,
 ) -> Option<(usize, usize)> {
-    let max_offset = pos.min(0x1000001).min(MAX_HISTORY).min(max_match_distance);
-    let max_length = (input.len() - pos).min(MAX_PPMD_MATCH_LENGTH);
-    if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH {
-        return None;
+    let mut walk = PpmdWalk::start(input, pos, finder, max_match_distance)?;
+    while walk.step(input, finder) {}
+    walk.best
+}
+
+/// [`best_ppmd_match`] at each position from `start`, one per slot of `out`.
+/// Returns how many slots, from the first, hold their position's result.
+///
+/// A chain walk is a run of dependent loads into links and input too large
+/// for the cache, so one walk at a time leaves the memory system idle. Several
+/// walks stepped in turn keep that many loads in flight. Each walk takes the
+/// steps it would take alone, so the results are the same.
+///
+/// With `until_found`, the search ends at the first position with a match:
+/// the parse codes that match or cools down after it, so it searches none of
+/// the next few positions, and those walked past it are dropped.
+fn best_ppmd_matches(
+    input: &[u8],
+    start: usize,
+    finder: &impl Candidates,
+    max_match_distance: usize,
+    out: &mut [Option<(u8, u32)>],
+    until_found: bool,
+) -> usize {
+    const LANES: usize = 16;
+    let mut lanes: [Option<PpmdWalk>; LANES] = [None; LANES];
+    let (mut next, mut end) = (0, out.len());
+    loop {
+        let mut busy = false;
+        for lane in &mut lanes {
+            if let Some(walk) = lane {
+                let at = walk.pos - start;
+                if at >= end {
+                    *lane = None;
+                } else if walk.step(input, finder) {
+                    busy = true;
+                    continue;
+                } else {
+                    // An escape match is at most 255 bytes long and 4 MiB back.
+                    out[at] = walk
+                        .best
+                        .map(|(length, offset)| (length as u8, offset as u32));
+                    if until_found && walk.best.is_some() {
+                        end = end.min(at + 1);
+                    }
+                    *lane = None;
+                }
+            }
+            while next < end {
+                let pos = start + next;
+                next += 1;
+                match PpmdWalk::start(input, pos, finder, max_match_distance) {
+                    Some(walk) => {
+                        *lane = Some(walk);
+                        busy = true;
+                        break;
+                    }
+                    None => out[pos - start] = None,
+                }
+            }
+        }
+        if !busy {
+            return end;
+        }
     }
-    let mut best = None;
-    let mut checked = 0usize;
-    let mut candidate = finder.first(input, pos, pos);
-    while candidate != match_finder::NO_POSITION {
+}
+
+/// One escape search part way along its chain.
+#[derive(Clone, Copy)]
+struct PpmdWalk {
+    pos: usize,
+    max_offset: usize,
+    max_length: usize,
+    /// The next candidate, or [`match_finder::NO_POSITION`] once the search is over.
+    candidate: usize,
+    checked: usize,
+    best: Option<(usize, usize)>,
+}
+
+impl PpmdWalk {
+    /// None where no escape match can start.
+    fn start(
+        input: &[u8],
+        pos: usize,
+        finder: &impl Candidates,
+        max_match_distance: usize,
+    ) -> Option<Self> {
+        let max_offset = pos.min(0x1000001).min(MAX_HISTORY).min(max_match_distance);
+        let max_length = (input.len() - pos).min(MAX_PPMD_MATCH_LENGTH);
+        if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH {
+            return None;
+        }
+        Some(Self {
+            pos,
+            max_offset,
+            max_length,
+            candidate: finder.first(input, pos, pos),
+            checked: 0,
+            best: None,
+        })
+    }
+
+    fn stop(&mut self) -> bool {
+        self.candidate = match_finder::NO_POSITION;
+        false
+    }
+
+    /// Looks at one candidate; false once the search is over.
+    fn step(&mut self, input: &[u8], finder: &impl Candidates) -> bool {
+        let (pos, candidate) = (self.pos, self.candidate);
+        if candidate == match_finder::NO_POSITION {
+            return false;
+        }
         // MatchFinder chains contain only previously inserted positions and
         // each link moves strictly backwards.
         let offset = pos - candidate;
-        if offset > max_offset {
-            break;
+        if offset > self.max_offset {
+            return self.stop();
         }
+        self.candidate = finder.previous(candidate);
         if offset < 2 {
-            candidate = finder.previous(candidate);
-            continue;
+            return true;
         }
-        checked += 1;
+        self.checked += 1;
         // Only a candidate reaching past the current best (or the minimum) can
         // win, so probe that one byte before measuring the whole match.
-        let probe = best.map_or(MIN_PPMD_MATCH_LENGTH - 1, |(best_length, _)| best_length);
-        if input[candidate + probe] != input[pos + probe] {
-            if checked >= MAX_MATCH_CANDIDATES {
-                break;
-            }
-            candidate = finder.previous(candidate);
-            continue;
-        }
-        let length = match_length(input, pos, offset, max_length);
-        if length >= MIN_PPMD_MATCH_LENGTH
-            && best.is_none_or(|(best_length, best_offset)| {
-                length > best_length || (length == best_length && offset < best_offset)
-            })
-        {
-            best = Some((length, offset));
-            if length == max_length {
-                break;
+        let probe = self
+            .best
+            .map_or(MIN_PPMD_MATCH_LENGTH - 1, |(best_length, _)| best_length);
+        if input[candidate + probe] == input[pos + probe] {
+            let length = match_length(input, pos, offset, self.max_length);
+            if length >= MIN_PPMD_MATCH_LENGTH
+                && self.best.is_none_or(|(best_length, best_offset)| {
+                    length > best_length || (length == best_length && offset < best_offset)
+                })
+            {
+                self.best = Some((length, offset));
+                if length == self.max_length {
+                    return self.stop();
+                }
             }
         }
-        if checked >= MAX_MATCH_CANDIDATES {
-            break;
+        if self.checked >= MAX_MATCH_CANDIDATES {
+            return self.stop();
         }
-        candidate = finder.previous(candidate);
+        true
     }
-    best
 }
 
 #[cfg(test)]
