@@ -16,7 +16,7 @@ mod progress;
 mod repair;
 mod unrars;
 use rars::timestamp as time;
-pub use unrars::unrars_main;
+pub use unrars::{unrars_main, unrars_run};
 mod volumes;
 
 use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};

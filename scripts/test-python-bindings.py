@@ -130,6 +130,11 @@ def main() -> int:
         env=env,
     )
     if not args.skip_pytest:
+        # The tests compare the installed `unrars` command with the binary.
+        run(["cargo", "build", "-p", "rars-cli", "--bin", "unrars"], env=env)
+        target = Path(os.environ.get("CARGO_TARGET_DIR", ROOT / "target"))
+        exe = ".exe" if os.name == "nt" else ""
+        env["RARS_UNRARS_BIN"] = str(target / "debug" / f"unrars{exe}")
         # --basetemp keeps pytest's tmp_path fixtures off /tmp too.
         run(
             [

@@ -28,7 +28,15 @@ const BAD_PASSWORD: i32 = 11;
 
 #[doc(hidden)]
 pub fn unrars_main() {
-    let code = match parse(std::env::args_os().skip(1)) {
+    std::process::exit(unrars_run(std::env::args_os().skip(1)));
+}
+
+/// Runs `unrars` on `args`, which leave out the program name, and returns the
+/// exit code where [`unrars_main`] exits with it. The Python package's
+/// `unrars` command runs through this.
+#[doc(hidden)]
+pub fn unrars_run(args: impl IntoIterator<Item = OsString>) -> i32 {
+    let code = match parse(args) {
         Ok(Some(invocation)) => run(&invocation),
         Ok(None) => {
             print!("{}", usage());
@@ -40,7 +48,7 @@ pub fn unrars_main() {
         }
     };
     let _ = std::io::stdout().flush();
-    std::process::exit(code);
+    code
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

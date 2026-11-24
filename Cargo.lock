@@ -727,6 +727,7 @@ dependencies = [
  "libc",
  "pyo3",
  "rars",
+ "rars-cli",
 ]
 
 [[package]]

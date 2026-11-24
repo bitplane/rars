@@ -25,3 +25,4 @@ extension-module = ["pyo3/extension-module"]
 libc.workspace = true
 pyo3 = { workspace = true, features = ["abi3-py310"] }
 rars_rs = { package = "rars", version = "0.13.0", path = "../rars" }
+rars-cli = { version = "0.13.0", path = "../rars-cli" }

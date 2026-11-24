@@ -26,6 +26,11 @@ classifiers = [
     "Topic :: System :: Archiving :: Compression",
 ]
 
+# The standalone binary's code, run through the extension module. No `unrar`
+# alias: it would shadow a real unrar on PATH.
+[project.scripts]
+unrars = "rars.rars:_unrars_main"
+
 [tool.maturin]
 manifest-path = "crates/rars-python/Cargo.toml"
 module-name = "rars"
