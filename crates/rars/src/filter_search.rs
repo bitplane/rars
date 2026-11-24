@@ -58,11 +58,13 @@ const X86_ASSUMED_REGIONS: u64 = 4;
 /// container headers and trailers are not part of the sampled signal.
 pub(crate) const AUTO_DELTA_EDGE_SKIP: usize = 64;
 
-/// How much of the member the table scanner judges at a time.
+/// How much of the member the table scanner judges at a time, unless the
+/// format asks for another size (see [`OwnedSearch::table_scan_window`]).
 ///
 /// A window is the resolution of the region boundaries: a table loses at most
-/// one window at each end. Smaller windows find smaller tables and cost more
-/// scanning per member.
+/// one window at each end, and the smallest table found is two windows long.
+/// Smaller windows find smaller tables, and every table found is another
+/// sample to screen and another filter record to write.
 const TABLE_SCAN_WINDOW: usize = 16 * 1024;
 
 /// The widest record stride the table scanner looks for.
@@ -90,8 +92,8 @@ const TABLE_STRIDE_HIT_PERCENT: usize = 40;
 /// picking a harmonic.
 const TABLE_STRIDE_TIE_PERCENT: usize = 95;
 
-/// The smallest run of table-like windows worth a filter of its own.
-const MIN_TABLE_REGION: usize = 2 * TABLE_SCAN_WINDOW;
+/// How many table-like windows in a row are worth a filter of their own.
+const MIN_TABLE_WINDOWS: usize = 2;
 
 /// How many table regions the progress estimate assumes the scanner will find.
 ///
@@ -129,6 +131,12 @@ pub(crate) trait FilterSearch {
     /// format that gets this wrong proposes a filter its own writer must then
     /// refuse, and there is no safe guess to make on its behalf.
     fn max_delta_channels(&self) -> usize;
+
+    /// How much of the member the table scanner judges at a time: the
+    /// resolution its regions are found at. See [`TABLE_SCAN_WINDOW`].
+    fn table_scan_window(&self) -> usize {
+        TABLE_SCAN_WINDOW
+    }
 
     /// Cheaper settings for the screens, when ranking candidates at less than
     /// full effort ranks them the same way.
@@ -225,6 +233,10 @@ pub(crate) trait OwnedSearch {
         false
     }
     fn max_delta_channels(&self) -> usize;
+    /// See [`FilterSearch::table_scan_window`].
+    fn table_scan_window(&self) -> usize {
+        TABLE_SCAN_WINDOW
+    }
     fn screen_options(&self, options: Self::Options) -> Self::Options;
     /// Whether every finalist is encoded in full at the caller's settings and
     /// the smallest kept, rather than the finalists ranked by a trial and only
@@ -286,6 +298,9 @@ impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
     }
     fn max_delta_channels(&self) -> usize {
         self.0.max_delta_channels()
+    }
+    fn table_scan_window(&self) -> usize {
+        self.0.table_scan_window()
     }
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.0.screen_options(options)
@@ -378,6 +393,9 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     }
     fn max_delta_channels(&self) -> usize {
         self.search.max_delta_channels()
+    }
+    fn table_scan_window(&self) -> usize {
+        self.search.table_scan_window()
     }
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)
@@ -933,12 +951,15 @@ fn stride_hits(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1
 fn table_regions<B: Budget>(
     data: &[u8],
     max_stride: usize,
+    scan_window: usize,
     allowance: &B,
 ) -> Result<Buffer<(Range<usize>, usize), B>> {
     let max_stride = max_stride.min(MAX_TABLE_STRIDE);
+    // A window has to hold more than a stride's worth of bytes to be scored.
+    let scan_window = scan_window.max(2 * MAX_TABLE_STRIDE);
     let mut regions: Buffer<(Range<usize>, usize), B> = Buffer::new(allowance);
-    for start in (0..).map(|window| window * TABLE_SCAN_WINDOW) {
-        let Some(window) = data.get(start..start + TABLE_SCAN_WINDOW) else {
+    for start in (0..).map(|window| window * scan_window) {
+        let Some(window) = data.get(start..start + scan_window) else {
             break;
         };
         let Some(stride) = table_stride(window, max_stride) else {
@@ -946,9 +967,9 @@ fn table_regions<B: Budget>(
         };
         match regions.last_mut() {
             Some((last, last_stride)) if *last_stride == stride && last.end == start => {
-                last.end = start + TABLE_SCAN_WINDOW;
+                last.end = start + scan_window;
             }
-            _ => regions.try_push((start..start + TABLE_SCAN_WINDOW, stride))?,
+            _ => regions.try_push((start..start + scan_window, stride))?,
         }
     }
     // The scan steps in whole windows, so a file that is one table loses its
@@ -956,7 +977,7 @@ fn table_regions<B: Budget>(
     // different tail stays out, which is what keeps a table from swallowing
     // the bytes after it. The last region has to reach the last whole window,
     // or the tail would also cover the windows the scan rejected.
-    let whole_windows = data.len() - data.len() % TABLE_SCAN_WINDOW;
+    let whole_windows = data.len() - data.len() % scan_window;
     if let Some((last, last_stride)) = regions.last_mut() {
         if last.end == whole_windows && last.end < data.len() {
             let tail = &data[last.end..];
@@ -965,7 +986,7 @@ fn table_regions<B: Budget>(
             }
         }
     }
-    regions.retain(|(range, _)| range.len() >= MIN_TABLE_REGION);
+    regions.retain(|(range, _)| range.len() >= MIN_TABLE_WINDOWS * scan_window);
     Ok(regions)
 }
 
@@ -1136,7 +1157,12 @@ fn finalists<S: OwnedSearch>(
     let allowance = search.allowance();
     let mut finalists = Buffer::collect([(Buffer::new(allowance), screen.plain)], allowance)?;
 
-    let table_regions = table_regions(data, search.max_delta_channels(), allowance)?;
+    let table_regions = table_regions(
+        data,
+        search.max_delta_channels(),
+        search.table_scan_window(),
+        allowance,
+    )?;
     let mut tables = table_screened_regions(search, data, &table_regions, options)?;
 
     // The tables graft into every x86 finalist rather than competing against
@@ -1517,6 +1543,9 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
     }
     fn max_delta_channels(&self) -> usize {
         self.search.max_delta_channels()
+    }
+    fn table_scan_window(&self) -> usize {
+        self.search.table_scan_window()
     }
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)
@@ -1911,7 +1940,7 @@ mod tests {
             .collect()
     }
     fn delta_table_regions(data: &[u8], max_stride: usize) -> Vec<(Range<usize>, usize)> {
-        table_regions(data, max_stride, &Allowance::default())
+        table_regions(data, max_stride, TABLE_SCAN_WINDOW, &Allowance::default())
             .unwrap()
             .into_vec()
     }
@@ -3014,6 +3043,37 @@ mod tests {
         );
     }
 
+    /// One executable's relocations are a few kilobytes: too short for two
+    /// default windows, and found by a format that scans finer.
+    #[test]
+    fn a_small_table_needs_a_fine_scan_window() {
+        let table = reloc_table(200);
+        let mut data = incompressible(64 * 1024);
+        let table_start = data.len();
+        data.extend_from_slice(&table);
+        data.extend(incompressible(64 * 1024));
+
+        assert_eq!(delta_table_regions(&data, MAX_TABLE_STRIDE), vec![]);
+        let regions = table_regions(&data, MAX_TABLE_STRIDE, 256, &Allowance::default())
+            .unwrap()
+            .into_vec();
+        assert_eq!(regions.len(), 1, "{regions:?}");
+        let (region, stride) = &regions[0];
+        assert_eq!(*stride, 24);
+        // A window is the resolution either way: one that is mostly table
+        // joins it, one that is mostly noise does not.
+        let table_end = table_start + table.len();
+        assert!(
+            region.start + 256 > table_start && region.end < table_end + 256,
+            "{region:?} strays a window past the table at {table_start}..{table_end}"
+        );
+        assert!(
+            region.len() + 2 * 256 >= table.len(),
+            "{region:?} loses more than a window at each end of {} bytes",
+            table.len()
+        );
+    }
+
     #[test]
     fn a_table_keeps_the_partial_window_at_the_end_of_the_file() {
         // 2,000 records is 48,000 bytes, two scan windows plus a tail. The
@@ -3021,7 +3081,7 @@ mod tests {
         // delta would stop 15,232 bytes early and those records would be
         // stored as they are.
         let data = reloc_table(2_000);
-        assert!(data.len() > MIN_TABLE_REGION);
+        assert!(data.len() > MIN_TABLE_WINDOWS * TABLE_SCAN_WINDOW);
         assert!(!data.len().is_multiple_of(TABLE_SCAN_WINDOW));
         let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
         assert_eq!(regions, vec![(0..data.len(), 24)]);
