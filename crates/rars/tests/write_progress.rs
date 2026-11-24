@@ -292,7 +292,8 @@ fn cancellation_interrupts_encrypted_volume_preparation() {
         EntrySource::from_opener(256 * 1024, move || {
             Ok(Box::new(Input {
                 data: Cursor::new(vec![b'a'; 256 * 1024]),
-                cancel: (opens.fetch_add(1, Ordering::Relaxed) > 0).then(|| cancel.clone()),
+                // Stored, the member is first opened to be encrypted.
+                cancel: (opens.fetch_add(1, Ordering::Relaxed) == 0).then(|| cancel.clone()),
             }))
         }),
     )
@@ -412,8 +413,10 @@ fn cancellation_on_final_compression_update_prevents_archive_and_volume_emission
                     b"file".to_vec(),
                     EntrySource::from_bytes(vec![42; size]),
                 )];
-                let options =
-                    WriterOptions::new(version, FeatureSet::store_only()).with_compression_level(0);
+                // A stored volume member is read as it is copied, after
+                // compression, so a set codes its member to finish one there.
+                let options = WriterOptions::new(version, FeatureSet::store_only())
+                    .with_compression_level(u8::from(volumes));
                 let reporter = CancelFinalUpdate::default();
                 let mut output = Vec::new();
                 let mut sink = rar50::CollectedVolumes::new();

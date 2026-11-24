@@ -21,6 +21,8 @@ mod layout;
 mod mixed_stored_tests;
 mod plan;
 #[cfg(test)]
+mod volume_body_tests;
+#[cfg(test)]
 use filter_policy::encode_options_for_level;
 use filter_policy::{
     compression_method_for_level, dictionary_size_for_options, encode_option_candidates_for_level,

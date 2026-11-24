@@ -63,8 +63,19 @@ fn rar50_stored_emission_rejects_changed_sources() {
             let lens: &[usize] = if volumes { &[4096] } else { &[4096, 1 << 20] };
             for &len in lens {
                 for changed_len in [len - 1, len, len + 1] {
-                    let result =
-                        write_rar50(changing_source(len, 1, changed_len), encrypted, volumes, 0);
+                    // A volume set reads a stored member once, hashing it as
+                    // it is copied, so what it can catch is a source that is
+                    // not the length it declared.
+                    let change_at = if volumes { 0 } else { 1 };
+                    if volumes && changed_len == len {
+                        continue;
+                    }
+                    let result = write_rar50(
+                        changing_source(len, change_at, changed_len),
+                        encrypted,
+                        volumes,
+                        0,
+                    );
                     let case = format!(
                         "encrypted={encrypted}, volumes={volumes}, len={len}, size={changed_len}"
                     );
@@ -83,14 +94,47 @@ fn rar50_stored_emission_rejects_changed_sources() {
     }
 }
 
+/// A stored member cut across volumes is read through one open, front to
+/// back, so a source that would read differently when opened again still
+/// gives each volume bytes from the same read, and the set checks out whole.
 #[test]
-fn rar50_fragment_checksums_are_verified_against_the_emission_read() {
-    // First open prepares whole-member integrity, second prepares the first
-    // fragment's header. Mutation on the third open changes its emitted bytes.
-    let error = write_rar50(changing_source(4096, 2, 4096), false, true, 0).unwrap_err();
-    assert!(error.to_string().contains("contents changed"));
-    assert_eq!(error.kind(), rars::ErrorKind::SourceChanged);
-    assert_eq!(error.entry_context().unwrap().0, b"file");
+fn rar50_volume_set_reads_a_stored_member_through_one_open() {
+    for encrypted in [false, true] {
+        if encrypted && !cfg!(feature = "encryption") {
+            continue;
+        }
+        let volumes = write_rar50(changing_source(4096, 1, 4096), encrypted, true, 0).unwrap();
+        assert!(volumes.len() > 3, "{} volumes", volumes.len());
+        let password = encrypted.then_some(b"secret".as_slice());
+        let archives: Vec<_> = volumes
+            .into_iter()
+            .map(|bytes| rar50::Archive::parse_owned_with_password(bytes, password).unwrap())
+            .collect();
+        let options = match password {
+            Some(password) => rars::ArchiveReadOptions::with_password(password),
+            None => rars::ArchiveReadOptions::new(),
+        };
+        let extracted = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let into = extracted.clone();
+        rar50::extract_volumes_to(&archives, options, move |_| {
+            Ok(Box::new(Collect(into.clone())))
+        })
+        .unwrap();
+        assert_eq!(*extracted.lock().unwrap(), vec![b'A'; 4096]);
+    }
+}
+
+struct Collect(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Collect {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 // Equal-length CRC32 collision, independently constructed with zlib's CRC32.
@@ -110,13 +154,10 @@ fn crc_collision_payloads() -> (Vec<u8>, Vec<u8>) {
 
 #[test]
 fn rar50_stored_emission_rejects_crc_collisions_using_the_payload_hash() {
-    for (encrypted, volumes, change_at) in [
-        (false, false, 1),
-        (true, false, 1),
-        (false, true, 1), // Fragment checksums match the changed bytes; whole-member hash refuses.
-        (false, true, 2), // First fragment's CRC matches, but its hash changed after header preparation.
-        (true, true, 1), // Encrypted volume staging must verify the source before retaining ciphertext.
-    ] {
+    // A volume set reads a stored member once, so there is no second read to
+    // compare with; `rar50_volume_set_reads_a_stored_member_through_one_open`
+    // covers it.
+    for (encrypted, volumes, change_at) in [(false, false, 1), (true, false, 1)] {
         if encrypted && !cfg!(feature = "encryption") {
             continue;
         }
@@ -142,8 +183,8 @@ fn rar50_stored_emission_rejects_crc_collisions_using_the_payload_hash() {
 }
 
 #[test]
-fn rar50_split_header_preparation_rejects_a_truncated_source_reread() {
-    let error = write_rar50(changing_source(4096, 1, 1), false, true, 0).unwrap_err();
+fn rar50_split_member_rejects_a_source_shorter_than_declared() {
+    let error = write_rar50(changing_source(4096, 0, 1), false, true, 0).unwrap_err();
     assert_eq!(error.kind(), rars::ErrorKind::SourceChanged);
     assert_eq!(error.entry_context().unwrap().0, b"file");
     assert!(error.to_string().contains("size changed"));
@@ -153,7 +194,9 @@ fn rar50_split_header_preparation_rejects_a_truncated_source_reread() {
 fn rar50_empty_sources_and_compression_store_fallback_are_verified() {
     for encrypted in [false, true] {
         for volumes in [false, true] {
-            assert!(write_rar50(changing_source(0, 1, 1), encrypted, volumes, 0).is_err());
+            // A volume set opens a stored member only to copy it.
+            let change_at = if volumes { 0 } else { 1 };
+            assert!(write_rar50(changing_source(0, change_at, 1), encrypted, volumes, 0).is_err());
         }
     }
     assert!(write_rar50(changing_source(1, 1, 1), false, false, 3).is_err());
