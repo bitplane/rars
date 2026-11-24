@@ -213,7 +213,7 @@ fn bounded_reader_admits_input_before_reading_and_releases_on_errors() {
 
 #[test]
 fn filtered_state_owns_transform_scratch_history_and_outputs() {
-    let data: Vec<_> = (0..FILTERED_LZ_BLOCK_SIZE + 257)
+    let data: Vec<_> = (0..LZ_BLOCK_SIZE + 257)
         .map(|i| ((i * 17) ^ (i >> 9)) as u8)
         .collect();
     for version in [0, 1] {
@@ -781,7 +781,7 @@ fn member_allocation_refusals_release_search_and_output_owners() {
 
 #[test]
 fn filtered_multiblock_output_growth_refusals_release_storage() {
-    let data = vec![b'A'; FILTERED_LZ_BLOCK_SIZE + 1];
+    let data = vec![b'A'; LZ_BLOCK_SIZE + 1];
     let filters = [crate::FilterSpec::whole(crate::FilterKind::E8)];
     let options = EncodeOptions::new(16).with_max_match_distance(256);
     let expected = filtered_lz_blocks(
@@ -3820,9 +3820,11 @@ fn blocks_are_short_enough_to_refit_the_tables_when_the_data_changes() {
 
 #[test]
 fn large_filtered_lz_members_split_filter_records_by_block() {
-    let last_block_start = FILTERED_LZ_BLOCK_SIZE * 2;
+    let last_block_start = LZ_BLOCK_SIZE * 2;
+    // Each block's worth draws on bytes of its own, so no block is extended
+    // over the next and the member is cut where an unfiltered one would be.
     let mut data: Vec<_> = (0..last_block_start + 512)
-        .map(|index| index as u8)
+        .map(|index| (index / LZ_BLOCK_SIZE * 64 + index % 61) as u8)
         .collect();
     data[256] = 0xe8;
     data[257..261].copy_from_slice(&0x20u32.to_le_bytes());
@@ -3865,8 +3867,8 @@ fn a_solid_filtered_member_matches_history_from_every_block() {
     // Bytes that do not compress on their own, so matching the history is
     // the only way this member gets small.
     let mut state = 0x2545_f491_4f6c_dd1du64;
-    let mut earlier = Vec::with_capacity(FILTERED_LZ_BLOCK_SIZE * 3);
-    while earlier.len() < FILTERED_LZ_BLOCK_SIZE * 3 {
+    let mut earlier = Vec::with_capacity(LZ_BLOCK_SIZE * 3);
+    while earlier.len() < LZ_BLOCK_SIZE * 3 {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
@@ -3902,28 +3904,119 @@ fn a_solid_filtered_member_matches_history_from_every_block() {
 
 #[test]
 fn filters_are_split_before_rar_reader_filter_limit() {
-    let data = vec![0u8; FILTERED_LZ_BLOCK_SIZE + 1];
+    // Zeros never move, so this is one block, and its filter five records.
+    let data = vec![0u8; 4 * FILTER_CELL + 1];
+    let filters = [crate::FilterSpec::whole(crate::FilterKind::Delta {
+        channels: 4,
+    })];
+    let blocks =
+        filter_blocks_in_place(&mut data.clone(), &filters, 0, &Allowance::default()).unwrap();
+    assert_eq!(blocks.len(), 1);
+    let lengths: Vec<_> = blocks[0].1.iter().map(|record| record.length).collect();
+    assert_eq!(lengths, [65536, 65536, 65536, 65536, 1]);
+
     let encoded =
         Unpack50Encoder::with_options(EncodeOptions::new(0).with_max_match_distance(128 * 1024))
-            .encode_member_with_filter(
-                &data,
-                0,
-                crate::FilterSpec::whole(crate::FilterKind::Delta { channels: 4 }),
-            )
+            .encode_member_with_filters(&data, 0, &filters)
             .unwrap();
     let mut cursor = std::io::Cursor::new(encoded.as_slice());
-    let first = read_compressed_block(&mut cursor).unwrap();
-    let second = read_compressed_block(&mut cursor).unwrap();
+    assert!(read_compressed_block(&mut cursor).unwrap().header.is_last);
     let mut decoder = Unpack50Decoder::new();
-
-    assert!(!first.header.is_last);
-    assert!(second.header.is_last);
     assert_eq!(
         decoder
             .decode_member(&encoded, 0, data.len(), false, DecodeMode::Lz)
             .unwrap(),
         data
     );
+}
+
+/// The period of the sweep's `large-compressible` file: a run of zeros, then
+/// one phrase over and over.
+fn zero_run_and_phrase(len: usize) -> Vec<u8> {
+    let phrase = b"the quick brown fox jumps over the lazy dog. ";
+    let mut period = vec![0u8; 4096];
+    while period.len() + phrase.len() <= 8191 {
+        period.extend_from_slice(phrase);
+    }
+    period.iter().copied().cycle().take(len).collect()
+}
+
+/// A filter is cut into the blocks the member would be coded in without
+/// it, rather than costing the member blocks and tables of its own.
+#[test]
+fn a_filtered_member_is_cut_where_an_unfiltered_one_is() {
+    let still = zero_run_and_phrase(2 * MAX_LZ_BLOCK_SIZE + 4096);
+    let moving: Vec<u8> = (0..4 * LZ_BLOCK_SIZE + 100)
+        .map(|index| (index / LZ_BLOCK_SIZE * 64 + (index * 7) % 59) as u8)
+        .collect();
+    let delta = crate::FilterKind::Delta { channels: 1 };
+    for data in [&still, &moving] {
+        let unfiltered: Vec<_> = MemberBlocks::new(data, 0).collect();
+        for filters in [
+            vec![crate::FilterSpec::whole(delta)],
+            vec![crate::FilterSpec::range(delta, 70_000..75_000)],
+            vec![
+                crate::FilterSpec::range(crate::FilterKind::E8, 1_000..200_000),
+                crate::FilterSpec::range(delta, 200_000..data.len() - 50),
+            ],
+        ] {
+            let mut filtered = data.clone();
+            let blocks =
+                filter_blocks_in_place(&mut filtered, &filters, 0, &Allowance::default()).unwrap();
+            let cuts: Vec<_> = blocks.iter().map(|(block, _)| block.clone()).collect();
+            assert_eq!(cuts, unfiltered);
+            // The search sees the bytes the encoder codes.
+            assert_eq!(
+                filtered,
+                &*filtered_run_bytes(data, &filters, 0, &Allowance::default()).unwrap()
+            );
+            // The records cover each filter's bytes once, inside one block
+            // each and no longer than a record may be.
+            let mut covered = Vec::new();
+            for (block, records) in blocks.iter() {
+                for record in records.iter() {
+                    let start = block.start + record.offset;
+                    // One cell of the grid each, so no longer than a cell.
+                    assert_eq!(
+                        start / FILTER_CELL,
+                        (start + record.length - 1) / FILTER_CELL
+                    );
+                    assert!(start + record.length <= block.end);
+                    covered.push(start..start + record.length);
+                }
+            }
+            covered.sort_by_key(|range| range.start);
+            assert!(covered.windows(2).all(|pair| pair[0].end <= pair[1].start));
+            for range in &covered {
+                assert!(filters.iter().any(|filter| {
+                    let within = filter.range.clone().unwrap_or(0..data.len());
+                    within.start <= range.start && range.end <= within.end
+                }));
+            }
+            let filtered_bytes: usize = filters
+                .iter()
+                .map(|filter| filter.range.clone().unwrap_or(0..data.len()).len())
+                .sum();
+            assert_eq!(
+                covered.iter().map(|range| range.len()).sum::<usize>(),
+                filtered_bytes
+            );
+
+            let encoded = Unpack50Encoder::with_options(EncodeOptions::new(16))
+                .encode_member_with_filters(data, 0, &filters)
+                .unwrap();
+            let mut cursor = std::io::Cursor::new(encoded.as_slice());
+            let mut coded = 0;
+            while cursor.position() < encoded.len() as u64 {
+                read_compressed_block(&mut cursor).unwrap();
+                coded += 1;
+            }
+            assert_eq!(coded, unfiltered.len());
+            assert_eq!(decode_lz(&encoded, 0, data.len()).unwrap(), *data);
+        }
+    }
+    // Still data is one block a mebibyte, whatever it carries.
+    assert_eq!(MemberBlocks::new(&still, 0).count(), 3);
 }
 
 #[test]

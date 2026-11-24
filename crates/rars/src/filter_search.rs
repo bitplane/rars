@@ -659,6 +659,31 @@ fn screen_kinds<S: OwnedSearch>(
             ))?;
         }
     }
+    // The screen parses with less effort than the caller, and a filter is
+    // only worth what the caller's parse cannot find without it. Where the
+    // caller's parse reaches a repeat the screen's does not, a filter can
+    // win the screen and lose the real encode: delta on a long period whose
+    // copy only a deep search finds. So the kind the screen liked best is
+    // encoded again at the caller's settings, on the same sample, beside the
+    // plain sample. If it no longer wins, no kind goes on. That costs two
+    // sample encodes, and only on a member some kind got through on.
+    //
+    // An exhaustive search skips this. It encodes the plain member in full
+    // beside every finalist anyway.
+    let confirms = !measures_the_member && screen_options != options && !search.exhaustive();
+    if let Some((best, _)) = sampled
+        .iter()
+        .min_by_key(|&&(_, packed)| packed)
+        .filter(|_| confirms)
+    {
+        let filters = [FilterSpec::whole(best.kind)];
+        let transformed = search.filtered_bytes(sample, &filters)?;
+        let filtered = search.encode_plain(&transformed, options, None)?.len();
+        let plain = search.encode_plain(sample, options, None)?.len();
+        if !screen_wins(filtered, plain) {
+            sampled.clear();
+        }
+    }
     // A kind the sample shows losing to another by the same margin it has to
     // beat the plain member by is not worth a whole-member encode either. On
     // 16-bit stereo audio delta 2 and delta 4 both clear the screen, and delta
@@ -1042,8 +1067,33 @@ fn table_regions<B: Budget>(
             }
         }
     }
-    regions.retain(|(range, _)| range.len() >= MIN_TABLE_WINDOWS * scan_window);
+    regions.retain(|(range, stride)| {
+        range.len() >= MIN_TABLE_WINDOWS * scan_window
+            && !delta_is_identity(&data[range.clone()], *stride)
+    });
     Ok(regions)
+}
+
+/// How much of a region delta has to leave as it is before the region is
+/// not worth a filter, as a fraction: fifteen sixteenths.
+const TABLE_IDENTITY_RATIO: (usize, usize) = (15, 16);
+
+/// Whether delta at `stride` would leave nearly every byte of `region` as it
+/// found it.
+///
+/// Delta subtracts the byte a stride back, so a byte comes out unchanged
+/// wherever that byte is zero. A run of zeros scans as a table at every
+/// stride, and a filter over it changes nothing. Its screen sample packs to
+/// a few dozen bytes either way, so the screen alone would pass it or not on
+/// a byte of noise. A real table has fields that move from one record to the
+/// next, and those are what delta changes.
+fn delta_is_identity(region: &[u8], stride: usize) -> bool {
+    let Some(behind) = region.len().checked_sub(stride).map(|len| &region[..len]) else {
+        return false;
+    };
+    let zeros = behind.iter().filter(|&&byte| byte == 0).count();
+    let (numerator, denominator) = TABLE_IDENTITY_RATIO;
+    zeros * denominator >= behind.len() * numerator
 }
 
 /// Which of the scanner's table regions the delta filter actually shrinks.
@@ -1398,7 +1448,9 @@ fn trial_size<S: OwnedSearch>(
 /// the same place far apart. Ranked with the others, the plain member won the
 /// trial on 1 MiB pieces of a tar of `/usr` that it lost by 7% in full, and
 /// the choice came to 0.35% more than the best finalist; left out, 0.07%. So
-/// when the screens pass only one filter, it is taken without a trial.
+/// when the screens pass only one filter, it is taken without a trial. A kind
+/// the screens pass has already beaten the plain sample at the caller's own
+/// settings (see [`screen_kinds`]).
 ///
 /// A member no longer than one span has no history to lose. It is encoded
 /// whole under each finalist, the plain member included, and at the caller's
@@ -3359,13 +3411,94 @@ mod tests {
     /// sample encode is what stops a useless filter there.
     #[test]
     fn a_run_of_constant_bytes_screens_out_of_the_table_regions() {
-        let data = vec![0u8; 200 * 1024];
+        let data = vec![0x41u8; 200 * 1024];
         let regions = delta_table_regions(&data, MAX_TABLE_STRIDE);
         assert!(!regions.is_empty(), "the scanner sees repetition in a run");
         assert_eq!(
             table_screened_regions(&FULL, &data, &regions, options()).unwrap(),
             vec![]
         );
+    }
+
+    /// The period of the sweep's `large-compressible` file: a run of zeros,
+    /// then one phrase over and over.
+    fn zero_run_and_phrase(len: usize) -> Vec<u8> {
+        let phrase = b"the quick brown fox jumps over the lazy dog. ";
+        let mut period = vec![0u8; 4096];
+        while period.len() + phrase.len() <= 8191 {
+            period.extend_from_slice(phrase);
+        }
+        period.iter().copied().cycle().take(len).collect()
+    }
+
+    /// Delta leaves a byte alone wherever the byte a stride back is zero, so
+    /// it does nothing to a run of zeros, which scans as a table at every
+    /// stride. The scanner drops such a region rather than leave it to a
+    /// screen sample a few dozen bytes long.
+    #[test]
+    fn a_run_of_zeros_is_not_a_table() {
+        let data = zero_run_and_phrase(256 * 1024);
+        assert_eq!(
+            table_regions(&data, MAX_TABLE_STRIDE, 256, &Allowance::default())
+                .unwrap()
+                .into_vec(),
+            vec![]
+        );
+        assert!(delta_is_identity(&[0; 512], 4));
+        assert!(!delta_is_identity(&reloc_table(64), 24));
+        // A table with zeros between its records is still a table.
+        let mut padded = Vec::new();
+        for record in reloc_table(64).chunks(24) {
+            padded.extend_from_slice(record);
+            padded.extend_from_slice(&[0; 8]);
+        }
+        assert!(!delta_is_identity(&padded, 32));
+    }
+
+    /// The screens parse at less than the caller's effort. On the period
+    /// above that parse never reaches the copy a period back, so delta wins
+    /// its sample; at level 3's own settings the copy is found and delta
+    /// loses. The kind that won the screen is measured again at the
+    /// caller's settings before it earns a whole-member encode.
+    #[test]
+    fn a_screened_kind_has_to_win_at_the_callers_settings_too() {
+        let data = zero_run_and_phrase(4 * SCREEN_SAMPLE_LEN);
+        let cheap = TestSearch {
+            cheap_screens: true,
+        };
+        let level_three = EncodeOptions::new(32)
+            .with_optimal_parse(true)
+            .with_nice_match_length(64)
+            .with_parse_passes(2)
+            .with_max_match_distance(4 << 20);
+        let sample = screen_sample(&data);
+        let delta = [FilterSpec::whole(FilterKind::Delta { channels: 1 })];
+        let filtered = cheap.filtered_bytes(sample, &delta).unwrap();
+        let price = |bytes: &[u8], options| cheap.encode_plain(bytes, options, None).unwrap().len();
+        let screen = cheap.screen_options(level_three);
+        assert!(screen_wins(price(&filtered, screen), price(sample, screen)));
+        assert!(!screen_wins(
+            price(&filtered, level_three),
+            price(sample, level_three)
+        ));
+
+        let screened = screen_kinds(&cheap, &data, level_three).unwrap();
+        assert!(
+            screened.kinds.is_empty(),
+            "{:?}",
+            screened
+                .kinds
+                .iter()
+                .map(|kind| kind.kind)
+                .collect::<Vec<_>>()
+        );
+        let (specs, _) = choose_filter(&cheap, &data, level_three, None).unwrap();
+        assert_eq!(specs, vec![]);
+
+        // A kind that wins at both keeps its place.
+        let screened =
+            screen_kinds(&cheap, &stereo_samples(4 * SCREEN_SAMPLE_LEN), level_three).unwrap();
+        assert!(!screened.kinds.is_empty());
     }
 
     #[test]

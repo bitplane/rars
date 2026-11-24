@@ -1516,6 +1516,95 @@ mod run_search_tests {
         assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
     }
 
+    /// A filtered member is cut into the blocks an unfiltered one would be,
+    /// so on data that never moves a block runs to a mebibyte, filter and
+    /// all, and a member coded in runs has blocks that end where its runs
+    /// do. The archive is the same at any thread count, and its packed member
+    /// is the one the whole-member path makes.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_filtered_member_in_long_blocks_codes_alike_on_any_thread_count() {
+        use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
+        use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
+        let root = crate::scratch::case("rar50-filtered-long-blocks");
+        // A run of zeros and then one phrase, 8,191 bytes a period.
+        let phrase = b"the quick brown fox jumps over the lazy dog. ";
+        let mut period = vec![0u8; 4096];
+        while period.len() + phrase.len() <= 8191 {
+            period.extend_from_slice(phrase);
+        }
+        let data: Vec<u8> = period
+            .iter()
+            .copied()
+            .cycle()
+            .take(2 * SEARCH + 100 * 1024)
+            .collect();
+        let policy = FilterPolicy::Explicit(crate::FilterSpec::whole(crate::FilterKind::Delta {
+            channels: 1,
+        }));
+        let options = encode_options_for_level(Some(3), 128 * 1024).unwrap();
+        let whole = super::super::plan::with_filter_search_bytes(SEARCH, || {
+            encode_member_with_filter_policy_candidates_and_progress(
+                &data,
+                0,
+                &policy,
+                &[options],
+                None,
+            )
+            .unwrap()
+        });
+        // Three blocks with a set of tables each. With a block every 64 KiB,
+        // the tables alone come to more than this.
+        assert!(whole.len() < 700, "{} bytes", whole.len());
+        let write = |threads: usize| {
+            let entries = [ArchiveEntry::new(
+                "period",
+                EntrySource::from_bytes(data.clone()),
+            )];
+            let resources = WriterResources::new(1024 * 1024 * 1024).with_temp_dir(&*root);
+            let mut bytes = Vec::new();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    super::super::plan::with_filter_search_bytes(SEARCH, || {
+                        crate::rar50::write_streaming_archive_with_progress(
+                            &entries,
+                            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                                .with_compression_level(3)
+                                .with_dictionary_size(128 * 1024),
+                            ArchiveExtras::default().with_filter_policy(policy.clone()),
+                            &resources,
+                            None,
+                            &mut bytes,
+                        )
+                    })
+                })
+                .unwrap();
+            bytes
+        };
+        let one = write(1);
+        assert!(
+            memchr::memmem::find(&one, &whole).is_some(),
+            "the {}-byte archive does not hold the {}-byte whole-member packing",
+            one.len(),
+            whole.len()
+        );
+        for threads in [2, 8] {
+            assert!(
+                one == write(threads),
+                "{threads} threads changed the archive"
+            );
+        }
+        let archive = ArchiveReader::read(&one).unwrap();
+        archive.test(None).unwrap();
+        assert_eq!(archive.read_member(b"period", None).unwrap().unwrap(), data);
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn an_explicit_filter_over_a_member_stops_at_4_gib() {
