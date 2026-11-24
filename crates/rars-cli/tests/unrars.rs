@@ -410,3 +410,328 @@ fn selects_members_by_mask_and_lists_bare_names() {
     let output = unrars(&dir, &["lb", "plain"]);
     assert_eq!(stdout(&output), "a.txt\nsub\nsub/b.bin\n");
 }
+
+/// Issue #564: the last word names the destination when it is a directory
+/// that is already there, trailing separator or not.
+#[test]
+fn an_existing_directory_is_the_destination_without_a_separator() {
+    let dir = scratch::case("unrars-destination-dir");
+    write(&dir, "plain.rar", None);
+    fs::create_dir(dir.join("out")).unwrap();
+    let output = unrars(&dir, &["x", "-idq", "plain.rar", "out"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(fs::read(dir.join("out/a.txt")).unwrap(), b"hello\n");
+    assert_eq!(fs::read(dir.join("out/sub/b.bin")).unwrap(), payload());
+    // A word that names no directory is still a mask.
+    let output = unrars(&dir, &["x", "-idq", "plain.rar", "elsewhere"]);
+    assert_eq!(output.status.code(), Some(10), "{}", stderr(&output));
+    assert!(!dir.join("elsewhere").exists());
+}
+
+/// Issue #564: `*` and `?` in the archive's name are expanded, and a volume
+/// set they match is read once, from its first volume.
+#[test]
+fn expands_wildcards_in_the_archive_name() {
+    let dir = scratch::case("unrars-archive-wildcards");
+    for (name, member) in [("one.rar", "first.txt"), ("two.rar", "second.txt")] {
+        let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+        builder
+            .add_bytes(
+                member.as_bytes().to_vec(),
+                name.as_bytes().to_vec(),
+                None,
+                None,
+            )
+            .unwrap();
+        builder.write_to_path(&dir.join(name), None).unwrap();
+    }
+    let volumes = builder(None)
+        .volume_size(Some(8 * 1024))
+        .build_volumes(None)
+        .unwrap();
+    assert!(volumes.len() >= 3);
+    for (index, bytes) in volumes.iter().enumerate() {
+        fs::write(dir.join(format!("set.part{}.rar", index + 1)), bytes).unwrap();
+    }
+    let output = unrars(&dir, &["x", "-o+", "-p-", "*.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    for name in ["one.rar", "two.rar", "set.part1.rar", "set.part2.rar"] {
+        let line = format!("Extracting from {name}\n");
+        assert_eq!(text.matches(&line).count(), 1, "{name}: {text}");
+    }
+    assert_eq!(text.matches("All OK").count(), 1, "{text}");
+    assert_eq!(fs::read(dir.join("out/first.txt")).unwrap(), b"one.rar");
+    assert_eq!(fs::read(dir.join("out/second.txt")).unwrap(), b"two.rar");
+    assert_eq!(fs::read(dir.join("out/sub/b.bin")).unwrap(), payload());
+
+    let output = unrars(&dir, &["x", "-idq", "o?e.rar", "single/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(dir.join("single/first.txt").exists());
+    assert!(!dir.join("single/second.txt").exists());
+
+    let output = unrars(&dir, &["x", "none*.rar", "none/"]);
+    assert_eq!(output.status.code(), Some(10), "{}", stderr(&output));
+    assert!(stdout(&output).contains("No files to extract"));
+}
+
+/// An archive whose `a.txt` needs a password and whose `info.nfo` doesn't.
+fn write_mixed(path: &Path) {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"a.txt".to_vec(), b"secret text\n".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"info.nfo".to_vec(), b"info\n".to_vec(), None, None)
+        .unwrap();
+    builder
+        .set_entry_encryption(b"a.txt", Some(b"secret".to_vec()), None)
+        .unwrap();
+    builder.write_to_path(path, None).unwrap();
+}
+
+/// Issue #564: a member that needs a password no one gave, or gets the
+/// wrong one, is reported by name and the run goes on to the next. One the
+/// command line doesn't ask for is passed over without a word.
+#[test]
+fn a_member_with_the_wrong_password_does_not_stop_the_run() {
+    let dir = scratch::case("unrars-mixed-password");
+    write_mixed(&dir.join("mixed.rar"));
+    for (password, out) in [("-p-", "none/"), ("-pwrong", "wrong/")] {
+        let output = unrars(&dir, &["x", password, "mixed.rar", out]);
+        assert_eq!(output.status.code(), Some(11), "{password}");
+        let errors = stderr(&output);
+        assert_eq!(
+            errors.trim_end(),
+            "Incorrect password for a.txt",
+            "{password}"
+        );
+        assert!(stdout(&output).contains("Total errors: 1"), "{password}");
+        assert_eq!(fs::read(dir.join(out).join("info.nfo")).unwrap(), b"info\n");
+        assert!(!dir.join(out).join("a.txt").exists(), "{password}");
+    }
+    let output = unrars(&dir, &["x", "-p-", "mixed.rar", "info.nfo", "plain/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    assert_eq!(fs::read(dir.join("plain/info.nfo")).unwrap(), b"info\n");
+
+    let output = unrars(&dir, &["p", "-inul", "-p-", "mixed.rar", "nosuch"]);
+    assert_eq!(output.status.code(), Some(10));
+    let output = unrars(&dir, &["p", "-inul", "-pwrong", "mixed.rar", "info.nfo"]);
+    assert_eq!(output.status.code(), Some(0));
+    assert_eq!(output.stdout, b"info\n");
+    let output = unrars(&dir, &["x", "-idq", "-psecret", "mixed.rar", "right/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(fs::read(dir.join("right/a.txt")).unwrap(), b"secret text\n");
+}
+
+/// Issue #564: without `-kb`, a member that fails its checksum is reported
+/// and left out, and the members after it are still extracted or tested.
+#[test]
+fn a_checksum_error_does_not_stop_the_run() {
+    let dir = scratch::case("unrars-checksum-continue");
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let name = format!("{version:?}.rar");
+        let path = dir.join(&name);
+        write_three(&path, version);
+        let mut bytes = fs::read(&path).unwrap();
+        let start = bytes
+            .windows(64)
+            .position(|window| window == &payload()[..64])
+            .unwrap();
+        bytes[start + 1000] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+
+        let out = format!("out-{version:?}/");
+        let output = unrars(&dir, &["x", &name, &out]);
+        assert_eq!(output.status.code(), Some(3), "{version:?}");
+        assert_eq!(
+            stderr(&output).trim_end(),
+            format!("{:<20} - checksum error", "mid.bin"),
+            "{version:?}"
+        );
+        assert!(stdout(&output).contains("Total errors: 1"), "{version:?}");
+        assert!(!dir.join(&out).join("mid.bin").exists(), "{version:?}");
+        assert_eq!(fs::read(dir.join(&out).join("a.txt")).unwrap(), b"hello\n");
+        assert_eq!(fs::read(dir.join(&out).join("z.txt")).unwrap(), b"after\n");
+
+        let output = unrars(&dir, &["t", &name]);
+        assert_eq!(output.status.code(), Some(3), "{version:?}");
+        let text = stdout(&output);
+        let tested = |name: &str, passed: bool| {
+            text.lines().any(|line| {
+                line.starts_with("Testing ")
+                    && line.contains(name)
+                    && line.ends_with("OK") == passed
+            })
+        };
+        assert!(tested("a.txt", true), "{version:?}: {text}");
+        assert!(tested("mid.bin", false), "{version:?}: {text}");
+        assert!(tested("z.txt", true), "{version:?}: {text}");
+
+        // A damaged member the command line doesn't ask for is no error.
+        let only = format!("only-{version:?}/");
+        let output = unrars(&dir, &["x", "-idq", &name, "z.txt", &only]);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{version:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(fs::read(dir.join(&only).join("z.txt")).unwrap(), b"after\n");
+    }
+}
+
+/// The files under `root`, as `/`-separated relative paths.
+fn files_under(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        for entry in fs::read_dir(at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let parts: Vec<_> = path
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|part| part.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            found.push(parts.join("/"));
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Issue #564: a plain name is a path from the archive root and takes a
+/// directory's contents with it; a wildcard without a path matches names in
+/// any directory.
+#[test]
+fn masks_select_as_unrar_does() {
+    let dir = scratch::case("unrars-mask-rules");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"a.txt".to_vec(), b"root\n".to_vec(), None, None)
+        .unwrap();
+    builder.add_directory(b"sub".to_vec(), None, None).unwrap();
+    for name in ["sub/a.txt", "sub/b.txt", "sub/deeper/a.txt"] {
+        builder
+            .add_bytes(name.as_bytes().to_vec(), b"x\n".to_vec(), None, None)
+            .unwrap();
+    }
+    builder.write_to_path(&dir.join("masks.rar"), None).unwrap();
+    let listed = |masks: &[&str]| {
+        let mut args = vec!["lb", "masks.rar"];
+        args.extend(masks);
+        stdout(&unrars(&dir, &args))
+    };
+    assert_eq!(listed(&["a.txt"]), "a.txt\n");
+    assert_eq!(
+        listed(&["sub"]),
+        "sub\nsub/a.txt\nsub/b.txt\nsub/deeper/a.txt\n"
+    );
+    assert_eq!(
+        listed(&["*.txt"]),
+        "a.txt\nsub/a.txt\nsub/b.txt\nsub/deeper/a.txt\n"
+    );
+    assert_eq!(listed(&["s*"]), "sub\n");
+    assert_eq!(listed(&["deeper"]), "");
+
+    for (mask, out, files) in [
+        ("a.txt", "root", &["a.txt"][..]),
+        (
+            "sub",
+            "tree",
+            &["sub/a.txt", "sub/b.txt", "sub/deeper/a.txt"],
+        ),
+    ] {
+        let output = unrars(&dir, &["x", "-idq", "masks.rar", mask, &format!("{out}/")]);
+        assert_eq!(output.status.code(), Some(0), "{mask}: {}", stderr(&output));
+        assert_eq!(files_under(&dir.join(out)), files, "{mask}");
+    }
+}
+
+/// A RAR 5 archive holding two stored copies of `v.txt`, an older one with a
+/// file version record as `rar -ver` writes it, then the latest, and `x;1`,
+/// a file whose name only looks like a version. Built by hand, since rars
+/// writes no version records.
+fn write_versions(path: &Path) {
+    fn vint(mut value: u64, out: &mut Vec<u8>) {
+        loop {
+            let byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value == 0 {
+                out.push(byte);
+                return;
+            }
+            out.push(byte | 0x80);
+        }
+    }
+    fn block(header: &[u8], out: &mut Vec<u8>) {
+        let mut sized = Vec::new();
+        vint(header.len() as u64, &mut sized);
+        sized.extend_from_slice(header);
+        out.extend_from_slice(&rars::crc32::crc32(&sized).to_le_bytes());
+        out.extend_from_slice(&sized);
+    }
+    fn file(name: &[u8], data: &[u8], version: Option<u64>, out: &mut Vec<u8>) {
+        let mut extra = Vec::new();
+        if let Some(version) = version {
+            // Type 4, no flags, then the version number.
+            let mut record = vec![4, 0];
+            vint(version, &mut record);
+            vint(record.len() as u64, &mut extra);
+            extra.extend_from_slice(&record);
+        }
+        // A file header with a data area, and an extra area if there is one.
+        let mut header = vec![2];
+        vint(if extra.is_empty() { 0x02 } else { 0x03 }, &mut header);
+        if !extra.is_empty() {
+            vint(extra.len() as u64, &mut header);
+        }
+        vint(data.len() as u64, &mut header);
+        // Flags (CRC32 present), size, attributes, CRC32, stored, Unix host.
+        vint(0x04, &mut header);
+        vint(data.len() as u64, &mut header);
+        vint(0o100644, &mut header);
+        header.extend_from_slice(&rars::crc32::crc32(data).to_le_bytes());
+        vint(0, &mut header);
+        vint(1, &mut header);
+        vint(name.len() as u64, &mut header);
+        header.extend_from_slice(name);
+        header.extend_from_slice(&extra);
+        block(&header, out);
+        out.extend_from_slice(data);
+    }
+    let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+    block(&[1, 0, 0], &mut bytes);
+    file(b"v.txt", b"one\n", Some(1), &mut bytes);
+    file(b"v.txt", b"two\n", None, &mut bytes);
+    file(b"x;1", b"semi\n", None, &mut bytes);
+    block(&[5, 0, 0], &mut bytes);
+    fs::write(path, bytes).unwrap();
+}
+
+/// Issue #564: older copies of a file are extracted only with `-ver`, and
+/// listed either way.
+#[test]
+fn older_file_versions_need_ver() {
+    let dir = scratch::case("unrars-versions");
+    write_versions(&dir.join("ver.rar"));
+    assert_eq!(
+        stdout(&unrars(&dir, &["lb", "ver.rar"])),
+        "v.txt;1\nv.txt\nx;1\n"
+    );
+    let output = unrars(&dir, &["x", "-idq", "ver.rar", "latest/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(files_under(&dir.join("latest")), ["v.txt", "x;1"]);
+    assert_eq!(fs::read(dir.join("latest/v.txt")).unwrap(), b"two\n");
+
+    let output = unrars(&dir, &["x", "-idq", "-ver", "ver.rar", "all/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(fs::read(dir.join("all/v.txt;1")).unwrap(), b"one\n");
+    assert_eq!(fs::read(dir.join("all/v.txt")).unwrap(), b"two\n");
+}

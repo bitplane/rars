@@ -8,12 +8,13 @@ use crate::output::{restore_output_metadata, ExtractedOutput, OverwritePolicy};
 use crate::password::Password;
 use crate::{display_bytes_lossy, lock, ExtractOutputState, KeptBroken};
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ErrorKind};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::{Mutex, PoisonError};
 use zeroize::Zeroizing;
 
 // Exit codes, as unrar returns them.
@@ -99,6 +100,9 @@ struct Invocation {
     /// `-kb`: keep a damaged file with what could be read of it, written
     /// where it lands, and read past damaged headers.
     keep_broken: bool,
+    /// `-ver`: older copies of a file kept by `rar -ver` are wanted too.
+    versions: bool,
+    /// May hold `*` and `?`, matched against the files in its directory.
     archive: PathBuf,
     masks: Vec<Vec<u8>>,
     destination: PathBuf,
@@ -141,13 +145,19 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         banner: true,
         done: true,
         keep_broken: false,
+        versions: false,
         archive: PathBuf::from(words.next().ok_or(())?),
         masks: Vec::new(),
         destination: PathBuf::new(),
     };
     let mut rest: Vec<OsString> = words.collect();
-    if matches!(command, Command::Extract { .. }) && rest.last().is_some_and(ends_with_separator) {
-        invocation.destination = PathBuf::from(rest.pop().expect("checked above"));
+    // The last word is where to extract to if it ends in a separator, or,
+    // extracting, if it names a directory that is already there.
+    let extracting = matches!(command, Command::Extract { .. });
+    if let Some(destination) =
+        rest.pop_if(|word| ends_with_separator(word) || (extracting && Path::new(word).is_dir()))
+    {
+        invocation.destination = PathBuf::from(destination);
     }
     for word in rest {
         match word.as_encoded_bytes().strip_prefix(b"@") {
@@ -180,6 +190,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
             b"p" => invocation.password = PasswordSwitch::Prompt,
             b"inul" => invocation.silent = true,
             b"kb" => invocation.keep_broken = true,
+            _ if lower.starts_with(b"ver") => invocation.versions = true,
             _ if lower.starts_with(b"id") => {
                 for flag in &lower[2..] {
                     match flag {
@@ -265,6 +276,25 @@ impl Out {
     }
 }
 
+/// What a run has come to, over every archive it read.
+#[derive(Default)]
+struct Tally {
+    /// The errors unrar counts in its closing "Total errors" line.
+    errors: usize,
+    /// The exit code: the first error's, unless that was only a warning.
+    code: i32,
+    /// Archives that had members to work on.
+    worked: usize,
+}
+
+impl Tally {
+    fn fail(&mut self, code: i32) {
+        if self.code == OK || (self.code == WARNING && code != OK) {
+            self.code = code;
+        }
+    }
+}
+
 fn run(invocation: &Invocation) -> i32 {
     let out = Out {
         silent: invocation.silent,
@@ -274,7 +304,6 @@ fn run(invocation: &Invocation) -> i32 {
     if invocation.banner && !bare && !out.silent && !out.quiet {
         print!("{}", banner());
     }
-    let path = archive_path(&invocation.archive);
     let mut password = match &invocation.password {
         PasswordSwitch::Given(password) => Some(password.clone()),
         PasswordSwitch::Prompt => match prompt_password() {
@@ -283,11 +312,49 @@ fn run(invocation: &Invocation) -> i32 {
         },
         PasswordSwitch::Unset | PasswordSwitch::Never => None,
     };
+    let mut tally = Tally::default();
+    // Volumes already read as part of a set an earlier archive started.
+    let mut read = HashSet::new();
+    for path in archive_paths(&invocation.archive) {
+        if !read.contains(&path) {
+            run_archive(invocation, out, &path, &mut password, &mut tally, &mut read);
+        }
+    }
+    if tally.errors > 0 {
+        out.info(&format!("Total errors: {}", tally.errors));
+    }
+    if tally.code != OK {
+        return tally.code;
+    }
+    if tally.worked == 0 {
+        out.info("No files to extract");
+        return NO_FILES;
+    }
+    if invocation.done && matches!(invocation.command, Command::Extract { .. } | Command::Test) {
+        out.info("All OK");
+    }
+    OK
+}
+
+/// Lists, extracts, tests or prints one archive, or the volume set it starts.
+fn run_archive(
+    invocation: &Invocation,
+    out: Out,
+    path: &Path,
+    password: &mut Option<Password>,
+    tally: &mut Tally,
+    read: &mut HashSet<PathBuf>,
+) {
     let may_ask = invocation.password == PasswordSwitch::Unset;
     let salvage = salvaging(invocation);
-    let archive = match open_archive(&path, &mut password, may_ask, salvage) {
+    let archive = match open_archive(path, password, may_ask, salvage) {
         Ok(archive) => archive,
-        Err(error) => return report_open_failure(out, &path, &error),
+        Err(error) => {
+            if let Some(code) = report_open_failure(out, path, &error) {
+                tally.fail(code);
+            }
+            return;
+        }
     };
     let listing = matches!(invocation.command, Command::List { .. });
     if may_ask
@@ -295,21 +362,58 @@ fn run(invocation: &Invocation) -> i32 {
         && password.is_none()
         && archive.members().any(|member| member.meta.is_encrypted)
     {
-        password = prompt_password();
+        *password = prompt_password();
     }
     match invocation.command {
-        Command::List { bare } => match list(&path, &archive, bare) {
-            OK if report_truncation(out, archive.truncation()) => WARNING,
-            code => code,
-        },
+        Command::List { bare } => {
+            list(invocation, path, &archive, bare);
+            tally.worked += 1;
+            if report_truncation(out, archive.truncation()) {
+                tally.fail(WARNING);
+            }
+        }
         _ => run_members(
             invocation,
             out,
-            &path,
+            path,
             &archive,
             password.as_deref().map(Vec::as_slice),
+            tally,
+            read,
         ),
     }
+}
+
+/// The archives a name stands for. Like unrar, `*` and `?` in its file name
+/// are matched against the files in its directory, so a quoted `*.rar`
+/// reads every archive there.
+fn archive_paths(archive: &Path) -> Vec<PathBuf> {
+    let path = archive_path(archive);
+    let pattern = match archive.file_name() {
+        Some(name) if !path.exists() && has_wildcard(name.as_encoded_bytes()) => {
+            name.as_encoded_bytes()
+        }
+        _ => return vec![path],
+    };
+    let dir = archive.parent().filter(|dir| !dir.as_os_str().is_empty());
+    let Ok(entries) = std::fs::read_dir(dir.unwrap_or(Path::new("."))) else {
+        return Vec::new();
+    };
+    let mut found: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .filter(|entry| wildcard(pattern, entry.file_name().as_encoded_bytes()))
+        .map(|entry| match dir {
+            Some(dir) => dir.join(entry.file_name()),
+            None => PathBuf::from(entry.file_name()),
+        })
+        .filter(|path| path.is_file())
+        .collect();
+    found.sort();
+    found
+}
+
+fn has_wildcard(text: &[u8]) -> bool {
+    text.iter().any(|&byte| byte == b'*' || byte == b'?')
 }
 
 /// unrar adds `.rar` to an archive named without an extension.
@@ -342,11 +446,7 @@ fn open_archive(
     salvage: bool,
 ) -> rars::Result<Archive> {
     let read = |password: &Option<Password>| {
-        ArchiveReader::read_path_with_options(
-            path,
-            ArchiveReadOptions::with_optional_password(password.as_deref().map(Vec::as_slice))
-                .with_salvage(salvage),
-        )
+        read_archive(path, password.as_deref().map(Vec::as_slice), salvage)
     };
     match read(password) {
         Err(error) if may_ask && password.is_none() && needs_password(&error) => {
@@ -360,6 +460,25 @@ fn open_archive(
     }
 }
 
+/// Reads an archive or volume. A password that fits none of its files'
+/// password checks fails each of those files as it is reached, as with
+/// unrar, rather than the whole archive: only encrypted headers need it to
+/// be right before anything can be read.
+fn read_archive(path: &Path, password: Option<&[u8]>, salvage: bool) -> rars::Result<Archive> {
+    let read = |password: Option<&[u8]>| {
+        ArchiveReader::read_path_with_options(
+            path,
+            ArchiveReadOptions::with_optional_password(password).with_salvage(salvage),
+        )
+    };
+    match read(password) {
+        Err(error) if password.is_some() && error.kind() == ErrorKind::BadPassword => {
+            read(None).map_err(|_| error)
+        }
+        result => result,
+    }
+}
+
 fn needs_password(error: &rars::Error) -> bool {
     matches!(
         error.kind(),
@@ -367,28 +486,28 @@ fn needs_password(error: &rars::Error) -> bool {
     )
 }
 
-fn report_open_failure(out: Out, path: &Path, error: &rars::Error) -> i32 {
-    let code = match error.kind() {
+/// Reports an archive that could not be opened, returning the exit code it
+/// fails the run with: `None` when it only has no files to give.
+fn report_open_failure(out: Out, path: &Path, error: &rars::Error) -> Option<i32> {
+    match error.kind() {
         ErrorKind::Io => {
             out.error(&format!("Cannot open {}", path.display()));
             out.error(&io_reason(error));
-            NO_FILES
+            None
         }
         ErrorKind::UnsupportedFormat | ErrorKind::InvalidArchive => {
             out.error(&format!("{} is not RAR archive", path.display()));
-            NO_FILES
+            None
         }
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             out.error(&format!("Incorrect password for {}", path.display()));
-            return BAD_PASSWORD;
+            Some(BAD_PASSWORD)
         }
         _ => {
             out.error(&format!("ERROR: {error}"));
-            return FATAL;
+            Some(FATAL)
         }
-    };
-    out.info("No files to extract");
-    code
+    }
 }
 
 /// An I/O error's message without Rust's "(os error N)" suffix, as unrar prints it.
@@ -403,16 +522,18 @@ fn io_reason(error: &rars::Error) -> String {
     }
 }
 
-fn list(path: &Path, archive: &Archive, bare: bool) -> i32 {
+fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) {
+    // unrar lists the older copies `rar -ver` kept, `-ver` or not.
     let members: Vec<_> = archive
         .members()
+        .filter(|member| selected(&invocation.masks, &member.meta.name))
         .map(|member| member.meta.clone())
         .collect();
     if bare {
         for meta in &members {
             println!("{}", display_name(&meta.name));
         }
-        return OK;
+        return;
     }
     let details = match archive.family() {
         rars::ArchiveFamily::Rar13 => "RAR 1.4",
@@ -449,7 +570,6 @@ fn list(path: &Path, archive: &Archive, bare: bool) -> i32 {
         "",
         members.len()
     );
-    OK
 }
 
 fn display_name(name: &[u8]) -> String {
@@ -498,7 +618,61 @@ fn attributes(meta: &rars::ArchiveMemberMeta) -> String {
     .collect()
 }
 
-/// A mask selects a member by its whole path, or by its name alone when the mask has no path.
+/// Which members a run is after: those its masks select and, of a file
+/// `rar -ver` kept older copies of, only the latest unless `-ver` asks for all.
+struct Wanted<'i> {
+    masks: &'i [Vec<u8>],
+    versions: bool,
+    /// Names of the older copies in the volumes read so far.
+    older: Mutex<HashSet<Vec<u8>>>,
+    /// Members chosen so far.
+    matched: AtomicUsize,
+}
+
+impl<'i> Wanted<'i> {
+    fn new(invocation: &'i Invocation) -> Self {
+        Self {
+            masks: &invocation.masks,
+            versions: invocation.versions,
+            older: Mutex::default(),
+            matched: AtomicUsize::new(0),
+        }
+    }
+
+    /// Notes the older copies of files in a volume, before its members are read.
+    fn note_versions(&self, archive: &Archive) {
+        if let Archive::Rar50Plus(archive) = archive {
+            lock(&self.older).extend(
+                archive
+                    .files()
+                    .filter(|file| file.version.is_some())
+                    .map(|file| file.name.clone()),
+            );
+        }
+    }
+
+    fn wants(&self, name: &[u8]) -> bool {
+        (self.versions || !lock(&self.older).contains(name)) && selected(self.masks, name)
+    }
+
+    /// Whether the run wants a member it has reached, counting it if so.
+    fn choose(&self, name: &[u8]) -> bool {
+        let wanted = self.wants(name);
+        if wanted {
+            self.matched.fetch_add(1, Ordering::Relaxed);
+        }
+        wanted
+    }
+}
+
+/// Whether any mask selects a member, as unrar matches them:
+///
+/// - a mask with no wildcards is a path from the archive root, and selects a
+///   directory's contents with it;
+/// - a mask with wildcards and no path is matched against the member's own
+///   name, in any directory;
+/// - a mask with wildcards and a path is matched against the whole path, and
+///   its `*` reaches into subdirectories.
 fn selected(masks: &[Vec<u8>], name: &[u8]) -> bool {
     if masks.is_empty() {
         return true;
@@ -507,14 +681,57 @@ fn selected(masks: &[Vec<u8>], name: &[u8]) -> bool {
         .iter()
         .map(|&byte| if byte == b'\\' { b'/' } else { byte })
         .collect();
-    let base = name.rsplit(|&byte| byte == b'/').next().unwrap_or(&name);
     masks.iter().any(|mask| {
-        let mask: Vec<u8> = mask
+        // Only Windows reads a backslash in a mask as a separator.
+        let mut mask: Vec<u8> = mask
             .iter()
-            .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+            .map(|&byte| {
+                if cfg!(windows) && byte == b'\\' {
+                    b'/'
+                } else {
+                    byte
+                }
+            })
             .collect();
-        wildcard(&mask, &name) || (!mask.contains(&b'/') && wildcard(&mask, base))
+        while mask.len() > 1 && mask.ends_with(b"/") {
+            mask.pop();
+        }
+        mask_selects(&mask, &name)
     })
+}
+
+fn mask_selects(mask: &[u8], name: &[u8]) -> bool {
+    if !has_wildcard(mask) {
+        return name.len() >= mask.len()
+            && same_bytes(&name[..mask.len()], mask)
+            && (name.len() == mask.len() || name[mask.len()] == b'/');
+    }
+    let subject = if mask.contains(&b'/') {
+        name
+    } else {
+        name.rsplit(|&byte| byte == b'/').next().unwrap_or(name)
+    };
+    let base = subject
+        .rsplit(|&byte| byte == b'/')
+        .next()
+        .unwrap_or(subject);
+    // As on DOS, `name.*` also matches `name`, and `*.` only names without an extension.
+    wildcard(mask, subject)
+        || mask
+            .strip_suffix(b".*")
+            .is_some_and(|stem| wildcard(stem, subject))
+        || mask.strip_suffix(b".").is_some_and(|stem| {
+            !stem.ends_with(b".") && !base.contains(&b'.') && wildcard(stem, subject)
+        })
+}
+
+/// Names compare exactly, except that Windows ignores ASCII case as its filesystems do.
+fn same_bytes(left: &[u8], right: &[u8]) -> bool {
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(right)
+    } else {
+        left == right
+    }
 }
 
 /// `*` matches any run of bytes and `?` any one byte.
@@ -522,12 +739,12 @@ fn wildcard(mask: &[u8], name: &[u8]) -> bool {
     let (mut m, mut n) = (0, 0);
     let mut star = None;
     while n < name.len() {
-        if m < mask.len() && (mask[m] == b'?' || mask[m] == name[n]) {
-            m += 1;
-            n += 1;
-        } else if m < mask.len() && mask[m] == b'*' {
+        if m < mask.len() && mask[m] == b'*' {
             star = Some((m, n));
             m += 1;
+        } else if m < mask.len() && (mask[m] == b'?' || same_bytes(&mask[m..=m], &name[n..=n])) {
+            m += 1;
+            n += 1;
         } else if let Some((star_m, star_n)) = star {
             m = star_m + 1;
             n = star_n + 1;
@@ -546,7 +763,9 @@ fn run_members(
     path: &Path,
     archive: &Archive,
     password: Option<&[u8]>,
-) -> i32 {
+    tally: &mut Tally,
+    read: &mut HashSet<PathBuf>,
+) {
     let salvage = salvaging(invocation);
     let options = ArchiveReadOptions::with_optional_password(password).with_salvage(salvage);
     let command = invocation.command;
@@ -556,12 +775,18 @@ fn run_members(
         _ => {}
     };
     announce(path);
+    read.insert(path.to_path_buf());
+    let wanted = Wanted::new(invocation);
+    wanted.note_versions(archive);
+    let later_wanted = &wanted;
     let header_errors = AtomicUsize::new(report_header_damage(out, archive));
     let later_header_errors = &header_errors;
     let mut index = 1;
     // The first volume that ends early, of those after the first.
-    let truncated = std::sync::Mutex::new(None);
+    let truncated = Mutex::new(None);
     let later_truncation = &truncated;
+    let later_volumes = Mutex::new(Vec::new());
+    let read_later = &later_volumes;
     let volumes = std::iter::from_fn(move || {
         let next = archive.volume_path(path, index)?;
         if !next.exists() {
@@ -569,73 +794,64 @@ fn run_members(
         }
         index += 1;
         announce(&next);
-        let volume = ArchiveReader::read_path_with_options(
-            &next,
-            ArchiveReadOptions::with_optional_password(password).with_salvage(salvage),
-        );
+        let volume = read_archive(&next, password, salvage);
+        lock(read_later).push(next);
         if let Ok(volume) = &volume {
             later_header_errors.fetch_add(report_header_damage(out, volume), Ordering::Relaxed);
+            later_wanted.note_versions(volume);
         }
         if let Some(truncation) = volume.as_ref().ok().and_then(Archive::truncation) {
-            if let Ok(mut truncated) = later_truncation.lock() {
-                truncated.get_or_insert_with(|| truncation.clone());
-            }
+            lock(later_truncation).get_or_insert_with(|| truncation.clone());
         }
         Some(volume)
     });
-    let matched = Cell::new(0usize);
-    let select = |meta: &rars::ExtractedEntryMeta| {
-        let chosen = selected(&invocation.masks, &meta.name);
-        matched.set(matched.get() + usize::from(chosen));
-        chosen
-    };
+    let failures = Failures::new(&wanted);
     let result = match command {
-        Command::Extract { .. } => extract(invocation, out, archive, volumes, options, &select),
-        _ => test_or_print(command, out, archive, volumes, options, &select).map(|warnings| {
-            Extracted {
-                warnings,
+        Command::Extract { .. } => extract(invocation, out, archive, volumes, options, &failures),
+        _ => {
+            test_or_print(command, out, archive, volumes, options, &failures).map(|()| Extracted {
+                warnings: false,
                 all_kept: false,
-                errors: MemberErrors::default(),
-            }
-        }),
+            })
+        }
     };
+    read.extend(
+        later_volumes
+            .into_inner()
+            .unwrap_or_else(PoisonError::into_inner),
+    );
     let header_errors = header_errors.into_inner();
-    let code = match result {
-        Ok(Extracted {
-            warnings,
-            all_kept,
-            errors,
-        }) => {
-            if matched.get() == 0 || all_kept {
-                out.info("No files to extract");
-                return NO_FILES;
-            }
+    let member_errors = failures.count.into_inner();
+    tally.errors += header_errors + member_errors;
+    if member_errors > 0 {
+        tally.fail(failures.code.into_inner());
+    }
+    match result {
+        Ok(Extracted { warnings, all_kept }) => {
             let later = truncated
-                .lock()
-                .ok()
-                .and_then(|mut truncated| truncated.take());
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
             let truncated = report_truncation(out, archive.truncation().or(later.as_ref()));
-            let member_errors = errors.count.into_inner();
-            let total = header_errors + member_errors + usize::from(truncated);
-            if total > 0 {
-                out.info(&format!("Total errors: {total}"));
+            tally.errors += usize::from(truncated);
+            if header_errors > 0 {
+                tally.fail(CHECKSUM);
             }
-            if member_errors > 0 {
-                errors.code.into_inner()
-            } else if header_errors > 0 {
-                CHECKSUM
-            } else if truncated || warnings {
-                WARNING
-            } else {
-                OK
+            if truncated || warnings {
+                tally.fail(WARNING);
+            }
+            if wanted.matched.into_inner() > 0 && !all_kept {
+                tally.worked += 1;
             }
         }
-        Err(error) => report_failure(out, archive, path, &error, header_errors),
-    };
-    if code == OK && invocation.done && command != Command::Print {
-        out.info("All OK");
+        Err(error) => {
+            tally.errors += 1;
+            tally.fail(report_failure(out, archive, path, &error));
+            if header_errors > 0 {
+                tally.fail(CHECKSUM);
+            }
+            tally.worked += 1;
+        }
     }
-    code
 }
 
 struct Extracted {
@@ -643,16 +859,73 @@ struct Extracted {
     warnings: bool,
     /// `-o-` kept every selected file that was already there, so nothing was written.
     all_kept: bool,
-    /// The members `-kb` went past.
-    errors: MemberErrors,
 }
 
-/// The members `-kb` reported and went past.
-#[derive(Default)]
-struct MemberErrors {
+/// The members a run failed on and went past. As unrar does, it reports each
+/// one it wants and carries on to the next, and passes over the failures of
+/// those it doesn't want without a word.
+struct Failures<'r> {
+    wanted: &'r Wanted<'r>,
     count: AtomicUsize,
     /// The exit code of the first.
     code: AtomicI32,
+    /// Failed members whose output is yet to be dropped.
+    failed: Mutex<Vec<Vec<u8>>>,
+    /// One of our own callbacks failed, and its error ends the run.
+    callback_failed: AtomicBool,
+}
+
+/// What to do about a member that failed.
+enum Failure {
+    /// End the run with its error.
+    Abort,
+    /// Not a member the run wants: go on without a word.
+    Unwanted,
+    /// Report this line and go on.
+    Report(String),
+}
+
+impl<'r> Failures<'r> {
+    fn new(wanted: &'r Wanted<'r>) -> Self {
+        Self {
+            wanted,
+            count: AtomicUsize::new(0),
+            code: AtomicI32::new(OK),
+            failed: Mutex::default(),
+            callback_failed: AtomicBool::new(false),
+        }
+    }
+
+    /// Counts a member that failed if the run wants it, giving its error line.
+    fn fail(&self, member: &rars::ArchiveMember, error: &rars::Error) -> Failure {
+        // Reading the archive or writing the output failing ends the run.
+        if self.callback_failed.load(Ordering::Relaxed) || error.kind() == ErrorKind::Io {
+            return Failure::Abort;
+        }
+        if !self.wanted.wants(&member.meta.name) {
+            return Failure::Unwanted;
+        }
+        // It may have failed before its output opened.
+        self.wanted.matched.fetch_add(1, Ordering::Relaxed);
+        let (line, code) = member_error_line(&display_name(&member.meta.name), error);
+        let _ = self
+            .code
+            .compare_exchange(OK, code, Ordering::Relaxed, Ordering::Relaxed);
+        self.count.fetch_add(1, Ordering::Relaxed);
+        Failure::Report(line)
+    }
+
+    /// Notes that one of our callbacks failed, so its error is not gone past.
+    fn callback<T>(&self, result: rars::Result<T>) -> rars::Result<T> {
+        if result.is_err() {
+            self.callback_failed.store(true, Ordering::Relaxed);
+        }
+        result
+    }
+
+    fn take_failed(&self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut *lock(&self.failed))
+    }
 }
 
 /// What `-kb` keeps: a member the library fails on after delivering its
@@ -663,7 +936,6 @@ struct KeepBroken {
     kept: KeptBroken,
     /// The error lines of kept members not yet in place, by member name.
     pending: Mutex<Vec<(Vec<u8>, String)>>,
-    errors: MemberErrors,
 }
 
 fn extract<V>(
@@ -672,7 +944,7 @@ fn extract<V>(
     archive: &Archive,
     volumes: V,
     options: ArchiveReadOptions<'_>,
-    select: &dyn Fn(&rars::ExtractedEntryMeta) -> bool,
+    failures: &Failures<'_>,
 ) -> rars::Result<Extracted>
 where
     V: Iterator<Item = rars::Result<Archive>> + Send,
@@ -692,7 +964,9 @@ where
         archive.family(),
     );
     state.skip_existing = policy == OverwritePolicy::Never;
-    state.selected = Some(Box::new(select));
+    state.selected = Some(Box::new(|meta: &rars::ExtractedEntryMeta| {
+        failures.wanted.choose(&meta.name)
+    }));
     state.on_published = Some(Box::new(move |output: &ExtractedOutput| {
         let verb = if output.meta.is_directory {
             "Creating"
@@ -715,48 +989,48 @@ where
         }
     }));
     let keep_broken = invocation.keep_broken;
-    // Goes past a damaged member, keeping what was read of it.
+    // Goes past a failed member. `-kb` keeps what was read of it; otherwise
+    // its output is dropped before the next member opens.
     let handler = |member: &rars::ArchiveMember, error: &rars::Error| {
-        if matches!(error.kind(), ErrorKind::BadPassword | ErrorKind::Io) {
-            return Ok(rars::ExtractionErrorAction::Abort);
-        }
-        let (line, code) = member_error_line(&display_name(&member.meta.name), error);
-        let errors = &broken.errors;
-        let _ = errors
-            .code
-            .compare_exchange(OK, code, Ordering::Relaxed, Ordering::Relaxed);
-        errors.count.fetch_add(1, Ordering::Relaxed);
-        if broken.kept.keep(&member.meta.name) {
-            lock(&broken.pending).push((member.meta.name.clone(), line));
+        let line = match failures.fail(member, error) {
+            Failure::Abort => return Ok(rars::ExtractionErrorAction::Abort),
+            Failure::Unwanted => return Ok(rars::ExtractionErrorAction::Continue),
+            Failure::Report(line) => line,
+        };
+        let name = &member.meta.name;
+        if !is_password_error(error) && broken.kept.keep(name) {
+            lock(&broken.pending).push((name.clone(), line));
         } else {
             out.error(&line);
+            lock(&failures.failed).push(name.clone());
         }
         Ok(rars::ExtractionErrorAction::Continue)
-    };
-    let options = if keep_broken {
-        options.with_member_error_handler(&handler)
-    } else {
-        options
     };
     let state = RefCell::new(state);
     let result = rars::output_links::extract_arriving_with_links(
         archive,
         volumes,
-        options,
+        options.with_member_error_handler(&handler),
         |meta| {
             let mut state = state.borrow_mut();
+            state.discard_failed(&failures.take_failed());
             let opened = if keep_broken {
                 broken.kept.open(&mut state, meta)
             } else {
                 state.open_entry(meta)
             };
-            opened.map(|writer| writer as Box<dyn Write>)
+            failures
+                .callback(opened)
+                .map(|writer| writer as Box<dyn Write>)
         },
         |meta, link| {
             broken.kept.close();
-            state.borrow_mut().create_link(meta, link)
+            let mut state = state.borrow_mut();
+            state.discard_failed(&failures.take_failed());
+            failures.callback(state.create_link(meta, link))
         },
     );
+    state.borrow_mut().discard_failed(&failures.take_failed());
     if let Err(error) = result {
         let _ = state.borrow_mut().publish_before_failure(&error);
         return Err(error);
@@ -769,8 +1043,14 @@ where
     Ok(Extracted {
         warnings: skipped_links > 0,
         all_kept: kept > 0 && outputs.iter().all(|output| output.meta.is_directory),
-        errors: keep.errors,
     })
+}
+
+fn is_password_error(error: &rars::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::PasswordRequired | ErrorKind::BadPassword
+    )
 }
 
 fn test_or_print<V>(
@@ -779,33 +1059,49 @@ fn test_or_print<V>(
     archive: &Archive,
     volumes: V,
     options: ArchiveReadOptions<'_>,
-    select: &dyn Fn(&rars::ExtractedEntryMeta) -> bool,
-) -> rars::Result<bool>
+    failures: &Failures<'_>,
+) -> rars::Result<()>
 where
     V: Iterator<Item = rars::Result<Archive>> + Send,
 {
-    // A member has passed its checksum once the next one starts, or the run ends.
-    let pending: RefCell<Option<String>> = RefCell::new(None);
-    let passed = || {
-        if let Some(name) = pending.borrow_mut().take() {
-            out.info(&format!("{:<11} {name:<57} OK", "Testing"));
+    // A member has passed its checksum once the next one starts, or the run
+    // ends, with no error for it.
+    let pending: Mutex<Option<Vec<u8>>> = Mutex::new(None);
+    let settle = |failed: Option<&[u8]>| {
+        if let Some(name) = lock(&pending).take() {
+            let name_text = display_name(&name);
+            if failed == Some(name.as_slice()) {
+                out.info(&format!("{:<11} {name_text}", "Testing"));
+            } else {
+                out.info(&format!("{:<11} {name_text:<57} OK", "Testing"));
+            }
         }
     };
-    let mut visit = |meta: &rars::ExtractedEntryMeta| -> bool {
-        passed();
-        let chosen = select(meta);
+    let visit = |meta: &rars::ExtractedEntryMeta| -> bool {
+        settle(None);
+        let chosen = failures.wanted.choose(&meta.name);
         if chosen && command == Command::Test {
-            *pending.borrow_mut() = Some(display_name(&meta.name));
+            *lock(&pending) = Some(meta.name.clone());
         }
         chosen
     };
-    let visit = RefCell::new(&mut visit);
+    let handler = |member: &rars::ArchiveMember, error: &rars::Error| {
+        match failures.fail(member, error) {
+            Failure::Abort => return Ok(rars::ExtractionErrorAction::Abort),
+            Failure::Unwanted => {}
+            Failure::Report(line) => {
+                settle(Some(&member.meta.name));
+                out.error(&line);
+            }
+        }
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
     rars::output_links::extract_arriving_with_links(
         archive,
         volumes,
-        options,
+        options.with_member_error_handler(&handler),
         |meta| {
-            let chosen = (visit.borrow_mut())(meta);
+            let chosen = visit(meta);
             Ok(if chosen && command == Command::Print {
                 Box::new(std::io::stdout()) as Box<dyn Write>
             } else {
@@ -813,12 +1109,12 @@ where
             })
         },
         |meta, _link| {
-            (visit.borrow_mut())(meta);
+            visit(meta);
             Ok(())
         },
     )?;
-    passed();
-    Ok(false)
+    settle(None);
+    Ok(())
 }
 
 /// Says that an archive ends early, as unrar does, after its members are done.
@@ -848,28 +1144,19 @@ fn report_truncation(out: Out, truncation: Option<&rars::Truncation>) -> bool {
     true
 }
 
-/// Reports a failure that ended the run. `earlier` errors were reported before it.
-fn report_failure(
-    out: Out,
-    archive: &Archive,
-    path: &Path,
-    error: &rars::Error,
-    earlier: usize,
-) -> i32 {
-    let total = earlier + 1;
+/// Reports a failure that ended the run, returning its exit code.
+fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error) -> i32 {
     let member = rars::output_staging::failed_entry_name(error).map(display_name);
     if let Some(index) = missing_volume(error) {
         let name = archive
             .volume_path(path, index)
             .unwrap_or_else(|| path.to_path_buf());
         out.error(&format!("Cannot find volume {}", name.display()));
-        out.info(&format!("Total errors: {total}"));
         return MISSING_VOLUME;
     }
     let member = member.unwrap_or_else(|| path.display().to_string());
     let (line, code) = member_error_line(&member, error);
     out.error(&line);
-    out.info(&format!("Total errors: {total}"));
     code
 }
 
@@ -1001,5 +1288,52 @@ mod tests {
         assert!(!selected(&masks(&["other/*.txt"]), b"sub/a.txt"));
         assert!(selected(&masks(&["s?b/*"]), b"sub/b.bin"));
         assert!(!selected(&masks(&["a.txt"]), b"sub/b.txt"));
+    }
+
+    /// Issue #564, as unrar matches masks.
+    #[test]
+    fn masks_match_as_unrar_does() {
+        let matches =
+            |mask: &str, name: &str| selected(&[mask.as_bytes().to_vec()], name.as_bytes());
+        // A plain name is a path from the root, and takes a directory's contents.
+        assert!(matches("a.txt", "a.txt"));
+        assert!(!matches("a.txt", "sub/a.txt"));
+        assert!(matches("sub", "sub"));
+        assert!(matches("sub", "sub/deeper/a.txt"));
+        assert!(!matches("sub", "subway.txt"));
+        assert!(matches("sub/deeper", "sub/deeper/a.txt"));
+        assert!(!matches("deeper", "sub/deeper"));
+        // Wildcards without a path match the name in any directory, and only it.
+        assert!(matches("*.txt", "sub/deeper/a.txt"));
+        assert!(matches("s*", "sub"));
+        assert!(!matches("s*", "sub/a.txt"));
+        assert!(matches("?.txt", "sub/b.txt"));
+        // With a path, `*` reaches into subdirectories.
+        assert!(matches("sub/*.txt", "sub/deeper/a.txt"));
+        assert!(matches("*/a.txt", "sub/deeper/a.txt"));
+        assert!(!matches("*/a.txt", "a.txt"));
+        // DOS rules for extensions.
+        assert!(matches("*.*", "sub"));
+        assert!(matches("sub.*", "sub"));
+        assert!(matches("*.", "sub/deeper"));
+        assert!(!matches("*.", "a.txt"));
+        // A separator at the end changes nothing.
+        assert!(matches("sub/", "sub/a.txt"));
+        // Case and backslashes in masks are the host's.
+        assert_eq!(matches("A.TXT", "a.txt"), cfg!(windows));
+        assert_eq!(matches(r"sub\a.txt", "sub/a.txt"), cfg!(windows));
+    }
+
+    #[test]
+    fn an_existing_directory_ends_the_masks() {
+        // A directory that is there, named without a trailing separator.
+        let dir = env!("CARGO_MANIFEST_DIR");
+        let parsed = invocation(&["x", "a.rar", "*.txt", dir]);
+        assert_eq!(parsed.destination, PathBuf::from(dir));
+        assert_eq!(parsed.masks, vec![b"*.txt".to_vec()]);
+        // Only extraction has a destination to find.
+        let parsed = invocation(&["t", "a.rar", dir]);
+        assert_eq!(parsed.destination, PathBuf::new());
+        assert!(invocation(&["x", "-ver", "a.rar"]).versions);
     }
 }
