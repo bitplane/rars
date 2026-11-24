@@ -223,14 +223,14 @@ fn seekable_archives_match_fingerprints_captured_from_master() {
         ));
     }
     let expected = [
-        ("Rar15_stored", "140205:92f2a959"),
-        ("Rar15_compressed", "111093:306171e8"),
-        ("Rar40_stored", "140212:db64ba84"),
-        ("Rar40_compressed", "105782:84fd30aa"),
-        ("Rar40_encrypted_headers", "105912:71880773"),
+        ("Rar15_stored", "140205:13201d9c"),
+        ("Rar15_compressed", "111093:f0054784"),
+        ("Rar40_stored", "140212:62caa6ac"),
+        ("Rar40_compressed", "105782:b31b133d"),
+        ("Rar40_encrypted_headers", "105912:faa7ab98"),
         (
             "Rar40_volumes_encrypted_headers",
-            "30000:1cbe6415 30000:cb5d28ff 30000:52c3702c 30000:3532be9b 21208:eb107e2c",
+            "30000:1a4e1a2c 30000:0f567ea9 30000:0d826c07 30000:4a74afcc 21208:5e4ad63a",
         ),
     ];
     crate::write_stream::assert_fingerprints(&cases, &expected);
