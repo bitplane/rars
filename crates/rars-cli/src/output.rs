@@ -157,17 +157,25 @@ pub(crate) fn has_mode(_file: &fs::File, _mode: u32) -> bool {
 /// created with each, so the others need no change when they are kept. The
 /// CLI never changes its umask.
 #[derive(Clone)]
-pub(crate) struct CreatedModes(std::sync::Arc<[std::sync::atomic::AtomicU8]>);
+pub(crate) struct CreatedModes {
+    #[cfg(unix)]
+    known: std::sync::Arc<[std::sync::atomic::AtomicU8]>,
+}
 
 impl Default for CreatedModes {
     fn default() -> Self {
-        Self((0..=0o7777).map(|_| Default::default()).collect())
+        Self {
+            #[cfg(unix)]
+            known: (0..=0o7777).map(|_| Default::default()).collect(),
+        }
     }
 }
 
 impl CreatedModes {
     // Not known yet is 0, as each starts.
+    #[cfg(unix)]
     const KEPT: u8 = 1;
+    #[cfg(unix)]
     const CHANGED: u8 = 2;
 
     /// Whether `file`, created here with the permission bits `mode` and not
@@ -176,7 +184,7 @@ impl CreatedModes {
     fn kept(&self, file: &fs::File, mode: u32) -> bool {
         use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::Ordering;
-        let Some(known) = self.0.get(mode as usize) else {
+        let Some(known) = self.known.get(mode as usize) else {
             return false;
         };
         match known.load(Ordering::Relaxed) {
