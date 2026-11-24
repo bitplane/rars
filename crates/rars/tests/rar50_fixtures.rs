@@ -7150,8 +7150,11 @@ fn a_volume_set_reports_compression_progress() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     // Blocks are a megabyte, so three of them is what proves the reporting is
-    // incremental rather than one jump at the end.
-    let payload = volume_payload(3 * 1024 * 1024);
+    // incremental rather than one jump at the end. Noise would be stored from
+    // its samples, and read only as it is copied into the volumes.
+    let payload: Vec<u8> = (0..3 * 1024 * 1024u32)
+        .map(|at| b"volume progress "[at as usize % 16] ^ (at >> 12) as u8)
+        .collect();
     let entries = [streaming_entry("progress.bin", &payload)];
 
     let started = AtomicBool::new(false);
@@ -7190,7 +7193,8 @@ fn a_volume_set_reports_compression_progress() {
         rar50::WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
             .with_compression_level(1),
         rar50::ArchiveExtras::default(),
-        900_000,
+        // The text packs small, so the volumes are too.
+        4096,
         &mut sink,
         &rars::WriterResources::default(),
         Some(&reporter),

@@ -830,7 +830,9 @@ fn hand_on_done<B: Budget>(
 }
 
 /// `advance` is called with each newly completed chunk of work and returns
-/// false when the caller wants to stop.
+/// false when the caller wants to stop. Stored members are hashed before they
+/// are handed on; the writers hash them on their copy instead.
+#[cfg(test)]
 pub(super) fn compress_members_with_context(
     sources: &[EntrySource],
     plan: &CompressPlan,
