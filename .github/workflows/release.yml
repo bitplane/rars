@@ -8,6 +8,11 @@ name: Release
 #
 # workflow_dispatch re-runs publishing for a version that is already tagged,
 # when a registry failed part way through.
+#
+# A release pull request (a release/v* branch), or any pull request labelled
+# `release-dry-run`, runs the gate and every build job with tagging and
+# publishing skipped, so a broken release path fails on the pull request rather
+# than after it is merged.
 on:
   push:
     branches:
@@ -15,6 +20,8 @@ on:
     paths:
       - "crates/*/Cargo.toml"
       - "pyproject.toml"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
     inputs:
       ref:
@@ -35,10 +42,11 @@ permissions: {}
 
 # Releases must never be cancelled mid-flight. Each push gets its own group, so
 # a later push to master cannot replace a release waiting for approval; two
-# pushes racing to tag one version are settled by the tag push itself.
+# pushes racing to tag one version are settled by the tag push itself. A dry
+# run on a pull request publishes nothing, so a new push to it replaces it.
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
-  cancel-in-progress: false
+  group: release-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.event_name == 'workflow_dispatch' && inputs.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -50,15 +58,21 @@ jobs:
   # 1. Decide whether this is a release, and check every publishable package
   #    declares the version being released. A push releases when it changed
   #    the version and that version has no tag; a dispatch republishes the
-  #    tag it names.
+  #    tag it names. `build` runs the gate and the build jobs; `release` also
+  #    tags and publishes. A dry run on a pull request sets only `build`.
   # ----------------------------------------------------------------------
   verify-tag:
     name: Decide the release and check package versions
+    if: >-
+      github.event_name != 'pull_request'
+      || startsWith(github.head_ref, 'release/')
+      || contains(github.event.pull_request.labels.*.name, 'release-dry-run')
     runs-on: ubuntu-latest
     permissions:
       contents: read
     outputs:
       version: ${{ steps.check.outputs.version }}
+      build: ${{ steps.check.outputs.build }}
       release: ${{ steps.check.outputs.release }}
     steps:
       - uses: actions/checkout@v7
@@ -82,6 +96,9 @@ jobs:
             TAG_VERSION="${TAG#v}"              # 0.1.0-alpha.1
             git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null \
               || { echo "::error::$TAG is not a tag"; exit 1; }
+          elif [ "$EVENT" = pull_request ]; then
+            TAG_VERSION="$(package_version < crates/rars/Cargo.toml)"
+            echo "Dry run of $TAG_VERSION; nothing is tagged or published."
           else
             TAG_VERSION="$(package_version < crates/rars/Cargo.toml)"
             PREVIOUS=""
@@ -90,11 +107,13 @@ jobs:
             fi
             if [ "$PREVIOUS" = "$TAG_VERSION" ]; then
               echo "Version $TAG_VERSION is unchanged; not a release."
+              echo "build=false" >> "$GITHUB_OUTPUT"
               echo "release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             if git ls-remote --exit-code --tags origin "refs/tags/v$TAG_VERSION" >/dev/null; then
               echo "v$TAG_VERSION is already tagged; not releasing it again."
+              echo "build=false" >> "$GITHUB_OUTPUT"
               echo "release=false" >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -138,16 +157,22 @@ jobs:
               raise SystemExit(1)
           PY
           echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
-          echo "release=true" >> "$GITHUB_OUTPUT"
+          echo "build=true" >> "$GITHUB_OUTPUT"
+          if [ "$EVENT" = pull_request ]; then
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
 
   # ----------------------------------------------------------------------
-  # 2. Re-run the suite as a release gate. Nothing else runs unless this is
-  #    green.
+  # 2. Re-run the suite as a release gate. Nothing else runs unless every
+  #    gate job is green. The jobs together run what scripts/release-gate.sh
+  #    (`just gate`) runs locally, split up so they run side by side.
   # ----------------------------------------------------------------------
-  test:
-    name: Test gate
+  gate-lint:
+    name: Gate / lint
     needs: verify-tag
-    if: needs.verify-tag.outputs.release == 'true'
+    if: needs.verify-tag.outputs.build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -162,62 +187,160 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The write matrix hands every archive shape to a decoder we did not
-      # write. Both are pinned and checksummed: unrar comes from source because
-      # distributions ship unrar-free under the same name, which cannot read
-      # RAR 5, and 7-Zip comes from upstream because the Debian and Ubuntu
-      # package has the RAR decompressor removed.
-      - name: Install unrar
-        run: |
-          set -euo pipefail
-          curl -sSfLO https://www.rarlab.com/rar/unrarsrc-7.1.6.tar.gz
-          echo "ca5e1da37dd6fa1b78bb5ed675486413f79e4a917709744aa04b6f93dfd914f0  unrarsrc-7.1.6.tar.gz" | sha256sum -c -
-          tar xf unrarsrc-7.1.6.tar.gz
-          make -C unrar -j"$(nproc)"
-          sudo install -m 0755 unrar/unrar /usr/local/bin/unrar
-          unrar | head -2
-
-      - name: Install 7-Zip
-        run: |
-          set -euo pipefail
-          curl -sSfLO https://github.com/ip7z/7zip/releases/download/26.00/7z2600-linux-x64.tar.xz
-          echo "c74dc4a48492cde43f5fec10d53fb2a66f520e4a62a69d630c44cb22c477edc6  7z2600-linux-x64.tar.xz" | sha256sum -c -
-          mkdir -p 7zip && tar -C 7zip -xf 7z2600-linux-x64.tar.xz
-          sudo install -m 0755 7zip/7zz /usr/local/bin/7zz
-          7zz | head -2
-
-      # Python 3.10 is what the wheels target, so the gate builds the extension
-      # against the oldest version it claims to support.
+      # The workspace includes PyO3 tests that embed Python.
       - uses: actions/setup-python@v7
         with:
           python-version: "3.10"
 
-      # The gate also builds the npm package and runs its checks, which needs a
-      # wasm target, wasm-bindgen and Node. The wasm-bindgen version has to
-      # match the crate the module was compiled against or the generated glue
-      # will not load it, so it is pinned here and in Cargo.lock together.
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+
+  # Every unit and integration test, slow ones included, in three shards.
+  # A missing external decoder fails the write matrix rather than skipping it.
+  gate-rust:
+    name: Gate / Rust tests ${{ matrix.shard }}/3
+    needs: verify-tag
+    if: needs.verify-tag.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    env:
+      RARS_REQUIRE_EXTERNAL_DECODERS: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: ./.github/actions/install-external-decoders
+
+      # Python 3.10 is what the wheels target, and the PyO3 tests embed it.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      # Unoptimised rars spends test runs decoding, as in CI's Rust checks.
+      - name: Optimise the rars crates in test builds
+        run: |
+          mkdir -p "${CARGO_HOME:-$HOME/.cargo}"
+          printf '[profile.dev.package.rars]\nopt-level = 1\n[profile.dev.package.rars-cli]\nopt-level = 1\n' >> "${CARGO_HOME:-$HOME/.cargo}/config.toml"
+
+      - run: >-
+          cargo nextest run --workspace --all-targets --locked --no-fail-fast
+          --partition count:${{ matrix.shard }}/3
+
+  # nextest does not run doctests.
+  gate-doctests:
+    name: Gate / doctests
+    needs: verify-tag
+    if: needs.verify-tag.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - run: cargo test --workspace --locked --doc
+
+  # The Python package ships from the same tag as the crates. This builds the
+  # extension against the oldest Python the wheels claim to support and runs
+  # python/tests against it; several of those check archives with unrar.
+  gate-python:
+    name: Gate / Python bindings
+    needs: verify-tag
+    if: needs.verify-tag.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: ./.github/actions/install-external-decoders
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - run: python3 scripts/test-python-bindings.py
+
+  # The npm package ships from the same tag as the crates, and this is where
+  # its JavaScript API is executed rather than compiled. The wasm-bindgen
+  # version has to match the crate the module was compiled against or the
+  # generated glue will not load it, so it is read from Cargo.lock.
+  gate-npm:
+    name: Gate / npm package
+    needs: verify-tag
+    if: needs.verify-tag.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_REF }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.10"
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
       - name: Install wasm toolchain
         run: |
           set -euo pipefail
-          rustup target add wasm32-unknown-unknown
           WASM_BINDGEN_VERSION="$(python3 scripts/wasm-bindgen-version.py)"
           cargo install wasm-bindgen-cli --version "$WASM_BINDGEN_VERSION" --locked
           npm install --global binaryen@132
           wasm-bindgen --version
           wasm-opt --version
 
-      - uses: actions/setup-node@v7
-        with:
-          node-version: "22"
+      - run: ./scripts/build-npm.sh
+      - run: node scripts/test-npm-package.js
 
-      # The same script `just gate` runs. Spelling the steps out here again is
-      # how the Python suite came to run in neither place: it was added to the
-      # script nobody called, and CI had its own copy of the cargo commands that
-      # knew nothing about it. One list, two callers.
-      #
-      # RARS_REQUIRE_EXTERNAL_DECODERS is set inside the script, so a missing
-      # decoder fails the gate rather than skipping the matrix.
-      - run: ./scripts/release-gate.sh
+  # One job for everything after the gate to wait on. It runs only when every
+  # gate job succeeded; otherwise it is skipped, and so is everything after it.
+  test:
+    name: Test gate
+    needs: [verify-tag, gate-lint, gate-rust, gate-doctests, gate-python, gate-npm]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: echo "Every gate job passed."
 
   # ----------------------------------------------------------------------
   # 2b. Tag the merge commit, now that the gate has passed on it. A tag that
@@ -252,7 +375,7 @@ jobs:
   build:
     name: Build ${{ matrix.label }}
     needs: [verify-tag, test]
-    if: github.event_name == 'push' || inputs.publish == 'all'
+    if: github.event_name != 'workflow_dispatch' || inputs.publish == 'all'
     permissions:
       contents: read
     strategy:
@@ -362,7 +485,7 @@ jobs:
   build-python-wheels:
     name: Build Python ${{ matrix.label }}
     needs: [verify-tag, test]
-    if: github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all'
+    if: github.event_name != 'workflow_dispatch' || inputs.publish == 'pypi' || inputs.publish == 'all'
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -425,7 +548,7 @@ jobs:
   build-python-sdist:
     name: Build Python sdist
     needs: [verify-tag, test]
-    if: github.event_name == 'push' || inputs.publish == 'pypi' || inputs.publish == 'all'
+    if: github.event_name != 'workflow_dispatch' || inputs.publish == 'pypi' || inputs.publish == 'all'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -458,7 +581,7 @@ jobs:
   build-npm:
     name: Build npm package
     needs: [verify-tag, test]
-    if: github.event_name == 'push' || inputs.publish == 'npm' || inputs.publish == 'all'
+    if: github.event_name != 'workflow_dispatch' || inputs.publish == 'npm' || inputs.publish == 'all'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -662,7 +785,9 @@ jobs:
   publish-github-release:
     name: Publish GitHub Release
     needs: [verify-tag, build, publish]
-    if: github.event_name == 'push' || inputs.publish == 'all'
+    if: >-
+      needs.verify-tag.outputs.release == 'true'
+      && (github.event_name == 'push' || inputs.publish == 'all')
     runs-on: ubuntu-latest
     permissions:
       contents: write
