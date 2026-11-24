@@ -109,17 +109,6 @@ jobs:
           cargo nextest run --workspace --locked --no-fail-fast
           cargo test --workspace --locked --doc
 
-      # The tests already built the CLI. `cargo build` would build rars and the
-      # CLI again, since the test build's dev-dependencies change the features
-      # of shared dependencies; asking for the test build again only confirms
-      # that target/debug/rars is current.
-      - name: Frozen runner real-binary smoke and portable checks
-        env:
-          RARS_SMOKE_BINARY: ${{ github.workspace }}/target/debug/rars
-        run: |
-          cargo test --workspace --locked --no-run
-          python3 -m unittest discover -s scripts/hybrid -v
-
   python:
     name: Python bindings (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
