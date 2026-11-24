@@ -1309,7 +1309,9 @@ impl Ppmd7<Allowance> {
     }
 
     fn encode_symbol(&mut self, symbol: u8, out: &mut RangeEncoder) -> Result<()> {
-        let mut mask = [0xffu8; 256];
+        // Filled only on an escape: most symbols are found in the first
+        // context, and never read it.
+        let mut mask: [u8; 256];
         let mc = self.min_context;
         let num_stats = self.num_stats(mc);
         if num_stats != 1 {
@@ -1337,6 +1339,7 @@ impl Ppmd7<Allowance> {
             self.prev_success = 0;
             out.encode(start, summ_freq - start, summ_freq);
             self.hi_bits_flag = hi_bits_flag3(self.symbol(self.found_state));
+            mask = [0xffu8; 256];
             for k in 0..num_stats {
                 mask[usize::from(self.symbol(stats + 6 * k))] = 0;
             }
@@ -1356,6 +1359,7 @@ impl Ppmd7<Allowance> {
             self.init_esc = u32::from(EXP_ESCAPE[(prob >> 10) as usize]);
             out.low = out.low.wrapping_add(size0);
             out.range = (out.range & !(BIN_SCALE - 1)).wrapping_sub(size0);
+            mask = [0xffu8; 256];
             mask[usize::from(self.symbol(s))] = 0;
             self.prev_success = 0;
         }
@@ -1483,6 +1487,11 @@ pub struct PpmdEncoder {
     model: PpmdModel,
     range: RangeEncoder,
     esc_char: u8,
+    /// The last [`PpmdEncoder::spent_bits`] reading and the output length and
+    /// range it was taken at. A token's price is read before and after it, so
+    /// each reading is usually the one before the next token as well.
+    #[cfg(feature = "write")]
+    spent: std::cell::Cell<(usize, u32, f64)>,
 }
 
 #[cfg(any(test, feature = "write"))]
@@ -1494,6 +1503,8 @@ impl PpmdEncoder {
             },
             range: RangeEncoder::new(),
             esc_char,
+            #[cfg(feature = "write")]
+            spent: std::cell::Cell::new((usize::MAX, 0, 0.0)),
         })
     }
 
@@ -1510,6 +1521,7 @@ impl PpmdEncoder {
             model,
             range: RangeEncoder::new(),
             esc_char,
+            spent: std::cell::Cell::new((usize::MAX, 0, 0.0)),
         }
     }
 
@@ -1606,7 +1618,14 @@ impl PpmdEncoder {
     /// this to price escape tokens against the literals they would replace.
     #[cfg(feature = "write")]
     pub(crate) fn spent_bits(&self) -> f64 {
-        8.0 * self.range.out.len() as f64 - f64::from(self.range.range.max(1)).log2()
+        let (len, range) = (self.range.out.len(), self.range.range);
+        let (last_len, last_range, last) = self.spent.get();
+        if (len, range) == (last_len, last_range) {
+            return last;
+        }
+        let bits = 8.0 * len as f64 - f64::from(range.max(1)).log2();
+        self.spent.set((len, range, bits));
+        bits
     }
 }
 
