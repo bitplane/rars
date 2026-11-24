@@ -48,9 +48,10 @@ fn mixed(len: usize) -> Vec<u8> {
     out
 }
 
-fn options() -> [EncodeOptions; 3] {
+fn options() -> [EncodeOptions; 4] {
     [
         EncodeOptions::new(),
+        EncodeOptions::new().with_priced_parse(true),
         EncodeOptions::new()
             .with_lazy_matching(false)
             .with_max_long_match_distance(16 * 1024),
@@ -114,6 +115,28 @@ fn a_solid_chain_codes_the_same_streamed_or_whole() {
         let expected = whole.encode_member(member).unwrap();
         assert!(
             streamed(&mut windowed, member, 9_000) == expected,
+            "member {index}"
+        );
+        assert_eq!(
+            decoder
+                .decode_member(&expected, member.len(), index > 0)
+                .unwrap(),
+            *member
+        );
+    }
+}
+
+#[test]
+fn a_priced_solid_chain_codes_the_same_streamed_or_whole() {
+    let options = EncodeOptions::new().with_priced_parse(true);
+    let members = [text(90_000, 3), noise(70_000, 4), mixed(100_000)];
+    let mut whole = Unpack15Encoder::with_options(options);
+    let mut windowed = Unpack15Encoder::with_options(options);
+    let mut decoder = Unpack15::new();
+    for (index, member) in members.iter().enumerate() {
+        let expected = whole.encode_member(member).unwrap();
+        assert!(
+            streamed(&mut windowed, member, LOOKAHEAD + 1) == expected,
             "member {index}"
         );
         assert_eq!(
