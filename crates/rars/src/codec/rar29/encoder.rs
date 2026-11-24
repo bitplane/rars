@@ -2865,7 +2865,10 @@ fn parse_range<C: Candidates>(
     let mut pos = start;
     // Filled from the history a near match can reach, so a block parses the
     // same whether the bytes before it were parsed in this call or another.
-    let mut near = (options.lazy_matching && options.near_matches).then(|| {
+    let near_pays = options.lazy_matching
+        && options.near_matches
+        && !NearMatches::looks_random(&data[start..end]);
+    let mut near = near_pays.then(|| {
         let mut near = NearMatches::new();
         for history_pos in start.saturating_sub(MAX_THREE_BYTE_OFFSET)..start {
             near.insert(data, history_pos);
@@ -3437,6 +3440,33 @@ impl NearMatches {
         if pos + 3 <= data.len() {
             self.triples[Self::triple(data, pos)] = pos as u32;
         }
+    }
+
+    /// Whether a block's bytes are spread so evenly that short matches are
+    /// not worth looking for: more than 7.5 bits a byte of order-0 entropy.
+    ///
+    /// Already-compressed data offers a three-byte match now and then and
+    /// nothing longer, so every position looked one up for nothing. On a 32 MiB
+    /// tar of compressed files at level 3 that cost 15% more time for 0.11%,
+    /// where executables gain 2.3% for 6%.
+    fn looks_random(block: &[u8]) -> bool {
+        if block.is_empty() {
+            return true;
+        }
+        let mut counts = [0u32; 256];
+        for &byte in block {
+            counts[usize::from(byte)] += 1;
+        }
+        let len = block.len() as f64;
+        let entropy: f64 = counts
+            .iter()
+            .filter(|&&count| count != 0)
+            .map(|&count| {
+                let p = f64::from(count) / len;
+                -p * p.log2()
+            })
+            .sum();
+        entropy > 7.5
     }
 
     /// The newest earlier position sharing `pos`'s three-byte hash.
