@@ -2980,6 +2980,46 @@ mod tests {
     }
 
     #[test]
+    fn a_long_repeat_packs_to_a_few_bytes_a_period_at_the_upper_levels() {
+        // A zero run and a phrase, repeating at a period no window aligns to.
+        // Every period after the first is one copy of the last, which the
+        // parse can code as a distance once and then the repeat-last-match
+        // symbol, a bit or two for each 4 KiB. The phrase's start also
+        // matches dozens of nearer, shorter copies of itself. A finder that
+        // stopped at the first match long enough to commit to found one of
+        // those, and the parse alternated two remembered distances at a dozen
+        // bits a token: 2,056 bytes for 4 MiB at every level, where WinRAR's
+        // -m4 and -m5 packed 393.
+        let mut period = vec![0u8; 4096];
+        period.extend(b"the quick brown fox jumps over the lazy dog. ".repeat(91));
+        let data: Vec<u8> = period.iter().copied().cycle().take(256 * 1024).collect();
+
+        for level in [4u8, 5] {
+            let options =
+                encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+            let packed =
+                encode_member_with_filter_policy(&data, 0, &FilterPolicy::None, options).unwrap();
+            assert!(
+                packed.len() < 120,
+                "level {level} packed {} KiB of repeats to {} bytes",
+                data.len() / 1024,
+                packed.len(),
+            );
+
+            let output = crate::codec::rar50::Unpack50Decoder::new()
+                .decode_member(
+                    &packed,
+                    0,
+                    data.len(),
+                    false,
+                    crate::codec::rar50::DecodeMode::Lz,
+                )
+                .unwrap();
+            assert_eq!(output, data, "level {level} did not round trip");
+        }
+    }
+
+    #[test]
     fn auto_x86_filter_ranges_select_dense_opcode_clusters() {
         let mut data = vec![0u8; 100_000];
         data[1_000] = 0xe8;

@@ -370,6 +370,9 @@ impl<B: Budget> MatchFinder<4, B> {
     }
 }
 
+/// The most runs [`TreeMatchFinder::matches`] reports for one position.
+pub(crate) const TREE_MAX_RUNS: usize = 8;
+
 /// A binary-tree match finder, after LZMA's BT4.
 ///
 /// Positions sharing a hash of their first four bytes form a binary search
@@ -406,7 +409,7 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// counted 229 MiB against the 151 MiB it is charged; at eight it counts
     /// 133 MiB. On 32 MiB each of text, source and binaries at level 3 the
     /// cap moves the output by at most five bytes.
-    const MAX_RUNS: usize = 8;
+    const MAX_RUNS: usize = TREE_MAX_RUNS;
 
     /// Builds a finder that remembers the last `window` positions, at eight
     /// bytes of links per byte of window.
@@ -559,6 +562,128 @@ impl<B: Budget> TreeMatchFinder<B> {
                 ptr0 = pair;
                 len0 = len;
                 current = resolve(pos, self.son[ptr0]);
+            }
+        }
+    }
+}
+
+/// Where the same long stretch of bytes last began, for a match finder that
+/// stops at a nice length.
+///
+/// A finder that stops at the first match long enough to commit to finds the
+/// nearest copy of a prefix, and the copy that runs on can be further back.
+/// The tree cannot hold that one: a node that matches the new position as far
+/// as the descent compares gives its place to it, so it keeps one position
+/// for every distinct prefix of the nice length, the newest. This keeps one
+/// for every distinct `span` bytes instead, by a rolling hash of the `span`
+/// bytes at each position, so the newest earlier position with the same hash
+/// is the nearest copy of the whole stretch, which a parse can take as the
+/// longest match there is.
+///
+/// Positions go in one at a time, in order. What it holds at a position is a
+/// property of the bytes before it and nothing else, so two parses of the same
+/// window that searched different positions see the same candidates.
+#[cfg(feature = "write")]
+#[derive(Debug)]
+pub(crate) struct WindowIndex<B: Budget = Allowance> {
+    table: Buffer<u32, B>,
+    shift: u32,
+    span: usize,
+    /// The weight of a window's first byte, for rolling it out.
+    first_weight: u64,
+    hash: u64,
+    /// The position `hash` covers, or [`NO_POSITION`] before the first.
+    at: usize,
+}
+
+#[cfg(feature = "write")]
+impl<B: Budget> WindowIndex<B> {
+    const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    /// An index of `span`-byte stretches for a window this long, a slot for
+    /// every sixteen positions in it, between 4,096 and 262,144 slots: at most
+    /// a mebibyte. Slots are shared by hash and the newest position takes one,
+    /// so a stretch further back than a few times the slot count has usually
+    /// been overwritten. A stretch that repeats is found at its nearest copy,
+    /// which is the one worth finding.
+    pub(crate) fn with_allowance(window: usize, span: usize, allowance: &B) -> Result<Self> {
+        let slots = (window / 16).clamp(1 << 12, 1 << 18).next_power_of_two();
+        let first_weight = (1..span).fold(1u64, |weight, _| weight.wrapping_mul(Self::MULTIPLIER));
+        Ok(Self {
+            table: Buffer::filled(slots, NO_LINK, allowance)?,
+            shift: 64 - slots.trailing_zeros(),
+            span,
+            first_weight,
+            hash: 0,
+            at: NO_POSITION,
+        })
+    }
+
+    /// Takes `pos` in and returns the newest earlier position whose `span`
+    /// bytes hashed the same, or [`NO_POSITION`]. A position with fewer than
+    /// `span` bytes left has no stretch to index. The caller confirms a
+    /// candidate by comparing bytes, since a hash can collide.
+    pub(crate) fn insert(&mut self, input: &[u8], pos: usize) -> usize {
+        let Some(last) = pos.checked_add(self.span).filter(|&end| end <= input.len()) else {
+            self.at = NO_POSITION;
+            return NO_POSITION;
+        };
+        if self.at != NO_POSITION && self.at + 1 == pos {
+            let outgoing = u64::from(input[pos - 1]).wrapping_mul(self.first_weight);
+            self.hash = self
+                .hash
+                .wrapping_sub(outgoing)
+                .wrapping_mul(Self::MULTIPLIER)
+                .wrapping_add(u64::from(input[last - 1]));
+        } else {
+            self.hash = input[pos..last].iter().fold(0u64, |hash, &byte| {
+                hash.wrapping_mul(Self::MULTIPLIER)
+                    .wrapping_add(u64::from(byte))
+            });
+        }
+        self.at = pos;
+        let slot = self.slot(self.hash);
+        let previous = resolve(pos, self.table[slot]);
+        self.table[slot] = pos as u32;
+        previous
+    }
+
+    fn slot(&self, hash: u64) -> usize {
+        (hash.wrapping_mul(Self::MULTIPLIER) >> self.shift) as usize
+    }
+
+    /// The distances back to the newest earlier copies of the stretches that
+    /// start just after `pos`, the position last inserted, one for each of
+    /// the next `ahead.len()` positions that has a stretch, nearest stretch
+    /// first and [`NO_POSITION`] where there is none.
+    ///
+    /// A slot is shared, so one stretch's copy is lost whenever a stretch
+    /// inserted after it hashes to the same slot. Over a repeat the same
+    /// stretches meet the same neighbours every time round, so a stretch that
+    /// lost its copy once loses it every time. Asking after its neighbours as
+    /// well finds the copy through any one that kept theirs; nothing older
+    /// than `pos` has been inserted for them, so their copies are where the
+    /// table left them. A match at one of these distances starts at `pos` only
+    /// if the bytes before the stretch match too, which the caller measures.
+    pub(crate) fn distances_ahead(&self, input: &[u8], pos: usize, ahead: &mut [usize]) {
+        ahead.fill(NO_POSITION);
+        if self.at != pos {
+            return;
+        }
+        let mut hash = self.hash;
+        for (step, distance) in (1..).zip(ahead.iter_mut()) {
+            let start = pos + step;
+            let Some(&incoming) = input.get(start + self.span - 1) else {
+                return;
+            };
+            let outgoing = u64::from(input[start - 1]).wrapping_mul(self.first_weight);
+            hash = hash
+                .wrapping_sub(outgoing)
+                .wrapping_mul(Self::MULTIPLIER)
+                .wrapping_add(u64::from(incoming));
+            let copy = resolve(pos, self.table[self.slot(hash)]);
+            if copy < pos {
+                *distance = start - copy;
             }
         }
     }
@@ -944,6 +1069,57 @@ mod tests {
             assert_eq!(reported, if longest >= 4 { longest } else { 0 }, "{pos}");
         }
         assert!(capped > 0, "the noise never filled a position's runs");
+    }
+
+    #[test]
+    #[cfg(feature = "write")]
+    fn a_stretch_is_found_at_its_nearest_earlier_copy() {
+        // Noise repeating every 300 bytes, with a stray byte in the third
+        // copy. Each 64-byte stretch's nearest earlier copy is a whole number
+        // of periods back, the fewest that miss the stray byte.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let period: Vec<u8> = (0..300)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        let mut input = period.repeat(5);
+        input[700] ^= 1;
+        // The most slots there are, so no two of these stretches share one.
+        let mut index =
+            super::WindowIndex::with_allowance(1 << 22, 64, &super::Allowance::default()).unwrap();
+        // The stray byte breaks every stretch over it, and its copies.
+        let stray = |start: usize| (start..start + 64).contains(&700);
+        let nearest_copy = |start: usize| {
+            (1..=start / 300)
+                .map(|periods| start - periods * 300)
+                .find(|&copy| !stray(start) && !stray(copy))
+        };
+        let mut ahead = [0; 4];
+        for pos in 0..input.len() {
+            let found = index.insert(&input, pos);
+            if pos + 64 > input.len() {
+                assert_eq!(found, NO_POSITION, "{pos}");
+                continue;
+            }
+            assert_eq!(found, nearest_copy(pos).unwrap_or(NO_POSITION), "{pos}");
+
+            // The stretches after this one, asked after from here, report
+            // their own nearest copies.
+            index.distances_ahead(&input, pos, &mut ahead);
+            for (step, &distance) in (1..).zip(&ahead) {
+                let start = pos + step;
+                let expected = if start + 64 > input.len() {
+                    NO_POSITION
+                } else {
+                    nearest_copy(start).map_or(NO_POSITION, |copy| start - copy)
+                };
+                assert_eq!(distance, expected, "{pos} + {step}");
+            }
+        }
     }
 
     #[test]
