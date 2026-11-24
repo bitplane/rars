@@ -5763,17 +5763,17 @@ mod tests {
             ));
         }
         let expected = [
-            ("seekable_stored", "240177:994e7518"),
+            ("seekable_stored", "240181:1864427d"),
             (
                 "volumes_stored",
-                "30000:8bae9d7e 30000:9377ff08 10225:5b128e3c",
+                "30000:9baaef02 30000:63ef6990 10237:287e48db",
             ),
-            ("seekable_compressed", "111209:bd92de39"),
+            ("seekable_compressed", "111213:7ad745e1"),
             (
                 "volumes_compressed",
-                "15000:646874aa 15000:a3a0bcef 11119:ed57eeac",
+                "15000:996bcdd9 15000:14cd3cf4 11131:721b8f08",
             ),
-            ("seekable_encrypted", "240177:fcd81fc7"),
+            ("seekable_encrypted", "240181:7df228a2"),
         ];
         crate::write_stream::assert_fingerprints(&cases, &expected);
     }
