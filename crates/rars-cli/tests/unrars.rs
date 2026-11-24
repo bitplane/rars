@@ -991,7 +991,7 @@ fn l_v_lists_every_volume() {
             "{text}"
         );
     }
-    let total = format!("{:>20}{:>21}\n", payload().len() + 12, 3);
+    let total = format!("{:>21}{:>21}\n", payload().len() + 12, 3);
     assert!(text.ends_with(&format!("{total}\n")), "{text}");
 
     let output = unrars(&dir, &["l", "set.part1.rar"]);
@@ -1280,4 +1280,133 @@ fn a_wrong_rar4_password_is_a_checksum_error() {
     );
     let output = unrars(&dir, &["x", "-idq", "-psecret", "enc4.rar", "out/"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+/// Issue #567: `p` writes the member's bytes and nothing else, banner or not.
+#[test]
+fn p_prints_only_the_member() {
+    let dir = scratch::case("unrars-p-banner");
+    write(&dir, "plain.rar", None);
+    let output = unrars(&dir, &["p", "plain.rar", "a.txt"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(output.stdout, b"hello\n");
+}
+
+/// 2011-06-12 10:53 UTC: 06:53 in New York, in daylight saving time.
+const SUMMER: i64 = 1_307_875_980;
+
+/// Issue #567: the listing columns, marker and Details line unrar shows.
+#[test]
+fn listings_show_what_unrar_shows() {
+    let dir = scratch::case("unrars-listing-details");
+    let when = Some(rars::Timestamp::from_unix_seconds(SUMMER));
+    let mut builder = Builder::new(ArchiveVersion::Rar50)
+        .store(true)
+        .solid(true)
+        .recovery_percent(Some(5))
+        .comment(Some(b"made by a test\n".to_vec()));
+    builder
+        .add_bytes(b"a.txt".to_vec(), b"hello\n".to_vec(), when, Some(0o644))
+        .unwrap();
+    builder
+        .add_bytes(
+            b"lock.txt".to_vec(),
+            b"locked\n".to_vec(),
+            when,
+            Some(0o644),
+        )
+        .unwrap();
+    builder
+        .set_entry_encryption(b"lock.txt", Some(b"secret".to_vec()), None)
+        .unwrap();
+    builder.write_to_path(&dir.join("full.rar"), None).unwrap();
+
+    let output = unrars(&dir, &["l", "-idc", "full.rar"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("\nArchive comment:\nmade by a test\n\n\nArchive: full.rar\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Details: RAR 5, solid, recovery record\n"),
+        "{text}"
+    );
+    assert!(text.contains(" Attributes       Size     Date    Time   Name\n"));
+    assert!(text.contains("\n -rw-r--r--          6  "), "{text}");
+    assert!(text.contains("\n*-rw-r--r--          7  "), "{text}");
+    assert!(text.contains(&format!("{:>22}{:>21}\n", 13, 2)), "{text}");
+
+    let output = unrars(&dir, &["v", "-idc", "full.rar"]);
+    let text = stdout(&output);
+    let crc = rars::crc32::crc32(b"hello\n");
+    assert!(
+        text.contains(" -rw-r--r--          6         ")
+            && text.contains(&format!("  {crc:08X}  a.txt\n")),
+        "{text}"
+    );
+    assert!(text.contains("Packed Ratio"), "{text}");
+
+    let output = unrars(&dir, &["lt", "-idc", "-psecret", "full.rar"]);
+    let text = stdout(&output);
+    for line in [
+        "        Name: a.txt\n        Type: File\n        Size: 6\n",
+        &format!("       CRC32: {crc:08X}\n     Host OS: Unix\n"),
+        "       Flags: solid encrypted \n",
+    ] {
+        assert!(text.contains(line), "{line:?}: {text}");
+    }
+}
+
+/// Issue #567: an archive whose headers need a password no one gave is
+/// still named, with its Details, as unrar does.
+#[test]
+fn a_listing_without_the_header_password_names_the_archive() {
+    let dir = scratch::case("unrars-listing-locked");
+    builder(Some(b"secret"))
+        .header_encryption(true)
+        .write_to_path(&dir.join("henc.rar"), None)
+        .unwrap();
+    let output = unrars(&dir, &["l", "-idc", "-p-", "henc.rar"]);
+    assert_eq!(output.status.code(), Some(11), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "Incorrect password for henc.rar\n");
+    assert_eq!(
+        stdout(&output),
+        "\nArchive: henc.rar\nDetails: RAR 5, encrypted headers\n  0 files\n\n"
+    );
+}
+
+/// Issue #567: RAR 5 times are UTC and listed in local time.
+#[cfg(unix)]
+#[test]
+fn listings_show_rar5_times_in_local_time() {
+    let dir = scratch::case("unrars-listing-local-time");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(
+            b"a.txt".to_vec(),
+            b"hello\n".to_vec(),
+            Some(rars::Timestamp::from_unix_seconds(SUMMER)),
+            None,
+        )
+        .unwrap();
+    builder
+        .write_to_path(&dir.join("summer.rar"), None)
+        .unwrap();
+    for (zone, shown) in [
+        ("America/New_York", "2011-06-12 06:53"),
+        ("UTC", "2011-06-12 10:53"),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_unrars"))
+            .current_dir(&dir)
+            .env("TZ", zone)
+            .args(["l", "summer.rar"])
+            .output()
+            .unwrap();
+        let text = stdout(&output);
+        assert!(
+            text.contains(&format!("  {shown}  a.txt\n")),
+            "{zone}: {text}"
+        );
+    }
 }

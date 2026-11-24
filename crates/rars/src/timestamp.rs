@@ -51,6 +51,20 @@ impl StoredTimestamp {
             }
         }
     }
+
+    /// Calendar fields as [`Self::calendar_fields`] gives them, but in the
+    /// local time zone: a Unix time is shifted by the zone's offset at that
+    /// instant, and DOS fields, already local, are left as they are.
+    pub fn local_calendar_fields(self) -> Option<(u16, u8, u8, u8, u8, u8)> {
+        match self {
+            Self::UnixSeconds(seconds) => {
+                let instant = i64::from(seconds);
+                let local = instant + i64::from(TimeZone::local().offset_at(instant));
+                Some(unix_datetime(u32::try_from(local).ok()?))
+            }
+            Self::DosLocal(_) => self.calendar_fields(),
+        }
+    }
 }
 
 pub fn current_filetime() -> u64 {
