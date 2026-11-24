@@ -14,8 +14,11 @@ use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError};
 use zeroize::Zeroizing;
+
+mod progress;
+use progress::{Counted, Opened, Progress};
 
 // Exit codes, as unrar returns them.
 const OK: i32 = 0;
@@ -184,6 +187,8 @@ struct Invocation {
     banner: bool,
     /// Off with `-idd`.
     done: bool,
+    /// Off with `-idp`: the running percentage on each member's line.
+    percentages: bool,
     /// `-kb`: keep a damaged file with what could be read of it, written
     /// where it lands, and read past damaged headers.
     keep_broken: bool,
@@ -348,6 +353,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         quiet: false,
         banner: true,
         done: true,
+        percentages: true,
         keep_broken: false,
         versions: false,
         pause_volumes: false,
@@ -430,6 +436,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
                     match flag {
                         b'c' => invocation.banner = false,
                         b'd' => invocation.done = false,
+                        b'p' => invocation.percentages = false,
                         b'q' => invocation.quiet = true,
                         _ => {}
                     }
@@ -484,7 +491,8 @@ Switches
   -ol-    Leave symbolic links out
   -ierr   Send all messages to stderr
   -inul   No messages
-  -idq    Errors only; -idc no banner; -idd no closing \"All OK\"
+  -idq    Errors only; -idc no banner; -idd no closing \"All OK\";
+          -idp no percentages
   --      End of switches
 
 Switches that filter by time, size, attributes or freshness (-ta, -tb, -tn,
@@ -531,6 +539,19 @@ impl Out {
     fn error(self, line: &str) {
         if !self.silent {
             write_stderr(format_args!("{line}\n"));
+        }
+    }
+
+    /// Part of a member's line, shown at once rather than when the line ends.
+    fn progress(self, text: std::fmt::Arguments<'_>) {
+        if self.silent || self.quiet {
+            return;
+        }
+        self.print(text);
+        if !self.stderr_only {
+            if let Err(error) = std::io::stdout().flush() {
+                note_stdout_error(&error);
+            }
         }
     }
 }
@@ -1529,25 +1550,34 @@ fn run_members(
     let pause = invocation.pause_volumes;
     let stdin_closed = AtomicBool::new(false);
     let closed = &stdin_closed;
+    let progress = Arc::new(Progress::new(out, invocation.percentages, path, archive));
+    let volume_progress = Arc::clone(&progress);
     let volumes = std::iter::from_fn(move || {
         let next = archive.volume_path(path, index)?;
+        volume_progress.volume_wanted();
         if pause {
             match ask_for_volume(out, &next) {
                 Answer::Continue => {}
-                Answer::Quit => return None,
+                Answer::Quit => {
+                    volume_progress.volume_missing();
+                    return None;
+                }
                 Answer::Closed => {
+                    volume_progress.volume_missing();
                     closed.store(true, Ordering::Relaxed);
                     return None;
                 }
             }
         }
         if !next.exists() {
+            volume_progress.volume_missing();
             return None;
         }
+        volume_progress.volume_found();
         index += 1;
         announce(&next);
         let volume = read_archive(&next, password);
-        lock(read_later).push(next);
+        lock(read_later).push(next.clone());
         if let Ok(volume) = &volume {
             later_header_errors.fetch_add(report_header_damage(out, volume), Ordering::Relaxed);
             later_wanted.note_versions(volume);
@@ -1555,18 +1585,22 @@ fn run_members(
         if let Some(truncation) = volume.as_ref().ok().and_then(Archive::truncation) {
             lock(later_truncation).get_or_insert_with(|| truncation.clone());
         }
+        volume_progress.volume_starts(&next, volume.as_ref().ok());
         Some(volume)
     });
     let failures = Failures::new(&wanted, archive, path);
     let result = match command {
-        Command::Extract { .. } => extract(invocation, out, archive, volumes, options, &failures),
-        _ => {
-            test_or_print(command, out, archive, volumes, options, &failures).map(|()| Extracted {
+        Command::Extract { .. } => extract(
+            invocation, out, archive, volumes, options, &failures, &progress,
+        ),
+        _ => test_or_print(command, archive, volumes, options, &failures, &progress).map(|()| {
+            Extracted {
                 warnings: false,
                 all_kept: false,
-            })
-        }
+            }
+        }),
     };
+    progress.stop();
     read.extend(
         later_volumes
             .into_inner()
@@ -1721,16 +1755,12 @@ impl<'r> Failures<'r> {
     fn take_failed(&self) -> Vec<Vec<u8>> {
         std::mem::take(&mut *lock(&self.failed))
     }
-}
 
-/// What `-kb` keeps: a member the library fails on after delivering its
-/// bytes keeps its output, and its error is reported once that is in place,
-/// after the file's line as unrar reports it.
-#[derive(Default)]
-struct KeepBroken {
-    kept: KeptBroken,
-    /// The error lines of kept members not yet in place, by member name.
-    pending: Mutex<Vec<(Vec<u8>, String)>>,
+    /// Whether a member failed before any of its data was read: a RAR 5
+    /// password is checked first. unrar prints no line for such a member.
+    fn refused(&self, error: &rars::Error) -> bool {
+        self.archive.family() == rars::ArchiveFamily::Rar50Plus && is_password_error(error)
+    }
 }
 
 fn extract<V>(
@@ -1740,6 +1770,7 @@ fn extract<V>(
     volumes: V,
     options: ArchiveReadOptions<'_>,
     failures: &Failures<'_>,
+    progress: &Arc<Progress>,
 ) -> rars::Result<Extracted>
 where
     V: Iterator<Item = rars::Result<Archive>> + Send,
@@ -1749,8 +1780,9 @@ where
         Overwrite::Never | Overwrite::Ask => OverwritePolicy::Never,
         Overwrite::Rename => OverwritePolicy::Rename,
     };
-    let keep = KeepBroken::default();
-    let broken = &keep;
+    // What `-kb` keeps: a member the library fails on after delivering its
+    // bytes keeps its output.
+    let kept = KeptBroken::default();
     let destination = invocation.destination_for(failures.path);
     let mut state = ExtractOutputState::new(
         &destination,
@@ -1760,28 +1792,10 @@ where
         archive.family(),
     );
     state.skip_existing = policy == OverwritePolicy::Never;
+    let published = Arc::clone(progress);
     state.on_published = Some(Box::new(move |output: &ExtractedOutput| {
-        let verb = if output.meta.is_directory {
-            "Creating"
-        } else {
-            "Extracting"
-        };
-        let pending = {
-            let mut pending = lock(&broken.pending);
-            pending
-                .iter()
-                .position(|(name, _)| *name == output.meta.name)
-                .map(|index| pending.remove(index).1)
-        };
-        match pending {
-            Some(line) => {
-                out.info(&format!("{verb:<11} {}", output.path.display()));
-                out.error(&line);
-            }
-            None => out.info(&format!("{verb:<11} {:<57} OK", output.path.display())),
-        }
+        published.published(&output.meta.name, &output.path);
     }));
-    let keep_broken = invocation.keep_broken;
     // Goes past a failed member. `-kb` keeps what was read of it; otherwise
     // its output is dropped before the next member opens.
     let handler = |member: &rars::ArchiveMember, error: &rars::Error| {
@@ -1790,41 +1804,71 @@ where
             Failure::Unwanted => return Ok(rars::ExtractionErrorAction::Continue),
             Failure::Report(line) => line,
         };
+        progress.fail(&member.meta.name, failures.refused(error));
+        out.error(&line);
         // Its output, if it has one, is under the name it is written as.
         let name = invocation.output_name(&member.meta.name);
-        if !is_password_error(error) && broken.kept.keep(name) {
-            lock(&broken.pending).push((name.to_vec(), line));
-        } else {
-            out.error(&line);
+        if is_password_error(error) || !kept.keep(name) {
             lock(&failures.failed).push(name.to_vec());
         }
         Ok(rars::ExtractionErrorAction::Continue)
     };
     let state = RefCell::new(state);
+    // Starts the line of a member whose output has just opened, if it has one.
+    let opened = |state: &ExtractOutputState<'_>, before: usize, member: &[u8], link: bool| {
+        if state.outputs.len() == before {
+            progress.pass(member);
+            return;
+        }
+        let output = state.outputs.last().expect("an output opened");
+        let shown = output.path.display().to_string();
+        if output.meta.is_directory {
+            progress.whole("Creating", member, &shown);
+            return;
+        }
+        // Staged, an output `-or` renames gets its name when it is published.
+        let renamed = policy == OverwritePolicy::Rename
+            && !state.in_place
+            && std::fs::symlink_metadata(&output.path).is_ok();
+        let how = match (renamed, link) {
+            (true, _) => Opened::Renamed,
+            (false, true) => Opened::Link,
+            (false, false) => Opened::File,
+        };
+        progress.start("Extracting", member, &output.meta.name, shown, how);
+    };
     let result = rars::output_links::extract_arriving_with_links(
         archive,
         volumes,
         options.with_member_error_handler(&handler),
         |meta| {
             check_stdout()?;
+            // The library has moved past the member before.
+            progress.settle();
             let mut state = state.borrow_mut();
             state.discard_failed(&failures.take_failed());
             if !failures.wanted.choose(&meta.name) {
-                broken.kept.close();
+                kept.close();
+                progress.pass(&meta.name);
                 return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
             }
-            let meta = written(invocation, meta);
-            let opened = if keep_broken {
-                broken.kept.open(&mut state, &meta)
+            let written = written(invocation, meta);
+            let before = state.outputs.len();
+            let opened_writer = if invocation.keep_broken {
+                kept.open(&mut state, &written)
             } else {
-                state.open_entry(&meta)
+                state.open_entry(&written)
             };
-            failures
-                .callback(opened)
-                .map(|writer| writer as Box<dyn Write>)
+            let writer = failures.callback(opened_writer)?;
+            opened(&state, before, &meta.name, false);
+            Ok(Box::new(Counted {
+                writer,
+                progress: Arc::clone(progress),
+            }) as Box<dyn Write>)
         },
         |meta, link| {
-            broken.kept.close();
+            progress.settle();
+            kept.close();
             let mut state = state.borrow_mut();
             state.discard_failed(&failures.take_failed());
             let symlink = matches!(
@@ -1832,9 +1876,13 @@ where
                 rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. }
             );
             if (symlink && invocation.skip_symlinks) || !failures.wanted.choose(&meta.name) {
+                progress.pass(&meta.name);
                 return Ok(());
             }
-            failures.callback(state.create_link(&written(invocation, meta), link))
+            let before = state.outputs.len();
+            failures.callback(state.create_link(&written(invocation, meta), link))?;
+            opened(&state, before, &meta.name, true);
+            Ok(())
         },
     );
     state.borrow_mut().discard_failed(&failures.take_failed());
@@ -1842,6 +1890,7 @@ where
         let _ = state.borrow_mut().publish_before_failure(&error);
         return Err(error);
     }
+    progress.settle();
     let state = state.into_inner();
     let skipped_links = state.skipped_links;
     let kept = state.kept_existing;
@@ -1876,33 +1925,33 @@ fn is_password_error(error: &rars::Error) -> bool {
 
 fn test_or_print<V>(
     command: Command,
-    out: Out,
     archive: &Archive,
     volumes: V,
     options: ArchiveReadOptions<'_>,
     failures: &Failures<'_>,
+    progress: &Arc<Progress>,
 ) -> rars::Result<()>
 where
     V: Iterator<Item = rars::Result<Archive>> + Send,
 {
     // A member has passed its checksum once the next one starts, or the run
     // ends, with no error for it.
-    let pending: Mutex<Option<Vec<u8>>> = Mutex::new(None);
-    let settle = |failed: Option<&[u8]>| {
-        if let Some(name) = lock(&pending).take() {
-            let name_text = display_name(&name);
-            if failed == Some(name.as_slice()) {
-                out.info(&format!("{:<11} {name_text}", "Testing"));
-            } else {
-                out.info(&format!("{:<11} {name_text:<57} OK", "Testing"));
-            }
-        }
-    };
-    let visit = |meta: &rars::ExtractedEntryMeta| -> bool {
-        settle(None);
+    let visit = |meta: &rars::ExtractedEntryMeta, link: bool| -> bool {
+        progress.settle();
         let chosen = failures.wanted.choose(&meta.name);
-        if chosen && command == Command::Test {
-            *lock(&pending) = Some(meta.name.clone());
+        if !chosen || command != Command::Test {
+            progress.pass(&meta.name);
+        } else if meta.is_directory {
+            progress.whole("Testing", &meta.name, &display_name(&meta.name));
+        } else {
+            let how = if link { Opened::Link } else { Opened::File };
+            progress.start(
+                "Testing",
+                &meta.name,
+                &meta.name,
+                display_name(&meta.name),
+                how,
+            );
         }
         chosen
     };
@@ -1911,8 +1960,8 @@ where
             Failure::Abort => return Ok(rars::ExtractionErrorAction::Abort),
             Failure::Unwanted => {}
             Failure::Report(line) => {
-                settle(Some(&member.meta.name));
-                out.error(&line);
+                progress.fail(&member.meta.name, failures.refused(error));
+                progress.out.error(&line);
             }
         }
         Ok(rars::ExtractionErrorAction::Continue)
@@ -1923,19 +1972,22 @@ where
         options.with_member_error_handler(&handler),
         |meta| {
             check_stdout()?;
-            let chosen = visit(meta);
+            let chosen = visit(meta, false);
             Ok(if chosen && command == Command::Print {
                 Box::new(PrintedMember) as Box<dyn Write>
             } else {
-                Box::new(std::io::sink())
+                Box::new(Counted {
+                    writer: Box::new(std::io::sink()),
+                    progress: Arc::clone(progress),
+                })
             })
         },
         |meta, _link| {
-            visit(meta);
+            visit(meta, true);
             Ok(())
         },
     )?;
-    settle(None);
+    progress.settle();
     Ok(())
 }
 
