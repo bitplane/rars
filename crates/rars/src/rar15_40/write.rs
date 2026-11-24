@@ -3574,12 +3574,12 @@ fn validate_header_encrypted_archive_options(
 ///
 /// From level 3 the lazy parse also takes the short matches its chains cannot
 /// offer (see `NearMatches`): on a 32 MiB tar of executables at level 3,
-/// 10,617,761 bytes became 10,335,057 for 8% more time. Levels 1 and 2 go
+/// 10,333,495 bytes became 10,099,860 for 6% more time. Levels 1 and 2 go
 /// without. They are there to be fast, and they already take longer than rar
 /// 3.93's `-m1` and `-m2` on the same tar, 1.17 s against 0.33 s and 1.96 s
-/// against 1.03 s at one thread. Lazy with eight candidates and the short
-/// matches would take level 1 to 10,619,423 bytes in 1.56 s, and level 2 at
-/// 64 candidates to 10,335,057 in 3.11 s.
+/// against 1.03 s at one thread. Before the piece search, lazy with eight
+/// candidates and the short matches would have taken level 1 to 10,619,423
+/// bytes in 1.56 s, and level 2 at 64 candidates to 10,335,057 in 3.11 s.
 ///
 /// An absent level keeps the lazy parse at 128 candidates the writer has
 /// always used, rather than paying for level 5's.
