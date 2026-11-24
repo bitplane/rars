@@ -1299,7 +1299,9 @@ impl Builder {
     }
 
     /// Write the archive to `path`, streaming where the format allows it.
-    /// The completed archive replaces the destination only after writing and syncing succeed.
+    /// The completed archive replaces the destination only after writing
+    /// succeeds, and is synced first when it replaces an existing file; a new
+    /// one is not synced.
     /// Large compressed RAR 1.3 to 4.x members are coded straight
     /// into the file, and RAR 1.3 to 4.x, RAR 5
     /// and RAR 7 stored members are read once, as a file can seek back to fill
@@ -1340,7 +1342,7 @@ impl Builder {
         {
             let mut output = output;
             self.write_single(SingleOutput::File(&mut output), resources, progress)?;
-            output.sync_all()?;
+            crate::publish::sync_if_replacing(&output, path)?;
         }
         check_cancelled(progress.map(ProgressReporter))?;
         fs::rename(pending.path.as_ref().unwrap(), path)?;

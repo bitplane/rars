@@ -3374,6 +3374,7 @@ fn write_plain_rar50_streaming(
 
 /// Writes each volume to a temporary file, then renames the set once the
 /// number of volumes is known, since that decides how the parts are numbered.
+/// Only a volume that replaces an existing file is synced.
 struct CliVolumeSink<'a> {
     first_path: &'a Path,
     temporaries: Vec<PathBuf>,
@@ -3417,6 +3418,11 @@ impl<'a> CliVolumeSink<'a> {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error.into()),
             }
+        }
+        // A volume that replaces an existing one is synced first, as a single
+        // archive is; a new one is not.
+        for (temporary, path) in self.temporaries.iter().zip(&paths) {
+            rars::publish::sync_staged_if_replacing(temporary, path)?;
         }
         let mut backups = Vec::new();
         let mut published = 0;
@@ -3596,7 +3602,9 @@ enum ArchiveDestination<'a> {
     Pipe(&'a mut dyn Write),
 }
 
-/// Replaces the destination entry only after writing and syncing succeeds.
+/// Replaces the destination entry only after writing succeeds. The archive is
+/// synced first when it replaces an existing one, which a crash could
+/// otherwise lose along with the new copy; a new archive is not synced.
 /// Existing symlinks and hard links are replaced rather than written through.
 fn write_archive_file<T>(
     archive_path: &Path,
@@ -3605,7 +3613,7 @@ fn write_archive_file<T>(
     let (temporary, mut output) = create_streaming_archive_temp(archive_path)?;
     let result = (|| -> CliResult<T> {
         let value = write(&mut output)?;
-        output.sync_all()?;
+        rars::publish::sync_if_replacing(&output, archive_path)?;
         Ok(value)
     })();
     drop(output);
