@@ -57,6 +57,11 @@ getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# The PPMd model's pool is an anonymous mapping, so pages it never touches are
+# never committed. Other targets keep a zeroed `Vec`.
+[target.'cfg(any(unix, windows))'.dependencies]
+memmap2.workspace = true
+
 # Publishes a staged output with one rename that refuses an existing destination.
 [target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
 rustix.workspace = true

@@ -6,11 +6,10 @@
 // but allocators keep freed blocks this large for reuse and clear them in
 // full when they hand them back. With glibc, once the first pool was freed
 // every later one came back cleared, so each worker testing PPMd members held
-// the whole declared size, 25 MiB at RAR 3's default (#553). On Unix the pool
-// is therefore a private anonymous mapping of its own: pages are committed
-// when the model first touches them and all of them are returned when it is
-// dropped. Elsewhere it stays a zeroed `Vec`.
-#![allow(unsafe_code)]
+// the whole declared size, 25 MiB at RAR 3's default (#553). On Unix and
+// Windows the pool is therefore an anonymous mapping of its own, made by
+// `memmap2`: pages are committed when the model first touches them and all of
+// them are returned when it is dropped. Elsewhere it stays a zeroed `Vec`.
 
 /// Zeroed bytes, read and written as a slice.
 pub(super) struct Pool(imp::Pool);
@@ -46,48 +45,25 @@ impl std::fmt::Debug for Pool {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod imp {
-    use std::ptr::NonNull;
+    use memmap2::{MmapMut, MmapOptions};
 
-    pub(super) struct Pool {
-        ptr: NonNull<u8>,
-        len: usize,
-    }
-
-    // SAFETY: the pool owns its mapping alone, as a `Box<[u8]>` owns its
-    // bytes, and hands out access only through `&self` and `&mut self`.
-    unsafe impl Send for Pool {}
-    unsafe impl Sync for Pool {}
+    /// Even an empty pool is a mapping (memmap2 maps a page for it), so the
+    /// model's every access reaches the slice without a branch: holding an
+    /// `Option` instead cost 3% of PPMd decoding time.
+    pub(super) struct Pool(MmapMut);
 
     impl Pool {
         pub(super) fn empty() -> Self {
-            Self {
-                ptr: NonNull::dangling(),
-                len: 0,
-            }
+            Self::zeroed(0)
         }
 
         pub(super) fn zeroed(len: usize) -> Self {
-            if len == 0 {
-                return Self::empty();
-            }
-            // SAFETY: a new private anonymous mapping at an address of the
-            // kernel's choosing touches no memory this process already uses.
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                    -1,
-                    0,
-                )
-            };
-            match NonNull::new(ptr.cast::<u8>()) {
-                Some(ptr) if ptr.as_ptr() != libc::MAP_FAILED.cast() => Self { ptr, len },
+            match MmapOptions::new().len(len).map_anon() {
+                Ok(map) => Self(map),
                 // Out of address space: fail as `vec![0; len]` would.
-                _ => std::alloc::handle_alloc_error(
+                Err(_) => std::alloc::handle_alloc_error(
                     std::alloc::Layout::array::<u8>(len).expect("pool size fits a layout"),
                 ),
             }
@@ -95,32 +71,17 @@ mod imp {
 
         #[inline(always)]
         pub(super) fn as_slice(&self) -> &[u8] {
-            // SAFETY: `ptr` is `len` readable bytes (or dangling with `len`
-            // 0), mapped zeroed and only written through `as_mut_slice`.
-            unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+            &self.0
         }
 
         #[inline(always)]
         pub(super) fn as_mut_slice(&mut self) -> &mut [u8] {
-            // SAFETY: as above, and `&mut self` makes this the only borrow.
-            unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
-        }
-    }
-
-    impl Drop for Pool {
-        fn drop(&mut self) {
-            if self.len != 0 {
-                // SAFETY: the mapping made in `zeroed`, unmapped once; no
-                // borrow of it can outlive `self`.
-                unsafe {
-                    libc::munmap(self.ptr.as_ptr().cast(), self.len);
-                }
-            }
+            &mut self.0
         }
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 mod imp {
     pub(super) struct Pool(Vec<u8>);
 
@@ -160,5 +121,11 @@ mod tests {
         assert_eq!((pool[0], pool[last]), (1, 2));
         assert!(Pool::empty().is_empty());
         assert!(Pool::zeroed(0).is_empty());
+    }
+
+    #[test]
+    fn a_pool_can_move_between_and_be_shared_by_threads() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Pool>();
     }
 }
