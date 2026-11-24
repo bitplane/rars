@@ -3822,6 +3822,43 @@ impl BitWriter {
     }
 }
 
+/// `dec r0; jnz 0`, then the implicit `ret`: a custom program that counts the
+/// register a filter record sets down to zero, two instructions a step,
+/// leaving its block as it found it. Left at zero, it wraps and runs until
+/// an instruction limit stops it.
+#[cfg(test)]
+pub(crate) const COUNTDOWN_VM_PROGRAM: &[u8] = &[0x12, 0x3a, 0x14, 0x3c];
+
+/// Codes `data` with a filter record for `code` over each range, with the
+/// registers given, so tests can build members with custom programs, which
+/// the writer never emits. Ranges must be in order.
+#[cfg(test)]
+pub(crate) fn encode_member_with_custom_filters(
+    data: &[u8],
+    code: &'static [u8],
+    filters: &[(std::ops::Range<usize>, u32)],
+) -> Result<Vec<u8>> {
+    let records: Vec<_> = filters
+        .iter()
+        .map(|(range, r0)| OwnedVmFilterRecord {
+            block_start: range.start,
+            block_size: range.len(),
+            init_regs: vec![(0, *r0)],
+            code,
+            global_data: Vec::new(),
+        })
+        .collect();
+    let mut levels = [0; TABLE_COUNT];
+    encode_filtered_member_blocks(
+        data,
+        &[],
+        &records,
+        EncodeOptions::default(),
+        &mut levels,
+        None,
+    )
+}
+
 #[path = "block_split.rs"]
 mod block_split;
 #[path = "optimal_parse.rs"]
@@ -3833,3 +3870,6 @@ pub(crate) use optimal_parse::OPTIMAL_PARSE_WORKSPACE;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+#[cfg(test)]
+#[path = "vm_work_tests.rs"]
+mod vm_work_tests;

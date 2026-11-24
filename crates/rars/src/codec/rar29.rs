@@ -1,5 +1,7 @@
 #[cfg(feature = "write")]
 mod encoder;
+#[cfg(all(test, feature = "write"))]
+pub(crate) use encoder::{encode_member_with_custom_filters, COUNTDOWN_VM_PROGRAM};
 #[cfg(feature = "write")]
 pub(crate) use encoder::{
     filtered_members, member_encode_workspace, named_filter_segments, ppmd_search_workspace,
@@ -243,6 +245,11 @@ pub(crate) struct Reader29State<B: Budget> {
     last_block_end: Option<LzBlockEnd>,
     // Set when the last member's stream went on past its declared size.
     ran_past: bool,
+    /// What custom filter programs may still run in this member.
+    vm_work: rarvm::VmWork,
+    /// Under salvage, why a custom filter program was skipped in this
+    /// member: the member fails with it once it has decoded the rest.
+    vm_skipped: Option<Error>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +263,43 @@ enum LzBlockEnd {
     SameFileNewTable,
     NewFileKeepTables,
     NewFileNewTables,
+}
+
+/// Grants custom programs their allowance for `bytes` more filtered bytes,
+/// in this member and in the whole operation, and returns how many
+/// instructions the next run may execute. They are taken from the
+/// operation's budget at once, so members decoding on other threads cannot
+/// spend them too; [`vm_work_spent`] returns what the run did not use.
+fn vm_work_limit(
+    member: &mut rarvm::VmWork,
+    control: &crate::read_control::ReadControl,
+    bytes: usize,
+) -> usize {
+    member.grant(bytes);
+    let member_limit = usize::try_from(member.available())
+        .unwrap_or(usize::MAX)
+        .min(rarvm::MAX_INSTRUCTIONS);
+    control
+        .with_vm_work(|work| {
+            work.grant(bytes);
+            let limit = usize::try_from(work.available())
+                .unwrap_or(usize::MAX)
+                .min(member_limit);
+            work.spend(limit);
+            limit
+        })
+        .unwrap_or(member_limit)
+}
+
+/// Charges a run that was allowed `limit` instructions and executed `used`.
+fn vm_work_spent(
+    member: &mut rarvm::VmWork,
+    control: &crate::read_control::ReadControl,
+    limit: usize,
+    used: usize,
+) {
+    member.spend(used);
+    control.with_vm_work(|work| work.refund(limit - used));
 }
 
 /// A member whose stream goes on past its declared size.
@@ -336,6 +380,8 @@ impl<B: Budget> Reader29State<B> {
             output: Buffer::new(allowance),
             last_block_end: None,
             ran_past: false,
+            vm_work: rarvm::VmWork::with_floor(rarvm::VM_WORK_MEMBER_FLOOR),
+            vm_skipped: None,
         }
     }
 
@@ -392,6 +438,8 @@ impl<B: Budget> Reader29State<B> {
             output: Buffer::copied(&self.output, &allowance)?,
             last_block_end: self.last_block_end,
             ran_past: self.ran_past,
+            vm_work: self.vm_work,
+            vm_skipped: self.vm_skipped.clone(),
         })
     }
     pub fn reset_non_solid(&mut self) {
@@ -496,6 +544,8 @@ impl<B: Budget> Reader29State<B> {
         // its last byte for a range past its end, is dropped here. Programs
         // stay, because a later record may refer to them by index.
         self.filters.clear();
+        self.vm_work = rarvm::VmWork::with_floor(rarvm::VM_WORK_MEMBER_FLOOR);
+        self.vm_skipped = None;
         let start = self.current_pos();
         let final_target = start
             .checked_add(output_size)
@@ -533,6 +583,10 @@ impl<B: Budget> Reader29State<B> {
                     let safe_end = self.safe_flush_end(flushed, end, final_target)?;
                     if safe_end > flushed {
                         self.write_range(flushed, safe_end, start, out)?;
+                    }
+                    // A skipped filter says more than the checksum will.
+                    if let Some(skipped) = self.vm_skipped.take() {
+                        return Err(skipped);
                     }
                 } else if self.read_control.salvage() {
                     // Salvage delivers what decoded before the failure,
@@ -582,7 +636,7 @@ impl<B: Budget> Reader29State<B> {
                 error => error,
             });
         }
-        Ok(())
+        self.vm_skipped.take().map_or(Ok(()), Err)
     }
 
     /// Whether the last member's stream went on past its declared size: its
@@ -1235,6 +1289,9 @@ impl<B: Budget> Reader29State<B> {
                 .checked_sub(member_start)
                 .ok_or(Error::InvalidData("RAR 2.9 VM filter starts before file"))?
                 as u32;
+            // Custom programs earn their budget from the bytes a chain of
+            // filters covers, once: a chain may restate its range many times.
+            let mut chain_granted = false;
             loop {
                 let (program_index, regs, global_data) = {
                     let filter = self
@@ -1256,23 +1313,63 @@ impl<B: Budget> Reader29State<B> {
                         &self.read_control,
                     )?,
                     VmProgramKind::Generic(generic) => {
+                        let granted = if chain_granted {
+                            0
+                        } else {
+                            filter_end - filter_start
+                        };
+                        chain_granted = true;
+                        let limit = vm_work_limit(&mut self.vm_work, &self.read_control, granted);
                         let globals = if global_data.is_empty() {
                             &program.globals[..]
                         } else {
                             &global_data[..]
                         };
-                        let result = generic.execute_with_control(
-                            rarvm::Invocation {
-                                input: &block,
-                                regs,
-                                global_data: globals,
-                                file_offset: file_offset as u64,
-                                exec_count: program.exec_count,
-                            },
-                            &self.read_control,
-                        )?;
-                        program.globals = result.globals;
-                        block = result.output;
+                        let result = if limit == 0 {
+                            Err(Error::Rar3VmWorkLimitExceeded)
+                        } else {
+                            generic.execute_with_control(
+                                rarvm::Invocation {
+                                    input: &block,
+                                    regs,
+                                    global_data: globals,
+                                    file_offset: file_offset as u64,
+                                    exec_count: program.exec_count,
+                                },
+                                &self.read_control,
+                                limit,
+                            )
+                        };
+                        let used = match &result {
+                            Ok(result) => result.instructions,
+                            Err(error) if *error == rarvm::INSTRUCTION_LIMIT_EXCEEDED => limit,
+                            Err(_) => 0,
+                        };
+                        vm_work_spent(&mut self.vm_work, &self.read_control, limit, used);
+                        match result {
+                            Ok(result) => {
+                                program.globals = result.globals;
+                                block = result.output;
+                            }
+                            Err(error) => {
+                                let error = if error == rarvm::INSTRUCTION_LIMIT_EXCEEDED
+                                    && limit < rarvm::MAX_INSTRUCTIONS
+                                {
+                                    Error::Rar3VmWorkLimitExceeded
+                                } else {
+                                    error
+                                };
+                                let over_limit = error == Error::Rar3VmWorkLimitExceeded
+                                    || error == rarvm::INSTRUCTION_LIMIT_EXCEEDED;
+                                if !(over_limit && self.read_control.salvage()) {
+                                    return Err(error);
+                                }
+                                // Salvage leaves the block as the filter
+                                // found it and decodes on, so the rest of
+                                // the member costs no more than its data.
+                                self.vm_skipped.get_or_insert(error);
+                            }
+                        }
                     }
                 }
                 applied[filters[index]] = true;

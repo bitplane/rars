@@ -11,10 +11,65 @@ const GLOBAL_BASE: usize = 0x3c000;
 const SYSTEM_GLOBAL_SIZE: usize = 64;
 const MAX_USER_GLOBAL: usize = 0x2000 - SYSTEM_GLOBAL_SIZE;
 const MAX_STATIC_DATA: usize = MEMORY_SIZE - GLOBAL_BASE;
-const MAX_INSTRUCTIONS: usize = 25_000_000;
+/// The most instructions one run of a program may execute. Decoding a member
+/// also holds all its runs to a budget in proportion to the bytes they
+/// filter; see [`VmWork`].
+pub(crate) const MAX_INSTRUCTIONS: usize = 25_000_000;
+/// A run reached the instruction limit it was given.
+pub(crate) const INSTRUCTION_LIMIT_EXCEEDED: Error =
+    Error::InvalidData("RARVM instruction limit exceeded");
+/// Instructions custom programs may run for each byte they filter. See
+/// [`VmWork`].
+pub(crate) const VM_WORK_PER_BYTE: u64 = 512;
+/// Instructions custom programs may run in one member beyond the per-byte
+/// allowance.
+pub(crate) const VM_WORK_MEMBER_FLOOR: u64 = 1 << 20;
+/// Instructions custom programs may run in one extraction beyond the per-byte
+/// allowance, across all its members.
+pub(crate) const VM_WORK_ARCHIVE_FLOOR: u64 = 1 << 22;
 const FLAG_C: u32 = 1;
 const FLAG_Z: u32 = 2;
 const FLAG_S: u32 = 0x8000_0000;
+
+/// What custom filter programs may still run: a floor, plus
+/// [`VM_WORK_PER_BYTE`] instructions for each byte they filter. Each run is
+/// also capped at [`MAX_INSTRUCTIONS`] on its own. Without the proportional
+/// budget, a filter over a single byte could buy a whole run, and a member
+/// may hold any number of filters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct VmWork {
+    granted: u64,
+    used: u64,
+}
+
+impl VmWork {
+    pub(crate) const fn with_floor(floor: u64) -> Self {
+        Self {
+            granted: floor,
+            used: 0,
+        }
+    }
+    /// Adds the allowance for `bytes` more filtered bytes.
+    pub(crate) fn grant(&mut self, bytes: usize) {
+        self.granted = self
+            .granted
+            .saturating_add(VM_WORK_PER_BYTE.saturating_mul(bytes as u64));
+    }
+    pub(crate) fn available(&self) -> u64 {
+        self.granted.saturating_sub(self.used)
+    }
+    pub(crate) fn spend(&mut self, instructions: usize) {
+        self.used = self.used.saturating_add(instructions as u64);
+    }
+    /// Returns instructions taken by [`Self::spend`] but not executed.
+    pub(crate) fn refund(&mut self, instructions: usize) {
+        self.used = self.used.saturating_sub(instructions as u64);
+    }
+    #[cfg(all(test, feature = "write"))]
+    pub(crate) fn used(&self) -> u64 {
+        self.used
+    }
+}
 
 #[cfg(any(test, fuzzing))]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -100,6 +155,8 @@ pub struct ExecutionResult {
     pub output: Vec<u8>,
     pub globals: Vec<u8>,
     pub regs: [u32; 8],
+    /// Instructions executed, counting the final one.
+    pub instructions: usize,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -151,14 +208,17 @@ impl<B: Budget> OwnedProgram<B> {
             )?,
         })
     }
+    /// Runs the program for at most `instruction_limit` instructions, itself
+    /// capped at [`MAX_INSTRUCTIONS`].
     pub(crate) fn execute_with_control(
         &self,
         invocation: Invocation<'_>,
         control: &crate::read_control::ReadControl,
+        instruction_limit: usize,
     ) -> Result<OwnedExecutionResult<B>> {
         control.check_codec()?;
         let mut vm = Vm::with_allowance(self, invocation, &self.static_data.allowance())?;
-        vm.run(self, control)
+        vm.run_with_limit(self, control, instruction_limit.min(MAX_INSTRUCTIONS))
     }
     pub(crate) fn parse(blob: &[u8], allowance: &B) -> Result<Self> {
         if blob.is_empty() {
@@ -298,6 +358,8 @@ impl<B: Budget> ProgramCode for OwnedProgram<B> {
 pub(crate) struct OwnedExecutionResult<B: Budget> {
     pub(crate) output: Buffer<u8, B>,
     pub(crate) globals: Buffer<u8, B>,
+    /// Instructions executed, counting the final one.
+    pub(crate) instructions: usize,
     #[cfg(any(test, fuzzing))]
     pub(crate) regs: [u32; 8],
 }
@@ -308,6 +370,7 @@ impl OwnedExecutionResult<Allowance> {
             output: self.output.into_vec(),
             globals: self.globals.into_vec(),
             regs: self.regs,
+            instructions: self.instructions,
         }
     }
 }
@@ -586,6 +649,7 @@ impl<B: Budget> Vm<B> {
         })
     }
 
+    #[cfg(any(test, fuzzing))]
     fn run(
         &mut self,
         program: &impl ProgramCode,
@@ -603,7 +667,9 @@ impl<B: Budget> Vm<B> {
         let mut poller = control.poller();
         let mut ip = 0usize;
         let mut terminated = false;
-        for _ in 0..instruction_limit {
+        let mut instructions = 0;
+        while instructions < instruction_limit {
+            instructions += 1;
             poller.check_codec(0)?;
             let Some(instruction) = program.instruction(ip) else {
                 terminated = true;
@@ -619,7 +685,7 @@ impl<B: Budget> Vm<B> {
             }
         }
         if !terminated {
-            return Err(Error::InvalidData("RARVM instruction limit exceeded"));
+            return Err(INSTRUCTION_LIMIT_EXCEEDED);
         }
 
         let mut output_pos = self.read_u32(GLOBAL_BASE + 0x20) as usize & MEMORY_MASK as usize;
@@ -644,6 +710,7 @@ impl<B: Budget> Vm<B> {
         Ok(OwnedExecutionResult {
             output,
             globals,
+            instructions,
             #[cfg(any(test, fuzzing))]
             regs: self.regs,
         })

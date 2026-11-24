@@ -309,9 +309,14 @@ pub struct ArchiveReadOptions<'a> {
     ///
     /// The standard filters always run, as native code. Any other program is
     /// arbitrary RARVM bytecode from the archive. It runs in a sandbox with no
-    /// I/O, but each run may execute up to 25 million instructions and an
-    /// archive may run programs many times, so an untrusted archive can cost a
-    /// lot of CPU time. When this is off, a member that defines such a
+    /// I/O. One run may execute up to 25 million instructions. All the runs in
+    /// a member may execute 512 for each byte they filter plus about a
+    /// million, and all those in one extraction 512 a byte plus about four
+    /// million. A run that would go past either fails its member as invalid
+    /// data; under [`Self::salvage`] it is skipped instead, leaving its bytes
+    /// unfiltered, and the member is reported once it has decoded. Even so, an
+    /// untrusted archive can cost far more CPU time than one using only the
+    /// standard filters. When this is off, a member that defines such a
     /// program fails with [`Error::Rar3VmProgramRefused`], whose
     /// [`ErrorKind`] is `UnsupportedFeature`. Current WinRAR and unrar do not
     /// run these programs either; WinRAR 3.x did. Enable this for trusted

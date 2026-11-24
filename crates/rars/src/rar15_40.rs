@@ -34,6 +34,8 @@ pub use write::{FileEntry, Rar29Method, StoredEntry, StreamingEntry, WriterOptio
 mod extract;
 #[cfg(feature = "write")]
 mod producer;
+#[cfg(all(test, feature = "write"))]
+mod vm_work_tests;
 #[cfg(feature = "write")]
 mod write;
 use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output, LegacyLink};
@@ -2147,6 +2149,7 @@ impl Archive {
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
+        shared: &crate::read_control::ReadControl,
         allowance: &B,
         open: &mut F,
         links: &mut Option<&mut LegacyLink<'_>>,
@@ -2155,6 +2158,7 @@ impl Archive {
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
         let mut budget = crate::output_limit::OutputBudget::new(options);
+        budget.control.share_vm_work(shared);
         let mut session = DecoderSession::with_allowance(false, options.password, allowance);
         session.read_control = budget.control.clone();
         self.stream_member(
@@ -2294,6 +2298,7 @@ impl Archive {
                             self,
                             file,
                             options,
+                            &publication,
                             local,
                             emit_links,
                             verification,
@@ -2318,7 +2323,8 @@ impl Archive {
                 )
             },
             |(open, links), file| {
-                let extracted = self.extract_inline(file, options, allowance, *open, links);
+                let extracted =
+                    self.extract_inline(file, options, &publication, allowance, *open, links);
                 finish_independent(options, || crate::rar15_40_member(file), extracted)
             },
         )
@@ -2422,6 +2428,7 @@ fn decode_parallel_entry<B: Budget>(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
+    shared: &crate::read_control::ReadControl,
     allowance: &B,
     links: bool,
     verification: bool,
@@ -2429,6 +2436,9 @@ fn decode_parallel_entry<B: Budget>(
     options.check_cancelled()?;
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
+    // Members on workers draw custom VM program work from one budget for
+    // the whole extraction, as sequential extraction does.
+    budget.control.share_vm_work(shared);
     // Split members are planned inline, never onto a worker.
     let meta = file.metadata();
     if meta.is_directory {
