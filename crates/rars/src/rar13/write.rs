@@ -16,6 +16,7 @@ use crate::write_stream::{
 use crate::ArchiveVersion;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Seek;
+use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -247,7 +248,8 @@ pub fn write_streaming_archive_to(
     )
 }
 
-/// Like [`write_streaming_archive_to`], but seeking lets a stored member be read once.
+/// Like [`write_streaming_archive_to`], but seeking lets a stored member be
+/// read once and a compressed one over 64 MiB be coded straight into `output`.
 #[doc(hidden)]
 pub fn write_seekable_archive_to<W: Write + Seek>(
     entries: &[StreamingEntry],
@@ -364,8 +366,6 @@ fn write_archive_to(
     // Bytes in memory never spool, so a writer given only those sets no threshold.
     let stream_above = output.stream_above.unwrap_or(u64::MAX);
     let mut output = output.cancellable(progress.map(ProgressReporter));
-    // Stored members copied from a source have their checksum patched in.
-    let patches = output.can_seek();
     if !options.target.is_rar13_family() {
         return Err(Error::UnsupportedVersion(options.target));
     }
@@ -425,11 +425,16 @@ fn write_archive_to(
             resources,
             &work,
             stream_above,
-            patches,
+            output
+                .as_seekable()
+                .map(|output| output as &mut dyn SeekWrite),
         )
         .map_err(|error| crate::write_stream::member_error(error, member.name, "preparing"))?;
-        write_member(&mut output, member, encoded, options, &work)
-            .map_err(|error| crate::write_stream::member_error(error, member.name, "writing"))?;
+        if let Some(encoded) = encoded {
+            write_member(&mut output, member, encoded, options, &work).map_err(|error| {
+                crate::write_stream::member_error(error, member.name, "writing")
+            })?;
+        }
         member.bytes.release();
         report_compression_entry(
             reporting,
@@ -516,7 +521,8 @@ fn member_workspace(unpacked: u64, compressing: bool) -> u64 {
         .saturating_add(crate::codec::rar13::ENCODER_WORKSPACE)
 }
 
-/// Codes one member, holding its bytes only while it is being coded.
+/// Codes one member, holding its bytes only while it is being coded. `None`
+/// when a large member has gone straight into `in_place`, header and all.
 #[allow(clippy::too_many_arguments)]
 fn encode_member<'a>(
     member: &Member<'a>,
@@ -527,8 +533,10 @@ fn encode_member<'a>(
     resources: &WriterResources,
     work: &WorkTracker<'_>,
     stream_above: u64,
-    patches: bool,
-) -> Result<EncodedMember<'a>> {
+    in_place: Option<&mut dyn SeekWrite>,
+) -> Result<Option<EncodedMember<'a>>> {
+    // Stored members copied from a source have their checksum patched in.
+    let patches = in_place.is_some();
     work.check()?;
     let unpacked_size = member.unpacked_size()?;
     validate_member(member.name, unpacked_size)?;
@@ -538,13 +546,13 @@ fn encode_member<'a>(
                 "RAR1.3/1.4 directories must have no payload",
             ));
         }
-        return Ok(EncodedMember {
+        return Ok(Some(EncodedMember {
             payload: Payload::Shared(MemberPayload::Packed(Vec::new())),
             method: METHOD_STORE,
             unpacked_size: 0,
             file_crc: Some(file_checksum(&[])),
             held: None,
-        });
+        }));
     }
     // A member its samples say will not compress is stored the way `--store`
     // stores it, never loaded or packed.
@@ -555,8 +563,9 @@ fn encode_member<'a>(
     } else {
         coding
     };
-    // A large member read from a source is packed into a spool a window at a
-    // time, and a stored fallback copied from the source.
+    // A large member read from a source is coded a window at a time, into
+    // the archive behind its header where that can be patched, and into a
+    // spool otherwise. A stored fallback is copied from the source.
     if let (true, Some(source)) = (
         coding.compresses()
             && options.compression_level != Some(0)
@@ -565,6 +574,19 @@ fn encode_member<'a>(
     ) {
         let permit = resources
             .acquire_serialising_cancellable(streamed_workspace(), &|| work.is_cancelled())?;
+        if let Some(output) = in_place {
+            write_in_place(
+                output,
+                member,
+                source,
+                unpacked_size,
+                options,
+                encode_options,
+                solid_encoder,
+                work,
+            )?;
+            return Ok(None);
+        }
         return encode_spooled_member(
             member,
             source,
@@ -574,7 +596,7 @@ fn encode_member<'a>(
             resources,
             work,
         )
-        .map(|encoded| encoded.holding(permit));
+        .map(|encoded| Some(encoded.holding(permit)));
     }
     let permit = resources.acquire_serialising_cancellable(
         member_workspace(unpacked_size as u64, coding.compresses()),
@@ -585,27 +607,29 @@ fn encode_member<'a>(
     // straight through, encrypting as it goes. Its checksum is summed on the
     // way where the header can be patched, and read ahead for where it can't.
     if let (MemberCoding::Stored, Some(source)) = (coding, member.bytes.source()) {
-        return Ok(EncodedMember {
-            payload: Payload::Shared(MemberPayload::Copied(source)),
-            method: METHOD_STORE,
-            unpacked_size,
-            file_crc: (!patches)
-                .then(|| -> Result<u16> {
-                    let mut checksum = Rar13Checksum::new();
-                    member.bytes.walk_exact_with_progress(
-                        unpacked_size as u64,
-                        work.reporter(),
-                        |chunk| {
-                            checksum.update(chunk);
-                            work.advance(chunk.len() as u64);
-                        },
-                    )?;
-                    Ok(checksum.finish())
-                })
-                .transpose()?,
-            held: None,
-        }
-        .holding(permit));
+        return Ok(Some(
+            EncodedMember {
+                payload: Payload::Shared(MemberPayload::Copied(source)),
+                method: METHOD_STORE,
+                unpacked_size,
+                file_crc: (!patches)
+                    .then(|| -> Result<u16> {
+                        let mut checksum = Rar13Checksum::new();
+                        member.bytes.walk_exact_with_progress(
+                            unpacked_size as u64,
+                            work.reporter(),
+                            |chunk| {
+                                checksum.update(chunk);
+                                work.advance(chunk.len() as u64);
+                            },
+                        )?;
+                        Ok(checksum.finish())
+                    })
+                    .transpose()?,
+                held: None,
+            }
+            .holding(permit),
+        ));
     }
 
     let data = member
@@ -624,14 +648,16 @@ fn encode_member<'a>(
     if !coding.compresses() {
         // The caller's bytes are written as they stand, encrypted as they go
         // out. A copy would hold the member a second time.
-        return Ok(EncodedMember {
-            payload: Payload::Shared(member.bytes.stored()),
-            method: METHOD_STORE,
-            unpacked_size,
-            file_crc: Some(file_crc),
-            held: None,
-        }
-        .holding(permit));
+        return Ok(Some(
+            EncodedMember {
+                payload: Payload::Shared(member.bytes.stored()),
+                method: METHOD_STORE,
+                unpacked_size,
+                file_crc: Some(file_crc),
+                held: None,
+            }
+            .holding(permit),
+        ));
     }
 
     let solid = solid_encoder.is_some();
@@ -648,14 +674,16 @@ fn encode_member<'a>(
         encode_verified_rar15_payload_with_progress(&data, encode_options, &mut advance)?
     };
     let (packed, method) = select_verified_payload(data, packed, solid);
-    Ok(EncodedMember {
-        payload: Payload::Shared(MemberPayload::Packed(packed)),
-        method,
-        unpacked_size,
-        file_crc: Some(file_crc),
-        held: None,
-    }
-    .holding(permit))
+    Ok(Some(
+        EncodedMember {
+            payload: Payload::Shared(MemberPayload::Packed(packed)),
+            method,
+            unpacked_size,
+            file_crc: Some(file_crc),
+            held: None,
+        }
+        .holding(permit),
+    ))
 }
 
 /// Whether to store an independent member without packing it, judged from
@@ -786,11 +814,10 @@ fn encode_spooled_member<'a>(
     })
 }
 
-type StreamedEncode<'e> = dyn FnMut(
-        &mut dyn Read,
-        &mut dyn FnMut(&[u8], usize) -> crate::codec::Result<std::ops::ControlFlow<()>>,
-    ) -> crate::codec::Result<std::ops::ControlFlow<()>>
-    + 'e;
+type PackedSink<'s> = dyn FnMut(&[u8], usize) -> crate::codec::Result<ControlFlow<()>> + 's;
+
+type StreamedEncode<'e> =
+    dyn FnMut(&mut dyn Read, &mut PackedSink<'_>) -> crate::codec::Result<ControlFlow<()>> + 'e;
 
 /// Packs the member from its source into a new spool, adding what it reads to
 /// `checksum` if given.
@@ -803,6 +830,23 @@ fn spool_attempt(
     encode: &mut StreamedEncode<'_>,
 ) -> Result<crate::streaming::Spool> {
     let mut spool = crate::streaming::Spool::create(resources)?;
+    code_from_source(member, len, work, checksum, encode, &mut |bytes, _| {
+        spool.write_all(bytes)?;
+        Ok(ControlFlow::Continue(()))
+    })
+    .map(|_| spool)
+}
+
+/// Codes the member from its source into `out`, which may cut the attempt
+/// short, adding what it reads to `checksum` if given.
+fn code_from_source(
+    member: &Member<'_>,
+    len: usize,
+    work: &WorkTracker<'_>,
+    checksum: Option<&mut Rar13Checksum>,
+    encode: &mut StreamedEncode<'_>,
+    out: &mut PackedSink<'_>,
+) -> Result<ControlFlow<()>> {
     let mut reader = crate::write_progress::CancellableIo {
         inner: member.bytes.open()?,
         progress: work.reporter(),
@@ -812,13 +856,9 @@ fn spool_attempt(
         checksum,
         read: 0,
     };
-    let mut out = |bytes: &[u8], _: usize| -> crate::codec::Result<std::ops::ControlFlow<()>> {
-        spool.write_all(bytes)?;
-        Ok(std::ops::ControlFlow::Continue(()))
-    };
-    let coded = encode(&mut counted, &mut out);
+    let coded = encode(&mut counted, out);
     let read = counted.read;
-    match coded {
+    let flow = match coded {
         Err(crate::codec::Error::Cancelled) => return Err(Error::Cancelled),
         Err(_) if read < len as u64 => {
             return Err(Error::SourceChanged(
@@ -826,15 +866,17 @@ fn spool_attempt(
             ))
         }
         Err(error) => return Err(error.into()),
-        Ok(_) => {}
+        Ok(flow) => flow,
+    };
+    if flow.is_continue() {
+        crate::write_stream::check_source_length(
+            &mut reader,
+            len as u64,
+            len as u64,
+            "entry source size changed while compressing",
+        )?;
     }
-    crate::write_stream::check_source_length(
-        &mut reader,
-        len as u64,
-        len as u64,
-        "entry source size changed while compressing",
-    )?;
-    Ok(spool)
+    Ok(flow)
 }
 
 /// Reads through to `inner`, counting the bytes and summing them if asked.
@@ -883,10 +925,7 @@ fn write_member(
     crate::write_progress::check_cancelled(progress)?;
     // A payload in memory is encrypted in place; one copied from a source or
     // a spool is encrypted as it is copied.
-    let mut cipher = match member.password {
-        Some(password) => Some(Rar13Cipher::for_password(password)?),
-        None => None,
-    };
+    let mut cipher = member_cipher(member)?;
     let payload = match encoded.payload {
         Payload::Shared(MemberPayload::Packed(mut packed)) => {
             if let Some(mut cipher) = cipher.take() {
@@ -909,35 +948,15 @@ fn write_member(
     let packed_size = u32::try_from(packed_size)
         .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))?;
 
-    let mut flags = 0u8;
-    if options.features.solid {
-        flags |= LHD_SOLID;
-    }
-    if member.password.is_some() {
-        flags |= LHD_PASSWORD;
-    }
-    if member.file_comment.is_some() {
-        flags |= LHD_COMMENT;
-    }
-    let file_extra = encode_file_comment(member.file_comment)?;
     let build_header = |file_crc: u16| -> Result<Vec<u8>> {
-        let mut header = Vec::new();
-        write_file_header(
-            &mut header,
-            FileEntryRecord {
-                name: member.name,
-                unpacked_size: encoded.unpacked_size as u32,
-                file_crc,
-                packed_size,
-                file_time: member.file_time,
-                file_attr: member.file_attr,
-                flags,
-                unp_ver: DEFAULT_UNP_VER,
-                method: encoded.method,
-                extra: &file_extra,
-            },
-        )?;
-        Ok(header)
+        member_header(
+            member,
+            options,
+            encoded.unpacked_size,
+            file_crc,
+            packed_size,
+            encoded.method,
+        )
     };
     let header = build_header(encoded.file_crc.unwrap_or(0))?;
     let header_at = match output.as_seekable() {
@@ -1012,6 +1031,148 @@ fn write_member(
             Ok(())
         }
     }
+}
+
+fn member_header(
+    member: &Member<'_>,
+    options: WriterOptions,
+    unpacked_size: usize,
+    file_crc: u16,
+    packed_size: u32,
+    method: u8,
+) -> Result<Vec<u8>> {
+    let mut flags = 0u8;
+    if options.features.solid {
+        flags |= LHD_SOLID;
+    }
+    if member.password.is_some() {
+        flags |= LHD_PASSWORD;
+    }
+    if member.file_comment.is_some() {
+        flags |= LHD_COMMENT;
+    }
+    let mut header = Vec::new();
+    write_file_header(
+        &mut header,
+        FileEntryRecord {
+            name: member.name,
+            unpacked_size: unpacked_size as u32,
+            file_crc,
+            packed_size,
+            file_time: member.file_time,
+            file_attr: member.file_attr,
+            flags,
+            unp_ver: DEFAULT_UNP_VER,
+            method,
+            extra: &encode_file_comment(member.file_comment)?,
+        },
+    )?;
+    Ok(header)
+}
+
+/// A header that can be patched makes a spool unnecessary; an attempt that
+/// would not shrink the member is cut short and stored over, as the spool stores it.
+#[allow(clippy::too_many_arguments)]
+fn write_in_place(
+    output: &mut dyn SeekWrite,
+    member: &Member<'_>,
+    source: &EntrySource,
+    unpacked_size: usize,
+    options: WriterOptions,
+    encode_options: Rar15EncodeOptions,
+    solid_encoder: Option<&mut Unpack15Encoder>,
+    work: &WorkTracker<'_>,
+) -> Result<()> {
+    let len = unpacked_size as u64;
+    let header_at = output.stream_position()?;
+    let header = member_header(member, options, unpacked_size, 0, 0, METHOD_BEST)?;
+    output.write_all(&header)?;
+    let payload_at = output.stream_position()?;
+    // A solid member is never stored instead, as in memory.
+    let storable = solid_encoder.is_none();
+
+    let mut checksum = Rar13Checksum::new();
+    let mut packed = 0u64;
+    let mut last = 0usize;
+    let coded = {
+        let mut sink = payload_writer(output, member_cipher(member)?);
+        let mut advance = |position: usize| advance_rar15_attempt(&mut last, work, position);
+        let mut encoder = solid_encoder;
+        let mut independent = Unpack15Encoder::with_options(encode_options);
+        code_from_source(
+            member,
+            unpacked_size,
+            work,
+            Some(&mut checksum),
+            &mut |input, out| {
+                encoder
+                    .as_deref_mut()
+                    .unwrap_or(&mut independent)
+                    .encode_member_streamed(input, unpacked_size, &mut advance, out)
+            },
+            &mut |block, _| {
+                if storable && packed + block.len() as u64 >= len {
+                    return Ok(ControlFlow::Break(()));
+                }
+                sink.write_all(block)?;
+                packed += block.len() as u64;
+                Ok(ControlFlow::Continue(()))
+            },
+        )?
+    };
+
+    let (file_crc, packed_size, method) = if coded.is_continue() {
+        (checksum.finish(), packed, METHOD_BEST)
+    } else {
+        // The stored copy is longer than the attempt, so it covers all of it.
+        output.seek(std::io::SeekFrom::Start(payload_at))?;
+        let mut checksum = Rar13Checksum::new();
+        MemberPayload::Copied(source).write_to(
+            &mut Rar13ChecksumWriter {
+                inner: &mut payload_writer(output, member_cipher(member)?),
+                checksum: &mut checksum,
+            },
+            len,
+        )?;
+        // Counted only as far as the attempt got.
+        work.advance(len.saturating_sub(last as u64));
+        (checksum.finish(), len, METHOD_STORE)
+    };
+    let packed_size = u32::try_from(packed_size)
+        .map_err(|_| Error::InvalidArgument("RAR 1.3 file is larger than 32-bit size fields"))?;
+    crate::write_stream::patch_header(
+        output,
+        header_at,
+        header.len() as u64,
+        &member_header(
+            member,
+            options,
+            unpacked_size,
+            file_crc,
+            packed_size,
+            method,
+        )?,
+        Error::WriterFailure("RAR 1.3 file header changed length when patched"),
+    )
+}
+
+fn payload_writer<'w>(
+    output: &'w mut dyn Write,
+    cipher: Option<Rar13Cipher>,
+) -> Box<dyn Write + 'w> {
+    match cipher {
+        Some(cipher) => Box::new(Rar13EncryptingWriter {
+            inner: output,
+            cipher,
+            buffer: Vec::new(),
+        }),
+        None => Box::new(output),
+    }
+}
+
+/// Each write of a payload starts the member's cipher afresh.
+fn member_cipher(member: &Member<'_>) -> Result<Option<Rar13Cipher>> {
+    member.password.map(Rar13Cipher::for_password).transpose()
 }
 
 /// A member not read ahead for its checksum is counted as it is copied.
@@ -2086,8 +2247,9 @@ mod tests {
                     &resources,
                     &work,
                     u64::MAX,
-                    false,
+                    None,
                 )
+                .unwrap()
                 .unwrap();
                 let held = match &encoded.payload {
                     // A stored member is the caller's bytes, not a copy of
@@ -2215,19 +2377,32 @@ mod tests {
         options: super::WriterOptions,
         stream_above: u64,
     ) -> (Vec<u8>, bool) {
+        written_above_to(entries, options, stream_above, false)
+    }
+
+    fn written_above_to(
+        entries: &[super::StreamingEntry],
+        options: super::WriterOptions,
+        stream_above: u64,
+        seekable: bool,
+    ) -> (Vec<u8>, bool) {
         struct Watching {
-            out: Vec<u8>,
+            out: std::io::Cursor<Vec<u8>>,
             dir: std::path::PathBuf,
             saw_spool: bool,
         }
         impl std::io::Write for Watching {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
                 self.saw_spool |= std::fs::read_dir(&self.dir)?.next().is_some();
-                self.out.extend_from_slice(bytes);
-                Ok(bytes.len())
+                self.out.write(bytes)
             }
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
+            }
+        }
+        impl std::io::Seek for Watching {
+            fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+                self.out.seek(from)
             }
         }
         let dir = crate::scratch::case("rars-rar13-spooled");
@@ -2247,9 +2422,14 @@ mod tests {
             })
             .collect();
         let mut out = Watching {
-            out: Vec::new(),
+            out: std::io::Cursor::new(Vec::new()),
             dir: dir.to_path_buf(),
             saw_spool: false,
+        };
+        let output = if seekable {
+            super::CallerOutput::seekable(&mut out)
+        } else {
+            super::CallerOutput::stream(&mut out)
         };
         super::write_archive_with_sources(
             &files,
@@ -2258,12 +2438,12 @@ mod tests {
             None,
             &resources,
             None,
-            super::CallerOutput::stream(&mut out).streaming_above(stream_above),
+            output.streaming_above(stream_above),
         )
         .unwrap();
         let left = std::fs::read_dir(&*dir).unwrap().count();
         assert_eq!(left, 0, "a spool was left behind");
-        (out.out, out.saw_spool)
+        (out.out.into_inner(), out.saw_spool)
     }
 
     fn spooled_members() -> Vec<(&'static str, Vec<u8>)> {
@@ -2341,6 +2521,88 @@ mod tests {
         check_spooled_archive(Some(b"spooled"));
     }
 
+    fn check_in_place_archive(password: Option<&[u8]>) {
+        let contents = spooled_members();
+        let entries: Vec<_> = contents
+            .iter()
+            .map(|(name, data)| {
+                let entry = super::StreamingEntry::new(
+                    name.as_bytes().to_vec(),
+                    super::EntrySource::from_bytes(data.clone()),
+                );
+                match password {
+                    Some(password) => entry.with_password(password.to_vec()),
+                    None => entry,
+                }
+            })
+            .collect();
+        for solid in [false, true] {
+            let mut features = FeatureSet::store_only();
+            features.solid = solid;
+            let options = WriterOptions {
+                target: ArchiveVersion::Rar14,
+                features,
+                compression_level: Some(3),
+            };
+
+            let (in_place, saw_spool) = written_above_to(&entries, options, 64 * 1024, true);
+            assert!(!saw_spool, "solid: {solid}");
+            let methods: Vec<_> = Archive::parse(&in_place)
+                .unwrap()
+                .entries
+                .iter()
+                .map(|entry| entry.header.method)
+                .collect();
+            let stored = if solid { METHOD_BEST } else { METHOD_STORE };
+            assert_eq!(methods, [stored, METHOD_BEST, stored], "solid: {solid}");
+            let (spooled, saw_spool) = written_above_to(&entries, options, 64 * 1024, false);
+            assert!(saw_spool, "solid: {solid}");
+            assert!(in_place == spooled, "solid: {solid}");
+        }
+    }
+
+    #[test]
+    fn a_large_member_is_coded_in_place_on_a_seekable_output() {
+        check_in_place_archive(None);
+    }
+
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn a_large_member_is_encrypted_in_place_on_a_seekable_output() {
+        check_in_place_archive(Some(b"in place"));
+    }
+
+    #[test]
+    fn a_source_that_changes_size_in_place_is_refused() {
+        let options = WriterOptions {
+            target: ArchiveVersion::Rar14,
+            features: FeatureSet::store_only(),
+            compression_level: Some(3),
+        };
+        // Packed whole, and stored over an attempt cut short.
+        for (_, data) in &spooled_members()[1..] {
+            for actual in [data.len() - 1, data.len() + 1] {
+                let opened: Vec<u8> = data.iter().copied().cycle().take(actual).collect();
+                let source = super::EntrySource::from_opener(data.len() as u64, move || {
+                    Ok(Box::new(std::io::Cursor::new(opened.clone())))
+                });
+                let entry = super::StreamingEntry::new(b"changing".to_vec(), source);
+                let mut out = std::io::Cursor::new(Vec::new());
+                let error = super::write_archive_to(
+                    &[super::Member::from_streaming(&entry)],
+                    options,
+                    super::MemberCoding::Compressed,
+                    None,
+                    &WriterResources::default(),
+                    None,
+                    super::CallerOutput::seekable(&mut out).streaming_above(64 * 1024),
+                )
+                .unwrap_err();
+                assert_eq!(error.kind(), crate::ErrorKind::SourceChanged, "{actual}");
+            }
+        }
+    }
+
     #[test]
     fn verification_decodes_against_the_member_without_a_copy() {
         let data = b"verification compares as it decodes, verification compares".repeat(40);
@@ -2393,7 +2655,7 @@ mod tests {
                 &resources,
                 &work,
                 u64::MAX,
-                false,
+                None,
             ),
             Err(crate::Error::Cancelled)
         ));

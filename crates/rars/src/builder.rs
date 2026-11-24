@@ -1239,11 +1239,11 @@ impl Builder {
     ///
     /// RAR 5 and RAR 7 stream using the supplied workspace and spool policy;
     /// see [`WriterResources`] for its scope and bare-WASM memory limits.
-    /// Legacy families emit headers and members directly. RAR 2.0 to 4.x code
-    /// a compressed member over 64 MiB into a spool in the resources' temp
-    /// directory, so its header can carry the sizes; smaller ones, and every
-    /// RAR 1.3 and 1.5 member, are held in memory. Legacy stored sources are
-    /// read twice to prepare and verify checksums; [`write_to_path`](Self::write_to_path)
+    /// Legacy families emit headers and members directly. RAR 1.3 and RAR 2.0
+    /// to 4.x code a compressed member over 64 MiB into a spool in the
+    /// resources' temp directory, so its header can carry the sizes; smaller
+    /// ones, and every RAR 1.5 member, are held in memory. Legacy stored
+    /// sources are read twice to prepare and verify checksums; [`write_to_path`](Self::write_to_path)
     /// reads them once. Legacy managed-memory quotas are not supported.
     /// On failure, `output` may contain a partial archive. Use
     /// [`write_to_path`](Self::write_to_path) for atomic file publication.
@@ -1299,7 +1299,8 @@ impl Builder {
 
     /// Write the archive to `path`, streaming where the format allows it.
     /// The completed archive replaces the destination only after writing and syncing succeed.
-    /// Large compressed RAR 2.0-4.x members stream, and RAR 1.3 to 4.x, RAR 5
+    /// Large compressed RAR 1.3 and RAR 2.0-4.x members are coded straight
+    /// into the file, and RAR 1.3 to 4.x, RAR 5
     /// and RAR 7 stored members are read once, as a file can seek back to fill
     /// in their headers. A RAR 5 or RAR 7 recovery record reads the file back.
     ///
