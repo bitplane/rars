@@ -17,6 +17,8 @@ pub(crate) mod headers;
 #[cfg(test)]
 mod in_place_tests;
 mod layout;
+#[cfg(test)]
+mod mixed_stored_tests;
 mod plan;
 #[cfg(test)]
 use filter_policy::encode_options_for_level;
