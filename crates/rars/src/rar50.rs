@@ -1632,7 +1632,8 @@ pub fn repair_inline_recovery_bytes_with_report(
 /// [`repair_inline_recovery_bytes_with_options`] for an archive read from
 /// `reader` as needed, published to `path` as
 /// [`crate::RecoveryRepairResult::write_to_path`] publishes: written beside
-/// it, checked to parse, and renamed over it only then. The destination is
+/// it, synced if it replaces an existing file, checked to parse, and renamed
+/// over it only then. The destination is
 /// untouched on failure.
 ///
 /// Neither the archive nor its repaired copy is held, only the recovery
@@ -1693,7 +1694,7 @@ pub fn repair_inline_recovery_to_path_with_options<R: Read + std::io::Seek + Sen
         } else {
             stream_record_repair(&read, len, &layout, &mut output, &control)?
         };
-        output.sync_all()?;
+        crate::publish::sync_if_replacing(&output, path)?;
         drop(output);
         let written = pending
             .path

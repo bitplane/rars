@@ -86,6 +86,8 @@ mod pending_archive;
 mod producer;
 #[cfg(any(feature = "write", feature = "recovery"))]
 mod progress;
+#[doc(hidden)]
+pub mod publish;
 mod read_control;
 #[doc(hidden)]
 pub mod read_session;
@@ -1584,8 +1586,9 @@ impl Archive {
     }
 
     /// Repairs into `path`, published as [`RecoveryRepairResult::write_to_path`]
-    /// publishes: written beside it, synced, and renamed over it only once the
-    /// repair succeeds and a final cancellation check passes. The destination
+    /// publishes: written beside it, synced if it replaces an existing file,
+    /// and renamed over it only once the repair succeeds and a final
+    /// cancellation check passes. The destination
     /// is untouched on failure. Only password and cancellation apply from the
     /// read options.
     ///
@@ -1625,7 +1628,7 @@ impl Archive {
                 }
                 Self::Rar13(_) => unreachable!("refused above"),
             };
-            output.sync_all()?;
+            crate::publish::sync_if_replacing(&output, path)?;
             drop(output);
             control.check()?;
             std::fs::rename(pending.path.as_ref().unwrap(), path)?;
@@ -1787,7 +1790,8 @@ pub struct RecoveryRepairResult {
 #[cfg(feature = "recovery")]
 impl RecoveryRepairResult {
     /// Publishes repaired bytes beside the destination, replacing it only after
-    /// writing, syncing and a final cancellation check succeed. Cancellation
+    /// writing and a final cancellation check succeed. The repaired copy is
+    /// synced first when it replaces an existing file. Cancellation
     /// after the final check cannot interrupt the rename. Temporary output is
     /// removed on failure; the destination is untouched until publication.
     pub fn write_to_path(
@@ -1813,7 +1817,7 @@ impl RecoveryRepairResult {
                     .write_all(&mut output, &self.data)
                     .map_err(Error::from),
             )?;
-            output.sync_all()?;
+            crate::publish::sync_if_replacing(&output, path)?;
         }
         control.check()?;
         std::fs::rename(pending.path.as_ref().unwrap(), path)?;

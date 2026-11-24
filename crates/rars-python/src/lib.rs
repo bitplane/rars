@@ -2845,9 +2845,11 @@ impl<'a> PythonVolumeSink<'a> {
     }
 }
 
-/// Names a staged volume. Without `overwrite` a link cannot replace a file that
-/// appeared since the names were checked; a file system without links renames.
+/// Names a staged volume, synced first if it replaces an existing file. Without
+/// `overwrite` a link cannot replace a file that appeared since the names were
+/// checked; a file system without links renames.
 fn publish_volume(temporary: &Path, path: &Path, overwrite: bool) -> io::Result<()> {
+    rars_rs::publish::sync_staged_if_replacing(temporary, path)?;
     if overwrite {
         return fs::rename(temporary, path);
     }
