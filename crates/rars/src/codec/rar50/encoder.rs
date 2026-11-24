@@ -1994,7 +1994,7 @@ fn a_seeded_tree_collects_what_a_tree_that_parsed_the_history_does() {
     assert!(!searches_tree(start + 1024, start, options));
 
     let mut seeded = OptimalCollector::with_allowance(&input, start, options, &allowance).unwrap();
-    assert!(matches!(&seeded.finder, CollectorFinder::Tree(_)));
+    assert!(matches!(&seeded.finder, CollectorFinder::Tree(..)));
     let mut parsed = OptimalCollector::with_allowance(&input, 0, options, &allowance).unwrap();
     for block in (0..start).step_by(LZ_BLOCK_SIZE) {
         parsed
@@ -2016,7 +2016,13 @@ fn a_seeded_tree_collects_what_a_tree_that_parsed_the_history_does() {
 enum CollectorFinder<B: Budget = Allowance> {
     Packed(super::super::packed_chain::PackedMatchFinder<B>),
 
-    Tree(Rar50TreeMatchFinder<B>),
+    /// The tree, and where each stretch as long as the longest match last
+    /// began, for the matches the tree stops short of. See
+    /// [`measure_past_nice`] for which parses keep the stretches.
+    Tree(
+        Rar50TreeMatchFinder<B>,
+        Option<match_finder::WindowIndex<B>>,
+    ),
     Chains(Rar50MatchFinder<B>),
 }
 
@@ -2036,15 +2042,25 @@ impl<B: Budget> OptimalCollector<B> {
         allowance: &B,
     ) -> Result<Self> {
         if searches_tree(combined.len(), start, options) {
-            let mut tree = Rar50TreeMatchFinder::with_allowance(
-                finder_window(options, combined.len()),
-                allowance,
-            )?;
+            let window = finder_window(options, combined.len());
+            let mut tree = Rar50TreeMatchFinder::with_allowance(window, allowance)?;
+            let mut stretches = if options.parse_passes > 1 {
+                Some(match_finder::WindowIndex::with_allowance(
+                    window,
+                    MAX_ENCODER_MATCH_LENGTH,
+                    allowance,
+                )?)
+            } else {
+                None
+            };
             // The history goes in as the collector would have put it there had
             // it parsed it: every position, each with the descent a search
             // makes. Nothing is reported, so nothing is allocated.
             let mut nothing = Buffer::new(allowance);
             for pos in start.saturating_sub(options.max_match_distance)..start {
+                if let Some(stretches) = &mut stretches {
+                    stretches.insert(combined, pos);
+                }
                 let avail = combined.len() - pos;
                 if avail >= 4 {
                     tree.matches(
@@ -2059,7 +2075,7 @@ impl<B: Budget> OptimalCollector<B> {
                 }
             }
             return Ok(Self {
-                finder: CollectorFinder::Tree(tree),
+                finder: CollectorFinder::Tree(tree, stretches),
             });
         }
         if packed_index_fits(combined.len(), start, options) {
@@ -2101,7 +2117,7 @@ impl<B: Budget> OptimalCollector<B> {
     ) -> Result<BlockMatches<B>> {
         let allowance = match &self.finder {
             CollectorFinder::Packed(finder) => finder.allowance(),
-            CollectorFinder::Tree(finder) => finder.allowance(),
+            CollectorFinder::Tree(finder, _) => finder.allowance(),
             CollectorFinder::Chains(finder) => finder.allowance(),
         };
         let span = block.end - block.start;
@@ -2137,7 +2153,12 @@ impl<B: Budget> OptimalCollector<B> {
             let before = matches.runs.len();
             match &mut self.finder {
                 CollectorFinder::Packed(_) => unreachable!("packed collector dispatched above"),
-                CollectorFinder::Tree(tree) => {
+                CollectorFinder::Tree(tree, stretches) => {
+                    let stretch = stretches
+                        .as_mut()
+                        .map_or(match_finder::NO_POSITION, |stretches| {
+                            stretches.insert(combined, pos)
+                        });
                     let avail = combined.len() - pos;
                     if avail < 4 {
                         continue;
@@ -2176,12 +2197,18 @@ impl<B: Budget> OptimalCollector<B> {
                         &mut matches.runs,
                     )
                     .map_err(Into::into)?;
-                    if let Some(last) = matches.runs[before..].last_mut() {
-                        let limit = avail.min(MAX_ENCODER_MATCH_LENGTH);
-                        if last.0 as usize == len_limit && len_limit < limit {
-                            last.0 = match_length(combined, pos, last.1 as usize, limit) as u32;
-                        }
-                    }
+                    measure_past_nice(
+                        combined,
+                        pos,
+                        len_limit,
+                        avail.min(MAX_ENCODER_MATCH_LENGTH),
+                        max_distance,
+                        stretches.as_ref(),
+                        stretch,
+                        &mut matches.runs,
+                        before,
+                    )
+                    .map_err(Into::into)?;
                 }
                 CollectorFinder::Chains(finder) => {
                     // Inserting into a chain is one store, so every position
@@ -2226,6 +2253,84 @@ impl<B: Budget> OptimalCollector<B> {
         matches.starts.push_admitted(matches.runs.len() as u32);
         Ok(matches)
     }
+}
+
+/// How many of the stretches after a position [`measure_past_nice`] asks
+/// after, besides its own. See [`match_finder::WindowIndex::distances_ahead`].
+const STRETCHES_AHEAD: usize = 8;
+
+/// Measures the longest run a tree descent reported out to its real end, when
+/// the descent stopped at `len_limit` and the match may run on, and offers the
+/// nearest earlier copy of the whole stretch ahead, `stretch`, when that
+/// reaches further. `runs[before..]` are this position's runs.
+///
+/// The tree stops at the nearest copy of the nice length, and the copy that
+/// runs on can be further back. 4 MiB of a zero run and a phrase, repeating
+/// every 8,191 bytes, has dozens of nearer copies of each phrase start that
+/// end with the phrase. The parse took those and alternated two remembered
+/// distances at a dozen bits a token, 2 KB at every level. Given the period,
+/// it codes the rest as repeats of one match at a bit or two each: 247 bytes
+/// at level 5, where WinRAR's -m5 packs 394.
+///
+/// A parse that prices once keeps no stretches. It commits to the longest
+/// match at its nice length of 32 without pricing it, and on 4 MiB of text
+/// the far copies it then took packed 0.28% larger at level 2.
+#[allow(clippy::too_many_arguments)]
+fn measure_past_nice<B: Budget>(
+    combined: &[u8],
+    pos: usize,
+    len_limit: usize,
+    limit: usize,
+    max_distance: usize,
+    stretches: Option<&match_finder::WindowIndex<B>>,
+    stretch: usize,
+    runs: &mut Buffer<(u32, u32), B>,
+    before: usize,
+) -> std::result::Result<(), B::Failure> {
+    let Some(last) = runs[before..].last_mut() else {
+        return Ok(());
+    };
+    if last.0 as usize != len_limit || len_limit >= limit {
+        return Ok(());
+    }
+    last.0 = match_length(combined, pos, last.1 as usize, limit) as u32;
+    let reach = last.0 as usize;
+    let Some(stretches) = stretches.filter(|_| reach < limit) else {
+        return Ok(());
+    };
+    let mut ahead = [match_finder::NO_POSITION; STRETCHES_AHEAD];
+    stretches.distances_ahead(combined, pos, &mut ahead);
+    let here = if stretch < pos {
+        pos - stretch
+    } else {
+        match_finder::NO_POSITION
+    };
+    let mut best = (reach, 0);
+    for distance in std::iter::once(here).chain(ahead) {
+        if distance > max_distance || distance > pos {
+            continue;
+        }
+        let length = match_length(combined, pos, distance, limit);
+        if length > best.0 || (length == best.0 && length > reach && distance < best.1) {
+            best = (length, distance);
+        }
+    }
+    let (length, distance) = best;
+    if length <= reach {
+        return Ok(());
+    }
+    // Runs grow in length and distance together, each the nearest distance
+    // that reaches its length, so the ones this outreaches from no nearer
+    // give way to it.
+    while runs.len() > before && runs[runs.len() - 1].1 as usize >= distance {
+        runs.pop();
+    }
+    // As many runs as the tree reports at most, the shortest giving way.
+    if runs.len() - before == match_finder::TREE_MAX_RUNS {
+        runs[before..].rotate_left(1);
+        runs.pop();
+    }
+    runs.push((length as u32, distance as u32))
 }
 
 /// The bytes one member's parse reaches across, and where its own data starts.
@@ -2305,7 +2410,7 @@ fn encode_lz_block_in_window(
         MemberSearch::Lazy(finder) => finder.allowance(),
         MemberSearch::Optimal(collector) => match &collector.finder {
             CollectorFinder::Packed(finder) => finder.allowance(),
-            CollectorFinder::Tree(finder) => finder.allowance(),
+            CollectorFinder::Tree(finder, _) => finder.allowance(),
             CollectorFinder::Chains(finder) => finder.allowance(),
         },
     };
@@ -3567,7 +3672,7 @@ fn encode_tokens_with_progress(
         MemberSearch::Lazy(finder) => finder.allowance().clone(),
         MemberSearch::Optimal(collector) => match &collector.finder {
             CollectorFinder::Packed(finder) => finder.allowance(),
-            CollectorFinder::Tree(finder) => finder.allowance().clone(),
+            CollectorFinder::Tree(finder, _) => finder.allowance().clone(),
             CollectorFinder::Chains(finder) => finder.allowance().clone(),
         },
     };
