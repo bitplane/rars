@@ -3356,6 +3356,56 @@ fn encode_ppmd_hybrid_span(
 ) -> Result<usize> {
     let input = search.input;
     while pos < end {
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        if crate::parallel::may_nest() {
+            pos = search.alongside(pos, |found, searched| {
+                encode_ppmd_hybrid_run(
+                    input,
+                    found,
+                    pos,
+                    end.min(searched),
+                    encoder,
+                    state,
+                    declare,
+                    &mut on_token,
+                    &mut progress,
+                )
+            })?;
+            continue;
+        }
+        let stop = end.min(pos.saturating_add(search.batch));
+        pos = encode_ppmd_hybrid_run(
+            input,
+            &mut |at| search.best(at),
+            pos,
+            stop,
+            encoder,
+            state,
+            declare,
+            &mut on_token,
+            &mut progress,
+        )?;
+    }
+    Ok(pos)
+}
+
+/// [`encode_ppmd_hybrid_span`] from `pos` to `end`, with `best` the escape search at a position.
+#[allow(clippy::too_many_arguments)]
+fn encode_ppmd_hybrid_run(
+    input: &[u8],
+    best: &mut dyn FnMut(usize) -> Option<(usize, usize)>,
+    mut pos: usize,
+    end: usize,
+    encoder: &mut PpmdEncoder,
+    state: &mut PpmdHybrid,
+    declare: Declare<'_>,
+    on_token: &mut impl FnMut(PpmdEncodeToken),
+    progress: &mut Option<&mut dyn FnMut(usize) -> bool>,
+) -> Result<usize> {
+    while pos < end {
         if pos >= state.next_check {
             if progress.as_mut().is_some_and(|report| !report(pos)) {
                 return Err(Error::Cancelled);
@@ -3375,7 +3425,7 @@ fn encode_ppmd_hybrid_span(
         }
 
         if pos >= state.search_from {
-            if let Some((length, offset)) = search.best(pos) {
+            if let Some((length, offset)) = best(pos) {
                 if state.costs.match_pays(length) {
                     declare(encoder, pos, length)?;
                     let before = encoder.spent_bits();
@@ -3422,6 +3472,12 @@ struct PpmdMatchSearch<'a> {
     filled: usize,
     found_from: usize,
     found: Vec<Option<(u8, u32)>>,
+    /// The half batch after `found`, searched on the pool while `found`'s is coded.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    ahead: Vec<Option<(u8, u32)>>,
 }
 
 impl<'a> PpmdMatchSearch<'a> {
@@ -3440,6 +3496,11 @@ impl<'a> PpmdMatchSearch<'a> {
             filled: 0,
             found_from: 0,
             found: Vec::new(),
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            ahead: Vec::new(),
         }
     }
 
@@ -3479,9 +3540,7 @@ impl<'a> PpmdMatchSearch<'a> {
         self.found.truncate(searched);
     }
 
-    // Searched ahead only when other threads share the batch; alone, searches
-    // inside a match or a rejection's cooldown would be wasted, so `best`
-    // looks only a few positions ahead.
+    /// Fills the finder a batch ahead of `pos`, so searches can run ahead of the parse.
     fn fill_from(&mut self, pos: usize) {
         let end = pos.saturating_add(self.batch).min(self.input.len());
         for history_pos in self.filled..end {
@@ -3490,17 +3549,89 @@ impl<'a> PpmdMatchSearch<'a> {
         self.filled = end;
         self.found_from = pos;
         self.found.clear();
-        if !crate::parallel::may_nest() {
-            return;
-        }
-        self.found.resize(end - pos, None);
-        let mut chunks: Vec<_> = self.found.chunks_mut(Self::CHUNK).collect();
-        let (input, finder, distance) = (self.input, &self.finder, self.max_match_distance);
-        crate::parallel::for_each_mut(&mut chunks, |index, chunk| {
-            let start = pos + index * Self::CHUNK;
-            best_ppmd_matches(input, start, &FilledAhead(finder), distance, chunk, false);
-        });
     }
+
+    /// Runs `code` from `pos` through the positions searched, handing it the
+    /// search at each and where the searched positions end, while the pool
+    /// searches the half batch after them. Two halves hold what one batch did.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    fn alongside<R>(
+        &mut self,
+        pos: usize,
+        code: impl FnOnce(&mut dyn FnMut(usize) -> Option<(usize, usize)>, usize) -> R,
+    ) -> R {
+        let half = self.batch / 2;
+        let Self {
+            input,
+            max_match_distance: distance,
+            finder,
+            filled,
+            found_from,
+            found,
+            ahead,
+            ..
+        } = self;
+        let (input, distance) = (*input, *distance);
+        if pos < *found_from || pos - *found_from >= found.len() {
+            let end = pos.saturating_add(half).min(input.len());
+            search_half(input, finder, filled, distance, pos, end, found);
+            *found_from = pos;
+        }
+        let searched = *found_from + found.len();
+        let next = searched.saturating_add(half).min(input.len());
+        let (behind, behind_from) = (&*found, *found_from);
+        let (finder, filled, next_found) = (&mut *finder, &mut *filled, &mut *ahead);
+        let coded = rayon::in_place_scope(|scope| {
+            if searched < next {
+                scope.spawn(move |_| {
+                    search_half(input, finder, filled, distance, searched, next, next_found);
+                });
+            }
+            code(
+                &mut |at| {
+                    behind[at - behind_from]
+                        .map(|(length, offset)| (usize::from(length), offset as usize))
+                },
+                searched,
+            )
+        });
+        if searched < next {
+            std::mem::swap(found, ahead);
+            *found_from = searched;
+        }
+        coded
+    }
+}
+
+/// Fills `finder` through `end` and searches `start..end` into `out`, a chunk per thread.
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+fn search_half(
+    input: &[u8],
+    finder: &mut PpmdMatchFinder,
+    filled: &mut usize,
+    distance: usize,
+    start: usize,
+    end: usize,
+    out: &mut Vec<Option<(u8, u32)>>,
+) {
+    for history_pos in *filled..end {
+        finder.insert(input, history_pos);
+    }
+    *filled = (*filled).max(end);
+    out.clear();
+    out.resize(end - start, None);
+    let finder = &*finder;
+    let mut chunks: Vec<_> = out.chunks_mut(PpmdMatchSearch::CHUNK).collect();
+    crate::parallel::for_each_mut(&mut chunks, |index, chunk| {
+        let from = start + index * PpmdMatchSearch::CHUNK;
+        best_ppmd_matches(input, from, &FilledAhead(finder), distance, chunk, false);
+    });
 }
 
 /// The most an escape search holds: links over the reach and a batch, the heads, and a batch found.
