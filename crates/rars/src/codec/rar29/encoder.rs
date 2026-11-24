@@ -2936,6 +2936,7 @@ fn parse_range<C: Candidates>(
 /// better match starts within the lazy lookahead window. Also returns the
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
+#[allow(clippy::too_many_arguments)]
 fn lazy_match_decision<C: Candidates>(
     input: &[u8],
     pos: usize,
