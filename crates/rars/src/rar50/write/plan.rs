@@ -70,6 +70,10 @@ pub(super) enum FallbackReason {
     },
     /// The member goes out as it is packed, which only runs can do.
     InPlace,
+    /// The member fits whole but codes the same in runs, which run in
+    /// parallel where a whole member runs on one thread: see
+    /// [`codes_alike_in_runs`].
+    LazyRuns,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +165,15 @@ impl ExecutionPlan {
                 } else {
                     whole_member_workspace(size, settings)
                 };
+                // A run's search is a piece of the member's, so it fits too.
+                if required <= limit && codes_alike_in_runs(settings, size) {
+                    return Ok(MemberPlan::in_runs(
+                        settings,
+                        size,
+                        FallbackReason::LazyRuns,
+                        limit,
+                    ));
+                }
                 let fallback = match &settings.filter_policy {
                     _ if required <= limit => None,
                     FilterPolicy::Auto => {
@@ -241,6 +254,33 @@ impl MemberPlan {
             admission: block_admission(settings, false, size, run_filters),
         }
     }
+}
+
+/// Whether a member that fits whole packs to the same bytes run by run, so
+/// it can take the runs.
+///
+/// The whole path parses the member with one finder on one thread, so a
+/// 32 MiB tar took the same time at 22 threads as at one (#545). The runs
+/// path parses each run against a finder seeded from the dictionary before
+/// it, and runs as many runs at once as there are threads.
+///
+/// The two agree when the parse is the lazy one, which walks hash chains on
+/// both paths, and the member is longer than one filter search, which the
+/// whole path then makes a piece at a time on the grid the runs are searched
+/// on ([`super::filter_policy`]'s `choose_owned_filter`). One difference
+/// is left: a member mostly of text is judged so whole and left unsearched,
+/// where each of its runs is judged by its own samples, so a run of code
+/// inside it is searched.
+///
+/// The shortest-path parse searches a tree on one path and can walk chains
+/// over a member's short last run on the other, so its members stay whole.
+/// A member trying several encoder settings needs them whole, and an
+/// explicit filter is applied over the whole member at once.
+fn codes_alike_in_runs(settings: &CompressPlan, size: u64) -> bool {
+    settings.filter_policy == FilterPolicy::Auto
+        && !settings.encode_options.optimal_parse
+        && matches!(&settings.candidates[..], [only] if !only.optimal_parse)
+        && size > filter_search_bytes() as u64
 }
 
 fn spec_fits(spec: &crate::FilterSpec, size: u64) -> bool {
@@ -436,6 +476,32 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_lazy_member_longer_than_one_search_takes_its_runs() {
+        let settings = settings();
+        assert!(!settings.encode_options.optimal_parse);
+        let search = filter_search_bytes() as u64;
+        let long = ExecutionPlan::new(&settings, [search + 1].into_iter(), u64::MAX);
+        assert_eq!(
+            long.members()[0].execution,
+            Execution::Blocks {
+                fallback: FallbackReason::LazyRuns,
+                run_filters: true,
+            }
+        );
+        // One search long, the whole member is searched as one piece, which
+        // its runs are not.
+        let short = ExecutionPlan::new(&settings, [search].into_iter(), u64::MAX);
+        assert_eq!(short.members()[0].execution, Execution::WholeMember);
+        // The shortest-path parse searches a tree whole and can walk chains
+        // over the last run, so it stays whole.
+        let mut optimal = settings.clone();
+        optimal.encode_options = optimal.encode_options.with_optimal_parse(true);
+        optimal.candidates = vec![optimal.encode_options].into();
+        let optimal = ExecutionPlan::new(&optimal, [search + 1].into_iter(), u64::MAX);
+        assert_eq!(optimal.members()[0].execution, Execution::WholeMember);
     }
 
     #[test]
