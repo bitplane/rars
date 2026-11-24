@@ -311,7 +311,7 @@ pub(crate) struct StoreFallback {
     /// Members below this size stay compressed. Where a stored member costs
     /// enough header of its own, swapping a small one can lose more than the
     /// compression was wasting.
-    pub(crate) min_size: usize,
+    pub(crate) min_size: u64,
     /// Whether a solid member may be swapped. RAR 5 runs one dictionary across
     /// every member and cannot go back on what it has already fed in; the
     /// RAR 1.5 family rebuilds its encoder at that point instead.
@@ -330,7 +330,7 @@ impl StoreFallback {
         }
     }
 
-    pub(crate) const fn min_size(mut self, size: usize) -> Self {
+    pub(crate) const fn min_size(mut self, size: u64) -> Self {
         self.min_size = size;
         self
     }
@@ -345,7 +345,7 @@ impl StoreFallback {
         self
     }
 
-    pub(crate) fn applies(&self, solid: bool, unpacked: usize, packed: usize) -> bool {
+    pub(crate) fn applies(&self, solid: bool, unpacked: u64, packed: u64) -> bool {
         if packed < unpacked || self.filter_requested {
             return false;
         }
