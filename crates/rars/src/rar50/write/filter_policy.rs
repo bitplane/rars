@@ -156,7 +156,7 @@ pub(super) fn should_store_compressed_payload(
     // filled, so this writer can never go back and store one.
     crate::write_plan::StoreFallback::new()
         .filter_requested(matches!(policy, FilterPolicy::Explicit(_)))
-        .applies(solid, unpacked as usize, packed as usize)
+        .applies(solid, unpacked, packed)
 }
 
 /// How hard each level looks for a match, and where the default sits.
@@ -1496,5 +1496,31 @@ mod run_search_tests {
             let options = encode_options_for_level(Some(level), dictionary).unwrap();
             assert_eq!(run_search_options(options), options);
         }
+    }
+}
+
+#[cfg(test)]
+mod store_decision_tests {
+    use super::*;
+
+    const FOUR_GIB: u64 = 1 << 32;
+
+    #[test]
+    fn a_member_over_four_gib_keeps_the_64_bit_store_decision() {
+        let auto = FilterPolicy::Auto;
+        // Cut to 32 bits, the unpacked size would fall below the packed one.
+        assert!(!should_store_compressed_payload(
+            FOUR_GIB + 10,
+            3 << 30,
+            false,
+            &auto
+        ));
+        // Cut to 32 bits, the packed size would fall below the unpacked one.
+        assert!(should_store_compressed_payload(
+            3 << 30,
+            FOUR_GIB + 10,
+            false,
+            &auto
+        ));
     }
 }

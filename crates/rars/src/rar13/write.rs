@@ -1544,8 +1544,8 @@ fn pack_volume_member(
         Some(packed)
             if !crate::write_plan::StoreFallback::new().applies(
                 false,
-                data.len(),
-                packed.len(),
+                data.len() as u64,
+                packed.len() as u64,
             ) =>
         {
             PackedVolumeMember {
@@ -1898,8 +1898,8 @@ fn select_verified_payload(
         Some(packed)
             if !crate::write_plan::StoreFallback::new().applies(
                 solid,
-                data.len(),
-                packed.len(),
+                data.len() as u64,
+                packed.len() as u64,
             ) =>
         {
             (packed, METHOD_BEST)

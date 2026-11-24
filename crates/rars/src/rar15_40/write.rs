@@ -191,7 +191,7 @@ fn checked_align16(value: usize, message: &'static str) -> Result<usize> {
 }
 
 const AUTO_RGB_WIDTHS: [usize; 4] = [24, 48, 96, 192];
-const MIN_STORE_FALLBACK_SIZE: usize = 1024;
+const MIN_STORE_FALLBACK_SIZE: u64 = 1024;
 const RAR29_TEXT_SAMPLE_SIZE: usize = 8192;
 
 /// How long a run of NUL has to be before the text screen reads it as padding
@@ -4442,7 +4442,7 @@ fn should_store_fallback(
         } else {
             MIN_STORE_FALLBACK_SIZE
         })
-        .applies(solid, unpacked_len, packed_len)
+        .applies(solid, unpacked_len as u64, packed_len as u64)
 }
 
 fn writer_file_flags(
