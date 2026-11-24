@@ -479,6 +479,7 @@ impl FileHeader {
         let payload = FileHeader {
             cut_short: false,
             history_lost: false,
+            version: None,
             block: self.block.clone(),
             file_flags: self.file_flags,
             rewrite_metadata_complete: self.rewrite_metadata_complete,
@@ -2766,6 +2767,7 @@ mod tests {
         FileHeader {
             cut_short: false,
             history_lost: false,
+            version: None,
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
@@ -3453,6 +3455,7 @@ mod tests {
         let file = FileHeader {
             cut_short: false,
             history_lost: false,
+            version: None,
             block: empty_block(HEAD_FILE, 0, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,
@@ -3782,6 +3785,7 @@ mod tests {
             blocks: vec![Block::File(FileHeader {
                 cut_short: false,
                 history_lost: false,
+                version: None,
                 block: empty_block(HEAD_FILE, flags, 0..data.len()),
                 file_flags: 0,
                 rewrite_metadata_complete: true,
@@ -3834,6 +3838,7 @@ mod tests {
         FileHeader {
             cut_short: false,
             history_lost: false,
+            version: None,
             block: empty_block(HEAD_FILE, hfl_flags, 0..0),
             file_flags: 0,
             rewrite_metadata_complete: true,

@@ -267,6 +267,10 @@ pub struct FileHeader {
     /// Set by a salvaging parse on a solid member after members of its
     /// stream were lost to header damage.
     pub(crate) history_lost: bool,
+    /// The number from a file version record (`rar -ver`): an older copy of
+    /// a file, whose name carries the same number as a `;N` suffix. `None`
+    /// for the latest copy, and for a name that merely ends in `;N`.
+    pub version: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1905,6 +1909,7 @@ fn parse_file_header_bytes(parsed: &ParsedBlockHeader) -> Result<FileHeader> {
     let mut file = FileHeader {
         cut_short: false,
         history_lost: false,
+        version: None,
         block: parsed.block.clone(),
         file_flags,
         rewrite_metadata_complete: reader.pos == reader.range.end,
@@ -2024,6 +2029,7 @@ fn parse_file_extra_area(
                     if !is_service && version != 0 {
                         file.name
                             .extend_from_slice(format!(";{version}").as_bytes());
+                        file.version = Some(version);
                     }
                     // The in-memory name no longer matches the stored header
                     // bytes, and the writer does not re-emit this record, so a
@@ -4334,6 +4340,7 @@ mod tests {
                 None,
             );
             assert_eq!(file.name, format!("f.txt;{version}").into_bytes());
+            assert_eq!(file.version, Some(u64::from(version)));
             assert!(!file.rewrite_metadata_complete);
         }
         assert_eq!(
@@ -4344,6 +4351,7 @@ mod tests {
         {
             let file = parse(FHEXTRA_VERSION as u8, &[0, 0], false, b"f.txt", None);
             assert_eq!(file.name, b"f.txt");
+            assert_eq!(file.version, None);
             assert!(!file.rewrite_metadata_complete);
         }
         // A version record too short to parse (empty, or flags without the
@@ -6098,6 +6106,7 @@ mod tests {
         let file = FileHeader {
             cut_short: false,
             history_lost: false,
+            version: None,
             block: BlockHeader {
                 header_crc: 0,
                 header_size: 0,
