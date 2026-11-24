@@ -429,3 +429,71 @@ fn a_set_from_stdin_must_match_the_size_its_last_part_gives() {
         }
     }
 }
+
+/// Issue #611: salvaging an encrypted split member that a missing volume
+/// cuts short keeps what decoded before the gap, whether or not its first
+/// part records its size, though the gap falls inside a cipher block. The
+/// call fails as it does without salvage. RAR 5 is checked alongside.
+#[cfg(feature = "encryption")]
+#[test]
+fn salvage_keeps_an_encrypted_split_member_up_to_a_missing_volume() {
+    let data: Vec<u8> = noise(60_000)
+        .into_iter()
+        .enumerate()
+        .map(|(at, byte)| if at % 7 == 0 { byte } else { b"text "[at % 5] })
+        .collect();
+    let password = b"secret".as_slice();
+    for (version, stored) in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ]
+    .into_iter()
+    .flat_map(|version| [(version, false), (version, true)])
+    {
+        let mut builder = Builder::new(version)
+            .store(stored)
+            .password(Some(password.to_vec()))
+            .volume_size(Some(2048));
+        builder
+            .add_bytes(NAME.to_vec(), data.clone(), None, None)
+            .unwrap();
+        let sized = builder.build_volumes(None).unwrap();
+        assert!(sized.len() >= 4, "{version:?}: {}", sized.len());
+        // A RAR 2.0 stream has no end marker to decode an unknown size to.
+        let unknown = (version != ArchiveVersion::Rar20).then(|| from_stdin(sized.clone()));
+        for (variant, volumes) in [("sized", Some(sized)), ("from stdin", unknown)] {
+            let Some(volumes) = volumes else { continue };
+            for gap in 1..volumes.len() - 1 {
+                let case = format!("{version:?} stored={stored} {variant} gap={gap}");
+                let archives = parse(&volumes[..gap]);
+                let run = |salvage| {
+                    let outputs: Outputs = Arc::default();
+                    let sink = outputs.clone();
+                    let error = extract_volumes_to_with_options(
+                        &archives,
+                        ArchiveReadOptions::with_optional_password(Some(password))
+                            .with_salvage(salvage),
+                        move |meta: &ExtractedEntryMeta| {
+                            sink.lock().unwrap().push((meta.name.clone(), Vec::new()));
+                            Ok(Box::new(Collect(sink.clone())) as Box<dyn Write>)
+                        },
+                    )
+                    .expect_err(&case);
+                    let kept = outputs.lock().unwrap().pop().map(|(_, kept)| kept);
+                    (error, kept.unwrap_or_default())
+                };
+                let (strict, _) = run(false);
+                let (error, kept) = run(true);
+                assert_eq!(error, strict, "{case}");
+                // A compressed RAR 5 member this small is decoded whole
+                // before any of it is written, encrypted or not.
+                if version != ArchiveVersion::Rar50 || stored {
+                    assert!(!kept.is_empty(), "{case}");
+                }
+                assert!(kept.len() < data.len(), "{case}: kept {}", kept.len());
+                assert!(kept == data[..kept.len()], "{case}: not a prefix");
+            }
+        }
+    }
+}

@@ -311,12 +311,14 @@ where
                     });
                 }
                 let decoded = {
+                    let salvage = walk.options.salvage;
                     let mut reader = packed_reader(
                         LazyChain::new(&mut *walk, first_reader),
                         first,
                         password,
                         &volume.key_cache,
                         &allowance,
+                        salvage,
                     )?;
                     session.decode_split_to(&mut reader, first, &mut writer)
                 };
@@ -391,7 +393,12 @@ fn write_stored<B: Budget>(
     }
     let expected_len = usize::try_from(first.unp_size)
         .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
-    let expected_packed_len = if first.is_encrypted() && first.unp_ver >= 20 {
+    // Salvaged without its size, which only a missing volume held, the
+    // member is copied to where its volumes end, short of the cipher
+    // padding, and the walk's failure ends it before the size is checked.
+    let unsized_salvage = walk.options.salvage && first.unp_size == UNSIZED;
+    let padded = first.is_encrypted() && first.unp_ver >= 20 && !unsized_salvage;
+    let expected_packed_len = if padded {
         expected_len
             .checked_add(15)
             .map(|len| len & !15)
@@ -403,12 +410,14 @@ fn write_stored<B: Budget>(
     };
     let mut crc = Crc32::new();
     let copied = {
+        let salvage = walk.options.salvage;
         let reader = packed_reader(
             LazyChain::new(&mut *walk, first_reader),
             first,
             password,
             key_cache,
             allowance,
+            salvage,
         )?;
         crate::stored_copy::copy(
             &mut reader.take(expected_len as u64),
@@ -466,6 +475,7 @@ pub(super) fn packed_reader<R: Read, B: Budget>(
     password: Option<&[u8]>,
     key_cache: &KeyCache,
     allowance: &B,
+    salvage: bool,
 ) -> Result<PackedReader<R, B>> {
     if !first.is_encrypted() {
         return Ok(PackedReader::Plain(chain));
@@ -481,6 +491,7 @@ pub(super) fn packed_reader<R: Read, B: Budget>(
                 key_cache,
                 allowance,
             )
+            .map(|reader| reader.dropping_cut_block(salvage))
         },
         allowance,
     )?))

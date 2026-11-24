@@ -514,6 +514,9 @@ pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
     read_buffer: Option<Buffer<u8, B>>,
     decrypted_pos: usize,
     eof: bool,
+    /// Salvaging a member whose volumes gave out: the cipher block cut at
+    /// the gap ends the stream rather than failing the read.
+    drop_cut_block: bool,
 }
 
 #[cfg(feature = "encryption")]
@@ -538,7 +541,17 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
             read_buffer,
             decrypted_pos: 0,
             eof: false,
+            drop_cut_block: false,
         })
+    }
+
+    /// Ends the stream at a final partial cipher block instead of failing.
+    /// Only for salvage, where the walk stops a member's data at a missing
+    /// volume, wherever in a block that falls. The whole blocks before it
+    /// still decrypt, and the member's own failure is still reported.
+    pub(super) fn dropping_cut_block(mut self, drop: bool) -> Self {
+        self.drop_cut_block = drop;
+        self
     }
 
     fn fill_decrypted(&mut self) -> std::io::Result<()> {
@@ -571,6 +584,7 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
                 &mut self.encrypted_block,
                 &mut self.decrypted,
                 &mut self.eof,
+                self.drop_cut_block,
                 |data| cipher.decrypt_in_place(data),
             )?,
             SplitCipher::Rar30(cipher) => Self::fill_block_decrypted(
@@ -578,6 +592,7 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
                 &mut self.encrypted_block,
                 &mut self.decrypted,
                 &mut self.eof,
+                self.drop_cut_block,
                 |data| cipher.decrypt_in_place(data),
             )?,
         }
@@ -589,6 +604,7 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
         encrypted_block: &mut Buffer<u8, B>,
         decrypted: &mut Buffer<u8, B>,
         eof: &mut bool,
+        drop_cut_block: bool,
         mut decrypt: impl FnMut(&mut [u8]) -> std::result::Result<(), E>,
     ) -> std::io::Result<()> {
         // fill_decrypted returns before calling us once EOF is known. The only
@@ -616,6 +632,10 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
             data.truncate(full_len);
             decrypt(&mut data).expect("data is truncated to whole blocks");
             *decrypted = data;
+        } else if drop_cut_block {
+            // With no full block, the loop ended at EOF: the rest of this
+            // block was in the volume that is missing.
+            encrypted_block.clear();
         } else if !encrypted_block.is_empty() {
             // With no full block, the loop could only have ended at EOF.
             return Err(std::io::Error::new(
@@ -1596,6 +1616,7 @@ mod tests {
                 password,
                 &volume.key_cache,
                 &Allowance::default(),
+                false,
             )?;
             Ok(read_in_small_chunks(reader))
         })
