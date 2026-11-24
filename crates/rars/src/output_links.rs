@@ -472,6 +472,98 @@ mod tests {
         .unwrap()
     }
 
+    fn redirection(link: ExtractedLink<'_>) -> Result<Option<PathBuf>> {
+        let meta = crate::ExtractedEntryMeta::new(b"a/copy".to_vec(), None, 0o100644, false)
+            .with_attr_source(crate::AttrSource::Unix);
+        link_target_in(
+            &Described(HashMap::new()),
+            Path::new(""),
+            Path::new("a/copy"),
+            &meta,
+            link,
+            ArchiveFamily::Rar50Plus,
+            false,
+        )
+    }
+
+    #[test]
+    fn hard_links_and_copies_name_members_and_refuse_anything_else() {
+        // They point at an earlier member, so they take member-name rules, not
+        // a symbolic link's: the target is a path from the root, `.` is
+        // dropped, and nothing may climb or be absolute.
+        for link in [
+            |target| ExtractedLink::HardLink { target },
+            |target| ExtractedLink::FileCopy { target },
+        ] as [fn(&[u8]) -> ExtractedLink<'_>; 2]
+        {
+            assert_eq!(
+                redirection(link(b"b/original")).unwrap(),
+                Some(PathBuf::from("b/original"))
+            );
+            assert_eq!(
+                redirection(link(b"./b/original")).unwrap(),
+                Some(PathBuf::from("b/original"))
+            );
+            for target in [
+                b"../outside".as_slice(),
+                b"b/../../outside",
+                b"/etc/passwd",
+                b"C:/Windows",
+                b"",
+                b"b\0x",
+            ] {
+                assert!(
+                    matches!(
+                        redirection(link(target)),
+                        Err(Error::InvalidHeader("unsafe archive redirection target"))
+                    ),
+                    "{target:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn current_directory_steps_are_dropped_before_the_containment_check() {
+        let root = crate::scratch::case("links-current-directory");
+        fs::create_dir(root.join("a")).unwrap();
+        assert_eq!(
+            check(&root, "a/sym", b"./local.txt"),
+            Some(PathBuf::from("local.txt"))
+        );
+        assert_eq!(
+            check(&root, "a/sym", b"./.././c/./target.txt"),
+            Some(PathBuf::from("../c/target.txt"))
+        );
+        // Dropping `.` must not hide a climb out of the root.
+        assert_eq!(check(&root, "a/sym", b"./../.././outside"), None);
+        // Nothing left to point at.
+        assert_eq!(check(&root, "a/sym", b"./."), None);
+    }
+
+    #[test]
+    fn a_link_whose_own_path_is_not_a_plain_member_path_is_refused() {
+        // Member names are made safe before this, so these cannot come from an
+        // archive; the check still refuses to measure from such a place.
+        let root = crate::scratch::case("links-own-path");
+        assert_eq!(check(&root, "../sym", b"x"), None);
+        assert_eq!(check(&root, "a/../sym", b"x"), None);
+        assert_eq!(check(&root, "/abs/sym", b"x"), None);
+    }
+
+    #[test]
+    fn legacy_symlink_targets_are_capped_at_64_kib() {
+        let limit = crate::extraction_links::LEGACY_TARGET_LIMIT;
+        assert!(check_legacy_symlink_target(b"link", limit, None).is_ok());
+        let error = check_legacy_symlink_target(b"link", limit + 1, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("legacy symbolic link target exceeds 64 KiB"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn flat_extraction_keeps_only_bare_targets() {
         let flat = |target: &[u8], unix_host: bool| {
