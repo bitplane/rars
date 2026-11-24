@@ -1367,23 +1367,23 @@ impl crate::filter_search::FilterSearch for Rar29Search {
 /// them. The search measures with the lazy parse, as every RAR 2.9 search does.
 /// A piece that reads as text is not searched, as a whole member is not.
 ///
-/// One piece at a time. On a 32 MiB tar of executables at four threads, four
-/// at a time took 1.17 s against 1.68 s, but peaked at 223 MiB against 139 MiB,
-/// most of it freed memory the allocator kept for each thread that ran a search.
+/// The pieces are searched [`PIECE_SEARCHES_AT_ONCE`] at a time where there are
+/// threads for it. Which filters come back does not depend on how many ran at
+/// once, so the archive is the same at any thread count.
 fn rar29_piece_filters(
     data: &[u8],
     file_offset: usize,
     options: Rar29EncodeOptions,
     piece: usize,
-    cancelled: &dyn Fn() -> bool,
+    cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<FilterSpec>> {
     let search_options = options.with_optimal_parse_passes(0);
-    let mut specs = Vec::new();
-    for start in (0..data.len()).step_by(piece.max(1)) {
+    let piece = piece.max(1);
+    let search = |start: usize| -> Result<Vec<FilterSpec>> {
         let end = (start + piece).min(data.len());
         let bytes = &data[start..end];
         if !crate::filter_search::search_applies_throughout(bytes) {
-            continue;
+            return Ok(Vec::new());
         }
         let mut poll = |_| !cancelled();
         let found = crate::filter_search::choose_filter_specs(
@@ -1392,15 +1392,50 @@ fn rar29_piece_filters(
             search_options,
             Some(&mut poll),
         )?;
-        specs.extend(found.into_iter().map(|spec| {
-            let range = spec
-                .range
-                .map_or(start..end, |range| start + range.start..start + range.end);
-            FilterSpec::range(spec.kind, range)
-        }));
+        Ok(found
+            .into_iter()
+            .map(|spec| {
+                let range = spec
+                    .range
+                    .map_or(start..end, |range| start + range.start..start + range.end);
+                FilterSpec::range(spec.kind, range)
+            })
+            .collect())
+    };
+    let at_once = if crate::parallel::may_nest() {
+        crate::parallel::threads().clamp(1, PIECE_SEARCHES_AT_ONCE)
+    } else {
+        1
+    };
+    let starts: Vec<usize> = (0..data.len()).step_by(piece).collect();
+    let mut specs = Vec::new();
+    for wave in starts.chunks(at_once) {
+        let (found, failure) = crate::parallel::map_prefix(wave.to_vec(), search);
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        specs.extend(found.into_iter().flatten());
     }
     Ok(specs)
 }
+
+/// How many pieces of one member [`rar29_piece_filters`] searches at once,
+/// at most, when there are threads for them.
+///
+/// On a 32 MiB tar of executables at four threads, min of three:
+///
+/// ```text
+/// at once   time    peak RSS       peak, MALLOC_TRIM_THRESHOLD_=0
+/// 1         1.66 s  131 MiB        121 MiB
+/// 2         1.31 s  188-208 MiB    121 MiB
+/// 4         1.18 s  210 MiB        121 MiB
+/// ```
+///
+/// Searched whole, the member took 1.14 s and peaked at 145 MiB, and rar 3.93
+/// `-m3` takes 1.40 s. What the searches hold at once is the same either way;
+/// the rest of the peak is memory each searching thread freed and the
+/// allocator kept. Two at a time beats rar 3.93 for the least of that.
+const PIECE_SEARCHES_AT_ONCE: usize = 2;
 
 #[cfg(test)]
 fn encode_rar29_auto_filtered_member(

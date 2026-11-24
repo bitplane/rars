@@ -538,18 +538,22 @@ fn screen_sample_range(len: usize) -> Range<usize> {
 /// sample starts at address zero, so every call back past its first byte looks
 /// like one of those and stays as it was: half the calls in ordinary code. The
 /// screen then prices a filter doing half its work, and that is the price it
-/// turned regions down at. So the member is filtered up to the end of the
-/// sample, over the sample's range only, and the sample is read back out.
+/// turned regions down at. So the sample is filtered at its own offset in the
+/// data, as a filter over its range alone would leave it.
+///
+/// It used to be filtered as a copy of the data up to the sample's end, which
+/// is the same bytes, but a copy as long as the member for every sample.
 fn filtered_sample<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     sample: Range<usize>,
     kind: FilterKind,
 ) -> Result<Buffer<u8, S::Memory>> {
-    let filters = [FilterSpec::range(kind, sample.clone())];
-    let mut filtered = search.filtered_bytes(&data[..sample.end], &filters)?;
-    filtered.discard_prefix(sample.start);
-    Ok(filtered)
+    search.filtered_window(
+        &data[sample.clone()],
+        sample.start,
+        &[FilterSpec::whole(kind)],
+    )
 }
 
 /// What the screen made of one filter kind.
@@ -1440,7 +1444,7 @@ fn ranked_finalists<S: OwnedSearch>(
 ///
 /// A solid chain is that caller. Its members code against everything before
 /// them, so a candidate encoded on its own has not been measured at all, and
-/// the bytes [`choose_filter`] returns are bytes the chain would never write.
+/// the bytes [`choose_owned`] returns are bytes the chain would never write.
 pub(crate) fn filter_candidates<S: FilterSearch>(
     search: &S,
     data: &[u8],
@@ -1462,7 +1466,7 @@ pub(crate) fn filter_candidates<S: FilterSearch>(
 /// Which filter suits a member is a property of the data, not of how hard the
 /// encoder is trying, so this is worth doing once even when several encoder
 /// settings are going to be compared afterwards.
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub(crate) fn choose_filter<S: FilterSearch>(
     search: &S,
     data: &[u8],
@@ -1478,7 +1482,7 @@ pub(crate) fn choose_filter<S: FilterSearch>(
     .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
 }
 
-/// The filters [`choose_filter`] would pick, for a caller that encodes the
+/// The filters [`choose_owned`] would pick, for a caller that encodes the
 /// member itself, under filters chosen for more than this one search. A
 /// winner the trial picks is not encoded at all.
 pub(crate) fn choose_filter_specs<S: FilterSearch>(
@@ -1496,7 +1500,7 @@ pub(crate) fn choose_filter_specs<S: FilterSearch>(
     .map(|specs| specs.into_vec())
 }
 
-/// [`choose_filter`], with the whole-member encodes run side by side where
+/// [`choose_owned`], with the whole-member encodes run side by side where
 /// there is room for them.
 ///
 /// Each finalist's encode fans out inside, but it still fills its match finder
@@ -1506,7 +1510,7 @@ pub(crate) fn choose_filter_specs<S: FilterSearch>(
 /// screen cannot measure on anything but a member one sample long, so beyond
 /// that it is encoded while the screens run.
 ///
-/// The choice is [`choose_filter`]'s: the finalists are the same, the trial
+/// The choice is [`choose_owned`]'s: the finalists are the same, the trial
 /// that ranks them is the same, each is encoded the same way whatever runs
 /// beside it, and they are compared in order, the smallest winning and a tie
 /// going to the earlier. A failure is the one the earliest failing finalist
