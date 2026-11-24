@@ -47,10 +47,22 @@ def test_reader_context_iteration_and_info_aliases():
             raise RuntimeError("context exception")
 
 
-def test_reader_takes_no_mode_and_refuses_noncallable_progress():
-    for call in (lambda: rars.RarFile(STORED, mode="r"), lambda: rars.RarFile(STORED, "r")):
-        with pytest.raises(TypeError):
-            call()
+def test_reader_mode_is_read_only():
+    names = rars.RarFile(STORED).namelist()
+    assert rars.RarFile(STORED, "r").namelist() == names
+    assert rars.RarFile(STORED, mode="r").namelist() == names
+    for mode in ("w", "a", "x"):
+        for call in (
+            lambda: rars.RarFile(STORED, mode),
+            lambda: rars.RarFile(STORED, mode=mode),
+        ):
+            with pytest.raises(ValueError, match="RarBuilder"):
+                call()
+    with pytest.raises(TypeError):
+        rars.RarFile(STORED, "r", mode="r")
+
+
+def test_builder_refuses_noncallable_progress():
     builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"payload", "file.txt")
     with pytest.raises(ValueError, match="progress must be callable"):

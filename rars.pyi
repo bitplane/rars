@@ -305,6 +305,7 @@ class RarFile:
     def __new__(
         cls,
         source: _Source,
+        mode: Literal["r"] = "r",
         *,
         password: _Password | None = None,
         options: ReadOptions | None = None,
@@ -318,7 +319,9 @@ class RarFile:
         and reads a volume set that begins late or ends early, leaving out the split
         members it holds only part of (see `incomplete_members`). Every later call
         delivers a damaged member's bytes, then reports its error to `on_member_error`
-        or raises it."""
+        or raises it.
+
+        `mode` may only be `"r"`, as `RarFile` only reads; `RarBuilder` writes."""
     def namelist(self) -> list[str]: ...
     def infolist(self) -> list[RarInfo]: ...
     def getinfo(self, member: _Member) -> RarInfo: ...
