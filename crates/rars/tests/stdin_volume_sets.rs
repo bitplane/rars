@@ -339,7 +339,7 @@ fn a_rar5_set_from_stdin_is_decoded_as_its_volumes_arrive() {
         let asked = Arc::new(Mutex::new(Vec::new()));
         let record = Arc::clone(&asked);
         let count = archives.len() - 1;
-        let later = archives[1..].to_vec().into_iter().map(move |volume| {
+        let later = archives[1..].iter().cloned().map(move |volume| {
             // A caller asked for the last volume waits a while for it, as a
             // person at a prompt does, which gives output written on another
             // thread time to arrive.
