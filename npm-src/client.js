@@ -64,6 +64,19 @@ export function createClient(spawnWorker) {
       }
       return;
     }
+    // A failed member the engine went past. What the callback throws ends the call; the
+    // engine doesn't wait for the callback, so it is stopped wherever it has got to.
+    if (message.memberError) {
+      try {
+        task.onMemberError?.(errorFactory(message.memberError));
+      } catch (error) {
+        if (active === task) {
+          stopWorker();
+          finish(task, () => task.reject(error));
+        }
+      }
+      return;
+    }
     if (message.error) {
       finish(task, () => task.reject(errorFactory(message.error)));
     } else {
@@ -89,10 +102,12 @@ export function createClient(spawnWorker) {
       const task = queue.shift();
       active = task;
       try {
-        // The engine reports bytes only to a caller that asked for progress.
+        // The engine reports bytes only to a caller that asked for progress, and carries
+        // on past failed members only for one that asked to hear of them.
         ensureWorker().post({
           id: task.id, operation: task.operation, payload: task.payload,
           progress: typeof task.onProgress === "function",
+          memberErrors: typeof task.onMemberError === "function",
         }, task.transfer ?? []);
       } catch (error) {
         if (active !== task) continue;
@@ -116,6 +131,7 @@ export function createClient(spawnWorker) {
           reject,
           signal: options.signal,
           onProgress: options.onProgress,
+          onMemberError: options.onMemberError,
           transfer: options.transfer,
         };
         if (task.signal?.aborted) {

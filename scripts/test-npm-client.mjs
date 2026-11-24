@@ -120,4 +120,42 @@ for (const failure of ["spawn", "post"]) {
   assert.equal(await next, "recovered");
 }
 
+// Failed members come as messages while the operation runs; the client calls back with each.
+{
+  const { client, workers } = harness();
+  client.setErrorFactory((record) => Object.assign(new Error(record.message), record));
+  const reported = [];
+  const silent = client.request("test", {});
+  assert.equal(workers[0].posts[0].memberErrors, false);
+  workers[0].complete("none asked");
+  assert.equal(await silent, "none asked");
+  const first = client.request("test", {}, { onMemberError: (error) => reported.push(error) });
+  assert.equal(workers[0].posts[1].memberErrors, true);
+  const id = workers[0].posts[1].id;
+  workers[0].message({ id, memberError: { code: "CHECKSUM_MISMATCH", message: "bad", member: "a" } });
+  workers[0].message({ id: id + 99, memberError: { code: "IO", message: "someone else's", member: "x" } });
+  workers[0].progress();
+  workers[0].message({ id, memberError: { code: "INVALID_ARCHIVE", message: "worse", member: "b" } });
+  workers[0].complete("done");
+  assert.equal(await first, "done");
+  assert.deepEqual(reported.map((error) => [error.code, error.member]),
+    [["CHECKSUM_MISMATCH", "a"], ["INVALID_ARCHIVE", "b"]]);
+  assert.equal(workers[0].terminations, 0);
+}
+
+// What the callback throws ends the call there: the engine doesn't wait for it, so it is stopped.
+{
+  const { client, workers } = harness();
+  const thrown = new Error("stop");
+  const first = client.request("test", {}, { onMemberError() { throw thrown; } });
+  const rejection = assert.rejects(first, (error) => error === thrown);
+  const second = client.request("read", {});
+  workers[0].message({ id: workers[0].posts[0].id, memberError: { code: "CHECKSUM_MISMATCH", message: "bad" } });
+  await rejection;
+  assert.equal(workers[0].terminations, 1);
+  workers[0].complete("late result");
+  workers[1].complete("recovered");
+  assert.equal(await second, "recovered");
+}
+
 console.log("npm queued/active cancellation and worker recovery checks passed");

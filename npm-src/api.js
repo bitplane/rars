@@ -55,7 +55,22 @@ export function createApi(runtime) {
       }
       limits.allowRar3VmPrograms = options.allowRar3VmPrograms;
     }
+    if (options.salvage != null) {
+      if (typeof options.salvage !== "boolean") {
+        throw new RarError("INVALID_OPTION", "salvage must be a boolean");
+      }
+      limits.salvage = options.salvage;
+    }
     return limits;
+  }
+
+  /** A call's `onMemberError`, checked before any work starts. */
+  function memberErrorCallback(operation) {
+    const callback = operation.onMemberError;
+    if (callback != null && typeof callback !== "function") {
+      throw new TypeError("onMemberError must be a function");
+    }
+    return callback ?? undefined;
   }
 
   function sameName(left, right) {
@@ -79,6 +94,7 @@ export function createApi(runtime) {
         throw new RarError("ENTRY_IS_DIRECTORY", `cannot read directory entry: ${this.name}`);
       }
       const operation = operationOptions(options);
+      memberErrorCallback(operation);
       return this._archive._request("read", {
         index: this.index,
         readOptions: this._archive._readOptions(operation),
@@ -153,6 +169,10 @@ export function createApi(runtime) {
       this.volumeIndex = metadata.volumeIndex;
       this.isFirstVolume = metadata.isFirstVolume;
       this.volumeNaming = metadata.volumeNaming;
+      // What salvage read past or left out; see ReadOptions.salvage.
+      this.truncation = metadata.truncation === undefined ? undefined : Object.freeze(metadata.truncation);
+      this.headerDamage = Object.freeze((metadata.headerDamage ?? []).map(Object.freeze));
+      this.incompleteMembers = Object.freeze((metadata.incompleteMembers ?? []).map(Object.freeze));
       this.entries = Object.freeze(metadata.entries.map(
         (entry) => Object.freeze(new RarEntry(this, entry)),
       ));
@@ -164,9 +184,16 @@ export function createApi(runtime) {
       }
     }
 
-    /** Options given to open() are defaults; a call's own fields override them one by one. */
+    /**
+     * Options given to open() are defaults; a call's own fields override them one by one,
+     * except `salvage`, which is the archive's: its parsing and every call read with it.
+     */
     _readOptions(operation) {
-      return { ...this._defaults, ...readOptions(operation) };
+      const call = readOptions(operation);
+      if (call.salvage !== undefined && call.salvage !== (this._defaults.salvage ?? false)) {
+        throw new RarError("INVALID_OPTION", "salvage is chosen when the archive is opened");
+      }
+      return { ...this._defaults, ...call };
     }
 
     _request(operation, payload, options) {
@@ -180,6 +207,10 @@ export function createApi(runtime) {
      */
     async _withVolumes(operation, payload, options) {
       if (options.volumes === undefined) return this._request(operation, payload, options);
+      if (this._defaults.salvage) {
+        throw new RarError("INVALID_OPTION",
+          "an archive opened with salvage reads the volumes it was opened with; give every volume to open()");
+      }
       if (!runtime.volumeFeed) {
         throw new RarError("UNSUPPORTED_FEATURE",
           "volumes as they arrive need Node; open the archive with every volume instead");
@@ -231,6 +262,7 @@ export function createApi(runtime) {
     async readMany(members, options) {
       assertOpen(this);
       const operation = operationOptions(options);
+      memberErrorCallback(operation);
       const indices = [];
       for (const member of members) {
         const entry = member instanceof RarEntry ? member : this.get(member);
@@ -254,6 +286,8 @@ export function createApi(runtime) {
      * Extracts entries under `directory` (Node) in one pass and returns the files written.
      * `members` selects some; `overwrite` is false (refuse), true or "rename" (name(N).ext);
      * `flatten` drops stored directories; `restoreTimes` (default true) sets modification times.
+     * `onMemberError` carries on past members that fail, writing none of their output, unless
+     * `keepBroken`, which needs `salvage`, keeps what was delivered for each.
      */
     async extractAll(directory, options) {
       assertOpen(this);
@@ -261,6 +295,20 @@ export function createApi(runtime) {
       const overwrite = operation.overwrite ?? false;
       if (overwrite !== true && overwrite !== false && overwrite !== "rename") {
         throw new TypeError('overwrite must be true, false or "rename"');
+      }
+      const onMemberError = memberErrorCallback(operation);
+      const keepBroken = operation.keepBroken ?? false;
+      if (typeof keepBroken !== "boolean") throw new TypeError("keepBroken must be a boolean");
+      if (keepBroken && !this._defaults.salvage) {
+        throw new RarError("INVALID_OPTION", "keepBroken needs an archive opened with salvage: true");
+      }
+      if (keepBroken && onMemberError === undefined) {
+        throw new RarError("INVALID_OPTION", "keepBroken needs onMemberError, which reports each member kept");
+      }
+      if (operation.members !== undefined && onMemberError !== undefined) {
+        // Selection counts the outputs opened, which a member failing before its output would upset.
+        throw new RarError("INVALID_OPTION",
+          "onMemberError reads every member, so it can't be combined with members");
       }
       let indices;
       if (operation.members !== undefined) {
@@ -280,6 +328,7 @@ export function createApi(runtime) {
         overwrite,
         flatten: operation.flatten ?? false,
         restoreTimes: operation.restoreTimes ?? true,
+        keepBroken,
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
       }, operation);
@@ -302,6 +351,7 @@ export function createApi(runtime) {
 
     async test(options) {
       const operation = operationOptions(options);
+      memberErrorCallback(operation);
       await this._withVolumes("test", {
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
@@ -664,7 +714,10 @@ export function createApi(runtime) {
 
   runtime.setErrorFactory((error) => {
     if (error?.name === "AbortError") return error;
-    return new RarError(error?.code ?? "INTERNAL", error?.message ?? String(error), error?.details);
+    const rarError = new RarError(error?.code ?? "INTERNAL", error?.message ?? String(error), error?.details);
+    // Set on the errors onMemberError is given: the name of the member that failed.
+    if (error?.member !== undefined) rarError.member = error.member;
+    return rarError;
   });
 
   return {

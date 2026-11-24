@@ -1,7 +1,7 @@
 export * from "./base.js";
 import type {
-  OperationOptions, ReadOptions, RarData, RarEntryOptions, RarInput, RarName,
-  RarWriterOptions,
+  MemberErrorOptions, OpenOptions, OperationOptions, ReadOptions, RarData, RarEntryOptions,
+  RarInput, RarName, RarWriterOptions,
 } from "./base.js";
 
 export type NodeRarInput = RarInput | string | URL;
@@ -10,7 +10,8 @@ export type VolumeSource = Iterable<NodeRarInput> | AsyncIterable<NodeRarInput>;
 export type NodePath = string | URL;
 
 export class RarArchive {
-  static open(input: NodeRarInput | readonly NodeRarInput[], options?: ReadOptions): Promise<RarArchive>;
+  /** With `salvage`, a first volume's path brings the later volumes found beside it until one is missing. */
+  static open(input: NodeRarInput | readonly NodeRarInput[], options?: OpenOptions): Promise<RarArchive>;
   readonly entries: readonly import("./base.js").RarEntry[];
   readonly family: import("./base.js").ArchiveFamily;
   readonly sfxOffset: number;
@@ -26,20 +27,30 @@ export class RarArchive {
   /** The files opened, when opened from paths: a first volume's path brings the later ones found beside it. */
   readonly volumePaths?: readonly string[];
   readonly comment?: Uint8Array;
+  /** Where the file ends early, in the first volume that does; undefined when none does. */
+  readonly truncation?: import("./base.js").Truncation;
+  /** The damaged headers `salvage` read past, in file order; always empty without it. */
+  readonly headerDamage: readonly import("./base.js").HeaderDamage[];
+  /** The split members `salvage` left out of a volume set, in archive order. */
+  readonly incompleteMembers: readonly import("./base.js").IncompleteMember[];
   get(name: RarName): import("./base.js").RarEntry | undefined;
   getAll(name: RarName): readonly import("./base.js").RarEntry[];
   has(name: RarName): boolean;
-  /** One session and shared output budgets; request order and duplicates are retained. */
+  /**
+   * One session and shared output budgets; request order and duplicates are retained.
+   * `onMemberError` can't be combined with a member in a later volume of a set.
+   */
   readMany(
     members: Iterable<import("./base.js").RarEntry | RarName>,
-    options?: ReadOptions,
+    options?: ReadOptions & MemberErrorOptions,
   ): Promise<Uint8Array[]>;
   readComment(options?: ReadOptions): Promise<Uint8Array | undefined>;
   /**
    * `volumes` gives the set's later parts, paths or bytes, pulled one at a time as the
-   * engine reaches them, so a set can be checked while it is still arriving.
+   * engine reaches them, so a set can be checked while it is still arriving; not on an
+   * archive opened with `salvage`, which reads the volumes it was opened with.
    */
-  test(options?: ReadOptions & { volumes?: VolumeSource }): Promise<void>;
+  test(options?: ReadOptions & MemberErrorOptions & { volumes?: VolumeSource }): Promise<void>;
   /**
    * Extracts entries under `directory` in one pass and returns the files written. Each is
    * written only once verified. `overwrite` is false (refuse an existing file), true, or
@@ -47,8 +58,14 @@ export class RarArchive {
    * `restoreTimes` (default true) sets modification times. Links are written too; one that
    * could lead outside `directory` is skipped with an `UnsafeLinkWarning` process warning.
    * `volumes` gives the set's later parts as they arrive, as for `test()`.
+   *
+   * `onMemberError` carries on past members that fail and writes none of their output; it
+   * can't be combined with `members`. `keepBroken`, on an archive opened with `salvage` and
+   * with `onMemberError`, keeps each failed member's file under its own name, holding what
+   * was delivered for it, unless it failed on its password.
    */
-  extractAll(directory: NodePath, options?: ReadOptions & {
+  extractAll(directory: NodePath, options?: ReadOptions & MemberErrorOptions & {
+    keepBroken?: boolean;
     volumes?: VolumeSource;
     members?: Iterable<import("./base.js").RarEntry | RarName>;
     overwrite?: boolean | "rename";
@@ -94,7 +111,7 @@ export class RarWriter {
 export function checkPassword(
   input: NodeRarInput,
   candidates: Iterable<string | Uint8Array>,
-  options?: ReadOptions,
+  options?: OpenOptions,
 ): Promise<import("./base.js").PasswordCheck<RarArchive>>;
 /** Whether the input starts with a RAR signature; an unreadable path is not RAR. */
 export function isRarFile(input: NodeRarInput): Promise<boolean>;

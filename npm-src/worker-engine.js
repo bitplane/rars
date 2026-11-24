@@ -80,6 +80,9 @@ function metadata(archive, password, options) {
     isFirstVolume: archive.isFirstVolume,
     volumeNaming: archive.volumeNaming,
     comment: archive.readComment(password, options),
+    truncation: archive.truncation(),
+    headerDamage: archive.headerDamage(),
+    incompleteMembers: archive.incompleteMembers(),
   };
 }
 
@@ -206,6 +209,12 @@ export function startWorker(port, wasm, platform) {
     const report = message.progress
       ? (phase, completed, total) => port.post({ id, progress: { operation, phase, completed, total } })
       : undefined;
+    // A member that fails is posted as it happens, and the engine carries on past it;
+    // the client gives it to the caller's onMemberError. A callback can't cross the
+    // worker boundary, so the engine never waits for one.
+    const memberError = message.memberErrors
+      ? (error) => port.post({ id, memberError: { ...errorRecord(error), member: error.member } })
+      : undefined;
     try {
       const phase = PHASES[operation];
       // The engine reports nothing while it runs, so the total is unknown until it ends.
@@ -223,10 +232,15 @@ export function startWorker(port, wasm, platform) {
             case "open":
               result = { ...metadata(archive, payload.password, payload.readOptions), sources: payload.sources };
               break;
-            case "read": result = archive.readAt(payload.index, payload.password, payload.readOptions, report); break;
-            case "readMany": result = archive.readMany(payload.indices, payload.password, payload.readOptions, report); break;
+            case "read":
+              result = archive.readAt(payload.index, payload.password, payload.readOptions, report, memberError);
+              break;
+            case "readMany":
+              result = archive.readMany(payload.indices, payload.password, payload.readOptions, report, memberError);
+              break;
             case "test":
-              archive.test(payload.password, payload.readOptions, report, platform.nextVolume?.(payload.volumeFeed));
+              archive.test(payload.password, payload.readOptions, report,
+                platform.nextVolume?.(payload.volumeFeed), memberError);
               break;
             case "readComment": result = archive.readComment(payload.password, payload.readOptions); break;
             case "readMemberComment": result = archive.readMemberComment(payload.index, payload.password, payload.readOptions); break;
@@ -235,7 +249,7 @@ export function startWorker(port, wasm, platform) {
               const output = platform.extractor(payload.directory, payload);
               archive.extractEach(payload.indices, payload.password, payload.readOptions,
                 payload.flatten, platform.posix, output.deliver, output.readLink,
-                platform.nextVolume?.(payload.volumeFeed), report);
+                platform.nextVolume?.(payload.volumeFeed), report, memberError, payload.keepBroken ?? false);
               result = output.finish();
               break;
             }

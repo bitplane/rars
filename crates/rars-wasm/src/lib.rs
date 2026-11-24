@@ -8,6 +8,7 @@
 use rars_rs::{ArchiveVersion, Builder};
 use wasm_bindgen::prelude::*;
 
+mod member_errors;
 mod progress;
 
 /// The `rars` version this module was built from, so a page can report which
@@ -171,6 +172,9 @@ fn js_error(error: rars_rs::Error) -> JsValue {
     let code = match error.root_cause() {
         rars_rs::Error::MissingVolume => "MISSING_VOLUME",
         rars_rs::Error::VolumeOutOfOrder => "VOLUME_ORDER",
+        // Only salvage reports these, after the member's bytes were delivered.
+        rars_rs::Error::MemberCutShort { .. } => "MEMBER_CUT_SHORT",
+        rars_rs::Error::MemberRanPastDeclaredSize { .. } => "MEMBER_RAN_PAST_DECLARED_SIZE",
         _ => error.kind().code(),
     };
     let record = binding_error(code, &error.to_string());
@@ -274,6 +278,13 @@ fn js_error(error: rars_rs::Error) -> JsValue {
             for (name, value) in header_count_error_details(*limit, *required) {
                 set_error_field(&details, name, &value.into());
             }
+        }
+        rars_rs::Error::MemberCutShort { packed, present } => {
+            set_error_field(&details, "packedBytes", &packed.to_string().into());
+            set_error_field(&details, "presentBytes", &present.to_string().into());
+        }
+        rars_rs::Error::MemberRanPastDeclaredSize { declared } => {
+            set_error_field(&details, "declaredBytes", &declared.to_string().into());
         }
         rars_rs::Error::Io(error) => {
             set_error_field(&details, "ioKind", &format!("{:?}", error.kind).into())
@@ -451,6 +462,48 @@ pub struct RarFile {
     infos: Vec<RarInfo>,
     /// Each member's first part: its volume, and its index within that volume.
     places: Vec<(usize, usize)>,
+    /// The split members `salvage` left out, as part of each is in a volume not given.
+    incomplete: Vec<Incomplete>,
+}
+
+/// A split member a salvaged volume set leaves out.
+#[derive(Clone)]
+struct Incomplete {
+    name: String,
+    name_bytes: Vec<u8>,
+    volume_index: usize,
+    missing: &'static str,
+}
+
+/// Under salvage, leaves out the members `volumes` hold only part of, so the rest read
+/// as a whole set, and returns them in archive order.
+fn drop_incomplete(
+    volumes: &mut [rars_rs::Archive],
+    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
+) -> rars_rs::Result<Vec<Incomplete>> {
+    // Only a volume's first or last member can be incomplete; name it as `entries` would.
+    let mut names = std::collections::HashMap::new();
+    for (index, volume) in volumes.iter().enumerate() {
+        for member in volume.members().take(1).chain(volume.members().last()) {
+            let name = String::from_utf8_lossy(&member.decoded_name(encoding)?).into_owned();
+            names.insert((index, member.meta.name.clone()), name);
+        }
+    }
+    Ok(rars_rs::drop_incomplete_members(volumes)
+        .into_iter()
+        .map(|member| Incomplete {
+            name: names
+                .remove(&(member.volume, member.name.clone()))
+                .unwrap_or_else(|| String::from_utf8_lossy(&member.name).into_owned()),
+            name_bytes: member.name,
+            volume_index: member.volume,
+            missing: match member.missing {
+                rars_rs::MissingPart::Start => "start",
+                rars_rs::MissingPart::End => "end",
+                _ => "both",
+            },
+        })
+        .collect())
 }
 
 #[wasm_bindgen]
@@ -469,19 +522,26 @@ impl RarFile {
     ) -> Result<RarFile, JsValue> {
         let password = password_bytes(password)?;
         let options = read_options(password.as_deref(), &settings)?;
-        let archive =
-            rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?;
-        let infos = archive
+        let mut archives =
+            vec![rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?];
+        // A volume on its own reads as a lone archive once its split members are gone.
+        let incomplete = if options.salvage {
+            drop_incomplete(&mut archives, options.legacy_name_encoding).map_err(js_error)?
+        } else {
+            Vec::new()
+        };
+        let infos = archives[0]
             .members()
             .map(|member| info_with_encoding(member, options.legacy_name_encoding))
             .collect::<rars_rs::Result<Vec<_>>>()
             .map_err(js_error)?;
         let places = (0..infos.len()).map(|index| (0, index)).collect();
         Ok(Self {
-            archives: vec![archive],
+            archives,
             password,
             infos,
             places,
+            incomplete,
         })
     }
 
@@ -507,6 +567,12 @@ impl RarFile {
                 rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
             );
         }
+        // A salvaged set may begin late or end early: what it holds only part of is left out.
+        let incomplete = if options.salvage {
+            drop_incomplete(&mut archives, options.legacy_name_encoding).map_err(js_error)?
+        } else {
+            Vec::new()
+        };
         // A member starts in the volume holding its first part.
         let places: Vec<(usize, usize)> = archives
             .iter()
@@ -536,7 +602,95 @@ impl RarFile {
             password,
             infos,
             places,
+            incomplete,
         })
+    }
+
+    /// Where the file ends early, or undefined: `{ block, name, offset, started,
+    /// membersComplete, volumeIndex, message }`, from the first volume that does.
+    /// `block` is `member`, `recoveryRecord`, `service`, `comment`, `end` or `unknown`,
+    /// and `name` the stored name of a cut member or service block.
+    pub fn truncation(&self) -> JsValue {
+        use rars_rs::TruncatedBlock as Block;
+        let Some((volume_index, truncation)) = self
+            .archives
+            .iter()
+            .enumerate()
+            .find_map(|(index, volume)| volume.truncation().map(|cut| (index, cut)))
+        else {
+            return JsValue::UNDEFINED;
+        };
+        let (block, name) = match &truncation.block {
+            Block::Member(name) => ("member", Some(name)),
+            Block::RecoveryRecord => ("recoveryRecord", None),
+            Block::Service(name) => ("service", Some(name)),
+            Block::Comment => ("comment", None),
+            Block::End => ("end", None),
+            _ => ("unknown", None),
+        };
+        let record = js_sys::Object::new();
+        set_error_field(&record, "block", &block.into());
+        if let Some(name) = name {
+            set_error_field(&record, "name", &js_sys::Uint8Array::from(name.as_slice()));
+        }
+        set_error_field(&record, "offset", &(truncation.offset as f64).into());
+        set_error_field(&record, "started", &truncation.started.into());
+        set_error_field(
+            &record,
+            "membersComplete",
+            &truncation.members_complete.into(),
+        );
+        set_error_field(&record, "volumeIndex", &(volume_index as f64).into());
+        set_error_field(&record, "message", &truncation.to_string().into());
+        record.into()
+    }
+
+    /// The damaged headers salvage read past, in file order: `{ kind, offset,
+    /// volumeIndex, message }`, `kind` one of `checksum`, `droppedRecord`,
+    /// `unreadable`, `resynced` or `quickOpenCopy`.
+    #[wasm_bindgen(js_name = headerDamage)]
+    pub fn header_damage(&self) -> js_sys::Array {
+        use rars_rs::HeaderDamageKind as Kind;
+        let list = js_sys::Array::new();
+        for (volume_index, volume) in self.archives.iter().enumerate() {
+            for damage in volume.header_damage() {
+                let kind = match damage.kind {
+                    Kind::Checksum { .. } => "checksum",
+                    Kind::DroppedRecord { .. } => "droppedRecord",
+                    Kind::Resynced { .. } => "resynced",
+                    Kind::QuickOpenCopy { .. } => "quickOpenCopy",
+                    _ => "unreadable",
+                };
+                let record = js_sys::Object::new();
+                set_error_field(&record, "kind", &kind.into());
+                set_error_field(&record, "offset", &(damage.offset as f64).into());
+                set_error_field(&record, "volumeIndex", &(volume_index as f64).into());
+                set_error_field(&record, "message", &damage.to_string().into());
+                list.push(&record);
+            }
+        }
+        list
+    }
+
+    /// The split members salvage left out of a volume set, in archive order:
+    /// `{ name, nameBytes, volumeIndex, missing }`, `missing` one of `start`, `end`
+    /// or `both`.
+    #[wasm_bindgen(js_name = incompleteMembers)]
+    pub fn incomplete_members(&self) -> js_sys::Array {
+        let list = js_sys::Array::new();
+        for member in &self.incomplete {
+            let record = js_sys::Object::new();
+            set_error_field(&record, "name", &member.name.as_str().into());
+            set_error_field(
+                &record,
+                "nameBytes",
+                &js_sys::Uint8Array::from(member.name_bytes.as_slice()),
+            );
+            set_error_field(&record, "volumeIndex", &(member.volume_index as f64).into());
+            set_error_field(&record, "missing", &member.missing.into());
+            list.push(&record);
+        }
+        list
     }
 
     /// Every member name, in archive order.
@@ -592,6 +746,10 @@ impl RarFile {
     }
 
     /// Decode one member by archive-order index.
+    ///
+    /// Given `memberError`, a member that fails is reported to it instead of failing
+    /// the call, and the call returns what was delivered for it: everything decoded
+    /// before the failure under salvage, and nothing otherwise.
     #[wasm_bindgen(js_name = readAt)]
     pub fn read_at(
         &self,
@@ -599,7 +757,19 @@ impl RarFile {
         password: Option<Password>,
         settings: JsValue,
         progress: Option<js_sys::Function>,
+        member_error: Option<js_sys::Function>,
     ) -> Result<Vec<u8>, JsValue> {
+        let missing = || {
+            binding_error(
+                "ENTRY_NOT_FOUND",
+                &format!("no such archive entry index: {index}"),
+            )
+        };
+        if member_error.is_some() {
+            let data =
+                self.read_reporting(&[index], password, &settings, progress, member_error)?;
+            return data.into_iter().next().flatten().ok_or_else(missing);
+        }
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         if progress.is_some() && self.archives.len() == 1 {
             let options = read_options(password.as_deref(), &settings)?;
@@ -607,12 +777,7 @@ impl RarFile {
                 read_counted(&self.archives[0], &[index], options)
             })
             .map_err(js_error)?;
-            return data.into_iter().next().flatten().ok_or_else(|| {
-                binding_error(
-                    "ENTRY_NOT_FOUND",
-                    &format!("no such archive entry index: {index}"),
-                )
-            });
+            return data.into_iter().next().flatten().ok_or_else(missing);
         }
         let found = if self.archives.len() == 1 {
             self.archives[0]
@@ -624,15 +789,11 @@ impl RarFile {
                 read_options(password.as_deref(), &settings)?,
             )
         };
-        found.map_err(js_error)?.ok_or_else(|| {
-            binding_error(
-                "ENTRY_NOT_FOUND",
-                &format!("no such archive entry index: {index}"),
-            )
-        })
+        found.map_err(js_error)?.ok_or_else(missing)
     }
 
     /// Decode selected indices in one session, preserving order and duplicates.
+    /// `memberError` works as in `readAt`, for each member that fails.
     #[wasm_bindgen(js_name = readMany)]
     pub fn read_many(
         &self,
@@ -640,20 +801,25 @@ impl RarFile {
         password: Option<Password>,
         settings: JsValue,
         progress: Option<js_sys::Function>,
+        member_error: Option<js_sys::Function>,
     ) -> Result<js_sys::Array, JsValue> {
         let indices: Vec<usize> = indices.into_iter().map(|index| index as usize).collect();
-        let password = password_bytes(password)?.or_else(|| self.password.clone());
-        let options = read_options(password.as_deref(), &settings)?;
-        let data = if progress.is_some() && self.archives.len() == 1 {
-            progress::watching(progress, || {
-                read_counted(&self.archives[0], &indices, options)
-            })
-        } else if self.archives.len() == 1 {
-            self.archives[0].read_members_at_with_options(&indices, options)
+        let data = if member_error.is_some() {
+            self.read_reporting(&indices, password, &settings, progress, member_error)?
         } else {
-            rars_rs::read_volume_members_at_with_options(&self.archives, &indices, options)
-        }
-        .map_err(js_error)?;
+            let password = password_bytes(password)?.or_else(|| self.password.clone());
+            let options = read_options(password.as_deref(), &settings)?;
+            if progress.is_some() && self.archives.len() == 1 {
+                progress::watching(progress, || {
+                    read_counted(&self.archives[0], &indices, options)
+                })
+            } else if self.archives.len() == 1 {
+                self.archives[0].read_members_at_with_options(&indices, options)
+            } else {
+                rars_rs::read_volume_members_at_with_options(&self.archives, &indices, options)
+            }
+            .map_err(js_error)?
+        };
         let results = js_sys::Array::new();
         for (index, bytes) in indices.into_iter().zip(data) {
             let bytes = bytes.ok_or_else(|| {
@@ -670,48 +836,29 @@ impl RarFile {
     /// Decode every member and discard the bytes, throwing on the first
     /// checksum failure or wrong password. Given `nextVolume`, the set's later
     /// volumes are each pulled from it as needed, until it returns undefined.
+    /// Given `memberError`, each member that fails is reported to it instead,
+    /// and the call carries on.
     pub fn test(
         &self,
         password: Option<Password>,
         settings: JsValue,
         progress: Option<js_sys::Function>,
         next_volume: Option<js_sys::Function>,
+        member_error: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        if next_volume.is_some() {
-            let options = read_options(password.as_deref(), &settings)?;
-            return progress::watching(progress, || {
-                let count = progress::ReadCount::with_total("testing", None);
-                let result = with_later_volumes(&self.archives, options, next_volume, |later| {
-                    self.archives[0].extract_with_volumes(later, options, |_| {
-                        Ok(count.counted(Box::new(std::io::sink())))
-                    })
-                });
-                if matches!(result, Ok(Ok(()))) {
-                    count.finish();
-                }
-                result
-            })?
-            .map_err(js_error);
+        let options = read_options(password.as_deref(), &settings)?;
+        let report =
+            member_errors::Reporting::start(member_error, options.legacy_name_encoding, false);
+        let options = report
+            .as_ref()
+            .map_or(options, |report| report.handling(options));
+        let result = self.test_with(options, progress, next_volume);
+        if let Some(report) = report {
+            report.finish()?;
         }
-        if progress.is_some() {
-            let options = read_options(password.as_deref(), &settings)?;
-            return progress::watching(progress, || test_counted(&self.archives, options))
-                .map_err(js_error);
-        }
-        if self.archives.len() == 1 {
-            return self.archives[0]
-                .test_with_options(read_options(password.as_deref(), &settings)?)
-                .map_err(js_error);
-        }
-        rars_rs::extract_volumes_to_with_options(
-            &self.archives,
-            read_options(password.as_deref(), &settings)?,
-            |_| Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>),
-        )
-        .map_err(js_error)
+        result
     }
-
     /// The archive comment, or `undefined` when there is none.
     #[wasm_bindgen(getter)]
     pub fn comment(&self) -> Result<Option<Vec<u8>>, JsValue> {
@@ -816,6 +963,10 @@ impl RarFile {
     /// and its raw target when following it could leave the output directory.
     /// `readLink(path)` answers for that check: the target of the symbolic link already at
     /// `path` under the output directory, or undefined.
+    ///
+    /// Given `memberError`, each member that fails is reported to it and the call carries
+    /// on; a reported member is not delivered, unless `keepBroken`, when it is delivered
+    /// with what it was given and `broken: true`. One that failed on its password is not.
     #[wasm_bindgen(js_name = extractEach)]
     #[allow(clippy::too_many_arguments)] // JavaScript arguments.
     pub fn extract_each(
@@ -829,6 +980,8 @@ impl RarFile {
         read_link: js_sys::Function,
         next_volume: Option<js_sys::Function>,
         progress: Option<js_sys::Function>,
+        member_error: Option<js_sys::Function>,
+        keep_broken: bool,
     ) -> Result<(), JsValue> {
         use rars_rs::ExtractedLink;
         use std::cell::RefCell;
@@ -836,6 +989,14 @@ impl RarFile {
         use std::rc::Rc;
         let password = password_bytes(password)?.or_else(|| self.password.clone());
         let options = read_options(password.as_deref(), &settings)?;
+        let report = member_errors::Reporting::start(
+            member_error,
+            options.legacy_name_encoding,
+            keep_broken,
+        );
+        let options = report
+            .as_ref()
+            .map_or(options, |report| report.handling(options));
         // Selection by stored name: the core calls back once per member, for a file,
         // directory or link alike, and gives each its stored name.
         let selected: Option<HashSet<Vec<u8>>> = indices.map(|indices| {
@@ -857,7 +1018,8 @@ impl RarFile {
         let encoding = options.legacy_name_encoding;
         let tree = JsTree(read_link);
         let raised: RefCell<Option<JsValue>> = RefCell::new(None);
-        type Pending = (JsValue, Rc<RefCell<Vec<u8>>>);
+        // The entry, its bytes, and its stored name, which a failure report names.
+        type Pending = (JsValue, Rc<RefCell<Vec<u8>>>, Vec<u8>);
         let pending: RefCell<Option<Pending>> = RefCell::new(None);
         let hand_over = |entry: &JsValue, bytes: &JsValue| -> rars_rs::Result<()> {
             if let Err(error) = deliver.call2(&JsValue::NULL, entry, bytes) {
@@ -866,13 +1028,24 @@ impl RarFile {
             }
             Ok(())
         };
-        // Hands over the entry before; the core has verified it by the time it opens the next.
+        // Hands over the entry before; the core has verified it, or reported it as failed,
+        // by the time it opens the next.
         let flush = || -> rars_rs::Result<()> {
-            if let Some((entry, buffer)) = pending.borrow_mut().take() {
-                let bytes = js_sys::Uint8Array::from(buffer.borrow().as_slice());
-                hand_over(&entry, &bytes)?;
+            // The members reported since the last entry was handed over.
+            let failed = report
+                .as_ref()
+                .map(member_errors::Reporting::take_failed)
+                .unwrap_or_default();
+            let Some((entry, buffer, stored)) = pending.borrow_mut().take() else {
+                return Ok(());
+            };
+            match failed.iter().rev().find(|(name, _)| *name == stored) {
+                Some((_, false)) => return Ok(()),
+                Some((_, true)) => set_error_field(&entry, "broken", &true.into()),
+                None => {}
             }
-            Ok(())
+            let bytes = js_sys::Uint8Array::from(buffer.borrow().as_slice());
+            hand_over(&entry, &bytes)
         };
         let describe =
             |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<(js_sys::Object, String)> {
@@ -897,7 +1070,8 @@ impl RarFile {
                     }
                     let (entry, _) = describe(meta)?;
                     let buffer = Rc::new(RefCell::new(Vec::new()));
-                    *pending.borrow_mut() = Some((entry.into(), Rc::clone(&buffer)));
+                    *pending.borrow_mut() =
+                        Some((entry.into(), Rc::clone(&buffer), meta.name.clone()));
                     Ok(count.counted(Box::new(SharedBytes(buffer))))
                 };
             let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
@@ -939,16 +1113,28 @@ impl RarFile {
                 }
                 hand_over(&entry, &JsValue::UNDEFINED)
             };
-            let result = with_later_volumes(&self.archives, options, next_volume, |later| {
-                rars_rs::output_links::extract_arriving_with_links(
-                    &self.archives[0],
-                    later,
-                    options,
-                    open,
-                    link,
-                )
-                .and_then(|()| flush())
-            });
+            let result = if options.salvage && next_volume.is_none() {
+                // A salvaged set may end early: it is the volumes it was opened with, and
+                // waits for no more. A volume on its own reads as a lone archive once its
+                // split members are gone.
+                Ok(if self.archives.len() == 1 {
+                    self.archives[0].extract_with_links(options, open, link)
+                } else {
+                    rars_rs::extract_volumes_with_links(&self.archives, options, open, link)
+                }
+                .and_then(|()| flush()))
+            } else {
+                with_later_volumes(&self.archives, options, next_volume, |later| {
+                    rars_rs::output_links::extract_arriving_with_links(
+                        &self.archives[0],
+                        later,
+                        options,
+                        open,
+                        link,
+                    )
+                    .and_then(|()| flush())
+                })
+            };
             if matches!(result, Ok(Ok(()))) {
                 count.finish();
             }
@@ -956,6 +1142,9 @@ impl RarFile {
         });
         if let Some(error) = raised.into_inner() {
             return Err(error);
+        }
+        if let Some(report) = report {
+            report.finish()?;
         }
         result?.map_err(js_error)
     }
@@ -1010,6 +1199,111 @@ impl RarFile {
     #[wasm_bindgen(getter)]
     pub fn family(&self) -> String {
         family_name(self.archives[0].family()).to_string()
+    }
+}
+
+impl RarFile {
+    /// `test` once its options are settled.
+    fn test_with(
+        &self,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        progress: Option<js_sys::Function>,
+        next_volume: Option<js_sys::Function>,
+    ) -> Result<(), JsValue> {
+        if next_volume.is_some() {
+            return progress::watching(progress, || {
+                let count = progress::ReadCount::with_total("testing", None);
+                let result = with_later_volumes(&self.archives, options, next_volume, |later| {
+                    self.archives[0].extract_with_volumes(later, options, |_| {
+                        Ok(count.counted(Box::new(std::io::sink())))
+                    })
+                });
+                if matches!(result, Ok(Ok(()))) {
+                    count.finish();
+                }
+                result
+            })?
+            .map_err(js_error);
+        }
+        if progress.is_some() {
+            return progress::watching(progress, || test_counted(&self.archives, options))
+                .map_err(js_error);
+        }
+        if self.archives.len() == 1 {
+            return self.archives[0]
+                .test_with_options(options)
+                .map_err(js_error);
+        }
+        rars_rs::extract_volumes_to_with_options(&self.archives, options, |_| {
+            Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>)
+        })
+        .map_err(js_error)
+    }
+
+    /// Reads `indices` with each member that fails reported to `member_error`, as
+    /// Python's `on_member_error`. A reported member gets what was delivered for it
+    /// under salvage, and nothing otherwise: what a decoder wrote before it found
+    /// the failure isn't the member's own.
+    fn read_reporting(
+        &self,
+        indices: &[usize],
+        password: Option<Password>,
+        settings: &JsValue,
+        progress: Option<js_sys::Function>,
+        member_error: Option<js_sys::Function>,
+    ) -> Result<Vec<Option<Vec<u8>>>, JsValue> {
+        // A set's reads count the outputs opened, which a member failing before its
+        // output would upset.
+        let later = |index: usize| match self.places.get(index) {
+            Some(&(0, at)) => self.archives[0]
+                .members()
+                .nth(at)
+                .is_none_or(|member| member.meta.is_split_after),
+            _ => true,
+        };
+        if self.archives.len() > 1 && indices.iter().any(|&index| later(index)) {
+            return Err(binding_error(
+                "INVALID_OPTION",
+                "onMemberError can't be combined with reading a member in a later volume; test() and extractAll() can carry on past those",
+            ));
+        }
+        let password = password_bytes(password)?.or_else(|| self.password.clone());
+        let options = read_options(password.as_deref(), settings)?;
+        let salvage = options.salvage;
+        let report =
+            member_errors::Reporting::start(member_error, options.legacy_name_encoding, false);
+        let options = report
+            .as_ref()
+            .map_or(options, |report| report.handling(options));
+        let data = if progress.is_some() && self.archives.len() == 1 {
+            progress::watching(progress, || {
+                read_counted(&self.archives[0], indices, options)
+            })
+        } else if self.archives.len() == 1 {
+            self.archives[0].read_members_at_with_options(indices, options)
+        } else {
+            rars_rs::read_volume_members_at_with_options(&self.archives, indices, options)
+        };
+        let failed = report
+            .as_ref()
+            .map(member_errors::Reporting::take_failed)
+            .unwrap_or_default();
+        if let Some(report) = report {
+            report.finish()?;
+        }
+        let mut data = data.map_err(js_error)?;
+        for (bytes, &index) in data.iter_mut().zip(indices) {
+            let Some(info) = self.infos.get(index) else {
+                continue;
+            };
+            if failed.iter().any(|(name, _)| *name == info.name) {
+                let bytes = bytes.get_or_insert_with(Vec::new);
+                if !salvage {
+                    bytes.clear();
+                }
+            }
+        }
+        Ok(data)
     }
 }
 
@@ -1995,6 +2289,7 @@ fn read_options<'a>(
     options.rar50_dictionary_size_limit = read_limit(settings, "maxRar50DictionaryBytes")?;
     options.rar50_buffered_decode_limit = read_limit(settings, "maxRar50BufferedMemberBytes")?;
     options.allow_rar3_vm_programs = opt_bool(settings, "allowRar3VmPrograms")?;
+    options.salvage = opt_bool(settings, "salvage")?;
     Ok(options)
 }
 
@@ -2020,6 +2315,7 @@ mod host_tests {
             infos,
             archives: vec![archive],
             password: None,
+            incomplete: Vec::new(),
         };
         assert_eq!(file.get_info("same").unwrap().size, 6.0);
     }
