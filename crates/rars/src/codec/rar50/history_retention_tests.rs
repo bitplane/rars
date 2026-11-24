@@ -587,10 +587,10 @@ fn reference_decode<B: Budget>(
                 algorithm_version,
                 &block.payload.allowance(),
             )?;
-            state.tables = Some(ReaderTables::from_lengths(
+            state.tables = Some(std::sync::Arc::new(ReaderTables::from_lengths(
                 &lengths,
                 &block.payload.allowance(),
-            )?);
+            )?));
             payload_bit_pos = table_bits;
         }
         let tables = state

@@ -10,6 +10,16 @@ mod block_ops;
 mod blocks_ahead;
 #[cfg(feature = "write")]
 mod encoder;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+mod members_ahead;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+pub(crate) use members_ahead::{Claimed, MembersAhead, Offered};
 mod filter_thread;
 #[cfg(feature = "write")]
 pub use encoder::{
@@ -36,6 +46,7 @@ use super::workspace::{Allowance, Budget, Buffer};
 use super::{Error, Result};
 use std::io::Read;
 use std::ops::Range;
+use std::sync::Arc;
 
 pub const LEVEL_TABLE_SIZE: usize = 20;
 pub const MAIN_TABLE_SIZE: usize = 306;
@@ -265,15 +276,6 @@ impl<B: Budget> ReaderTables<B> {
                 .align
                 .iter()
                 .any(|&length| length != 0 && length != 4),
-        })
-    }
-    fn try_clone(&self) -> Result<Self> {
-        Ok(Self {
-            main: self.main.try_clone()?,
-            distance: self.distance.try_clone()?,
-            align: self.align.try_clone()?,
-            length: self.length.try_clone()?,
-            align_mode: self.align_mode,
         })
     }
 }
@@ -615,7 +617,7 @@ pub(crate) enum HistoryRetention {
 #[derive(Debug)]
 pub(crate) struct ReaderState<B: Budget> {
     pub(crate) read_control: crate::read_control::ReadControl,
-    tables: Option<ReaderTables<B>>,
+    tables: Option<Arc<ReaderTables<B>>>,
     reps: [usize; 4],
     last_length: usize,
     history: Buffer<u8, B>,
@@ -633,6 +635,18 @@ pub(crate) struct ReaderState<B: Budget> {
     // Under salvage: what a buffered member that failed decoded before the
     // failure, up to the first filter it couldn't apply.
     salvaged: Option<Buffer<u8, B>>,
+    // The next buffered member's blocks, decoded ahead on the pool.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    claimed: Option<Claimed<B>>,
+    // Whether the last claimed member replayed to its final block.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    replayed_whole: bool,
 }
 
 impl<B: Budget> ReaderState<B> {
@@ -651,7 +665,31 @@ impl<B: Budget> ReaderState<B> {
             ended_early: None,
             ran_past: false,
             salvaged: None,
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            claimed: None,
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            replayed_whole: false,
         }
+    }
+
+    /// Whether the next buffered member's blocks were decoded ahead.
+    pub(crate) fn has_claimed(&self) -> bool {
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        return self.claimed.is_some() && !B::LIMITED;
+        #[cfg(not(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        )))]
+        false
     }
 
     /// The length the last member decoded to, if its stream ended before its
@@ -727,11 +765,7 @@ impl<B: Budget> ReaderState<B> {
     pub(crate) fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             read_control: self.read_control.clone(),
-            tables: self
-                .tables
-                .as_ref()
-                .map(ReaderTables::try_clone)
-                .transpose()?,
+            tables: self.tables.clone(),
             reps: self.reps,
             last_length: self.last_length,
             history_window: self.history_window,
@@ -752,6 +786,16 @@ impl<B: Budget> ReaderState<B> {
             ended_early: self.ended_early,
             ran_past: self.ran_past,
             salvaged: None,
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            claimed: None,
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            replayed_whole: false,
         })
     }
 
@@ -912,8 +956,27 @@ impl<B: Budget> ReaderState<B> {
         let mut literals = [0; LITERAL_BURST];
         let mut overrun = None;
         let mut resume = None;
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        let claimed = self.take_claimed(mode);
 
         let blocks = (|| -> Result<()> {
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            if let Some(claimed) = claimed {
+                let mut flat = block_ops::Flat {
+                    output: &mut output,
+                    filters: &mut filters,
+                    output_size,
+                    dictionary_size,
+                    overrun: &mut overrun,
+                };
+                return self.replay_claimed(claimed, &mut flat);
+            }
             loop {
                 let block = read_compressed_block_salvaging(
                     input,
@@ -928,10 +991,10 @@ impl<B: Budget> ReaderState<B> {
                         algorithm_version,
                         &block.payload.allowance(),
                     )?;
-                    self.tables = Some(ReaderTables::from_lengths(
+                    self.tables = Some(Arc::new(ReaderTables::from_lengths(
                         &lengths,
                         &block.payload.allowance(),
-                    )?);
+                    )?));
                     payload_bit_pos = table_bits;
                 }
                 let tables = self
@@ -1359,10 +1422,10 @@ impl<B: Budget> ReaderState<B> {
                     algorithm_version,
                     &block.payload.allowance(),
                 )?;
-                self.tables = Some(ReaderTables::from_lengths(
+                self.tables = Some(Arc::new(ReaderTables::from_lengths(
                     &lengths,
                     &block.payload.allowance(),
-                )?);
+                )?));
                 payload_bit_pos = table_bits;
             }
             let tables = self

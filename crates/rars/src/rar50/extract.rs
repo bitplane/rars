@@ -1,5 +1,11 @@
 #[path = "scratch.rs"]
 mod scratch;
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[path = "solid_ahead.rs"]
+mod solid_ahead;
 #[path = "volumes.rs"]
 mod volumes;
 use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
@@ -27,6 +33,14 @@ const BUFFERED_DECODE_LIMIT: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 const BUFFERED_DECODE_LIMIT: u64 = 1024;
 
+#[cfg(all(
+    test,
+    feature = "write",
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[path = "solid_ahead_tests.rs"]
+mod solid_ahead_tests;
 #[cfg(all(test, feature = "write"))]
 #[path = "streaming_checks_tests.rs"]
 mod streaming_checks_tests;
@@ -549,13 +563,22 @@ impl FileHeader {
         key_cache: &crate::key_cache::KeyCache,
         history: HistoryRetention,
     ) -> Result<DecodedData<B>> {
-        let (packed, keys) = self.packed_data_with_allowance(
-            archive,
-            password,
-            key_cache,
-            &decoder.read_control,
-            &decoder.allowance(),
-        )?;
+        // A member decoded ahead was read when it was offered.
+        let (packed, keys) = if decoder.has_claimed() {
+            let keys = self
+                .encrypted
+                .then(|| self.encryption_keys_cached(password, key_cache))
+                .transpose()?;
+            (Buffer::new(&decoder.allowance()), keys)
+        } else {
+            self.packed_data_with_allowance(
+                archive,
+                password,
+                key_cache,
+                &decoder.read_control,
+                &decoder.allowance(),
+            )?
+        };
         let data = self.decode_packed_owned(&packed, decoder, history)?;
         Ok(DecodedData { data, keys })
     }
@@ -1069,7 +1092,8 @@ impl Archive {
         let archive_solid =
             self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0);
         let solid = selector.is_some() && archive_solid;
-        for file in self.files() {
+        let files: Vec<&FileHeader> = self.files().collect();
+        for (index, &file) in files.iter().enumerate() {
             let selected = crate::extraction_control::select(
                 &mut selector,
                 options,
@@ -1085,6 +1109,7 @@ impl Archive {
                 Some(crate::ExtractionDecision::Extract(writer)) => Some(writer),
                 None => None,
             };
+            session.read_ahead(self, &files, index);
             let result = (|| {
                 options.check_cancelled()?;
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
@@ -1821,6 +1846,11 @@ struct DecoderSession<'a, B: Budget = Allowance> {
     scratch: Option<&'a crate::Rar50Scratch>,
     // Set by a failed compressed member; a solid successor has no history.
     solid_chain_broken: bool,
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    ahead: solid_ahead::SolidAhead<B>,
 }
 
 impl<'a, B: Budget> DecoderSession<'a, B> {
@@ -1836,6 +1866,11 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             buffered_decode_limit,
             scratch: None,
             solid_chain_broken: false,
+            #[cfg(all(
+                feature = "parallel",
+                not(all(target_arch = "wasm32", target_os = "unknown"))
+            ))]
+            ahead: solid_ahead::SolidAhead::Undecided,
         }
     }
 
@@ -1896,43 +1931,55 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             );
         }
         self.guard_solid_chain(file, |session| {
-            if file.should_stream_decode(session.buffered_decode_limit) {
-                return session.stream_file_to(archive, file, writer);
-            }
-            let decoded = match session.decoded_file_data(archive, file, history) {
-                Ok(decoded) => decoded,
-                Err(error) => {
-                    // Salvage delivers what decoded before the failure.
-                    if let Some(partial) = session.decoder.take_salvaged() {
-                        writer
-                            .write_all(&partial)
-                            .map_err(Error::from)
-                            .map_err(|error| file.entry_error("writing", error))?;
-                    }
-                    return Err(file.entry_error("decoding", error));
-                }
-            };
-            let verified = file.salvaged_result(
-                &session.decoder,
-                file.ended_early_result(
-                    &session.decoder,
-                    file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()),
-                ),
-            );
-            // A whole member that strict sizes fail is still written, and
-            // salvage writes every member.
-            if verified.as_ref().is_err_and(|error| {
-                !matches!(error, Error::MemberEndedEarly { .. })
-                    && !session.decoder.read_control.salvage()
-            }) {
-                return verified.map_err(|error| file.entry_error("verifying", error));
-            }
-            writer
-                .write_all(&decoded.data)
-                .map_err(Error::from)
-                .map_err(|error| file.entry_error("writing", error))?;
-            verified.map_err(|error| file.entry_error("verifying", error))
+            session.claim_ahead(file);
+            let result = session.write_compressed_to(archive, file, writer, history);
+            session.settle_ahead(file, result.is_ok());
+            result
         })
+    }
+
+    fn write_compressed_to(
+        &mut self,
+        archive: &Archive,
+        file: &FileHeader,
+        writer: &mut dyn Write,
+        history: HistoryRetention,
+    ) -> Result<()> {
+        if file.should_stream_decode(self.buffered_decode_limit) {
+            return self.stream_file_to(archive, file, writer);
+        }
+        let decoded = match self.decoded_file_data(archive, file, history) {
+            Ok(decoded) => decoded,
+            Err(error) => {
+                // Salvage delivers what decoded before the failure.
+                if let Some(partial) = self.decoder.take_salvaged() {
+                    writer
+                        .write_all(&partial)
+                        .map_err(Error::from)
+                        .map_err(|error| file.entry_error("writing", error))?;
+                }
+                return Err(file.entry_error("decoding", error));
+            }
+        };
+        let verified = file.salvaged_result(
+            &self.decoder,
+            file.ended_early_result(
+                &self.decoder,
+                file.verify_integrity_with_keys(&decoded.data, decoded.keys.as_ref()),
+            ),
+        );
+        // A whole member that strict sizes fail is still written, and
+        // salvage writes every member.
+        if verified.as_ref().is_err_and(|error| {
+            !matches!(error, Error::MemberEndedEarly { .. }) && !self.decoder.read_control.salvage()
+        }) {
+            return verified.map_err(|error| file.entry_error("verifying", error));
+        }
+        writer
+            .write_all(&decoded.data)
+            .map_err(Error::from)
+            .map_err(|error| file.entry_error("writing", error))?;
+        verified.map_err(|error| file.entry_error("verifying", error))
     }
 
     fn stream_file_to(
@@ -1985,6 +2032,17 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
             history,
         )
     }
+}
+
+#[cfg(not(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+)))]
+impl<B: Budget> DecoderSession<'_, B> {
+    fn read_ahead(&mut self, _archive: &Archive, _files: &[&FileHeader], _index: usize) {}
+    fn claim_ahead(&mut self, _file: &FileHeader) {}
+    fn settle_ahead(&mut self, _file: &FileHeader, _decoded: bool) {}
+    fn end_volume(&mut self) {}
 }
 
 impl<'a> DecoderSession<'a, Allowance> {

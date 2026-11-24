@@ -2,9 +2,9 @@
 //! as operations; replaying them in order resolves what earlier blocks decide.
 use super::{
     distance_from_slot_parts, distance_slot_bit_count, length_bonus, length_from_slot_parts,
-    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, DecodedChunk,
-    Error, PendingFilter, ReaderTables, Result, StreamDecodeError, StreamingOutput, LITERAL_BURST,
-    SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
+    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, Buffer,
+    DecodedChunk, Error, Overrun, PendingFilter, ReaderState, ReaderTables, Result,
+    StreamDecodeError, StreamingOutput, LITERAL_BURST, SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
 };
 use crate::read_control::Poller;
 use std::hint::select_unpredictable;
@@ -323,6 +323,137 @@ impl BlockOps {
         *repeats.distances = reps;
         *repeats.last_length = last_length;
         walked
+    }
+}
+
+/// Where the buffered decoder writes a member: flat, with its filters kept for the end.
+pub(super) struct Flat<'a, B: Budget> {
+    pub(super) output: &'a mut Buffer<u8, B>,
+    pub(super) filters: &'a mut Buffer<PendingFilter, B>,
+    pub(super) output_size: usize,
+    pub(super) dictionary_size: usize,
+    pub(super) overrun: &'a mut Option<Overrun>,
+}
+
+/// Where a buffered replay stopped in its list.
+#[derive(PartialEq, Eq)]
+pub(super) enum Walked {
+    /// Every operation applied.
+    All,
+    /// At the end of a block's symbols, before the next block's.
+    BlockEnd,
+    Within,
+}
+
+impl BlockOps {
+    /// [`Self::apply`] for the buffered decoder, which owns the repeat state and history.
+    pub(super) fn apply_buffered<B: Budget>(
+        &self,
+        state: &mut ReaderState<B>,
+        flat: &mut Flat<'_, B>,
+        poller: &mut Poller,
+        reached: &mut Reached,
+    ) -> Result<Walked> {
+        let output_size = flat.output_size;
+        let mut literals = self.literals.as_slice();
+        let mut block_filters = self.filters.iter();
+        for &op in &self.ops {
+            if flat.output.len() >= output_size {
+                return Ok(if op.tag() == BLOCK {
+                    Walked::BlockEnd
+                } else {
+                    Walked::Within
+                });
+            }
+            poller.check_codec(flat.output.len())?;
+            let prefix = op.prefix();
+            if prefix != 0 {
+                let len = flat.output.len();
+                let visible = prefix.min(output_size - len);
+                reached.symbols += visible;
+                match literals.first_chunk::<SHORT_MATCH>() {
+                    // A fixed-width copy into spare capacity, cut back to the run.
+                    Some(bytes)
+                        if prefix <= SHORT_MATCH && flat.output.capacity() - len >= SHORT_MATCH =>
+                    {
+                        flat.output.extend_from_slice(bytes).map_err(Into::into)?;
+                        flat.output.truncate(len + visible);
+                    }
+                    _ => flat
+                        .output
+                        .extend_from_slice(&literals[..visible])
+                        .map_err(Into::into)?,
+                }
+                literals = &literals[prefix..];
+                if flat.output.len() >= output_size {
+                    return Ok(Walked::Within);
+                }
+            }
+            let tag = op.tag();
+            match tag {
+                MATCH | REPEAT | REPEAT_LAST => {
+                    reached.symbols += 1;
+                    let index = if tag == MATCH { 3 } else { op.value() };
+                    let distance = if tag == MATCH {
+                        op.value()
+                    } else {
+                        pick(state.reps, index)
+                    };
+                    if tag == REPEAT {
+                        initialized(distance)?;
+                    }
+                    let length = if tag == REPEAT_LAST {
+                        state.last_length
+                    } else {
+                        op.length()
+                    };
+                    state.reps[..=index].rotate_right(1);
+                    state.reps[0] = distance;
+                    state.last_length = length;
+                    if length != 0 {
+                        *flat.overrun = state.copy_match(
+                            flat.output,
+                            distance,
+                            length,
+                            output_size,
+                            flat.dictionary_size,
+                        )?;
+                    }
+                }
+                LITERALS => {
+                    let (run, rest) = literals.split_at(op.value());
+                    literals = rest;
+                    let visible = run.len().min(output_size - flat.output.len());
+                    reached.symbols += visible;
+                    for piece in run[..visible].chunks(LITERAL_POLL) {
+                        poller.check_codec(flat.output.len())?;
+                        flat.output.extend_from_slice(piece).map_err(Into::into)?;
+                    }
+                    if visible < run.len() {
+                        return Ok(Walked::Within);
+                    }
+                }
+                FILTER => {
+                    reached.symbols += 1;
+                    let mut filter = *block_filters.next().expect("one filter per filter op");
+                    filter.start = flat
+                        .output
+                        .len()
+                        .checked_add(filter.start)
+                        .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?;
+                    flat.filters.try_push(filter)?;
+                }
+                REPEAT_CHECK => {
+                    initialized(pick(state.reps, op.value()))?;
+                }
+                BLOCK => {
+                    reached.blocks += 1;
+                    reached.symbols = 0;
+                }
+                tag => unreachable!("operation tag {tag}"),
+            }
+        }
+        Ok(Walked::All)
     }
 }
 
