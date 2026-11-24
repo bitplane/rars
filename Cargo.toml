@@ -30,6 +30,7 @@ indicatif = "0.18.6"
 js-sys = "0.3"
 libc = "0.2"
 memchr = "2.8"
+memmap2 = "0.9.12"
 pyo3 = "0.30.1"
 rayon = "1.12.0"
 rars = { version = "0.13.0", path = "crates/rars" }
