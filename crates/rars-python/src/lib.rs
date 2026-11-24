@@ -1241,6 +1241,8 @@ impl RarInfo {
 
 /// An archive opened from a bytes-like object (`bytes`, `bytearray`, `memoryview`,
 /// `mmap`...), a path (`str` or `PathLike`) or a binary file object.
+///
+/// `mode` may only be `"r"`, as `RarFile` only reads; `RarBuilder` writes.
 #[pyclass(module = "rars")]
 struct RarFile {
     identity: Arc<()>,
@@ -1353,11 +1355,12 @@ impl RarFile {
     /// in `incomplete_members`. Every later call delivers a damaged member's
     /// bytes, then reports its error to `on_member_error` or raises it.
     #[new]
-    #[pyo3(signature = (source, *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None, salvage = false))]
+    #[pyo3(signature = (source, mode = "r", *, password = None, options = None, cancellation = None, first_volume_only = false, volumes = None, salvage = false))]
     #[allow(clippy::too_many_arguments)] // Python keyword arguments.
     fn new(
         py: Python<'_>,
         source: &Bound<'_, PyAny>,
+        mode: &str,
         password: Option<&Bound<'_, PyAny>>,
         options: Option<&ReadOptions>,
         cancellation: Option<&CancellationToken>,
@@ -1365,6 +1368,11 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
         salvage: bool,
     ) -> PyResult<Self> {
+        if mode != "r" {
+            return Err(PyValueError::new_err(
+                "RarFile only reads, so mode must be 'r'; write archives with RarBuilder",
+            ));
+        }
         let mut call_options = ReadOptions::for_call(options, None, cancellation)?;
         if salvage {
             call_options
@@ -3191,6 +3199,7 @@ impl RarBuilder {
             Err(_) => RarFile::new(
                 py,
                 source,
+                "r",
                 password,
                 options,
                 cancellation,
