@@ -15,8 +15,35 @@ fn unrars(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// Stdout as a terminal shows it: see [`rendered`].
 fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
+    rendered(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// What a terminal shows of `text`: a backspace moves back over the
+/// character before it, for the next to overwrite, and spaces at the end of
+/// a line don't show.
+fn rendered(text: &str) -> String {
+    text.split('\n')
+        .map(|raw| {
+            let mut line: Vec<char> = Vec::new();
+            let mut at = 0;
+            for c in raw.chars() {
+                if c == '\u{8}' {
+                    at = usize::saturating_sub(at, 1);
+                    continue;
+                }
+                if at < line.len() {
+                    line[at] = c;
+                } else {
+                    line.push(c);
+                }
+                at += 1;
+            }
+            line.into_iter().collect::<String>().trim_end().to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn stderr(output: &Output) -> String {
@@ -345,11 +372,12 @@ fn kb_keeps_a_member_that_fails_its_checksum() {
         );
         let text = stdout(&output);
         assert!(text.contains("Total errors: 1"), "{version:?}: {text}");
-        let kept_line = format!(
-            "Extracting  {}\n",
-            Path::new(&out).join("mid.bin").display()
+        let kept_line = format!("Extracting  {}", Path::new(&out).join("mid.bin").display());
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with(&kept_line) && !line.ends_with("OK")),
+            "{version:?}: {text}"
         );
-        assert!(text.contains(&kept_line), "{version:?}: {text}");
         assert!(fs::read(dir.join(&out).join("mid.bin")).unwrap() == damaged);
         assert_eq!(fs::read(dir.join(&out).join("a.txt")).unwrap(), b"hello\n");
         assert_eq!(fs::read(dir.join(&out).join("z.txt")).unwrap(), b"after\n");
@@ -1348,7 +1376,8 @@ fn listings_show_what_unrar_shows() {
     assert!(text.contains("Packed Ratio"), "{text}");
 
     let output = unrars(&dir, &["lt", "-idc", "-psecret", "full.rar"]);
-    let text = stdout(&output);
+    // As written: the Flags line ends in a space.
+    let text = String::from_utf8_lossy(&output.stdout);
     for line in [
         "        Name: a.txt\n        Type: File\n        Size: 6\n",
         &format!("       CRC32: {crc:08X}\n     Host OS: Unix\n"),
@@ -1466,4 +1495,145 @@ fn a_closed_stdout_ends_the_run_quietly() {
         assert_eq!(code, Some(141), "{args:?}: {errors}");
         assert!(errors.is_empty(), "{args:?}: {errors}");
     }
+}
+
+/// The percentages printed in `text`, in order.
+fn percentages(text: &[u8]) -> Vec<u32> {
+    text.split(|&byte| byte == 8)
+        .filter_map(|piece| {
+            let digits = piece.get(..4)?.strip_suffix(b"%")?;
+            std::str::from_utf8(digits).ok()?.trim().parse().ok()
+        })
+        .collect()
+}
+
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// Issue #577: each member's line as unrar 7.20 prints it, terminal or not:
+/// the name, a percentage redrawn with backspaces as the data is read, then
+/// `OK` over the percentage. The percentage is how far into the archive the
+/// member reaches, so the last member's line ends at 100%.
+#[test]
+fn member_lines_show_a_percentage_as_unrar_does() {
+    let dir = scratch::case("unrars-percentages");
+    write(&dir, "plain.rar", None);
+    let start = |verb: &str, name: &str| format!("{verb:<11} {name:<56}     ");
+    let ok = "\u{8}\u{8}\u{8}\u{8}\u{8}  OK ";
+    for (args, verb, names) in [
+        (&["t", "plain.rar"][..], "Testing", ["a.txt", "sub/b.bin"]),
+        (
+            &["x", "-y", "plain.rar", "out/"],
+            "Extracting",
+            ["a.txt", "sub/b.bin"],
+        ),
+    ] {
+        let output = unrars(&dir, args);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut last = 0;
+        for name in names {
+            let name = if verb == "Testing" {
+                name.to_string()
+            } else {
+                Path::new("out/").join(native(name)).display().to_string()
+            };
+            let line = text
+                .lines()
+                .find(|line| line.starts_with(&start(verb, &name)))
+                .unwrap_or_else(|| panic!("{args:?}: {text:?}"));
+            assert!(line.ends_with(ok), "{args:?}: {line:?}");
+            let shown = percentages(line.as_bytes());
+            assert!(!shown.is_empty(), "{args:?}: {line:?}");
+            assert!(shown.is_sorted() && shown[0] >= last, "{args:?}: {line:?}");
+            last = *shown.last().unwrap();
+        }
+        assert_eq!(last, 100, "{args:?}: {text:?}");
+    }
+    // A directory has no data, so no percentage.
+    let output = unrars(&dir, &["x", "-y", "plain.rar", "dirs/"]);
+    let created = format!(
+        "{:<11} {:<57} OK\n",
+        "Creating",
+        Path::new("dirs/").join("sub").display()
+    );
+    assert!(
+        String::from_utf8(output.stdout).unwrap().contains(&created),
+        "{created:?}"
+    );
+
+    // -idp leaves the percentages out; -idq and -inul print no lines at all.
+    let output = unrars(&dir, &["t", "-idp", "plain.rar"]);
+    let text = String::from_utf8(output.stdout).unwrap();
+    let line = format!("{:<11} {:<56}  OK \n", "Testing", "a.txt");
+    assert!(text.contains(&line), "{text:?}");
+    assert!(!text.contains('\u{8}'), "{text:?}");
+    for quiet in ["-idq", "-inul"] {
+        let output = unrars(&dir, &["t", quiet, "plain.rar"]);
+        assert_eq!(output.status.code(), Some(0));
+        assert!(output.stdout.is_empty(), "{quiet}: {:?}", output.stdout);
+    }
+    // p prints only the member, still.
+    let output = unrars(&dir, &["p", "plain.rar", "a.txt"]);
+    assert_eq!(output.stdout, b"hello\n");
+}
+
+/// Issue #577: through a volume set the percentage keeps climbing, and a
+/// member split across volumes goes on in a `...` line after each volume's
+/// `Testing archive` line, ending with `OK` in its last.
+#[test]
+fn a_split_member_goes_on_in_each_volume() {
+    let dir = scratch::case("unrars-percentages-volumes");
+    let count = write_set(&dir);
+    for args in [&["t", "set.part1.rar"][..], &["t", "-idp", "set.part1.rar"]] {
+        let output = unrars(&dir, args);
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let shown = percentages(&output.stdout);
+        if args.contains(&"-idp") {
+            assert!(shown.is_empty(), "{shown:?}");
+        } else {
+            assert!(shown.is_sorted(), "{shown:?}");
+            assert_eq!(shown.last(), Some(&100), "{shown:?}");
+        }
+        let text = stdout(&output);
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("Testing     big.bin") && !line.ends_with("OK")),
+            "{text}"
+        );
+        for part in 2..=count {
+            let header = format!("Testing archive set.part{part}.rar\n\n...         big.bin");
+            assert!(text.contains(&header), "{args:?}: {text}");
+        }
+        let continued: Vec<_> = text
+            .lines()
+            .filter(|line| line.starts_with("...         big.bin"))
+            .collect();
+        assert_eq!(continued.len(), count - 1, "{text}");
+        assert!(continued.last().unwrap().ends_with("OK"), "{text}");
+    }
+}
+
+/// Issue #577: with `-or`, a file written beside an existing one is named on
+/// its line by the name it gets.
+#[test]
+fn or_names_the_renamed_file_on_its_line() {
+    let dir = scratch::case("unrars-percentages-rename");
+    write(&dir, "plain.rar", None);
+    fs::create_dir_all(dir.join("out")).unwrap();
+    fs::write(dir.join("out/a.txt"), b"old\n").unwrap();
+    let output = unrars(&dir, &["x", "-or", "plain.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    let renamed = format!(
+        "Extracting  {}",
+        Path::new("out/").join("a(1).txt").display()
+    );
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&renamed) && line.ends_with("OK")),
+        "{text}"
+    );
+    assert_eq!(fs::read(dir.join("out/a(1).txt")).unwrap(), b"hello\n");
 }
