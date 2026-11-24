@@ -1066,3 +1066,218 @@ fn kb_keeps_a_split_member_up_to_a_missing_volume() {
     assert!(!kept.is_empty() && kept.len() < payload().len());
     assert_eq!(kept, payload()[..kept.len()]);
 }
+
+/// `a.txt`, `info.nfo` and `sub/` holding `a.txt`, `b.txt` and `deeper/a.txt`.
+fn write_tree(path: &Path) {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder.add_directory(b"sub".to_vec(), None, None).unwrap();
+    for name in [
+        "a.txt",
+        "info.nfo",
+        "sub/a.txt",
+        "sub/b.txt",
+        "sub/deeper/a.txt",
+    ] {
+        builder
+            .add_bytes(
+                name.as_bytes().to_vec(),
+                name.as_bytes().to_vec(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    builder.write_to_path(path, None).unwrap();
+}
+
+/// Issue #568: the switches that choose which files are written, and where.
+#[test]
+fn selection_and_destination_switches() {
+    let dir = scratch::case("unrars-selection-switches");
+    write_tree(&dir.join("tree.rar"));
+    let all = [
+        "a.txt",
+        "info.nfo",
+        "sub/a.txt",
+        "sub/b.txt",
+        "sub/deeper/a.txt",
+    ];
+    for (switches, out, files) in [
+        (
+            &["-x*.nfo"][..],
+            "x",
+            &["a.txt", "sub/a.txt", "sub/b.txt", "sub/deeper/a.txt"][..],
+        ),
+        (&["-x*.nfo", "-xsub"], "x2", &all[..1]),
+        (&["-n*.nfo"], "n", &all[1..2]),
+        (
+            &["-n*.txt", "-xsub/deeper"],
+            "nx",
+            &["a.txt", "sub/a.txt", "sub/b.txt"],
+        ),
+        (&["-apsub"], "ap", &["a.txt", "b.txt", "deeper/a.txt"]),
+        (&["-ap/sub/"], "ap2", &["a.txt", "b.txt", "deeper/a.txt"]),
+        (&["-ad", "-x*.txt"], "ad", &["tree/info.nfo"]),
+        (&["-ep", "-o+"], "ep", &["a.txt", "b.txt", "info.nfo"]),
+    ] {
+        let destination = format!("{out}/");
+        let mut args = vec!["x", "-idq"];
+        args.extend(switches);
+        args.extend(["tree.rar", &destination]);
+        let output = unrars(&dir, &args);
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{switches:?}: {}",
+            stderr(&output)
+        );
+        assert_eq!(files_under(&dir.join(out)), files, "{switches:?}");
+    }
+    assert_eq!(fs::read(dir.join("ap/b.txt")).unwrap(), b"sub/b.txt");
+
+    let list = dir.join("excluded.lst");
+    fs::write(&list, "*.nfo\r\nsub\n").unwrap();
+    let output = unrars(&dir, &["x", "-idq", "-x@excluded.lst", "tree.rar", "list/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(files_under(&dir.join("list")), ["a.txt"]);
+
+    let output = unrars(&dir, &["x", "-idq", "-optarget", "tree.rar", "a.txt"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(files_under(&dir.join("target")), ["a.txt"]);
+
+    assert_eq!(
+        stdout(&unrars(&dir, &["lb", "-x*.txt", "tree.rar"])),
+        "sub\ninfo.nfo\n"
+    );
+}
+
+/// Issue #568: a switch unrars can't honour is refused by name, not ignored.
+#[test]
+fn unsupported_selection_switches_are_refused() {
+    let dir = scratch::case("unrars-refused-switches");
+    write_tree(&dir.join("tree.rar"));
+    for switch in [
+        "-ta20200101",
+        "-tb2020",
+        "-sl100",
+        "-f",
+        "-u",
+        "-ep3",
+        "-ad1",
+        "-ola",
+        "-cl",
+    ] {
+        let output = unrars(&dir, &["x", switch, "tree.rar", "out/"]);
+        assert_eq!(output.status.code(), Some(7), "{switch}");
+        assert_eq!(
+            stderr(&output).trim_end(),
+            format!("ERROR: unrars does not support the {switch} switch yet"),
+        );
+        assert!(!dir.join("out").exists(), "{switch}");
+    }
+    // Cosmetic ones are still accepted.
+    let output = unrars(&dir, &["x", "-idq", "-ai", "-c-", "tree.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
+
+/// Issue #568: `-ol-` leaves symbolic links out.
+#[cfg(unix)]
+#[test]
+fn ol_minus_leaves_symlinks_out() {
+    let dir = scratch::case("unrars-ol-minus");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"a.txt".to_vec(), b"hello\n".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_unix_symlink(b"link.txt".to_vec(), b"a.txt".to_vec(), false, None, None)
+        .unwrap();
+    builder.write_to_path(&dir.join("ln.rar"), None).unwrap();
+    let output = unrars(&dir, &["x", "-idq", "-ol-", "ln.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(fs::symlink_metadata(dir.join("out/link.txt")).is_err());
+    assert_eq!(fs::read(dir.join("out/a.txt")).unwrap(), b"hello\n");
+    let output = unrars(&dir, &["x", "-idq", "ln.rar", "links/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(fs::symlink_metadata(dir.join("links/link.txt"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+/// Issue #568: `-ierr` sends every message to stderr, listings included;
+/// `p` still writes the file's bytes to stdout.
+#[test]
+fn ierr_sends_messages_to_stderr() {
+    let dir = scratch::case("unrars-ierr");
+    write(&dir, "plain.rar", None);
+    for args in [
+        &["x", "-ierr", "plain.rar", "out/"][..],
+        &["l", "-ierr", "plain.rar"],
+    ] {
+        let output = unrars(&dir, args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {}", stdout(&output));
+        assert!(stderr(&output).contains("a.txt"), "{args:?}");
+    }
+    let output = unrars(&dir, &["p", "-ierr", "-idc", "plain.rar", "a.txt"]);
+    assert_eq!(output.stdout, b"hello\n");
+}
+
+/// Issue #568: with no terminal, the password is read from a line of stdin.
+#[test]
+fn reads_a_password_from_stdin() {
+    let dir = scratch::case("unrars-stdin-password");
+    write(&dir, "enc.rar", Some(b"secret"));
+    for (args, out, prompt) in [
+        (
+            &["x", "-idq"][..],
+            "asked/",
+            "Enter password (will not be echoed) for a.txt: ",
+        ),
+        (
+            &["x", "-idq", "-p"],
+            "given/",
+            "Enter password (will not be echoed): ",
+        ),
+    ] {
+        let mut args = args.to_vec();
+        args.extend(["enc.rar", out]);
+        let output = unrars_with_input(&dir, &args, b"secret\n");
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{args:?}: {}",
+            stderr(&output)
+        );
+        assert!(stderr(&output).contains(prompt), "{}", stderr(&output));
+        assert_eq!(fs::read(dir.join(out).join("a.txt")).unwrap(), b"hello\n");
+    }
+    // Nothing on stdin: the members that need it fail.
+    let output = unrars(&dir, &["x", "-idq", "enc.rar", "none/"]);
+    assert_eq!(output.status.code(), Some(11), "{}", stderr(&output));
+    let output = unrars(&dir, &["x", "-idq", "-p", "enc.rar", "none/"]);
+    assert_eq!(output.status.code(), Some(12), "{}", stderr(&output));
+}
+
+/// Issue #568: RAR 4 keeps no password check, so a wrong password reads as
+/// a damaged member, as unrar says.
+#[test]
+fn a_wrong_rar4_password_is_a_checksum_error() {
+    let dir = scratch::case("unrars-rar4-password");
+    let mut builder = Builder::new(ArchiveVersion::Rar29)
+        .store(true)
+        .password(Some(b"secret".to_vec()));
+    builder
+        .add_bytes(b"a.txt".to_vec(), b"hello\n".to_vec(), None, None)
+        .unwrap();
+    builder.write_to_path(&dir.join("enc4.rar"), None).unwrap();
+    let output = unrars(&dir, &["x", "-idq", "-pwrong", "enc4.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        stderr(&output),
+        "Checksum error in the encrypted file a.txt. Corrupt file or wrong password.\n"
+    );
+    let output = unrars(&dir, &["x", "-idq", "-psecret", "enc4.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+}
