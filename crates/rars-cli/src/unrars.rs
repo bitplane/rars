@@ -346,8 +346,7 @@ fn run_archive(
     read: &mut HashSet<PathBuf>,
 ) {
     let may_ask = invocation.password == PasswordSwitch::Unset;
-    let salvage = salvaging(invocation);
-    let archive = match open_archive(path, password, may_ask, salvage) {
+    let archive = match open_archive(path, password, may_ask) {
         Ok(archive) => archive,
         Err(error) => {
             if let Some(code) = report_open_failure(out, path, &error) {
@@ -366,6 +365,9 @@ fn run_archive(
     }
     match invocation.command {
         Command::List { bare } => {
+            if report_header_damage(out, &archive) > 0 {
+                tally.fail(CHECKSUM);
+            }
             list(invocation, path, &archive, bare);
             tally.worked += 1;
             if report_truncation(out, archive.truncation()) {
@@ -434,20 +436,24 @@ fn prompt_password() -> Option<Password> {
     Some(Zeroizing::new(line.into_bytes()))
 }
 
-/// `-kb` reads past damage when extracting.
-fn salvaging(invocation: &Invocation) -> bool {
-    invocation.keep_broken && matches!(invocation.command, Command::Extract { .. })
+/// Whether testing or extracting reads past damage: always where `-kb` keeps
+/// what it reads, and where the archive, or a volume after it, may be
+/// damaged. Members are then read one at a time, so an archive that parsed
+/// clean is read without it.
+fn salvaging(invocation: &Invocation, archive: &Archive) -> bool {
+    invocation.keep_broken
+        || archive.is_volume()
+        || archive.truncation().is_some()
+        || !archive.header_damage().is_empty()
 }
 
 fn open_archive(
     path: &Path,
     password: &mut Option<Password>,
     may_ask: bool,
-    salvage: bool,
 ) -> rars::Result<Archive> {
-    let read = |password: &Option<Password>| {
-        read_archive(path, password.as_deref().map(Vec::as_slice), salvage)
-    };
+    let read =
+        |password: &Option<Password>| read_archive(path, password.as_deref().map(Vec::as_slice));
     match read(password) {
         Err(error) if may_ask && password.is_none() && needs_password(&error) => {
             *password = prompt_password();
@@ -460,15 +466,18 @@ fn open_archive(
     }
 }
 
-/// Reads an archive or volume. A password that fits none of its files'
-/// password checks fails each of those files as it is reached, as with
-/// unrar, rather than the whole archive: only encrypted headers need it to
-/// be right before anything can be read.
-fn read_archive(path: &Path, password: Option<&[u8]>, salvage: bool) -> rars::Result<Archive> {
+/// Reads an archive or volume, as unrar does, for whatever it still holds:
+/// past damaged headers, and up to where a cut file ends.
+///
+/// A password that fits none of its files' password checks fails each of
+/// those files as it is reached, as with unrar, rather than the whole
+/// archive: only encrypted headers need it to be right before anything can
+/// be read.
+fn read_archive(path: &Path, password: Option<&[u8]>) -> rars::Result<Archive> {
     let read = |password: Option<&[u8]>| {
         ArchiveReader::read_path_with_options(
             path,
-            ArchiveReadOptions::with_optional_password(password).with_salvage(salvage),
+            ArchiveReadOptions::with_optional_password(password).with_salvage(true),
         )
     };
     match read(password) {
@@ -766,8 +775,8 @@ fn run_members(
     tally: &mut Tally,
     read: &mut HashSet<PathBuf>,
 ) {
-    let salvage = salvaging(invocation);
-    let options = ArchiveReadOptions::with_optional_password(password).with_salvage(salvage);
+    let options = ArchiveReadOptions::with_optional_password(password)
+        .with_salvage(salvaging(invocation, archive));
     let command = invocation.command;
     let announce = move |volume: &Path| match command {
         Command::Extract { .. } => out.info(&format!("\nExtracting from {}\n", volume.display())),
@@ -794,7 +803,7 @@ fn run_members(
         }
         index += 1;
         announce(&next);
-        let volume = read_archive(&next, password, salvage);
+        let volume = read_archive(&next, password);
         lock(read_later).push(next);
         if let Ok(volume) = &volume {
             later_header_errors.fetch_add(report_header_damage(out, volume), Ordering::Relaxed);
@@ -1169,17 +1178,26 @@ fn member_error_line(member: &str, error: &rars::Error) -> (String, i32) {
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             (format!("Incorrect password for {member}"), BAD_PASSWORD)
         }
+        // Such as a compression method from a later version, or one that
+        // damage made up.
+        ErrorKind::UnsupportedFeature | ErrorKind::UnsupportedFormat => (
+            format!("Unknown method in {member}\nYou may need a newer version of RAR."),
+            FATAL,
+        ),
         _ => (format!("ERROR: {error}"), FATAL),
     }
 }
 
-/// Reports the damaged headers `-kb` read past as unrar does, returning the
+/// Reports the damaged headers read past as unrar does, returning the
 /// errors unrar would count for them.
 fn report_header_damage(out: Out, archive: &Archive) -> usize {
     let mut errors = 0;
     for damage in archive.header_damage() {
         let Some(name) = header_member(archive, damage.offset) else {
             out.error("Corrupt header is found");
+            if damage.offset == main_header_offset(archive) {
+                out.error("Main archive header is corrupt");
+            }
             errors += 1;
             continue;
         };
@@ -1194,6 +1212,15 @@ fn report_header_damage(out: Out, archive: &Archive) -> usize {
         errors += 2;
     }
     errors
+}
+
+/// Where the main archive header starts: straight after the signature.
+fn main_header_offset(archive: &Archive) -> u64 {
+    let signature = match archive.family() {
+        rars::ArchiveFamily::Rar50Plus => 8,
+        _ => 7,
+    };
+    (archive.sfx_offset() + signature) as u64
 }
 
 /// The name of the file whose header is at `offset`.
