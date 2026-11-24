@@ -6173,7 +6173,10 @@ mod tests {
         let pixels = noisy_rgb(1200 * 1024);
         let cases = [
             (&mono, FilterSpec::whole(FilterKind::Audio { channels: 1 })),
-            (&pixels, FilterSpec::whole(FilterKind::Delta { channels: 3 })),
+            (
+                &pixels,
+                FilterSpec::whole(FilterKind::Delta { channels: 3 }),
+            ),
         ];
         for (data, filter) in cases {
             for level in 1..=3 {
