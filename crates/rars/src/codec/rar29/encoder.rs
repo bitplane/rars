@@ -795,6 +795,10 @@ pub struct EncodeOptions {
     /// Whether a block's tokens may be cut into several blocks, each with
     /// tables of its own, where the cuts price smaller than one table.
     pub split_blocks: bool,
+    /// Whether the lazy parse also takes three-byte matches under 8 KiB and
+    /// repeats of two or three bytes at a remembered offset, which its
+    /// four-byte chains cannot offer. A greedy parse ignores it.
+    pub near_matches: bool,
 }
 
 impl EncodeOptions {
@@ -807,6 +811,7 @@ impl EncodeOptions {
             block_size: None,
             optimal_parse_passes: 0,
             split_blocks: false,
+            near_matches: false,
         }
     }
 
@@ -841,6 +846,11 @@ impl EncodeOptions {
 
     pub const fn with_split_blocks(mut self, enabled: bool) -> Self {
         self.split_blocks = enabled;
+        self
+    }
+
+    pub const fn with_near_matches(mut self, enabled: bool) -> Self {
+        self.near_matches = enabled;
         self
     }
 
@@ -2853,16 +2863,42 @@ fn parse_range<C: Candidates>(
     let mut next_report = 0usize;
     let mut pending_match: Option<MatchCandidate> = None;
     let mut pos = start;
+    // Filled from the history a near match can reach, so a block parses the
+    // same whether the bytes before it were parsed in this call or another.
+    let near_pays = options.lazy_matching
+        && options.near_matches
+        && !NearMatches::looks_random(&data[start..end]);
+    let mut near = near_pays.then(|| {
+        let mut near = NearMatches::new();
+        for history_pos in start.saturating_sub(MAX_THREE_BYTE_OFFSET)..start {
+            near.insert(data, history_pos);
+        }
+        near
+    });
+    let insert = |finder: &mut C, near: &mut Option<NearMatches>, pos: usize| {
+        finder.insert(data, pos);
+        if let Some(near) = near {
+            near.insert(data, pos);
+        }
+    };
     while pos < end {
-        let candidate = pending_match
-            .take()
-            .or_else(|| best_match_before(data, pos, end, pos, finder, options, &state));
+        let candidate = pending_match.take().or_else(|| {
+            best_match_before(data, pos, end, pos, finder, options, &state, near.as_ref())
+        });
         if let Some(candidate) = candidate {
-            let (emit_literal, cached_next) =
-                lazy_match_decision(data, pos, end, finder, options, &state, candidate);
+            let (emit_literal, cached_next) = lazy_match_decision(
+                data,
+                pos,
+                end,
+                finder,
+                options,
+                &state,
+                candidate,
+                near.as_ref(),
+            );
             if emit_literal {
                 tokens.push(EncodeToken::Literal(data[pos]));
-                finder.insert(data, pos);
+                insert(finder, &mut near, pos);
                 pos += 1;
                 pending_match = cached_next;
                 continue;
@@ -2874,12 +2910,12 @@ fn parse_range<C: Candidates>(
             });
             state.remember(length, offset);
             for history_pos in pos..pos + length {
-                finder.insert(data, history_pos);
+                insert(finder, &mut near, history_pos);
             }
             pos += length;
         } else {
             tokens.push(EncodeToken::Literal(data[pos]));
-            finder.insert(data, pos);
+            insert(finder, &mut near, pos);
             pos += 1;
         }
         let consumed = pos - start;
@@ -2903,6 +2939,7 @@ fn parse_range<C: Candidates>(
 /// better match starts within the lazy lookahead window. Also returns the
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
+#[allow(clippy::too_many_arguments)]
 fn lazy_match_decision<C: Candidates>(
     input: &[u8],
     pos: usize,
@@ -2911,6 +2948,7 @@ fn lazy_match_decision<C: Candidates>(
     options: EncodeOptions,
     state: &EncoderMatchState,
     current: MatchCandidate,
+    near: Option<&NearMatches>,
 ) -> (bool, Option<MatchCandidate>) {
     if !options.lazy_matching {
         return (false, None);
@@ -2921,7 +2959,7 @@ fn lazy_match_decision<C: Candidates>(
         if pos + offset >= end {
             break;
         }
-        let next = best_match_before(input, pos + offset, end, pos, finder, options, state);
+        let next = best_match_before(input, pos + offset, end, pos, finder, options, state, near);
         if offset == 1 {
             cached_next = next;
         }
@@ -3355,9 +3393,103 @@ fn best_match(
     options: EncodeOptions,
     state: &EncoderMatchState,
 ) -> Option<MatchCandidate> {
-    best_match_before(input, pos, end, pos, finder, options, state)
+    best_match_before(input, pos, end, pos, finder, options, state, None)
 }
 
+/// The newest position of each three-byte hash, for the matches the
+/// four-byte chains cannot offer: three bytes under 8 KiB.
+///
+/// Only the lazy parse keeps it. The shortest-path parse finds these matches
+/// its own way, and the levels that ask for it beat a lazy parse without them
+/// by 4% to 7% on binaries, much of which this takes back: on a 4 MiB shared
+/// object, with repeats of two and three bytes as well, the lazy parse at
+/// level 3 comes out 1.45 MB against 1.51 MB, and rar 3.93 `-m3` packs
+/// 1.45 MB. A greedy parse has no second look to undo a short match that costs
+/// it a longer one next, so it goes without.
+///
+/// Two-byte matches at short offsets were offered too, and dropped. The lazy
+/// parse prices a literal at eight bits, so every one of them looked cheaper
+/// than the two literals it replaced, and random data offers one every few
+/// hundred bytes: a member of noise coded larger than stored. Over the bench
+/// corpus they were worth 0.3% on the unstripped ELF and cost up to 1.3% on
+/// text, and the totals came out within 0.03% of each other.
+struct NearMatches {
+    triples: Vec<u32>,
+}
+
+impl NearMatches {
+    const EMPTY: u32 = u32::MAX;
+    /// Hashed, and small, because a block parses with a table of its own and
+    /// it is cleared for every one: the newest position is all it keeps, and
+    /// a three-byte match reaches back only 8 KiB.
+    const TRIPLE_BITS: u32 = 14;
+
+    fn new() -> Self {
+        Self {
+            triples: vec![Self::EMPTY; 1 << Self::TRIPLE_BITS],
+        }
+    }
+
+    fn triple(data: &[u8], pos: usize) -> usize {
+        let bytes =
+            u32::from(data[pos]) << 16 | u32::from(data[pos + 1]) << 8 | u32::from(data[pos + 2]);
+        (bytes.wrapping_mul(2_654_435_761) >> (32 - Self::TRIPLE_BITS)) as usize
+    }
+
+    fn insert(&mut self, data: &[u8], pos: usize) {
+        if pos + 3 <= data.len() {
+            self.triples[Self::triple(data, pos)] = pos as u32;
+        }
+    }
+
+    /// Whether a block's bytes are spread so evenly that short matches are
+    /// not worth looking for: more than 7.5 bits a byte of order-0 entropy.
+    ///
+    /// Already-compressed data offers a three-byte match now and then and
+    /// nothing longer, so every position looked one up for nothing. On a 32 MiB
+    /// tar of compressed files at level 3 that cost 15% more time for 0.11%,
+    /// where executables gain 2.3% for 6%.
+    fn looks_random(block: &[u8]) -> bool {
+        if block.is_empty() {
+            return true;
+        }
+        let mut counts = [0u32; 256];
+        for &byte in block {
+            counts[usize::from(byte)] += 1;
+        }
+        let len = block.len() as f64;
+        let entropy: f64 = counts
+            .iter()
+            .filter(|&&count| count != 0)
+            .map(|&count| {
+                let p = f64::from(count) / len;
+                -p * p.log2()
+            })
+            .sum();
+        entropy > 7.5
+    }
+
+    /// The newest earlier position sharing `pos`'s three-byte hash.
+    fn candidate(&self, data: &[u8], pos: usize) -> Option<usize> {
+        if pos + 3 > data.len() {
+            return None;
+        }
+        let slot = self.triples[Self::triple(data, pos)];
+        (slot != Self::EMPTY && (slot as usize) < pos).then_some(slot as usize)
+    }
+}
+
+/// The shortest match the four-byte chains offer.
+const MIN_CHAIN_MATCH: usize = 4;
+
+/// How far a three-byte fresh match reaches: past it the format adds a byte
+/// to every fresh length.
+const MAX_THREE_BYTE_OFFSET: usize = 0x2000 - 1;
+
+/// From this length on, a match is not worth looking for a near one beside.
+const NEAR_MATCH_LIMIT: usize = 8;
+
+#[allow(clippy::too_many_arguments)]
 fn best_match_before<C: Candidates>(
     input: &[u8],
     pos: usize,
@@ -3366,6 +3498,7 @@ fn best_match_before<C: Candidates>(
     finder: &C,
     options: EncodeOptions,
     state: &EncoderMatchState,
+    near: Option<&NearMatches>,
 ) -> Option<MatchCandidate> {
     let max_offset = pos.min(options.max_match_distance).min(MAX_HISTORY);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
@@ -3382,12 +3515,23 @@ fn best_match_before<C: Candidates>(
     let shares_prefix = |candidate: usize| {
         u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap()) == prefix
     };
+    // A remembered offset codes a repeat as short as two bytes, which a parse
+    // keeping near matches takes where it prices in.
+    let min_repeat = if near.is_some() { 2 } else { MIN_CHAIN_MATCH };
     for offset in state.old_offsets {
-        if offset == 0 || offset > max_offset || !shares_prefix(pos - offset) {
+        if offset == 0 || offset > max_offset {
+            continue;
+        }
+        let from = pos - offset;
+        let shares = match near {
+            Some(_) => input[from..from + 2] == input[pos..pos + 2],
+            None => shares_prefix(from),
+        };
+        if !shares {
             continue;
         }
         let length = match_length(input, pos, offset, max_length);
-        consider_match_candidate(&mut best, state, length, offset);
+        consider_match_candidate(&mut best, state, length, offset, min_repeat);
     }
     if let Some(best) = best {
         if best.length == max_length {
@@ -3408,7 +3552,7 @@ fn best_match_before<C: Candidates>(
         let best_length = best.map_or(0, |best: MatchCandidate| best.length);
         if input[candidate + best_length] == input[pos + best_length] && shares_prefix(candidate) {
             let length = match_length(input, pos, offset, max_length);
-            consider_match_candidate(&mut best, state, length, offset);
+            consider_match_candidate(&mut best, state, length, offset, MIN_CHAIN_MATCH);
         }
         if best.is_some_and(|candidate| candidate.length == max_length) {
             break;
@@ -3417,6 +3561,18 @@ fn best_match_before<C: Candidates>(
             break;
         }
         candidate = finder.previous(candidate);
+    }
+    if let Some(near) = near.filter(|_| best.is_none_or(|best| best.length < NEAR_MATCH_LIMIT)) {
+        if let Some(from) = near.candidate(input, pos) {
+            let offset = pos - from;
+            if offset <= max_offset
+                && offset <= MAX_THREE_BYTE_OFFSET
+                && input[from..from + 3] == input[pos..pos + 3]
+            {
+                let length = match_length(input, pos, offset, max_length);
+                consider_match_candidate(&mut best, state, length, offset, 3);
+            }
+        }
     }
     best
 }
@@ -3430,8 +3586,9 @@ fn consider_match_candidate(
     state: &EncoderMatchState,
     length: usize,
     offset: usize,
+    min_length: usize,
 ) {
-    if length < 4 {
+    if length < min_length {
         return;
     }
     let Ok(cost) = estimated_match_cost(state, length, offset) else {

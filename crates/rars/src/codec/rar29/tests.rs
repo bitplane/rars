@@ -380,7 +380,17 @@ fn should_lazy_emit_literal(
     state: &EncoderMatchState,
     current: MatchCandidate,
 ) -> bool {
-    lazy_match_decision(input, pos, input.len(), finder, options, state, current).0
+    lazy_match_decision(
+        input,
+        pos,
+        input.len(),
+        finder,
+        options,
+        state,
+        current,
+        None,
+    )
+    .0
 }
 
 use super::{
@@ -2140,7 +2150,7 @@ fn match_field_encoders_reject_values_outside_the_wire_ranges() {
             Err(Error::InvalidData(message))
         );
         let mut candidate = None;
-        super::consider_match_candidate(&mut candidate, &state, length, offset);
+        super::consider_match_candidate(&mut candidate, &state, length, offset, 4);
         assert_eq!(candidate, None);
     }
 }
@@ -5668,4 +5678,60 @@ fn a_ppmd_member_codes_with_escapes_or_as_literals_whichever_is_smaller() {
         };
         assert_eq!(&decoded.unwrap(), member, "member {index}");
     }
+}
+
+/// Three-byte words from a small vocabulary, each followed by a byte of
+/// noise, so the words repeat close by while no four bytes do.
+fn three_byte_words(len: usize) -> Vec<u8> {
+    let mut state = 0x2545_f491_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let words: Vec<[u8; 3]> = (0..32)
+        .map(|_| {
+            let bits = next();
+            [bits as u8, (bits >> 8) as u8, (bits >> 16) as u8]
+        })
+        .collect();
+    let mut out = Vec::with_capacity(len + 4);
+    while out.len() < len {
+        out.extend_from_slice(&words[next() as usize % words.len()]);
+        out.push(next() as u8);
+    }
+    out.truncate(len);
+    out
+}
+
+#[test]
+fn the_lazy_parse_takes_three_byte_matches_when_asked() {
+    let input = three_byte_words(64 * 1024);
+    let options = EncodeOptions::new(64)
+        .with_lazy_matching(true)
+        .with_block_size(16 * 1024);
+    let without = Unpack29Encoder::with_options(options)
+        .encode_member(&input)
+        .unwrap();
+    let with = Unpack29Encoder::with_options(options.with_near_matches(true))
+        .encode_member(&input)
+        .unwrap();
+    assert_eq!(super::unpack29_decode(&with, input.len()).unwrap(), input);
+    assert!(
+        with.len() * 10 < without.len() * 9,
+        "{} with near matches against {} without",
+        with.len(),
+        without.len()
+    );
+    // A greedy parse ignores the option.
+    let greedy = EncodeOptions::new(64).with_block_size(16 * 1024);
+    assert_eq!(
+        Unpack29Encoder::with_options(greedy.with_near_matches(true))
+            .encode_member(&input)
+            .unwrap(),
+        Unpack29Encoder::with_options(greedy)
+            .encode_member(&input)
+            .unwrap()
+    );
 }
