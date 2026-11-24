@@ -110,12 +110,16 @@ pub(super) fn split(start: usize, end: usize, tokens: Vec<EncodeToken>) -> Resul
 
     // cheapest[last] covers marks 0..=last, its final block starting at from[last].
     let units = marks.len() - 1;
+    // Only the symbols the parse uses can count anywhere in it, and pricing
+    // skipped every other one anyway.
+    let used = Used::new(&marks[0].counts, &marks[units].counts);
     let mut cheapest = vec![f64::MAX; units + 1];
     let mut from = vec![0usize; units + 1];
     cheapest[0] = 0.0;
     for last in 1..=units {
         for first in 0..last {
-            let bits = cheapest[first] + estimated(&marks[first].counts, &marks[last].counts);
+            let bits =
+                cheapest[first] + estimated(&used, &marks[first].counts, &marks[last].counts);
             if bits < cheapest[last] {
                 cheapest[last] = bits;
                 from[last] = first;
@@ -164,13 +168,14 @@ pub(super) fn split(start: usize, end: usize, tokens: Vec<EncodeToken>) -> Resul
 ///
 /// Building the codes for every run of units took as long as level 2's whole
 /// lazy parse. This takes a fifth of that, and its cuts packed within 0.01%.
-fn estimated(before: &[usize; TABLE_COUNT], after: &[usize; TABLE_COUNT]) -> f64 {
+fn estimated(used: &Used, before: &[usize; TABLE_COUNT], after: &[usize; TABLE_COUNT]) -> f64 {
     let mut table = [0u8; TABLE_COUNT];
     let mut symbols = 0.0;
-    for alphabet in ALPHABETS {
+    for alphabet in used.alphabets() {
         let mut total = 0usize;
         let mut sum = 0.0;
-        for symbol in alphabet.clone() {
+        for &symbol in alphabet {
+            let symbol = usize::from(symbol);
             let frequency = after[symbol] - before[symbol] + usize::from(symbol == 256);
             if frequency != 0 {
                 total += frequency;
@@ -183,16 +188,45 @@ fn estimated(before: &[usize; TABLE_COUNT], after: &[usize; TABLE_COUNT]) -> f64
         symbols += self_information(total) - sum;
         // Rounded down on both sides, which is near enough to price the table.
         let total_bits = total.ilog2();
-        for symbol in alphabet {
+        for &symbol in alphabet {
+            let symbol = usize::from(symbol);
             let frequency = after[symbol] - before[symbol] + usize::from(symbol == 256);
             if frequency != 0 {
                 table[symbol] = (total_bits - frequency.ilog2()).clamp(1, 15) as u8;
             }
         }
     }
-    (4 * LEVEL_COUNT + level_tokens_bit_cost(&encode_table_level_tokens(&table)) + FRAMING_BITS)
-        as f64
-        + symbols
+    (4 * LEVEL_COUNT + table_level_bit_cost(&table) + FRAMING_BITS) as f64 + symbols
+}
+
+/// The symbols a parse uses, in order, and where each alphabet starts.
+struct Used {
+    symbols: Vec<u16>,
+    /// Where each of [`ALPHABETS`] starts in `symbols`, and where the last ends.
+    bounds: [usize; ALPHABETS.len() + 1],
+}
+
+impl Used {
+    fn new(first: &[usize; TABLE_COUNT], last: &[usize; TABLE_COUNT]) -> Self {
+        let mut symbols = Vec::new();
+        let mut bounds = [0; ALPHABETS.len() + 1];
+        for (index, alphabet) in ALPHABETS.into_iter().enumerate() {
+            bounds[index] = symbols.len();
+            symbols.extend(
+                alphabet
+                    .filter(|&symbol| symbol == 256 || last[symbol] != first[symbol])
+                    .map(|symbol| symbol as u16),
+            );
+        }
+        bounds[ALPHABETS.len()] = symbols.len();
+        Self { symbols, bounds }
+    }
+
+    fn alphabets(&self) -> impl Iterator<Item = &[u16]> {
+        self.bounds
+            .windows(2)
+            .map(|bounds| &self.symbols[bounds[0]..bounds[1]])
+    }
 }
 
 /// `n log2 n`, from a table for the counts most symbols in a block have.

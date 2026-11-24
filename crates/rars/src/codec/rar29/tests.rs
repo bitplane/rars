@@ -5735,3 +5735,73 @@ fn the_lazy_parse_takes_three_byte_matches_when_asked() {
             .unwrap()
     );
 }
+
+#[test]
+fn skipping_literal_runs_still_finds_a_repeat_in_noise() {
+    // The same 48 KiB of noise twice: nothing to find for 48 KiB, then one
+    // long repeat, which a parse skipping ahead has to land in.
+    let once = noise(0x9e37_79b9, 48 * 1024);
+    let input = [once.as_slice(), once.as_slice()].concat();
+    let options = EncodeOptions::new(8).with_block_size(16 * 1024);
+    let every = Unpack29Encoder::with_options(options)
+        .encode_member(&input)
+        .unwrap();
+    let skipping = Unpack29Encoder::with_options(options.with_skip_literal_runs(Some(16)))
+        .encode_member(&input)
+        .unwrap();
+    assert_eq!(
+        super::unpack29_decode(&skipping, input.len()).unwrap(),
+        input
+    );
+    assert!(
+        skipping.len() <= every.len() + 64,
+        "{} skipping against {} looking everywhere",
+        skipping.len(),
+        every.len()
+    );
+    assert!(skipping.len() < once.len() + once.len() / 20);
+    // Data that does not look random is parsed at every byte either way.
+    let words = three_byte_words(64 * 1024);
+    assert_eq!(
+        Unpack29Encoder::with_options(options.with_skip_literal_runs(Some(1)))
+            .encode_member(&words)
+            .unwrap(),
+        Unpack29Encoder::with_options(options)
+            .encode_member(&words)
+            .unwrap()
+    );
+}
+
+#[test]
+fn the_bit_writer_packs_bits_in_the_order_written() {
+    let mut state = 0x1234_5678u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state
+    };
+    let mut bits = BitWriter::default();
+    let mut expected: Vec<bool> = Vec::new();
+    for _ in 0..4096 {
+        let count = (next() % 33) as u8;
+        let value = next();
+        bits.write_bits(value, count);
+        expected.extend((0..count).rev().map(|bit| value >> bit & 1 != 0));
+        if next() % 7 == 0 {
+            let bit = next() & 1 != 0;
+            bits.write_bit(bit);
+            expected.push(bit);
+        }
+    }
+    let packed = bits.finish();
+    assert_eq!(packed.len(), expected.len().div_ceil(8));
+    let mut unpacked: Vec<bool> = packed
+        .iter()
+        .flat_map(|&byte| (0..8).rev().map(move |bit| byte >> bit & 1 != 0))
+        .collect();
+    // The last byte is padded with zeroes.
+    assert!(unpacked[expected.len()..].iter().all(|&bit| !bit));
+    unpacked.truncate(expected.len());
+    assert_eq!(unpacked, expected);
+}

@@ -799,6 +799,15 @@ pub struct EncodeOptions {
     /// repeats of two or three bytes at a remembered offset, which its
     /// four-byte chains cannot offer. A greedy parse ignores it.
     pub near_matches: bool,
+    /// In a block that looks random, how many positions in a row may offer no
+    /// match before the parse looks only at every other one, then every third
+    /// after as many again, and so on. `None` looks at every position.
+    ///
+    /// Already-compressed data offers a match now and then and nothing in
+    /// between, so a parse that looks everywhere walks a chain of collisions
+    /// at every byte for nothing. A long repeat is still found a few bytes in.
+    /// See [`SKIP_RANDOM_ABOVE_BITS`] for which blocks look random.
+    pub skip_literal_runs: Option<usize>,
 }
 
 impl EncodeOptions {
@@ -812,6 +821,7 @@ impl EncodeOptions {
             optimal_parse_passes: 0,
             split_blocks: false,
             near_matches: false,
+            skip_literal_runs: None,
         }
     }
 
@@ -851,6 +861,11 @@ impl EncodeOptions {
 
     pub const fn with_near_matches(mut self, enabled: bool) -> Self {
         self.near_matches = enabled;
+        self
+    }
+
+    pub const fn with_skip_literal_runs(mut self, misses: Option<usize>) -> Self {
+        self.skip_literal_runs = misses;
         self
     }
 
@@ -2875,6 +2890,13 @@ fn parse_range<C: Candidates>(
         }
         near
     });
+    // Judged from the block's own bytes, like the near matches, so a block
+    // parses the same wherever the member is cut.
+    let skip_after = options
+        .skip_literal_runs
+        .filter(|_| order0_entropy(&data[start..end]) > SKIP_RANDOM_ABOVE_BITS)
+        .map(|misses| misses.max(1));
+    let mut misses = 0usize;
     let insert = |finder: &mut C, near: &mut Option<NearMatches>, pos: usize| {
         finder.insert(data, pos);
         if let Some(near) = near {
@@ -2886,6 +2908,7 @@ fn parse_range<C: Candidates>(
             best_match_before(data, pos, end, pos, finder, options, &state, near.as_ref())
         });
         if let Some(candidate) = candidate {
+            misses = 0;
             let (emit_literal, cached_next) = lazy_match_decision(
                 data,
                 pos,
@@ -2913,6 +2936,14 @@ fn parse_range<C: Candidates>(
                 insert(finder, &mut near, history_pos);
             }
             pos += length;
+        } else if let Some(skip_after) = skip_after {
+            misses += 1;
+            let run = (1 + misses / skip_after).min(end - pos);
+            for (literal_pos, &byte) in (pos..).zip(&data[pos..pos + run]) {
+                tokens.push(EncodeToken::Literal(byte));
+                insert(finder, &mut near, literal_pos);
+            }
+            pos += run;
         } else {
             tokens.push(EncodeToken::Literal(data[pos]));
             insert(finder, &mut near, pos);
@@ -3450,23 +3481,7 @@ impl NearMatches {
     /// tar of compressed files at level 3 that cost 15% more time for 0.11%,
     /// where executables gain 2.3% for 6%.
     fn looks_random(block: &[u8]) -> bool {
-        if block.is_empty() {
-            return true;
-        }
-        let mut counts = [0u32; 256];
-        for &byte in block {
-            counts[usize::from(byte)] += 1;
-        }
-        let len = block.len() as f64;
-        let entropy: f64 = counts
-            .iter()
-            .filter(|&&count| count != 0)
-            .map(|&count| {
-                let p = f64::from(count) / len;
-                -p * p.log2()
-            })
-            .sum();
-        entropy > 7.5
+        block.is_empty() || order0_entropy(block) > 7.5
     }
 
     /// The newest earlier position sharing `pos`'s three-byte hash.
@@ -3477,6 +3492,34 @@ impl NearMatches {
         let slot = self.triples[Self::triple(data, pos)];
         (slot != Self::EMPTY && (slot as usize) < pos).then_some(slot as usize)
     }
+}
+
+/// Above this much order-0 entropy, in bits a byte, a block looks random
+/// enough for [`EncodeOptions::skip_literal_runs`] to apply.
+///
+/// The threshold the near matches use. On a 32 MiB tar of already-compressed
+/// files, skipping from 7.8 bits rather than 7.5 kept 0.06% more at level 2
+/// for a fifth more time; waiting longer before skipping was the better knob.
+const SKIP_RANDOM_ABOVE_BITS: f64 = 7.5;
+
+/// The order-0 entropy of `block` in bits a byte, 8 for an empty one.
+pub(crate) fn order0_entropy(block: &[u8]) -> f64 {
+    if block.is_empty() {
+        return 8.0;
+    }
+    let mut counts = [0u32; 256];
+    for &byte in block {
+        counts[usize::from(byte)] += 1;
+    }
+    let len = block.len() as f64;
+    counts
+        .iter()
+        .filter(|&&count| count != 0)
+        .map(|&count| {
+            let p = f64::from(count) / len;
+            -p * p.log2()
+        })
+        .sum()
 }
 
 /// The shortest match the four-byte chains offer.
@@ -3780,8 +3823,52 @@ fn encode_table_level_tokens(lengths: &[u8; TABLE_COUNT]) -> Vec<LevelToken> {
 /// and 18 and 19 write zeroes, both regardless of `base`, so runs are found in
 /// the lengths themselves either way.
 fn encode_level_tokens_against(lengths: &[u8], base: &[u8]) -> Vec<LevelToken> {
-    let delta = |pos: usize, value: u8| (value.wrapping_sub(base[pos]) & 0x0f) as usize;
     let mut tokens = Vec::new();
+    level_tokens_against(lengths, base, &mut tokens);
+    tokens
+}
+
+/// What [`level_tokens_bit_cost`] says the outright coding of `lengths`
+/// costs, without keeping the tokens.
+fn table_level_bit_cost(lengths: &[u8; TABLE_COUNT]) -> usize {
+    struct Tally {
+        frequencies: [usize; LEVEL_COUNT],
+        extra_bits: usize,
+    }
+    impl LevelTokens for Tally {
+        fn push(&mut self, token: LevelToken) {
+            self.frequencies[token.symbol] += 1;
+            self.extra_bits += usize::from(token.extra_bits);
+        }
+    }
+    let mut tally = Tally {
+        frequencies: [0; LEVEL_COUNT],
+        extra_bits: 0,
+    };
+    level_tokens_against(lengths, &[0; TABLE_COUNT], &mut tally);
+    let lengths = level_code_lengths_for(tally.frequencies);
+    tally
+        .frequencies
+        .iter()
+        .zip(lengths)
+        .map(|(&count, length)| count * usize::from(length))
+        .sum::<usize>()
+        + tally.extra_bits
+}
+
+/// Where level tokens go as they are found.
+trait LevelTokens {
+    fn push(&mut self, token: LevelToken);
+}
+
+impl LevelTokens for Vec<LevelToken> {
+    fn push(&mut self, token: LevelToken) {
+        Vec::push(self, token);
+    }
+}
+
+fn level_tokens_against(lengths: &[u8], base: &[u8], tokens: &mut impl LevelTokens) {
+    let delta = |pos: usize, value: u8| (value.wrapping_sub(base[pos]) & 0x0f) as usize;
     let mut pos = 0usize;
     let mut previous = None;
     while pos < lengths.len() {
@@ -3792,14 +3879,14 @@ fn encode_level_tokens_against(lengths: &[u8], base: &[u8]) -> Vec<LevelToken> {
         }
 
         if value == 0 {
-            emit_zero_level_run(&mut tokens, pos, run, &delta);
+            emit_zero_level_run(tokens, pos, run, &delta);
             previous = Some(0);
             pos += run;
             continue;
         }
 
         if previous == Some(value) && run >= 3 {
-            emit_repeat_level_run(&mut tokens, run);
+            emit_repeat_level_run(tokens, run);
             pos += run;
             continue;
         }
@@ -3808,7 +3895,6 @@ fn encode_level_tokens_against(lengths: &[u8], base: &[u8]) -> Vec<LevelToken> {
         previous = Some(value);
         pos += 1;
     }
-    tokens
 }
 
 /// What the level tokens cost, so two codings of a table can be compared.
@@ -3823,7 +3909,7 @@ fn level_tokens_bit_cost(tokens: &[LevelToken]) -> usize {
         .sum()
 }
 
-fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
+fn emit_repeat_level_run(tokens: &mut impl LevelTokens, mut run: usize) {
     while run >= 11 {
         let mut chunk = run.min(138);
         if matches!(run - chunk, 1 | 2) {
@@ -3838,7 +3924,7 @@ fn emit_repeat_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
 }
 
 fn emit_zero_level_run(
-    tokens: &mut Vec<LevelToken>,
+    tokens: &mut impl LevelTokens,
     start: usize,
     mut run: usize,
     delta: &dyn Fn(usize, u8) -> usize,
@@ -3861,7 +3947,9 @@ fn emit_zero_level_run(
         } else {
             // A run too short for its own symbol is written out position by
             // position, and each of those is a delta like any other.
-            tokens.extend((pos..pos + run).map(|pos| LevelToken::plain(delta(pos, 0))));
+            for pos in pos..pos + run {
+                tokens.push(LevelToken::plain(delta(pos, 0)));
+            }
             break;
         }
     }
@@ -3881,6 +3969,11 @@ fn level_code_lengths(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {
     for token in tokens {
         frequencies[token.symbol] += 1;
     }
+    level_code_lengths_for(frequencies)
+}
+
+/// [`level_code_lengths`] from how often each level symbol is used.
+fn level_code_lengths_for(frequencies: [usize; LEVEL_COUNT]) -> [u8; LEVEL_COUNT] {
     // One symbol in play gives a code with one branch and an empty slot beside
     // it, which a strict reader rejects. Only the flat assignment pads it.
     if frequencies.iter().filter(|&&count| count != 0).count() <= 1 {
@@ -3930,20 +4023,46 @@ fn canonical_codes(lengths: &[u8]) -> Vec<Option<HuffmanCode>> {
     codes
 }
 
+/// Bits written most significant first, gathered in a word and moved to the
+/// bytes a word at a time.
+///
+/// Pushing each symbol into the bytes as it came was a quarter of the time
+/// level 1 spent on a binary.
 #[derive(Default)]
 struct BitWriter {
     bytes: Vec<u8>,
-    bit_pos: usize,
+    /// The bits not yet in `bytes`, in the low `pending` bits.
+    word: u64,
+    pending: u32,
 }
 
 impl BitWriter {
     fn write_bits(&mut self, value: u32, count: u8) {
-        super::super::fast::write_msb_bits(
-            &mut self.bytes,
-            &mut self.bit_pos,
-            u64::from(value),
-            usize::from(count),
-        );
+        let count = u32::from(count);
+        debug_assert!(count <= 32);
+        if count == 0 {
+            return;
+        }
+        let value = u64::from(value) & ((1u64 << count) - 1);
+        if self.pending + count > 64 {
+            self.flush_bytes();
+        }
+        self.word = (self.word << count) | value;
+        self.pending += count;
+    }
+
+    /// Moves the whole bytes the word holds into `bytes`.
+    fn flush_bytes(&mut self) {
+        let whole = self.pending / 8;
+        if whole == 0 {
+            return;
+        }
+        let rest = self.pending % 8;
+        let out = (self.word >> rest) << (64 - 8 * whole);
+        self.bytes
+            .extend_from_slice(&out.to_be_bytes()[..whole as usize]);
+        self.word &= (1u64 << rest) - 1;
+        self.pending = rest;
     }
 
     fn write_encoded_u32(&mut self, value: u32) {
@@ -3964,17 +4083,14 @@ impl BitWriter {
     }
 
     fn write_bit(&mut self, bit: bool) {
-        if self.bit_pos.is_multiple_of(8) {
-            self.bytes.push(0);
-        }
-        if bit {
-            let shift = 7 - (self.bit_pos % 8);
-            *self.bytes.last_mut().unwrap() |= 1 << shift;
-        }
-        self.bit_pos += 1;
+        self.write_bits(u32::from(bit), 1);
     }
 
-    fn finish(self) -> Vec<u8> {
+    fn finish(mut self) -> Vec<u8> {
+        self.flush_bytes();
+        if self.pending != 0 {
+            self.bytes.push((self.word << (8 - self.pending)) as u8);
+        }
         self.bytes
     }
 }

@@ -165,6 +165,13 @@ pub(crate) trait FilterSearch {
         false
     }
 
+    /// Whether the x86 scanner's regions are taken as it finds them, the pair
+    /// of filters over each, rather than screened by sample encodes. See
+    /// [`OwnedSearch::trusts_x86_scanner`].
+    fn trusts_x86_scanner(&self) -> bool {
+        false
+    }
+
     /// Apply the filters to a copy of `data`, without encoding it.
     ///
     /// This is how a screen prices a filter it can only afford to try on a slice
@@ -257,6 +264,14 @@ pub(crate) trait OwnedSearch {
     fn exhaustive(&self) -> bool {
         false
     }
+    /// Whether [`x86_screened_regions`] keeps every region the scanner
+    /// proposed and converts the jumps with the calls, without a sample
+    /// encode. For a level that would rather be fast: the scanner is right
+    /// about most of what it finds, and the screens were most of what the
+    /// search cost there.
+    fn trusts_x86_scanner(&self) -> bool {
+        false
+    }
     fn filtered_bytes(
         &self,
         data: &[u8],
@@ -323,6 +338,9 @@ impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
     }
     fn exhaustive(&self) -> bool {
         self.0.exhaustive()
+    }
+    fn trusts_x86_scanner(&self) -> bool {
+        self.0.trusts_x86_scanner()
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>> {
         self.0.filtered_bytes(data, filters).map(Buffer::from_vec)
@@ -421,6 +439,9 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     }
     fn exhaustive(&self) -> bool {
         self.search.exhaustive()
+    }
+    fn trusts_x86_scanner(&self) -> bool {
+        self.search.trusts_x86_scanner()
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
@@ -737,6 +758,14 @@ fn x86_screened_regions<S: OwnedSearch>(
         }
         Ok(packed)
     };
+    if search.trusts_x86_scanner() {
+        return Ok(X86Screen {
+            kept: Buffer::collect(regions.iter().cloned(), search.allowance())?,
+            rejected_a_region: false,
+            jumps_pay: !regions.is_empty(),
+            jumps_cost_more: false,
+        });
+    }
     let mut kept = Buffer::new(search.allowance());
     let mut helped = false;
     for region in regions {
@@ -1606,6 +1635,9 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
     }
     fn exhaustive(&self) -> bool {
         self.search.exhaustive()
+    }
+    fn trusts_x86_scanner(&self) -> bool {
+        self.search.trusts_x86_scanner()
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
