@@ -13,6 +13,11 @@ const CHECKER: &str = "crates/rars/tests/unsafe_code_policy.rs";
 #[test]
 fn only_simd_lifts_the_unsafe_code_lint() {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // The published crate carries this test but not the workspace around it.
+    if !repo.join("crates/rars/src/simd.rs").is_file() {
+        eprintln!("not in the rars repository; nothing to check");
+        return;
+    }
     let mut files = Vec::new();
     for dir in ["crates", "fuzz"] {
         rust_files(&repo.join(dir), &mut files);
