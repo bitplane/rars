@@ -1,6 +1,10 @@
 //! RAR13 member encoding and bit emission.
 use super::*;
+use parse::Plan;
 use std::ops::ControlFlow;
+
+#[path = "parse.rs"]
+mod parse;
 
 /// Takes packed bytes and how far into the member they reach; a break stops the coding.
 type PackedOut<'a> = &'a mut dyn FnMut(&[u8], usize) -> Result<ControlFlow<()>>;
@@ -193,6 +197,7 @@ pub struct EncodeOptions {
     lazy_matching: bool,
     stmode_literal_runs: bool,
     max_long_match_distance: usize,
+    priced_parse: bool,
 }
 
 impl EncodeOptions {
@@ -202,6 +207,7 @@ impl EncodeOptions {
             lazy_matching: true,
             stmode_literal_runs: true,
             max_long_match_distance: MAX_LONG_LZ_DISTANCE,
+            priced_parse: false,
         }
     }
 
@@ -222,6 +228,15 @@ impl EncodeOptions {
 
     pub const fn with_max_long_match_distance(mut self, distance: usize) -> Self {
         self.max_long_match_distance = distance;
+        self
+    }
+
+    /// Chooses tokens by the cheapest path through each span of the member,
+    /// priced from the adaptive tables, rather than one at a time. Slower;
+    /// smaller output. The lazy-matching and old-distance switches do not
+    /// apply to it.
+    pub const fn with_priced_parse(mut self, enabled: bool) -> Self {
+        self.priced_parse = enabled;
         self
     }
 
@@ -437,6 +452,7 @@ impl Unpack15Encoder {
             straddle: None,
             stmode_open: false,
             next_report: 0,
+            plan: Plan::default(),
         }
     }
 
@@ -459,10 +475,17 @@ impl Unpack15Encoder {
             input.len().saturating_sub(LOOKAHEAD)
         };
         let buckets = &mut member.finder;
+        let plan = &mut member.plan;
+        let priced = self.options.priced_parse;
         let mut pos = member.pos - base;
         let mut straddle = member.straddle.take();
         if member.stmode_open {
-            if !self.emit_stmode_literal_run(input, Some(&mut *buckets), &mut pos, limit) {
+            if !self.emit_stmode_literal_run(
+                input,
+                Some((&mut *buckets, &mut *plan, base)),
+                &mut pos,
+                limit,
+            ) {
                 member.pos = base + pos;
                 member.straddle = straddle;
                 return Ok(());
@@ -490,19 +513,23 @@ impl Unpack15Encoder {
 
             while flag_bits < 8 && pos < input.len() {
                 let state = plan_encoder.lz_plan_state();
-                let token = plan_encoder
-                    .choose_lz_token(input, pos, buckets, state)
-                    .filter(|token| {
-                        !self.options.lazy_matching
-                            || !should_lazy_emit_literal(
-                                input,
-                                pos,
-                                buckets,
-                                *token,
-                                state.max_dist3,
-                                self.options,
-                            )
-                    });
+                let token = if priced {
+                    plan_encoder.planned_step(plan, input, pos, base + pos, buckets)
+                } else {
+                    plan_encoder
+                        .choose_lz_token(input, pos, buckets, state)
+                        .filter(|token| {
+                            !self.options.lazy_matching
+                                || !should_lazy_emit_literal(
+                                    input,
+                                    pos,
+                                    buckets,
+                                    *token,
+                                    state.max_dist3,
+                                    self.options,
+                                )
+                        })
+                };
                 if let Some(token) = token {
                     let flag = token.flag_bits(state.nlzb, state.nhfb);
                     let next_pos = pos + token.length() as usize;
@@ -512,7 +539,16 @@ impl Unpack15Encoder {
                         pos = next_pos;
                         plan_encoder.emit_payloads(vec![token.into()]);
                         payloads.push(token.into());
+                        plan.consume();
                         continue;
+                    }
+                    if priced {
+                        // The plan counted on this match, so its flag goes
+                        // across the byte rather than giving way to a literal.
+                        straddle = Some(split_flag(&mut flags, flag_bits, flag, token.into()));
+                        pos = next_pos;
+                        plan.consume();
+                        break;
                     }
                 }
 
@@ -525,8 +561,10 @@ impl Unpack15Encoder {
                         EncodedToken::Literal(input[pos]),
                     ));
                     pos += 1;
+                    plan.consume();
                     break;
                 }
+                plan.consume();
                 write_planned_flag_bits(&mut flags, flag_bits, flag);
                 let literal = input[pos];
                 payloads.push(EncodedToken::Literal(input[pos]));
@@ -542,7 +580,12 @@ impl Unpack15Encoder {
             self.emit_payloads(payloads);
             if group_enters_stmode {
                 if self.options.stmode_literal_runs
-                    && !self.emit_stmode_literal_run(input, Some(&mut *buckets), &mut pos, limit)
+                    && !self.emit_stmode_literal_run(
+                        input,
+                        Some((&mut *buckets, &mut *plan, base)),
+                        &mut pos,
+                        limit,
+                    )
                 {
                     member.stmode_open = true;
                     break;
@@ -747,16 +790,28 @@ impl Unpack15Encoder {
     /// Codes literals in stmode until a match turns up or the member ends,
     /// and says whether the run is over. A run that reaches `limit` first
     /// stops there, still open, for the next window to go on with.
+    ///
+    /// `index` is the match index, the plan and the member position of the
+    /// window's first byte. A priced parse follows its plan instead, leaving
+    /// stmode only for a planned match worth the exit code.
     fn emit_stmode_literal_run(
         &mut self,
         input: &[u8],
-        mut buckets: Option<&mut Rar13MatchFinder>,
+        mut index: Option<(&mut Rar13MatchFinder, &mut Plan, usize)>,
         pos: &mut usize,
         limit: usize,
     ) -> bool {
         while *pos + 1 < input.len() {
             if *pos >= limit {
                 return false;
+            }
+            if self.options.priced_parse {
+                if let Some((finder, plan, base)) = index.as_mut() {
+                    if self.planned_stmode_step(plan, input, pos, *base, finder) {
+                        break;
+                    }
+                    continue;
+                }
             }
             let state = LzPlanState {
                 last_dist: self.last_dist,
@@ -768,9 +823,11 @@ impl Unpack15Encoder {
                 nhfb: self.nhfb,
                 l_count: self.l_count,
             };
-            if buckets
-                .as_deref_mut()
-                .and_then(|buckets| find_lz_token(input, *pos, buckets, state, self.options))
+            if index
+                .as_mut()
+                .and_then(|(buckets, _, _)| {
+                    find_lz_token(input, *pos, buckets, state, self.options)
+                })
                 .is_some()
             {
                 break;
@@ -1150,6 +1207,15 @@ impl MatchToken {
         }
     }
 
+    fn distance(self) -> u32 {
+        match self {
+            Self::ShortLz(token) => token.distance,
+            Self::RepeatLast(token) => token.distance,
+            Self::OldDist(token) => token.distance,
+            Self::LongLz(token) => token.distance,
+        }
+    }
+
     fn flag_bits(self, nlzb: u32, nhfb: u32) -> &'static [bool] {
         match self {
             Self::LongLz(_) => long_lz_flag_bits(nlzb > nhfb),
@@ -1220,6 +1286,8 @@ struct MemberState {
     /// A stmode literal run reached the end of the window still open.
     stmode_open: bool,
     next_report: usize,
+    /// The priced parse's steps not yet coded.
+    plan: Plan,
 }
 
 /// A token whose flag did not fit in what was left of a flags byte.

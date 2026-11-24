@@ -1696,6 +1696,7 @@ fn rar15_encode_options_for_level(level: Option<u8>) -> Rar15EncodeOptions {
     let level = usize::from(level.unwrap_or(5));
     let options = Rar15EncodeOptions::new()
         .with_lazy_matching(level == 5)
+        .with_priced_parse(level == 5)
         .with_stmode_literal_runs(level >= 3);
     let max_distance = [
         Some(0),
@@ -5491,10 +5492,10 @@ mod tests {
                 "volumes_stored",
                 "30000:8bae9d7e 30000:9377ff08 10225:5b128e3c",
             ),
-            ("seekable_compressed", "112582:d5db9b77"),
+            ("seekable_compressed", "111209:bd92de39"),
             (
                 "volumes_compressed",
-                "15000:4c426e46 15000:9c9166ff 12492:7e13c63d",
+                "15000:646874aa 15000:a3a0bcef 11119:ed57eeac",
             ),
             ("seekable_encrypted", "240177:fcd81fc7"),
         ];
