@@ -248,11 +248,12 @@ pub struct ArchiveReadOptions<'a> {
     /// at every setting. Each worker holds one batch of blocks, about 256 KiB
     /// packed (a single larger block is at most 16 MiB), and up to 8 MiB of
     /// decoded operations. About 32 MiB of a streamed member's packed input
-    /// is read ahead at most, and a solid archive's later members are read
-    /// ahead until their packed input and decoded operations reach about
-    /// 32 MiB, or one member more. Buffered members of an archive that is not
-    /// solid, readers with `max_reader_workspace_bytes` and calls made from
-    /// inside the thread pool decode serially. Needs the `parallel` feature.
+    /// is read ahead at most. A solid archive's later members are read ahead
+    /// up to three more than there are workers, while their packed input and
+    /// decoded operations stay under about 12 MiB; one larger member is still
+    /// taken. Buffered members of an archive that is not solid, readers with
+    /// `max_reader_workspace_bytes` and calls made from inside the thread pool
+    /// decode serially. Needs the `parallel` feature.
     pub rar50_decode_workers: Option<usize>,
     /// Caps one extraction or test's members decoded side by side, and a large
     /// RAR5/7 member's block decoders (see `rar50_decode_workers`). 0 or 1 keeps

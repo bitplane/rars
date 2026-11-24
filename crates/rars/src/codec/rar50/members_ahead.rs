@@ -7,8 +7,12 @@ use std::sync::{Arc, Mutex};
 
 // Packed input and decoded operations held for members not yet replayed; one
 // larger member is still taken when less is held.
-const HELD_MAX: usize = 32 << 20;
-const DEPTH_PER_WORKER: usize = 4;
+const HELD_MAX: usize = 12 << 20;
+// Replay is slower than decode, so a few members past one per worker keep it
+// fed; more only holds memory. The member being claimed counts, so at least
+// one other must fit.
+const DEPTH_PAST_WORKERS: usize = 3;
+const DEPTH_MIN: usize = 4;
 const DEPTH_MAX: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,7 +79,7 @@ impl<B: Budget> MembersAhead<B> {
         Some(Self {
             pool: decode_pool(workers)?,
             allowance: allowance.clone(),
-            depth: (workers * DEPTH_PER_WORKER).clamp(1, DEPTH_MAX),
+            depth: (workers + DEPTH_PAST_WORKERS).clamp(DEPTH_MIN, DEPTH_MAX),
             queue: VecDeque::new(),
             held: 0,
             carry: None,
