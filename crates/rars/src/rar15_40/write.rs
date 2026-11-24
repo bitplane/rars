@@ -402,11 +402,12 @@ pub fn write_rar29_compressed_archive_with_filter_policy_and_progress(
 /// compressed rather than every input at once.
 ///
 /// `resources` bounds how many members are in flight, which is what keeps the
-/// peak flat across an archive of many files. A RAR 2.0 to 4.x member over
-/// 64 MiB is coded as it is read into a spool in the resources' temp directory,
-/// then written behind a header carrying its sizes. Smaller members, and every
-/// RAR 1.5 member, are compressed whole; one larger than the budget is
-/// compressed on its own rather than refused.
+/// peak flat across an archive of many files. A compressed member over 64 MiB,
+/// other than a RAR 2.0 member given an explicit filter, is coded as it is
+/// read into a spool in the resources' temp directory, then written behind a
+/// header carrying its sizes. Smaller members are compressed whole; one larger
+/// than the budget is compressed on its own rather than refused. A stored
+/// member's source is read twice, once for its checksum and once to copy it.
 pub fn write_streaming_archive_to(
     entries: &[StreamingEntry],
     options: WriterOptions,
