@@ -26,6 +26,7 @@ const MISSING_VOLUME: i32 = 6;
 const USAGE: i32 = 7;
 const NO_FILES: i32 = 10;
 const BAD_PASSWORD: i32 = 11;
+const READ_ERROR: i32 = 12;
 
 #[doc(hidden)]
 pub fn unrars_main() {
@@ -102,6 +103,10 @@ struct Invocation {
     keep_broken: bool,
     /// `-ver`: older copies of a file kept by `rar -ver` are wanted too.
     versions: bool,
+    /// `-vp`: ask before each later volume, and wait for the answer.
+    pause_volumes: bool,
+    /// `-v` with `l`: list every volume of a set, not only the one named.
+    all_volumes: bool,
     /// May hold `*` and `?`, matched against the files in its directory.
     archive: PathBuf,
     masks: Vec<Vec<u8>>,
@@ -146,6 +151,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         done: true,
         keep_broken: false,
         versions: false,
+        pause_volumes: false,
+        all_volumes: false,
         archive: PathBuf::from(words.next().ok_or(())?),
         masks: Vec::new(),
         destination: PathBuf::new(),
@@ -190,6 +197,8 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
             b"p" => invocation.password = PasswordSwitch::Prompt,
             b"inul" => invocation.silent = true,
             b"kb" => invocation.keep_broken = true,
+            b"vp" => invocation.pause_volumes = true,
+            b"v" => invocation.all_volumes = true,
             _ if lower.starts_with(b"ver") => invocation.versions = true,
             _ if lower.starts_with(b"id") => {
                 for flag in &lower[2..] {
@@ -238,6 +247,9 @@ Switches
   -y      Overwrite existing files unless -o- was given
   -p<pwd> Use this password; -p- for none; -p alone to be asked
   -kb     Keep broken extracted files
+  -ver    Extract older file versions too
+  -v      List every volume of a set (l, v)
+  -vp     Ask before each later volume, and wait for the answer on stdin
   -inul   No messages
   -idq    Errors only; -idc no banner; -idd no closing \"All OK\"
   --      End of switches
@@ -346,16 +358,32 @@ fn run_archive(
     read: &mut HashSet<PathBuf>,
 ) {
     let may_ask = invocation.password == PasswordSwitch::Unset;
-    let archive = match open_archive(path, password, may_ask) {
+    let mut path = path.to_path_buf();
+    let mut archive = match open_archive(&path, password, may_ask) {
         Ok(archive) => archive,
         Err(error) => {
-            if let Some(code) = report_open_failure(out, path, &error) {
+            if let Some(code) = report_open_failure(out, &path, &error) {
                 tally.fail(code);
             }
             return;
         }
     };
     let listing = matches!(invocation.command, Command::List { .. });
+    // Named by a later volume, a set is read from its first, as unrar does.
+    if !listing && archive.is_first_volume() == Some(false) {
+        let first = first_volume(&path, &archive).filter(|first| first.is_file());
+        if let Some(first) = first {
+            match open_archive(&first, password, may_ask) {
+                Ok(first_archive) if first_archive.is_first_volume() == Some(true) => {
+                    read.insert(path);
+                    path = first;
+                    archive = first_archive;
+                }
+                _ => {}
+            }
+        }
+    }
+    let path = path.as_path();
     if may_ask
         && !listing
         && password.is_none()
@@ -365,14 +393,9 @@ fn run_archive(
     }
     match invocation.command {
         Command::List { bare } => {
-            if report_header_damage(out, &archive) > 0 {
-                tally.fail(CHECKSUM);
-            }
-            list(invocation, path, &archive, bare);
+            let password = password.as_deref().map(Vec::as_slice);
+            list_volumes(invocation, out, path, archive, password, bare, tally);
             tally.worked += 1;
-            if report_truncation(out, archive.truncation()) {
-                tally.fail(WARNING);
-            }
         }
         _ => run_members(
             invocation,
@@ -383,6 +406,75 @@ fn run_archive(
             tally,
             read,
         ),
+    }
+}
+
+/// The first volume of the set a later volume belongs to, named as RAR names
+/// it beside that volume.
+fn first_volume(path: &Path, archive: &Archive) -> Option<PathBuf> {
+    match archive.volume_naming() {
+        rars::volume_name::VolumeNaming::Part => {
+            let width = rars::volume_name::part_width(path)?;
+            rars::volume_name::part_style(path, 0, width)
+        }
+        rars::volume_name::VolumeNaming::Old => {
+            let upper = path
+                .extension()
+                .and_then(|extension| extension.as_encoded_bytes().first())
+                .is_some_and(u8::is_ascii_uppercase);
+            Some(path.with_extension(if upper { "RAR" } else { "rar" }))
+        }
+    }
+}
+
+/// Lists an archive and, with `-v`, each later volume of its set in turn,
+/// then their grand total.
+fn list_volumes(
+    invocation: &Invocation,
+    out: Out,
+    path: &Path,
+    archive: Archive,
+    password: Option<&[u8]>,
+    bare: bool,
+    tally: &mut Tally,
+) {
+    let mut totals = (0, 0);
+    let mut listed = 0;
+    let mut next = Some((path.to_path_buf(), archive.clone()));
+    while let Some((volume_path, volume)) = next.take() {
+        if report_header_damage(out, &volume) > 0 {
+            tally.fail(CHECKSUM);
+        }
+        let (size, count) = list(invocation, &volume_path, &volume, bare);
+        totals = (totals.0 + size, totals.1 + count);
+        listed += 1;
+        if report_truncation(out, volume.truncation()) {
+            tally.fail(WARNING);
+        }
+        if !invocation.all_volumes || !volume.is_volume() {
+            break;
+        }
+        let Some(later) = archive
+            .volume_path(path, listed)
+            .filter(|later| later.is_file())
+        else {
+            break;
+        };
+        match read_archive(&later, password) {
+            Ok(volume) => next = Some((later, volume)),
+            Err(error) => {
+                if let Some(code) = report_open_failure(out, &later, &error) {
+                    tally.fail(code);
+                }
+            }
+        }
+    }
+    if invocation.all_volumes && !bare {
+        // unrar sets the grand total one column left of each volume's.
+        println!("{:>20}{:>21}", totals.0, totals.1);
+    }
+    if !bare {
+        println!();
     }
 }
 
@@ -531,7 +623,9 @@ fn io_reason(error: &rars::Error) -> String {
     }
 }
 
-fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) {
+/// Lists one archive or volume, returning the size and count of the files
+/// that start in it.
+fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) -> (u64, usize) {
     // unrar lists the older copies `rar -ver` kept, `-ver` or not.
     let members: Vec<_> = archive
         .members()
@@ -542,20 +636,24 @@ fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) {
         for meta in &members {
             println!("{}", display_name(&meta.name));
         }
-        return;
     }
-    let details = match archive.family() {
-        rars::ArchiveFamily::Rar13 => "RAR 1.4",
-        rars::ArchiveFamily::Rar15To40 => "RAR 4",
-        rars::ArchiveFamily::Rar50Plus => "RAR 5",
-        _ => "RAR",
-    };
-    println!("\nArchive: {}\nDetails: {details}\n", path.display());
+    // A member continued from an earlier volume counts where it starts.
+    let starting = members.iter().filter(|meta| !meta.is_split_before);
+    let totals = (
+        starting.clone().map(|meta| meta.unpacked_size).sum(),
+        starting.count(),
+    );
+    if bare {
+        return totals;
+    }
+    println!(
+        "\nArchive: {}\nDetails: {}\n",
+        path.display(),
+        details(archive)
+    );
     println!(" Attributes      Size     Date    Time   Name");
     println!("----------- ---------  ---------- -----  ----");
-    let mut total = 0u64;
     for meta in &members {
-        total += meta.unpacked_size;
         let (date, time) = match meta
             .stored_modification_time()
             .and_then(|time| time.calendar_fields())
@@ -574,11 +672,26 @@ fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) {
         );
     }
     println!("----------- ---------  ---------- -----  ----");
-    println!(
-        " {:<10} {total:>9}                    {}\n",
-        "",
-        members.len()
-    );
+    println!(" {:<10} {:>9}{:>21}", "", totals.0, totals.1);
+    totals
+}
+
+/// The listing's `Details:` line: the format, then what unrar notes about the archive.
+fn details(archive: &Archive) -> String {
+    let mut details = match archive.family() {
+        rars::ArchiveFamily::Rar13 => "RAR 1.4",
+        rars::ArchiveFamily::Rar15To40 => "RAR 4",
+        rars::ArchiveFamily::Rar50Plus => "RAR 5",
+        _ => "RAR",
+    }
+    .to_string();
+    if archive.is_volume() {
+        match archive.volume_index() {
+            Some(index) => details.push_str(&format!(", volume {}", index + 1)),
+            None => details.push_str(", volume"),
+        }
+    }
+    details
 }
 
 fn display_name(name: &[u8]) -> String {
@@ -796,8 +909,21 @@ fn run_members(
     let later_truncation = &truncated;
     let later_volumes = Mutex::new(Vec::new());
     let read_later = &later_volumes;
+    let pause = invocation.pause_volumes;
+    let stdin_closed = AtomicBool::new(false);
+    let closed = &stdin_closed;
     let volumes = std::iter::from_fn(move || {
         let next = archive.volume_path(path, index)?;
+        if pause {
+            match ask_for_volume(out, &next) {
+                Answer::Continue => {}
+                Answer::Quit => return None,
+                Answer::Closed => {
+                    closed.store(true, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
         if !next.exists() {
             return None;
         }
@@ -814,7 +940,7 @@ fn run_members(
         }
         Some(volume)
     });
-    let failures = Failures::new(&wanted);
+    let failures = Failures::new(&wanted, archive, path);
     let result = match command {
         Command::Extract { .. } => extract(invocation, out, archive, volumes, options, &failures),
         _ => {
@@ -852,6 +978,12 @@ fn run_members(
                 tally.worked += 1;
             }
         }
+        Err(_) if stdin_closed.into_inner() => {
+            out.error("Read error in the file stdin");
+            out.info("Program aborted");
+            tally.fail(READ_ERROR);
+            tally.worked += 1;
+        }
         Err(error) => {
             tally.errors += 1;
             tally.fail(report_failure(out, archive, path, &error));
@@ -860,6 +992,30 @@ fn run_members(
             }
             tally.worked += 1;
         }
+    }
+}
+
+/// What the caller said when `-vp` asked for the next volume.
+enum Answer {
+    Continue,
+    Quit,
+    /// Nothing more can be read from stdin.
+    Closed,
+}
+
+/// `-vp`: asks on stderr before the next volume is opened and waits for an
+/// answer on stdin, terminal or not, so a caller can hold the run until the
+/// volume is there.
+fn ask_for_volume(out: Out, next: &Path) -> Answer {
+    if !out.silent {
+        eprint!("\nInsert disk with {} [C]ontinue, [Q]uit ", next.display());
+        let _ = std::io::stderr().flush();
+    }
+    let mut answer = String::new();
+    match std::io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => Answer::Closed,
+        Ok(_) if answer.trim_start().starts_with(['q', 'Q']) => Answer::Quit,
+        Ok(_) => Answer::Continue,
     }
 }
 
@@ -875,6 +1031,9 @@ struct Extracted {
 /// those it doesn't want without a word.
 struct Failures<'r> {
     wanted: &'r Wanted<'r>,
+    /// The set's first volume, to name the others by.
+    archive: &'r Archive,
+    path: &'r Path,
     count: AtomicUsize,
     /// The exit code of the first.
     code: AtomicI32,
@@ -895,9 +1054,11 @@ enum Failure {
 }
 
 impl<'r> Failures<'r> {
-    fn new(wanted: &'r Wanted<'r>) -> Self {
+    fn new(wanted: &'r Wanted<'r>, archive: &'r Archive, path: &'r Path) -> Self {
         Self {
             wanted,
+            archive,
+            path,
             count: AtomicUsize::new(0),
             code: AtomicI32::new(OK),
             failed: Mutex::default(),
@@ -916,7 +1077,12 @@ impl<'r> Failures<'r> {
         }
         // It may have failed before its output opened.
         self.wanted.matched.fetch_add(1, Ordering::Relaxed);
-        let (line, code) = member_error_line(&display_name(&member.meta.name), error);
+        let (line, code) = member_error_line(
+            self.archive,
+            self.path,
+            &display_name(&member.meta.name),
+            error,
+        );
         let _ = self
             .code
             .compare_exchange(OK, code, Ordering::Relaxed, Ordering::Relaxed);
@@ -1164,16 +1330,34 @@ fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error)
         return MISSING_VOLUME;
     }
     let member = member.unwrap_or_else(|| path.display().to_string());
-    let (line, code) = member_error_line(&member, error);
+    let (line, code) = member_error_line(archive, path, &member, error);
     out.error(&line);
     code
 }
 
 /// What unrar says about a member it failed on, and the exit code it gives.
-fn member_error_line(member: &str, error: &rars::Error) -> (String, i32) {
+///
+/// `archive` and `path` are the first volume's, to name a damaged later one by.
+fn member_error_line(
+    archive: &Archive,
+    path: &Path,
+    member: &str,
+    error: &rars::Error,
+) -> (String, i32) {
     match error.kind() {
         ErrorKind::ChecksumMismatch | ErrorKind::InvalidArchive => {
-            (format!("{member:<20} - checksum error"), CHECKSUM)
+            let line = format!("{member:<20} - checksum error");
+            // unrar first names the volume whose packed data failed its own checksum.
+            match damaged_volume(error).and_then(|index| archive.volume_path(path, index)) {
+                Some(volume) => (
+                    format!(
+                        "{member:<20} : packed data checksum error in volume {}\n{line}",
+                        volume.display()
+                    ),
+                    CHECKSUM,
+                ),
+                None => (line, CHECKSUM),
+            }
         }
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             (format!("Incorrect password for {member}"), BAD_PASSWORD)
@@ -1234,6 +1418,25 @@ fn header_member(archive: &Archive, offset: u64) -> Option<&[u8]> {
             .files()
             .find(|file| file.block.offset as u64 == offset)
             .map(|file| file.name.as_slice()),
+        _ => None,
+    }
+}
+
+/// The volume whose packed data failed the checksum its header gives for it,
+/// when that is why a split member failed.
+fn damaged_volume(error: &rars::Error) -> Option<usize> {
+    match error {
+        rars::Error::InVolume { index, source }
+            if matches!(
+                **source,
+                rars::Error::Crc32Mismatch { .. } | rars::Error::HashMismatch { .. }
+            ) =>
+        {
+            Some(*index)
+        }
+        rars::Error::AtEntry { source, .. }
+        | rars::Error::AtArchiveOffset { source, .. }
+        | rars::Error::InVolume { source, .. } => damaged_volume(source),
         _ => None,
     }
 }

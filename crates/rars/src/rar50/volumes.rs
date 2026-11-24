@@ -1,5 +1,5 @@
 use super::*;
-use crate::extraction_control::{finish_member, Resume};
+use crate::extraction_control::{finish_member, finish_split_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::rar50::{Block, FHFL_UNP_SIZE_UNKNOWN};
 use crate::source::{ArchiveSource, RangeReader};
@@ -52,7 +52,7 @@ where
                         "RAR 5 split entry is interrupted by a regular entry",
                     ));
                 }
-                resume = Some(extract_split(
+                let last = match extract_split(
                     &volume,
                     file,
                     feed,
@@ -60,7 +60,37 @@ where
                     &mut session,
                     &mut budget,
                     open,
-                )?);
+                ) {
+                    Ok(last) => last,
+                    Err(SplitFailure { error, last: None }) => return Err(error),
+                    // The member's last volume is in hand, so a member error
+                    // handler can carry on past it, as for any other member.
+                    Err(SplitFailure {
+                        error,
+                        last: Some(last),
+                    }) => {
+                        let solid = volume.main.is_solid() || file.compression_info & 0x40 != 0;
+                        match finish_split_member(
+                            options,
+                            || crate::rar50_member(file),
+                            solid,
+                            error,
+                        )? {
+                            Resume::Fresh => {
+                                session = DecoderSession::with_allowance(
+                                    options.password,
+                                    buffered_decode_limit,
+                                    allowance,
+                                );
+                                session.decoder.read_control = budget.control.clone();
+                                session.scratch = options.rar50_scratch;
+                            }
+                            Resume::Solid => session.passed_over(),
+                        }
+                        *last
+                    }
+                };
+                resume = Some(last);
                 break;
             }
             if let Some(redirection) = file
@@ -145,7 +175,23 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
     }
 }
 
+/// A split member that failed, and the volume holding its end when the walk
+/// could still read that far.
+struct SplitFailure {
+    error: Error,
+    last: Option<Box<Archive>>,
+}
+
+impl From<Error> for SplitFailure {
+    fn from(error: Error) -> Self {
+        Self { error, last: None }
+    }
+}
+
 /// Decodes a split member while its later volumes arrive; returns the volume holding its end.
+///
+/// When it fails with a member error handler set, the rest of its volumes
+/// are still read, so the walk can go on to the members after it.
 fn extract_split<F, B: Budget>(
     volume: &Archive,
     first: &FileHeader,
@@ -154,20 +200,61 @@ fn extract_split<F, B: Budget>(
     session: &mut DecoderSession<'_, B>,
     budget: &mut OutputBudget,
     open: &mut F,
-) -> Result<Archive>
+) -> std::result::Result<Archive, SplitFailure>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
     validate_split_fragment(first, options.password)?;
     let mut walk = SplitWalk::new(feed, volume, first, &session.allowance)?;
+    let salvage = options.salvage;
+    match extract_split_walk(volume, first, &mut walk, salvage, session, budget, open) {
+        Ok(()) => Ok(walk.into_last_volume()?),
+        Err(error)
+            if options.member_errors.is_none()
+                || matches!(
+                    error.kind(),
+                    crate::ErrorKind::Cancelled
+                        | crate::ErrorKind::Io
+                        | crate::ErrorKind::ResourceLimit
+                ) =>
+        {
+            // Limits on a split member stay terminal, as before.
+            Err(error.into())
+        }
+        Err(error) => Err(SplitFailure {
+            error,
+            last: walk.into_last_volume().ok().map(Box::new),
+        }),
+    }
+}
+
+fn extract_split_walk<F, B: Budget>(
+    volume: &Archive,
+    first: &FileHeader,
+    walk: &mut SplitWalk<'_, '_, '_, B>,
+    salvage: bool,
+    session: &mut DecoderSession<'_, B>,
+    budget: &mut OutputBudget,
+    open: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
     // Parts written before the size was known record it only in the last header.
     let sized;
     let first = if first.known_unpacked_size().is_none() {
-        let last = walk.prefetch()?;
         let mut header = first.clone();
-        header.unpacked_size = last.unpacked_size;
-        header.file_flags =
-            (first.file_flags & !FHFL_UNP_SIZE_UNKNOWN) | (last.file_flags & FHFL_UNP_SIZE_UNKNOWN);
+        match walk.prefetch() {
+            Ok(last) => {
+                header.unpacked_size = last.unpacked_size;
+                header.file_flags = (first.file_flags & !FHFL_UNP_SIZE_UNKNOWN)
+                    | (last.file_flags & FHFL_UNP_SIZE_UNKNOWN);
+            }
+            // Salvaging, the volumes there are are still decoded, size
+            // unknown, until the walk's failure stops the decoder.
+            Err(_) if salvage => header.unpacked_size = u64::MAX,
+            Err(error) => return Err(error),
+        }
         sized = header;
         &sized
     } else {
@@ -195,7 +282,7 @@ where
                 let allowance = session.allowance.clone();
                 return write_stored(
                     first,
-                    &mut walk,
+                    walk,
                     first_reader,
                     decryptor.as_ref(),
                     &mut writer,
@@ -210,10 +297,9 @@ where
                 })
                 .map_err(|error| first.entry_error("extracting", error));
             }
-            session.write_lazy_split_to(first, &mut walk, first_reader, decryptor.as_ref(), writer)
+            session.write_lazy_split_to(first, walk, first_reader, decryptor.as_ref(), writer)
         })
-        .map_err(|error| walk.failure.take().unwrap_or(error))?;
-    walk.into_last_volume()
+        .map_err(|error| walk.failure.take().unwrap_or(error))
 }
 
 fn split_decryptor<B: Budget>(
@@ -325,19 +411,37 @@ impl<B: Budget> DecoderSession<'_, B> {
                     .stream_lazy_split_to(first, walk, first_reader, decryptor, writer)
                     .map_err(|error| first.entry_error("decoding", error));
             }
-            let data = session
-                .decode_lazy_split(first, walk, first_reader, decryptor)
-                .map_err(|error| first.entry_error("decoding", error))?;
-            let last = walk
-                .finish()
-                .map_err(|error| first.entry_error("decoding", error))?;
-            last.verify_integrity_with_keys(&data, decryptor.map(|decryptor| &decryptor.keys))
-                .map_err(|error| walk.checksum_error().unwrap_or(error))
-                .map_err(|error| first.entry_error("verifying", error))?;
-            writer
-                .write_all(&data)
-                .map_err(Error::from)
-                .map_err(|error| first.entry_error("writing", error))
+            let write = |writer: &mut dyn Write, data: &[u8]| {
+                writer
+                    .write_all(data)
+                    .map_err(Error::from)
+                    .map_err(|error| first.entry_error("writing", error))
+            };
+            let data = match session.decode_lazy_split(first, walk, first_reader, decryptor) {
+                Ok(data) => data,
+                Err(error) => {
+                    // Salvage delivers what decoded before the failure.
+                    if let Some(partial) = session.decoder.take_salvaged() {
+                        write(writer, &partial)?;
+                    }
+                    return Err(first.entry_error("decoding", error));
+                }
+            };
+            let checked = walk.finish().map(|last| {
+                last.verify_integrity_with_keys(&data, decryptor.map(|decryptor| &decryptor.keys))
+            });
+            let verified = match checked {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => {
+                    Err(first.entry_error("verifying", walk.checksum_error().unwrap_or(error)))
+                }
+                Err(error) => Err(first.entry_error("decoding", error)),
+            };
+            // Salvage writes the member even when it fails, then its error.
+            if verified.is_ok() || session.decoder.read_control.salvage() {
+                write(writer, &data)?;
+            }
+            verified
         })
     }
 
@@ -533,6 +637,10 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     /// Reads past any fragments the decoder did not need and returns the member's last header.
     pub(super) fn finish(&mut self) -> Result<&FileHeader> {
         while self.next_fragment()?.is_some() {}
+        // Salvaging, a failure ends the fragments rather than failing.
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         self.last_header()
     }
 
@@ -640,14 +748,27 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
 
 impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
     fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
-        }
+        // Fragments fetched before a failure are still read, when salvaging.
         if let Some(reader) = self.prefetched.pop_front() {
             return Ok(Some(reader));
         }
-        self.advance()
-            .inspect_err(|error| self.failure = Some(error.clone()))
+        let error = match &self.failure {
+            Some(error) => error.clone(),
+            None => match self.advance() {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    self.failure = Some(error.clone());
+                    error
+                }
+            },
+        };
+        // Salvaging, the member's data ends where its volumes give out, so
+        // the decoder delivers what it decoded first. The failure is still
+        // the member's, once it is decoded.
+        if self.options.salvage {
+            return Ok(None);
+        }
+        Err(error)
     }
 }
 

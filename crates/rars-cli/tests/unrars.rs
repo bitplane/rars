@@ -889,3 +889,180 @@ fn an_unknown_method_is_reported_as_unrar_does() {
     );
     assert_eq!(fs::read(dir.join("out/b.txt")).unwrap(), b"plain\n");
 }
+
+/// `unrars` with `input` piped to its stdin.
+fn unrars_with_input(dir: &Path, args: &[&str], input: &[u8]) -> Output {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_unrars"))
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // It may stop reading before taking all of it.
+    let _ = stdin.write_all(input);
+    drop(stdin);
+    child.wait_with_output().unwrap()
+}
+
+/// A stored RAR 5 volume set named `set.partN.rar` in `dir`: `a.txt`, then
+/// `big.bin` ([`payload`]) across several volumes, then `z.txt` in the last.
+/// Returns the number of volumes.
+fn write_set(dir: &Path) -> usize {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    for (name, data) in [
+        (&b"a.txt"[..], b"hello\n".to_vec()),
+        (b"big.bin", payload()),
+        (b"z.txt", b"after\n".to_vec()),
+    ] {
+        builder.add_bytes(name.to_vec(), data, None, None).unwrap();
+    }
+    let volumes = builder
+        .volume_size(Some(8 * 1024))
+        .build_volumes(None)
+        .unwrap();
+    assert!(volumes.len() >= 3);
+    for (index, bytes) in volumes.iter().enumerate() {
+        fs::write(dir.join(format!("set.part{}.rar", index + 1)), bytes).unwrap();
+    }
+    volumes.len()
+}
+
+/// Issue #566: `-vp` asks before each later volume and waits for the answer
+/// on stdin, terminal or not.
+#[test]
+fn vp_asks_before_each_volume() {
+    let dir = scratch::case("unrars-vp");
+    let count = write_set(&dir);
+    let output = unrars_with_input(
+        &dir,
+        &["x", "-vp", "set.part1.rar", "out/"],
+        "\n".repeat(count).as_bytes(),
+    );
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(0), "{errors}");
+    for index in 2..=count {
+        let prompt = format!("Insert disk with set.part{index}.rar [C]ontinue, [Q]uit ");
+        assert!(errors.contains(&prompt), "{errors}");
+    }
+    assert_eq!(fs::read(dir.join("out/big.bin")).unwrap(), payload());
+    assert_eq!(fs::read(dir.join("out/z.txt")).unwrap(), b"after\n");
+
+    // With nothing to read on stdin, the run stops there.
+    let output = unrars(&dir, &["x", "-vp", "set.part1.rar", "closed/"]);
+    assert_eq!(output.status.code(), Some(12), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Program aborted"));
+    assert!(!dir.join("closed/big.bin").exists());
+    // Quitting leaves the volume missing.
+    let output = unrars_with_input(&dir, &["x", "-vp", "set.part1.rar", "quit/"], b"q\n");
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(stderr(&output).contains("Cannot find volume set.part2.rar"));
+}
+
+/// Issue #566: named by a later volume, a set is read from its first.
+#[test]
+fn a_set_named_by_a_later_volume_starts_at_the_first() {
+    let dir = scratch::case("unrars-middle-volume");
+    write_set(&dir);
+    let output = unrars(&dir, &["x", "set.part2.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stdout(&output).contains("Extracting from set.part1.rar"));
+    assert_eq!(files_under(&dir.join("out")), ["a.txt", "big.bin", "z.txt"]);
+    assert_eq!(fs::read(dir.join("out/big.bin")).unwrap(), payload());
+}
+
+/// Issue #566: `l -v` lists each volume in turn, then a grand total, and
+/// the Details line gives the volume's number.
+#[test]
+fn l_v_lists_every_volume() {
+    let dir = scratch::case("unrars-list-volumes");
+    let count = write_set(&dir);
+    let output = unrars(&dir, &["l", "-v", "set.part1.rar"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let text = stdout(&output);
+    for index in 1..=count {
+        assert!(
+            text.contains(&format!(
+                "Archive: set.part{index}.rar\nDetails: RAR 5, volume {index}\n"
+            )),
+            "{text}"
+        );
+    }
+    let total = format!("{:>20}{:>21}\n", payload().len() + 12, 3);
+    assert!(text.ends_with(&format!("{total}\n")), "{text}");
+
+    let output = unrars(&dir, &["l", "set.part1.rar"]);
+    let text = stdout(&output);
+    assert_eq!(text.matches("Archive:").count(), 1, "{text}");
+    assert!(text.contains("Details: RAR 5, volume 1\n"), "{text}");
+    let output = unrars(&dir, &["lb", "-v", "set.part1.rar"]);
+    let names = stdout(&output);
+    assert_eq!(names.matches("big.bin").count(), count, "{names}");
+    assert!(names.starts_with("a.txt\nbig.bin\n"), "{names}");
+    assert!(names.ends_with("big.bin\nz.txt\n"), "{names}");
+}
+
+/// Issue #566: a damaged volume in the middle of a split member is named,
+/// and the members after it in the set are still extracted.
+#[test]
+fn a_damaged_volume_is_named_and_the_set_goes_on() {
+    let dir = scratch::case("unrars-damaged-volume");
+    write_set(&dir);
+    let path = dir.join("set.part2.rar");
+    let mut bytes = fs::read(&path).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    fs::write(&path, bytes).unwrap();
+    let output = unrars(&dir, &["x", "set.part1.rar", "out/"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(3), "{errors}");
+    assert_eq!(
+        errors,
+        format!(
+            "{name:<20} : packed data checksum error in volume set.part2.rar\n\
+             {name:<20} - checksum error\n",
+            name = "big.bin"
+        )
+    );
+    assert_eq!(files_under(&dir.join("out")), ["a.txt", "z.txt"]);
+    assert_eq!(fs::read(dir.join("out/z.txt")).unwrap(), b"after\n");
+}
+
+/// Issue #566: a volume cut short in the middle of a split member loses
+/// that member, and the members after it are still extracted.
+#[test]
+fn a_cut_middle_volume_loses_only_its_member() {
+    let dir = scratch::case("unrars-cut-volume");
+    write_set(&dir);
+    let path = dir.join("set.part2.rar");
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+    let output = unrars(&dir, &["x", "set.part1.rar", "out/"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(3), "{errors}");
+    assert!(
+        errors.contains(&format!("{:<20} - checksum error", "big.bin")),
+        "{errors}"
+    );
+    assert!(errors.contains("Unexpected end of archive"), "{errors}");
+    assert!(!errors.contains("set.part1.rar - "), "{errors}");
+    assert_eq!(files_under(&dir.join("out")), ["a.txt", "z.txt"]);
+}
+
+/// Issue #566: `-kb` keeps what a split member's volumes held before the
+/// missing one.
+#[test]
+fn kb_keeps_a_split_member_up_to_a_missing_volume() {
+    let dir = scratch::case("unrars-kb-missing-volume");
+    write_set(&dir);
+    fs::remove_file(dir.join("set.part2.rar")).unwrap();
+    let output = unrars(&dir, &["x", "-kb", "set.part1.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert!(stderr(&output).contains("Cannot find volume set.part2.rar"));
+    let kept = fs::read(dir.join("out/big.bin")).unwrap();
+    assert!(!kept.is_empty() && kept.len() < payload().len());
+    assert_eq!(kept, payload()[..kept.len()]);
+}
