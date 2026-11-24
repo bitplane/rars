@@ -10,8 +10,9 @@ function spawnWorker() {
     post(message, transfer = []) { worker.ref(); worker.postMessage(message, transfer); },
     onMessage(callback) {
       worker.on("message", (message) => {
-        // The callback can start and ref the next queued operation.
-        if (!message.progress) worker.unref();
+        // The callback can start and ref the next queued operation; progress and
+        // member reports come while the operation still runs.
+        if (!message.progress && !message.memberError) worker.unref();
         callback(message);
       });
     },
