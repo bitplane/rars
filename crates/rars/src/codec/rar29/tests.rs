@@ -1945,7 +1945,9 @@ fn table_level_encoder_uses_rar29_run_symbols() {
 
 #[test]
 fn lazy_lz_parser_defers_short_match_for_longer_next_match() {
-    let input = b"abcdXbcdYYYYYYYYYYYYabcdYYYYYYYYYYYY";
+    // Repeated, so the block's matches pay for their table and it is not
+    // coded as literals alone.
+    let input = &b"abcdXbcdYYYYYYYYYYYYabcdYYYYYYYYYYYY".repeat(8)[..];
     let greedy = encode_tokens(input, &[], EncodeOptions::new(MAX_MATCH_CANDIDATES));
     let lazy = encode_tokens(
         input,
@@ -5061,7 +5063,7 @@ fn long_key_parses_code_the_same_at_every_thread_count_and_cut() {
         let options = options
             .with_max_match_distance(64 * 1024)
             .with_block_size(4096);
-        assert!(super::keys_long(options, input.len()));
+        assert!(super::keys_long(options, input.len(), false));
         let encode = |threads: Option<usize>| {
             pool.install(|| {
                 let _cap = crate::parallel::ThreadCap::set(threads);
@@ -5213,6 +5215,7 @@ fn a_batch_of_blocks_codes_as_it_does_one_block_at_a_time() {
             .map(|(index, data)| super::BlockToCode {
                 tokens: tokens_of(data).unwrap(),
                 state: states[index],
+                counted: None,
                 // Filter records only count towards the table and are copied out.
                 filters: match index {
                     2 => vec![vec![0x12, 0x34, 0x56]],
@@ -5238,6 +5241,7 @@ fn a_batch_of_blocks_codes_as_it_does_one_block_at_a_time() {
                     state.remember(4, 1);
                     state
                 },
+                counted: None,
                 filters: Vec::new(),
                 more_blocks_follow: false,
             }))
