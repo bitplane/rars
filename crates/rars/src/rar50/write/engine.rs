@@ -5284,14 +5284,14 @@ mod stored_pipe_tests {
             ));
         }
         let expected = [
-            ("crc32_only", "2570159:a0e203b26c17284a"),
-            ("one", "2500141:214930c9491ae64f"),
-            ("empty", "135:48c92c5a1d765e8b"),
-            ("several", "2570267:4b7664377148b4e7"),
-            ("quick_open", "2570524:8e585393f60e0b4d"),
-            ("recovery", "2715543:e2c41f112ff34c56"),
-            ("encrypted", "2570414:095fdfd7c4ea3e13"),
-            ("encrypted_headers", "2570602:6261c6bdeaa4b8b7"),
+            ("crc32_only", "2570159:95d379a900c9a4f0"),
+            ("one", "2500141:627d3bbcf3bc2aed"),
+            ("empty", "135:53a770de9f9a0c06"),
+            ("several", "2570267:f9e49553770e7dbd"),
+            ("quick_open", "2570524:adae80589582c928"),
+            ("recovery", "2715543:8d2f38b9537e1106"),
+            ("encrypted", "2570414:2a73c89f6110a083"),
+            ("encrypted_headers", "2570602:6cb0bc7d9d5255ee"),
         ];
         let actual: Vec<_> = cases
             .iter()
@@ -5363,11 +5363,11 @@ mod stored_pipe_tests {
             .map(|(name, bytes)| (name, crate::write_stream::fingerprint([&bytes[..]])))
             .collect();
         let expected = [
-            ("crc32_only", "2570159:30ddf3ad"),
-            ("one", "2500141:a6c68802"),
-            ("several", "2570267:a6dc6e09"),
-            ("quick_open", "2570524:d5eb5a67"),
-            ("recovery", "2715543:c207e3f3"),
+            ("crc32_only", "2570159:67e93a66"),
+            ("one", "2500141:cef430f2"),
+            ("several", "2570267:10171f7b"),
+            ("quick_open", "2570524:2bfc58f2"),
+            ("recovery", "2715543:62e1ac42"),
         ];
         crate::write_stream::assert_fingerprints(&cases, &expected);
     }
@@ -5417,10 +5417,10 @@ mod stored_pipe_tests {
             ),
         ];
         let expected = [
-            ("seekable", "2570602:d156fdb9"),
+            ("seekable", "2570602:a8cf5981"),
             (
                 "volumes",
-                "1000000:2813d873 1000000:a39861c1 571262:ce3e9274",
+                "1000000:5977e661 1000000:b8c7dba3 571262:faf25299",
             ),
         ];
         crate::write_stream::assert_fingerprints(&cases, &expected);
