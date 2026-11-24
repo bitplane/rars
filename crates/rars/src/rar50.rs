@@ -426,6 +426,22 @@ impl FileHeader {
         &self.name
     }
 
+    /// Whether `password` passes the password check this file's encryption
+    /// record carries, without decoding anything. `None` when the file isn't
+    /// encrypted or its record has no check value to test against.
+    pub fn password_matches(&self, password: &[u8]) -> Result<Option<bool>> {
+        let Some(check_value) = self
+            .encryption
+            .as_ref()
+            .and_then(PasswordCheckValue::of_file)
+        else {
+            return Ok(None);
+        };
+        check_value
+            .matches(password, &KeyCache::default())
+            .map(Some)
+    }
+
     /// Returns the file name with invalid UTF-8 replaced for display only.
     ///
     /// Use [`Self::name_bytes`] when exact archive bytes matter.

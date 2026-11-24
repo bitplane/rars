@@ -287,6 +287,19 @@ impl Progress {
         }
     }
 
+    /// The member of the open line, if it goes on into a volume that is
+    /// missing, ending its line as unrar does: with five spaces after it.
+    pub(super) fn cut_short(&self) -> Option<Vec<u8>> {
+        let mut state = lock(&self.state);
+        let line = state
+            .line
+            .take_if(|line| line.span.as_ref().is_some_and(|span| span.split_after))?;
+        if line.begun && !line.ended {
+            self.out.progress(format_args!("     \n"));
+        }
+        Some(line.member)
+    }
+
     /// Ends the open line, whatever its state, when the run stops.
     pub(super) fn stop(&self) {
         let mut state = lock(&self.state);
