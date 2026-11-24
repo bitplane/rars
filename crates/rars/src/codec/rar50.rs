@@ -1587,6 +1587,18 @@ impl<B: Budget> ReaderState<B> {
             self.history
                 .extend_from_slice(incoming)
                 .map_err(Into::into)?;
+        } else if !B::LIMITED
+            && reader_history_capacity::<B>(capacity, required, dictionary_size)
+                >= (self.history.len() + incoming.len()).max(capacity + 1)
+        {
+            // Grown where it lies, so the allocator can remap rather than
+            // hold the old window and its copy at once.
+            let capacity = reader_history_capacity::<B>(capacity, required, dictionary_size);
+            self.history.grow_in_place(capacity)?;
+            self.history.discard_prefix(self.history.len() - keep);
+            self.history
+                .extend_from_slice(incoming)
+                .map_err(Into::into)?;
         } else {
             // Admit the replacement before touching the old window. Growing
             // toward the slack limit avoids moving a full dictionary per file.
