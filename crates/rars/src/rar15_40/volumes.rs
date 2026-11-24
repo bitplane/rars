@@ -294,7 +294,10 @@ where
                         &mut writer,
                         &allowance,
                     )
-                    .map_err(|error| first.entry_error("extracting", walk.explain(error)));
+                    .map_err(|error| match walk.explanation(&error) {
+                        Some(explained) => first.entry_error("extracting", explained),
+                        None => error,
+                    });
                 }
                 let decoded = {
                     let mut reader = packed_reader(
@@ -372,6 +375,7 @@ fn write_stored<B: Budget>(
         ));
     }
     last.crc_result(crc.finish(), password)
+        .map_err(|error| last.entry_error("extracting", error))
 }
 
 pub(super) fn packed_reader<R: Read, B: Budget>(
@@ -504,18 +508,25 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
 
     /// Turns a failed member's error into the checksum mismatch of the
     /// fragment whose packed data disagrees with its header, if one does.
-    /// Sink and reader I/O, limits and cancellation keep their own meaning.
+    /// Sink and reader I/O, limits, cancellation and headers that contradict
+    /// each other keep their own meaning.
     fn explain(&self, error: Error) -> Error {
+        self.explanation(&error).unwrap_or(error)
+    }
+
+    /// The fragment checksum mismatch [`Self::explain`] gives for `error`.
+    fn explanation(&self, error: &Error) -> Option<Error> {
         if matches!(
             error.kind(),
             crate::ErrorKind::Io
                 | crate::ErrorKind::ResourceLimit
                 | crate::ErrorKind::Cancelled
                 | crate::ErrorKind::UnsupportedFeature
-        ) {
-            return error;
+        ) || matches!(error.root_cause(), Error::InvalidHeader(_))
+        {
+            return None;
         }
-        self.checksum_error().unwrap_or(error)
+        self.checksum_error()
     }
 
     /// Re-reads every fragment that carries a CRC32 of its own packed data
