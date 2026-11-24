@@ -24,6 +24,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[path = "../../rars/tests/support/scratch.rs"]
 mod scratch;
 
+mod unrars;
+
 create_exception!(rars, Error, pyo3::exceptions::PyException);
 // `BadRarFile` is damage; a password or a volume still to come is not.
 create_exception!(rars, BadRarFile, Error);
@@ -3917,6 +3919,8 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(is_rarfile, m)?)?;
     m.add_function(wrap_pyfunction!(is_rarfile_sfx, m)?)?;
     m.add_function(wrap_pyfunction!(repair, m)?)?;
+    // Set rather than added, so it stays out of `__all__` and the package.
+    m.setattr("_unrars_main", wrap_pyfunction!(unrars::unrars_main, m)?)?;
     let error = py.get_type::<Error>();
     // Set on the errors `on_member_error` is given; None elsewhere unless a subclass says.
     error.setattr("member", py.None())?;
