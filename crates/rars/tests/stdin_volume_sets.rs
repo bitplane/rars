@@ -298,3 +298,112 @@ fn a_known_size_that_changes_still_breaks_the_set() {
         }
     }
 }
+
+/// Issue #582: a RAR 5 member whose first part doesn't record its size is
+/// decoded as its volumes arrive, so a caller asked for each volume in turn,
+/// as `unrars -vp` asks, sees output before the last one, as with a known size.
+/// An encrypted stored member still fetches them all first: only its size
+/// tells its data from the cipher padding.
+#[test]
+fn a_rar5_set_from_stdin_is_decoded_as_its_volumes_arrive() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Past the size at which output goes out a chunk at a time, and
+    // compressible, so that it isn't stored instead.
+    let data: Vec<u8> = noise(3 << 20)
+        .into_iter()
+        .enumerate()
+        .map(|(at, byte)| if at % 7 == 0 { byte } else { b"text "[at % 5] })
+        .collect();
+    let password = b"secret".as_slice();
+    for (stored, password) in [
+        (true, None),
+        (false, None),
+        (false, Some(password)),
+        (true, Some(password)),
+    ] {
+        let case = format!("stored={stored} encrypted={}", password.is_some());
+        let mut builder = Builder::new(ArchiveVersion::Rar50)
+            .store(stored)
+            .password(password.map(<[u8]>::to_vec))
+            .volume_size(Some(128 << 10));
+        builder
+            .add_bytes(NAME.to_vec(), data.clone(), None, None)
+            .unwrap();
+        let volumes = from_stdin(builder.build_volumes(None).unwrap());
+        assert!(volumes.len() >= 4, "{case}");
+        let archives = parse(&volumes);
+
+        let written = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&written);
+        // How much was written by the time each later volume was asked for.
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&asked);
+        let count = archives.len() - 1;
+        let later = archives[1..].to_vec().into_iter().map(move |volume| {
+            // A caller asked for the last volume waits a while for it, as a
+            // person at a prompt does, which gives output written on another
+            // thread time to arrive.
+            let start = std::time::Instant::now();
+            let mut record = record.lock().unwrap();
+            while record.len() + 1 == count
+                && seen.load(Ordering::Relaxed) == 0
+                && start.elapsed() < std::time::Duration::from_secs(1)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            record.push(seen.load(Ordering::Relaxed));
+            Ok(volume)
+        });
+        let output = Arc::new(Mutex::new(Vec::new()));
+        rars::output_links::extract_arriving_with_links(
+            &archives[0],
+            later,
+            // On one thread the decoder writes as it goes. With more, the
+            // compressed member's output reaches the writer in larger pieces,
+            // later, as it does for a member whose size is known.
+            ArchiveReadOptions::with_optional_password(password).with_threads(1),
+            |_| {
+                struct Counted(Arc<AtomicUsize>, Arc<Mutex<Vec<u8>>>);
+                impl Write for Counted {
+                    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                        self.0.fetch_add(buf.len(), Ordering::Relaxed);
+                        self.1.lock().unwrap().extend_from_slice(buf);
+                        Ok(buf.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                Ok(Box::new(Counted(Arc::clone(&written), Arc::clone(&output))))
+            },
+            |_, _| Ok(()),
+        )
+        .unwrap_or_else(|error| panic!("{case}: {error}"));
+        assert!(*output.lock().unwrap() == data, "{case}");
+        let asked = asked.lock().unwrap();
+        assert_eq!(asked.len(), volumes.len() - 1, "{case}");
+        let lazy = !(stored && password.is_some());
+        assert_eq!(*asked.last().unwrap() > 0, lazy, "{case}: {asked:?}");
+    }
+}
+
+/// Issue #582: decoded as its volumes arrive, a member from stdin still has
+/// to come to the size its last part gives.
+#[test]
+fn a_rar5_set_from_stdin_must_match_the_size_its_last_part_gives() {
+    let data = noise(30_000);
+    for stored in [true, false] {
+        for wrong in [data.len() as u64 - 1, data.len() as u64 + 1] {
+            let case = format!("stored={stored} size={wrong}");
+            let mut volumes = from_stdin(build_set(ArchiveVersion::Rar50, stored, &data));
+            let last = volumes.len() - 1;
+            set_size(&mut volumes[last], Size::Known(wrong));
+            let error = extract(&parse(&volumes)).expect_err(&case);
+            assert_eq!(
+                error.kind(),
+                rars::ErrorKind::InvalidArchive,
+                "{case}: {error}"
+            );
+        }
+    }
+}

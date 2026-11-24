@@ -244,16 +244,22 @@ where
     let sized;
     let first = if first.known_unpacked_size().is_none() {
         let mut header = first.clone();
-        match walk.prefetch() {
-            Ok(last) => {
-                header.unpacked_size = last.unpacked_size;
-                header.file_flags = (first.file_flags & !FHFL_UNP_SIZE_UNKNOWN)
-                    | (last.file_flags & FHFL_UNP_SIZE_UNKNOWN);
+        if decodes_unsized(first, budget, session.scratch.is_some()) {
+            // Its volumes are fetched as the decoder reaches them, and its
+            // size checked against the last one's header at the end.
+            header.unpacked_size = usize::MAX as u64;
+        } else {
+            match walk.prefetch() {
+                Ok(last) => {
+                    header.unpacked_size = last.unpacked_size;
+                    header.file_flags = (first.file_flags & !FHFL_UNP_SIZE_UNKNOWN)
+                        | (last.file_flags & FHFL_UNP_SIZE_UNKNOWN);
+                }
+                // Salvaging, the volumes there are are still decoded, size
+                // unknown, until the walk's failure stops the decoder.
+                Err(_) if salvage => header.unpacked_size = u64::MAX,
+                Err(error) => return Err(error),
             }
-            // Salvaging, the volumes there are are still decoded, size
-            // unknown, until the walk's failure stops the decoder.
-            Err(_) if salvage => header.unpacked_size = u64::MAX,
-            Err(error) => return Err(error),
         }
         sized = header;
         &sized
@@ -300,6 +306,27 @@ where
             session.write_lazy_split_to(first, walk, first_reader, decryptor.as_ref(), writer)
         })
         .map_err(|error| walk.failure.take().unwrap_or(error))
+}
+
+/// Whether a split member whose first part doesn't record its size can be
+/// decoded as its volumes arrive, so that a caller asked for each volume in
+/// turn sees its output between them. The decoder stops at the stream's last
+/// block. An output limit needs the size first, as do the scratch decoder and
+/// an encrypted stored member, whose cipher padding only the size tells from
+/// its data; their volumes are all fetched before decoding.
+fn decodes_unsized(first: &FileHeader, budget: &OutputBudget, scratch: bool) -> bool {
+    !budget.is_limited() && !scratch && !(first.is_stored() && first.encrypted)
+}
+
+/// Checks what an unsized split member decoded to, up to its stream's last
+/// block, against the size its last header gives.
+fn decoded_size_matches(last: &FileHeader, decoded: Option<usize>) -> Result<()> {
+    let declared = last.unpacked_size;
+    match decoded.map(|decoded| decoded as u64) {
+        Some(decoded) if decoded == declared => Ok(()),
+        Some(decoded) if decoded < declared => Err(Error::MemberEndedEarly { declared, decoded }),
+        _ => Err(Error::MemberRanPastDeclaredSize { declared }),
+    }
 }
 
 fn split_decryptor<B: Budget>(
@@ -406,7 +433,9 @@ impl<B: Budget> DecoderSession<'_, B> {
         writer: &mut dyn Write,
     ) -> Result<()> {
         self.guard_solid_chain(first, |session| {
-            if first.should_stream_decode(session.buffered_decode_limit) {
+            if first.known_unpacked_size().is_none()
+                || first.should_stream_decode(session.buffered_decode_limit)
+            {
                 return session
                     .stream_lazy_split_to(first, walk, first_reader, decryptor, writer)
                     .map_err(|error| first.entry_error("decoding", error));
@@ -479,8 +508,15 @@ impl<B: Budget> DecoderSession<'_, B> {
                 writer,
             ))
         };
+        let size_unknown = first.known_unpacked_size().is_none();
         decoded
-            .and_then(|()| walk.finish().and_then(|last| sums.verify(last, decryptor)))
+            .and_then(|()| walk.finish())
+            .and_then(|last| {
+                if size_unknown {
+                    decoded_size_matches(last, decoder.ended_early())?;
+                }
+                sums.verify(last, decryptor)
+            })
             .map_err(|error| match error {
                 // Sink/reader I/O and the intentional filter limit must retain their
                 // own meaning. Fragment diagnostics are for decode/integrity failure.
