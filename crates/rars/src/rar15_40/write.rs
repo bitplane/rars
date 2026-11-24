@@ -1329,9 +1329,15 @@ impl SearchEffort {
     /// look for filters in bytes that look random, which none of them shrink.
     /// On a 32 MiB tar of already-compressed files that took level 1 from
     /// 1.09 s to 0.69 s and came out 1,276 bytes smaller.
+    ///
+    /// Bytes can look random and not be. Noisy samples and pixels spread
+    /// across every byte value, but their differences at the sample or pixel
+    /// width do not, and that is what a delta filter codes. So bytes are only
+    /// taken as random when their differences are too.
     fn skips(self, data: &[u8]) -> bool {
         self != Self::Full
             && crate::codec::rar29::order0_entropy(data) > REDUCED_SEARCH_RANDOM_ABOVE_BITS
+            && differences_look_random(data)
     }
 }
 
@@ -1339,6 +1345,57 @@ impl SearchEffort {
 /// a piece; the near matches and the skipped literal runs judge blocks by the
 /// same line.
 const REDUCED_SEARCH_RANDOM_ABOVE_BITS: f64 = 7.5;
+
+/// Whether the differences between bytes at every stride a reduced search
+/// tries a delta filter at, one to four, look as random as the bytes,
+/// judged on spread-out samples by the same line.
+///
+/// Compressed data differences to as much entropy as it has itself, close to
+/// eight bits, and so do PNG images, whose pixels are compressed. Sampled
+/// sound and raw pixels can reach seven and a half bits a byte as they are,
+/// but at their sample or pixel width they difference to far less.
+fn differences_look_random(data: &[u8]) -> bool {
+    const WINDOWS: usize = 16;
+    const WINDOW: usize = 256;
+    let segment = data.len() / WINDOWS;
+    let mut counts = [[0u32; 256]; 4];
+    let mut count = |window: &[u8]| {
+        for (index, &byte) in window.iter().enumerate() {
+            for (stride, counts) in (1..=index.min(4)).zip(&mut counts) {
+                counts[usize::from(byte.wrapping_sub(window[index - stride]))] += 1;
+            }
+        }
+    };
+    if segment < WINDOW {
+        count(data);
+    } else {
+        for index in 0..WINDOWS {
+            let start = index * segment + (segment - WINDOW) / 2;
+            count(&data[start..start + WINDOW]);
+        }
+    }
+    counts
+        .iter()
+        .all(|counts| counts_entropy(counts) > REDUCED_SEARCH_RANDOM_ABOVE_BITS)
+}
+
+/// The entropy in bits a symbol of the distribution `counts` describes, 8
+/// for an empty one.
+fn counts_entropy(counts: &[u32; 256]) -> f64 {
+    let total: u64 = counts.iter().map(|&count| u64::from(count)).sum();
+    if total == 0 {
+        return 8.0;
+    }
+    let total = total as f64;
+    counts
+        .iter()
+        .filter(|&&count| count != 0)
+        .map(|&count| {
+            let p = f64::from(count) / total;
+            -p * p.log2()
+        })
+        .sum()
+}
 
 impl crate::filter_search::FilterSearch for Rar29Search {
     type Options = Rar29EncodeOptions;
@@ -5903,6 +5960,113 @@ mod tests {
         let packed = super::Unpack29Encoder::with_options(options)
             .encode_member_with_filters(&data, &specs)
             .unwrap();
+        assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
+    }
+
+    /// Sixteen-bit stereo: two tones with noise in the low bits, which as
+    /// bytes spread over more than seven and a half bits apiece.
+    fn noisy_stereo(len: usize) -> Vec<u8> {
+        let mut state = 0x6170_0001_u32;
+        let mut data = Vec::with_capacity(len + 4);
+        let mut phase = 0.0f64;
+        while data.len() < len {
+            phase += 0.013;
+            for (scale, rate) in [(12000.0, 1.0), (9000.0, 1.5)] {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let sample = (scale * (phase * rate).sin()) as i32 + (state & 0xff) as i32 - 128;
+                data.extend_from_slice(&(sample as i16).to_le_bytes());
+            }
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// The reduced searches skip bytes that look random, which no filter
+    /// shrinks. Noisy samples look random byte by byte, but not sample by
+    /// sample, which is what a delta filter codes, so they are still searched.
+    #[test]
+    fn the_reduced_searches_skip_noise_but_not_noisy_samples() {
+        let stereo = noisy_stereo(256 * 1024);
+        assert!(
+            crate::codec::rar29::order0_entropy(&stereo) > super::REDUCED_SEARCH_RANDOM_ABOVE_BITS
+        );
+        let noise = noise(256 * 1024);
+        for effort in [super::SearchEffort::Least, super::SearchEffort::Reduced] {
+            assert!(!effort.skips(&stereo), "{effort:?} skipped the samples");
+            assert!(effort.skips(&noise), "{effort:?} searched noise");
+            // Too short to sample spread out, judged whole.
+            assert!(
+                !effort.skips(&stereo[..4096]),
+                "{effort:?} skipped a few samples"
+            );
+            assert!(
+                effort.skips(&noise[..4096]),
+                "{effort:?} searched a little noise"
+            );
+        }
+        assert!(!super::SearchEffort::Full.skips(&noise));
+    }
+
+    /// Level 1 searches its pieces at once, finds the filter the samples
+    /// want and none for the noise, and finds the same at any thread count.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn level_one_filters_noisy_samples_alike_on_any_thread_count() {
+        let piece = 128 * 1024;
+        let stereo = noisy_stereo(2 * piece);
+        let noise = noise(2 * piece);
+        let data = [
+            &stereo[..piece],
+            &noise[..piece],
+            &stereo[piece..],
+            &noise[piece..],
+        ]
+        .concat();
+        let options = super::rar29_encode_options_for_level(Some(1)).unwrap();
+        let search = |threads: usize| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    super::rar29_piece_filters(
+                        &data,
+                        0,
+                        options,
+                        super::SearchEffort::Least,
+                        piece,
+                        &|| false,
+                    )
+                    .unwrap()
+                })
+        };
+        let specs = search(1);
+        for (index, start) in (0..data.len()).step_by(piece).enumerate() {
+            let filtered = specs.iter().any(|spec| {
+                spec.range
+                    .as_ref()
+                    .is_some_and(|range| range.start >= start && range.end <= start + piece)
+            });
+            assert_eq!(filtered, index % 2 == 0, "piece at {start}: {specs:?}");
+        }
+        for threads in [2, 8] {
+            assert_eq!(search(threads), specs, "{threads} threads");
+        }
+        let plain = super::encode_rar29_lz_member(&data, options, 0x31, None).unwrap();
+        let packed = super::Unpack29Encoder::with_options(options)
+            .encode_member_with_filters(&data, &specs)
+            .unwrap();
+        assert!(
+            packed.len() * 10 < plain.data.len() * 9,
+            "filtered {} bytes, plain {}",
+            packed.len(),
+            plain.data.len()
+        );
         assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
     }
 
