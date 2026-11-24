@@ -654,11 +654,13 @@ fn masks_select_as_unrar_does() {
     }
 }
 
-/// A RAR 5 archive holding two stored copies of `v.txt`, an older one with a
-/// file version record as `rar -ver` writes it, then the latest, and `x;1`,
-/// a file whose name only looks like a version. Built by hand, since rars
-/// writes no version records.
-fn write_versions(path: &Path) {
+/// A member for [`rar5_by_hand`]: name, data, file version, compression info.
+type HandMember<'a> = (&'a [u8], &'a [u8], Option<u64>, u64);
+
+/// A RAR 5 archive of members with the given headers, built by hand for
+/// headers rars doesn't write: file version records, or compression methods
+/// from later versions. Each member's CRC32 is of its data.
+fn rar5_by_hand(path: &Path, members: &[HandMember<'_>]) {
     fn vint(mut value: u64, out: &mut Vec<u8>) {
         loop {
             let byte = (value & 0x7f) as u8;
@@ -677,7 +679,9 @@ fn write_versions(path: &Path) {
         out.extend_from_slice(&rars::crc32::crc32(&sized).to_le_bytes());
         out.extend_from_slice(&sized);
     }
-    fn file(name: &[u8], data: &[u8], version: Option<u64>, out: &mut Vec<u8>) {
+    let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
+    block(&[1, 0, 0], &mut bytes);
+    for &(name, data, version, compression) in members {
         let mut extra = Vec::new();
         if let Some(version) = version {
             // Type 4, no flags, then the version number.
@@ -693,26 +697,35 @@ fn write_versions(path: &Path) {
             vint(extra.len() as u64, &mut header);
         }
         vint(data.len() as u64, &mut header);
-        // Flags (CRC32 present), size, attributes, CRC32, stored, Unix host.
+        // Flags (CRC32 present), size, attributes, CRC32, compression, Unix host.
         vint(0x04, &mut header);
         vint(data.len() as u64, &mut header);
         vint(0o100644, &mut header);
         header.extend_from_slice(&rars::crc32::crc32(data).to_le_bytes());
-        vint(0, &mut header);
+        vint(compression, &mut header);
         vint(1, &mut header);
         vint(name.len() as u64, &mut header);
         header.extend_from_slice(name);
         header.extend_from_slice(&extra);
-        block(&header, out);
-        out.extend_from_slice(data);
+        block(&header, &mut bytes);
+        bytes.extend_from_slice(data);
     }
-    let mut bytes = b"Rar!\x1a\x07\x01\x00".to_vec();
-    block(&[1, 0, 0], &mut bytes);
-    file(b"v.txt", b"one\n", Some(1), &mut bytes);
-    file(b"v.txt", b"two\n", None, &mut bytes);
-    file(b"x;1", b"semi\n", None, &mut bytes);
     block(&[5, 0, 0], &mut bytes);
     fs::write(path, bytes).unwrap();
+}
+
+/// Two stored copies of `v.txt`, an older one with a file version record as
+/// `rar -ver` writes it, then the latest, and `x;1`, a file whose name only
+/// looks like a version.
+fn write_versions(path: &Path) {
+    rar5_by_hand(
+        path,
+        &[
+            (b"v.txt", b"one\n", Some(1), 0),
+            (b"v.txt", b"two\n", None, 0),
+            (b"x;1", b"semi\n", None, 0),
+        ],
+    );
 }
 
 /// Issue #564: older copies of a file are extracted only with `-ver`, and
@@ -734,4 +747,145 @@ fn older_file_versions_need_ver() {
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     assert_eq!(fs::read(dir.join("all/v.txt;1")).unwrap(), b"one\n");
     assert_eq!(fs::read(dir.join("all/v.txt")).unwrap(), b"two\n");
+}
+
+/// Issue #565: an archive cut inside its last member's data gives every
+/// member before the cut, whatever `-kb` says, and lists all three.
+#[test]
+fn a_cut_archive_gives_the_members_before_the_cut() {
+    let dir = scratch::case("unrars-cut-member");
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let name = format!("{version:?}.rar");
+        let path = dir.join(&name);
+        let mut builder = Builder::new(version).store(true);
+        for (member, data) in [
+            (&b"a.txt"[..], b"hello\n".to_vec()),
+            (b"z.txt", b"after\n".to_vec()),
+            (b"big.bin", payload()),
+        ] {
+            builder
+                .add_bytes(member.to_vec(), data, None, None)
+                .unwrap();
+        }
+        builder.write_to_path(&path, None).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        let start = bytes
+            .windows(64)
+            .position(|window| window == &payload()[..64])
+            .unwrap();
+        fs::write(&path, &bytes[..start + 5000]).unwrap();
+
+        let out = format!("out-{version:?}/");
+        let output = unrars(&dir, &["x", &name, &out]);
+        let errors = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "{version:?}: {errors}");
+        assert!(
+            errors.contains(&format!("{:<20} - checksum error", "big.bin")),
+            "{version:?}: {errors}"
+        );
+        assert!(
+            errors.contains("Unexpected end of archive"),
+            "{version:?}: {errors}"
+        );
+        assert!(!errors.contains("not RAR archive"), "{version:?}: {errors}");
+        assert!(stdout(&output).contains("Total errors: 2"), "{version:?}");
+        assert_eq!(
+            files_under(&dir.join(&out)),
+            ["a.txt", "z.txt"],
+            "{version:?}"
+        );
+
+        let output = unrars(&dir, &["t", &name]);
+        assert_eq!(output.status.code(), Some(3), "{version:?}");
+
+        let output = unrars(&dir, &["lb", &name]);
+        assert_eq!(output.status.code(), Some(1), "{version:?}");
+        assert_eq!(stdout(&output), "a.txt\nz.txt\nbig.bin\n", "{version:?}");
+        let output = unrars(&dir, &["l", &name]);
+        assert_eq!(output.status.code(), Some(1), "{version:?}");
+        assert!(stderr(&output).contains("Unexpected end of archive"));
+    }
+}
+
+/// Issue #565: without `-kb`, a file header that fails its checksum is
+/// reported as unrar does, and its member and those after it are read.
+#[test]
+fn a_damaged_file_header_is_read_past() {
+    let dir = scratch::case("unrars-damaged-header");
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let name = format!("{version:?}.rar");
+        let path = dir.join(&name);
+        write_three(&path, version);
+        let mut bytes = fs::read(&path).unwrap();
+        let at = bytes.windows(7).position(|v| v == b"mid.bin").unwrap();
+        // Renames it to lid.bin, so the header fails its checksum.
+        bytes[at] ^= 0x01;
+        fs::write(&path, bytes).unwrap();
+        for args in [&["x"][..], &["t"], &["l"], &["p", "-inul"]] {
+            let mut args = args.to_vec();
+            let out = format!("out-{version:?}/");
+            args.push(&name);
+            if args[0] == "x" {
+                args.push(&out);
+            }
+            let output = unrars(&dir, &args);
+            let errors = stderr(&output);
+            assert_eq!(
+                output.status.code(),
+                Some(3),
+                "{version:?} {args:?}: {errors}"
+            );
+            if args[0] != "p" {
+                assert!(
+                    errors.contains("lid.bin - the file header is corrupt"),
+                    "{version:?} {args:?}: {errors}"
+                );
+                assert!(!errors.contains("ERROR"), "{version:?} {args:?}: {errors}");
+            }
+        }
+        let out = dir.join(format!("out-{version:?}"));
+        assert_eq!(fs::read(out.join("lid.bin")).unwrap(), payload());
+        assert_eq!(fs::read(out.join("z.txt")).unwrap(), b"after\n");
+    }
+}
+
+/// Issue #565: damage to the main archive header is named as unrar names it.
+#[test]
+fn a_damaged_main_header_is_named() {
+    let dir = scratch::case("unrars-main-header");
+    let path = write(&dir, "main.rar", None);
+    let mut bytes = fs::read(&path).unwrap();
+    // The main header's CRC, straight after the RAR 5 signature.
+    bytes[8] ^= 0xff;
+    fs::write(&path, bytes).unwrap();
+    let output = unrars(&dir, &["t", "main.rar"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(3), "{errors}");
+    assert!(
+        errors.contains("Main archive header is corrupt"),
+        "{errors}"
+    );
+}
+
+/// Issue #565: a member compressed by a method this reader doesn't know is
+/// reported in unrar's words, and the run goes on.
+#[test]
+fn an_unknown_method_is_reported_as_unrar_does() {
+    let dir = scratch::case("unrars-unknown-method");
+    // Method 1 with algorithm version 5, which no RAR writes yet.
+    rar5_by_hand(
+        &dir.join("new.rar"),
+        &[
+            (b"a.txt", &[0; 64], None, 5 | 1 << 7),
+            (b"b.txt", b"plain\n", None, 0),
+        ],
+    );
+    let output = unrars(&dir, &["x", "new.rar", "out/"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(2), "{errors}");
+    assert_eq!(
+        errors,
+        "Unknown method in a.txt\nYou may need a newer version of RAR.\n"
+    );
+    assert_eq!(fs::read(dir.join("out/b.txt")).unwrap(), b"plain\n");
 }
