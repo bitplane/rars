@@ -1526,6 +1526,12 @@ impl<B: Budget> Reader29State<B> {
         self.base_offset + self.output.len()
     }
 
+    /// The most output a member decoded next may declare: what the solid
+    /// stream before it leaves of the position range.
+    pub(crate) fn output_room(&self) -> usize {
+        usize::MAX - self.current_pos()
+    }
+
     fn raw_range(&self, start: usize, end: usize) -> Result<&[u8]> {
         if start < self.base_offset || end < start {
             return Err(Error::InvalidData(

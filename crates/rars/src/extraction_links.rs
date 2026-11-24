@@ -204,7 +204,7 @@ pub(crate) fn check_legacy_size(
     Ok(())
 }
 
-fn legacy_meta_is_link(meta: &crate::rar15_40::ExtractedEntryMeta) -> bool {
+pub(crate) fn legacy_meta_is_link(meta: &crate::rar15_40::ExtractedEntryMeta) -> bool {
     is_legacy_symlink(
         u64::from(meta.host_os),
         u64::from(meta.attr),

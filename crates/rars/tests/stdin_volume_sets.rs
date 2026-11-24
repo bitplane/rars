@@ -299,30 +299,45 @@ fn a_known_size_that_changes_still_breaks_the_set() {
     }
 }
 
-/// Issue #582: a RAR 5 member whose first part doesn't record its size is
-/// decoded as its volumes arrive, so a caller asked for each volume in turn,
-/// as `unrars -vp` asks, sees output before the last one, as with a known size.
-/// An encrypted stored member still fetches them all first: only its size
-/// tells its data from the cipher padding.
+/// Issues #582 and #602: a member whose first part doesn't record its size
+/// is decoded as its volumes arrive, so a caller asked for each volume in
+/// turn, as `unrars -vp` asks, sees output before the last one, as with a
+/// known size. An encrypted stored member still fetches them all first: only
+/// its size tells its data from the cipher padding. So does a compressed
+/// RAR 2.0 one, whose stream has no end-of-file marker to stop at.
 #[test]
-fn a_rar5_set_from_stdin_is_decoded_as_its_volumes_arrive() {
+fn a_set_from_stdin_is_decoded_as_its_volumes_arrive() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     // Past the size at which output goes out a chunk at a time, and
-    // compressible, so that it isn't stored instead.
+    // compressible, so that it isn't stored instead, but not so much that it
+    // packs into the megabyte a RAR 1.5-4 decoder reads ahead.
     let data: Vec<u8> = noise(3 << 20)
         .into_iter()
         .enumerate()
-        .map(|(at, byte)| if at % 7 == 0 { byte } else { b"text "[at % 5] })
+        .map(|(at, byte)| if at % 2 == 0 { byte } else { b"text "[at % 5] })
         .collect();
     let password = b"secret".as_slice();
-    for (stored, password) in [
-        (true, None),
-        (false, None),
-        (false, Some(password)),
-        (true, Some(password)),
-    ] {
-        let case = format!("stored={stored} encrypted={}", password.is_some());
-        let mut builder = Builder::new(ArchiveVersion::Rar50)
+    let rar20 = [
+        (ArchiveVersion::Rar20, true, None),
+        (ArchiveVersion::Rar20, false, None),
+    ];
+    for (version, stored, password) in [ArchiveVersion::Rar29, ArchiveVersion::Rar50]
+        .into_iter()
+        .flat_map(|version| {
+            [
+                (version, true, None),
+                (version, false, None),
+                (version, false, Some(password)),
+                (version, true, Some(password)),
+            ]
+        })
+        .chain(rar20)
+    {
+        let case = format!(
+            "{version:?} stored={stored} encrypted={}",
+            password.is_some()
+        );
+        let mut builder = Builder::new(version)
             .store(stored)
             .password(password.map(<[u8]>::to_vec))
             .volume_size(Some(128 << 10));
@@ -382,20 +397,27 @@ fn a_rar5_set_from_stdin_is_decoded_as_its_volumes_arrive() {
         assert!(*output.lock().unwrap() == data, "{case}");
         let asked = asked.lock().unwrap();
         assert_eq!(asked.len(), volumes.len() - 1, "{case}");
-        let lazy = !(stored && password.is_some());
+        let lazy = if stored {
+            password.is_none()
+        } else {
+            version != ArchiveVersion::Rar20
+        };
         assert_eq!(*asked.last().unwrap() > 0, lazy, "{case}: {asked:?}");
     }
 }
 
-/// Issue #582: decoded as its volumes arrive, a member from stdin still has
-/// to come to the size its last part gives.
+/// Issues #582 and #602: decoded as its volumes arrive, a member from stdin
+/// still has to come to the size its last part gives.
 #[test]
-fn a_rar5_set_from_stdin_must_match_the_size_its_last_part_gives() {
+fn a_set_from_stdin_must_match_the_size_its_last_part_gives() {
     let data = noise(30_000);
-    for stored in [true, false] {
+    for (version, stored) in [ArchiveVersion::Rar29, ArchiveVersion::Rar50]
+        .into_iter()
+        .flat_map(|version| [(version, true), (version, false)])
+    {
         for wrong in [data.len() as u64 - 1, data.len() as u64 + 1] {
-            let case = format!("stored={stored} size={wrong}");
-            let mut volumes = from_stdin(build_set(ArchiveVersion::Rar50, stored, &data));
+            let case = format!("{version:?} stored={stored} size={wrong}");
+            let mut volumes = from_stdin(build_set(version, stored, &data));
             let last = volumes.len() - 1;
             set_size(&mut volumes[last], Size::Known(wrong));
             let error = extract(&parse(&volumes)).expect_err(&case);

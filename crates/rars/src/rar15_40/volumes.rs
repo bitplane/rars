@@ -1,5 +1,6 @@
 use super::*;
 use crate::extraction_control::{finish_member, finish_split_member, Resume};
+use crate::extraction_links::legacy_meta_is_link;
 use crate::output_limit::OutputBudget;
 use crate::source::{ArchiveSource, RangeReader};
 use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
@@ -245,23 +246,6 @@ where
 {
     let password = session.password;
     let allowance = session.allowance.clone();
-    // Parts written before the size was known record it only in the last header.
-    let sized;
-    let first = if first.known_unp_size().is_none() {
-        let mut header = first.clone();
-        match walk.prefetch() {
-            Ok(last) => header.unp_size = last.unp_size,
-            // Salvaging, the volumes there are are still decoded, size
-            // unknown, until the walk's failure stops the decoder.
-            Err(_) if salvage => header.unp_size = usize::MAX as u64,
-            Err(error) => return Err(error),
-        }
-        sized = header;
-        &sized
-    } else {
-        first
-    };
-    budget.check(first.unp_size, &first.name)?;
     let meta = ExtractedEntryMeta {
         name_is_unicode: first.name_is_unicode(),
         name: first.name.clone(),
@@ -271,6 +255,32 @@ where
         host_os: first.host_os,
         is_directory: false,
     };
+    // Parts written before the size was known record it only in the last header.
+    let lazy = first.known_unp_size().is_none()
+        && decodes_unsized(first, budget, links.is_some() && legacy_meta_is_link(&meta));
+    let sized;
+    let first = if lazy {
+        // Its volumes are fetched as the decoder reaches them, and its size
+        // checked against the last one's header at the end.
+        let mut header = first.clone();
+        header.unp_size = UNSIZED;
+        sized = header;
+        &sized
+    } else if first.known_unp_size().is_none() {
+        let mut header = first.clone();
+        match walk.prefetch() {
+            Ok(last) => header.unp_size = last.unp_size,
+            // Salvaging, the volumes there are are still decoded, size
+            // unknown, until the walk's failure stops the decoder.
+            Err(_) if salvage => header.unp_size = UNSIZED,
+            Err(error) => return Err(error),
+        }
+        sized = header;
+        &sized
+    } else {
+        first
+    };
+    budget.check(first.unp_size, &first.name)?;
     check_legacy_size(&meta, first.unp_size, links.is_some())?;
     let first_reader = volume
         .source
@@ -287,6 +297,7 @@ where
                 if first.is_stored() {
                     return write_stored(
                         first,
+                        lazy,
                         first_reader,
                         walk,
                         password,
@@ -314,6 +325,12 @@ where
                 let last = walk
                     .finish()
                     .map_err(|error| first.entry_error("extracting", error))?;
+                if lazy {
+                    // Decoded to its stream's end-of-file marker.
+                    return size_matches(last, decoded.len)
+                        .and_then(|()| last.crc_result(decoded.crc, password))
+                        .map_err(|error| first.entry_error("extracting", walk.explain(error)));
+                }
                 // Split members pass a stream that ends early whatever the
                 // strict-sizes option says.
                 last.decoded_result(decoded.lenient(), password)
@@ -324,8 +341,44 @@ where
     .map_err(|error| walk.failure.take().unwrap_or(error))
 }
 
+/// The size an unsized split member is decoded to: its stream's end, or the
+/// volumes' end for a stored one.
+const UNSIZED: u64 = usize::MAX as u64;
+
+/// Whether a split member whose first part doesn't record its size can be
+/// decoded as its volumes arrive, so that a caller asked for each volume in
+/// turn sees its output between them. RAR 2.9 and later streams end with an
+/// end-of-file marker for the decoder to stop at; RAR 1.5 and 2.0 ones need
+/// the size. So do an output limit, a symbolic link's target, which is read
+/// whole, and an encrypted stored member, whose cipher padding only the size
+/// tells from its data. Their volumes are all fetched before decoding.
+fn decodes_unsized(first: &FileHeader, budget: &OutputBudget, link: bool) -> bool {
+    !budget.is_limited()
+        && !link
+        && if first.is_stored() {
+            !first.is_encrypted()
+        } else {
+            first.unp_ver >= 29
+        }
+}
+
+/// Checks what an unsized split member decoded to against the size its last
+/// header gives.
+fn size_matches(last: &FileHeader, decoded: u64) -> Result<()> {
+    let declared = last.unp_size;
+    if decoded == declared {
+        Ok(())
+    } else if decoded < declared {
+        Err(Error::MemberEndedEarly { declared, decoded })
+    } else {
+        Err(Error::MemberRanPastDeclaredSize { declared })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn write_stored<B: Budget>(
     first: &FileHeader,
+    lazy: bool,
     first_reader: RangeReader<'static>,
     walk: &mut SplitWalk<'_, '_, '_, B>,
     password: Option<&[u8]>,
@@ -333,6 +386,9 @@ fn write_stored<B: Budget>(
     writer: &mut dyn Write,
     allowance: &B,
 ) -> Result<()> {
+    if lazy {
+        return write_unsized_stored(first, first_reader, walk, writer, allowance);
+    }
     let expected_len = usize::try_from(first.unp_size)
         .map_err(|_| Error::InvalidHeader("RAR 1.5 split unpacked size overflows usize"))?;
     let expected_packed_len = if first.is_encrypted() && first.unp_ver >= 20 {
@@ -375,6 +431,32 @@ fn write_stored<B: Budget>(
         ));
     }
     last.crc_result(crc.finish(), password)
+        .map_err(|error| last.entry_error("extracting", error))
+}
+
+/// Copies an unencrypted stored member of unknown size to the end of its
+/// last fragment, then checks its length and CRC against the last header.
+fn write_unsized_stored<B: Budget>(
+    first: &FileHeader,
+    first_reader: RangeReader<'static>,
+    walk: &mut SplitWalk<'_, '_, '_, B>,
+    writer: &mut dyn Write,
+    allowance: &B,
+) -> Result<()> {
+    debug_assert!(!first.is_encrypted());
+    let mut crc = Crc32::new();
+    let copied = crate::stored_copy::copy(
+        &mut LazyChain::new(&mut *walk, first_reader),
+        UNSIZED,
+        false,
+        &mut |chunk: &[u8]| crc.update(chunk),
+        writer,
+        allowance,
+    );
+    let last = walk.finish()?.clone();
+    let copied = copied?;
+    size_matches(&last, copied)?;
+    last.crc_result(crc.finish(), None)
         .map_err(|error| last.entry_error("extracting", error))
 }
 

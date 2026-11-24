@@ -124,6 +124,13 @@ impl<B: Budget> CodecState<B> {
             }
             Self::Unpack20(decoder) => decoder.decode_member_from_reader(input, target, out),
             Self::Unpack29(decoder) => {
+                // A member of unknown size is decoded to its end-of-file
+                // marker, as far as a solid stream before it leaves room.
+                let target = if file.unp_size == usize::MAX as u64 {
+                    target.min(decoder.output_room())
+                } else {
+                    target
+                };
                 if solid {
                     decoder.decode_member_from_reader(input, target, out)
                 } else {
