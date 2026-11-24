@@ -1522,6 +1522,26 @@ fn compress_members_whole(
             return Err(Error::Cancelled);
         }
         if let Execution::Blocks { run_filters, .. } = members[start].execution {
+            let end = runs_lookahead(members, integrity, start, straight);
+            if members[start..end]
+                .iter()
+                .any(|member| runs_kind(member) != Some(run_filters))
+            {
+                compress_lookahead(
+                    start..end,
+                    sources,
+                    integrity,
+                    plan,
+                    members,
+                    resources,
+                    advance,
+                    error_context,
+                    straight,
+                    consume,
+                )?;
+                start = end;
+                continue;
+            }
             // Consecutive fallback members share waves, so a set of mid-size
             // members fills the machine instead of running one member's two
             // or three runs at a time. Each member keeps its own runs,
@@ -1529,12 +1549,7 @@ fn compress_members_whole(
             let end = start
                 + members[start..]
                     .iter()
-                    .take_while(|member| {
-                        matches!(
-                            member.execution,
-                            Execution::Blocks { run_filters: same, .. } if same == run_filters
-                        )
-                    })
+                    .take_while(|member| runs_kind(member) == Some(run_filters))
                     .count();
             let required = members[start..end]
                 .iter()
@@ -1635,6 +1650,104 @@ fn compress_members_whole(
         start = end;
     }
     Ok(())
+}
+
+/// Past 32 MiB the lookahead stopped gaining and only held more packed members.
+const RUNS_LOOKAHEAD_BYTES: u64 = 64 * 1024 * 1024;
+const RUNS_LOOKAHEAD_MEMBERS: usize = 1024;
+
+/// So a few members coded in runs share waves across the whole members between them.
+fn runs_lookahead(
+    members: &[MemberPlan],
+    integrity: &[Integrity],
+    start: usize,
+    straight: &Straight<'_>,
+) -> usize {
+    let mut last = start;
+    let mut bytes = 0u64;
+    let mut end = start;
+    while end < members.len() && end - start < RUNS_LOOKAHEAD_MEMBERS {
+        let size = integrity[end].0;
+        bytes = bytes.saturating_add(size);
+        if straight(end, size) || (end > start && bytes > RUNS_LOOKAHEAD_BYTES) {
+            break;
+        }
+        if matches!(members[end].execution, Execution::Blocks { .. }) {
+            last = end;
+        }
+        end += 1;
+    }
+    last + 1
+}
+
+/// No member's bytes depend on its neighbours, so each kind is coded as if the others were not there.
+#[allow(clippy::too_many_arguments)]
+fn compress_lookahead(
+    window: std::ops::Range<usize>,
+    sources: &[EntrySource],
+    integrity: &[Integrity],
+    plan: &CompressPlan,
+    members: &[MemberPlan],
+    resources: &WriterResources,
+    advance: &dyn CompressionProgress,
+    error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+    straight: &Straight<'_>,
+    consume: &mut Consume<'_>,
+) -> Result<()> {
+    let first = window.start;
+    let mut packed = Records::collect(window.clone().map(|_| Ok(None)), resources)?;
+    for wanted in [Some(true), Some(false), None] {
+        let count = members[window.clone()]
+            .iter()
+            .filter(|member| runs_kind(member) == wanted)
+            .count();
+        if count == 0 {
+            continue;
+        }
+        let mut indexes = Records::new(count, resources)?;
+        let mut picked_sources = Records::new(count, resources)?;
+        let mut picked_integrity = Records::new(count, resources)?;
+        let mut picked_members = Records::new(count, resources)?;
+        for index in window
+            .clone()
+            .filter(|&index| runs_kind(&members[index]) == wanted)
+        {
+            indexes.push(index)?;
+            picked_sources.push(sources[index].clone())?;
+            picked_integrity.push(integrity[index])?;
+            picked_members.push(members[index])?;
+        }
+        compress_members_whole(
+            &picked_sources,
+            &picked_integrity,
+            plan,
+            &picked_members,
+            resources,
+            &Remapped::new(&indexes, advance),
+            &|member, error| error_context(indexes[member], error),
+            &|member, size| straight(indexes[member], size),
+            &mut |member, handed| match handed {
+                Handed::Member(member_packed) => {
+                    packed[indexes[member] - first] = Some(member_packed);
+                    Ok(())
+                }
+                _ => unreachable!("no member in a lookahead goes out straight"),
+            },
+        )?;
+    }
+    for (offset, member) in packed.into_iter().enumerate() {
+        let member = member.expect("every member in a lookahead is coded");
+        consume(first + offset, Handed::Member(member))?;
+    }
+    Ok(())
+}
+
+/// Whether a member is coded in runs that search filters, in runs that do not, or whole.
+fn runs_kind(member: &MemberPlan) -> Option<bool> {
+    match member.execution {
+        Execution::Blocks { run_filters, .. } => Some(run_filters),
+        Execution::WholeMember => None,
+    }
 }
 
 /// A contiguous wave fitting both the configured estimate and the worker count.
@@ -4714,6 +4827,89 @@ mod tests {
             assert_eq!(bytes(&mut together[index]), bytes(&mut alone[0]));
         }
         drop(together);
+        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn members_coded_in_runs_share_waves_across_the_whole_members_between_them() {
+        use std::sync::Mutex;
+        struct Starts(Mutex<Vec<usize>>);
+        impl CompressionProgress for Starts {
+            fn advance(&self, _: u64) -> bool {
+                true
+            }
+            fn started(&self, index: usize, _: u64) {
+                self.0.lock().unwrap().push(index);
+            }
+        }
+        let scratch = crate::scratch::case("medium-lookahead");
+        let first = b"runs either side of a whole member\n".repeat(65536);
+        let second: Vec<u8> = (0..600_000u32)
+            .flat_map(|n| (n.wrapping_mul(2_654_435_761) >> 7).to_le_bytes())
+            .collect();
+        let sources = [
+            EntrySource::from_bytes(first.clone()),
+            EntrySource::from_bytes(b"small enough to code whole".to_vec()),
+            EntrySource::from_bytes(second.clone()),
+            EntrySource::from_bytes(b"and another".to_vec()),
+        ];
+        let encode_options = EncodeOptions::new(8).with_max_match_distance(128 * 1024);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options,
+            dictionary_size: 128 * 1024,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![encode_options].into(),
+            blake2sp: true,
+        };
+        let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
+
+        let starts = Starts(Mutex::new(Vec::new()));
+        let mut handed = Vec::new();
+        compress_members_in_order(
+            &sources,
+            &plan,
+            &resources,
+            &starts,
+            &|_, error| error,
+            false,
+            &|_, _| false,
+            &mut |index, member| match member {
+                Handed::Member(member) => {
+                    handed.push((index, member));
+                    Ok(())
+                }
+                _ => unreachable!("no member goes out straight"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            handed.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            [0, 1, 2, 3]
+        );
+        let starts = starts.0.into_inner().unwrap();
+        let at = |member| starts.iter().position(|&index| index == member).unwrap();
+        assert!(at(2) < at(1), "{starts:?}");
+
+        // Captured from the writer before members in runs looked ahead.
+        let fingerprints = [
+            (156, 0x4d9e_9ba6, false),
+            (0, 0, true),
+            (2_126_960, 0x8f44_4877, false),
+            (0, 0, true),
+        ];
+        for ((_, member), expected) in handed.iter_mut().zip(fingerprints) {
+            let mut bytes = Vec::new();
+            member.packed.copy_to(&mut bytes).unwrap();
+            assert_eq!(
+                (bytes.len(), crate::crc32::crc32(&bytes), member.store),
+                expected
+            );
+        }
+        drop(handed);
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
     }
 
