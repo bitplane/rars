@@ -1444,6 +1444,78 @@ mod run_search_tests {
         }
     }
 
+    /// Level 1 codes a member longer than one filter search in runs, which
+    /// run on every thread, rather than whole on one (#545). The archive is
+    /// the same at any thread count, and its packed member is the one the
+    /// whole-member path makes.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_lazy_member_codes_in_runs_alike_on_any_thread_count() {
+        use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
+        use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
+        let root = crate::scratch::case("rar50-lazy-member-runs");
+        let data = scripted_code(2 * SEARCH + 100 * 1024);
+        let options = encode_options_for_level(Some(1), 128 * 1024).unwrap();
+        assert!(!options.optimal_parse);
+        let whole = super::super::plan::with_filter_search_bytes(SEARCH, || {
+            encode_member_with_filter_policy_candidates_and_progress(
+                &data,
+                0,
+                &FilterPolicy::Auto,
+                &[options],
+                None,
+            )
+            .unwrap()
+        });
+        let write = |threads: usize| {
+            let entries = [ArchiveEntry::new(
+                "code",
+                EntrySource::from_bytes(data.clone()),
+            )];
+            let resources = WriterResources::new(1024 * 1024 * 1024).with_temp_dir(&*root);
+            let mut bytes = Vec::new();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    super::super::plan::with_filter_search_bytes(SEARCH, || {
+                        crate::rar50::write_streaming_archive_with_progress(
+                            &entries,
+                            WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                                .with_compression_level(1)
+                                .with_dictionary_size(128 * 1024),
+                            ArchiveExtras::default().with_filter_policy(FilterPolicy::Auto),
+                            &resources,
+                            None,
+                            &mut bytes,
+                        )
+                    })
+                })
+                .unwrap();
+            bytes
+        };
+        let one = write(1);
+        assert!(
+            memchr::memmem::find(&one, &whole).is_some(),
+            "the {}-byte archive does not hold the {}-byte whole-member packing",
+            one.len(),
+            whole.len()
+        );
+        for threads in [2, 8] {
+            assert!(
+                one == write(threads),
+                "{threads} threads changed the archive"
+            );
+        }
+        let archive = ArchiveReader::read(&one).unwrap();
+        archive.test(None).unwrap();
+        assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn an_explicit_filter_over_a_member_stops_at_4_gib() {
