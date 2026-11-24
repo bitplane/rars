@@ -44,8 +44,15 @@ pub fn unrars_run(args: impl IntoIterator<Item = OsString>) -> i32 {
             print!("{}", usage());
             OK
         }
-        Err(()) => {
+        Err(Refused::Usage) => {
             print!("{}", usage());
+            USAGE
+        }
+        Err(Refused::Switch(switch)) => {
+            eprintln!(
+                "ERROR: unrars does not support the -{} switch yet",
+                String::from_utf8_lossy(&switch)
+            );
             USAGE
         }
     };
@@ -107,14 +114,124 @@ struct Invocation {
     pause_volumes: bool,
     /// `-v` with `l`: list every volume of a set, not only the one named.
     all_volumes: bool,
+    /// `-n`: only members these masks select.
+    include: Vec<Vec<u8>>,
+    /// `-x`: never members these masks select.
+    exclude: Vec<Vec<u8>>,
+    /// `-ap`: only members under this path in the archive, extracted
+    /// without it.
+    inside: Option<Vec<u8>>,
+    /// `-ad`: extract into a directory named after the archive.
+    archive_directory: bool,
+    /// `-ol-`: leave symbolic links out.
+    skip_symlinks: bool,
+    /// `-ierr`: every message on stderr.
+    stderr_only: bool,
     /// May hold `*` and `?`, matched against the files in its directory.
     archive: PathBuf,
     masks: Vec<Vec<u8>>,
     destination: PathBuf,
 }
 
-/// `Ok(None)` asks for the usage text; `Err` is a command line unrar would refuse.
-fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>, ()> {
+impl Invocation {
+    /// Whether the masks, `-n`, `-x` and `-ap` select a member.
+    fn selects(&self, name: &[u8]) -> bool {
+        selected(&self.masks, name)
+            && (self.include.is_empty() || selected(&self.include, name))
+            && !(!self.exclude.is_empty() && selected(&self.exclude, name))
+            && self.inside.as_ref().is_none_or(|inside| {
+                strip_inside(inside, name).is_some_and(|rest| !rest.is_empty())
+            })
+    }
+
+    /// The name a member is written under: without the `-ap` path.
+    fn output_name<'n>(&self, name: &'n [u8]) -> &'n [u8] {
+        self.inside
+            .as_ref()
+            .and_then(|inside| strip_inside(inside, name))
+            .unwrap_or(name)
+    }
+
+    /// Where an archive's members go: the destination, and with `-ad` a
+    /// directory named after the archive.
+    fn destination_for(&self, archive: &Path) -> PathBuf {
+        match archive.file_stem() {
+            Some(stem) if self.archive_directory => self.destination.join(stem),
+            _ => self.destination.clone(),
+        }
+    }
+}
+
+/// What of `name` follows the `-ap` path `inside`, when it is under it.
+fn strip_inside<'n>(inside: &[u8], name: &'n [u8]) -> Option<&'n [u8]> {
+    let separator = |byte: &u8| *byte == b'/' || *byte == b'\\';
+    if name.len() < inside.len()
+        || !name
+            .iter()
+            .zip(inside)
+            .all(|(&left, &right)| left == right || (separator(&left) && right == b'/'))
+    {
+        return None;
+    }
+    match name.get(inside.len()) {
+        None => Some(&name[name.len()..]),
+        Some(byte) if separator(byte) => Some(&name[inside.len() + 1..]),
+        Some(_) => None,
+    }
+}
+
+/// Why a command line is refused.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// One unrar would refuse too.
+    Usage,
+    /// A switch that changes which files are written, or where, that unrars
+    /// can't honour yet. Ignoring it would write what the caller asked not to.
+    Switch(Vec<u8>),
+}
+
+impl From<()> for Refused {
+    fn from((): ()) -> Self {
+        Self::Usage
+    }
+}
+
+/// Masks from a switch's argument: the mask itself, or `@` and a list file.
+fn switch_masks(argument: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    match argument.strip_prefix(b"@") {
+        Some(list) => read_mask_list(list),
+        None if argument.is_empty() => Err(()),
+        None => Ok(vec![argument.to_vec()]),
+    }
+}
+
+/// The masks in a list file, one to a line.
+fn read_mask_list(list: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
+    let list =
+        std::fs::read(OsString::from(String::from_utf8_lossy(list).as_ref())).map_err(|_| ())?;
+    Ok(list
+        .split(|&byte| byte == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+        .filter(|line| !line.is_empty())
+        .map(<[u8]>::to_vec)
+        .collect())
+}
+
+/// Switches unrars refuses rather than ignores: they filter by time, size,
+/// attributes or freshness, rename what is written, or allow absolute paths
+/// and links.
+fn refused_switch(lower: &[u8]) -> bool {
+    matches!(
+        lower,
+        b"f" | b"u" | b"cl" | b"cu" | b"ad1" | b"ad2" | b"ola"
+    ) || [&b"ta"[..], b"tb", b"tn", b"to", b"sl", b"sm", b"ep", b"e+"]
+        .iter()
+        .any(|prefix| lower.starts_with(prefix) && lower != b"ep")
+        || (lower.starts_with(b"e") && lower.len() > 1 && lower[1].is_ascii_digit())
+}
+
+/// `Ok(None)` asks for the usage text.
+fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>, Refused> {
     let mut words = Vec::new();
     let mut switches = Vec::new();
     let mut switches_ended = false;
@@ -139,7 +256,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         "p" => Command::Print,
         "l" | "v" | "lt" | "vt" | "lta" | "vta" => Command::List { bare: false },
         "lb" | "vb" => Command::List { bare: true },
-        _ => return Err(()),
+        _ => return Err(Refused::Usage),
     };
     let mut invocation = Invocation {
         command,
@@ -153,6 +270,12 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         versions: false,
         pause_volumes: false,
         all_volumes: false,
+        include: Vec::new(),
+        exclude: Vec::new(),
+        inside: None,
+        archive_directory: false,
+        skip_symlinks: false,
+        stderr_only: false,
         archive: PathBuf::from(words.next().ok_or(())?),
         masks: Vec::new(),
         destination: PathBuf::new(),
@@ -168,16 +291,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
     }
     for word in rest {
         match word.as_encoded_bytes().strip_prefix(b"@") {
-            Some(list) => {
-                let list = std::fs::read(OsString::from(String::from_utf8_lossy(list).as_ref()))
-                    .map_err(|_| ())?;
-                invocation.masks.extend(
-                    list.split(|&byte| byte == b'\n')
-                        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-                        .filter(|line| !line.is_empty())
-                        .map(<[u8]>::to_vec),
-                );
-            }
+            Some(list) => invocation.masks.extend(read_mask_list(list)?),
             None => invocation.masks.push(word.as_encoded_bytes().to_vec()),
         }
     }
@@ -199,6 +313,35 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
             b"kb" => invocation.keep_broken = true,
             b"vp" => invocation.pause_volumes = true,
             b"v" => invocation.all_volumes = true,
+            b"ad" => invocation.archive_directory = true,
+            b"ep" => {
+                if let Command::Extract { flat } = &mut invocation.command {
+                    *flat = true;
+                }
+            }
+            b"ol-" => invocation.skip_symlinks = true,
+            b"ierr" => invocation.stderr_only = true,
+            _ if refused_switch(&lower) => return Err(Refused::Switch(raw.to_vec())),
+            // Masks and paths keep their case.
+            _ if lower.starts_with(b"x") => invocation.exclude.extend(switch_masks(&raw[1..])?),
+            _ if lower.starts_with(b"n") => invocation.include.extend(switch_masks(&raw[1..])?),
+            _ if lower.starts_with(b"ap") => {
+                let mut inside: Vec<u8> = raw[2..]
+                    .iter()
+                    .map(|&byte| if byte == b'\\' { b'/' } else { byte })
+                    .collect();
+                while inside.ends_with(b"/") {
+                    inside.pop();
+                }
+                // A path in the archive, whether or not it starts at its root.
+                let start = inside.iter().take_while(|&&byte| byte == b'/').count();
+                inside.drain(..start);
+                invocation.inside = (!inside.is_empty()).then_some(inside);
+            }
+            _ if lower.starts_with(b"op") && raw.len() > 2 => {
+                invocation.destination =
+                    PathBuf::from(OsString::from(String::from_utf8_lossy(&raw[2..]).as_ref()));
+            }
             _ if lower.starts_with(b"ver") => invocation.versions = true,
             _ if lower.starts_with(b"id") => {
                 for flag in &lower[2..] {
@@ -250,11 +393,22 @@ Switches
   -ver    Extract older file versions too
   -v      List every volume of a set (l, v)
   -vp     Ask before each later volume, and wait for the answer on stdin
+  -x<f>   Exclude files matching <f>; -x@<list> for a list of masks
+  -n<f>   Include only files matching <f>; -n@<list> for a list of masks
+  -ap<p>  Only files under <p> in the archive, extracted without it
+  -ad     Extract into a directory named after the archive
+  -ep     Extract without paths, as e does
+  -op<p>  Extract into <p>
+  -ol-    Leave symbolic links out
+  -ierr   Send all messages to stderr
   -inul   No messages
   -idq    Errors only; -idc no banner; -idd no closing \"All OK\"
   --      End of switches
 
-Other unrar switches are accepted and ignored.
+Switches that filter by time, size, attributes or freshness (-ta, -tb, -tn,
+-to, -sl, -sm, -e, -f, -u), change names (-cl, -cu) or allow absolute paths
+and links (-ad1, -ad2, -ep1 to -ep4, -ola) are refused. Other unrar switches
+are accepted and ignored.
 ",
         banner()
     )
@@ -267,17 +421,28 @@ fn banner() -> String {
     )
 }
 
-/// Where messages go: unrar puts progress on stdout and errors on stderr.
+/// Where messages go: unrar puts progress on stdout and errors on stderr,
+/// or everything on stderr with `-ierr`.
 #[derive(Clone, Copy)]
 struct Out {
     silent: bool,
     quiet: bool,
+    stderr_only: bool,
 }
 
 impl Out {
     fn info(self, line: &str) {
         if !self.silent && !self.quiet {
-            println!("{line}");
+            self.print(format_args!("{line}\n"));
+        }
+    }
+
+    /// Listings and the banner, which `-idq` leaves alone.
+    fn print(self, text: std::fmt::Arguments<'_>) {
+        if self.stderr_only {
+            eprint!("{text}");
+        } else {
+            print!("{text}");
         }
     }
 
@@ -311,16 +476,20 @@ fn run(invocation: &Invocation) -> i32 {
     let out = Out {
         silent: invocation.silent,
         quiet: invocation.quiet,
+        stderr_only: invocation.stderr_only,
     };
     let bare = invocation.command == Command::List { bare: true };
     if invocation.banner && !bare && !out.silent && !out.quiet {
-        print!("{}", banner());
+        out.print(format_args!("{}", banner()));
     }
     let mut password = match &invocation.password {
         PasswordSwitch::Given(password) => Some(password.clone()),
-        PasswordSwitch::Prompt => match prompt_password() {
+        PasswordSwitch::Prompt => match prompt_password(None) {
             Some(password) => Some(password),
-            None => return USAGE,
+            None => {
+                out.error("Read error in the file stdin");
+                return READ_ERROR;
+            }
         },
         PasswordSwitch::Unset | PasswordSwitch::Never => None,
     };
@@ -384,12 +553,13 @@ fn run_archive(
         }
     }
     let path = path.as_path();
-    if may_ask
-        && !listing
-        && password.is_none()
-        && archive.members().any(|member| member.meta.is_encrypted)
-    {
-        *password = prompt_password();
+    if may_ask && !listing && password.is_none() {
+        let locked = archive
+            .members()
+            .find(|member| member.meta.is_encrypted && invocation.selects(&member.meta.name));
+        if let Some(member) = locked {
+            *password = prompt_password(Some(&display_name(&member.meta.name)));
+        }
     }
     match invocation.command {
         Command::List { bare } => {
@@ -445,7 +615,7 @@ fn list_volumes(
         if report_header_damage(out, &volume) > 0 {
             tally.fail(CHECKSUM);
         }
-        let (size, count) = list(invocation, &volume_path, &volume, bare);
+        let (size, count) = list(invocation, out, &volume_path, &volume, bare);
         totals = (totals.0 + size, totals.1 + count);
         listed += 1;
         if report_truncation(out, volume.truncation()) {
@@ -471,10 +641,10 @@ fn list_volumes(
     }
     if invocation.all_volumes && !bare {
         // unrar sets the grand total one column left of each volume's.
-        println!("{:>20}{:>21}", totals.0, totals.1);
+        out.print(format_args!("{:>20}{:>21}\n", totals.0, totals.1));
     }
     if !bare {
-        println!();
+        out.print(format_args!("\n"));
     }
 }
 
@@ -520,12 +690,27 @@ fn archive_path(archive: &Path) -> PathBuf {
     archive.to_path_buf()
 }
 
-fn prompt_password() -> Option<Password> {
-    if !std::io::stdin().is_terminal() {
-        return None;
+/// Asks for a password, for `name` if given, as unrar does: on a terminal
+/// without echo, otherwise from a line of stdin, so a caller can pipe it in.
+fn prompt_password(name: Option<&str>) -> Option<Password> {
+    let prompt = match name {
+        Some(name) => format!("\nEnter password (will not be echoed) for {name}: "),
+        None => "\nEnter password (will not be echoed): ".to_string(),
+    };
+    if std::io::stdin().is_terminal() {
+        let line = rpassword::prompt_password(prompt).ok()?;
+        return Some(Zeroizing::new(line.into_bytes()));
     }
-    let line = rpassword::prompt_password("Enter password: ").ok()?;
-    Some(Zeroizing::new(line.into_bytes()))
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    let mut line = Zeroizing::new(String::new());
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => {
+            let password = line.trim_end_matches(['\n', '\r']);
+            Some(Zeroizing::new(password.as_bytes().to_vec()))
+        }
+    }
 }
 
 /// Whether testing or extracting reads past damage: always where `-kb` keeps
@@ -548,7 +733,8 @@ fn open_archive(
         |password: &Option<Password>| read_archive(path, password.as_deref().map(Vec::as_slice));
     match read(password) {
         Err(error) if may_ask && password.is_none() && needs_password(&error) => {
-            *password = prompt_password();
+            let name = path.file_name().unwrap_or(path.as_os_str());
+            *password = prompt_password(Some(&name.to_string_lossy()));
             if password.is_none() {
                 return Err(error);
             }
@@ -625,16 +811,22 @@ fn io_reason(error: &rars::Error) -> String {
 
 /// Lists one archive or volume, returning the size and count of the files
 /// that start in it.
-fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) -> (u64, usize) {
+fn list(
+    invocation: &Invocation,
+    out: Out,
+    path: &Path,
+    archive: &Archive,
+    bare: bool,
+) -> (u64, usize) {
     // unrar lists the older copies `rar -ver` kept, `-ver` or not.
     let members: Vec<_> = archive
         .members()
-        .filter(|member| selected(&invocation.masks, &member.meta.name))
+        .filter(|member| invocation.selects(&member.meta.name))
         .map(|member| member.meta.clone())
         .collect();
     if bare {
         for meta in &members {
-            println!("{}", display_name(&meta.name));
+            out.print(format_args!("{}\n", display_name(&meta.name)));
         }
     }
     // A member continued from an earlier volume counts where it starts.
@@ -646,13 +838,17 @@ fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) -> 
     if bare {
         return totals;
     }
-    println!(
-        "\nArchive: {}\nDetails: {}\n",
+    out.print(format_args!(
+        "\nArchive: {}\nDetails: {}\n\n",
         path.display(),
         details(archive)
-    );
-    println!(" Attributes      Size     Date    Time   Name");
-    println!("----------- ---------  ---------- -----  ----");
+    ));
+    out.print(format_args!(
+        " Attributes      Size     Date    Time   Name\n"
+    ));
+    out.print(format_args!(
+        "----------- ---------  ---------- -----  ----\n"
+    ));
     for meta in &members {
         let (date, time) = match meta
             .stored_modification_time()
@@ -664,15 +860,20 @@ fn list(invocation: &Invocation, path: &Path, archive: &Archive, bare: bool) -> 
             ),
             None => ("????-??-??".to_string(), "??:??".to_string()),
         };
-        println!(
-            " {:<10} {:>9}  {date} {time}  {}",
+        out.print(format_args!(
+            " {:<10} {:>9}  {date} {time}  {}\n",
             attributes(meta),
             meta.unpacked_size,
             display_name(&meta.name)
-        );
+        ));
     }
-    println!("----------- ---------  ---------- -----  ----");
-    println!(" {:<10} {:>9}{:>21}", "", totals.0, totals.1);
+    out.print(format_args!(
+        "--------------------  ---------- -----  ----\n"
+    ));
+    out.print(format_args!(
+        " {:<10} {:>9}{:>21}\n",
+        "", totals.0, totals.1
+    ));
     totals
 }
 
@@ -743,8 +944,7 @@ fn attributes(meta: &rars::ArchiveMemberMeta) -> String {
 /// Which members a run is after: those its masks select and, of a file
 /// `rar -ver` kept older copies of, only the latest unless `-ver` asks for all.
 struct Wanted<'i> {
-    masks: &'i [Vec<u8>],
-    versions: bool,
+    invocation: &'i Invocation,
     /// Names of the older copies in the volumes read so far.
     older: Mutex<HashSet<Vec<u8>>>,
     /// Members chosen so far.
@@ -754,8 +954,7 @@ struct Wanted<'i> {
 impl<'i> Wanted<'i> {
     fn new(invocation: &'i Invocation) -> Self {
         Self {
-            masks: &invocation.masks,
-            versions: invocation.versions,
+            invocation,
             older: Mutex::default(),
             matched: AtomicUsize::new(0),
         }
@@ -774,7 +973,8 @@ impl<'i> Wanted<'i> {
     }
 
     fn wants(&self, name: &[u8]) -> bool {
-        (self.versions || !lock(&self.older).contains(name)) && selected(self.masks, name)
+        (self.invocation.versions || !lock(&self.older).contains(name))
+            && self.invocation.selects(name)
     }
 
     /// Whether the run wants a member it has reached, counting it if so.
@@ -1131,17 +1331,15 @@ where
     };
     let keep = KeepBroken::default();
     let broken = &keep;
+    let destination = invocation.destination_for(failures.path);
     let mut state = ExtractOutputState::new(
-        &invocation.destination,
+        &destination,
         policy,
         invocation.keep_broken,
         invocation.command == (Command::Extract { flat: true }),
         archive.family(),
     );
     state.skip_existing = policy == OverwritePolicy::Never;
-    state.selected = Some(Box::new(|meta: &rars::ExtractedEntryMeta| {
-        failures.wanted.choose(&meta.name)
-    }));
     state.on_published = Some(Box::new(move |output: &ExtractedOutput| {
         let verb = if output.meta.is_directory {
             "Creating"
@@ -1172,12 +1370,13 @@ where
             Failure::Unwanted => return Ok(rars::ExtractionErrorAction::Continue),
             Failure::Report(line) => line,
         };
-        let name = &member.meta.name;
+        // Its output, if it has one, is under the name it is written as.
+        let name = invocation.output_name(&member.meta.name);
         if !is_password_error(error) && broken.kept.keep(name) {
-            lock(&broken.pending).push((name.clone(), line));
+            lock(&broken.pending).push((name.to_vec(), line));
         } else {
             out.error(&line);
-            lock(&failures.failed).push(name.clone());
+            lock(&failures.failed).push(name.to_vec());
         }
         Ok(rars::ExtractionErrorAction::Continue)
     };
@@ -1189,10 +1388,15 @@ where
         |meta| {
             let mut state = state.borrow_mut();
             state.discard_failed(&failures.take_failed());
+            if !failures.wanted.choose(&meta.name) {
+                broken.kept.close();
+                return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+            }
+            let meta = written(invocation, meta);
             let opened = if keep_broken {
-                broken.kept.open(&mut state, meta)
+                broken.kept.open(&mut state, &meta)
             } else {
-                state.open_entry(meta)
+                state.open_entry(&meta)
             };
             failures
                 .callback(opened)
@@ -1202,7 +1406,14 @@ where
             broken.kept.close();
             let mut state = state.borrow_mut();
             state.discard_failed(&failures.take_failed());
-            failures.callback(state.create_link(meta, link))
+            let symlink = matches!(
+                link,
+                rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. }
+            );
+            if (symlink && invocation.skip_symlinks) || !failures.wanted.choose(&meta.name) {
+                return Ok(());
+            }
+            failures.callback(state.create_link(&written(invocation, meta), link))
         },
     );
     state.borrow_mut().discard_failed(&failures.take_failed());
@@ -1219,6 +1430,20 @@ where
         warnings: skipped_links > 0,
         all_kept: kept > 0 && outputs.iter().all(|output| output.meta.is_directory),
     })
+}
+
+/// A member as it is written: without the `-ap` path.
+fn written<'m>(
+    invocation: &Invocation,
+    meta: &'m rars::ExtractedEntryMeta,
+) -> std::borrow::Cow<'m, rars::ExtractedEntryMeta> {
+    let name = invocation.output_name(&meta.name);
+    if name.len() == meta.name.len() {
+        return std::borrow::Cow::Borrowed(meta);
+    }
+    let mut meta = meta.clone();
+    meta.name = name.to_vec();
+    std::borrow::Cow::Owned(meta)
 }
 
 fn is_password_error(error: &rars::Error) -> bool {
@@ -1359,6 +1584,14 @@ fn member_error_line(
                 None => (line, CHECKSUM),
             }
         }
+        // RAR 1.5-4 store no password check, so a wrong password and a
+        // damaged member look the same, and unrar says so.
+        ErrorKind::BadPassword if archive.family() != rars::ArchiveFamily::Rar50Plus => (
+            format!(
+                "Checksum error in the encrypted file {member}. Corrupt file or wrong password."
+            ),
+            CHECKSUM,
+        ),
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             (format!("Incorrect password for {member}"), BAD_PASSWORD)
         }
