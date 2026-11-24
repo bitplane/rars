@@ -1,6 +1,6 @@
 //! Pool threads decode batches of blocks to operations; the calling thread
 //! reads ahead and replays them, so output and errors match the serial decoder.
-use super::block_ops::{skip_symbols, BlockOps, Flat, Reached, Repeats, Stop, Walked};
+use super::block_ops::{skip_symbols, BlockOps, Reached, Repeats, Replay, Stop, Walked};
 use super::{
     read_compressed_block_salvaging, read_table_lengths_with_allowance,
     refuse_stream_past_declared, Budget, DecodedChunk, Error, OwnedCompressedBlock, PendingFilter,
@@ -299,7 +299,7 @@ impl<B: Budget> ReaderState<B> {
         &mut self,
         batch: &Batch<B>,
         spare: &Mutex<Vec<BlockOps>>,
-        flat: &mut Flat<'_, B>,
+        out: &mut Replay<'_, '_, B>,
         reached_tables: &mut Option<Tables<B>>,
     ) -> (Result<()>, bool) {
         let mut poller = self.read_control.poller();
@@ -312,14 +312,14 @@ impl<B: Budget> ReaderState<B> {
         let mut reached = Reached::default();
         let mut in_symbols = false;
         let replayed = loop {
-            let walked = match ops.apply_buffered(self, flat, &mut poller, &mut reached) {
+            let walked = match ops.apply_buffered(self, out, &mut poller, &mut reached) {
                 Ok(walked) => walked,
                 Err(error) => {
                     in_symbols = true;
                     break Err(error);
                 }
             };
-            if flat.output.len() >= flat.output_size {
+            if out.full() {
                 // A block whose every symbol was replayed has nothing past the declared size.
                 if walked == Walked::BlockEnd
                     || walked == Walked::All && matches!(stop, Stop::BlockEnd)

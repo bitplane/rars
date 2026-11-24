@@ -1,4 +1,4 @@
-use super::block_ops::{BlockOps, Flat};
+use super::block_ops::{BlockOps, Flat, Replay};
 use super::blocks_ahead::{decode_pool, enter, held_bytes, Batch, Tables, BATCH_BYTES};
 use super::{read_compressed_block_salvaging, Budget, DecodeMode, ReaderState, Result};
 use std::collections::VecDeque;
@@ -261,18 +261,20 @@ impl<B: Budget> ReaderState<B> {
         claimed: Claimed<B>,
         flat: &mut Flat<'_, B>,
     ) -> Result<()> {
+        let mut out = Replay::begin(flat)?;
         let mut tables = self.tables.take();
         let mut replayed = Ok(());
         let mut whole = false;
         for (index, batch) in claimed.batches.iter().enumerate() {
             let (batch_replayed, batch_whole) =
-                self.replay_batch(batch, &claimed.spare, flat, &mut tables);
+                self.replay_batch(batch, &claimed.spare, &mut out, &mut tables);
             replayed = batch_replayed;
             whole = batch_whole && index + 1 == claimed.batches.len();
-            if replayed.is_err() || flat.output.len() >= flat.output_size {
+            if replayed.is_err() || out.full() {
                 break;
             }
         }
+        out.finish();
         self.tables = tables;
         self.replayed_whole = replayed.is_ok() && whole;
         replayed

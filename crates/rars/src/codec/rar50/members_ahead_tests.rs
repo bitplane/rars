@@ -258,6 +258,43 @@ fn solid_and_filtered_members_decode_ahead_as_the_serial_decoder_does() {
 }
 
 #[test]
+fn long_members_matching_into_history_decode_ahead_as_the_serial_decoder_does() {
+    let first = prose(20_000, 29);
+    let second = [
+        &first[5_000..15_000],
+        &[b'z'; 3_000][..],
+        &prose(4_000, 31),
+        &first[..8_000],
+    ]
+    .concat();
+    // Encoded against a longer history than the chain holds, so its
+    // matches into the missing part reach past the window.
+    let missing = prose(4_000, 37);
+    let third = [&prose(3_000, 41)[..], &missing[..2_000]].concat();
+    let members = [
+        Member {
+            stream: lz_stream(&first, &[], 6_000),
+            size: first.len(),
+            solid: false,
+        },
+        Member {
+            stream: lz_stream(&second, &first, 6_000),
+            size: second.len(),
+            solid: true,
+        },
+        Member {
+            stream: lz_stream(&third, &[&missing[..], &first, &second].concat(), 6_000),
+            size: third.len(),
+            solid: true,
+        },
+    ];
+    let (outcomes, claimed) = assert_ahead_matches_serial(&members);
+    assert_eq!(outcomes[1].output.as_ref(), Ok(&second));
+    assert_ne!(outcomes[2].output.as_ref(), Ok(&third));
+    assert_eq!(claimed, [0, 1, 2]);
+}
+
+#[test]
 fn members_after_the_declared_size_decode_ahead_as_the_serial_decoder_does() {
     let data = prose(2_100, 11);
     let stream = lz_stream(&data, &[], 700);
