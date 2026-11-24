@@ -220,6 +220,8 @@ pub(super) struct CompressedMember {
     pub(super) store: bool,
     /// True when this member continues the previous member's dictionary.
     pub(super) solid_continuation: bool,
+    /// Stored without being read, so its checksums wait for its copy.
+    pub(super) checksums_pending: bool,
 }
 
 #[cfg(test)]
@@ -832,18 +834,32 @@ pub(super) fn compress_members_in_order(
         let size = source
             .len()
             .map_err(|error| error_context(stored[member], error))?;
-        stored_integrity.push((size, 0, None))?;
+        // A placeholder hash sizes the header until the copy's is patched in.
+        let hash = (stored_hashed_later && plan.blake2sp).then_some([0; 32]);
+        stored_integrity.push((size, 0, hash))?;
     }
     let mut checksums = Records::new(stored.len(), resources)?;
-    hash_stored_members(
-        &stored_sources,
-        &stored_integrity,
-        plan.blake2sp,
-        resources,
-        &Remapped::new(&stored, advance),
-        &|member, error| error_context(stored[member], error),
-        &mut |_, size, crc, hash| checksums.push((size, crc, hash)),
-    )?;
+    if stored_hashed_later {
+        // Progress reports them where hashing them would have.
+        for (member, &integrity) in stored_integrity.iter().enumerate() {
+            advance.started(stored[member], integrity.0);
+            if !advance.advance(integrity.0) {
+                return Err(Error::Cancelled);
+            }
+            advance.finished(stored[member], integrity.0);
+            checksums.push(integrity)?;
+        }
+    } else {
+        hash_stored_members(
+            &stored_sources,
+            &stored_integrity,
+            plan.blake2sp,
+            resources,
+            &Remapped::new(&stored, advance),
+            &|member, error| error_context(stored[member], error),
+            &mut |_, size, crc, hash| checksums.push((size, crc, hash)),
+        )?;
+    }
 
     // Members go out in order, so each coded one waits for the stored ones before it.
     let mut next_stored = 0;
@@ -861,6 +877,7 @@ pub(super) fn compress_members_in_order(
                 hand_on_stored(
                     &stored,
                     &checksums,
+                    stored_hashed_later,
                     &mut next_stored,
                     index,
                     resources,
@@ -873,6 +890,7 @@ pub(super) fn compress_members_in_order(
     hand_on_stored(
         &stored,
         &checksums,
+        stored_hashed_later,
         &mut next_stored,
         usize::MAX,
         resources,
@@ -883,6 +901,7 @@ pub(super) fn compress_members_in_order(
 fn hand_on_stored(
     stored: &[usize],
     checksums: &[Integrity],
+    pending: bool,
     next: &mut usize,
     before: usize,
     resources: &WriterResources,
@@ -897,6 +916,7 @@ fn hand_on_stored(
             packed: Spool::create_parked(resources)?,
             store: true,
             solid_continuation: false,
+            checksums_pending: pending,
         };
         consume(stored[*next], Handed::Member(member))?;
         *next += 1;
@@ -1067,7 +1087,7 @@ fn compress_members_as_planned(
                 &plan.filter_policy,
             )
     };
-    let stored = |index: usize, (input_size, crc32, hash): Integrity| {
+    let stored = |index: usize, (input_size, crc32, hash): Integrity, pending: bool| {
         Ok::<_, Error>(Handed::Member(CompressedMember {
             input_size,
             crc32,
@@ -1075,6 +1095,7 @@ fn compress_members_as_planned(
             store: true,
             packed: Spool::create_parked(resources)?,
             solid_continuation: plan.solid && index > 0,
+            checksums_pending: pending,
         }))
     };
     match execution {
@@ -1094,7 +1115,7 @@ fn compress_members_as_planned(
         ExecutionPlan::Stored if stored_hashed_later => integrity
             .iter()
             .enumerate()
-            .try_for_each(|(index, &member)| consume(index, stored(index, member)?)),
+            .try_for_each(|(index, &member)| consume(index, stored(index, member, true)?)),
         ExecutionPlan::Stored => hash_stored_members(
             sources,
             &integrity,
@@ -1102,7 +1123,7 @@ fn compress_members_as_planned(
             resources,
             advance,
             error_context,
-            &mut |index, size, crc, hash| consume(index, stored(index, (size, crc, hash))?),
+            &mut |index, size, crc, hash| consume(index, stored(index, (size, crc, hash), false)?),
         ),
         ExecutionPlan::Blocks {
             workspace,
@@ -1142,6 +1163,7 @@ fn settle<'b>(
             store: store(input_size, packed.len()),
             packed,
             solid_continuation,
+            checksums_pending: false,
         }),
         Packing::Opening(input_size) => Handed::Opening { input_size },
         Packing::Packed(bytes) => Handed::Packed(bytes),
@@ -1188,6 +1210,7 @@ impl ClosedMember {
             packed: Spool::create_parked(resources)?,
             store: true,
             solid_continuation: false,
+            checksums_pending: false,
         })
     }
 }
@@ -1685,6 +1708,7 @@ fn compress_whole_member<B: Budget>(
         store: stored,
         packed: packed_spool,
         solid_continuation: false,
+        checksums_pending: false,
     })
 }
 
@@ -5453,7 +5477,8 @@ mod incompressible_probe_tests {
                 for (member, data) in members.iter().zip([&text, &random]) {
                     assert_eq!(member.hash, None);
                     // A stored member hashed on its copy has no checksums yet.
-                    if !(stored_later && plan.method == 0) {
+                    assert_eq!(member.checksums_pending, stored_later && member.store);
+                    if !member.checksums_pending {
                         assert_eq!(member.crc32, checksums(data).0);
                     }
                 }

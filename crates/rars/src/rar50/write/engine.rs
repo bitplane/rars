@@ -15,8 +15,9 @@
 //! The workspace admission budget is not an aggregate RAM or disk quota.
 //!
 //! Stored payloads are reread and verified during emission, or, when the output
-//! can seek and every member is stored, read once behind a header patched
-//! with the checksums of what was copied. Recovery requires a further pass
+//! can seek and a member is stored without being read, read once behind a
+//! header patched with the checksums of what was copied. Recovery requires a
+//! further pass
 //! over the preceding archive bytes, read back from the output when it can be
 //! and otherwise mirrored into a spool.
 
@@ -254,9 +255,11 @@ pub(super) fn write_archive<'a>(
     output: CallerOutput<'_>,
 ) -> Result<()> {
     let mut sink = output.cancellable(plan.progress);
-    // A seekable archive lets stored members be read once and their headers
-    // patched. Every member is stored, so none is read before it is copied.
-    let hash_on_copy = sink.can_seek() && plan.compress.method == 0;
+    // A seekable archive lets a member stored without being read be read once,
+    // its header patched with the copy's checksums.
+    let hash_on_copy = sink.can_seek();
+    // Every member is then stored and read once, so the copy is the work done.
+    let all_hashed_on_copy = hash_on_copy && plan.compress.method == 0;
     // A recovery record reads the archive back from an output that can, and
     // otherwise from a copy mirrored into a spool as it is written.
     let read_back = plan.recovery_percent.is_some()
@@ -265,9 +268,9 @@ pub(super) fn write_archive<'a>(
             .is_some_and(|output| output.inner.readable().is_some());
     // Members go out as their windows finish unless the main header has to
     // locate blocks after them and cannot be patched, or a recovery record
-    // would have to mirror them. Stored members hashed on their copy already
-    // go out in one pass.
-    let in_order = !hash_on_copy
+    // would have to mirror them. An archive of stored members hashed on their
+    // copy already goes out in one pass.
+    let in_order = !all_hashed_on_copy
         && (plan.recovery_percent.is_none() || read_back)
         && (!plan.quick_open || sink.can_seek());
     // The main header goes out first and its locator offsets are patched.
@@ -383,12 +386,10 @@ pub(super) fn write_archive<'a>(
         Some(_) if !read_back => Some(Spool::create(resources)?),
         _ => None,
     };
-    // Members hashed on their copy report it here, as compression skipped them.
-    let copy_work = WorkTracker::new(
-        plan.progress,
-        crate::WriteOperation::Emission,
-        if hash_on_copy { total_input } else { 0 },
-    );
+    // An archive of members hashed on their copy reports it here, as
+    // compression skipped them.
+    let copy_work = all_hashed_on_copy
+        .then(|| WorkTracker::new(plan.progress, crate::WriteOperation::Emission, total_input));
     let mut quick_open_payload = None;
     let mut quick_open_patched = false;
     let mut emit = |block: PreparedBlock<'_>,
@@ -398,17 +399,23 @@ pub(super) fn write_archive<'a>(
                     written: &mut Option<WrittenHeaders>|
      -> Result<()> {
         let entry_index = block.entry_index;
-        if let Some(written) = written.as_mut().filter(|_| block.quick_open_cached) {
-            debug_assert!(
-                block.patch.is_none(),
-                "a member hashed on its copy is held, not recorded"
-            );
-            let at = sink
-                .as_seekable()
-                .expect("headers are recorded only on a seekable output")
-                .stream_position()?;
-            written.record(at, &block.header)?;
-        }
+        let recorded_at = match written.as_mut().filter(|_| block.quick_open_cached) {
+            Some(written) => {
+                let at = sink
+                    .as_seekable()
+                    .expect("headers are recorded only on a seekable output")
+                    .stream_position()?;
+                // A header patched after its copy is recorded once it is.
+                if block.patch.is_none() {
+                    written.record(at, &block.header)?;
+                    None
+                } else {
+                    Some(at)
+                }
+            }
+            None => None,
+        };
+        let patching_quick_open = quick_open_payload.is_some();
         let result = emit_block(
             block,
             entries,
@@ -418,13 +425,19 @@ pub(super) fn write_archive<'a>(
             header_keys.as_ref(),
             resources,
             plan.progress,
-            &copy_work,
+            copy_work.as_ref(),
         );
-        quick_open_patched |= result.as_ref().is_ok_and(|patched| *patched);
-        result.map(|_| ()).map_err(|error| match entry_index {
+        let patched = result.map_err(|error| match entry_index {
             Some(index) => member_error(error, &entries[index].name, "writing"),
             None => error,
-        })
+        })?;
+        if let Some(patched) = patched {
+            quick_open_patched |= patching_quick_open;
+            if let (Some(written), Some(at)) = (written.as_mut(), recorded_at) {
+                written.record(at, &patched)?;
+            }
+        }
+        Ok(())
     };
 
     let mut leading = Records::<PreparedBlock>::new(2, resources)?;
@@ -520,7 +533,6 @@ pub(super) fn write_archive<'a>(
                         entry,
                         member,
                         &plan,
-                        hash_on_copy,
                         None,
                         &mut write_keys,
                         header_keys.as_ref(),
@@ -538,7 +550,6 @@ pub(super) fn write_archive<'a>(
                             entry,
                             closed.stored(resources)?,
                             &plan,
-                            false,
                             Some(&member),
                             &mut write_keys,
                             header_keys.as_ref(),
@@ -1021,8 +1032,8 @@ fn emit_block(
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
-    copy_work: &WorkTracker<'_>,
-) -> Result<bool> {
+    copy_work: Option<&WorkTracker<'_>>,
+) -> Result<Option<Bytes>> {
     let PreparedBlock {
         header: prepared,
         payload,
@@ -1051,21 +1062,17 @@ fn emit_block(
         } else {
             tee.write_all(&prepared)?;
         }
+        let copy_work = copy_work.filter(|_| patch.is_some());
         let entry = patch
             .as_ref()
             .map(|(patch, index, _)| (*index, &entries[*index].name, patch.input_size));
-        if let Some((index, name, size)) = entry {
-            copy_work.entry_started(index, entries.len(), name, size);
+        let reported = copy_work.zip(entry);
+        if let Some((work, (index, name, size))) = reported {
+            work.entry_started(index, entries.len(), name, size);
         }
-        let checksums = write_payload(
-            payload,
-            &mut tee,
-            resources,
-            progress,
-            entry.is_some().then_some(copy_work),
-        )?;
-        if let Some((index, name, size)) = entry {
-            copy_work.entry_finished(index, entries.len(), name, size);
+        let checksums = write_payload(payload, &mut tee, resources, progress, copy_work)?;
+        if let Some((work, (index, name, size))) = reported {
+            work.entry_finished(index, entries.len(), name, size);
         }
         checksums
     };
@@ -1099,7 +1106,7 @@ fn emit_block(
         }
     };
     let Some(patched) = patched else {
-        return Ok(false);
+        return Ok(None);
     };
     if let (Some(payload), Some((at, distance))) = (quick_open, quick_open_record) {
         // The record keeps its length, so it is rewritten where it stands.
@@ -1107,7 +1114,7 @@ fn emit_block(
         append_quick_open_entry(payload, &mut crate::crc32::Crc32::new(), distance, &patched)?;
         payload.park();
     }
-    Ok(true)
+    Ok(Some(patched))
 }
 
 /// Appends one quick-open record: how far back the header sits, then the
@@ -1388,13 +1395,12 @@ fn prepare_member<'a>(
     entry: &'a ArchiveEntry,
     member: CompressedMember,
     plan: &EnginePlan<'_>,
-    hash_on_copy: bool,
     over: Option<&InPlace>,
     write_keys: &mut WriteKeys<'a>,
     header_keys: Option<&HeaderEncryptionKeys>,
     resources: &WriterResources,
 ) -> Result<PreparedBlock<'static>> {
-    let hash_on_copy = hash_on_copy && member.store;
+    let hash_on_copy = member.checksums_pending;
     let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
         member.input_size
