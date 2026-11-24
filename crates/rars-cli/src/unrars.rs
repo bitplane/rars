@@ -1944,6 +1944,7 @@ impl<'r> Failures<'r> {
             self.archive,
             self.path,
             &display_name(&member.meta.name),
+            member.meta.is_encrypted,
             error,
         );
         let _ = self
@@ -2250,7 +2251,7 @@ fn report_failure(out: Out, archive: &Archive, path: &Path, error: &rars::Error)
         return MISSING_VOLUME;
     }
     let member = member.unwrap_or_else(|| path.display().to_string());
-    let (line, code) = member_error_line(archive, path, &member, error);
+    let (line, code) = member_error_line(archive, path, &member, false, error);
     out.error(&line);
     code
 }
@@ -2262,11 +2263,17 @@ fn member_error_line(
     archive: &Archive,
     path: &Path,
     member: &str,
+    encrypted: bool,
     error: &rars::Error,
 ) -> (String, i32) {
+    let legacy = archive.family() != rars::ArchiveFamily::Rar50Plus;
     match error.kind() {
         ErrorKind::ChecksumMismatch | ErrorKind::InvalidArchive => {
-            let line = format!("{member:<20} - checksum error");
+            let line = if legacy && encrypted {
+                encrypted_checksum_line(member)
+            } else {
+                format!("{member:<20} - checksum error")
+            };
             // unrar first names the volume whose packed data failed its own checksum.
             match damaged_volume(error).and_then(|index| archive.volume_path(path, index)) {
                 Some(volume) => (
@@ -2281,12 +2288,7 @@ fn member_error_line(
         }
         // RAR 1.5-4 store no password check, so a wrong password and a
         // damaged member look the same, and unrar says so.
-        ErrorKind::BadPassword if archive.family() != rars::ArchiveFamily::Rar50Plus => (
-            format!(
-                "Checksum error in the encrypted file {member}. Corrupt file or wrong password."
-            ),
-            CHECKSUM,
-        ),
+        ErrorKind::BadPassword if legacy => (encrypted_checksum_line(member), CHECKSUM),
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             (format!("Incorrect password for {member}"), BAD_PASSWORD)
         }
@@ -2298,6 +2300,12 @@ fn member_error_line(
         ),
         _ => (format!("ERROR: {error}"), FATAL),
     }
+}
+
+/// A RAR 1.5-4 encrypted member that fails its checksum, which may be a
+/// wrong password as easily as damage.
+fn encrypted_checksum_line(member: &str) -> String {
+    format!("Checksum error in the encrypted file {member}. Corrupt file or wrong password.")
 }
 
 /// Reports the damaged headers read past as unrar does, returning the
