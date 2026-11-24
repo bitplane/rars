@@ -638,6 +638,30 @@ const SCREENED_KINDS: [FilterKind; 5] = [
     FilterKind::Delta { channels: 4 },
 ];
 
+/// How finely RAR 5 looks for tables of fixed-size records to delta filter.
+///
+/// A binary's tables are mostly small: the relocations, symbols, dynamic
+/// section and unwind index of one executable come to a few kilobytes each,
+/// and a tar of executables has one set per file. At the shared search's
+/// 16 KiB windows, with two in a row needed, the scanner saw none of them on a
+/// 32 MiB tar of `/usr` executables, and level 3 packed it 2.9% larger than
+/// `rar` 7.12 `-m3`, which filters them. Over that tar, a 32 MiB tar of text
+/// and one of already-compressed files at level 3, 8 threads:
+///
+/// ```text
+/// window      binaries       text    compressed   binary seconds
+///  16 KiB    9,846,842  6,300,382    32,121,181             2.85
+///   1 KiB    9,548,200  6,126,292    32,121,456             2.77
+///  512 B     9,505,763  6,114,504    32,122,138             2.83
+///  256 B     9,479,434  6,119,311    32,124,377             2.82
+///  128 B     9,477,465  6,144,787    32,128,320             2.82
+/// ```
+///
+/// The scan costs the same per byte at any window size, and the time went
+/// nowhere. Below 256 bytes a window holds too few records to tell a table
+/// from chance, and text starts to lose.
+const RAR50_TABLE_SCAN_WINDOW: usize = 256;
+
 struct Rar50OwnedSearch<B: Budget> {
     algorithm_version: u8,
     /// Where the data searched starts in its member. The x86 filters convert
@@ -667,6 +691,9 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
     }
     fn max_delta_channels(&self) -> usize {
         crate::codec::rar50::MAX_DELTA_CHANNELS
+    }
+    fn table_scan_window(&self) -> usize {
+        RAR50_TABLE_SCAN_WINDOW
     }
     /// One step down from the caller's parse: the lazy parse that seeds the
     /// shortest path, and below level 2, where that lazy parse is the real
@@ -1012,6 +1039,9 @@ impl crate::filter_search::FilterSearch for Rar50Search {
 
     fn max_delta_channels(&self) -> usize {
         crate::codec::rar50::MAX_DELTA_CHANNELS
+    }
+    fn table_scan_window(&self) -> usize {
+        RAR50_TABLE_SCAN_WINDOW
     }
 
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
