@@ -249,6 +249,124 @@ fn volume_api_split_member_limits_remain_terminal() {
     assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
 }
 
+/// `first`, then `split` across several volumes, then `after`, with the
+/// packed data in the second volume damaged.
+fn damaged_split_set(version: ArchiveVersion, solid: bool, store: bool) -> Vec<Archive> {
+    let mut builder = Builder::new(version)
+        .solid(solid)
+        .store(store)
+        .volume_size(Some(4096));
+    for (seed, (name, len)) in (1..).zip([("first", 100), ("split", 100_000), ("after", 300)]) {
+        builder
+            .add_bytes(name.as_bytes().to_vec(), noisy_text(seed, len), None, None)
+            .unwrap();
+    }
+    let mut volumes = builder.build_volumes(None).unwrap();
+    assert!(volumes.len() >= 3, "{version:?}");
+    let at = volumes[1].len() / 2;
+    volumes[1][at] ^= 0xff;
+    volumes
+        .into_iter()
+        .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
+        .collect()
+}
+
+fn in_volume(error: &Error) -> Option<usize> {
+    match error {
+        Error::InVolume { index, .. } => Some(*index),
+        Error::AtEntry { source, .. } | Error::AtArchiveOffset { source, .. } => in_volume(source),
+        _ => None,
+    }
+}
+
+/// Members written by an extraction, by name.
+type Written = Rc<RefCell<Vec<(Vec<u8>, Rc<RefCell<Vec<u8>>>)>>>;
+
+fn extract_set(
+    volumes: &[Archive],
+    options: ArchiveReadOptions<'_>,
+) -> (rars::Result<()>, Written) {
+    let written = Written::default();
+    let result = rars::extract_volumes_to_with_options(volumes, options, |meta| {
+        let output = Rc::new(RefCell::new(Vec::new()));
+        written
+            .borrow_mut()
+            .push((meta.name.clone(), Rc::clone(&output)));
+        Ok(Box::new(Capture(output)))
+    });
+    (result, written)
+}
+
+#[test]
+fn volume_api_member_handler_goes_past_a_damaged_split_member() {
+    for version in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar50,
+    ] {
+        for (solid, store) in [(false, false), (true, false), (false, true)] {
+            let case = format!("{version:?}, solid {solid}, stored {store}");
+            let volumes = damaged_split_set(version, solid, store);
+
+            let failed = std::sync::Mutex::new(Vec::new());
+            let handler = |member: &rars::ArchiveMember, error: &Error| {
+                failed
+                    .lock()
+                    .unwrap()
+                    .push((member.meta.name.clone(), error.clone()));
+                Ok(rars::ExtractionErrorAction::Continue)
+            };
+            let (result, written) = extract_set(
+                &volumes,
+                ArchiveReadOptions::new().with_member_error_handler(&handler),
+            );
+            result.unwrap_or_else(|error| panic!("{case}: {error}"));
+            let failed = failed.into_inner().unwrap();
+            assert_eq!(failed[0].0, b"split", "{case}");
+            // The volume whose packed data fails its own CRC32 is named.
+            assert_eq!(in_volume(&failed[0].1), Some(1), "{case}: {}", failed[0].1);
+            let written = written.borrow();
+            let names: Vec<_> = written.iter().map(|(name, _)| name.as_slice()).collect();
+            assert_eq!(names, [&b"first"[..], b"split", b"after"], "{case}");
+            assert_eq!(*written[0].1.borrow(), noisy_text(1, 100), "{case}");
+            if solid {
+                // It decodes from the state the failed member left, as unrar does.
+                assert!(failed.len() <= 2, "{case}");
+            } else {
+                assert_eq!(failed.len(), 1, "{case}");
+                assert_eq!(*written[2].1.borrow(), noisy_text(3, 300), "{case}");
+            }
+
+            // Without a handler, the run ends at the split member.
+            let (result, written) = extract_set(&volumes, ArchiveReadOptions::new());
+            assert!(result.is_err(), "{case}");
+            assert_eq!(written.borrow().len(), 2, "{case}");
+        }
+    }
+}
+
+#[test]
+fn volume_api_a_missing_volume_still_ends_the_run() {
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let mut volumes = damaged_split_set(version, false, false);
+        // The set's last volume holds the end of `split` and all of `after`.
+        volumes.pop();
+        let handler_calls = AtomicUsize::new(0);
+        let handler = |_: &rars::ArchiveMember, _: &Error| {
+            handler_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let (result, written) = extract_set(
+            &volumes,
+            ArchiveReadOptions::new().with_member_error_handler(&handler),
+        );
+        assert!(result.is_err(), "{version:?}");
+        assert_eq!(handler_calls.load(Ordering::Relaxed), 0, "{version:?}");
+        assert_eq!(written.borrow().len(), 2, "{version:?}");
+    }
+}
+
 #[test]
 fn operation_wide_and_solid_member_limits_remain_terminal() {
     let handler_calls = AtomicUsize::new(0);

@@ -1,8 +1,9 @@
 use super::*;
-use crate::extraction_control::{finish_member, Resume};
+use crate::extraction_control::{finish_member, finish_split_member, Resume};
 use crate::output_limit::OutputBudget;
-use crate::source::RangeReader;
+use crate::source::{ArchiveSource, RangeReader};
 use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
+use std::ops::Range;
 
 pub(super) fn extract<F, B: Budget>(
     feed: &mut VolumeFeed<'_, '_, Archive>,
@@ -40,15 +41,45 @@ where
                         "RAR 1.5 split entry is interrupted by a regular entry",
                     ));
                 }
-                resume = Some(extract_split(
+                let last = match extract_split(
                     &volume,
                     file,
                     feed,
+                    options,
                     &mut session,
                     &mut budget,
                     &mut open,
                     &mut links,
-                )?);
+                ) {
+                    Ok(last) => last,
+                    Err(SplitFailure { error, last: None }) => return Err(error),
+                    // The member's last volume is in hand, so a member error
+                    // handler can carry on past it, as for any other member.
+                    Err(SplitFailure {
+                        error,
+                        last: Some(last),
+                    }) => {
+                        let solid = volume.main.is_solid() || file.is_solid();
+                        match finish_split_member(
+                            options,
+                            || crate::rar15_40_member(file),
+                            solid,
+                            error,
+                        )? {
+                            Resume::Fresh => {
+                                session = DecoderSession::with_allowance(
+                                    volume.main.is_solid(),
+                                    password,
+                                    allowance,
+                                );
+                                session.read_control = budget.control.clone();
+                            }
+                            Resume::Solid => session.passed_over(),
+                        }
+                        *last
+                    }
+                };
+                resume = Some(last);
                 break;
             }
             let meta = file.metadata();
@@ -140,29 +171,91 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
     }
 }
 
+/// A split member that failed, and the volume holding its end when the walk
+/// could still read that far.
+struct SplitFailure {
+    error: Error,
+    last: Option<Box<Archive>>,
+}
+
+impl From<Error> for SplitFailure {
+    fn from(error: Error) -> Self {
+        Self { error, last: None }
+    }
+}
+
 /// Decodes a split member while its later volumes arrive; returns the volume holding its end.
+///
+/// When it fails with a member error handler set, the rest of its volumes
+/// are still read, so the walk can go on to the members after it.
+#[allow(clippy::too_many_arguments)]
 fn extract_split<F, B: Budget>(
     volume: &Archive,
     first: &FileHeader,
     feed: &mut VolumeFeed<'_, '_, Archive>,
+    options: crate::ArchiveReadOptions<'_>,
     session: &mut DecoderSession<'_, B>,
     budget: &mut OutputBudget,
     open: &mut F,
     links: &mut Option<&mut LegacyLink<'_>>,
-) -> Result<Archive>
+) -> std::result::Result<Archive, SplitFailure>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    validate_split_fragment(first, session.password)?;
+    let allowance = session.allowance.clone();
+    let mut walk = SplitWalk::new(feed, volume, first, &allowance)?;
+    let salvage = options.salvage;
+    match extract_split_walk(
+        volume, first, &mut walk, salvage, session, budget, open, links,
+    ) {
+        Ok(()) => Ok(walk.into_last_volume()?),
+        Err(error)
+            if options.member_errors.is_none()
+                || matches!(
+                    error.kind(),
+                    crate::ErrorKind::Cancelled
+                        | crate::ErrorKind::Io
+                        | crate::ErrorKind::ResourceLimit
+                ) =>
+        {
+            // Limits on a split member stay terminal, as before.
+            Err(error.into())
+        }
+        Err(error) => Err(SplitFailure {
+            error,
+            last: walk.into_last_volume().ok().map(Box::new),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_split_walk<F, B: Budget>(
+    volume: &Archive,
+    first: &FileHeader,
+    walk: &mut SplitWalk<'_, '_, '_, B>,
+    salvage: bool,
+    session: &mut DecoderSession<'_, B>,
+    budget: &mut OutputBudget,
+    open: &mut F,
+    links: &mut Option<&mut LegacyLink<'_>>,
+) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
     let password = session.password;
-    validate_split_fragment(first, password)?;
     let allowance = session.allowance.clone();
-    let mut walk = SplitWalk::new(feed, first, &allowance)?;
     // Parts written before the size was known record it only in the last header.
     let sized;
     let first = if first.known_unp_size().is_none() {
-        let last = walk.prefetch()?;
         let mut header = first.clone();
-        header.unp_size = last.unp_size;
+        match walk.prefetch() {
+            Ok(last) => header.unp_size = last.unp_size,
+            // Salvaging, the volumes there are are still decoded, size
+            // unknown, until the walk's failure stops the decoder.
+            Err(_) if salvage => header.unp_size = usize::MAX as u64,
+            Err(error) => return Err(error),
+        }
         sized = header;
         &sized
     } else {
@@ -195,37 +288,37 @@ where
                     return write_stored(
                         first,
                         first_reader,
-                        &mut walk,
+                        walk,
                         password,
                         &volume.key_cache,
                         &mut writer,
                         &allowance,
-                    );
+                    )
+                    .map_err(|error| first.entry_error("extracting", walk.explain(error)));
                 }
                 let decoded = {
                     let mut reader = packed_reader(
-                        LazyChain::new(&mut walk, first_reader),
+                        LazyChain::new(&mut *walk, first_reader),
                         first,
                         password,
                         &volume.key_cache,
                         &allowance,
                     )?;
-                    session
-                        .decode_split_to(&mut reader, first, &mut writer)
-                        .map_err(|error| first.entry_error("extracting", error))?
+                    session.decode_split_to(&mut reader, first, &mut writer)
                 };
+                let decoded = decoded
+                    .map_err(|error| first.entry_error("extracting", walk.explain(error)))?;
                 let last = walk
                     .finish()
                     .map_err(|error| first.entry_error("extracting", error))?;
-                // A member error handler cannot go past a split member, so
-                // strict sizes would end the whole run for it.
+                // Split members pass a stream that ends early whatever the
+                // strict-sizes option says.
                 last.decoded_result(decoded.lenient(), password)
-                    .map_err(|error| first.entry_error("extracting", error))
+                    .map_err(|error| first.entry_error("extracting", walk.explain(error)))
             })
         },
     )
-    .map_err(|error| walk.failure.take().unwrap_or(error))?;
-    walk.into_last_volume()
+    .map_err(|error| walk.failure.take().unwrap_or(error))
 }
 
 fn write_stored<B: Budget>(
@@ -279,7 +372,6 @@ fn write_stored<B: Budget>(
         ));
     }
     last.crc_result(crc.finish(), password)
-        .map_err(|error| last.entry_error("extracting", error))
 }
 
 pub(super) fn packed_reader<R: Read, B: Budget>(
@@ -323,9 +415,47 @@ pub(super) fn validate_split_fragment(file: &FileHeader, password: Option<&[u8]>
     Ok(())
 }
 
+/// Where a fragment's packed data is, and the CRC32 its header gives for it.
+pub(super) struct Fragment {
+    volume: usize,
+    source: ArchiveSource,
+    range: Range<usize>,
+    /// Only a fragment the member goes on past has one: the last holds
+    /// the CRC32 of the member's output instead. RAR 1.5 writes all ones.
+    crc: Option<u32>,
+}
+
+impl Fragment {
+    fn of(volume: usize, archive: &Archive, file: &FileHeader) -> Self {
+        Self {
+            volume,
+            source: archive.source.clone(),
+            range: file.packed_range.clone(),
+            crc: file
+                .is_split_after()
+                .then_some(file.file_crc)
+                .filter(|&crc| crc != u32::MAX),
+        }
+    }
+
+    /// The CRC32 of its packed data, when its volume can still be read.
+    fn actual_crc(&self) -> Option<u32> {
+        let mut crc = Crc32::new();
+        let mut sink = CrcWriter {
+            inner: &mut std::io::sink(),
+            crc: &mut crc,
+        };
+        self.source
+            .copy_range_to(self.range.clone(), &mut sink)
+            .ok()
+            .map(|()| crc.finish())
+    }
+}
+
 /// Fetches a split member's later volumes as its reader reaches each fragment's end.
 pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
     feed: &'f mut VolumeFeed<'p, 'o, Archive>,
+    options: crate::ArchiveReadOptions<'o>,
     first: FileHeader,
     /// The member's size, once a fragment states it.
     size: Option<u64>,
@@ -333,8 +463,8 @@ pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
     last: Option<Archive>,
     packed_len: usize,
     prefetched: std::collections::VecDeque<RangeReader<'static>>,
-    /// The volume of each fragment, charged to the reader workspace.
-    fragments: Buffer<usize, B>,
+    /// Each fragment read so far, charged to the reader workspace.
+    fragments: Buffer<Fragment, B>,
     /// A refused or missing volume, reported as itself rather than as a decode failure.
     failure: Option<Error>,
 }
@@ -342,11 +472,15 @@ pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
 impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     fn new(
         feed: &'f mut VolumeFeed<'p, 'o, Archive>,
+        volume: &Archive,
         first: &FileHeader,
         allowance: &B,
     ) -> Result<Self> {
+        let mut fragments = Buffer::new(allowance);
+        fragments.try_push(Fragment::of(feed.current_index(), volume, first))?;
         Ok(Self {
-            fragments: Buffer::copied(&[feed.current_index()], allowance)?,
+            fragments,
+            options: feed.options(),
             feed,
             first: first.clone(),
             size: first.known_unp_size(),
@@ -361,7 +495,45 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     /// Reads past any fragments the decoder did not need and returns the member's last header.
     fn finish(&mut self) -> Result<&FileHeader> {
         while self.next_fragment()?.is_some() {}
+        // Salvaging, a failure ends the fragments rather than failing.
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         self.last_header()
+    }
+
+    /// Turns a failed member's error into the checksum mismatch of the
+    /// fragment whose packed data disagrees with its header, if one does.
+    /// Sink and reader I/O, limits and cancellation keep their own meaning.
+    fn explain(&self, error: Error) -> Error {
+        if matches!(
+            error.kind(),
+            crate::ErrorKind::Io
+                | crate::ErrorKind::ResourceLimit
+                | crate::ErrorKind::Cancelled
+                | crate::ErrorKind::UnsupportedFeature
+        ) {
+            return error;
+        }
+        self.checksum_error().unwrap_or(error)
+    }
+
+    /// Re-reads every fragment that carries a CRC32 of its own packed data
+    /// and reports the first that disagrees.
+    ///
+    /// Only consulted once a member has already failed, as for RAR 5: a
+    /// fragment CRC32 that says something other than what is there does not
+    /// stop a member that decodes to its own checksum. A volume the caller
+    /// has since removed is skipped.
+    fn checksum_error(&self) -> Option<Error> {
+        self.fragments.iter().find_map(|fragment| {
+            let expected = fragment.crc?;
+            let actual = fragment.actual_crc()?;
+            (actual != expected).then(|| Error::InVolume {
+                index: fragment.volume,
+                source: Box::new(Error::Crc32Mismatch { expected, actual }),
+            })
+        })
     }
 
     fn last_header(&self) -> Result<&FileHeader> {
@@ -393,7 +565,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
                 "RAR 1.5 split entry is interrupted by a regular entry",
             ));
         }
-        validate_split_fragment(file, self.feed.options().password)?;
+        validate_split_fragment(file, self.options.password)?;
         let first = &self.first;
         // The stored name may differ; size, method and CRC still tie the fragment to its member.
         if let (Some(size), Some(known)) = (file.known_unp_size(), self.size) {
@@ -444,7 +616,8 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
                 ));
             }
             self.size = self.size.or(file.known_unp_size());
-            self.fragments.try_push(self.feed.current_index())?;
+            self.fragments
+                .try_push(Fragment::of(self.feed.current_index(), &volume, file))?;
             self.packed_len = packed_len(self.packed_len, file)?;
             let reader = volume
                 .source
@@ -469,14 +642,27 @@ pub(super) fn packed_len(total: usize, file: &FileHeader) -> Result<usize> {
 
 impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
     fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
-        }
+        // Fragments fetched before a failure are still read, when salvaging.
         if let Some(reader) = self.prefetched.pop_front() {
             return Ok(Some(reader));
         }
-        self.advance()
-            .inspect_err(|error| self.failure = Some(error.clone()))
+        let error = match &self.failure {
+            Some(error) => error.clone(),
+            None => match self.advance() {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    self.failure = Some(error.clone());
+                    error
+                }
+            },
+        };
+        // Salvaging, the member's data ends where its volumes give out, so
+        // the decoder delivers what it decoded first. The failure is still
+        // the member's, once it is decoded.
+        if self.options.salvage {
+            return Ok(None);
+        }
+        Err(error)
     }
 }
 
@@ -495,6 +681,6 @@ pub(super) fn with_walk<T>(
     let mut feed = VolumeFeed::complete(&mut volumes, options);
     let volume = feed.next()?.expect("a first volume");
     let first = volume.files().next().expect("a first fragment");
-    let mut walk = SplitWalk::new(&mut feed, first, &Default::default())?;
+    let mut walk = SplitWalk::new(&mut feed, &volume, first, &Default::default())?;
     run(&volume, first, &mut walk)
 }

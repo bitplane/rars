@@ -1094,6 +1094,185 @@ fn kb_keeps_a_split_member_up_to_a_missing_volume() {
     assert_eq!(kept, payload()[..kept.len()]);
 }
 
+/// Text that compresses, but not to nothing: a byte of noise in every seven.
+fn noisy_payload(len: usize) -> Vec<u8> {
+    let mut x = 2_463_534_242u32;
+    (0..len)
+        .map(|i| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            if i % 7 == 0 {
+                x as u8
+            } else {
+                b"the quick brown fox "[i % 20]
+            }
+        })
+        .collect()
+}
+
+/// A RAR 2.9 volume set named `set.rar`, `set.r00`, ... in `dir`: `a.txt`,
+/// then `big.bin` ([`noisy_payload`]) across several volumes, then `z.txt`
+/// in the last. Returns the volumes' names.
+fn write_legacy_set(dir: &Path, store: bool, solid: bool, password: Option<&[u8]>) -> Vec<String> {
+    let mut builder = Builder::new(ArchiveVersion::Rar29)
+        .store(store)
+        .solid(solid)
+        .password(password.map(<[u8]>::to_vec));
+    for (name, data) in [
+        (&b"a.txt"[..], b"hello\n".to_vec()),
+        (b"big.bin", noisy_payload(100_000)),
+        (b"z.txt", noisy_payload(700)),
+    ] {
+        builder.add_bytes(name.to_vec(), data, None, None).unwrap();
+    }
+    let volumes = builder
+        .volume_size(Some(4 * 1024))
+        .build_volumes(None)
+        .unwrap();
+    assert!(volumes.len() >= 4, "{}", volumes.len());
+    (0..volumes.len())
+        .map(|index| {
+            let name = rars::volume_name::old_style(Path::new("set.rar"), index)
+                .unwrap()
+                .display()
+                .to_string();
+            fs::write(dir.join(&name), &volumes[index]).unwrap();
+            name
+        })
+        .collect()
+}
+
+/// Flips a byte in the middle of a volume, inside a split member's data.
+fn damage(path: &Path) {
+    let mut bytes = fs::read(path).unwrap();
+    let at = bytes.len() / 2;
+    bytes[at] ^= 0xff;
+    fs::write(path, bytes).unwrap();
+}
+
+/// Issue #582: in a RAR 1.5-4 set, as in a RAR 5 one, a damaged volume in
+/// the middle of a split member is named, and the members after it in the
+/// set are still extracted.
+#[test]
+fn a_damaged_legacy_volume_is_named_and_the_set_goes_on() {
+    for store in [true, false] {
+        let dir = scratch::case(&format!("unrars-legacy-damaged-volume-{store}"));
+        let names = write_legacy_set(&dir, store, false, None);
+        damage(&dir.join(&names[1]));
+        let output = unrars(&dir, &["x", "set.rar", "out/"]);
+        let errors = stderr(&output);
+        assert_eq!(output.status.code(), Some(3), "{errors}");
+        assert_eq!(
+            errors,
+            format!(
+                "{name:<20} : packed data checksum error in volume set.r00\n\
+                 {name:<20} - checksum error\n",
+                name = "big.bin"
+            )
+        );
+        assert!(stdout(&output).contains("Total errors: 1"));
+        assert_eq!(files_under(&dir.join("out")), ["a.txt", "z.txt"]);
+        assert_eq!(fs::read(dir.join("out/z.txt")).unwrap(), noisy_payload(700));
+    }
+}
+
+/// Issue #582: in a solid RAR 1.5-4 set, the members after a failed split
+/// member are decoded from the state it left, as unrar does.
+#[test]
+fn a_solid_legacy_set_goes_on_past_a_damaged_volume() {
+    let dir = scratch::case("unrars-legacy-solid-damaged-volume");
+    let names = write_legacy_set(&dir, false, true, None);
+    damage(&dir.join(&names[1]));
+    let output = unrars(&dir, &["t", "set.rar"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(3), "{errors}");
+    assert!(
+        errors.starts_with(&format!(
+            "{name:<20} : packed data checksum error in volume set.r00\n\
+             {name:<20} - checksum error\n",
+            name = "big.bin"
+        )),
+        "{errors}"
+    );
+    let failed = errors.matches(" - checksum error").count();
+    assert!(
+        stdout(&output).contains(&format!("Total errors: {failed}")),
+        "{}",
+        stdout(&output)
+    );
+    assert!(stdout(&output).contains("z.txt"), "{}", stdout(&output));
+}
+
+/// Issue #582: a damaged volume in an encrypted RAR 1.5-4 set is named,
+/// then the member's checksum error as unrar gives it for an encrypted one.
+#[test]
+fn a_damaged_encrypted_legacy_volume_is_named() {
+    let dir = scratch::case("unrars-legacy-encrypted-damaged-volume");
+    let names = write_legacy_set(&dir, false, false, Some(b"secret"));
+    damage(&dir.join(&names[1]));
+    let output = unrars(&dir, &["x", "-psecret", "set.rar", "out/"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(3), "{errors}");
+    assert_eq!(
+        errors,
+        format!(
+            "{:<20} : packed data checksum error in volume set.r00\n\
+             Checksum error in the encrypted file big.bin. Corrupt file or wrong password.\n",
+            "big.bin"
+        )
+    );
+    assert_eq!(files_under(&dir.join("out")), ["a.txt", "z.txt"]);
+}
+
+/// Issue #582: a RAR 1.5-4 volume cut short in the middle of a split member
+/// loses that member, and the members after it are still extracted.
+#[test]
+fn a_cut_legacy_volume_loses_only_its_member() {
+    let dir = scratch::case("unrars-legacy-cut-volume");
+    let names = write_legacy_set(&dir, false, false, None);
+    let path = dir.join(&names[1]);
+    let bytes = fs::read(&path).unwrap();
+    fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+    let output = unrars(&dir, &["x", "set.rar", "out/"]);
+    let errors = stderr(&output);
+    assert_eq!(output.status.code(), Some(3), "{errors}");
+    assert_eq!(
+        errors,
+        format!(
+            "{:<20} - checksum error\nUnexpected end of archive\n",
+            "big.bin"
+        )
+    );
+    assert!(stdout(&output).contains("Total errors: 2"));
+    assert_eq!(files_under(&dir.join("out")), ["a.txt", "z.txt"]);
+}
+
+/// Issue #582: a missing RAR 1.5-4 volume still ends the run, and `-kb`
+/// keeps what the split member's volumes held before it.
+#[test]
+fn kb_keeps_a_legacy_split_member_up_to_a_missing_volume() {
+    let dir = scratch::case("unrars-legacy-kb-missing-volume");
+    let names = write_legacy_set(&dir, false, false, None);
+    fs::remove_file(dir.join(&names[2])).unwrap();
+    let output = unrars(&dir, &["x", "set.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "Cannot find volume set.r01\n{:<20} - checksum error\n",
+            "big.bin"
+        )
+    );
+    assert_eq!(files_under(&dir.join("out")), ["a.txt"]);
+
+    let output = unrars(&dir, &["x", "-kb", "set.rar", "kept/"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    let kept = fs::read(dir.join("kept/big.bin")).unwrap();
+    assert!(!kept.is_empty() && kept.len() < 100_000, "{}", kept.len());
+    assert_eq!(kept, noisy_payload(100_000)[..kept.len()]);
+}
+
 /// `a.txt`, `info.nfo` and `sub/` holding `a.txt`, `b.txt` and `deeper/a.txt`.
 fn write_tree(path: &Path) {
     let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
