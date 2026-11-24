@@ -1,6 +1,6 @@
 [package]
 name = "rars-python"
-version = "0.13.0"
+version = "0.13.1"
 description = "PyO3 bindings for the rars RAR archive toolkit."
 publish = false
 edition.workspace = true
@@ -24,5 +24,5 @@ extension-module = ["pyo3/extension-module"]
 [dependencies]
 libc.workspace = true
 pyo3 = { workspace = true, features = ["abi3-py310"] }
-rars_rs = { package = "rars", version = "0.13.0", path = "../rars" }
-rars-cli = { version = "0.13.0", path = "../rars-cli" }
+rars_rs = { package = "rars", version = "0.13.1", path = "../rars" }
+rars-cli = { version = "0.13.1", path = "../rars-cli" }
