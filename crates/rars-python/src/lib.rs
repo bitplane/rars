@@ -3199,6 +3199,7 @@ impl RarBuilder {
             Err(_) => RarFile::new(
                 py,
                 source,
+                "r",
                 password,
                 options,
                 cancellation,
