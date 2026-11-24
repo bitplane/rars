@@ -236,7 +236,7 @@ pub(crate) struct AddArgs {
     /// time and memory to search.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
-    /// Maximum total compression working memory (default: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
+    /// Maximum total compression working memory (default: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
     ///
     /// Raising it lets more work run at once and never changes the archive.
     /// Below 256m it also plans smaller jobs, which can.
