@@ -59,6 +59,7 @@ struct Span {
     unpacked: u64,
     split_before: bool,
     split_after: bool,
+    encrypted: bool,
 }
 
 struct Line {
@@ -287,9 +288,10 @@ impl Progress {
         }
     }
 
-    /// The member of the open line, if it goes on into a volume that is
-    /// missing, ending its line as unrar does: with five spaces after it.
-    pub(super) fn cut_short(&self) -> Option<Vec<u8>> {
+    /// The member of the open line, and whether it is encrypted, if it goes
+    /// on into a volume that is missing, ending its line as unrar does: with
+    /// five spaces after it.
+    pub(super) fn cut_short(&self) -> Option<(Vec<u8>, bool)> {
         let mut state = lock(&self.state);
         let line = state
             .line
@@ -297,7 +299,8 @@ impl Progress {
         if line.begun && !line.ended {
             self.out.progress(format_args!("     \n"));
         }
-        Some(line.member)
+        let encrypted = line.span.as_ref().is_some_and(|span| span.encrypted);
+        Some((line.member, encrypted))
     }
 
     /// Ends the open line, whatever its state, when the run stops.
@@ -496,6 +499,7 @@ fn spans(archive: &Archive, base: u64, size: u64) -> Vec<Span> {
                 unpacked: meta.unpacked_size,
                 split_before: meta.is_split_before,
                 split_after: meta.is_split_after,
+                encrypted: meta.is_encrypted,
             };
             previous = end;
             span

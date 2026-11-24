@@ -1,5 +1,5 @@
 use super::*;
-use crate::extraction_control::{finish_member, Resume};
+use crate::extraction_control::{finish_member, finish_split_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::source::RangeReader;
 use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
@@ -41,7 +41,7 @@ where
                         "RAR 1.3 split entry is interrupted by a regular entry",
                     ));
                 }
-                resume = Some(extract_split(
+                let last = match extract_split(
                     &volume,
                     entry,
                     feed,
@@ -49,8 +49,35 @@ where
                     &mut unpack15,
                     solid,
                     &mut open,
-                )?);
-                extracted_count += 1;
+                ) {
+                    Ok(last) => {
+                        extracted_count += 1;
+                        last
+                    }
+                    Err(SplitFailure { error, last: None }) => return Err(error),
+                    // The member's last volume is in hand, so a member error
+                    // handler can carry on past it, as for any other member.
+                    Err(SplitFailure {
+                        error,
+                        last: Some(last),
+                    }) => {
+                        match finish_split_member(
+                            options,
+                            || crate::rar13_member(entry),
+                            volume.main.is_solid(),
+                            error,
+                        )? {
+                            Resume::Fresh => {
+                                unpack15.reset();
+                                unpack15.read_control = budget.control.clone();
+                                extracted_count = 0;
+                            }
+                            Resume::Solid => extracted_count += 1,
+                        }
+                        *last
+                    }
+                };
+                resume = Some(last);
                 break;
             }
             let meta = entry.metadata();
@@ -114,7 +141,26 @@ where
     Ok(())
 }
 
+/// A split member that failed, and the volume holding its end when the walk
+/// could still read that far.
+struct SplitFailure {
+    error: Error,
+    last: Option<Box<Archive>>,
+}
+
+impl From<Error> for SplitFailure {
+    fn from(error: Error) -> Self {
+        Self { error, last: None }
+    }
+}
+
 /// Decodes a split member while its later volumes arrive; returns the volume holding its end.
+///
+/// When it fails with a member error handler set, the rest of its volumes
+/// are still read, so the walk can go on to the members after it. Unlike
+/// RAR 1.5 and later, a fragment's header gives no checksum of its own
+/// packed data (RAR 1.402 writes a running checksum of the input there), so
+/// the damaged volume isn't named.
 fn extract_split<F, B: Budget>(
     volume: &Archive,
     first: &Entry,
@@ -123,7 +169,7 @@ fn extract_split<F, B: Budget>(
     unpack15: &mut Decoder15<B>,
     solid: bool,
     open: &mut F,
-) -> Result<Archive>
+) -> std::result::Result<Archive, SplitFailure>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
@@ -135,6 +181,40 @@ where
         options.password.ok_or(Error::NeedPassword)?;
     }
     let mut walk = SplitWalk::new(feed, first, &unpack15.allowance)?;
+    match extract_split_walk(volume, first, &mut walk, budget, unpack15, solid, open) {
+        Ok(()) => Ok(walk.into_last_volume()?),
+        Err(error)
+            if options.member_errors.is_none()
+                || matches!(
+                    error.kind(),
+                    crate::ErrorKind::Cancelled
+                        | crate::ErrorKind::Io
+                        | crate::ErrorKind::ResourceLimit
+                ) =>
+        {
+            Err(error.into())
+        }
+        Err(error) => Err(SplitFailure {
+            error,
+            last: walk.into_last_volume().ok().map(Box::new),
+        }),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn extract_split_walk<F, B: Budget>(
+    volume: &Archive,
+    first: &Entry,
+    walk: &mut SplitWalk<'_, '_, '_, B>,
+    budget: &mut OutputBudget,
+    unpack15: &mut Decoder15<B>,
+    solid: bool,
+    open: &mut F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    let options = walk.options;
     let first_reader = volume
         .source
         .owned_range_reader(first.packed_range.clone())?;
@@ -152,7 +232,7 @@ where
             let mut checksum = Rar13Checksum::new();
             {
                 let mut reader = packed_reader(
-                    LazyChain::new(&mut walk, first_reader),
+                    LazyChain::new(&mut *walk, first_reader),
                     first.is_encrypted(),
                     options.password,
                 )?;
@@ -171,11 +251,13 @@ where
                         inner: &mut writer,
                         checksum: &mut checksum,
                     };
+                    // Salvaging, a missing volume ends the input, so the
+                    // last step may have run on past the bytes there are.
                     unpack15.decode_member_from_reader(
                         &mut reader,
                         first.header.unp_size as usize,
                         solid,
-                        false,
+                        options.salvage,
                         &mut checksum_writer,
                     )?;
                 }
@@ -196,8 +278,7 @@ where
             options.check_cancelled()
         })
         .map_err(|error| first.entry_error("extracting", error))
-        .map_err(|error| walk.failure.take().unwrap_or(error))?;
-    walk.into_last_volume()
+        .map_err(|error| walk.failure.take().unwrap_or(error))
 }
 
 fn packed_reader<R: Read>(
@@ -221,6 +302,7 @@ fn packed_reader<R: Read>(
 /// Fetches a split member's later volumes as its reader reaches each fragment's end.
 struct SplitWalk<'f, 'p, 'o, B: Budget> {
     feed: &'f mut VolumeFeed<'p, 'o, Archive>,
+    options: crate::ArchiveReadOptions<'o>,
     first: Entry,
     split_after: bool,
     last: Option<Archive>,
@@ -238,6 +320,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     ) -> Result<Self> {
         Ok(Self {
             fragments: Buffer::copied(&[feed.current_index()], allowance)?,
+            options: feed.options(),
             feed,
             first: first.clone(),
             split_after: true,
@@ -249,6 +332,10 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     /// Reads past any fragments the decoder did not need and returns the member's last entry.
     fn finish(&mut self) -> Result<&Entry> {
         while self.next_fragment()?.is_some() {}
+        // Salvaging, a failure ends the fragments rather than failing.
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
         self.last
             .as_ref()
             .and_then(|volume| volume.entries.first())
@@ -319,10 +406,22 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
 
 impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
     fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
+        let error = match &self.failure {
+            Some(error) => error.clone(),
+            None => match self.advance() {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    self.failure = Some(error.clone());
+                    error
+                }
+            },
+        };
+        // Salvaging, the member's data ends where its volumes give out, so
+        // the decoder delivers what it decoded first. The failure is still
+        // the member's, once it is decoded.
+        if self.options.salvage {
+            return Ok(None);
         }
-        self.advance()
-            .inspect_err(|error| self.failure = Some(error.clone()))
+        Err(error)
     }
 }

@@ -1273,6 +1273,123 @@ fn kb_keeps_a_legacy_split_member_up_to_a_missing_volume() {
     assert_eq!(kept, noisy_payload(100_000)[..kept.len()]);
 }
 
+/// A split member of an encrypted RAR 1.5-4 set that a missing volume cuts
+/// short gets unrar's line for an encrypted member.
+#[test]
+fn a_missing_volume_cuts_an_encrypted_legacy_member_short() {
+    let dir = scratch::case("unrars-legacy-encrypted-missing-volume");
+    let names = write_legacy_set(&dir, false, false, Some(b"secret"));
+    fs::remove_file(dir.join(&names[2])).unwrap();
+    let output = unrars(&dir, &["x", "-psecret", "set.rar", "out/"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        "Cannot find volume set.r01\n\
+         Checksum error in the encrypted file big.bin. Corrupt file or wrong password.\n"
+    );
+    assert_eq!(files_under(&dir.join("out")), ["a.txt"]);
+}
+
+/// A RAR 1.4 archive's bytes after its main header: its members.
+fn rar14_members(bytes: &[u8]) -> &[u8] {
+    &bytes[usize::from(u16::from_le_bytes([bytes[4], bytes[5]]))..]
+}
+
+/// [`write_legacy_set`] for RAR 1.4, compressed or stored. rars writes a
+/// RAR 1.4 volume set of one file, so `a.txt` and `z.txt` are spliced in
+/// from archives of their own.
+fn write_rar14_set(dir: &Path, store: bool) -> Vec<String> {
+    let member = |name: &[u8], data: Vec<u8>| {
+        let mut builder = Builder::new(ArchiveVersion::Rar14).store(store);
+        builder.add_bytes(name.to_vec(), data, None, None).unwrap();
+        rar14_members(&builder.to_bytes().unwrap()).to_vec()
+    };
+    let mut builder = Builder::new(ArchiveVersion::Rar14).store(store);
+    builder
+        .add_bytes(b"big.bin".to_vec(), noisy_payload(100_000), None, None)
+        .unwrap();
+    let mut volumes = builder
+        .volume_size(Some(4 * 1024))
+        .build_volumes(None)
+        .unwrap();
+    assert!(volumes.len() >= 4, "{}", volumes.len());
+    let at = volumes[0].len() - rar14_members(&volumes[0]).len();
+    volumes[0].splice(at..at, member(b"a.txt", b"hello\n".to_vec()));
+    volumes
+        .last_mut()
+        .unwrap()
+        .extend(member(b"z.txt", noisy_payload(700)));
+    (0..volumes.len())
+        .map(|index| {
+            let name = rars::volume_name::old_style(Path::new("set.rar"), index)
+                .unwrap()
+                .display()
+                .to_string();
+            fs::write(dir.join(&name), &volumes[index]).unwrap();
+            name
+        })
+        .collect()
+}
+
+/// Issue #601: a damaged or cut volume in the middle of a RAR 1.4 split
+/// member loses that member, and the members after it are still extracted.
+/// RAR 1.4 names no volume, and says nothing about the cut, as unrar 7.20.
+#[test]
+fn a_damaged_rar14_volume_loses_only_its_member() {
+    for store in [true, false] {
+        for cut in [false, true] {
+            let case = format!("stored {store}, cut {cut}");
+            let dir = scratch::case(&format!("unrars-rar14-damaged-volume-{store}-{cut}"));
+            let names = write_rar14_set(&dir, store);
+            let path = dir.join(&names[1]);
+            if cut {
+                let bytes = fs::read(&path).unwrap();
+                fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
+            } else {
+                damage(&path);
+            }
+            let output = unrars(&dir, &["x", "set.rar", "out/"]);
+            let errors = stderr(&output);
+            assert_eq!(output.status.code(), Some(3), "{case}: {errors}");
+            assert_eq!(
+                errors,
+                format!("{:<20} - checksum error\n", "big.bin"),
+                "{case}"
+            );
+            assert!(stdout(&output).contains("Total errors: 1"), "{case}");
+            assert_eq!(files_under(&dir.join("out")), ["a.txt", "z.txt"], "{case}");
+            assert_eq!(fs::read(dir.join("out/z.txt")).unwrap(), noisy_payload(700));
+        }
+    }
+}
+
+/// Issue #601: a missing RAR 1.4 volume still ends the run, and `-kb`
+/// keeps what the split member's volumes held before it.
+#[test]
+fn kb_keeps_a_rar14_split_member_up_to_a_missing_volume() {
+    for store in [true, false] {
+        let dir = scratch::case(&format!("unrars-rar14-kb-missing-volume-{store}"));
+        let names = write_rar14_set(&dir, store);
+        fs::remove_file(dir.join(&names[2])).unwrap();
+        let output = unrars(&dir, &["x", "set.rar", "out/"]);
+        assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+        assert_eq!(
+            stderr(&output),
+            format!(
+                "Cannot find volume set.r01\n{:<20} - checksum error\n",
+                "big.bin"
+            )
+        );
+        assert_eq!(files_under(&dir.join("out")), ["a.txt"]);
+
+        let output = unrars(&dir, &["x", "-kb", "set.rar", "kept/"]);
+        assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+        let kept = fs::read(dir.join("kept/big.bin")).unwrap();
+        assert!(!kept.is_empty() && kept.len() < 100_000, "{}", kept.len());
+        assert_eq!(kept, noisy_payload(100_000)[..kept.len()]);
+    }
+}
+
 /// `a.txt`, `info.nfo` and `sub/` holding `a.txt`, `b.txt` and `deeper/a.txt`.
 fn write_tree(path: &Path) {
     let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
