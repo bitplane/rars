@@ -20,6 +20,9 @@ impl<R, B> Reader<R, B> {
             feature: "encryption",
         })
     }
+    pub(crate) fn dropping_cut_block(self, _drop: bool) -> Self {
+        match self.unavailable {}
+    }
 }
 impl<R> Reader<R> {
     pub(crate) fn with_keys(_inner: R, _key: [u8; 32], _iv: [u8; 16]) -> Result<Self> {

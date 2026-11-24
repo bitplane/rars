@@ -348,12 +348,16 @@ pub(super) fn packed_reader<R: Read, B: Budget>(
     chain: R,
     decryptor: Option<&SplitDecryptor>,
     allowance: &B,
+    salvage: bool,
 ) -> Result<PackedReader<R, B>> {
     let Some(decryptor) = decryptor else {
         return Ok(PackedReader::Plain(chain));
     };
     Ok(PackedReader::Encrypted(Boxed::try_new(
-        || Rar50DecryptingReader::with_keys(chain, decryptor.keys.key, decryptor.iv),
+        || {
+            Rar50DecryptingReader::with_keys(chain, decryptor.keys.key, decryptor.iv)
+                .map(|reader| reader.dropping_cut_block(salvage))
+        },
         allowance,
     )?))
 }
@@ -403,7 +407,13 @@ pub(super) fn write_stored<B: Budget>(
     allowance: &B,
 ) -> Result<()> {
     let mut sums = SplitChecksums::new(first);
-    let mut reader = packed_reader(LazyChain::new(walk, first_reader), decryptor, allowance)?;
+    let salvage = walk.options.salvage;
+    let mut reader = packed_reader(
+        LazyChain::new(walk, first_reader),
+        decryptor,
+        allowance,
+        salvage,
+    )?;
     // Padding after the unpacked size may hold any bytes.
     let written = crate::stored_copy::copy(
         &mut reader,
@@ -493,10 +503,12 @@ impl<B: Budget> DecoderSession<'_, B> {
         unchecked.hash = None;
         let mut sums = SplitChecksums::new(first);
         let decoded = {
+            let salvage = walk.options.salvage;
             let mut packed = packed_reader(
                 LazyChain::new(&mut *walk, first_reader),
                 decryptor,
                 &self.allowance,
+                salvage,
             )?;
             control.finish(unchecked.stream_packed_with_crc_policy::<true, _, _>(
                 &mut packed,
@@ -551,10 +563,12 @@ impl<B: Budget> DecoderSession<'_, B> {
         let output_size = checked_unpacked_size(first.unpacked_size)?;
         let allowance = self.decoder.allowance();
         let decoded = {
+            let salvage = walk.options.salvage;
             let mut reader = packed_reader(
                 LazyChain::new(&mut *walk, first_reader),
                 decryptor,
                 &allowance,
+                salvage,
             )?;
             self.decoder
                 .decode_member_from_reader_with_dictionary(

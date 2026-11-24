@@ -2230,6 +2230,9 @@ struct Rar50DecryptingReader<R> {
     pos: usize,
     plain_end: usize,
     filled: usize,
+    /// Salvaging a member whose volumes gave out: the cipher block cut at
+    /// the gap ends the stream rather than failing the read.
+    drop_cut_block: bool,
 }
 
 #[cfg(feature = "encryption")]
@@ -2246,7 +2249,17 @@ impl<R: Read> Rar50DecryptingReader<R> {
             pos: 0,
             plain_end: 0,
             filled: 0,
+            drop_cut_block: false,
         }
+    }
+
+    /// Ends the stream at a final partial cipher block instead of failing.
+    /// Only for salvage, where the walk stops a member's data at a missing
+    /// volume, wherever in a block that falls. The whole blocks before it
+    /// still decrypt, and the member's own failure is still reported.
+    pub(super) fn dropping_cut_block(mut self, drop: bool) -> Self {
+        self.drop_cut_block = drop;
+        self
     }
 
     /// Refills the window once everything decrypted has been handed out.
@@ -2263,7 +2276,8 @@ impl<R: Read> Rar50DecryptingReader<R> {
         while self.filled < 16 {
             let count = self.inner.read(&mut self.window[self.filled..])?;
             if count == 0 {
-                if self.filled == 0 {
+                if self.filled == 0 || self.drop_cut_block {
+                    self.filled = 0;
                     return Ok(false);
                 }
                 return Err(std::io::Error::new(
@@ -2372,6 +2386,7 @@ mod tests {
                         crate::volume_extract::LazyChain::new(walk, reader),
                         Some(&decryptor),
                         budget,
+                        false,
                     )?;
                     Ok(())
                 },

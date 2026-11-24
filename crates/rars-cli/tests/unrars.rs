@@ -1288,6 +1288,56 @@ fn a_missing_volume_cuts_an_encrypted_legacy_member_short() {
          Checksum error in the encrypted file big.bin. Corrupt file or wrong password.\n"
     );
     assert_eq!(files_under(&dir.join("out")), ["a.txt"]);
+
+    // Issue #611: `-kb` keeps what decoded before the gap, which falls
+    // inside a cipher block, and reports the same.
+    let output = unrars(&dir, &["x", "-kb", "-psecret", "set.rar", "kept/"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        "Cannot find volume set.r01\n\
+         Checksum error in the encrypted file big.bin. Corrupt file or wrong password.\n"
+    );
+    let kept = fs::read(dir.join("kept/big.bin")).unwrap();
+    assert!(!kept.is_empty() && kept.len() < 100_000, "{}", kept.len());
+    assert_eq!(kept, noisy_payload(100_000)[..kept.len()]);
+}
+
+/// Issue #611: `-kb` keeps what decoded of an encrypted RAR 5 split member
+/// before a missing volume, as it does for a RAR 1.5-4 one.
+#[test]
+fn kb_keeps_an_encrypted_rar5_split_member_up_to_a_missing_volume() {
+    let dir = scratch::case("unrars-rar5-encrypted-kb-missing-volume");
+    let data = noisy_payload(1_000_000);
+    let mut builder = Builder::new(ArchiveVersion::Rar50).password(Some(b"secret".to_vec()));
+    builder
+        .add_bytes(b"big.bin".to_vec(), data.clone(), None, None)
+        .unwrap();
+    let volumes = builder
+        .volume_size(Some(32 * 1024))
+        .build_volumes(None)
+        .unwrap();
+    assert!(volumes.len() >= 4, "{}", volumes.len());
+    for (index, bytes) in volumes.iter().enumerate() {
+        fs::write(dir.join(format!("set.part{}.rar", index + 1)), bytes).unwrap();
+    }
+    fs::remove_file(dir.join("set.part3.rar")).unwrap();
+    let output = unrars(&dir, &["x", "-kb", "-psecret", "set.part1.rar", "kept/"]);
+    assert_eq!(output.status.code(), Some(6), "{}", stderr(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "Cannot find volume set.part3.rar\n{:<20} - checksum error\n",
+            "big.bin"
+        )
+    );
+    let kept = fs::read(dir.join("kept/big.bin")).unwrap();
+    assert!(
+        !kept.is_empty() && kept.len() < data.len(),
+        "{}",
+        kept.len()
+    );
+    assert_eq!(kept, data[..kept.len()]);
 }
 
 /// A RAR 1.4 archive's bytes after its main header: its members.
