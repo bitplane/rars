@@ -51,9 +51,8 @@ fn admitted_block_jobs_stay_inside_the_budget_on_noise() {
     // A 1 MiB dictionary makes 1 MiB runs. Planned at 190 MiB, a 3 MiB
     // member is too large to code whole (192 MiB) and each run's search
     // fits (184 MiB). A job is admitted for 120 MiB, so this budget runs
-    // three at once, where planning charges admitted two. Three peaked at
-    // 271 MiB allocated and 355 MiB resident: glibc keeps what worker
-    // threads free in their own arenas (#276), and that counts here too.
+    // three at once, where planning charges admitted two. glibc keeps what
+    // worker threads free in their own arenas (#276), and that counts too.
     const BUDGET: u64 = 400 * MIB;
     let scratch = scratch::case("rar50-admission-memory");
     let entries: Vec<_> = (0..4)

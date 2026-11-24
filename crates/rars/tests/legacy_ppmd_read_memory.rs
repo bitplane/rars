@@ -1,10 +1,10 @@
 #![cfg(all(feature = "write", feature = "parallel", target_os = "linux"))]
 
-//! Testing an archive of small RAR 3 PPMd members once held the whole
+//! Testing an archive of small RAR 3 PPMd members must not hold the whole
 //! declared model resident on every worker (#553). Each member's model is
 //! 25 MB, RAR 3's default, of which a few kilobytes of text reach a few
-//! pages. With glibc, once the first model was freed each later one came back
-//! from the heap cleared in full, so four workers held 100 MiB.
+//! pages. With glibc, once the first model is freed each later one comes back
+//! from the heap cleared in full, so four workers can hold 100 MiB.
 //!
 //! Real use is resident memory, read from `/proc`. The test is the only one
 //! in its binary, so nothing else runs in the process.

@@ -50,7 +50,7 @@ mod backend {
     const STRIPE: usize = LANES * BLOCK_BYTES;
     // Keeping more than this behind each compressed stripe leaves every leaf a block to finalize.
     const HOLD: usize = STRIPE - BLOCK_BYTES;
-    // Split, a 128 KiB run measured 10% slower than on one thread, and 512 KiB 7% faster.
+    // Below this, splitting a run across threads is slower than one thread.
     const SPLIT_STRIPES: usize = (256 << 10) / STRIPE;
 
     // Inside the pool the other members already keep every thread busy.

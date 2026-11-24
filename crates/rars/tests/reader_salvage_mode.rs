@@ -1086,7 +1086,7 @@ fn resyncs(archive: &Archive) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// A block header that doesn't parse no longer ends the walk: it goes on at
+/// A block header that doesn't parse does not end the walk: it goes on at
 /// the next header that checks out, and the members after it are read.
 #[test]
 fn the_walk_resyncs_past_a_header_that_does_not_parse() {

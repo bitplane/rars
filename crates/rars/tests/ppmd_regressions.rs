@@ -96,7 +96,7 @@ fn ppmd_block_can_emit_embedded_one_byte_lz_repeats() {
 /// Fuzzed solid archives whose first member fails partway through a PPMd
 /// symbol. Reading on past it with a member error handler, the later member
 /// continues the model, which the failed symbol left half-updated. It must
-/// fail as a missing model; it used to panic indexing the model's memory.
+/// fail as a missing model, not panic indexing the model's memory.
 #[test]
 fn a_member_continuing_a_failed_ppmd_model_fails_cleanly() {
     for (name, first) in [

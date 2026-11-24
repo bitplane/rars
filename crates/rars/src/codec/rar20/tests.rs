@@ -116,9 +116,8 @@ use super::{
 /// 7-Zip builds the RAR pre-table with `k_BuildMode_Full` and refuses a
 /// code that leaves part of the code space unassigned, where unrar takes
 /// it. Giving every used symbol the same length only fills the space when
-/// the count is a power of two, so the flat table we used to emit was
-/// under-full for 3, 5, 6, 7, 9 symbols and so on, and 7-Zip rejected the
-/// archive before decoding a byte.
+/// the count is a power of two, so a flat table is under-full for 3, 5, 6, 7,
+/// 9 symbols and so on, and 7-Zip rejects the archive before decoding a byte.
 #[test]
 fn the_pre_table_fills_its_code_space_for_every_symbol_count() {
     for count in 1..=LEVEL_COUNT {
@@ -1664,8 +1663,6 @@ fn priced_parses_code_to_the_unpruned_search_bytes() {
         })
         .collect();
 
-    // Captured from the encoder that priced every candidate in full, then again
-    // once the pre-table was weighted and absent symbols priced (all smaller).
     assert_eq!(
         fingerprints,
         [
@@ -1729,11 +1726,8 @@ fn level_ladder_codes_to_the_bytes_it_always_has() {
         }
     }
 
-    // Captured from master 61e9cbe0: per level, text, random, windowed, then the
-    // second solid member at a full and a 16 KiB window. Captured again once the
-    // pre-table was weighted and absent symbols priced: every size is smaller
-    // or, for the solid members on the fixed table, unchanged. Level 5's text
-    // moved by a byte once its seed pass read the match lists.
+    // Per level: text, random, windowed, then the second solid member at a
+    // full and a 16 KiB window.
     assert_eq!(
         fingerprints,
         [

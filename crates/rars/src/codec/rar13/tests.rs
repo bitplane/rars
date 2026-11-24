@@ -1483,9 +1483,8 @@ fn encoder_round_trips_source_shaped_payload() {
 
 /// Match-heavy input drives `nlzb` above `nhfb`, which widens the literal
 /// flag to two bits, which is what lets a flag reach the last bit of a
-/// flags byte with a bit still to place. The encoder used to pad the byte
-/// and start the next group cleanly; the decoder read that padding as a
-/// flag and everything after it decoded to the wrong bytes.
+/// flags byte with a bit still to place. The encoder must not pad the byte:
+/// the decoder reads padding as a flag.
 #[test]
 fn a_flag_straddling_two_flags_bytes_round_trips() {
     let input = match_heavy_payload(176, 8000);

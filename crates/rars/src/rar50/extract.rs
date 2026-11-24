@@ -201,8 +201,7 @@ impl FileHeader {
     /// evaluated beside it. Measured on RAR 7.12 and unrar 7.20 with a file
     /// header carrying both: a deliberately wrong CRC32 next to a correct
     /// BLAKE2sp tests clean in both readers, while a correct CRC32 next to a
-    /// corrupted BLAKE2sp is rejected by both. rars used to check both fields
-    /// and so rejected the first archive.
+    /// corrupted BLAKE2sp is rejected by both.
     ///
     /// WinRAR writes one or the other, never both, so this only shows up on
     /// archives from somewhere else.
@@ -220,7 +219,7 @@ impl FileHeader {
     /// 1.5-4 members are: it passes if what it produced matches its checksum,
     /// since the whole file is there and the declared size is what is wrong.
     /// Without a checksum to say so (#44), or if it fails, the member is
-    /// truncated, as it always was.
+    /// truncated.
     fn ended_early_result<B: Budget>(
         &self,
         decoder: &ReaderState<B>,
@@ -2219,9 +2218,7 @@ const DECRYPT_WINDOW: usize = 64 * 1024;
 /// Decrypts a RAR 5 AES-256-CBC payload as it is read.
 ///
 /// The source is usually an unbuffered `File::take`, so every `read` here is a
-/// syscall. This reader used to ask it for one 16-byte AES block at a time,
-/// and a 256 MiB `-hp` set took 38 s to extract, 35 s of it in the kernel,
-/// against unrar's 0.25 s. Keep the window.
+/// syscall, and this reads a window rather than one 16-byte AES block at a time.
 ///
 /// `window[pos..plain_end]` is decrypted and not yet handed out, and
 /// `window[plain_end..filled]` is ciphertext short of a whole block.

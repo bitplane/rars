@@ -5172,8 +5172,8 @@ mod repair_workspace_tests {
 
     #[test]
     fn rar5_reconstruction_admits_padded_output_and_all_solve_matrices() {
-        // Less than 1 MiB of caller metadata and 8 KiB of parity used to
-        // allocate 512 MiB of zero padding before the solve was considered.
+        // Less than 1 MiB of caller metadata and 8 KiB of parity must not
+        // allocate 512 MiB of zero padding before the solve is considered.
         let empty = &[][..];
         let mut data = vec![Some(empty); super::FIELD_SIZE - 1];
         data[0] = None;

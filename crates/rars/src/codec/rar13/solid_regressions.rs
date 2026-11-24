@@ -32,9 +32,8 @@ fn decode_solid_run(packed: &[Vec<u8>], members: &[&[u8]]) -> Vec<Vec<u8>> {
 }
 
 /// The short-LZ literal run does not survive a member boundary: the decoder
-/// clears it for every member, solid or not. The encoder kept it, so where
-/// a member happened to end mid-run the next one opened with a break bit
-/// nothing would read, and every symbol after it was a bit out of step.
+/// clears it for every member, solid or not, so the encoder must too: a member
+/// ending mid-run would open the next with a break bit nothing reads.
 ///
 /// This pair is the smallest one that ends a member with the run at two.
 #[test]
@@ -54,8 +53,7 @@ fn a_member_boundary_clears_the_short_lz_literal_run() {
 }
 
 /// A decoder handed a solid member first skips the non-solid reset, so
-/// whatever it was constructed with is what decodes the member. It used to
-/// be constructed with the Huffman tables left at zero.
+/// whatever it was constructed with is what decodes the member.
 #[test]
 fn a_first_member_marked_solid_decodes_against_real_tables() {
     let member = b"the quick brown fox jumps over the lazy dog\n".repeat(40);

@@ -146,8 +146,8 @@ impl<B: Budget> Huffman<B> {
     /// up to 10 bits; bounded readers scan without extra storage. The caller
     /// consumes only the code's bits, and must
     /// check that they were real input rather than padding past its end.
-    // Always inlined: adding a second caller previously stopped the compiler
-    // from inlining this inner loop into RAR5 (11% slower).
+    // Always inlined: with a second caller the compiler stops inlining this
+    // inner loop into RAR5.
     #[inline(always)]
     pub(super) fn decode_peeked(&self, peek: u32) -> Option<(usize, usize)> {
         if B::LIMITED {
