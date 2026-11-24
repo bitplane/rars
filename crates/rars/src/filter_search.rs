@@ -138,6 +138,15 @@ pub(crate) trait FilterSearch {
         TABLE_SCAN_WINDOW
     }
 
+    /// How much of an x86 region each of the screen's samples stands for.
+    ///
+    /// Defaults to [`X86_REGION_SAMPLE_SPAN`]. RAR 2.9 searches a large member
+    /// in pieces of that size, so a region there is never longer than one
+    /// span, and one sample in its middle would stand for all of it.
+    fn x86_region_sample_span(&self) -> usize {
+        X86_REGION_SAMPLE_SPAN
+    }
+
     /// Cheaper settings for the screens, when ranking candidates at less than
     /// full effort ranks them the same way.
     ///
@@ -237,6 +246,10 @@ pub(crate) trait OwnedSearch {
     fn table_scan_window(&self) -> usize {
         TABLE_SCAN_WINDOW
     }
+    /// See [`FilterSearch::x86_region_sample_span`].
+    fn x86_region_sample_span(&self) -> usize {
+        X86_REGION_SAMPLE_SPAN
+    }
     fn screen_options(&self, options: Self::Options) -> Self::Options;
     /// Whether every finalist is encoded in full at the caller's settings and
     /// the smallest kept, rather than the finalists ranked by a trial and only
@@ -301,6 +314,9 @@ impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
     }
     fn table_scan_window(&self) -> usize {
         self.0.table_scan_window()
+    }
+    fn x86_region_sample_span(&self) -> usize {
+        self.0.x86_region_sample_span()
     }
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.0.screen_options(options)
@@ -396,6 +412,9 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     }
     fn table_scan_window(&self) -> usize {
         self.search.table_scan_window()
+    }
+    fn x86_region_sample_span(&self) -> usize {
+        self.search.x86_region_sample_span()
     }
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)
@@ -703,7 +722,7 @@ fn x86_screened_regions<S: OwnedSearch>(
     // The packed size of a region's samples under `kind`, or left alone.
     let priced = |region: &Range<usize>, kind: Option<FilterKind>| -> Result<usize> {
         let mut packed = 0;
-        for within in x86_region_samples(region) {
+        for within in x86_region_samples(region, search.x86_region_sample_span()) {
             packed += match kind {
                 None => search.encode_plain(&data[within], options, None)?.len(),
                 Some(kind) => {
@@ -790,7 +809,8 @@ fn x86_screened_regions<S: OwnedSearch>(
 const X86_REGION_SAMPLE_SPAN: usize = 4 * 1024 * 1024;
 
 /// Where the x86 screen samples `region`: the middle of each of as many equal
-/// parts as it takes to keep each part within [`X86_REGION_SAMPLE_SPAN`].
+/// parts as it takes to keep each part within `span`, which is
+/// [`X86_REGION_SAMPLE_SPAN`] unless the format asks for less.
 ///
 /// One sample used to stand for a region however long. On a 32 MiB slice of a
 /// tar of `/usr/bin` the scanner proposed one region for the last 26 MiB of ELF
@@ -800,8 +820,11 @@ const X86_REGION_SAMPLE_SPAN: usize = 4 * 1024 * 1024;
 /// unfiltered and the member came out 5% larger, at some levels and not
 /// others. Summed over a sample for each 4 MiB, the code in the region
 /// outweighs whatever one window happens to land on.
-fn x86_region_samples(region: &Range<usize>) -> impl Iterator<Item = Range<usize>> + '_ {
-    let parts = region.len().div_ceil(X86_REGION_SAMPLE_SPAN).max(1);
+fn x86_region_samples(
+    region: &Range<usize>,
+    span: usize,
+) -> impl Iterator<Item = Range<usize>> + '_ {
+    let parts = region.len().div_ceil(span.max(1)).max(1);
     (0..parts).map(move |part| {
         let start = region.start + region.len() * part / parts;
         let end = region.start + region.len() * (part + 1) / parts;
@@ -1121,21 +1144,26 @@ fn tables_outside_code<S: OwnedSearch>(
     };
     let mut kept = Buffer::new(search.allowance());
     for (region, stride) in tables {
-        let within = screen_sample_range(region.len());
-        let within = region.start + within.start..region.start + within.end;
-        let in_code = code
-            .kept
-            .iter()
-            .any(|code| code.start < within.end && within.start < code.end);
-        if in_code {
-            let filters = [FilterSpec::whole(FilterKind::Delta { channels: stride })];
-            let as_table = search.filtered_bytes(&data[within.clone()], &filters)?;
-            let as_table = search.encode_plain(&as_table, screen_options, None)?;
-            let as_code = filtered_sample(search, data, within, kind)?;
-            let as_code = search.encode_plain(&as_code, screen_options, None)?;
-            if as_code.len() < as_table.len() {
+        // Sampled as the x86 screen samples a region, so a table as long as
+        // the code it lies in is not judged on whatever its middle holds.
+        let mut as_table = 0;
+        let mut as_code = 0;
+        for within in x86_region_samples(&region, search.x86_region_sample_span()) {
+            let in_code = code
+                .kept
+                .iter()
+                .any(|code| code.start < within.end && within.start < code.end);
+            if !in_code {
                 continue;
             }
+            let filters = [FilterSpec::whole(FilterKind::Delta { channels: stride })];
+            let table = search.filtered_bytes(&data[within.clone()], &filters)?;
+            as_table += search.encode_plain(&table, screen_options, None)?.len();
+            let code = filtered_sample(search, data, within, kind)?;
+            as_code += search.encode_plain(&code, screen_options, None)?.len();
+        }
+        if as_code < as_table {
+            continue;
         }
         kept.try_push((region, stride))?;
     }
@@ -1434,6 +1462,7 @@ pub(crate) fn filter_candidates<S: FilterSearch>(
 /// Which filter suits a member is a property of the data, not of how hard the
 /// encoder is trying, so this is worth doing once even when several encoder
 /// settings are going to be compared afterwards.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn choose_filter<S: FilterSearch>(
     search: &S,
     data: &[u8],
@@ -1447,6 +1476,24 @@ pub(crate) fn choose_filter<S: FilterSearch>(
         progress,
     )
     .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
+}
+
+/// The filters [`choose_filter`] would pick, for a caller that encodes the
+/// member itself, under filters chosen for more than this one search. A
+/// winner the trial picks is not encoded at all.
+pub(crate) fn choose_filter_specs<S: FilterSearch>(
+    search: &S,
+    data: &[u8],
+    options: S::Options,
+    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
+) -> Result<Vec<FilterSpec>> {
+    choose_owned_specs(
+        &UnlimitedSearch(search, Allowance::default()),
+        data,
+        options,
+        progress,
+    )
+    .map(|specs| specs.into_vec())
 }
 
 /// [`choose_filter`], with the whole-member encodes run side by side where
@@ -1546,6 +1593,9 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
     }
     fn table_scan_window(&self) -> usize {
         self.search.table_scan_window()
+    }
+    fn x86_region_sample_span(&self) -> usize {
+        self.search.x86_region_sample_span()
     }
     fn screen_options(&self, options: Self::Options) -> Self::Options {
         self.search.screen_options(options)

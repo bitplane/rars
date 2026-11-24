@@ -229,6 +229,32 @@ const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
 const RAR29_LZ_BLOCK_SIZE: usize = 64 * 1024;
 use crate::write_stream::STREAM_MEMBERS_ABOVE;
 
+/// How much of a member one RAR 2.9 filter search covers. A longer member, or
+/// a longer streamed segment, is searched a piece at a time and coded once
+/// under every piece's filters, as RAR 5 searches its runs.
+///
+/// Searched whole, a 32 MiB tar of x86-64 executables and libraries came out
+/// 5.1% larger than rar 3.93's `-m3`: the x86 scanner proposes a handful of
+/// regions for the whole member, and its tables were judged a window too
+/// coarse for the few kilobytes of relocations each file holds. In 4 MiB
+/// pieces it came out 0.6% smaller than searched whole; 1 MiB and 512 KiB
+/// pieces did no better and searched for longer.
+const RAR29_FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// How much of a piece the RAR 2.9 table scanner judges at a time.
+///
+/// rar 3.93 codes delta filters over regions as short as 768 bytes. On the
+/// same 32 MiB tar the default 16 KiB window found 3.2 MB of tables, and
+/// 2 KiB found enough more to take another 2% off the member at level 3, for
+/// 13% more time. 1 KiB took 0.4% more for another 15%; RAR 5's 256 bytes
+/// would cost more again, a filter record per table.
+const RAR29_TABLE_SCAN_WINDOW: usize = 2 * 1024;
+
+/// How much of an x86 region each RAR 2.9 screen sample stands for: a
+/// quarter of a piece, so a region as long as one is judged on four samples
+/// rather than on whatever its middle holds.
+const RAR29_X86_REGION_SAMPLE_SPAN: usize = RAR29_FILTER_SEARCH_BYTES / 4;
+
 /// The largest dictionary the format encodes, used when a memory estimate
 /// cannot resolve the real one. It has to stay an upper bound, so it does not
 /// follow the block size.
@@ -1280,6 +1306,14 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         crate::codec::rar29::MAX_VM_DELTA_FILTER_BLOCK_SIZE
     }
 
+    fn table_scan_window(&self) -> usize {
+        RAR29_TABLE_SCAN_WINDOW
+    }
+
+    fn x86_region_sample_span(&self) -> usize {
+        RAR29_X86_REGION_SAMPLE_SPAN
+    }
+
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
         crate::codec::rar29::filtered_members(data, self.file_offset, filters)
             .map(|filtered| filtered.data)
@@ -1325,6 +1359,49 @@ impl crate::filter_search::FilterSearch for Rar29Search {
     }
 }
 
+/// The filters for `data`, which starts `file_offset` bytes into its member,
+/// searched [`RAR29_FILTER_SEARCH_BYTES`] at a time and ranged over `data`.
+///
+/// Each piece is measured on its own, filtered where it lies in the member,
+/// and only the choice is kept: the caller codes the member once under all of
+/// them. The search measures with the lazy parse, as every RAR 2.9 search does.
+/// A piece that reads as text is not searched, as a whole member is not.
+///
+/// One piece at a time. On a 32 MiB tar of executables at four threads, four
+/// at a time took 1.17 s against 1.68 s, but peaked at 223 MiB against 139 MiB,
+/// most of it freed memory the allocator kept for each thread that ran a search.
+fn rar29_piece_filters(
+    data: &[u8],
+    file_offset: usize,
+    options: Rar29EncodeOptions,
+    piece: usize,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<FilterSpec>> {
+    let search_options = options.with_optimal_parse_passes(0);
+    let mut specs = Vec::new();
+    for start in (0..data.len()).step_by(piece.max(1)) {
+        let end = (start + piece).min(data.len());
+        let bytes = &data[start..end];
+        if !crate::filter_search::search_applies_throughout(bytes) {
+            continue;
+        }
+        let mut poll = |_| !cancelled();
+        let found = crate::filter_search::choose_filter_specs(
+            &Rar29Search::at(file_offset + start, options),
+            bytes,
+            search_options,
+            Some(&mut poll),
+        )?;
+        specs.extend(found.into_iter().map(|spec| {
+            let range = spec
+                .range
+                .map_or(start..end, |range| start + range.start..start + range.end);
+            FilterSpec::range(spec.kind, range)
+        }));
+    }
+    Ok(specs)
+}
+
 #[cfg(test)]
 fn encode_rar29_auto_filtered_member(
     data: &[u8],
@@ -1360,7 +1437,26 @@ fn encode_rar29_auto_filtered_member_with_progress(
     }
     let searching = !text && crate::filter_search::search_applies_throughout(data);
     let best = EncodedPayload {
-        data: if searching {
+        data: if searching && data.len() > RAR29_FILTER_SEARCH_BYTES {
+            // Too long to search whole: searched a piece at a time, then coded
+            // once under every piece's filters, at the member's own settings.
+            let filters =
+                rar29_piece_filters(data, 0, options, RAR29_FILTER_SEARCH_BYTES, &|| {
+                    progress.is_some_and(WorkTracker::is_cancelled)
+                })?;
+            with_codec_progress(progress, |report| {
+                if filters.is_empty() {
+                    unpack29_encode_literals_with_options_and_progress(data, options, report)
+                } else {
+                    Unpack29Encoder::with_options(options).encode_member_with_filters_and_progress(
+                        data,
+                        0,
+                        &filters,
+                        Some(report),
+                    )
+                }
+            })?
+        } else if searching {
             // Every finalist is a full encode, so at the levels with a
             // shortest-path parse they are measured by the lazy parse that
             // seeds it, and only the winner is parsed the slow way. Which
@@ -1415,18 +1511,19 @@ fn encode_rar29_auto_filtered_member_with_progress(
     Ok(best)
 }
 
-/// Codes text as LZ, PPMd with escapes and plain PPMd, the PPMd under each
-/// model the level tries; the smallest wins.
+/// Codes text as LZ and PPMd, the PPMd under each model the level tries; the
+/// smallest wins. See [`text_trial`] for which candidates are screened out.
 fn encode_rar29_text_member(
     data: &[u8],
     options: Rar29EncodeOptions,
     lz_method: u8,
     progress: Option<&WorkTracker<'_>>,
 ) -> Result<EncodedPayload> {
-    // Encode the whole member with both engines and keep the smaller. Neither
-    // size nor a sample predicts the winner: 8 MiB of content that repeats
-    // every 4 MiB packs to 843 KB under LZ and 1.44 MB under PPMd, and a sample
-    // narrower than the repeat distance cannot see the repetition. On a small
+    // Encode the whole member with both engines, LZ at least by the screen's
+    // parse, and keep the smaller. Neither size nor a sample predicts the
+    // winner: 8 MiB of content that repeats every 4 MiB packs to 843 KB under
+    // LZ and 1.44 MB under PPMd, and a sample narrower than the repeat
+    // distance cannot see the repetition. On a small
     // sample archive overhead dominates, so 128 KiB of one phrase reads as a
     // 45% PPMd win (118 bytes against 213). PPMd costs about three times LZ on
     // the same bytes; `ppmd_trial_pays` decides which levels pay for both.
@@ -1436,7 +1533,8 @@ fn encode_rar29_text_member(
     // shortest-path parse changed no packed byte and doubled the time on the
     // 4 MiB members.
     let options = options.with_optimal_parse_passes(0);
-    let (_, best) = text_trial(data, options, models, &|encode| {
+    let exhaustive = text_trial_exhaustive(lz_method.saturating_sub(0x30));
+    let (_, best) = text_trial(data, options, models, exhaustive, &|encode| {
         with_codec_progress(progress, |report| encode(report))
     })?;
     if best.len() >= data.len() {
@@ -1458,8 +1556,39 @@ type TrialRun<'a> = dyn Fn(
     + Sync
     + 'a;
 
-/// Codes text as LZ, then PPMd with escapes and plain PPMd under each model
-/// size in turn; the smallest wins, earlier on a tie.
+/// How long a text member can be and still have plain PPMd, with no escapes,
+/// tried beside PPMd with them.
+///
+/// The escape tokens price themselves against costs measured off the stream
+/// they are shaping, so a member where every escape loses can still ratify a
+/// few before the measurements catch up, and a pure-literal stream is the
+/// direct check. What that costs is a few escapes, not a share of the member:
+/// over the bench's 89 text members it won on 59, the largest 35,149 bytes,
+/// and lost on every member past that, the 4 MiB and 32 MiB ones included.
+/// Past this length it is a whole second PPMd encode for nothing.
+const PPMD_LITERAL_TRIAL_BYTES: usize = 256 * 1024;
+
+/// Whether this level's text trial codes every candidate in full rather than
+/// screening some of them out. Level 5 spends whatever it takes.
+fn text_trial_exhaustive(level: u8) -> bool {
+    level >= 5
+}
+
+/// Codes text as PPMd with escapes, and plain PPMd where it can still win,
+/// under each model size in turn, and as LZ; the smallest wins, LZ first on a
+/// tie, then the earlier model.
+///
+/// LZ is first screened by the reduced parse the filter search ranks with,
+/// which costs about a fifth of the lazy one, and only coded in full where that
+/// screen comes within a fifth of the best PPMd. The lazy parse is at most 11%
+/// smaller than the screen on the bench's text (4 MiB of source), so a screen
+/// that far behind cannot be overturned; and PPMd won every text member
+/// there, by at least 8% over the screen. A member that repeats beyond what
+/// PPMd's escapes reach, which is where LZ wins, wins under the screen as
+/// well. Without the screen, a 32 MiB tar of text took 6.8 times rar 3.93's
+/// `-m3` to code at one thread.
+///
+/// An exhaustive trial skips both screens and codes every candidate.
 ///
 /// A PPMd engine names the model it won under, so a caller that codes the
 /// member again from it starts the same one.
@@ -1467,6 +1596,7 @@ fn text_trial(
     data: &[u8],
     options: Rar29EncodeOptions,
     models: &[PpmdModelSize],
+    exhaustive: bool,
     run: &TrialRun<'_>,
 ) -> Result<(StreamedEngine, Vec<u8>)> {
     let ppmd = |size: PpmdModelSize, escapes: Option<usize>| {
@@ -1481,52 +1611,74 @@ fn text_trial(
             )
         })
     };
-    // The escape tokens price themselves against costs measured off the
-    // stream they are shaping, so a member where every escape loses can still
-    // ratify a few before the measurements catch up. A pure-literal stream is
-    // the direct check.
-    let pair = |size: PpmdModelSize| {
-        crate::parallel::join(
-            || ppmd(size, Some(options.max_match_distance)),
-            || ppmd(size, None),
-        )
+    let literals = exhaustive || data.len() <= PPMD_LITERAL_TRIAL_BYTES;
+    let models_of = |size: PpmdModelSize| -> (Result<Vec<u8>>, Option<Result<Vec<u8>>>) {
+        if literals {
+            let (escaped, literals) = crate::parallel::join(
+                || ppmd(size, Some(options.max_match_distance)),
+                || ppmd(size, None),
+            );
+            (escaped, Some(literals))
+        } else {
+            (ppmd(size, Some(options.max_match_distance)), None)
+        }
+    };
+    let lz = |options: Rar29EncodeOptions| {
+        run(&mut |report| unpack29_encode_literals_with_options_and_progress(data, options, report))
+    };
+    let screen = if exhaustive {
+        options
+    } else {
+        use crate::filter_search::FilterSearch;
+        Rar29Search::MEMBER.screen_options(options)
     };
     let (&first, larger) = models
         .split_first()
         .expect("every level that trials PPMd names a model");
-    let (lz, first_pair) = crate::parallel::join(
-        || {
-            run(&mut |report| {
-                unpack29_encode_literals_with_options_and_progress(data, options, report)
-            })
-        },
-        || pair(first),
-    );
-    let mut best = (
-        StreamedEngine::Lz {
-            filter_search: false,
-        },
-        lz?,
-    );
+    let (screened, first_models) = crate::parallel::join(|| lz(screen), || models_of(first));
+    let screened = screened?;
+    let mut best: Option<(StreamedEngine, Vec<u8>)> = None;
     let mut consider = |size: PpmdModelSize,
-                        (escaped, literals): (Result<Vec<u8>>, Result<Vec<u8>>)|
+                        (escaped, literals): (Result<Vec<u8>>, Option<Result<Vec<u8>>>)|
      -> Result<()> {
-        for (escapes, candidate) in [
-            (Some(options.max_match_distance), escaped?),
-            (None, literals?),
-        ] {
-            if candidate.len() < best.1.len() {
-                best = (StreamedEngine::Ppmd { escapes, size }, candidate);
+        let escapes = Some(options.max_match_distance);
+        for (escapes, candidate) in [(escapes, Some(escaped)), (None, literals)] {
+            let Some(candidate) = candidate.transpose()? else {
+                continue;
+            };
+            if best
+                .as_ref()
+                .is_none_or(|(_, best)| candidate.len() < best.len())
+            {
+                best = Some((StreamedEngine::Ppmd { escapes, size }, candidate));
             }
         }
         Ok(())
     };
-    consider(first, first_pair)?;
+    consider(first, first_models)?;
     // One model at a time, so the trial holds two of them rather than all.
     for &size in larger {
-        consider(size, pair(size))?;
+        consider(size, models_of(size))?;
     }
-    Ok(best)
+    let (engine, ppmd) = best.expect("the first model was coded");
+    let lz = if exhaustive {
+        screened
+    } else if screened.len().saturating_mul(5) < ppmd.len().saturating_mul(6) {
+        drop(screened);
+        lz(options)?
+    } else {
+        return Ok((engine, ppmd));
+    };
+    Ok(if lz.len() <= ppmd.len() {
+        (
+            StreamedEngine::Lz {
+                filter_search: false,
+            },
+            lz,
+        )
+    } else {
+        (engine, ppmd)
+    })
 }
 
 /// The bytes of the largest PPMd model the writer's level tries.
@@ -2255,10 +2407,12 @@ fn streamed_engine(
     }
     let sample = engine_sample(member, len, options)?;
     // LZ is measured by the lazy parse, as the in-memory trial measures it.
+    let level = compression_method_for_level(options).saturating_sub(0x30);
     let (engine, _) = text_trial(
         &sample,
         encode_options.with_optimal_parse_passes(0),
         models,
+        text_trial_exhaustive(level),
         &|encode| encode(&mut |_| !progress.is_cancelled()).map_err(map_codec_cancel),
     )?;
     Ok(engine)
@@ -2662,15 +2816,15 @@ fn stream_member_admitted(
                     if !crate::filter_search::search_applies_throughout(segment) {
                         return Ok(Vec::new());
                     }
-                    let mut poll = |_| !progress.is_cancelled();
-                    // Only the choice is kept, so the lazy parse measures it.
-                    crate::filter_search::choose_filter(
-                        &Rar29Search::at(start, encode_options),
+                    // Only the choice is kept, so the lazy parse measures it,
+                    // a piece at a time as a member held whole is searched.
+                    rar29_piece_filters(
                         segment,
-                        encode_options.with_optimal_parse_passes(0),
-                        Some(&mut poll),
+                        start,
+                        encode_options,
+                        RAR29_FILTER_SEARCH_BYTES,
+                        &|| progress.is_cancelled(),
                     )
-                    .map(|(specs, _)| specs)
                     .map_err(|error| crate::codec::Error::Io(Box::new(error)))
                 };
             let explicit = match coding {
@@ -5460,6 +5614,100 @@ mod tests {
                 .any(|spec| matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9)),
             "the calls went unfiltered: {specs:?}"
         );
+    }
+
+    /// A relocation table: 24-byte records whose fields creep from one record
+    /// to the next, so the match finder gets nothing and delta 24 everything.
+    fn relocations(records: usize) -> Vec<u8> {
+        let mut data = Vec::with_capacity(records * 24);
+        for index in 0..records as u64 {
+            data.extend_from_slice(&(0x7f80_1234_0000 + index * 24).to_le_bytes());
+            data.extend_from_slice(&0x0102_0304_0506_0708u64.to_le_bytes());
+            data.extend_from_slice(&(0x4455_6677_0000 | ((index * 7) & 0xffff)).to_le_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn a_member_longer_than_one_search_is_searched_a_piece_at_a_time() {
+        // Four pieces of code, each ending in a table a few kilobytes long.
+        let piece = 128 * 1024;
+        let table = relocations(256);
+        let mut data = Vec::new();
+        for _ in 0..4 {
+            data.extend_from_slice(&x86_calls(piece - table.len()));
+            data.extend_from_slice(&table);
+        }
+        let options = super::rar29_encode_options_for_options(rar40()).unwrap();
+
+        let specs = super::rar29_piece_filters(&data, 0, options, piece, &|| false).unwrap();
+
+        let ranges: Vec<_> = specs
+            .iter()
+            .map(|spec| spec.range.clone().expect("every piece's filter is ranged"))
+            .collect();
+        assert!(
+            ranges.windows(2).all(|pair| pair[0].end <= pair[1].start),
+            "{specs:?}"
+        );
+        for start in (0..data.len()).step_by(piece) {
+            let within =
+                |range: &std::ops::Range<usize>| range.start >= start && range.end <= start + piece;
+            assert!(
+                specs.iter().zip(&ranges).any(|(spec, range)| {
+                    matches!(spec.kind, FilterKind::E8 | FilterKind::E8E9) && within(range)
+                }),
+                "no x86 filter in the piece at {start}: {specs:?}"
+            );
+            assert!(
+                specs.iter().zip(&ranges).any(|(spec, range)| {
+                    spec.kind == (FilterKind::Delta { channels: 24 }) && within(range)
+                }),
+                "no table in the piece at {start}: {specs:?}"
+            );
+        }
+        // And the member codes back to itself under them.
+        let packed = super::Unpack29Encoder::with_options(options)
+            .encode_member_with_filters(&data, &specs)
+            .unwrap();
+        assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
+    }
+
+    #[test]
+    fn a_long_text_member_is_screened_rather_than_coded_by_every_engine() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let text = word_text(super::PPMD_LITERAL_TRIAL_BYTES + 1);
+        let options = super::rar29_encode_options_for_options(rar40())
+            .unwrap()
+            .with_optimal_parse_passes(0);
+        let models = super::ppmd_models_for_level(3);
+        let trial = |exhaustive| {
+            let runs = AtomicUsize::new(0);
+            let (engine, packed) =
+                super::text_trial(&text, options, models, exhaustive, &|encode| {
+                    runs.fetch_add(1, Ordering::Relaxed);
+                    encode(&mut |_| true).map_err(super::map_codec_cancel)
+                })
+                .unwrap();
+            (engine, packed, runs.into_inner())
+        };
+
+        // The LZ screen and PPMd with escapes; plain PPMd and the full LZ
+        // parse are not worth coding on a member this long.
+        let (engine, screened, runs) = trial(false);
+        assert!(matches!(
+            engine,
+            super::StreamedEngine::Ppmd {
+                escapes: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(runs, 2);
+        // Coding every candidate finds the same winner.
+        let (_, every, runs) = trial(true);
+        assert_eq!(runs, 3);
+        assert_eq!(screened, every);
     }
 
     /// A script that carries its own machine code: 16 KiB of text, then x86
