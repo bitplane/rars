@@ -589,6 +589,43 @@ pub(super) fn run_size(plan: &CompressPlan) -> usize {
         .max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE)
 }
 
+/// The longest run an independent member is cut into: 4 MiB.
+///
+/// A run is a dictionary long up to this, as at levels 1 to 3. A larger
+/// dictionary is cut into runs of this length instead, so a 32 MiB member at
+/// level 5's 16 MiB dictionary is eight runs rather than two, and eight
+/// threads code it (#546). A run that starts a job seeds a tree from the
+/// dictionary before it, a descent per byte, so a job of one short run costs
+/// more CPU than one of a whole dictionary. [`runs_per_job`] joins the runs
+/// back up a dictionary at a time where threads or memory are short, and a
+/// job that joins runs parses straight on, so the archive does not depend on
+/// it. It is the length of one filter search, which the runs are already
+/// searched in pieces of, and a test that lowers one lowers the other.
+fn longest_member_run() -> usize {
+    super::plan::filter_search_bytes()
+}
+
+/// How long the runs of an independent member are: [`run_size`], or
+/// [`longest_member_run`] where the dictionary is longer and the parse is
+/// the shortest-path one. The lazy parse keeps a dictionary a run, so its
+/// runs cut a member where the whole-member path does
+/// (`super::plan::codes_alike_in_runs`).
+pub(super) fn member_run_size(plan: &CompressPlan) -> usize {
+    if !plan.encode_options.optimal_parse {
+        return run_size(plan);
+    }
+    run_size(plan).min(longest_member_run().max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE))
+}
+
+/// Whether the rest of a member, `unread` bytes, goes into the run being read
+/// rather than a run of its own: where runs are shorter than the dictionary
+/// and that run would walk chains (see [`next_run_searches_tree`]). Joined to
+/// the run before it, the tail is parsed on the tree that run has built, at
+/// no cost in seeding.
+fn absorbs_tail(plan: &CompressPlan, unread: u64) -> bool {
+    member_run_size(plan) < run_size(plan) && !next_run_searches_tree(plan, unread)
+}
+
 /// How many of a member's runs one block job codes back to back.
 ///
 /// A run that follows another in its member seeds a tree from the
@@ -603,6 +640,12 @@ pub(super) fn run_size(plan: &CompressPlan) -> usize {
 /// few jobs as the budget allows, and a machine with more threads than runs
 /// codes every run on its own, as before. A run that walks chains, which only
 /// a member's short last run does, still starts a job of its own.
+///
+/// Where runs are shorter than the dictionary ([`member_run_size`]), threads
+/// count only as far as the budget holds a job for each, and a job of more
+/// than a dictionary holds whole dictionaries of runs: every job seeds a
+/// dictionary of history, so one thread codes the member a dictionary a job,
+/// as it did when that was one run.
 fn runs_per_job(
     plan: &CompressPlan,
     largest: u64,
@@ -613,14 +656,29 @@ fn runs_per_job(
     if !plan.encode_options.optimal_parse {
         return 1;
     }
-    let run = run_size(plan) as u64;
-    let runs = largest.div_ceil(run).max(1);
-    let threads = threads.max(1) as u64;
+    let run = member_run_size(plan) as u64;
+    let dictionary = (run_size(plan) as u64 / run).max(1);
+    // A short tail joins the run before it, so it is not a run of its own.
+    let runs = if dictionary > 1 {
+        largest / run
+    } else {
+        largest.div_ceil(run)
+    }
+    .max(1);
+    let mut threads = threads.max(1) as u64;
+    if dictionary > 1 {
+        threads = threads
+            .min(memory_limit / joined_admission(plan, admission, 1, memory_limit))
+            .max(1);
+    }
     // A window this long is what the finders are known to hold.
     let longest = (SHARED_WINDOW_LIMIT as u64 / run).max(1);
     for waves in 1u64.. {
         let jobs = threads.saturating_mul(waves);
-        let joined = runs.div_ceil(jobs);
+        let mut joined = runs.div_ceil(jobs);
+        if joined > dictionary {
+            joined -= joined % dictionary;
+        }
         if joined <= 1 {
             return 1;
         }
@@ -628,7 +686,8 @@ fn runs_per_job(
             continue;
         }
         let concurrent = threads.min(runs.div_ceil(joined));
-        if memory_limit / joined_admission(plan, admission, joined as usize) >= concurrent {
+        let admitted = joined_admission(plan, admission, joined as usize, memory_limit);
+        if memory_limit / admitted >= concurrent {
             return usize::try_from(joined).unwrap_or(1);
         }
     }
@@ -638,8 +697,17 @@ fn runs_per_job(
 /// What a job of `joined` runs is admitted for, beside `admission` for one:
 /// each further run is held by the coordinator while it is read and its
 /// filters are searched, and then by the job's window.
-fn joined_admission(plan: &CompressPlan, admission: u64, joined: usize) -> u64 {
-    let further = (joined.saturating_sub(1) as u64).saturating_mul(run_size(plan) as u64);
+///
+/// A job no longer than a dictionary is admitted as one run of a dictionary
+/// was before runs were cut shorter than it, which is what it holds: each
+/// further run once, and the whole budget when it needs more, one job at a
+/// time.
+fn joined_admission(plan: &CompressPlan, admission: u64, joined: usize, memory_limit: u64) -> u64 {
+    let run = member_run_size(plan) as u64;
+    let further = (joined.saturating_sub(1) as u64).saturating_mul(run);
+    if (joined as u64).saturating_mul(run) <= run_size(plan) as u64 {
+        return admission.saturating_add(further).min(memory_limit).max(1);
+    }
     admission.saturating_add(further.saturating_mul(2)).max(1)
 }
 
@@ -650,7 +718,9 @@ fn joined_admission(plan: &CompressPlan, admission: u64, joined: usize) -> u64 {
 fn next_run_searches_tree(plan: &CompressPlan, unread: u64) -> bool {
     let options = plan.encode_options;
     let dictionary = options.max_match_distance;
-    let run = usize::try_from(unread).map_or(run_size(plan), |unread| unread.min(run_size(plan)));
+    let run = usize::try_from(unread).map_or(member_run_size(plan), |unread| {
+        unread.min(member_run_size(plan))
+    });
     options.optimal_parse
         && crate::codec::rar50::searches_tree(dictionary.saturating_add(run), dictionary, options)
 }
@@ -1312,12 +1382,16 @@ fn compress_streaming_members(
         required
     } else {
         // Admission can be above the planning charge, as at level 5. When it
-        // is above the whole budget, one job at a time takes all of it.
-        admission.min(resources.memory_limit())
+        // is above the whole budget, one job at a time takes all of it: see
+        // `joined_admission`.
+        admission
     };
-    // A budget with its own ledger admits each job for one run's window.
-    let runs_per_job = if resources.execution.is_some() || plan.solid {
+    // A budget with its own ledger admits each job for one dictionary's
+    // window, which is one run unless runs are cut shorter.
+    let runs_per_job = if plan.solid {
         1
+    } else if resources.execution.is_some() {
+        run_size(plan) / member_run_size(plan)
     } else {
         runs_per_job(
             plan,
@@ -1327,10 +1401,10 @@ fn compress_streaming_members(
             crate::parallel::threads(),
         )
     };
-    let required = if runs_per_job > 1 {
-        joined_admission(plan, required, runs_per_job)
-    } else {
+    let required = if resources.execution.is_some() {
         required
+    } else {
+        joined_admission(plan, required, runs_per_job, resources.memory_limit())
     };
     let batch_capacity = usize::try_from(resources.memory_limit() / required)
         .unwrap_or(usize::MAX)
@@ -1894,7 +1968,10 @@ where
                 };
                 let mut run_start = 0;
                 loop {
-                    while stream.has_more() && job.data.len() - run_start < run_size(plan) {
+                    while stream.has_more()
+                        && (job.data.len() - run_start < member_run_size(plan)
+                            || absorbs_tail(plan, stream.unread()))
+                    {
                         job.append(
                             read_block(stream, plan.block_size, advance)
                                 .map_err(|error| error_context(stream.member, error))?,
@@ -1932,8 +2009,18 @@ where
                         explicit_run_filter(job, spec)?;
                     }
                 } else {
-                    let concurrent = jobs.len();
-                    choose_run_filters(&mut jobs, concurrent, plan, required, resources, advance)?;
+                    // The wave reserved workspace for `wave_capacity` jobs
+                    // whether or not it filled that many, so that many
+                    // searches fit at once. A member of two runs has eight
+                    // pieces to search at level 5.
+                    choose_run_filters(
+                        &mut jobs,
+                        wave_capacity,
+                        plan,
+                        required,
+                        resources,
+                        advance,
+                    )?;
                 }
                 for job in jobs.iter_mut() {
                     let (member, _, _) = job.blocks[0];
@@ -5115,6 +5202,110 @@ mod tests {
         data
     }
 
+    /// Runs shorter than the dictionary, as level 5's are, are joined a
+    /// dictionary at a time when one thread or the budget allows one job,
+    /// and coded each on its own when there are threads for all of them.
+    #[test]
+    fn short_runs_are_joined_a_dictionary_at_a_time() {
+        const MIB: u64 = 1024 * 1024;
+        let options = EncodeOptions::new(512)
+            .with_max_match_distance(16 * MIB as usize)
+            .with_optimal_parse(true);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 16 * MIB,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::Auto,
+            candidates: vec![options].into(),
+            blake2sp: true,
+        };
+        assert_eq!(member_run_size(&plan), 4 * MIB as usize);
+        let budget = |threads: u64| 256 * MIB + 160 * MIB * (threads - 1);
+        let joined = |threads: usize| {
+            runs_per_job(&plan, 33 * MIB, 283 * MIB, budget(threads as u64), threads)
+        };
+        // One job of a dictionary fits one thread's budget as one run of it
+        // did. Two threads' budget holds no second job, but holds one job of
+        // the whole member, which seeds nothing.
+        assert_eq!(joined(1), 4);
+        assert_eq!(joined(2), 8);
+        assert_eq!(joined(4), 4);
+        assert_eq!(joined(8), 2);
+        assert_eq!(joined(22), 1);
+        assert_eq!(
+            joined_admission(&plan, 283 * MIB, 4, budget(1)),
+            256 * MIB,
+            "a dictionary a job takes the whole budget"
+        );
+        // The lazy parse keeps a dictionary a run.
+        let lazy = plan.encode_options.with_optimal_parse(false);
+        let lazy = CompressPlan {
+            encode_options: lazy,
+            candidates: vec![lazy].into(),
+            ..plan
+        };
+        assert_eq!(member_run_size(&lazy), 16 * MIB as usize);
+    }
+
+    /// Runs shorter than the dictionary code the same member at 1, 2 and 8
+    /// threads, which join them four, two and one to a job, and the short
+    /// tail joins the run before it (#546).
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn runs_shorter_than_the_dictionary_code_alike_on_any_thread_count() {
+        const MIB: usize = 1024 * 1024;
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(2 * MIB)
+            .with_optimal_parse(true);
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 2 * MIB as u64,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+            blake2sp: true,
+        };
+        let data = joined_runs_input(MIB);
+        let sources = [EntrySource::from_bytes(data.clone())];
+        let scratch = crate::scratch::case("short-runs-threads");
+        let code = |threads: usize| -> Vec<u8> {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    super::super::plan::with_filter_search_bytes(MIB, || {
+                        assert_eq!(member_run_size(&plan), MIB);
+                        let resources = WriterResources::default().with_temp_dir(&*scratch);
+                        let mut members =
+                            compress_members_reporting(&sources, plan.clone(), &resources, &|_| {
+                                true
+                            })
+                            .unwrap();
+                        let mut packed = Vec::new();
+                        members[0].packed.copy_to(&mut packed).unwrap();
+                        assert_eq!(resources.workspace_in_use(), 0);
+                        packed
+                    })
+                })
+        };
+        let one = code(1);
+        for threads in [2, 8] {
+            assert!(code(threads) == one, "{threads} threads changed the member");
+        }
+        let decoded = crate::codec::rar50::decode_lz(&one, 0, data.len()).unwrap();
+        assert!(decoded == data, "the member does not round-trip");
+    }
+
     /// A job of several runs parses straight through where each run of its
     /// own seeds a tree from the history before it. The bytes are the same
     /// either way, with the runs' filters searched, given, or not looked
@@ -5227,7 +5418,8 @@ mod tests {
             for size in [4, 8, 12, 20, 64, 1024] {
                 let runs = joined(size * MIB, threads);
                 let jobs = (size / 4).div_ceil(runs as u64).min(threads as u64);
-                let admitted = budget(threads as u64) / joined_admission(&plan, 159 * MIB, runs);
+                let budget = budget(threads as u64);
+                let admitted = budget / joined_admission(&plan, 159 * MIB, runs, budget);
                 assert!(admitted >= jobs, "{size} MiB at {threads} threads");
             }
         }
