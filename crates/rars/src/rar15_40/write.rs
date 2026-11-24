@@ -1559,13 +1559,14 @@ fn encode_rar29_auto_filtered_member_with_progress(
     // and returns the winner's bytes, so encoding the member plainly here as
     // well was a second full pass over every binary member on the default
     // settings. Text goes nowhere near the search, so it still needs one.
-    let text = is_text_ppmd_candidate(data);
-    if include_ppmd && text {
+    let text = text_score(data);
+    if include_ppmd && text.reads_as_text() {
         return encode_rar29_text_member(data, options, lz_method, progress);
     }
     let effort = SearchEffort::for_method(lz_method);
-    let searching =
-        !text && crate::filter_search::search_applies_throughout(data) && !effort.skips(data);
+    let searching = !text.declines_filter_search()
+        && crate::filter_search::search_applies_throughout(data)
+        && !effort.skips(data);
     let best = EncodedPayload {
         data: if searching && data.len() > RAR29_FILTER_SEARCH_BYTES {
             // Too long to search whole: searched a piece at a time, then coded
@@ -1871,26 +1872,66 @@ fn ppmd_models_for_level(level: u8) -> &'static [PpmdModelSize] {
 }
 
 fn is_text_ppmd_candidate(data: &[u8]) -> bool {
-    windows_read_as_text(text_sample_offsets(data.len()).map(|start| {
+    text_score(data).reads_as_text()
+}
+
+/// What the text screen reads in a member's sampled windows.
+fn text_score(data: &[u8]) -> TextScore {
+    score_text_windows(text_sample_offsets(data.len()).map(|start| {
         let end = start.saturating_add(RAR29_TEXT_SAMPLE_SIZE).min(data.len());
         &data[start..end]
     }))
 }
 
-fn windows_read_as_text<'a>(windows: impl IntoIterator<Item = &'a [u8]>) -> bool {
-    let mut printable = 0usize;
-    let mut nul = 0usize;
-    let mut total = 0usize;
-    for window in windows {
-        let (window_printable, window_nul, window_total) = score_text_window(window);
-        printable += window_printable;
-        nul += window_nul;
-        total += window_total;
-    }
-    total != 0 && nul * 100 <= total && printable * 100 >= total * 85
+/// The text screen's counts over a member's sampled windows. `total` leaves
+/// out the runs of NUL it reads as padding, which `padding` counts instead.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TextScore {
+    printable: usize,
+    nul: usize,
+    total: usize,
+    padding: usize,
 }
 
-/// Counts one sampled window as printable, NUL and total bytes.
+impl TextScore {
+    fn reads_as_text(self) -> bool {
+        self.total != 0 && self.nul * 100 <= self.total && self.printable * 100 >= self.total * 85
+    }
+
+    /// Whether a member is text the filter search should leave alone.
+    ///
+    /// Padding is left out of the text screen because it says nothing about
+    /// whether PPMd or LZ suits what is around it. It does say something about
+    /// filters: the search's own screen counts it against text, and a member
+    /// that is a quarter padding or more is laid out in records, not written.
+    /// The bench's 4 MiB of one phrase between 4 KiB runs of NUL is half
+    /// padding. It read as text, so at levels 1 and 2, which trial no PPMd, it
+    /// went unsearched and came out 7,063 and 6,953 bytes. Delta over it takes
+    /// that to 4,589 and 4,580, under WinRAR 3.x's 5,255 and 4,924.
+    ///
+    /// Text that pads less is still left alone, though the search's screen
+    /// sees more of a member and can disagree. Searched, the 32 MiB tar of
+    /// text the release bench uses, which carries some binaries the three
+    /// windows miss, came out 3.5% smaller at levels 1 and 2, for 77% and 30%
+    /// more time.
+    fn declines_filter_search(self) -> bool {
+        self.reads_as_text() && self.padding * 4 < self.total + self.padding
+    }
+}
+
+fn score_text_windows<'a>(windows: impl IntoIterator<Item = &'a [u8]>) -> TextScore {
+    windows
+        .into_iter()
+        .map(score_text_window)
+        .fold(TextScore::default(), |sum, window| TextScore {
+            printable: sum.printable + window.printable,
+            nul: sum.nul + window.nul,
+            total: sum.total + window.total,
+            padding: sum.padding + window.padding,
+        })
+}
+
+/// Counts one sampled window as printable, NUL, total and padding bytes.
 ///
 /// Counting only ASCII read every non-English member as binary. The bench's
 /// text member is a set of translated man pages, 23% of it well-formed
@@ -1899,10 +1940,11 @@ fn windows_read_as_text<'a>(windows: impl IntoIterator<Item = &'a [u8]>) -> bool
 /// no precision either, because random binary almost never forms one: a lead
 /// byte followed by a continuation byte is about 3% of positions, nowhere near
 /// enough to carry a binary member over the bar.
-fn score_text_window(window: &[u8]) -> (usize, usize, usize) {
+fn score_text_window(window: &[u8]) -> TextScore {
     let mut printable = 0usize;
     let mut nul = 0usize;
     let mut total = 0usize;
+    let mut padding = 0usize;
     let mut index = 0usize;
     while index < window.len() {
         let byte = window[index];
@@ -1923,6 +1965,8 @@ fn score_text_window(window: &[u8]) -> (usize, usize, usize) {
             if run < RAR29_NUL_RUN_IS_PADDING {
                 nul += run;
                 total += run;
+            } else {
+                padding += run;
             }
         } else if byte.is_ascii_graphic() || matches!(byte, b'\n' | b'\r' | b'\t' | b' ') {
             printable += 1;
@@ -1941,7 +1985,12 @@ fn score_text_window(window: &[u8]) -> (usize, usize, usize) {
             index += 1;
         }
     }
-    (printable, nul, total)
+    TextScore {
+        printable,
+        nul,
+        total,
+        padding,
+    }
 }
 
 /// How many bytes the sequence starting with this byte claims, if it can start
@@ -2526,13 +2575,13 @@ fn streamed_engine(
         });
     }
     let text = sampled_text(&member.bytes, len as u64)?;
-    if !(text && trials_engines(options)) {
+    if !(text.reads_as_text() && trials_engines(options)) {
         let policy_searches = match coding {
             MemberCoding::Filtered(policy) => matches!(policy, FilterPolicy::Auto),
             _ => true,
         };
         return Ok(StreamedEngine::Lz {
-            filter_search: policy_searches && !text,
+            filter_search: policy_searches && !text.declines_filter_search(),
         });
     }
     let sample = engine_sample(member, len, options)?;
@@ -2578,8 +2627,8 @@ fn engine_sample_len(options: WriterOptions) -> usize {
         .saturating_mul(4)
 }
 
-/// [`is_text_ppmd_candidate`] on the same windows, read without loading the member.
-fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<bool> {
+/// [`text_score`] on the same windows, read without loading the member.
+fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<TextScore> {
     let len = usize::try_from(len)
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
     let mut reader = bytes.open()?;
@@ -2596,7 +2645,7 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<bool> {
         }
         windows.push(window);
     }
-    Ok(windows_read_as_text(windows.iter().map(Vec::as_slice)))
+    Ok(score_text_windows(windows.iter().map(Vec::as_slice)))
 }
 
 /// A filter search holds a filtered segment and a candidate; a PPMd trial holds the sample and two models.
@@ -8500,6 +8549,49 @@ mod tests {
             "sample must be multibyte enough to have failed the ASCII-only test"
         );
         assert!(super::is_text_ppmd_candidate(&data));
+    }
+
+    /// Half padding reads as text, since padding is left out of the count, but
+    /// at levels 1 and 2 it still gets the filter search, where delta wins.
+    #[test]
+    fn padded_text_is_searched_for_filters_at_level_one() {
+        let block = [
+            vec![0u8; 4096],
+            b"the quick brown fox jumps over the lazy dog. ".repeat(91),
+        ]
+        .concat();
+        let data: Vec<u8> = block.iter().copied().cycle().take(1 << 20).collect();
+        let score = super::text_score(&data);
+        assert!(score.reads_as_text());
+        assert!(!score.declines_filter_search());
+
+        let options = super::rar29_encode_options_for_level(Some(1)).unwrap();
+        let searched = encode_rar29_auto_filtered_member(&data, options, 0x31, false).unwrap();
+        let plain = super::encode_rar29_lz_member(&data, options, 0x31, None).unwrap();
+        assert!(
+            searched.data.len() < plain.data.len(),
+            "searched {} bytes, plain {}",
+            searched.data.len(),
+            plain.data.len()
+        );
+    }
+
+    /// A tar of text pads every file, and that much padding still leaves it
+    /// text the filter search stays out of.
+    #[test]
+    fn a_tar_of_text_still_declines_the_filter_search() {
+        let mut data = Vec::new();
+        for file in 0..64 {
+            let mut header = format!("docs/page-{file}.txt").into_bytes();
+            header.resize(512, 0);
+            data.extend_from_slice(&header);
+            data.extend_from_slice(&prose_like_text(3000 + file * 7));
+            data.resize(data.len().div_ceil(512) * 512, 0);
+        }
+        let score = super::text_score(&data);
+        assert!(score.padding > 0);
+        assert!(score.reads_as_text());
+        assert!(score.declines_filter_search());
     }
 
     /// Accepting multibyte sequences must not accept binary that happens to
