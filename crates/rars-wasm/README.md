@@ -6,6 +6,8 @@ Read, write and repair RAR archives in browsers and Node.
 npm install @bitplane/rars
 ```
 
+Every option is documented in the package's TypeScript declarations.
+
 ## Read
 
 ```js
@@ -19,97 +21,11 @@ for (const entry of archive.entries) {
 
 const bytes = await archive.get("docs/readme.txt").bytes();
 await archive.test();
-archive.close(); // optional; releases retained input eagerly
 ```
 
-`open()` accepts a `Blob`, `ArrayBuffer` or typed array. Pass an ordered array
-to open a volume set. Entry objects use archive-order indices internally, so
-duplicate names and non-UTF-8 names remain unambiguous; `nameBytes` contains
-the exact header bytes.
-
-`get(name)` selects the last matching entry; `getAll(name)` returns every match
-in archive order, and `has(name)` says whether there is one. Each returned entry
-reads its own payload by index. In a volume set, `entry.volumeIndex` is the
-volume the entry starts in, counting the first as 0. The archive says where it
-sits in its set: `isVolume`, `volumeIndex` (from 0), `isFirstVolume` and
-`volumeNaming` (`"part"` or `"old"`), the last three read from the headers.
-Pass `salvage: true` to `open()` to read what survives of a damaged archive.
-`archive.truncation` says where the file ends early, `headerDamage` lists the
-damaged headers salvage read past, and `incompleteMembers` the split members it
-left out of a volume set.
-`entry.bytes()`, `readMany()`, `test()` and `extractAll()` take `onMemberError`,
-called with each member that fails instead of failing the call.
-`entry.readComment()` returns the comment attached to an entry, or undefined.
-`entry.isLink` says whether it is a link, and `entry.readLink()` returns its raw
-target from the headers without following it.
-
-Node also accepts paths and file URLs. Opening the first volume of a set by path
-finds the later volumes beside it, by the names RAR gives them, and stops at the
-first that isn't there; `archive.volumePaths` lists the files it opened.
-
-For legacy byte names, pass `legacyNameEncoding: "cp850"` to `open()`.
-Supported encodings are `cp437`, `cp850`, `cp852`, `cp866`, `windows-1251`,
-`windows-1252` and `utf-8` (`cp1251`, `cp1252` and `utf8` are aliases).
-Names are case insensitive. Unicode names take precedence; unspecified legacy
-encodings are never guessed. Invalid or undefined input fails conversion.
-`entry.name` is the selected view and `entry.nameBytes` retains its original
-identity. Reopen to select another encoding. `get()` refuses ambiguous decoded
-names with `AMBIGUOUS_ENTRY`; use `getAll()` or archive-order entry indices.
-This setting does not affect comments, passwords, payloads or writer names.
-
-`open()`, `entry.bytes()`, `readMany()`, `test()` and `readComment()` accept `ReadOptions`:
-
-```js
-const limits = { maxHeaderCount: 10000, maxMemberOutputBytes: 256 * 1024 * 1024 };
-const archive = await RarArchive.open(file, limits);
-const bytes = await archive.entries[0].bytes(limits);
-const selected = await archive.readMany([archive.entries[1], archive.entries[0]], limits);
-const comment = await archive.readComment(limits); // undefined if absent
-```
-
-The optional fields are `maxHeaderCount`, `maxHeaderBytes`,
-`maxMemberOutputBytes`, `maxTotalOutputBytes`, `maxReaderWorkspaceBytes`, `maxRar50DictionaryBytes` and
-`maxRar50BufferedMemberBytes`. Values must be nonnegative safe integer numbers or
-`bigint` values through `2n ** 64n - 1n`. Zero is a real limit. Omission retains
-the library default. Options given to `open()` are the defaults for every later call
-on that archive, and a call's own fields override them one by one.
-Each operation reparses its input; header limits apply per archive/volume.
-`readMany()` accepts an iterable of entries or names and performs one parse and
-decoder traversal for the batch. Results retain request order and duplicates;
-prefer entry objects for duplicate identity and direct index selection. Entries
-from another archive are rejected. Solid predecessors are decoded once, and
-output limits apply to the whole batch. Repeated results have independent byte
-buffers but do not consume logical decode quota again. Failures return no partial
-list. Directories are rejected; RAR5 redirections have no readable file payload.
-The cached `archive.comment` is decoded under the options passed to `open()`;
-`readComment()` decodes it again with fresh options and an optional password.
-
-`allowRar3VmPrograms: true` lets RAR 2.9-4.x members run filter programs other
-than the six standard ones (E8, E8E9, Itanium, Delta, RGB and Audio). It is off
-by default because such programs are arbitrary bytecode from the archive and can
-use a lot of CPU time; a member that needs one fails with `UNSUPPORTED_FEATURE`.
-Current WinRAR does not run them either. Enable it only for archives you trust.
-
-Output limits count decoded bytes, including solid-prefix output that is
-discarded. Reading one entry of a volume set decodes the whole set, so the
-total-output limit covers other members too. Unknown-size RAR 5 members are
-refused under a member-output limit.
-
-`maxReaderWorkspaceBytes` caps the reader's own allocations per call,
-including decoder state and queued parallel payloads, but not the input,
-returned bytes or JavaScript objects. None of these limits is a process memory
-ceiling.
-
-`isRarFile(input)` says whether the input starts with a RAR signature, and
-`isRarFileSfx(input)` whether an archive starts in it, behind a self-extractor
-stub or not. Only the bytes those need are read, and a path that can't be read
-is not RAR.
-
-`checkPassword(input, candidates)` tries passwords in order against one volume and
-stops at the first proved correct. It returns `{ correct, undetermined,
-needsPassword, archive }`: `undetermined` holds candidates a RAR 4 archive can't
-prove without decoding data, and `archive` is opened with the correct one, or
-without a password when the headers aren't encrypted.
+`open()` accepts a `Blob`, `ArrayBuffer` or typed array, or an ordered array of
+them for a volume set. Node also accepts paths and file URLs, and finds a set's
+later volumes beside the first.
 
 ## Write
 
@@ -127,105 +43,19 @@ const split = new RarWriter({ volumeSize: 5 * 1024 * 1024 }).add("big.bin", payl
 const parts = await split.volumes();
 ```
 
-`add()` takes `mode`, `mtime` and a `comment` for the member, and for RAR 5
-`atime` and `birthtime`. `addDirectory(name)` queues an explicit directory and
-`addSymlink(name, target)` a Unix symbolic link, stored as given. `level` runs
-from 0 (stored) to 5. Other writer options are `solid`, `password`,
-`encryptHeaders`, `blake2sp`, `comment`, `recoveryPercent` and `volumeSize`. With
-`volumeSize` set, `volumes()` returns the parts and `bytes()` refuses. Node
-additionally provides `addFile()` and `writeTo(path)`, which writes the archive,
-or every part of a set, and returns the paths written. It refuses an existing
-file unless given `{ overwrite: true }`; a set checks every
-part before writing any.
-For legacy formats, `writeTo()` keeps the first path of a set and names later
-volumes `.r00` through `.r99`, then `.s00` on up to `.z99` as RAR 4 does, in the
-same directory. Sets exceeding 901 volumes or containing overlapping output
-paths are rejected before any file is written.
-
-`RarWriter.fromArchive(archive)` starts a writer holding every member of an
-open archive, or of its whole volume set, with names, times, attributes,
-comments and links carried over, to edit with `add()`, `remove()` and
-`rename()` and write again:
+To edit an existing archive:
 
 ```js
 const writer = await RarWriter.fromArchive(await RarArchive.open("old.rar"));
 const bytes = await writer.remove("draft.txt").add("final.txt", text).bytes();
 ```
 
-By default it keeps the source's format, settings and encryption, and refuses
-an archive whose settings it can't keep; `{ preserve: false }` writes RAR 5 at
-level 3 instead. Members' data is decoded and verified, in memory, when the
-archive is written, so the source must still be readable then;
-`maxStagedBytes` caps how much is held at once.
-
-Long operations accept an `AbortSignal` and a progress callback, called with the
-phase (`reading`, `testing`, `compressing`, `protecting`, `writing` or
-`repairing`) and bytes `completed` of `total`, which is absent until known.
-Writing, testing and reading from one archive report as the engine goes; reading
-selected entries of a volume set, and repairing, report only start and end:
-
-```js
-const bytes = await writer.bytes({
-  signal: controller.signal,
-  onProgress: ({ phase, completed, total }) => {
-    console.log(phase, completed, total);
-  },
-});
-```
-
-Errors are `RarError` instances with a stable `code`; client `AbortSignal`
-cancellation uses the standard `AbortError`. Core errors carry their code through
-WASM and the worker without parsing message text. `details.contexts` retains
-entry names as raw byte arrays, operations, archive offsets and volume indices,
-counting the first volume as 0.
-Resource-limit details use decimal strings for byte counts, preserving values
-beyond JavaScript’s exact integer range. Node filesystem errors use `IO` with
-the original system code, errno and syscall in `details`.
-
-Aborting queued work rejects it at once. Aborting running work terminates its
-worker, and the next operation starts a fresh one. Rust cleanup doesn't run, so
-an interrupted Node write may leave staged temporary files behind.
-
-`RarWriter` accepts `maxMemoryBytes` (a safe integer or `bigint`) to cap the
-RAR 5/7 writer's managed allocations, including spools, output and the final
-copy to JavaScript. The default is unlimited. Going over fails with
-`RESOURCE_LIMIT`; other formats refuse the option with `INVALID_OPTION`. It
-doesn't cover your inputs, runtime overhead, reading or rewrite staging.
-
 ## Extract (Node)
 
 ```js
 const written = await archive.extractAll("out", { overwrite: "rename" });
 const one = await archive.get("docs/readme.txt").extract("out");
-const damaged = await RarArchive.open("damaged.rar", { salvage: true });
-await damaged.extractAll("out", { onMemberError: (error) => console.log(error.member, error.code), keepBroken: true });
 ```
-
-`extractAll()` decodes in one pass and writes each file only once it has been
-verified, under paths the core checks stay inside the directory. An existing
-file is refused unless `overwrite` is `true`, or kept with the new one written
-beside it as `name(N).ext` under `"rename"`. `members` selects entries,
-`flatten: true` drops stored directories, `restoreTimes` (on by default)
-sets modification times, and `keepBroken: true`, with `salvage` and
-`onMemberError`, keeps each failed member's file. Symbolic links, hard links
-and file copies are written too, under the same overwrite rules. A symbolic link that could lead outside the
-directory, directly or through a link already there, is skipped with an
-`UnsafeLinkWarning` process warning. It returns the files and links written.
-
-In Node, `test()` and `extractAll()` also take `volumes`, an iterable or async
-iterable of a set's later parts, paths or bytes, to read a set while it is still
-arriving, as Python's `volumes=`. The archive is opened with its first volume
-alone, and each later part is pulled only when extraction reaches it:
-
-```js
-const archive = await RarArchive.open(firstPart);
-await archive.extractAll("out", { volumes: downloads() }); // an async generator
-```
-
-A part the iterator never yields fails with `MISSING_VOLUME`, and a part out of
-order with `VOLUME_ORDER`, both naming the volume in the error's `volume`
-context. An error the iterator throws is raised as it was. Browsers take every
-volume up front instead.
 
 ## Repair
 
@@ -233,17 +63,12 @@ volume up front instead.
 import { repair } from "@bitplane/rars";
 
 const { data, report } = await repair(damaged, { password: "optional" });
-console.log(report.dataRepaired, report.recoveryRecordRebuilt);
 ```
-
-`repair()` rebuilds a RAR 5 archive from its recovery record. In Node,
-`{ output: path }` writes the result there instead and leaves `data` undefined;
-an existing file is refused unless `overwrite: true`.
 
 ## Loading
 
-ES modules, Node `require`, Vite, webpack, Rollup and direct browser imports use
-the same API and require no explicit Wasm initialisation:
+ES modules, Node `require`, bundlers and direct browser imports use the same
+API, with no explicit Wasm initialisation:
 
 ```html
 <script type="module">
@@ -251,11 +76,9 @@ the same API and require no explicit Wasm initialisation:
 </script>
 ```
 
-Direct cross-origin imports use a small blob worker bootstrap. A restrictive
-Content Security Policy must therefore allow `blob:` in `worker-src`, or the
-package assets should be bundled or served from the page's origin.
-
-Input and output are whole byte arrays; there is no streaming API yet.
+Direct cross-origin imports start a blob worker, so a Content Security Policy
+must allow `blob:` in `worker-src`, or the package should be bundled or served
+from the page's origin.
 
 The same library is available as a [Rust crate][crate], [Python package][pypi]
 and [command-line tool][repo].
@@ -266,10 +89,6 @@ and [command-line tool][repo].
 `node scripts/test-npm-package.js` builds and tests quickly (no LTO or
 `wasm-opt`); drop `--debug` for release artifacts. Both need a `wasm-bindgen`
 CLI matching `Cargo.lock`.
-
-`python3 scripts/coverage-wasm.py` measures Rust coverage under Node. It
-also needs nightly Rust on LLVM 23 with `wasm32-unknown-unknown` and
-`llvm-tools-preview`, and writes to `target/coverage-wasm-focused`.
 
 [crate]: https://crates.io/crates/rars
 [pypi]: https://pypi.org/project/rars/

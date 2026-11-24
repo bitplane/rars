@@ -43,41 +43,26 @@ Pinned by `writer_limits_table_matches_what_each_format_supports`.
 
 ## Memory
 
-Peak resident memory writing 1 GiB (512 MiB of random bytes, then 512 MiB of
-text) at `--level 3`, on a 32-thread machine. Single archives ran under
-`--memory-limit 256m`. Legacy volume sets refuse that flag, so they ran
-without it. The solid column is two 512 MiB members.
-
-| format | stored | compressed, to a file | compressed, to a pipe | solid | password | encrypted headers | volumes, stored / compressed | recovery |
-|---|---|---|---|---|---|---|---|---|
-| `rar14` | 7 MB | 10 MB | 10 MB | 10 MB | 10 MB | refused | 5 MB / 9 MB | refused |
-| `rar15` | 6 MB | 10 MB | 10 MB | 10 MB | 11 MB | refused | 6 MB / 10 MB | refused |
-| `rar20` | 6 MB | 27 MB | 28 MB | 25 MB | 31 MB | refused | 6 MB / 28 MB | refused |
-| `rar40` | 6 MB | 144 MB | 145 MB | 181 MB | 146 MB | 145 MB | 6 MB / 193 MB | refused |
-| `rar50` | 6 MB | 219 MB | 221 MB | 222 MB | 214 MB | 222 MB | 221 MB | 220 MB |
-| `rar70` | 6 MB | 222 MB | not run | 223 MB | 221 MB | 222 MB | 219 MB | 225 MB |
-
 What each writer holds, what bounds it, and the tests that pin it:
 
 | format and path | holds | bounded by | tests |
 |---|---|---|---|
-| any format, stored | a copy buffer; the source is read twice, for the CRC and then the copy | constant | `a_stored_member_is_copied_through_not_loaded_in_every_format`, `a_stored_volume_set_is_copied_through_in_every_legacy_format`, `stored_split_member_reads_its_source_at_most_twice` |
+| any format, stored | a copy buffer | constant | `a_stored_member_is_copied_through_not_loaded_in_every_format`, `a_stored_volume_set_is_copied_through_in_every_legacy_format`, `stored_split_member_reads_its_source_at_most_twice` |
 | `rar14` compressed | one 64 KiB window, the next 1 MiB and a match index over the window; a member over 64 MiB is packed into a spool in the temp directory, verified by decoding the spool against the source, then copied out | the window, plus disk | `a_spooled_member_writes_the_archive_the_in_memory_writer_does`, `a_spooled_member_is_encrypted_as_it_is_copied_out`, `a_member_coded_a_window_at_a_time_packs_as_it_does_whole` |
 | `rar15` compressed | one 64 KiB window, the next 1 MiB and a match index over the window | the window, whatever the member's size | `rar15_charges_an_index_whatever_the_member_size`, `a_streamed_rar15_member_writes_the_archive_the_in_memory_writer_does`, `solid_rar15_members_stream_on_the_chain_and_are_never_stored`, `a_member_coded_a_window_at_a_time_packs_as_it_does_whole` |
 | `rar20` compressed | one 1 MiB block and its tables | the block, whatever the member's size | `rar20_charges_a_block_whatever_the_member_size`, `a_streamed_rar20_member_writes_the_archive_the_in_memory_writer_does`, `solid_rar20_members_stream_on_the_chain_and_leave_it_for_the_next` |
-| `rar40` compressed | the LZ window or PPMd model; levels 4 and 5 try larger models, up to 128 MB (338 MB peak for 120 MB of text at level 5, 149 MB at level 3) | dictionary and level | `a_streamed_member_is_charged_what_it_holds_not_its_size`, `a_streamed_member_writes_the_archive_the_in_memory_writer_does`, `rar29_levels_are_charged_for_the_models_and_parse_they_hold` |
+| `rar40` compressed | the LZ window or PPMd model; levels 4 and 5 try larger models, up to 128 MB | dictionary and level | `a_streamed_member_is_charged_what_it_holds_not_its_size`, `a_streamed_member_writes_the_archive_the_in_memory_writer_does`, `rar29_levels_are_charged_for_the_models_and_parse_they_hold` |
 | `rar15`, `rar20`, `rar40` to a pipe | as to a file; a member over 64 MiB is packed into a spool in the temp directory first | as to a file, plus disk | `a_streamed_rar15_member_writes_the_archive_the_in_memory_writer_does`, `a_piped_member_is_spooled_into_the_archive_a_file_gets`, `a_piped_password_protected_member_is_spooled_and_encrypted` |
 | legacy members of 64 MiB or less | the member and its packed form, one per member in flight; the packed form stays charged until it is written | `--memory-limit` decides how many are in flight | `a_compressed_member_is_charged_itself_its_packed_form_and_a_fixed_index`, `a_coded_member_is_charged_for_its_packed_form_until_it_is_written`, `a_tight_budget_on_many_threads_writes_what_one_thread_writes`, `an_oversized_member_is_admitted_alone_rather_than_refused`, `legacy_resource_limits_fail_before_opening_a_member_or_writing_output` |
-| legacy stored with a password, single archive | a copy buffer; the source or the caller's bytes are encrypted as they are written (#334, #336) | constant | `a_stored_member_is_written_from_the_bytes_it_was_handed` |
-| `rar40` with a named filter | as compressed: a member over 64 MiB streams, filtered a segment at a time (79 MB for the 1 GiB above, 3.8 GB before #335); under `--ppmd` too, a record at a time (121 MB for 512 MiB of ELF binaries, 1.4 GB before #345) | dictionary and level | `a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes`, `a_named_filter_streams_on_a_solid_chain_and_through_a_pipe`, `a_filtered_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes` |
+| legacy stored with a password, single archive | a copy buffer; the source or the caller's bytes are encrypted as they are written | constant | `a_stored_member_is_written_from_the_bytes_it_was_handed` |
+| `rar40` with a named filter | as compressed: a member over 64 MiB streams, filtered a segment at a time; under `--ppmd` too, a record at a time | dictionary and level | `a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes`, `a_named_filter_streams_on_a_solid_chain_and_through_a_pipe`, `a_filtered_ppmd_member_read_in_segments_codes_to_the_in_memory_bytes` |
 | `rar14` volume set | a copy buffer; a compressed member is packed first, as a single archive's is (a member over 64 MiB into a spool in the temp directory), then copied out a volume at a time | as a single archive, plus disk | `streamed_volume_sets_are_the_sets_the_in_memory_writer_built`, `a_stored_volume_set_is_copied_through_in_every_legacy_format` |
 | `rar15`, `rar20`, `rar40` volume set | as a single archive: large members stream into the set | as a single archive | `a_streamed_rar15_member_splits_into_the_volumes_the_in_memory_writer_does`, `a_streamed_rar20_member_splits_into_the_volumes_the_in_memory_writer_does`, `a_compressed_member_over_4_gib_streams_into_a_set`*, `the_builder_writes_the_set_the_streaming_writer_does` |
-| `rar50`, `rar70` compressed | blocks in flight; each member spooled to disk before it's written | `--memory-limit`, dictionary × jobs; disk only if a spool quota is set | `default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings`, `two_codec_workers_hold_admitted_capacity_concurrently`, `the_workspace_charge_covers_what_a_member_measured`, `spool_quota_does_not_change_successful_archive_bytes` |
+| `rar50`, `rar70` compressed | blocks in flight | `--memory-limit`, dictionary × jobs; disk only if a spool quota is set | `default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings`, `two_codec_workers_hold_admitted_capacity_concurrently`, `the_workspace_charge_covers_what_a_member_measured`, `spool_quota_does_not_change_successful_archive_bytes` |
 | `rar50`, `rar70` solid | the dictionary carried between members | dictionary | `solid_multirun_history_fits_fixed_ceiling_and_extracts` |
 | `rar50`, `rar70` recovery | the parity, or 64 MiB stripes of it under pressure | `--memory-limit` | `recovery_memory_mode_switches_to_striping_under_pressure`, `striped_recovery_matches_resident_recovery_byte_for_byte` |
 | `rar50`, `rar70` encrypted | a cipher block; volume sets spool the ciphertext | constant, plus disk | `encrypted_streaming_writer_round_trips_across_input_blocks`, `encrypted_volume_preparation_uses_the_shared_spool_quota` |
 
 Some library calls hold the whole archive by design, because they return it:
 `Builder::to_bytes`, `Builder::build_volumes` and `Rar50Writer::finish`.
-A RAR 5 write shares `Builder::add_bytes` payloads rather than copying them
-(#337), and a legacy one stores them without a copy (#336).
+`Builder::add_bytes` payloads are shared with the writer, not copied.
