@@ -226,8 +226,8 @@ fn seekable_archives_match_fingerprints_captured_from_master() {
         ("Rar15_stored", "140205:92f2a959"),
         ("Rar15_compressed", "111093:306171e8"),
         ("Rar40_stored", "140212:db64ba84"),
-        ("Rar40_compressed", "106764:65dd24f6"),
-        ("Rar40_encrypted_headers", "106888:17bc5604"),
+        ("Rar40_compressed", "105782:84fd30aa"),
+        ("Rar40_encrypted_headers", "105912:71880773"),
         (
             "Rar40_volumes_encrypted_headers",
             "30000:1cbe6415 30000:cb5d28ff 30000:52c3702c 30000:3532be9b 21208:eb107e2c",

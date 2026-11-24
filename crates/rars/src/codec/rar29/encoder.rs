@@ -93,7 +93,8 @@ type Rar29LongMatchFinder = match_finder::MatchFinder<6>;
 ///
 /// A lazy parse walking 64 candidates, as level 3 does, already reaches most of
 /// what a long key would find, and executables come out larger keyed on six
-/// there. A short member keeps four-byte chains (see [`LONG_KEY_MIN_SPAN`]).
+/// there, except in differences a filter codes (see [`keys_long`]). A short
+/// member keeps four-byte chains (see [`LONG_KEY_MIN_SPAN`]).
 const LONG_KEY_MAX_CANDIDATES: usize = 16;
 
 /// How many bytes a member and the history before it must span for its
@@ -114,10 +115,42 @@ fn walks_few(options: EncodeOptions) -> bool {
 }
 
 /// Whether a member spanning `span` bytes with the history it reaches keys its
-/// chains on six bytes. Judged from lengths alone, so a member parses the same
-/// read whole or in segments.
-fn keys_long(options: EncodeOptions, span: usize) -> bool {
-    walks_few(options) && span >= LONG_KEY_MIN_SPAN
+/// chains on six bytes. Judged from lengths and from `differences`, what
+/// [`codes_differences`] says of the filters the member's first segment
+/// declares, so a member parses the same read whole or in segments.
+///
+/// A parse walking more candidates keys on six too where most of the member
+/// is differences, and is not refined by shortest path. Sound and pixels a
+/// delta, audio or RGB filter has turned into differences are small numbers,
+/// and on noisy ones nearly every four bytes recur within a few hundred
+/// positions. Level 3's 64 newest positions sharing four bytes then match six
+/// or seven, and the copies that run on are further down. On 4 MiB of noisy
+/// 24-bit pixels through the delta filter, level 3 keyed on four took 6-7
+/// byte matches for 270,834 tokens and 8 or more for 105,776; keyed on six,
+/// 49,731 and 274,598, and it packed 930,117 bytes rather than 963,053, where
+/// level 2 packs 944,113.
+fn keys_long(options: EncodeOptions, span: usize, differences: bool) -> bool {
+    let walk_reaches = walks_few(options)
+        || (differences && options.max_match_candidates > 0 && options.optimal_parse_passes == 0);
+    walk_reaches && span >= LONG_KEY_MIN_SPAN
+}
+
+/// Whether filters that code differences, delta, audio or RGB, cover at least
+/// half of the `len` bytes `records` were declared for.
+fn codes_differences(records: &[OwnedVmFilterRecord], len: usize) -> bool {
+    let covered: usize = records
+        .iter()
+        .filter(|record| {
+            [
+                RAR3_DELTA_FILTER_BYTECODE,
+                RAR3_AUDIO_FILTER_BYTECODE,
+                RAR3_RGB_FILTER_BYTECODE,
+            ]
+            .contains(&record.code)
+        })
+        .map(|record| record.block_size)
+        .sum();
+    covered >= len.div_ceil(2) && len > 0
 }
 
 /// The chains a parse walks, keyed as [`keys_long`] says.
@@ -1834,7 +1867,10 @@ fn for_each_block(
         } = input.segment(block_start, behind, segment_end, reach)?;
         let base = combined.len() - (segment_end - block_start);
         // The first segment starts with all the history the member reaches.
-        let long = *long.get_or_insert_with(|| keys_long(options, len + base));
+        let long = *long.get_or_insert_with(|| {
+            let differences = codes_differences(&records, segment_end - block_start);
+            keys_long(options, len + base, differences)
+        });
         let mut parser = LzParser::new(&combined, base, options, block_size, long);
         let origin = block_start;
         let local = |end: usize| base + end - origin;
@@ -1861,6 +1897,7 @@ fn for_each_block(
                             BlockToCode {
                                 tokens: piece.tokens,
                                 state: piece.state,
+                                counted: piece.counted,
                                 filters,
                                 more_blocks_follow: piece_end < len,
                             },
@@ -1918,6 +1955,8 @@ fn for_each_block(
 struct BlockToCode {
     tokens: Vec<EncodeToken>,
     state: EncoderMatchState,
+    /// As [`Piece::counted`].
+    counted: Option<Box<Counted>>,
     filters: Vec<Vec<u8>>,
     more_blocks_follow: bool,
 }
@@ -1936,7 +1975,12 @@ fn code_blocks(
     levels: &mut [u8; TABLE_COUNT],
 ) -> (Vec<Vec<u8>>, Option<Error>) {
     let (tables, table_failure) = map_blocks(blocks.iter().collect(), |block: &BlockToCode| {
-        table_lengths_for_tokens(&block.tokens, block.state, block.filters.len())
+        piece_table(
+            &block.tokens,
+            block.state,
+            block.counted.as_deref(),
+            block.filters.len(),
+        )
     });
     let mut previous = *levels;
     let jobs: Vec<_> = blocks
@@ -2003,13 +2047,21 @@ fn encode_member_inner(
     let mut filters = initial_filters;
     for (index, piece) in pieces.iter().enumerate() {
         let more = more_blocks_follow || index + 1 < pieces.len();
-        out.extend_from_slice(&code_block(
+        let table = piece_table(
+            &piece.tokens,
+            piece.state,
+            piece.counted.as_deref(),
+            filters.len(),
+        )?;
+        out.extend_from_slice(&code_block_with_table(
             &piece.tokens,
             piece.state,
             filters,
             more,
             previous_levels,
+            &table,
         )?);
+        *previous_levels = table;
         filters = &[];
     }
     Ok(out)
@@ -2018,25 +2070,19 @@ fn encode_member_inner(
 /// The code-length table a block of these tokens is coded with.
 fn table_lengths_for_tokens(
     tokens: &[EncodeToken],
-    mut match_state: EncoderMatchState,
+    match_state: EncoderMatchState,
     filter_records: usize,
 ) -> Result<[u8; TABLE_COUNT]> {
-    let mut frequencies = [0usize; TABLE_COUNT];
+    let counts = SymbolCounts::of_tokens(tokens, match_state)?;
+    Ok(block_table(counts.frequencies, filter_records))
+}
+
+/// The code-length table for a block coding `frequencies`, counted as
+/// [`SymbolCounts`] counts them, and `filter_records` filter records.
+fn block_table(mut frequencies: [usize; TABLE_COUNT], filter_records: usize) -> [u8; TABLE_COUNT] {
     frequencies[257] += filter_records;
-    for token in tokens {
-        match *token {
-            EncodeToken::Literal(byte) => {
-                frequencies[byte as usize] += 1;
-            }
-            EncodeToken::Match { length, offset } => {
-                let (length, offset) = (length as usize, offset as usize);
-                count_match(match_state.encode_match(length, offset)?, &mut frequencies);
-                match_state.remember(length, offset);
-            }
-        }
-    }
     frequencies[256] += 1;
-    Ok(table_lengths_for_frequencies(frequencies))
+    table_lengths_for_frequencies(frequencies)
 }
 
 /// Where each alphabet starts in a table, and in counts laid out like one.
@@ -2091,6 +2137,7 @@ fn table_lengths_for_frequencies(mut frequencies: [usize; TABLE_COUNT]) -> [u8; 
     table_lengths
 }
 
+#[cfg(test)]
 fn code_block(
     tokens: &[EncodeToken],
     state: EncoderMatchState,
@@ -2720,7 +2767,7 @@ fn parse_member(
     let combined = with_history(history, input, options);
     let start = combined.len() - input.len();
     let reach = options.max_match_distance.min(MAX_HISTORY);
-    let long = keys_long(options, input.len() + start.min(reach));
+    let long = keys_long(options, input.len() + start.min(reach), false);
     let mut finder = ChainFinder::for_reach(reach, reach, long);
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
@@ -2909,11 +2956,62 @@ struct Piece {
     /// its own across blocks, and agrees on every one of these it remembers.
     state: EncoderMatchState,
     tokens: Vec<EncodeToken>,
+    /// What `tokens` code from `state`, where the parse counted it already,
+    /// so coding the piece need not count it again.
+    counted: Option<Box<Counted>>,
+}
+
+/// A piece's symbols as [`SymbolCounts`] counts them, and the table they code
+/// with if the piece declares no filter records, where that was built too.
+#[derive(Debug)]
+struct Counted {
+    frequencies: [usize; TABLE_COUNT],
+    table: Option<[u8; TABLE_COUNT]>,
+}
+
+impl Counted {
+    /// The piece's table, declaring `filter_records` filter records.
+    fn table(&self, filter_records: usize) -> [u8; TABLE_COUNT] {
+        match (self.table, filter_records) {
+            (Some(table), 0) => table,
+            _ => block_table(self.frequencies, filter_records),
+        }
+    }
+}
+
+/// The table a piece codes with, declaring `filter_records` filter records:
+/// from what the parse counted where it did, or counted from its tokens.
+fn piece_table(
+    tokens: &[EncodeToken],
+    state: EncoderMatchState,
+    counted: Option<&Counted>,
+    filter_records: usize,
+) -> Result<[u8; TABLE_COUNT]> {
+    match counted {
+        Some(counted) => Ok(counted.table(filter_records)),
+        None => table_lengths_for_tokens(tokens, state, filter_records),
+    }
 }
 
 /// The lazy parse, at the levels that ask for it parsed again by shortest
-/// path, then cut into blocks where that codes smaller. At those levels each
-/// block is parsed again once cut, priced by the tables it now has.
+/// path, then as literals alone if they code smaller, then cut into blocks
+/// where that codes smaller. At those levels each block is parsed again once
+/// cut, priced by the tables it now has.
+///
+/// Every parse here takes a match the moment its fixed guess at token costs
+/// says it pays, and that guess prices a literal at eight bits. Where the
+/// literals cost far less, as in sound or pixels a filter has turned into
+/// small differences, the short matches noise offers cost more than the
+/// literals they replace. On 1 MiB of noisy 8-bit sound through the audio
+/// filter, every level's matches made it larger than its literals alone:
+/// 547,768 bytes at level 1 and 601,969 at level 2, where literals code to
+/// 518,873. The more a level searched, the more of those matches it found,
+/// so level 2 came out larger than level 1.
+///
+/// Weighing the two takes a count of the block's bytes, which most parses
+/// take anyway to judge whether they look random, and a count of the
+/// parse's symbols, which its table is then built from rather than counted
+/// again. Most blocks are settled by estimates without building a code.
 fn parse_block<C: Candidates>(
     data: &[u8],
     start: usize,
@@ -2922,7 +3020,10 @@ fn parse_block<C: Candidates>(
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<Piece>> {
-    let mut tokens = parse_range(data, start, end, finder, options, progress)?;
+    let bytes = byte_counts(&data[start..end]);
+    let entropy = counts_entropy(&bytes);
+    let looks_random = NearMatches::looks_random(entropy);
+    let mut tokens = parse_range(data, start, end, finder, options, looks_random, progress)?;
     let fresh = EncoderMatchState::default();
     let refiner = match options.optimal_parse_passes {
         0 => None,
@@ -2933,14 +3034,42 @@ fn parse_block<C: Candidates>(
             .refine(data, (start, end), options, tokens, (fresh, fresh))?
             .0;
     }
+    let mut counts = SymbolCounts::of_tokens(&tokens, fresh)?;
+    let mut table = None;
+    // No code for the literals beats their entropy, so where the parse's
+    // Shannon estimate is under that, as in most blocks, neither needs its
+    // tables here. Where it is under what the literals code to, the parse's
+    // need not be built here either. Otherwise the winner's is kept.
+    let estimate = counts.shannon_bits();
+    if estimate as f64 > entropy * (end - start) as f64 {
+        let literals = SymbolCounts::of_literals(&bytes);
+        let (literal_bits, literal_table) = literals.priced();
+        if estimate > literal_bits {
+            let (parsed_bits, parsed_table) = counts.priced();
+            table = Some(parsed_table);
+            if literal_bits < parsed_bits {
+                tokens = data[start..end]
+                    .iter()
+                    .map(|&byte| EncodeToken::Literal(byte))
+                    .collect();
+                counts = literals;
+                table = Some(literal_table);
+            }
+        }
+    }
+    let counted = Box::new(Counted {
+        frequencies: counts.frequencies,
+        table,
+    });
     if !options.split_blocks {
         return Ok(vec![Piece {
             end,
             state: fresh,
             tokens,
+            counted: Some(counted),
         }]);
     }
-    let pieces = block_split::split(start, end, tokens)?;
+    let pieces = block_split::split(start, end, tokens, counted)?;
     let Some(refiner) = refiner.filter(|_| pieces.len() > 1) else {
         return Ok(pieces);
     };
@@ -2969,6 +3098,7 @@ fn parse_block<C: Candidates>(
             end: piece.end,
             state,
             tokens,
+            counted: None,
         };
         for token in &piece.tokens {
             if let EncodeToken::Match { length, offset } = *token {
@@ -2984,6 +3114,119 @@ fn parse_block<C: Candidates>(
     })
 }
 
+/// How many times each byte value occurs in `bytes`.
+fn byte_counts(bytes: &[u8]) -> [usize; 256] {
+    let mut counts = [0usize; 256];
+    for &byte in bytes {
+        counts[usize::from(byte)] += 1;
+    }
+    counts
+}
+
+/// The symbols a block of tokens codes, the end of block and filter records
+/// aside, and the extra bits its matches carry beside them.
+struct SymbolCounts {
+    frequencies: [usize; TABLE_COUNT],
+    extra_bits: usize,
+}
+
+impl SymbolCounts {
+    fn of_tokens(tokens: &[EncodeToken], mut state: EncoderMatchState) -> Result<Self> {
+        let mut frequencies = [0usize; TABLE_COUNT];
+        let mut extra_bits = 0usize;
+        for token in tokens {
+            match *token {
+                EncodeToken::Literal(byte) => frequencies[usize::from(byte)] += 1,
+                EncodeToken::Match { length, offset } => {
+                    let (length, offset) = (length as usize, offset as usize);
+                    let encoded = state.encode_match(length, offset)?;
+                    extra_bits += usize::from(match encoded {
+                        EncodedMatch::LastLengthRepeat => 0,
+                        EncodedMatch::RepeatOffset { length_slot, .. } => LENGTH_BITS[length_slot],
+                        EncodedMatch::Short { slot, .. } => SHORT_BITS[slot],
+                        // Past slot 9 the low four bits of the offset are a
+                        // symbol of their own, counted with the rest.
+                        EncodedMatch::Fresh {
+                            length_slot,
+                            offset_slot,
+                            ..
+                        } => {
+                            LENGTH_BITS[length_slot]
+                                + match offset_slot > 9 {
+                                    true => OFFSET_BITS[offset_slot].saturating_sub(4),
+                                    false => OFFSET_BITS[offset_slot],
+                                }
+                        }
+                    });
+                    count_match(encoded, &mut frequencies);
+                    state.remember(length, offset);
+                }
+            }
+        }
+        Ok(Self {
+            frequencies,
+            extra_bits,
+        })
+    }
+
+    /// A block of bytes as literals alone, from their [`byte_counts`].
+    fn of_literals(bytes: &[usize; 256]) -> Self {
+        let mut frequencies = [0usize; TABLE_COUNT];
+        frequencies[..256].copy_from_slice(bytes);
+        Self {
+            frequencies,
+            extra_bits: 0,
+        }
+    }
+
+    /// About what [`Self::priced`] says, from above, without the Huffman
+    /// codes: the symbols under Shannon's lengths for their counts, the
+    /// whole bits of each symbol's information, which a Huffman code never
+    /// spends more than, and the header that writes those lengths.
+    ///
+    /// The header Huffman lengths take can differ from that by a few bits,
+    /// so this is a screen for which blocks need the codes built, not a
+    /// bound.
+    fn shannon_bits(&self) -> usize {
+        let mut lengths = [0u8; TABLE_COUNT];
+        let mut symbols = 0usize;
+        for alphabet in [
+            0..OFFSET_TABLE,
+            OFFSET_TABLE..LOW_OFFSET_TABLE,
+            LOW_OFFSET_TABLE..LENGTH_TABLE,
+            LENGTH_TABLE..TABLE_COUNT,
+        ] {
+            let counts = &self.frequencies[alphabet.clone()];
+            let total = counts.iter().sum::<usize>();
+            for (length, &count) in lengths[alphabet].iter_mut().zip(counts) {
+                if count != 0 {
+                    // The bits of 1/p rounded up, which those of 1/p rounded
+                    // up to a whole number are.
+                    let bits = total.div_ceil(count).next_power_of_two().trailing_zeros();
+                    *length = (bits as u8).clamp(1, 15);
+                    symbols += count * usize::from(*length);
+                }
+            }
+        }
+        4 * LEVEL_COUNT + table_level_bit_cost(&lengths) + symbols + self.extra_bits
+    }
+
+    /// What the block codes to with tables of its own, header included and
+    /// the end of block aside, as [`optimal_parse::priced_bits`] prices it,
+    /// and those tables.
+    fn priced(&self) -> (usize, [u8; TABLE_COUNT]) {
+        let table = block_table(self.frequencies, 0);
+        let symbols: usize = self
+            .frequencies
+            .iter()
+            .zip(&table)
+            .map(|(&count, &length)| count * usize::from(length))
+            .sum();
+        let bits = 4 * LEVEL_COUNT + table_level_bit_cost(&table) + symbols + self.extra_bits;
+        (bits, table)
+    }
+}
+
 /// No match crosses `end`, so a block covers exactly the bytes it was given.
 fn parse_range<C: Candidates>(
     data: &[u8],
@@ -2991,6 +3234,7 @@ fn parse_range<C: Candidates>(
     end: usize,
     finder: &mut C,
     options: EncodeOptions,
+    looks_random: bool,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
 ) -> Result<Vec<EncodeToken>> {
     let mut tokens = Vec::new();
@@ -2998,10 +3242,8 @@ fn parse_range<C: Candidates>(
     let mut next_report = 0usize;
     let mut pending_match: Option<MatchCandidate> = None;
     let mut pos = start;
-    // Judged from the block's own bytes, so a block parses the same wherever
-    // the member is cut.
-    let random = std::cell::OnceCell::new();
-    let looks_random = || *random.get_or_init(|| NearMatches::looks_random(&data[start..end]));
+    // `looks_random` is judged from the block's own bytes, so a block parses
+    // the same wherever the member is cut.
     // A parse that walks few candidates keeps near matches for the four- and
     // five-byte matches a six-byte key cannot offer. A lazy one keeps them on
     // four-byte chains too, where they pay; a greedy one there has its chains'
@@ -3012,7 +3254,7 @@ fn parse_range<C: Candidates>(
         false => finder.key() > MIN_CHAIN_MATCH,
     };
     let near_pays =
-        (walks_few_on || (options.lazy_matching && options.near_matches)) && !looks_random();
+        (walks_few_on || (options.lazy_matching && options.near_matches)) && !looks_random;
     // Filled from the history a near match can reach, so a block parses the
     // same whether the bytes before it were parsed in this call or another.
     let mut near = near_pays.then(|| {
@@ -3024,7 +3266,7 @@ fn parse_range<C: Candidates>(
     });
     let skip_after = options
         .skip_literal_runs
-        .filter(|_| looks_random())
+        .filter(|_| looks_random)
         .map(|misses| misses.max(1));
     let mut misses = 0usize;
     // A greedy parse keyed on six bytes is the fastest level, and keeps the
@@ -3867,15 +4109,16 @@ impl NearMatches {
         }
     }
 
-    /// Whether a block's bytes are spread so evenly that short matches are
-    /// not worth looking for: more than 7.5 bits a byte of order-0 entropy.
+    /// Whether a block whose bytes carry `entropy` bits a byte of order-0
+    /// entropy is spread so evenly that short matches are not worth looking
+    /// for: more than 7.5.
     ///
     /// Already-compressed data offers a three-byte match now and then and
     /// nothing longer, so every position looked one up for nothing. On a 32 MiB
     /// tar of compressed files at level 3 that cost 15% more time for 0.11%,
     /// where executables gain 2.3% for 6%.
-    fn looks_random(block: &[u8]) -> bool {
-        block.is_empty() || order0_entropy(block) > SKIP_RANDOM_ABOVE_BITS
+    fn looks_random(entropy: f64) -> bool {
+        entropy > SKIP_RANDOM_ABOVE_BITS
     }
 
     /// The newest earlier position sharing `pos`'s three-byte hash.
@@ -3898,19 +4141,21 @@ const SKIP_RANDOM_ABOVE_BITS: f64 = 7.5;
 
 /// The order-0 entropy of `block` in bits a byte, 8 for an empty one.
 pub(crate) fn order0_entropy(block: &[u8]) -> f64 {
-    if block.is_empty() {
+    counts_entropy(&byte_counts(block))
+}
+
+/// [`order0_entropy`] of the bytes [`byte_counts`] counted.
+fn counts_entropy(bytes: &[usize; 256]) -> f64 {
+    let len: usize = bytes.iter().sum();
+    if len == 0 {
         return 8.0;
     }
-    let mut counts = [0u32; 256];
-    for &byte in block {
-        counts[usize::from(byte)] += 1;
-    }
-    let len = block.len() as f64;
-    counts
+    let len = len as f64;
+    bytes
         .iter()
         .filter(|&&count| count != 0)
         .map(|&count| {
-            let p = f64::from(count) / len;
+            let p = count as f64 / len;
             -p * p.log2()
         })
         .sum()

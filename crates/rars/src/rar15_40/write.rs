@@ -6070,6 +6070,140 @@ mod tests {
         assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
     }
 
+    /// The next xorshift step of `state`.
+    fn xorshift(state: &mut u32) -> u32 {
+        *state ^= *state << 13;
+        *state ^= *state >> 17;
+        *state ^= *state << 5;
+        *state
+    }
+
+    /// Eight-bit mono: two tones with a few steps of noise on every sample.
+    fn noisy_mono8(len: usize) -> Vec<u8> {
+        let mut state = 0x6d38_0001_u32;
+        (1..=len)
+            .map(|index| {
+                let phase = index as f64 * 0.013;
+                let tone = 128.0 + 90.0 * phase.sin() + 20.0 * (phase * 3.7).sin();
+                let noise = (xorshift(&mut state) % 9) as f64 - 4.0;
+                (tone + noise).clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    }
+
+    /// 24-bit pixels 1024 to a row: red and green ramps with two bits of
+    /// noise, blue a clean diagonal.
+    fn noisy_rgb(len: usize) -> Vec<u8> {
+        let mut state = 0x7267_0001_u32;
+        let mut data = Vec::with_capacity(len + 3);
+        let mut pixel = 0usize;
+        while data.len() < len {
+            let (x, y) = (pixel % 1024, pixel / 1024);
+            data.push((x as u32 + xorshift(&mut state) % 4) as u8);
+            data.push((y as u32 / 2 + xorshift(&mut state) % 4) as u8);
+            data.push(((x + y) / 3) as u8);
+            pixel += 1;
+        }
+        data.truncate(len);
+        data
+    }
+
+    /// Sound the audio filter has turned into small noisy differences codes
+    /// smaller as literals than with the short matches noise offers, and no
+    /// level codes it larger than literals alone. Level 1 was 13% over them
+    /// and level 2 under level 1 only by chance of length; at 1 MiB, where
+    /// level 1 keys its chains on six bytes and so finds fewer of those
+    /// matches, level 2 packed 10% larger than level 1.
+    #[test]
+    fn no_level_codes_filtered_noise_larger_than_its_literals() {
+        let data = noisy_mono8(256 * 1024);
+        let filters = [FilterSpec::whole(FilterKind::Audio { channels: 1 })];
+        let encode = |options: super::Rar29EncodeOptions| {
+            super::Unpack29Encoder::with_options(options)
+                .encode_member_with_filters(&data, &filters)
+                .unwrap()
+        };
+        let literals = encode(super::rar29_encode_options_for_level(Some(0)).unwrap());
+        for level in 1..=5 {
+            let packed = encode(super::rar29_encode_options_for_level(Some(level)).unwrap());
+            assert!(
+                packed.len() <= literals.len(),
+                "level {level}: {} bytes, literals alone {}",
+                packed.len(),
+                literals.len()
+            );
+            assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
+        }
+    }
+
+    /// Noisy pixels through the delta filter, a member long enough for level
+    /// 2's chains to key on six bytes. Level 3 keyed its own on four and
+    /// walked their 64 newest, all short matches, and packed larger than
+    /// level 2. It now keys on six in differences too.
+    #[test]
+    fn level_three_packs_delta_filtered_pixels_no_larger_than_level_two() {
+        let data = noisy_rgb(1200 * 1024);
+        let filters = [FilterSpec::whole(FilterKind::Delta { channels: 3 })];
+        let encode = |level: u8| {
+            super::Unpack29Encoder::with_options(
+                super::rar29_encode_options_for_level(Some(level)).unwrap(),
+            )
+            .encode_member_with_filters(&data, &filters)
+            .unwrap()
+        };
+        let (two, three) = (encode(2), encode(3));
+        assert!(
+            three.len() <= two.len(),
+            "level 3 {} bytes, level 2 {}",
+            three.len(),
+            two.len()
+        );
+        assert_eq!(unpack29_decode(&three, data.len()).unwrap(), data);
+    }
+
+    /// The literals-alone fallback and six-byte keys over filtered
+    /// differences decide per block and per member, never per thread.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn filtered_noise_codes_alike_on_any_thread_count() {
+        let mono = noisy_mono8(256 * 1024);
+        let pixels = noisy_rgb(1200 * 1024);
+        let cases = [
+            (&mono, FilterSpec::whole(FilterKind::Audio { channels: 1 })),
+            (
+                &pixels,
+                FilterSpec::whole(FilterKind::Delta { channels: 3 }),
+            ),
+        ];
+        for (data, filter) in cases {
+            for level in 1..=3 {
+                let encode = |threads: usize| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                        .install(|| {
+                            super::Unpack29Encoder::with_options(
+                                super::rar29_encode_options_for_level(Some(level)).unwrap(),
+                            )
+                            .encode_member_with_filters(data, std::slice::from_ref(&filter))
+                            .unwrap()
+                        })
+                };
+                let one = encode(1);
+                for threads in [2, 8] {
+                    assert!(
+                        encode(threads) == one,
+                        "{filter:?} level {level}: {threads} threads changed the member"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_long_text_member_is_screened_rather_than_coded_by_every_engine() {
         use std::sync::atomic::{AtomicUsize, Ordering};

@@ -69,12 +69,57 @@ fn lazy() -> EncodeOptions {
         .with_max_match_distance(1 << 20)
 }
 
+/// What `tokens` code from no repeat offsets, counted.
+fn counted(tokens: &[EncodeToken]) -> Box<Counted> {
+    Box::new(Counted {
+        frequencies: SymbolCounts::of_tokens(tokens, EncoderMatchState::default())
+            .unwrap()
+            .frequencies,
+        table: None,
+    })
+}
+
+/// Each piece carries its own symbols, so coding it builds the same table
+/// counting them again would, and the counted bits are what pricing every
+/// token says.
+#[test]
+fn cut_pieces_carry_the_symbols_they_code() {
+    let mut cut = prose(32 * 1024, 1);
+    cut.extend(code_like(32 * 1024, 2));
+    for (block, pieces_at_least) in [(cut, 2), (prose(64 * 1024, 5), 1)] {
+        let tokens = encode_tokens_with_progress(&block, &[], lazy(), None).unwrap();
+        let fresh = EncoderMatchState::default();
+        let counts = SymbolCounts::of_tokens(&tokens, fresh).unwrap();
+        let (bits, table) = counts.priced();
+        assert_eq!(bits, optimal_parse::priced_bits(&tokens, fresh).unwrap());
+        assert_eq!(table, table_lengths_for_tokens(&tokens, fresh, 0).unwrap());
+        assert!(counts.shannon_bits() >= bits);
+        let pieces = split(0, block.len(), tokens.clone(), counted(&tokens)).unwrap();
+        assert!(pieces.len() >= pieces_at_least, "{} pieces", pieces.len());
+        for piece in &pieces {
+            let mine = SymbolCounts::of_tokens(&piece.tokens, piece.state).unwrap();
+            let counted = piece.counted.as_deref().expect("a cut piece is counted");
+            assert_eq!(
+                counted.frequencies, mine.frequencies,
+                "piece ending at {}",
+                piece.end
+            );
+            for filters in [0, 2] {
+                assert_eq!(
+                    counted.table(filters),
+                    table_lengths_for_tokens(&piece.tokens, piece.state, filters).unwrap()
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn a_block_is_cut_near_where_its_statistics_change() {
     let mut data = prose(32 * 1024, 1);
     data.extend(code_like(32 * 1024, 2));
     let tokens = encode_tokens_with_progress(&data, &[], lazy(), None).unwrap();
-    let pieces = split(0, data.len(), tokens.clone()).unwrap();
+    let pieces = split(0, data.len(), tokens.clone(), counted(&tokens)).unwrap();
 
     assert!(pieces.len() >= 2, "{} pieces", pieces.len());
     assert!(
@@ -97,7 +142,7 @@ fn a_block_with_one_kind_of_content_or_too_short_to_cut_stays_whole() {
     let history = prose(64 * 1024, 4);
     for data in [prose(64 * 1024, 5), prose(2 * UNIT - 1, 6)] {
         let tokens = encode_tokens_with_progress(&data, &history, lazy(), None).unwrap();
-        let pieces = split(0, data.len(), tokens).unwrap();
+        let pieces = split(0, data.len(), tokens.clone(), counted(&tokens)).unwrap();
         assert_eq!(pieces.len(), 1, "{} bytes", data.len());
     }
 }

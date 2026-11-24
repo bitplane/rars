@@ -55,14 +55,20 @@ struct Mark {
     counts: Box<[usize; TABLE_COUNT]>,
 }
 
-/// Cuts `tokens`, which code `start..end` from no repeat offsets, into the
-/// blocks that code smallest.
-pub(super) fn split(start: usize, end: usize, tokens: Vec<EncodeToken>) -> Result<Vec<Piece>> {
+/// Cuts `tokens`, which code `start..end` from no repeat offsets as
+/// `counted` says, into the blocks that code smallest.
+pub(super) fn split(
+    start: usize,
+    end: usize,
+    tokens: Vec<EncodeToken>,
+    counted: Box<Counted>,
+) -> Result<Vec<Piece>> {
     let whole = |tokens| {
         Ok(vec![Piece {
             end,
             state: EncoderMatchState::default(),
             tokens,
+            counted: Some(counted),
         }])
     };
     if end - start > SPLIT_SPAN || end - start < 2 * UNIT {
@@ -150,14 +156,27 @@ pub(super) fn split(start: usize, end: usize, tokens: Vec<EncodeToken>) -> Resul
     let mut pieces = Vec::with_capacity(cuts.len());
     let mut rest = tokens;
     let mut piece_end = end;
+    let mut after = &marks[units];
     for &cut in &cuts {
         let mark = &marks[cut];
+        let mut frequencies = [0usize; TABLE_COUNT];
+        for (frequency, (after, before)) in frequencies
+            .iter_mut()
+            .zip(after.counts.iter().zip(mark.counts.iter()))
+        {
+            *frequency = after - before;
+        }
         pieces.push(Piece {
             end: piece_end,
             state: mark.state,
             tokens: rest.split_off(mark.token),
+            counted: Some(Box::new(Counted {
+                frequencies,
+                table: None,
+            })),
         });
         piece_end = mark.pos;
+        after = mark;
     }
     pieces.reverse();
     Ok(pieces)
