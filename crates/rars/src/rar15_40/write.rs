@@ -6161,6 +6161,46 @@ mod tests {
         assert_eq!(unpack29_decode(&three, data.len()).unwrap(), data);
     }
 
+    /// The literals-alone fallback and six-byte keys over filtered
+    /// differences decide per block and per member, never per thread.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn filtered_noise_codes_alike_on_any_thread_count() {
+        let mono = noisy_mono8(256 * 1024);
+        let pixels = noisy_rgb(1200 * 1024);
+        let cases = [
+            (&mono, FilterSpec::whole(FilterKind::Audio { channels: 1 })),
+            (&pixels, FilterSpec::whole(FilterKind::Delta { channels: 3 })),
+        ];
+        for (data, filter) in cases {
+            for level in 1..=3 {
+                let encode = |threads: usize| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(threads)
+                        .build()
+                        .unwrap()
+                        .install(|| {
+                            super::Unpack29Encoder::with_options(
+                                super::rar29_encode_options_for_level(Some(level)).unwrap(),
+                            )
+                            .encode_member_with_filters(data, std::slice::from_ref(&filter))
+                            .unwrap()
+                        })
+                };
+                let one = encode(1);
+                for threads in [2, 8] {
+                    assert!(
+                        encode(threads) == one,
+                        "{filter:?} level {level}: {threads} threads changed the member"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_long_text_member_is_screened_rather_than_coded_by_every_engine() {
         use std::sync::atomic::{AtomicUsize, Ordering};
