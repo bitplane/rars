@@ -1,7 +1,7 @@
 use super::*;
 use crate::codec::workspace::RefusingBudget;
 
-// Original eager policy, independent of the new batching helpers.
+// The eager policy, independent of the batching helpers.
 fn eager<B: Budget>(state: &mut Reader20State<B>) {
     let drain = state.output.len().saturating_sub(MAX_HISTORY);
     state.output.discard_prefix(drain);

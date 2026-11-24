@@ -2,10 +2,9 @@
 //! it is coded.
 //!
 //! A writer that codes a member and only then compares sizes spends its whole
-//! compression time on noise, video or archives it ends up storing anyway: two
-//! and a half minutes on 2 GiB of random bytes at RAR 5 level 3, where storing
-//! it takes three seconds (#481). This looks at sixteen spread-out samples
-//! first and stores the member if together they show nothing worth keeping.
+//! compression time on noise, video or archives it ends up storing anyway
+//! (#481). This looks at sixteen spread-out samples first and stores the
+//! member if together they show nothing worth keeping.
 //!
 //! The sampling and the rule are format-neutral. A writer supplies what one
 //! sample packs to on its own, coded the cheapest way it has, and keeps the

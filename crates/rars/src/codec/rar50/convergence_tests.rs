@@ -185,8 +185,7 @@ fn compare_pipeline(
 #[test]
 fn equal_tables_with_changed_tokens_skip_a_real_pricing_pass() {
     // The first Huffman-priced pass chooses a different token sequence, but
-    // generates exactly the same four tables. The old third pass recreates
-    // that sequence and stops; the new pipeline avoids that work entirely.
+    // generates exactly the same four tables, so no third pass is priced.
     let input = generated_noise(92, 256, 2);
     let options = EncodeOptions::new(16).with_optimal_parse(true);
     for version in [0, 1] {

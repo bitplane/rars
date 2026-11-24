@@ -569,10 +569,8 @@ fn code_lz_block(
 
     // Re-parse against the prices the first pass implies, then again against
     // the prices that produced. A greedy parse has converged by the first
-    // re-parse and a second buys 0.02%, but the shortest-path parse is far more
-    // sensitive to its prices and a second pass is worth 0.12% to it. A third
-    // and fourth buy another 0.06% on the bench's small members and 0.03% on its
-    // 4 MiB text and binaries, which is what levels 4 and 5 are for.
+    // re-parse, but the shortest-path parse is far more sensitive to its
+    // prices. Levels 4 and 5 add a third and fourth.
     let refinements = if options.optimal_parse { 2 } else { 1 } + options.extra_priced_passes;
     let span = window.len() - start;
     let mut poll = progress.map(|report| move |_: usize| report(span));
@@ -594,7 +592,7 @@ fn code_lz_block(
         write_lz_block(&mut next, &next_tokens, header, None, &next_table, more)?;
         // The repeats are tried on the packed result only. Prices drawn from a
         // table with them in would make the next parse shun the very matches
-        // that become repeats, which cost 0.18% on an unstripped binary.
+        // that become repeats.
         if matches.is_some() && use_repeats(&mut next_tokens) {
             let repeat_table = table_lengths_for_tokens(&next_tokens, None, more)?;
             let mut repeated = BitWriter::default();
@@ -624,8 +622,7 @@ fn code_lz_block(
 ///
 /// Read as it stands, a missing length or offset slot costs nothing but its
 /// extra bits, so the parse spends the next table on symbols it chose because
-/// they looked free. Pricing them like a missing literal is worth 0.14% at
-/// levels 4 and 5 on the bench's small members and 0.05% at level 3.
+/// they looked free.
 fn absent_priced(table: &[u8; TABLE_COUNT]) -> [u8; TABLE_COUNT] {
     table.map(|length| match length {
         0 => ABSENT_SYMBOL_BITS as u8,
@@ -917,7 +914,7 @@ impl EncodeToken {
 /// code plus its fixed extra bits, with the extra value itself costing nothing.
 /// So the parse only needs the longest length in each slot, plus the longest
 /// match found. That is at most twenty-nine candidates where trying every
-/// length is up to two hundred and fifty-six, for 0.03% of packed size.
+/// length is up to two hundred and fifty-six.
 fn candidate_lengths(best_length: usize, adjustment: usize, out: &mut Vec<usize>) {
     out.clear();
     // Slot tops rise with the slot, so the list comes out sorted.
@@ -1109,8 +1106,7 @@ fn nearest_three_byte_match(
 /// The greedy parse commits to a match the moment it finds one, with a two
 /// position lazy check as its only way out. This asks instead what the cheapest
 /// route to the end of the member is, so a match that looks good on its own can
-/// lose to one that leaves the positions after it cheaper. Worth about 0.9% on
-/// the bench corpus, which is more than everything else tried put together.
+/// lose to one that leaves the positions after it cheaper.
 ///
 /// One approximation. The four recent offsets depend on the route taken, and
 /// carrying every reachable rep state would multiply the search out of reach.
@@ -1528,7 +1524,7 @@ impl<'a> CostModel<'a> {
     }
 }
 
-/// How far ahead each rebuild prices; re-pricing the overlapped reach costs under 1% at this span.
+/// How far ahead each rebuild prices.
 const LITERAL_TOTALS_SPAN: usize = 64 * 1024;
 
 /// Totals over the stretch ahead of the parse only, since no span priced reaches further.
@@ -2221,9 +2217,7 @@ fn emit_zero_level_run(tokens: &mut Vec<LevelToken>, mut run: usize) {
 /// of them appear.
 ///
 /// A flat code charges every symbol in play the same, so a table spelled
-/// mostly in a few lengths pays as if they were spread evenly. On the bench's
-/// small members, where the tables are a tenth of the packed bytes, that was
-/// an eighth of every table and the whole of the gap to RAR 2.50 there.
+/// mostly in a few lengths pays as if they were spread evenly.
 ///
 /// The 19 lengths are written four bits each, hence the cap of 15.
 fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_COUNT] {

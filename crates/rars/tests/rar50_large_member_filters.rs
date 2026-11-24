@@ -126,10 +126,8 @@ fn an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run() {
 
 /// A member coded run by run comes out byte for byte as it does coded whole,
 /// filters and all (#383). The script in front leaves the member's last run
-/// 85,536 bytes long, behind 128 KiB of history. A last run shorter than its
-/// history used to search hash chains where the whole member searches a tree,
-/// and the two paths wrote archives a few bytes apart at level 2. Down to a
-/// quarter of its history it now searches a tree too (#419).
+/// 85,536 bytes long, behind 128 KiB of history. Down to a quarter of its
+/// history, a last run searches a tree as the whole member does (#419).
 #[test]
 fn a_filtered_member_codes_alike_run_by_run_and_whole() {
     let root = scratch::case("rar50-filtered-member-paths-agree");

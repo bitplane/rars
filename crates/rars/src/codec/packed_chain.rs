@@ -368,8 +368,7 @@ impl<B: Budget> SharedPackedIndex<B> {
     /// of `positions`, ascending, as if every position before it had been
     /// inserted.
     ///
-    /// Building is the cost a group's jobs used to pay in parallel, one index
-    /// each, so it is split by bucket range across the pool: every part walks
+    /// Building is split by bucket range across the pool: every part walks
     /// the whole window and writes only its own buckets' records, which lie
     /// together in the stream. A bucket's records depend only on its own
     /// positions in order, so the stream is the one a single pass writes. The

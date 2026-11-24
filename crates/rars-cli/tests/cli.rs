@@ -1877,7 +1877,7 @@ fn modern_writer_memory_limit_is_forwarded_for_success_and_refusal() {
 #[test]
 fn raising_the_memory_limit_never_changes_the_archive() {
     // A member too large to code whole in the default limit is coded in
-    // blocks. A raised limit used to code it whole, several times slower.
+    // blocks.
     let root = scratch("raised-memory-limit");
     let source = root.join("payload.bin");
     let mut state = 0x2545_f491_4f6c_dd1du64;
@@ -7561,8 +7561,6 @@ fn rejects_ppmd_for_rar5_writer() {
 }
 
 /// These three name RAR 2.9 RarVM programs that RAR 5 has no filter type for.
-/// They used to be counted as filters and then quietly dropped, so the archive
-/// came out auto-filtered instead of filtered the way it was asked for.
 #[test]
 fn rejects_rar29_only_filters_for_rar5_writer() {
     let dir = scratch("reject-rar5-rar29-filters");
@@ -7989,9 +7987,7 @@ fn expected_rar15_40_compressed_text_payload() -> Vec<u8> {
     "Hello, RAR 3.x fixture world.\n".repeat(80).into_bytes()
 }
 
-/// `--store` must not compress. It used to run the encoder anyway and keep
-/// the compressed block while labelling the member as stored, which produced
-/// archives that neither rars nor unrar could read.
+/// `--store` must not compress.
 #[test]
 fn stored_rar50_members_hold_their_payload_verbatim() {
     let dir = scratch("rar50-store-verbatim");
@@ -8060,10 +8056,8 @@ fn rar50_looks_for_a_data_filter_by_default() {
     assert!(test.status.success(), "stderr: {}", stderr(&test));
 }
 
-/// The buffered RAR 5 path refused to combine an explicit filter with
-/// encryption, recovery records, comments, metadata, volumes or solid mode.
-/// None of those were format limits; they were limits of the writer that path
-/// used, and the streaming engine has none of them.
+/// An explicit filter combines with encryption, recovery records, comments,
+/// metadata, volumes and solid mode. None of those is a format limit.
 #[test]
 fn rar5_explicit_filters_combine_with_the_rest_of_the_writer() {
     let dir = scratch("rar5-filters-combine");
@@ -8165,8 +8159,7 @@ const REJECTED_COMBINATIONS: &[(&[&str], &str)] = &[
     ),
     // Two filters have to be reported as the conflict they are. Asking which
     // one the format supports has no answer, and the two checks rank the flags
-    // differently, so the format check used to name a flag it never looked at:
-    // rar50 was told it could not write --delta-filter, which it can.
+    // differently, so the format check would name a flag it never looked at.
     (
         &[
             "--format",
@@ -8227,7 +8220,7 @@ fn add_accepts_flags_that_ask_for_what_already_happens() {
         vec!["--format", "rar50", "--auto-filter"],
         // RAR 1.3 does write solid archives.
         vec!["--format", "rar14", "--solid"],
-        // The legacy writers stream now, so a budget bounds them too.
+        // The legacy writers stream, so a budget bounds them too.
         vec!["--format", "rar29", "--memory-limit", "64m"],
         // RAR 2.9 does search, so turning it off is a real request.
         vec!["--format", "rar29", "--no-filter"],
@@ -8257,9 +8250,6 @@ fn add_accepts_flags_that_ask_for_what_already_happens() {
     }
 }
 
-/// `--no-filter` used to be read only on the RAR 5 streaming path, so on
-/// RAR 2.9 it was accepted and then ignored: the archive came out auto-filtered
-/// exactly as if the flag had not been typed.
 #[test]
 fn no_filter_turns_off_the_rar29_search() {
     let dir = scratch("rar29-no-filter");

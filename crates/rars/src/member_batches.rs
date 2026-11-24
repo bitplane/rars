@@ -3,7 +3,7 @@
 //! Members are handled in archive order. A member a worker can decode alone
 //! and cheaply joins a batch. Any other member (split, too large to buffer)
 //! is decoded inline on the calling thread, after the batches before it have
-//! been published. One large member therefore no longer serializes the whole
+//! been published. One large member therefore does not serialize the whole
 //! archive, and inline members leave the worker pool idle for any parallelism
 //! inside their own decode.
 

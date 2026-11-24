@@ -2,9 +2,8 @@
 //!
 //! The RAR 1.3 to 4.x codecs compress a member as a unit, so those writers
 //! cannot avoid having a member resident. What they can avoid is having *every*
-//! member resident, which is what they used to do: the caller read all the
-//! inputs, the writer built the whole archive in a `Vec`, and peak memory was a
-//! multiple of the total input rather than of the largest member.
+//! member resident, which makes peak memory a multiple of the total input
+//! rather than of the largest member.
 
 use crate::error::{Error, Result};
 use crate::streaming::EntrySource;

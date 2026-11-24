@@ -61,9 +61,8 @@ impl TimeZone {
 
     /// The machine's zone, parsed once and reused.
     ///
-    /// Anything unreadable or unparsable falls back to UTC, which is what this
-    /// did before the database was consulted at all. A timestamp is not worth
-    /// failing an extraction over.
+    /// Anything unreadable or unparsable falls back to UTC. A timestamp is not
+    /// worth failing an extraction over.
     pub(crate) fn local() -> &'static Self {
         static LOCAL: OnceLock<TimeZone> = OnceLock::new();
         LOCAL.get_or_init(|| {

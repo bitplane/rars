@@ -3714,8 +3714,7 @@ fn reusing_a_remembered_distance_packs_strided_data_smaller() {
 /// Once the parse commits to a match it steps over the bytes that match
 /// covers, so a block that repeats is emitted as whole matches back to back
 /// rather than as the cheapest split of each one. That is the difference
-/// between the parse pricing 4096 positions per match and pricing one, which
-/// is worth 53.41s against 1.19s on a mebibyte of this.
+/// between the parse pricing 4096 positions per match and pricing one.
 #[test]
 fn the_optimal_parse_steps_over_a_match_it_has_committed_to() {
     let block: Vec<u8> = (0..4096u32)
@@ -3794,8 +3793,7 @@ fn blocks_are_short_enough_to_refit_the_tables_when_the_data_changes() {
     // Four stretches, one block each, every one drawing from its own
     // sixteen bytes. A table per block codes sixteen symbols; one table
     // over the member codes sixty-four. Raising LZ_BLOCK_SIZE trades the
-    // first for the second, which is what cost the corpus 6.4% until the
-    // block came down from a mebibyte.
+    // first for the second.
     let stretch_len = 64 * 1024;
     let mut data = Vec::with_capacity(stretch_len * 4);
     let mut noise = 0x2545_f491_4f6c_dd1du64;
@@ -3861,9 +3859,7 @@ fn large_filtered_lz_members_split_filter_records_by_block() {
 
 /// The window a filtered member is parsed in reaches back into the
 /// history the solid stream carries, and keeps reaching for every block
-/// of it rather than only the first. Each block used to be handed its own
-/// copy of that history and its own finder rebuilt from it, which cost
-/// the member a re-insert per block and reached exactly this far.
+/// of it rather than only the first.
 #[test]
 fn a_solid_filtered_member_matches_history_from_every_block() {
     // Bytes that do not compress on their own, so matching the history is

@@ -1,9 +1,7 @@
 #![cfg(all(feature = "write", feature = "encryption", feature = "recovery"))]
 
 //! `volume_size` is the size of each volume file, headers included, the way
-//! RAR's own `-v` switch counts it. The writers used to treat it as the payload
-//! each volume carried and put the headers on top, so every part came out tens
-//! or hundreds of bytes over the size it was asked for.
+//! RAR's own `-v` switch counts it.
 
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error};
 

@@ -161,10 +161,9 @@ pub(crate) fn reject_coding_without_compression(
 ///
 /// RAR 5 and RAR 7 code solid members as one chain, which chooses filters for
 /// each run of each member and has nowhere to put one named for the whole
-/// archive. A named filter used to be taken and dropped. The search runs
-/// either way, so `--auto-filter` only says what happens already. RAR 2.9
-/// takes a named filter too: its chain measures each candidate against the
-/// history so far.
+/// archive. The search runs either way, so `--auto-filter` only says what
+/// happens already. RAR 2.9 takes a named filter too: its chain measures each
+/// candidate against the history so far.
 pub(crate) fn reject_filter_with_solid(
     target: ArchiveVersion,
     filters: &AskedFilters,

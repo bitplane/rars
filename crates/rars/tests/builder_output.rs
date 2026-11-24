@@ -415,7 +415,7 @@ fn volume_builder_rejects_unsupported_settings_before_opening_sources() {
     }
     assert_eq!(multiple.build_volumes(None).unwrap().len(), 1);
 
-    // A RAR 1.3 set has nowhere to put an archive comment; it used to be dropped.
+    // A RAR 1.3 set has nowhere to put an archive comment.
     let mut commented = Builder::new(ArchiveVersion::Rar14)
         .store(true)
         .comment(Some(b"comment".to_vec()))

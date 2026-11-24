@@ -106,7 +106,7 @@ impl Write for CollectWriter {
 /// The RAR 4.20 fixture exercises the whole path: present, odd second, and the
 /// full three sub-second bytes. RAR 7.12 restores it as
 /// 2026-04-27 06:54:43.704088300 UTC, which is the DOS 06:54:42 plus both
-/// parts, and rars now agrees to the nanosecond.
+/// parts, and rars agrees to the nanosecond.
 #[test]
 fn decodes_the_extended_modification_time() {
     let bytes = std::fs::read(fixture("rar420/ext_time_rar420.rar")).unwrap();
@@ -3433,10 +3433,7 @@ fn solid_rar29_explicit_filter_codes_members_into_one_chain() {
     assert_eq!(extracted[2].data, second_data);
 }
 
-/// `--no-filter` reaches the writer as a filter policy, and only an explicit
-/// filter was routed through the solid chain, so asking for no filter used to
-/// cost the whole benefit of `--solid` while the members still claimed to
-/// continue a chain that was never built.
+/// `--no-filter` reaches the writer as a filter policy.
 #[test]
 #[cfg(feature = "write")]
 fn a_solid_chain_survives_asking_for_no_filter() {
@@ -3483,8 +3480,7 @@ fn a_solid_chain_survives_asking_for_no_filter() {
 }
 
 /// An explicit filter over a zero-byte member asks for a 0..0 range, which the
-/// codec refuses. One empty file in a directory used to compress every other
-/// member and then fail at the last step, writing no archive at all.
+/// codec refuses.
 #[test]
 #[cfg(feature = "write")]
 fn an_empty_member_is_written_under_every_explicit_filter() {
@@ -3612,8 +3608,6 @@ fn an_empty_member_keeps_a_filtered_solid_chain_intact() {
     assert_eq!(extracted[2].data, payload);
 }
 
-/// A filtered member used to be coded on its own whatever the archive said,
-/// while its header still claimed to continue the chain.
 #[test]
 #[cfg(feature = "write")]
 fn a_solid_rar29_chain_survives_a_filter_and_stays_solid() {
@@ -3735,9 +3729,8 @@ fn solid_rar29_entries<'a>(first: &'a [u8], second: &'a [u8]) -> [FileEntry<'a>;
     ]
 }
 
-/// A solid archive used to refuse the search outright, on the grounds that a
-/// candidate can only be measured against the history behind it. It can be:
-/// the chain codes each one for real and keeps the smallest.
+/// A candidate can only be measured against the history behind it, so the
+/// chain codes each one for real and keeps the smallest.
 #[test]
 #[cfg(feature = "write")]
 fn a_solid_rar29_chain_searches_for_a_filter() {
@@ -4062,9 +4055,9 @@ fn rar29_family_writer_levels_increase_lz_match_effort() {
 /// floored at what the target's decoders expect. The pairs below are what
 /// WinRAR declares for members of that size in our own fixtures.
 ///
-/// A fixed default was wrong in both directions. 128K lost half the ratio on
-/// content whose repeats sit further apart than that, and RAR 2.9's old 1M
-/// default made a reader allocate a megabyte to unpack thirty bytes.
+/// A fixed default is wrong in both directions: 128K loses half the ratio on
+/// content whose repeats sit further apart, and 1M makes a reader allocate a
+/// megabyte to unpack thirty bytes.
 #[test]
 #[cfg(feature = "write")]
 fn the_writer_fits_the_dictionary_to_the_member() {
@@ -4480,10 +4473,9 @@ fn auto_filtered_rar29_writer_spans_separated_x86_call_clusters() {
     assert_eq!(collect_extract(&auto).unwrap()[0].data, payload);
 }
 
-/// The method byte names the level, not the engine. It used to be stamped 0x35
-/// for every PPMd payload, which was only ever right at level 5: WinRAR 3.00
-/// writes 0x34 on the PPMd archive it produces at -m4, and RAR 2.9 signals the
-/// engine inside the stream, which is why our decoder takes no method byte.
+/// The method byte names the level, not the engine: WinRAR 3.00 writes 0x34
+/// on the PPMd archive it produces at -m4, and RAR 2.9 signals the engine
+/// inside the stream, which is why our decoder takes no method byte.
 #[test]
 #[cfg(feature = "write")]
 fn ppmd_rar29_writer_stamps_the_level_and_still_reads_back_as_ppmd() {
@@ -4983,9 +4975,8 @@ fn writes_stored_rar15_volume_set_that_reader_reassembles() {
     assert_eq!(extracted[0].data, entry.data);
 }
 
-/// Compressing well enough to need only one volume used to be an error, so a
-/// script with a fixed `--volume-size` could start failing because compression
-/// improved. RAR 5 always wrote the single volume; the legacy writers refused.
+/// A script with a fixed `--volume-size` must not start failing because
+/// compression improved.
 #[test]
 #[cfg(feature = "write")]
 fn a_volume_set_that_fits_in_one_volume_is_written_not_refused() {
@@ -5736,8 +5727,7 @@ fn extracts_rars_generated_rar15_encrypted_volume_oracle() {
     assert_eq!(encrypted[0].data, RARS_GENERATED_PAYLOAD);
 }
 
-/// RAR 1.5 has no header encryption, and used to be told so only by a message
-/// naming neither the option nor a format that does support it.
+/// RAR 1.5 has no header encryption, and the error says so by name.
 #[test]
 #[cfg(all(feature = "write", feature = "encryption"))]
 fn rar15_writer_rejects_header_encryption_by_name() {
@@ -8426,8 +8416,6 @@ fn expected_rar250_big_lz_payload() -> Vec<u8> {
     data
 }
 
-/// The engine and the filter used to be one five-variant enum, so some pairings
-/// could not be asked for at all. These are the ones that were missing.
 #[test]
 #[cfg(feature = "write")]
 fn rar29_chooses_engine_and_filter_independently() {
@@ -8485,9 +8473,7 @@ fn rar29_chooses_engine_and_filter_independently() {
     );
 }
 
-/// The automatic search now emits one filter per merged code region, which is a
-/// shape the RarVM program emitter never saw while the two copies of the range
-/// merger disagreed and this one dropped overlaps instead of merging them.
+/// The automatic search emits one filter per merged code region.
 #[test]
 #[cfg(feature = "write")]
 fn rar29_auto_filter_round_trips_a_member_with_two_distant_code_regions() {
@@ -8520,8 +8506,8 @@ fn rar29_auto_filter_round_trips_a_member_with_two_distant_code_regions() {
     assert_eq!(collect_extract(&archive).unwrap()[0].data, payload);
 }
 
-/// A filter whose chunking left a remainder shorter than its own scanline width
-/// used to fail the whole write. Those bytes are simply left unfiltered now.
+/// A chunking remainder shorter than the filter's scanline width is left
+/// unfiltered.
 #[test]
 #[cfg(feature = "write")]
 fn rar29_rgb_filter_handles_a_length_that_leaves_a_short_trailing_chunk() {

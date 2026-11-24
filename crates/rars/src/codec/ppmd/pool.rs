@@ -50,8 +50,7 @@ mod imp {
     use memmap2::{MmapMut, MmapOptions};
 
     /// Even an empty pool is a mapping (memmap2 maps a page for it), so the
-    /// model's every access reaches the slice without a branch: holding an
-    /// `Option` instead cost 3% of PPMd decoding time.
+    /// model's every access reaches the slice without a branch.
     pub(super) struct Pool(MmapMut);
 
     impl Pool {
