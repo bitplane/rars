@@ -239,8 +239,8 @@ mod splitter_tests {
 /// encoder chooses can outgrow it.
 pub(crate) fn packed_most(input_size: u64) -> u64 {
     // The encoder never codes an empty block but perhaps the last, and gives a
-    // block no more filter records than it has bytes: one at most, or in a
-    // solid run one per disjoint filtered range. A block is five header bytes
+    // block no more filter records than it has bytes: each covers at least
+    // one byte of its block, and the filtered ranges are disjoint. A block is five header bytes
     // and at most 1,248 bytes of tables: twenty level lengths of eight bits,
     // 446 lengths of a fifteen-bit code and seven extra bits, and byte padding.
     const BLOCK_MOST: u64 = 5 + 1_248;
@@ -253,25 +253,26 @@ pub(crate) fn packed_most(input_size: u64) -> u64 {
         .saturating_mul(BLOCK_MOST + 2 * TOKEN_MOST)
 }
 
+/// The most bytes one filter record is given to cover. A longer filtered range
+/// goes out as several records.
 const MAX_FILTER_BLOCK_LENGTH: usize = 0x3ffff;
+
+/// The most bytes a member's filter record covers.
+///
+/// A member's filters are cut at every multiple of this from the start of the
+/// data, and each piece is a record (see [`filter_cells_in_place`]). Blocks
+/// are cut on the same grid, so no piece straddles one. A reader holds a
+/// record's bytes twice while it filters them, so this sets how much filter
+/// memory it needs, and readers can be given a limit on it. WinRAR 7.12
+/// writes no longer record.
+const FILTER_CELL: usize = LZ_BLOCK_SIZE;
+
+const _: () =
+    assert!(FILTER_CELL <= MAX_FILTER_BLOCK_LENGTH && LZ_BLOCK_SIZE.is_multiple_of(FILTER_CELL));
 
 /// The most channels a RAR 5 delta filter record can name. The count is written
 /// as five bits biased by one, so this is what the format can say, not a policy.
 pub(crate) const MAX_DELTA_CHANNELS: usize = 32;
-
-/// How much input goes into one compressed block once a filter is carried.
-///
-/// A filter record cannot describe more than [`MAX_FILTER_BLOCK_LENGTH`] bytes,
-/// so this is the smaller of that ceiling and the plain block size. Splitting a
-/// filtered range across blocks costs one more record per block and converts
-/// the same bytes either way: the transform reads an absolute file offset, and
-/// an instruction straddling a boundary was already left alone at the old
-/// 256 KiB one.
-const FILTERED_LZ_BLOCK_SIZE: usize = if LZ_BLOCK_SIZE < MAX_FILTER_BLOCK_LENGTH {
-    LZ_BLOCK_SIZE
-} else {
-    MAX_FILTER_BLOCK_LENGTH
-};
 
 /// Where the encoder stops looking for anything better.
 ///
@@ -1059,7 +1060,7 @@ pub(crate) fn filtered_run_bytes<B: Budget>(
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
     let mut filtered = Buffer::copied(data, allowance)?;
-    filter_blocks_in_place(&mut filtered, filters, file_offset, allowance)?;
+    filter_cells_in_place(&mut filtered, filters, file_offset, allowance)?;
     Ok(filtered)
 }
 
@@ -1270,50 +1271,84 @@ fn filtered_lz_blocks<B: Budget>(
 
 type FilteredBlocks<B> = Buffer<(Range<usize>, Buffer<EncodeFilter, B>), B>;
 
-/// Transforms `data`, which starts `file_offset` bytes into its member, one
-/// [`FILTERED_LZ_BLOCK_SIZE`] block at a time, which is how the decoder undoes
-/// it: a filter record covers one block, so an x86 call or a delta plane that
-/// straddles a cut converts on each side separately. Returns each block's range
-/// and records.
+/// Transforms `data`, which starts `file_offset` bytes into its member, and
+/// cuts it into the blocks it is coded in. Returns each block's range and
+/// records.
+///
+/// The blocks are the ones the member would be cut into unfiltered (see
+/// [`MemberBlocks`]), judged on the bytes as they were before the transform,
+/// as the streaming writer judges them when it reads the member. The
+/// transform is [`filter_cells_in_place`]'s, which does not depend on where
+/// the blocks fall, so a filter costs its member no blocks of its own, only
+/// a few bytes of record for each [`FILTER_CELL`] it covers.
 fn filter_blocks_in_place<B: Budget>(
     data: &mut [u8],
     filters: &[crate::FilterSpec],
     file_offset: usize,
     allowance: &B,
 ) -> Result<FilteredBlocks<B>> {
+    // Every cut is decided before any byte is transformed.
+    let cuts = Buffer::collect(MemberBlocks::new(data, 0), allowance)?;
+    let mut records = filter_cells_in_place(data, filters, file_offset, allowance)?
+        .into_iter()
+        .peekable();
+    let mut blocks = Buffer::with_capacity(cuts.len(), allowance)?;
+    for block in cuts {
+        let mut own = Buffer::new(allowance);
+        // Blocks are cut on the cell grid, so a cell's records all fall in
+        // one block.
+        while let Some(record) = records.next_if(|record| record.offset < block.end) {
+            own.push(EncodeFilter {
+                offset: record.offset - block.start,
+                ..record
+            })
+            .map_err(Into::into)?;
+        }
+        blocks.push_admitted((block, own));
+    }
+    Ok(blocks)
+}
+
+/// Transforms `data`, which starts `file_offset` bytes into its member, one
+/// [`FILTER_CELL`] at a time. Each filter is cut at every multiple of a cell
+/// from the start of `data`, and each piece converts on its own and gets a
+/// record of its own, which is how the decoder undoes it: an x86 call or a
+/// delta plane that straddles a cut converts on each side separately.
+/// Returns the records, with offsets into `data`, in the order the decoder
+/// meets them.
+fn filter_cells_in_place<B: Budget>(
+    data: &mut [u8],
+    filters: &[crate::FilterSpec],
+    file_offset: usize,
+    allowance: &B,
+) -> Result<Buffer<EncodeFilter, B>> {
     let filters = normalized_filter_specs(data.len(), filters, allowance)?;
-    let mut blocks = Buffer::new(allowance);
-    let mut chunk_start = 0usize;
-    while chunk_start < data.len() {
-        let chunk_end = (chunk_start + FILTERED_LZ_BLOCK_SIZE).min(data.len());
-        let mut records = Buffer::new(allowance);
+    let mut records = Buffer::new(allowance);
+    for cell_start in (0..data.len()).step_by(FILTER_CELL) {
+        let cell_end = (cell_start + FILTER_CELL).min(data.len());
         for filter in filters.iter() {
-            let filter_start = filter.range.start.max(chunk_start);
-            let filter_end = filter.range.end.min(chunk_end);
-            if filter_start >= filter_end {
+            let start = filter.range.start.max(cell_start);
+            let end = filter.range.end.min(cell_end);
+            if start >= end {
                 continue;
             }
             let (filter_type, channels) = encode_filter_data(
                 filter.kind,
-                &mut data[filter_start..filter_end],
-                file_offset + filter_start,
+                &mut data[start..end],
+                file_offset + start,
                 allowance,
             )?;
             records
                 .push(EncodeFilter {
-                    offset: filter_start - chunk_start,
-                    length: filter_end - filter_start,
+                    offset: start,
+                    length: end - start,
                     filter_type,
                     channels,
                 })
                 .map_err(Into::into)?;
         }
-        blocks
-            .push((chunk_start..chunk_end, records))
-            .map_err(Into::into)?;
-        chunk_start = chunk_end;
     }
-    Ok(blocks)
+    Ok(records)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2617,7 +2652,7 @@ impl<B: Budget> EncoderState<B> {
                 progress,
                 &allowance,
             )?,
-            Some(filters) if input.len() > FILTERED_LZ_BLOCK_SIZE => filtered_lz_blocks(
+            Some(filters) if input.len() > LZ_BLOCK_SIZE => filtered_lz_blocks(
                 input,
                 filters,
                 &self.history,
