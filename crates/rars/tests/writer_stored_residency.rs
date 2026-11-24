@@ -2,7 +2,7 @@
 
 //! A stored member is copied through, never loaded: whatever the format, the
 //! writer reads no further ahead of its output than its copy buffers. This pins
-//! the "stored" column of `docs/writer-limits.md`.
+//! the stored row of `docs/writer-limits.md`.
 
 use rars::{ArchiveVersion, Builder, EntrySource, WriterResources};
 use std::io::{Read, Seek, SeekFrom, Write};
