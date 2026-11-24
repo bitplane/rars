@@ -8,10 +8,13 @@
 // The model is consistent whatever the input: input only chooses symbols.
 // So pool indexing never fails on corrupt data, and a failing index is a bug.
 
+mod pool;
+
 #[cfg(any(test, feature = "write"))]
 use super::workspace::Allowance;
 use super::workspace::Budget;
 use super::{Error, Result};
+use pool::Pool;
 
 const MAX_FREQ: u32 = 124;
 const UNIT_SIZE: u32 = 12;
@@ -116,9 +119,10 @@ impl RangeDecoder {
 
 #[derive(Debug)]
 pub(crate) struct Ppmd7<B: Budget> {
-    // The pool, reserved at its declared size. Untouched pages cost nothing,
-    // so the budget is charged only for what the model has reached.
-    mem: Vec<u8>,
+    // The pool, reserved at its declared size. Untouched pages cost nothing
+    // (see `pool`), so the budget is charged only for what the model has
+    // reached.
+    mem: Pool,
     charge: B::Charge,
     charged: u64,
     // The furthest each region has reached since the pool was allocated. Its
@@ -203,7 +207,7 @@ impl<B: Budget> Ppmd7<B> {
             }
         }
         Self {
-            mem: Vec::new(),
+            mem: Pool::empty(),
             charge: allowance.charge(),
             charged: 0,
             text_peak: 0,
@@ -259,7 +263,7 @@ impl<B: Budget> Ppmd7<B> {
         // Only the text, the units in use and the contexts carry data.
         let mut charge = B::allowance(&self.charge).charge();
         B::resize(&mut charge, self.charged)?;
-        let mut mem = vec![0u8; self.mem.len()];
+        let mut mem = Pool::zeroed(self.mem.len());
         for range in [
             0..self.text as usize,
             self.units_start as usize..self.lo_unit as usize,
@@ -304,11 +308,11 @@ impl<B: Budget> Ppmd7<B> {
             // Until the new model is charged there is none to continue.
             self.allocated = false;
             if self.size != size || self.mem.is_empty() {
-                self.mem = Vec::new();
+                self.mem = Pool::empty();
                 B::resize(&mut self.charge, 0)?;
                 self.charged = 0;
                 self.align = 4u32.wrapping_sub(size) & 3;
-                self.mem = vec![0u8; (self.align + size) as usize];
+                self.mem = Pool::zeroed((self.align + size) as usize);
                 self.size = size;
             }
             self.max_order = max_order;
@@ -1295,7 +1299,7 @@ impl Ppmd7<Allowance> {
         let mut model = Self::with_allowance(&Allowance::default());
         let size = (dictionary_mb as u32) << 20;
         model.align = 4u32.wrapping_sub(size) & 3;
-        model.mem = vec![0u8; (model.align + size) as usize];
+        model.mem = Pool::zeroed((model.align + size) as usize);
         model.size = size;
         model.max_order = max_order as u32;
         model.restart_model();
