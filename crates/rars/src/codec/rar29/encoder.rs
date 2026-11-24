@@ -74,6 +74,95 @@ const PPMD_CONTEXT_BREAK_BITS: f64 = 64.0;
 const PPMD_REJECT_SEARCH_COOLDOWN: usize = 8;
 
 type Rar29MatchFinder = match_finder::MatchFinder<4>;
+/// Chains keyed on six bytes, for a parse that walks only a few candidates.
+type Rar29LongMatchFinder = match_finder::MatchFinder<6>;
+
+/// The most candidates a parse walks for its chains to key on six bytes.
+///
+/// A chain holds every earlier position that shares its key, newest first, and
+/// a parse that walks eight or sixteen of them never gets past the newest. On
+/// text the newest positions sharing four bytes are spaces, indentation and
+/// common words, which match four to eight bytes, and the copy that runs on
+/// for thirty is further down. Keyed on six bytes a chain holds far fewer of
+/// those, so the same walk reaches back to it. The four- and five-byte matches
+/// it can no longer offer come from [`NearMatches`] instead.
+///
+/// On 4 MiB of source, rar 3.93 `-m2` packs 693,278 bytes in 0.09 s. Keyed on
+/// four, the lazy parse needs about 1,024 candidates to get there, and takes
+/// 1.3 s. Levels 1 and 2 walk 8 and 16:
+///
+/// ```text
+///                      level 1     level 2
+/// keyed on four        811,771     755,045
+/// keyed on six         773,677     736,079
+///   and near matches   760,220     724,398
+/// ```
+///
+/// Keyed on six bytes, executables came out up to 3% larger without the near
+/// matches, which take that back and more. The near matches are most of the
+/// time this costs, since every position goes into their table: on the release
+/// bench's 32 MiB tars at one thread, level 1 takes 20% and 23% longer on text
+/// and executables, and level 2 6% and 11%.
+///
+/// Level 3 walks 64 candidates, and executables still came out larger there
+/// keyed on six. A short member is left keyed on four (see
+/// [`LONG_KEY_MIN_SPAN`]).
+const LONG_KEY_MAX_CANDIDATES: usize = 16;
+
+/// How many bytes a member and the history before it must span for its
+/// chains to key on six bytes.
+///
+/// A member of a few tens of kilobytes keeps its chains short enough to walk
+/// in full, and keyed on six the corpus's small text classes came out up to
+/// 0.7% larger at level 2, all of it four- and five-byte matches further back
+/// than the near matches reach.
+const LONG_KEY_MIN_SPAN: usize = 1024 * 1024;
+
+/// Whether a parse searching `options` walks few enough candidates to key its
+/// chains on six bytes over a long span, and so keeps near matches at any
+/// span. One refined by shortest path keeps four-byte chains, which it prices
+/// from.
+fn walks_few(options: EncodeOptions) -> bool {
+    (1..=LONG_KEY_MAX_CANDIDATES).contains(&options.max_match_candidates)
+        && options.optimal_parse_passes == 0
+}
+
+/// Whether a member spanning `span` bytes with the history it reaches keys its
+/// chains on six bytes. Judged from lengths alone, so a member parses the same
+/// read whole or in segments.
+fn keys_long(options: EncodeOptions, span: usize) -> bool {
+    walks_few(options) && span >= LONG_KEY_MIN_SPAN
+}
+
+/// The chains a parse walks, keyed as [`keys_long`] says.
+enum ChainFinder {
+    Short(Rar29MatchFinder),
+    Long(Rar29LongMatchFinder),
+}
+
+impl ChainFinder {
+    fn for_reach(window: usize, reach: usize, long: bool) -> Self {
+        match long {
+            true => Self::Long(Rar29LongMatchFinder::for_reach(window, reach)),
+            false => Self::Short(Rar29MatchFinder::for_reach(window, reach)),
+        }
+    }
+
+    fn insert(&mut self, input: &[u8], pos: usize) {
+        match self {
+            Self::Short(finder) => finder.insert(input, pos),
+            Self::Long(finder) => finder.insert(input, pos),
+        }
+    }
+
+    #[cfg(test)]
+    fn window(&self) -> usize {
+        match self {
+            Self::Short(finder) => finder.window(),
+            Self::Long(finder) => finder.window(),
+        }
+    }
+}
 /// PPMd takes only 32-byte matches; a 4-byte key fills text chains with words that never get there.
 type PpmdMatchFinder = match_finder::MatchFinder<MIN_PPMD_MATCH_LENGTH>;
 
@@ -84,11 +173,19 @@ trait Candidates {
     fn insert(&mut self, input: &[u8], pos: usize);
     /// The newest candidate before `pos`, once `pos` itself has been inserted.
     fn before(&self, pos: usize) -> usize;
+    /// How many bytes a position's chain is keyed on. A position with fewer
+    /// left before its block ends is not looked up: whether it was inserted
+    /// depends on where the bytes in hand end, which is not where the block does.
+    fn key(&self) -> usize;
 }
 
 impl<const MIN_MATCH: usize> Candidates for match_finder::MatchFinder<MIN_MATCH> {
     fn first(&self, input: &[u8], pos: usize, _limit: usize) -> usize {
         match_finder::MatchFinder::first(self, input, pos)
+    }
+
+    fn key(&self) -> usize {
+        MIN_MATCH
     }
 
     fn before(&self, pos: usize) -> usize {
@@ -109,6 +206,10 @@ struct FilledAhead<'a, const MIN_MATCH: usize = 4>(&'a match_finder::MatchFinder
 impl<const MIN_MATCH: usize> Candidates for FilledAhead<'_, MIN_MATCH> {
     fn first(&self, _input: &[u8], pos: usize, limit: usize) -> usize {
         self.0.first_before(pos, limit)
+    }
+
+    fn key(&self) -> usize {
+        MIN_MATCH
     }
 
     fn previous(&self, candidate: usize) -> usize {
@@ -798,6 +899,10 @@ pub struct EncodeOptions {
     /// Whether the lazy parse also takes three-byte matches under 8 KiB and
     /// repeats of two or three bytes at a remembered offset, which its
     /// four-byte chains cannot offer. A greedy parse ignores it.
+    ///
+    /// A parse whose chains key on six bytes (at most
+    /// [`LONG_KEY_MAX_CANDIDATES`] candidates) keeps near matches whatever
+    /// this says, since they are where its short matches come from.
     pub near_matches: bool,
     /// In a block that looks random, how many positions in a row may offer no
     /// match before the parse looks only at every other one, then every third
@@ -1733,6 +1838,7 @@ fn for_each_block(
             .div_ceil(per_batch * block_size)
             .max(1);
     let mut block_start = 0;
+    let mut long = None;
     for segment in ends.chunks(per_segment) {
         let segment_end = *segment.last().expect("chunks are never empty");
         let behind = reach.min(block_start);
@@ -1741,7 +1847,9 @@ fn for_each_block(
             records,
         } = input.segment(block_start, behind, segment_end, reach)?;
         let base = combined.len() - (segment_end - block_start);
-        let mut parser = LzParser::new(&combined, base, options, block_size);
+        // The first segment starts with all the history the member reaches.
+        let long = *long.get_or_insert_with(|| keys_long(options, len + base));
+        let mut parser = LzParser::new(&combined, base, options, block_size, long);
         let origin = block_start;
         let local = |end: usize| base + end - origin;
         let batches: Vec<&[usize]> = segment.chunks(per_batch).collect();
@@ -2626,18 +2734,16 @@ fn parse_member(
     let combined = with_history(history, input, options);
     let start = combined.len() - input.len();
     let reach = options.max_match_distance.min(MAX_HISTORY);
-    let mut finder = Rar29MatchFinder::for_reach(reach, reach);
+    let long = keys_long(options, input.len() + start.min(reach));
+    let mut finder = ChainFinder::for_reach(reach, reach, long);
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
     }
-    parse_block(
-        &combined,
-        start,
-        combined.len(),
-        &mut finder,
-        options,
-        progress,
-    )
+    let end = combined.len();
+    match &mut finder {
+        ChainFinder::Short(finder) => parse_block(&combined, start, end, finder, options, progress),
+        ChainFinder::Long(finder) => parse_block(&combined, start, end, finder, options, progress),
+    }
 }
 
 fn with_history<'a>(
@@ -2662,7 +2768,7 @@ struct LzParser<'a> {
     parsed: usize,
     filled: usize,
     batch_bytes: usize,
-    finder: Rar29MatchFinder,
+    finder: ChainFinder,
     options: EncodeOptions,
 }
 
@@ -2674,7 +2780,14 @@ impl<'a> LzParser<'a> {
             .max(block_size)
     }
 
-    fn new(data: &'a [u8], start: usize, options: EncodeOptions, block_size: usize) -> Self {
+    /// `long` is [`keys_long`] for the whole member, which a segment of it cannot judge.
+    fn new(
+        data: &'a [u8],
+        start: usize,
+        options: EncodeOptions,
+        block_size: usize,
+        long: bool,
+    ) -> Self {
         let reach = options.max_match_distance.min(MAX_HISTORY);
         let batch_bytes = Self::batch_bytes(block_size);
         // Reach plus a batch, so filling a batch only overwrites links nothing
@@ -2682,7 +2795,7 @@ impl<'a> LzParser<'a> {
         // none. A batch is megabytes at any thread count: clearing links for
         // one was most of the time spent on a member of a few kilobytes.
         let window = reach.saturating_add(batch_bytes).min(data.len());
-        let mut finder = Rar29MatchFinder::for_reach(window, reach);
+        let mut finder = ChainFinder::for_reach(window, reach, long);
         for history_pos in 0..start {
             finder.insert(data, history_pos);
         }
@@ -2712,8 +2825,17 @@ impl<'a> LzParser<'a> {
     fn fill_to(&mut self, last: usize) {
         debug_assert!(self.filled == self.parsed);
         debug_assert!(last - self.filled <= self.batch_bytes);
-        for pos in self.filled..last {
-            self.finder.insert(self.data, pos);
+        match &mut self.finder {
+            ChainFinder::Short(finder) => {
+                for pos in self.filled..last {
+                    finder.insert(self.data, pos);
+                }
+            }
+            ChainFinder::Long(finder) => {
+                for pos in self.filled..last {
+                    finder.insert(self.data, pos);
+                }
+            }
         }
         self.filled = last;
     }
@@ -2729,18 +2851,30 @@ impl<'a> LzParser<'a> {
             .chain(ends[..ends.len() - 1].iter().copied())
             .zip(ends.iter().copied())
             .collect();
-        let (data, options, finder) = (self.data, self.options, &self.finder);
-        let parse = |(start, end): (usize, usize)| {
-            parse_block(data, start, end, &mut FilledAhead(finder), options, None)
-        };
-        if !crate::parallel::may_nest() {
-            return ranges.into_iter().map(parse).collect();
+        let (data, options) = (self.data, self.options);
+        match &self.finder {
+            ChainFinder::Short(finder) => parse_ranges(ranges, |(start, end)| {
+                parse_block(data, start, end, &mut FilledAhead(finder), options, None)
+            }),
+            ChainFinder::Long(finder) => parse_ranges(ranges, |(start, end)| {
+                parse_block(data, start, end, &mut FilledAhead(finder), options, None)
+            }),
         }
-        // A failure must not leave the blocks after it out of the member.
-        match crate::parallel::map_prefix(ranges, parse) {
-            (_, Some(error)) => Err(error),
-            (pieces, None) => Ok(pieces),
-        }
+    }
+}
+
+/// Parses each block, side by side when this thread may fan out.
+fn parse_ranges(
+    ranges: Vec<(usize, usize)>,
+    parse: impl Fn((usize, usize)) -> Result<Vec<Piece>> + Sync + Send,
+) -> Result<Vec<Vec<Piece>>> {
+    if !crate::parallel::may_nest() {
+        return ranges.into_iter().map(parse).collect();
+    }
+    // A failure must not leave the blocks after it out of the member.
+    match crate::parallel::map_prefix(ranges, parse) {
+        (_, Some(error)) => Err(error),
+        (pieces, None) => Ok(pieces),
     }
 }
 
@@ -2878,11 +3012,19 @@ fn parse_range<C: Candidates>(
     let mut next_report = 0usize;
     let mut pending_match: Option<MatchCandidate> = None;
     let mut pos = start;
+    // Judged from the block's own bytes, so a block parses the same wherever
+    // the member is cut.
+    let random = std::cell::OnceCell::new();
+    let looks_random = || *random.get_or_init(|| NearMatches::looks_random(&data[start..end]));
+    // A parse that walks few candidates keeps near matches for the four- and
+    // five-byte matches a six-byte key cannot offer, and at short spans because
+    // they paid there too. Not in a block that looks random, at any level: on
+    // the release bench's 32 MiB of compressed files they took level 2 from
+    // 32,177,760 bytes to 32,119,035 for 46% more time.
+    let near_pays =
+        (walks_few(options) || (options.lazy_matching && options.near_matches)) && !looks_random();
     // Filled from the history a near match can reach, so a block parses the
     // same whether the bytes before it were parsed in this call or another.
-    let near_pays = options.lazy_matching
-        && options.near_matches
-        && !NearMatches::looks_random(&data[start..end]);
     let mut near = near_pays.then(|| {
         let mut near = NearMatches::new();
         for history_pos in start.saturating_sub(MAX_THREE_BYTE_OFFSET)..start {
@@ -2890,11 +3032,9 @@ fn parse_range<C: Candidates>(
         }
         near
     });
-    // Judged from the block's own bytes, like the near matches, so a block
-    // parses the same wherever the member is cut.
     let skip_after = options
         .skip_literal_runs
-        .filter(|_| order0_entropy(&data[start..end]) > SKIP_RANDOM_ABOVE_BITS)
+        .filter(|_| looks_random())
         .map(|misses| misses.max(1));
     let mut misses = 0usize;
     let insert = |finder: &mut C, near: &mut Option<NearMatches>, pos: usize| {
@@ -3430,13 +3570,19 @@ fn best_match(
 /// The newest position of each three-byte hash, for the matches the
 /// four-byte chains cannot offer: three bytes under 8 KiB.
 ///
-/// Only the lazy parse keeps it. The shortest-path parse finds these matches
-/// its own way, and the levels that ask for it beat a lazy parse without them
-/// by 4% to 7% on binaries, much of which this takes back: on a 4 MiB shared
-/// object, with repeats of two and three bytes as well, the lazy parse at
-/// level 3 comes out 1.45 MB against 1.51 MB, and rar 3.93 `-m3` packs
-/// 1.45 MB. A greedy parse has no second look to undo a short match that costs
-/// it a longer one next, so it goes without.
+/// The lazy parse keeps it when asked. The shortest-path parse finds these
+/// matches its own way, and the levels that ask for it beat a lazy parse
+/// without them by 4% to 7% on binaries, much of which this takes back: on a
+/// 4 MiB shared object, with repeats of two and three bytes as well, the lazy
+/// parse at level 3 comes out 1.45 MB against 1.51 MB, and rar 3.93 `-m3`
+/// packs 1.45 MB. A greedy parse has no second look to undo a short match that
+/// costs it a longer one next, so it goes without three-byte ones.
+///
+/// A parse with chains keyed on six bytes always keeps it, for the four- and
+/// five-byte matches those chains cannot offer, greedy or not (see
+/// [`LONG_KEY_MAX_CANDIDATES`]). The newest copy under 8 KiB is most of what
+/// they were worth: a greedy parse takes it from four bytes, as its chains
+/// did.
 ///
 /// Two-byte matches at short offsets were offered too, and dropped. The lazy
 /// parse prices a literal at eight bits, so every one of them looked cheaper
@@ -3481,7 +3627,7 @@ impl NearMatches {
     /// tar of compressed files at level 3 that cost 15% more time for 0.11%,
     /// where executables gain 2.3% for 6%.
     fn looks_random(block: &[u8]) -> bool {
-        block.is_empty() || order0_entropy(block) > 7.5
+        block.is_empty() || order0_entropy(block) > SKIP_RANDOM_ABOVE_BITS
     }
 
     /// The newest earlier position sharing `pos`'s three-byte hash.
@@ -3558,9 +3704,17 @@ fn best_match_before<C: Candidates>(
     let shares_prefix = |candidate: usize| {
         u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap()) == prefix
     };
-    // A remembered offset codes a repeat as short as two bytes, which a parse
-    // keeping near matches takes where it prices in.
-    let min_repeat = if near.is_some() { 2 } else { MIN_CHAIN_MATCH };
+    // A remembered offset codes a repeat as short as two bytes, which a lazy
+    // parse keeping near matches takes where it prices in. A greedy one takes
+    // near matches only as long as its chains would have offered.
+    let near_min = match options.lazy_matching {
+        true => 3,
+        false => MIN_CHAIN_MATCH,
+    };
+    let min_repeat = match near {
+        Some(_) if options.lazy_matching => 2,
+        _ => MIN_CHAIN_MATCH,
+    };
     for offset in state.old_offsets {
         if offset == 0 || offset > max_offset {
             continue;
@@ -3581,7 +3735,10 @@ fn best_match_before<C: Candidates>(
             return Some(best);
         }
     }
-    let mut candidate = finder.first(input, pos, limit);
+    let mut candidate = match max_length >= finder.key() {
+        true => finder.first(input, pos, limit),
+        false => match_finder::NO_POSITION,
+    };
     while candidate != match_finder::NO_POSITION {
         // MatchFinder chains contain only previously inserted positions and
         // each link moves strictly backwards.
@@ -3613,7 +3770,7 @@ fn best_match_before<C: Candidates>(
                 && input[from..from + 3] == input[pos..pos + 3]
             {
                 let length = match_length(input, pos, offset, max_length);
-                consider_match_candidate(&mut best, state, length, offset, 3);
+                consider_match_candidate(&mut best, state, length, offset, near_min);
             }
         }
     }
