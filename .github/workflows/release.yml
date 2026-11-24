@@ -400,6 +400,11 @@ jobs:
         with:
           targets: ${{ matrix.rust-targets }}
 
+      # pyproject.toml builds Linux wheels with build[uv], and cibuildwheel
+      # then repairs them in a uv virtualenv on the host.
+      - uses: astral-sh/setup-uv@v10.4.0
+        if: runner.os == 'Linux'
+
       - uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
