@@ -3572,20 +3572,35 @@ fn validate_header_encrypted_archive_options(
 /// times the lazy parse, so it takes the top two levels, which differ in how
 /// far they search and how often they re-price.
 ///
+/// From level 3 the lazy parse also takes the short matches its chains cannot
+/// offer (see `NearMatches`): on a 32 MiB tar of executables at level 3,
+/// 10,617,761 bytes became 10,335,057 for 8% more time. Levels 1 and 2 go
+/// without. They are there to be fast, and they already take longer than rar
+/// 3.93's `-m1` and `-m2` on the same tar, 1.17 s against 0.33 s and 1.96 s
+/// against 1.03 s at one thread. Lazy with eight candidates and the short
+/// matches would take level 1 to 10,619,423 bytes in 1.56 s, and level 2 at
+/// 64 candidates to 10,335,057 in 3.11 s.
+///
 /// An absent level keeps the lazy parse at 128 candidates the writer has
 /// always used, rather than paying for level 5's.
 fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOptions> {
     let options = match level {
-        None => Rar29EncodeOptions::new(128).with_lazy_matching(true),
+        None => Rar29EncodeOptions::new(128)
+            .with_lazy_matching(true)
+            .with_near_matches(true),
         Some(0) => Rar29EncodeOptions::new(0),
         Some(1) => Rar29EncodeOptions::new(8),
         Some(2) => Rar29EncodeOptions::new(16).with_lazy_matching(true),
-        Some(3) => Rar29EncodeOptions::new(64).with_lazy_matching(true),
+        Some(3) => Rar29EncodeOptions::new(64)
+            .with_lazy_matching(true)
+            .with_near_matches(true),
         Some(4) => Rar29EncodeOptions::new(64)
             .with_lazy_matching(true)
+            .with_near_matches(true)
             .with_optimal_parse_passes(1),
         Some(5) => Rar29EncodeOptions::new(128)
             .with_lazy_matching(true)
+            .with_near_matches(true)
             .with_optimal_parse_passes(3),
         Some(_) => {
             return Err(Error::InvalidArgument(
