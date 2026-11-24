@@ -4968,6 +4968,131 @@ fn members_parsed_in_segments_code_to_the_serial_parse_bytes() {
     assert_eq!(packed_fingerprint(&continued), (73_398, 3_211_860_258));
 }
 
+/// Chains keyed on four bytes fill with the newest positions sharing a
+/// phrase's first bytes, and a walk of 16 never gets past them to the copy that
+/// runs on. Keyed on six, the decoys share no chain with it.
+#[test]
+fn a_long_key_reaches_the_copy_that_runs_on() {
+    let phrase = b"fn decode_member_to(&mut self, input: &[u8], size: usize) -> Result<()>\n";
+    let mut input = phrase.to_vec();
+    for index in 0..200u32 {
+        // The phrase's first five bytes, then something else. Five, so that
+        // looking one byte ahead meets decoys too.
+        input.extend_from_slice(format!("fn de{index:04}#").as_bytes());
+    }
+    // Nothing before the second copy matches into it.
+    input.push(b'@');
+    let at = input.len();
+    input.extend_from_slice(phrase);
+    let options = EncodeOptions::new(16).with_lazy_matching(true);
+    assert!(super::walks_few(options));
+
+    let parsed_at = |long: bool| {
+        let pieces = match long {
+            true => super::parse_block(
+                &input,
+                0,
+                input.len(),
+                &mut super::Rar29LongMatchFinder::for_reach(input.len(), input.len()),
+                options,
+                None,
+            ),
+            false => super::parse_block(
+                &input,
+                0,
+                input.len(),
+                &mut Rar29MatchFinder::for_reach(input.len(), input.len()),
+                options,
+                None,
+            ),
+        }
+        .unwrap();
+        let mut pos = 0usize;
+        for token in pieces.into_iter().flat_map(|piece| piece.tokens) {
+            if pos == at {
+                return token;
+            }
+            pos += match token {
+                EncodeToken::Literal(_) => 1,
+                EncodeToken::Match { length, .. } => length as usize,
+            };
+        }
+        panic!("no token starts at the second copy");
+    };
+    assert!(
+        matches!(parsed_at(false), EncodeToken::Match { length, .. } if (length as usize) < 16),
+        "four-byte chains found the phrase"
+    );
+    let long = parsed_at(true);
+    assert!(
+        matches!(long, EncodeToken::Match { length, offset }
+            if length as usize == phrase.len() && offset as usize == at),
+        "{long:?}"
+    );
+
+    let packed = Unpack29Encoder::with_options(options)
+        .encode_member(&input)
+        .unwrap();
+    assert_eq!(super::unpack29_decode(&packed, input.len()).unwrap(), input);
+}
+
+/// The fast levels' parses, keyed on six bytes with near matches, code a
+/// member to the same bytes at any thread count, read whole or in segments.
+#[test]
+#[cfg(feature = "parallel")]
+fn long_key_parses_code_the_same_at_every_thread_count_and_cut() {
+    let mut input = mixed_member(700 * 1024);
+    input.extend(phrase_member(300 * 1024));
+    // Noise, for the blocks that look random.
+    let mut state = 0x1234_5678_u32;
+    input.extend((0..100 * 1024).map(|_| {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        state as u8
+    }));
+    let pool = crate::parallel::private_pool(8);
+    for options in [
+        EncodeOptions::new(8).with_skip_literal_runs(Some(16)),
+        EncodeOptions::new(16)
+            .with_lazy_matching(true)
+            .with_skip_literal_runs(Some(128)),
+    ] {
+        let options = options
+            .with_max_match_distance(64 * 1024)
+            .with_block_size(4096);
+        assert!(super::keys_long(options, input.len()));
+        let encode = |threads: Option<usize>| {
+            pool.install(|| {
+                let _cap = crate::parallel::ThreadCap::set(threads);
+                Unpack29Encoder::with_options(options)
+                    .encode_member(&input)
+                    .unwrap()
+            })
+        };
+        let one = encode(Some(1));
+        assert_eq!(super::unpack29_decode(&one, input.len()).unwrap(), input);
+        assert!(encode(Some(2)) == one, "two threads, {options:?}");
+        assert!(encode(None) == one, "eight threads, {options:?}");
+
+        let mut streamed = Vec::new();
+        let flow = super::unpack29_encode_literals_streamed(
+            &mut &input[..],
+            input.len(),
+            options,
+            None,
+            &mut |_| true,
+            &mut |block, _| {
+                streamed.extend_from_slice(block);
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+        )
+        .unwrap();
+        assert_eq!(flow, std::ops::ControlFlow::Continue(()));
+        assert!(streamed == one, "streamed, {options:?}");
+    }
+}
+
 /// A parser keeps links for a reach and a batch, and a batch is megabytes at
 /// any thread count. A member of a few kilobytes used to have all of them
 /// cleared for it, which took longer than compressing it.
@@ -4979,16 +5104,17 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     let batch = super::LzParser::batch_bytes(block_size);
     assert!(batch > 16 * input.len());
 
-    let mut parser = super::LzParser::new(&input, 0, options, block_size);
+    let mut parser = super::LzParser::new(&input, 0, options, block_size, false);
     assert_eq!(parser.finder.window(), input.len().next_power_of_two());
     let tokens = parser.parse_blocks(&[input.len()]).unwrap();
 
     // The links it would have kept are the same links: nothing in a member
     // this short is far enough back to be overwritten either way.
-    let mut roomy = super::LzParser::new(&input, 0, options, block_size);
-    roomy.finder = super::Rar29MatchFinder::for_reach(
+    let mut roomy = super::LzParser::new(&input, 0, options, block_size, false);
+    roomy.finder = super::ChainFinder::for_reach(
         options.max_match_distance + batch,
         options.max_match_distance,
+        false,
     );
     assert!(roomy.finder.window() > 16 * parser.finder.window());
     assert_eq!(
@@ -5004,7 +5130,7 @@ fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     let long = vec![0u8; 3 * 64 * 1024];
     let near = EncodeOptions::new(8).with_max_match_distance(64 * 1024);
     let batch = super::LzParser::batch_bytes(4096);
-    let parser = super::LzParser::new(&long, 0, near, 4096);
+    let parser = super::LzParser::new(&long, 0, near, 4096, false);
     assert_eq!(
         parser.finder.window(),
         (64 * 1024 + batch).min(long.len()).next_power_of_two()
@@ -5033,7 +5159,7 @@ fn a_member_encode_is_charged_for_what_its_parser_holds() {
         for threads in [1, 4, 16] {
             let (charge, finder, batch) = pool.install(|| {
                 let _cap = crate::parallel::ThreadCap::set(Some(threads));
-                let parser = super::LzParser::new(&input, 0, options, block_size);
+                let parser = super::LzParser::new(&input, 0, options, block_size, false);
                 (
                     super::member_encode_workspace(len, options),
                     super::Rar29MatchFinder::bytes_for_reach(parser.finder.window(), reach),
