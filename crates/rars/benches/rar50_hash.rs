@@ -10,16 +10,15 @@ fn hashes(c: &mut Criterion) {
         // Preparing, parsing and validating the stored archive are untimed.
         // Use the public member hash verifier to exercise the production hash
         // without conflating it with compression or copying decoded output.
-        let bytes = Rar50Writer::new(WriterOptions::new(
-            ArchiveVersion::Rar50,
-            FeatureSet::store_only(),
-        ))
-        .entry(ArchiveEntry::new(
-            b"payload".to_vec(),
-            EntrySource::from_bytes(Arc::clone(&data)),
-        ))
-        .finish()
-        .expect("hash benchmark archive should encode");
+        let mut features = FeatureSet::store_only();
+        features.blake2sp = true;
+        let bytes = Rar50Writer::new(WriterOptions::new(ArchiveVersion::Rar50, features))
+            .entry(ArchiveEntry::new(
+                b"payload".to_vec(),
+                EntrySource::from_bytes(Arc::clone(&data)),
+            ))
+            .finish()
+            .expect("hash benchmark archive should encode");
         let archive = ArchiveReader::read_owned(bytes).expect("benchmark archive should parse");
         let raw = archive.as_rar50().unwrap();
         let file = raw.files().next().unwrap();
