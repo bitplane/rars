@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 // Packed bytes read ahead of the output, whatever the worker count.
 const MAX_AHEAD_BYTES: usize = 32 * 1024 * 1024;
@@ -46,6 +47,7 @@ struct Decoded<B: Budget> {
     stop: Stop,
     // The tables of each block begun, in order.
     tables: Vec<Tables<B>>,
+    took: Duration,
 }
 
 enum Turn<B: Budget> {
@@ -90,6 +92,7 @@ impl<B: Budget> Batch<B> {
     }
 
     fn decode(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded<B> {
+        let start = Instant::now();
         let mut ops = spare.lock().unwrap().pop().unwrap_or_default();
         ops.clear();
         let mut tables = Vec::with_capacity(self.blocks.len());
@@ -99,6 +102,7 @@ impl<B: Budget> Batch<B> {
             index,
             stop,
             tables,
+            took: start.elapsed(),
         }
     }
 
@@ -141,6 +145,131 @@ impl<B: Budget> Drop for Finish<'_, B> {
             *slot = turn;
         }
         self.0.ready.notify_all();
+    }
+}
+
+/// How long a batch takes to decode and to replay, on average. The replay
+/// needs as many workers as decoding takes longer, and one more for slack:
+/// two or three on most members, all of them on one made of literals.
+/// Workers past that only decode further ahead and take CPU from the replay
+/// when threads outnumber free cores.
+struct Pace {
+    decode: Option<f64>,
+    replay: Option<f64>,
+}
+
+impl Pace {
+    fn note(average: &mut Option<f64>, took: Duration) {
+        let took = took.as_secs_f64();
+        *average = Some(average.map_or(took, |average| average + (took - average) / 8.0));
+    }
+
+    /// All of them until there is a batch to judge by.
+    fn workers(&self, workers: usize) -> usize {
+        match (self.decode, self.replay) {
+            (Some(decode), Some(replay)) if replay > 0.0 => {
+                let needed = (decode / replay).ceil().min(workers as f64) as usize;
+                (needed + 1).min(workers)
+            }
+            _ => workers,
+        }
+    }
+}
+
+/// Batches no worker has claimed, and the workers taking them in turn.
+struct Lanes<B: Budget> {
+    pending: VecDeque<Arc<Batch<B>>>,
+    // How many may decode at once.
+    engaged: usize,
+    running: usize,
+    // Started but not yet at the queue, so each pending batch starts one worker at most.
+    starting: usize,
+}
+
+/// What a member's workers share with its replay.
+struct Shared<B: Budget> {
+    lanes: Mutex<Lanes<B>>,
+    spare: Mutex<Vec<BlockOps>>,
+    abandoned: AtomicBool,
+}
+
+impl<B: Budget> Shared<B> {
+    fn new(engaged: usize) -> Self {
+        Self {
+            lanes: Mutex::new(Lanes {
+                pending: VecDeque::new(),
+                engaged,
+                running: 0,
+                starting: 0,
+            }),
+            spare: Mutex::new(Vec::new()),
+            abandoned: AtomicBool::new(false),
+        }
+    }
+
+    /// Queues `batch`, if given, and starts workers for what is pending,
+    /// up to `engaged` at once; a worker past that stops after its batch.
+    fn offer<'scope>(
+        &'scope self,
+        batch: Option<Arc<Batch<B>>>,
+        engaged: usize,
+        scope: &rayon::Scope<'scope>,
+    ) {
+        let mut lanes = self.lanes.lock().unwrap();
+        lanes.pending.extend(batch);
+        lanes.engaged = engaged;
+        while lanes.running < engaged && lanes.pending.len() > lanes.starting {
+            lanes.running += 1;
+            lanes.starting += 1;
+            scope.spawn(move |_| self.lane());
+        }
+    }
+
+    /// Decodes pending batches in order until none is left, or until more
+    /// workers are running than are engaged.
+    fn lane(&self) {
+        let mut lane = Lane(self, true);
+        loop {
+            let batch = {
+                let mut lanes = self.lanes.lock().unwrap();
+                if std::mem::take(&mut lane.1) {
+                    lanes.starting -= 1;
+                }
+                let next = if lanes.running > lanes.engaged {
+                    None
+                } else {
+                    lanes.pending.pop_front()
+                };
+                let Some(batch) = next else {
+                    lanes.running -= 1;
+                    std::mem::forget(lane);
+                    return;
+                };
+                batch
+            };
+            batch.run(&self.spare, &self.abandoned);
+        }
+    }
+}
+
+/// Gives back an unwinding worker's place.
+struct Lane<'a, B: Budget>(&'a Shared<B>, bool);
+
+impl<B: Budget> Drop for Lane<'_, B> {
+    fn drop(&mut self) {
+        if let Ok(mut lanes) = self.0.lanes.lock() {
+            lanes.running -= 1;
+            lanes.starting -= usize::from(self.1);
+        }
+    }
+}
+
+/// Ends the member's workers however the replay ends: batches no worker has started are skipped.
+struct Abandon<'a>(&'a AtomicBool);
+
+impl Drop for Abandon<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -306,14 +435,23 @@ impl<B: Budget> ReaderState<B> {
             unparsed: None,
             done: false,
         };
-        let spare = Mutex::new(Vec::new());
-        let abandoned = AtomicBool::new(false);
+        let shared = Shared::new(workers);
+        let spare = &shared.spare;
 
         let pool = decode_pool(workers);
         let result = in_place_scope(pool.as_deref(), |scope| {
+            let _abandon = Abandon(&shared.abandoned);
             // A read failure waits in line behind the blocks before it.
             let mut queue: VecDeque<Result<Arc<Batch<B>>>> = VecDeque::new();
             let mut ahead_bytes = 0;
+            let mut pace = Pace {
+                decode: None,
+                replay: None,
+            };
+            // Lanes decoding at once; the pool may hold more threads.
+            let mut engaged = workers;
+            let shared = &shared;
+            let offer = |batch, engaged| shared.offer(batch, engaged, scope);
             let mut replay = || loop {
                 while !scan.done && queue.len() <= workers && ahead_bytes < MAX_AHEAD_BYTES {
                     let (batch, failure) = scan.next();
@@ -321,9 +459,7 @@ impl<B: Budget> ReaderState<B> {
                         ahead_bytes += batch_bytes(&batch);
                         // The batch at the head is decoded here unless more follow.
                         if !queue.is_empty() {
-                            let batch = Arc::clone(&batch);
-                            let (spare, abandoned) = (&spare, &abandoned);
-                            scope.spawn(move |_| batch.run(spare, abandoned));
+                            offer(Some(Arc::clone(&batch)), engaged);
                         }
                         queue.push_back(Ok(batch));
                     }
@@ -337,7 +473,9 @@ impl<B: Budget> ReaderState<B> {
                     mut index,
                     mut stop,
                     mut tables,
-                } = batch.take(&spare);
+                    took,
+                } = batch.take(spare);
+                let replay_start = Instant::now();
                 let mut reached = Reached::default();
                 let mut in_symbols = false;
                 let replayed = loop {
@@ -388,13 +526,18 @@ impl<B: Budget> ReaderState<B> {
                 }
                 replayed?;
                 spare.lock().unwrap().push(ops);
+                Pace::note(&mut pace.decode, took);
+                Pace::note(&mut pace.replay, replay_start.elapsed());
+                let needed = pace.workers(workers);
+                if needed != engaged {
+                    engaged = needed;
+                    offer(None, engaged);
+                }
                 if scan.done && queue.is_empty() || output.written() >= output_size {
                     return Ok(());
                 }
             };
-            let result = replay();
-            abandoned.store(true, Ordering::Relaxed);
-            result
+            replay()
         });
 
         // A solid successor continues from the last block replayed, not the last scanned.

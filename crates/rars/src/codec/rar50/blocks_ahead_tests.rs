@@ -513,3 +513,25 @@ fn decode_pools_are_kept_per_worker_count() {
     assert!(!Arc::ptr_eq(&two, &pools.get(2).unwrap()));
     assert_eq!(pools.0.len(), DECODE_POOL_SIZES);
 }
+
+#[test]
+fn the_replay_engages_as_many_workers_as_decoding_takes_longer_and_one_more() {
+    let pace = |decode: u64, replay: u64| {
+        let mut pace = Pace {
+            decode: None,
+            replay: None,
+        };
+        Pace::note(&mut pace.decode, Duration::from_micros(decode));
+        Pace::note(&mut pace.replay, Duration::from_micros(replay));
+        pace.workers(8)
+    };
+    let unjudged = Pace {
+        decode: None,
+        replay: None,
+    };
+    assert_eq!(unjudged.workers(8), 8);
+    assert_eq!(pace(1_100, 700), 3);
+    assert_eq!(pace(300, 700), 2);
+    assert_eq!(pace(5_000, 700), 8);
+    assert_eq!(pace(5_000, 0), 8);
+}

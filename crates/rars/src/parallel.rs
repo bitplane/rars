@@ -437,9 +437,19 @@ mod threaded {
             DecodeWorkers::AtMost(cap) => cap.min(threads()),
             // Unit tests take the worker path even on one core.
             DecodeWorkers::Auto => (threads() - 1)
+                .min(cpus() - 1)
                 .min(DEFAULT_BLOCK_DECODE_WORKERS)
                 .max(usize::from(cfg!(test))),
         }
+    }
+
+    /// The CPUs this process may run on. A thread count above it adds no
+    /// decode workers, which would only take turns with the replay.
+    fn cpus() -> usize {
+        static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *CPUS.get_or_init(|| {
+            std::thread::available_parallelism().map_or(usize::MAX, |cpus| cpus.get())
+        })
     }
 }
 
