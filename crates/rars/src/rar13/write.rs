@@ -10,7 +10,9 @@ pub use crate::streaming::{EntrySource, WriterResources};
 pub use crate::write_plan::MemberCoding;
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::{ProgressReporter, WorkTracker};
-use crate::write_stream::{CallerOutput, CancellableOutput, MemberBytes, MemberPayload};
+use crate::write_stream::{
+    CallerOutput, CancellableOutput, MemberBytes, MemberPayload, SeekWrite, STREAM_MEMBERS_ABOVE,
+};
 use crate::ArchiveVersion;
 use crate::{WriteOperation, WriteProgress, WriteProgressEvent};
 use std::io::Seek;
@@ -189,7 +191,6 @@ pub(crate) fn write_archive_with_sources(
         resources,
         progress,
         output,
-        STREAM_MEMBERS_ABOVE,
     )
 }
 
@@ -242,8 +243,7 @@ pub fn write_streaming_archive_to(
         archive_comment,
         resources,
         progress,
-        CallerOutput::stream(output),
-        STREAM_MEMBERS_ABOVE,
+        stream_output(output),
     )
 }
 
@@ -267,8 +267,7 @@ pub fn write_seekable_archive_to<W: Write + Seek>(
         archive_comment,
         resources,
         progress,
-        CallerOutput::seekable(output),
-        STREAM_MEMBERS_ABOVE,
+        seekable_output(output),
     )
 }
 
@@ -340,7 +339,6 @@ fn collect_archive(
         &WriterResources::default(),
         progress,
         CallerOutput::stream(&mut out),
-        STREAM_MEMBERS_ABOVE,
     )?;
     Ok(out)
 }
@@ -354,7 +352,6 @@ fn write_archive_to(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
     output: CallerOutput<'_>,
-    stream_above: u64,
 ) -> Result<()> {
     if members.iter().any(|member| member.password.is_some()) {
         crate::crypto::require_encryption()?;
@@ -364,6 +361,8 @@ fn write_archive_to(
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress = Some(&control as &dyn WriteProgress);
     crate::write_progress::check_cancelled(progress.map(ProgressReporter))?;
+    // Bytes in memory never spool, so a writer given only those sets no threshold.
+    let stream_above = output.stream_above.unwrap_or(u64::MAX);
     let mut output = output.cancellable(progress.map(ProgressReporter));
     // Stored members copied from a source have their checksum patched in.
     let patches = output.can_seek();
@@ -487,8 +486,14 @@ enum Payload<'a> {
     Spooled(crate::streaming::Spool),
 }
 
-/// Members larger than this are packed into a spool rather than in memory.
-const STREAM_MEMBERS_ABOVE: u64 = 64 * 1024 * 1024;
+/// An output that cannot seek, large members spooled.
+pub(crate) fn stream_output(output: &mut dyn Write) -> CallerOutput<'_> {
+    CallerOutput::stream(output).streaming_above(STREAM_MEMBERS_ABOVE)
+}
+
+pub(crate) fn seekable_output(output: &mut dyn SeekWrite) -> CallerOutput<'_> {
+    CallerOutput::seekable(output).streaming_above(STREAM_MEMBERS_ABOVE)
+}
 
 /// What a member packed into a spool holds: the encoder's window and index,
 /// and a verifying decoder.
@@ -2205,9 +2210,6 @@ mod tests {
         }
     }
 
-    /// The archive written with members over `stream_above` packed into a
-    /// spool, and whether a spool sat in the temp directory while it was
-    /// written out.
     fn written_above(
         entries: &[super::StreamingEntry],
         options: super::WriterOptions,
@@ -2230,21 +2232,33 @@ mod tests {
         }
         let dir = crate::scratch::case("rars-rar13-spooled");
         let resources = super::WriterResources::default().with_temp_dir(dir.to_path_buf());
-        let members: Vec<_> = entries.iter().map(super::Member::from_streaming).collect();
+        let files: Vec<_> = entries
+            .iter()
+            .map(|entry| super::BorrowedFileEntry {
+                file: super::FileEntry {
+                    name: &entry.name,
+                    data: &[],
+                    file_time: entry.file_time,
+                    file_attr: entry.file_attr,
+                    password: entry.password.as_deref(),
+                    file_comment: entry.file_comment.as_deref(),
+                },
+                source: Some(&entry.source),
+            })
+            .collect();
         let mut out = Watching {
             out: Vec::new(),
             dir: dir.to_path_buf(),
             saw_spool: false,
         };
-        super::write_archive_to(
-            &members,
+        super::write_archive_with_sources(
+            &files,
             options,
             super::MemberCoding::Compressed,
             None,
             &resources,
             None,
-            super::CallerOutput::stream(&mut out),
-            stream_above,
+            super::CallerOutput::stream(&mut out).streaming_above(stream_above),
         )
         .unwrap();
         let left = std::fs::read_dir(&*dir).unwrap().count();

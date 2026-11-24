@@ -1283,7 +1283,7 @@ impl Builder {
             SingleOutput::File(output) if self.format.family() == ArchiveFamily::Rar13 => {
                 let mut output = EmissionWriter::new(output, reporting);
                 self.write_rar13_single(
-                    CallerOutput::seekable(&mut output),
+                    rar13::seekable_output(&mut output),
                     resources,
                     Some(&progress),
                 )?;
@@ -1612,7 +1612,7 @@ impl Builder {
                 self.write_rar15_single(rar15_40::stream_output(output), resources, progress)
             }
             ArchiveFamily::Rar13 => {
-                self.write_rar13_single(CallerOutput::stream(output), resources, progress)
+                self.write_rar13_single(rar13::stream_output(output), resources, progress)
             }
         }
     }

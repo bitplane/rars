@@ -9,7 +9,8 @@ pub(crate) mod write;
 pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
 #[cfg(feature = "write")]
 pub(crate) use write::{
-    write_archive_with_sources, write_volumes_with_source_to, BorrowedFileEntry,
+    seekable_output, stream_output, write_archive_with_sources, write_volumes_with_source_to,
+    BorrowedFileEntry,
 };
 #[cfg(feature = "write")]
 pub use write::{
