@@ -165,7 +165,12 @@ export interface RarEntryOptions {
 export type RarErrorCode =
   | "INVALID_ARCHIVE" | "INVALID_OPTION" | "UNSUPPORTED_FORMAT"
   | "UNSUPPORTED_FEATURE" | "PASSWORD_REQUIRED" | "BAD_PASSWORD"
-  | "CHECKSUM_MISMATCH" | "MISSING_VOLUME" | "VOLUME_ORDER"
+  | "CHECKSUM_MISMATCH"
+  /** A volume the set needs wasn't given or found; details carry its `volumeIndex`, counting
+   * the first as 0, and the `path` looked for when the set was opened by path. */
+  | "MISSING_VOLUME"
+  /** A volume came out of order; details carry the `volumeIndex` where the order broke. */
+  | "VOLUME_ORDER"
   | "ENTRY_NOT_FOUND" | "ENTRY_IS_DIRECTORY" | "AMBIGUOUS_ENTRY"
   | "DUPLICATE_ENTRY" | "UNSAFE_ENTRY_NAME" | "IO" | "CLOSED"
   | "RESOURCE_LIMIT" | "CANCELLED" | "SOURCE_CHANGED"

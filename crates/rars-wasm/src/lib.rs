@@ -181,6 +181,8 @@ fn js_error(error: rars_rs::Error) -> JsValue {
     let details = js_sys::Object::new();
     let contexts = js_sys::Array::new();
     let mut cause = &error;
+    // The innermost volume, where the fault is rather than where reading began.
+    let mut volume_index = None;
     loop {
         let context = js_sys::Object::new();
         match cause {
@@ -208,6 +210,7 @@ fn js_error(error: rars_rs::Error) -> JsValue {
             rars_rs::Error::InVolume { index, source } => {
                 set_error_field(&context, "kind", &"volume".into());
                 set_error_field(&context, "index", &(*index as f64).into());
+                volume_index = Some(*index);
                 cause = source;
             }
             _ => break,
@@ -218,6 +221,12 @@ fn js_error(error: rars_rs::Error) -> JsValue {
         set_error_field(&details, "contexts", &contexts);
     }
     match cause {
+        // Python's MissingVolume and VolumeOrderError carry it as `volume_index`.
+        rars_rs::Error::MissingVolume | rars_rs::Error::VolumeOutOfOrder => {
+            if let Some(index) = volume_index {
+                set_error_field(&details, "volumeIndex", &(index as f64).into());
+            }
+        }
         rars_rs::Error::Codec(rars_rs::codec::Error::WorkspaceLimitExceeded(detail)) => {
             for (name, value) in
                 total_output_error_details(detail.limit, detail.required, detail.used)
@@ -759,6 +768,7 @@ impl RarFile {
         progress: Option<js_sys::Function>,
         member_error: Option<js_sys::Function>,
     ) -> Result<Vec<u8>, JsValue> {
+        self.refuse_continued(&[index])?;
         let missing = || {
             binding_error(
                 "ENTRY_NOT_FOUND",
@@ -804,6 +814,7 @@ impl RarFile {
         member_error: Option<js_sys::Function>,
     ) -> Result<js_sys::Array, JsValue> {
         let indices: Vec<usize> = indices.into_iter().map(|index| index as usize).collect();
+        self.refuse_continued(&indices)?;
         let data = if member_error.is_some() {
             self.read_reporting(&indices, password, &settings, progress, member_error)?
         } else {
@@ -1203,6 +1214,25 @@ impl RarFile {
 }
 
 impl RarFile {
+    /// Refuses a read of a member that a volume on its own holds only the start of:
+    /// the rest is in the next volume, which wasn't given, so it is missing, as
+    /// reading the set would report. Salvage has left such members out already.
+    fn refuse_continued(&self, indices: &[usize]) -> Result<(), JsValue> {
+        let [archive] = self.archives.as_slice() else {
+            return Ok(());
+        };
+        let continued = archive.members().enumerate().any(|(index, member)| {
+            member.meta.is_split_after && !member.meta.is_split_before && indices.contains(&index)
+        });
+        if continued {
+            return Err(js_error(rars_rs::Error::InVolume {
+                index: 1,
+                source: Box::new(rars_rs::Error::MissingVolume),
+            }));
+        }
+        Ok(())
+    }
+
     /// `test` once its options are settled.
     fn test_with(
         &self,
@@ -1210,7 +1240,11 @@ impl RarFile {
         progress: Option<js_sys::Function>,
         next_volume: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
-        if next_volume.is_some() {
+        // A volume on its own is the start of its set, so running out of it is a
+        // missing volume, as extraction and Python have it. Salvage stops there.
+        let lone_volume =
+            !options.salvage && self.archives.len() == 1 && self.archives[0].is_volume();
+        if next_volume.is_some() || lone_volume {
             return progress::watching(progress, || {
                 let count = progress::ReadCount::with_total("testing", None);
                 let result = with_later_volumes(&self.archives, options, next_volume, |later| {

@@ -318,11 +318,10 @@ try {
       await unlink(paths[missing]);
       const label = `${paths.length} volumes, ${missing} missing`;
 
-      // Strict: the set is refused where it runs out. A first volume alone fails on its
-      // split member; Python names the missing volume there.
+      // Strict: the set is refused where it runs out, naming the missing volume.
       const strict = await RarArchive.open(paths[0]).catch((error) => error);
-      const refused = (error) => error instanceof RarError
-        && (error.code === "MISSING_VOLUME" || (missing === 1 && error.code === "INVALID_ARCHIVE"));
+      const refused = (error) => error instanceof RarError && error.code === "MISSING_VOLUME"
+        && error.details.volumeIndex === missing && error.details.path === paths[missing];
       if (strict instanceof RarArchive) {
         assert.deepEqual(strict.incompleteMembers, []);
         await assert.rejects(strict.extractAll(fresh()), refused, label);

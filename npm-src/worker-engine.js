@@ -87,12 +87,13 @@ function metadata(archive, password, options) {
 }
 
 // A set opened from its first volume's path finds the later ones by the names the core
-// gives them, as Python and the CLI do, and stops at the first that isn't there.
+// gives them, as Python and the CLI do, and stops at the first that isn't there, which
+// it returns as `notFound` so a missing volume can be named.
 async function discoverVolumes(wasm, source, password, platform, options) {
   const first = new wasm.RarFile(await platform.readFile(source.path), password, options);
   try {
     // Undefined when the headers can't tell, as in RAR 1.3 to 2.0 sets.
-    if (!first.isVolume || first.isFirstVolume === false) return [source];
+    if (!first.isVolume || first.isFirstVolume === false) return { sources: [source] };
     const found = [source];
     const seen = new Set([source.path]);
     const name = platform.baseName(source.path);
@@ -100,14 +101,27 @@ async function discoverVolumes(wasm, source, password, platform, options) {
       const next = first.volumeName(name, index);
       if (next === undefined) break;
       const file = platform.sibling(source.path, next);
-      if (seen.has(file) || !(await platform.isFile(file))) break;
+      if (seen.has(file)) break;
+      if (!(await platform.isFile(file))) return { sources: found, notFound: { index, path: file } };
       seen.add(file);
       found.push({ kind: "path", path: file });
     }
-    return found;
+    return { sources: found };
   } finally {
     first.free();
   }
+}
+
+// The path a set opened by path looked for and didn't find, added to the missing-volume
+// error for that volume, as Python's MissingVolume has it.
+function nameMissingVolume(error, notFound) {
+  if (error?.code !== "MISSING_VOLUME" || notFound === undefined
+      || error.details?.volumeIndex !== notFound.index) {
+    return error;
+  }
+  error.message += `: ${notFound.path}`;
+  error.details.path = notFound.path;
+  return error;
 }
 
 async function openArchive(wasm, sources, password, platform, options) {
@@ -215,6 +229,8 @@ export function startWorker(port, wasm, platform) {
     const memberError = message.memberErrors
       ? (error) => port.post({ id, memberError: { ...errorRecord(error), member: error.member } })
       : undefined;
+    // Volumes as they arrive come from the caller, not from where the set was opened.
+    let notFound = payload?.volumeFeed === undefined ? payload?.volumeNotFound : undefined;
     try {
       const phase = PHASES[operation];
       // The engine reports nothing while it runs, so the total is unknown until it ends.
@@ -224,13 +240,15 @@ export function startWorker(port, wasm, platform) {
           || operation === "test" || operation === "readComment" || operation === "readMemberComment"
           || operation === "extract" || operation === "readLink") {
         if (operation === "open" && payload.sources.length === 1 && payload.sources[0]?.kind === "path") {
-          payload.sources = await discoverVolumes(wasm, payload.sources[0], payload.password, platform, payload.readOptions);
+          ({ sources: payload.sources, notFound } = await discoverVolumes(
+            wasm, payload.sources[0], payload.password, platform, payload.readOptions));
         }
         const archive = await openArchive(wasm, payload.sources, payload.password, platform, payload.readOptions);
         try {
           switch (operation) {
             case "open":
-              result = { ...metadata(archive, payload.password, payload.readOptions), sources: payload.sources };
+              result = { ...metadata(archive, payload.password, payload.readOptions),
+                sources: payload.sources, volumeNotFound: notFound };
               break;
             case "read":
               result = archive.readAt(payload.index, payload.password, payload.readOptions, report, memberError);
@@ -329,7 +347,7 @@ export function startWorker(port, wasm, platform) {
       }
       port.post({ id, result }, transfers);
     } catch (error) {
-      port.post({ id, error: errorRecord(error) });
+      port.post({ id, error: errorRecord(nameMissingVolume(error, notFound)) });
     }
   });
 }
