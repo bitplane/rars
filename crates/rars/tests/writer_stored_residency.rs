@@ -1,7 +1,7 @@
 #![cfg(feature = "write")]
 
 //! A stored member is copied through, never loaded: whatever the format, the
-//! writer reads no further ahead of its output than one copy buffer. This pins
+//! writer reads no further ahead of its output than its copy buffers. This pins
 //! the "stored" column of `docs/writer-limits.md`.
 
 use rars::{ArchiveVersion, Builder, EntrySource, WriterResources};
@@ -10,8 +10,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 const MEMBER: u64 = 16 << 20;
-/// Headers plus the largest copy buffer any writer uses, with room to spare.
+/// Headers plus the largest buffer any writer copies through inline, with room
+/// to spare.
 const AHEAD: u64 = 1 << 20;
+/// RAR 5 and 7 read, hash and write a stored member on separate threads when
+/// there is more than one, through four 1 MiB buffers. However late the output
+/// runs, the reader can fill every buffer but the one being written.
+const PIPELINED_AHEAD: u64 = 3 << 20;
 
 /// Bytes made up from their position, so the test holds none of them.
 struct Pattern {
@@ -101,9 +106,13 @@ fn a_stored_member_is_copied_through_not_loaded_in_every_format() {
             .write_to(&mut output, &WriterResources::default(), None)
             .unwrap();
 
+        let bound = match format {
+            ArchiveVersion::Rar50 | ArchiveVersion::Rar70 => PIPELINED_AHEAD,
+            _ => AHEAD,
+        };
         assert!(output.written > MEMBER, "{format}: {}", output.written);
         assert!(
-            output.furthest_ahead <= AHEAD,
+            output.furthest_ahead <= bound,
             "{format}: read {} bytes ahead of the output",
             output.furthest_ahead
         );
