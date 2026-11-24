@@ -7,7 +7,7 @@ use crate::{Result, WriterResources};
 
 /// How much of a run one filter search covers when a member is too large to
 /// search whole. Larger dictionaries make longer runs, and this keeps each
-/// search inside the one-thread default budget at every level.
+/// search inside the default planning limit at every level.
 pub(super) const FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(test)]
@@ -349,10 +349,11 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
 /// job at level 3, and 225.7 at level 5. A wave still reserves this for every
 /// job it could hold.
 ///
-/// At level 5 this is above the planning charge. One thread's default budget,
-/// 256 MiB, is below it, so a lone job is given the whole budget there, and
-/// on noise peaks past it as it did before. What glibc keeps after a free is
-/// not counted here, as in the other charges.
+/// At level 5 this is above the planning charge and the planning limit, so
+/// one thread's default budget, [`crate::DEFAULT_WRITER_MEMORY_LIMIT`], is
+/// this charge for level 5 rather than that limit. A smaller budget gives a
+/// lone job the whole of it, and on noise the job peaks past it. What glibc
+/// keeps after a free is not counted here, as in the other charges.
 pub(super) fn block_admission(
     settings: &CompressPlan,
     include_candidates: bool,
@@ -426,6 +427,7 @@ pub(super) fn whole_member_workspace(input_size: u64, plan: &CompressPlan) -> u6
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::streaming::{DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_PLANNING_LIMIT};
 
     fn settings() -> CompressPlan {
         let encode_options = EncodeOptions::new(8).with_max_match_distance(128 * 1024);
@@ -632,7 +634,7 @@ mod tests {
     /// planning charge admitted 5 of 8 and 21 of 32.
     #[test]
     fn filtered_jobs_fill_every_thread_of_the_default_budget() {
-        use crate::streaming::{DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_MEMORY_PER_THREAD};
+        use crate::streaming::DEFAULT_WRITER_MEMORY_PER_THREAD;
         let dictionary = 4 * 1024 * 1024;
         let options =
             super::super::filter_policy::encode_options_for_level(Some(3), dictionary).unwrap();
@@ -656,7 +658,7 @@ mod tests {
                 Execution::Blocks {
                     fallback: FallbackReason::AutomaticFilterWorkspace {
                         required: whole_member_workspace(size, &settings),
-                        limit: DEFAULT_WRITER_MEMORY_LIMIT,
+                        limit: DEFAULT_WRITER_PLANNING_LIMIT,
                     },
                     run_filters: true,
                 }
@@ -668,6 +670,104 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// The job a default writer plans for one large member at `level`, and
+    /// what it is admitted for, with `resources` deciding the plan as a write
+    /// would.
+    fn default_job(level: u8, solid: bool, resources: &WriterResources) -> (CompressPlan, u64) {
+        let features = crate::FeatureSet {
+            solid,
+            ..crate::FeatureSet::default()
+        };
+        let options = super::super::WriterOptions::new(crate::ArchiveVersion::Rar50, features)
+            .with_compression_level(level);
+        let size = 1 << 30;
+        let settings = super::super::compression_plan(
+            options,
+            FilterPolicy::Auto,
+            size,
+            resources.planning_memory_limit(),
+            resources,
+        )
+        .unwrap();
+        let admission = match ExecutionPlan::with_resources(
+            &settings,
+            [size].into_iter(),
+            resources,
+        )
+        .unwrap()
+        {
+            ExecutionPlan::Blocks {
+                admission,
+                run_filters,
+                ..
+            } => {
+                assert!(run_filters, "level {level}, solid {solid}");
+                admission
+            }
+            ExecutionPlan::IndependentMembers(members) => {
+                assert!(
+                    matches!(
+                        members[0].execution,
+                        Execution::Blocks {
+                            run_filters: true,
+                            ..
+                        }
+                    ),
+                    "level {level}, solid {solid}"
+                );
+                members[0].admission
+            }
+            ExecutionPlan::Stored => panic!("level {level} stored"),
+        };
+        (settings, admission)
+    }
+
+    /// The one-thread default budget is the largest admission a default plan
+    /// makes, rounded up to a MiB: level 5's, at its fitted 16 MiB dictionary
+    /// with filters searched. If that charge moves, this fails until the
+    /// constant follows it.
+    #[test]
+    fn the_one_thread_default_is_the_largest_default_admission() {
+        const MIB: u64 = 1024 * 1024;
+        let resources = WriterResources::with_default_planning(DEFAULT_WRITER_MEMORY_LIMIT);
+        let mut largest = (0, 0);
+        for level in 1..=5 {
+            for solid in [false, true] {
+                let (_, admission) = default_job(level, solid, &resources);
+                largest = largest.max((admission, level));
+            }
+        }
+        assert_eq!(largest.1, 5);
+        assert_eq!(largest.0.next_multiple_of(MIB), DEFAULT_WRITER_MEMORY_LIMIT);
+        // Planning stays where it was, below what the job is admitted for.
+        assert!(DEFAULT_WRITER_PLANNING_LIMIT < largest.0);
+    }
+
+    /// A default `WriterResources` at one thread holds a level 5 block job for
+    /// its whole `block_admission` charge, where the planning limit alone
+    /// would have clamped it to the budget. The plan is the one an explicit
+    /// planning-limit budget makes, so the archive is unchanged.
+    #[test]
+    fn one_default_thread_admits_a_level_5_job_unclamped() {
+        let resources = WriterResources::with_default_planning(DEFAULT_WRITER_MEMORY_LIMIT);
+        let (settings, admission) = default_job(5, false, &resources);
+        assert_eq!(settings.dictionary_size, 16 * 1024 * 1024);
+        assert!(admission <= resources.memory_limit());
+        let permit = resources
+            .try_acquire_serialising(admission)
+            .unwrap()
+            .expect("an idle budget admits the job");
+        assert_eq!(permit.bytes(), admission);
+        drop(permit);
+
+        let explicit = WriterResources::default().with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
+        let (planned, _) = default_job(5, false, &explicit);
+        assert_eq!(planned.dictionary_size, settings.dictionary_size);
+        assert_eq!(planned.encode_options, settings.encode_options);
+        // At that budget the same job is clamped to all of it.
+        assert!(admission > explicit.memory_limit());
     }
 
     #[test]

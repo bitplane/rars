@@ -12,8 +12,24 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Default aggregate compression workspace budget at one thread (256 MiB).
-pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = 256 * 1024 * 1024;
+/// Default aggregate compression workspace budget at one thread (283 MiB).
+///
+/// What the largest job a default writer plans is admitted for: a RAR 5 level 5
+/// block job at its fitted 16 MiB dictionary with filters searched, so one
+/// thread holds that job whole. A test pins it to that job's admission charge.
+/// What gets written is planned within [`DEFAULT_WRITER_PLANNING_LIMIT`]
+/// instead, which is lower: a job's admission also counts what the coordinator
+/// holds for it, which decides nothing about the output.
+pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = 283 * 1024 * 1024;
+
+/// The budget for one job that a default writer plans within (256 MiB).
+///
+/// It decides what gets written: each RAR 5 level's dictionary, and whether a
+/// member is coded whole. A default [`WriterResources`] plans within it at every
+/// thread count, and keeps planning within it when
+/// [`WriterResources::with_memory_limit`] gives a budget at or above it, so
+/// neither changes the archive.
+pub const DEFAULT_WRITER_PLANNING_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// What each worker thread past the first adds to the default budget: one RAR 5
 /// block job at the default level and dictionary, so every thread can hold one.
@@ -300,16 +316,27 @@ pub struct WriterResources {
 impl Default for WriterResources {
     /// Budgets [`default_writer_memory_limit`] for the thread count at the time
     /// of the call. Each job is still planned within
-    /// [`DEFAULT_WRITER_MEMORY_LIMIT`], so threads add room for more jobs at
+    /// [`DEFAULT_WRITER_PLANNING_LIMIT`], so threads add room for more jobs at
     /// once and never change the archive written.
     fn default() -> Self {
-        let mut resources = Self::new(default_writer_memory_limit());
-        resources.planning_limit = DEFAULT_WRITER_MEMORY_LIMIT.min(resources.memory_limit);
-        resources
+        Self::with_default_planning(default_writer_memory_limit())
     }
 }
 
 impl WriterResources {
+    /// A budget of `memory_limit` whose jobs are planned as a default writer's.
+    pub(crate) fn with_default_planning(memory_limit: u64) -> Self {
+        let mut resources = Self::new(memory_limit);
+        resources.planning_limit = DEFAULT_WRITER_PLANNING_LIMIT.min(memory_limit);
+        resources
+    }
+
+    /// A budget of `memory_limit`, with each job planned within the same limit.
+    ///
+    /// Unlike [`WriterResources::default`], which plans within
+    /// [`DEFAULT_WRITER_PLANNING_LIMIT`], the budget here also decides what
+    /// gets written, so `new(DEFAULT_WRITER_MEMORY_LIMIT)` can write a
+    /// different archive from the default.
     pub fn new(memory_limit: u64) -> Self {
         Self {
             memory_limit,
@@ -328,9 +355,10 @@ impl WriterResources {
     /// Replace the compression workspace budget, keeping the rest of the policy.
     ///
     /// Unlike [`WriterResources::new`], each job is still planned within the
-    /// limit it had, or within `limit` when that is lower. A budget at or above
-    /// [`DEFAULT_WRITER_MEMORY_LIMIT`] therefore changes only how many jobs run
-    /// at once, never the archive written; a lower one also plans smaller jobs.
+    /// limit it had, or within `limit` when that is lower. On a default writer,
+    /// a budget at or above [`DEFAULT_WRITER_PLANNING_LIMIT`] therefore changes
+    /// only how many jobs run at once, never the archive written; a lower one
+    /// also plans smaller jobs.
     /// Configure before execution; clones share the new budget.
     pub fn with_memory_limit(mut self, limit: u64) -> Self {
         self.memory_limit = limit;
@@ -1204,15 +1232,16 @@ mod tests {
         use super::*;
 
         const MIB: u64 = 1024 * 1024;
-        assert_eq!(scaled_writer_memory_limit(1, None), 256 * MIB);
-        assert_eq!(scaled_writer_memory_limit(0, None), 256 * MIB);
-        assert_eq!(scaled_writer_memory_limit(8, None), (256 + 7 * 160) * MIB);
+        let one = DEFAULT_WRITER_MEMORY_LIMIT;
+        assert_eq!(scaled_writer_memory_limit(1, None), one);
+        assert_eq!(scaled_writer_memory_limit(0, None), one);
+        assert_eq!(scaled_writer_memory_limit(8, None), one + 7 * 160 * MIB);
         assert_eq!(
             scaled_writer_memory_limit(32, Some(8 * 1024 * MIB)),
             2 * 1024 * MIB
         );
         // A small machine keeps the one-thread default rather than shrinking it.
-        assert_eq!(scaled_writer_memory_limit(32, Some(512 * MIB)), 256 * MIB);
+        assert_eq!(scaled_writer_memory_limit(32, Some(512 * MIB)), one);
         assert_eq!(scaled_writer_memory_limit(usize::MAX, None), u64::MAX);
         // A 2 GiB container on a 32-thread host gets a quarter of its limit.
         assert_eq!(scaled_writer_memory_limit(32, Some(2048 * MIB)), 512 * MIB);
@@ -1225,7 +1254,24 @@ mod tests {
         const MIB: u64 = 1024 * 1024;
         let raised = WriterResources::default().with_memory_limit(4096 * MIB);
         assert_eq!(raised.memory_limit(), 4096 * MIB);
-        assert_eq!(raised.planning_memory_limit(), DEFAULT_WRITER_MEMORY_LIMIT);
+        assert_eq!(
+            raised.planning_memory_limit(),
+            DEFAULT_WRITER_PLANNING_LIMIT
+        );
+        // Between the planning limit and the one-thread default, as an explicit
+        // 256 MiB is, the archive is still the default one.
+        let between = WriterResources::default().with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
+        assert_eq!(
+            between.planning_memory_limit(),
+            DEFAULT_WRITER_PLANNING_LIMIT
+        );
+        let one_thread =
+            WriterResources::with_default_planning(scaled_writer_memory_limit(1, None));
+        assert_eq!(one_thread.memory_limit(), DEFAULT_WRITER_MEMORY_LIMIT);
+        assert_eq!(
+            one_thread.planning_memory_limit(),
+            DEFAULT_WRITER_PLANNING_LIMIT
+        );
         let lowered = WriterResources::default().with_memory_limit(64 * MIB);
         assert_eq!(lowered.memory_limit(), 64 * MIB);
         assert_eq!(lowered.planning_memory_limit(), 64 * MIB);

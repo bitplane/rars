@@ -164,7 +164,7 @@ pub use streaming::output::{WriterOutput, WriterVolumes};
 #[cfg(feature = "write")]
 pub use streaming::{
     default_writer_memory_limit, EntryReader, EntrySource, WriteCancellation, WriterResources,
-    DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_MEMORY_PER_THREAD,
+    DEFAULT_WRITER_MEMORY_LIMIT, DEFAULT_WRITER_MEMORY_PER_THREAD, DEFAULT_WRITER_PLANNING_LIMIT,
 };
 pub use timestamp::StoredTimestamp;
 pub use truncation::{TruncatedBlock, Truncation};
