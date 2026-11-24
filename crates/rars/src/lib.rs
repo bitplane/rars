@@ -456,9 +456,9 @@ impl<'a> ArchiveReadOptions<'a> {
     /// buffered-decode, scratch, filter-memory or reader-workspace limit is
     /// offered to the handler. Cancellation, operation-wide or unknown limits
     /// and every solid-member limit still stop the call. So does a member split
-    /// across volumes, except in a RAR 1.5 or later set when the volume holding
-    /// the member's end can still be read: its remaining volumes are read past,
-    /// and the handler can carry on to the members after it.
+    /// across volumes, except when the volume holding the member's end can
+    /// still be read: its remaining volumes are read past, and the handler can
+    /// carry on to the members after it.
     ///
     /// Parsing with a handler also reads an archive whose file is cut short
     /// inside a member's data or file header, up to that member, and records
@@ -525,9 +525,9 @@ impl<'a> ArchiveReadOptions<'a> {
     /// - a member the file ends partway through, unless it is split across
     ///   volumes, is listed, and gets what decodes from the bytes there are,
     ///   then [`Error::MemberCutShort`]; [`Archive::truncation`] names it;
-    /// - a member split across volumes of a RAR 1.5 or later set, one of
-    ///   which is missing or refused, gets what decodes from the volumes
-    ///   before it, then that volume's error;
+    /// - a member split across volumes, one of which is missing or refused,
+    ///   gets what decodes from the volumes before it, then that volume's
+    ///   error;
     /// - a member whose stream decodes past its declared size gets its
     ///   declared bytes, and [`Error::MemberRanPastDeclaredSize`]. The rest
     ///   of the stream is decoded into the window only, so that a solid

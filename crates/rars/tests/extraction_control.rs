@@ -367,6 +367,114 @@ fn volume_api_a_missing_volume_still_ends_the_run() {
     }
 }
 
+/// A RAR 1.4 archive's bytes after its main header: its members.
+fn rar14_members(bytes: &[u8]) -> &[u8] {
+    &bytes[usize::from(u16::from_le_bytes([bytes[4], bytes[5]]))..]
+}
+
+/// [`damaged_split_set`] for RAR 1.4. rars writes a RAR 1.4 volume set of
+/// one file, so `first` and `after` are spliced in from archives of their
+/// own. A solid set leaves `first` out, since `split` is compressed as the
+/// first member of its stream.
+fn damaged_rar14_split_set(solid: bool, store: bool) -> Vec<Vec<u8>> {
+    let member = |name: &str, seed, len| {
+        let mut builder = Builder::new(ArchiveVersion::Rar14).store(store);
+        builder
+            .add_bytes(name.as_bytes().to_vec(), noisy_text(seed, len), None, None)
+            .unwrap();
+        rar14_members(&builder.to_bytes().unwrap()).to_vec()
+    };
+    let mut builder = Builder::new(ArchiveVersion::Rar14)
+        .solid(solid)
+        .store(store)
+        .volume_size(Some(4096));
+    builder
+        .add_bytes(b"split".to_vec(), noisy_text(2, 100_000), None, None)
+        .unwrap();
+    let mut volumes = builder.build_volumes(None).unwrap();
+    assert!(volumes.len() >= 3);
+    if !solid {
+        let at = volumes[0].len() - rar14_members(&volumes[0]).len();
+        volumes[0].splice(at..at, member("first", 1, 100));
+    }
+    volumes.last_mut().unwrap().extend(member("after", 3, 300));
+    let at = volumes[1].len() / 2;
+    volumes[1][at] ^= 0xff;
+    volumes
+}
+
+fn read_set(volumes: Vec<Vec<u8>>) -> Vec<Archive> {
+    volumes
+        .into_iter()
+        .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
+        .collect()
+}
+
+/// Issue #601: as for RAR 1.5 and later, a member error handler goes past
+/// a RAR 1.4 member split across volumes. Its fragments carry no checksum
+/// of their own packed data, so no volume is named.
+#[test]
+fn volume_api_member_handler_goes_past_a_damaged_rar14_split_member() {
+    for (solid, store) in [(false, false), (true, false), (false, true)] {
+        let case = format!("solid {solid}, stored {store}");
+        let volumes = read_set(damaged_rar14_split_set(solid, store));
+
+        let failed = std::sync::Mutex::new(Vec::new());
+        let handler = |member: &rars::ArchiveMember, error: &Error| {
+            failed
+                .lock()
+                .unwrap()
+                .push((member.meta.name.clone(), error.clone()));
+            Ok(rars::ExtractionErrorAction::Continue)
+        };
+        let (result, written) = extract_set(
+            &volumes,
+            ArchiveReadOptions::new().with_member_error_handler(&handler),
+        );
+        result.unwrap_or_else(|error| panic!("{case}: {error}"));
+        let failed = failed.into_inner().unwrap();
+        assert_eq!(failed[0].0, b"split", "{case}");
+        assert_eq!(in_volume(&failed[0].1), None, "{case}: {}", failed[0].1);
+        let written = written.borrow();
+        let names: Vec<_> = written.iter().map(|(name, _)| name.as_slice()).collect();
+        if solid {
+            assert_eq!(names, [&b"split"[..], b"after"], "{case}");
+            assert!(failed.len() <= 2, "{case}");
+        } else {
+            assert_eq!(names, [&b"first"[..], b"split", b"after"], "{case}");
+            assert_eq!(failed.len(), 1, "{case}");
+            assert_eq!(*written[0].1.borrow(), noisy_text(1, 100), "{case}");
+            assert_eq!(*written[2].1.borrow(), noisy_text(3, 300), "{case}");
+        }
+
+        // Without a handler, the run ends at the split member.
+        let (result, written) = extract_set(&volumes, ArchiveReadOptions::new());
+        assert!(result.is_err(), "{case}");
+        assert_eq!(written.borrow().len(), names.len() - 1, "{case}");
+    }
+}
+
+/// Issue #601: a RAR 1.4 set missing the volume that holds a split member's
+/// end still ends the run without asking the handler.
+#[test]
+fn volume_api_a_missing_rar14_volume_still_ends_the_run() {
+    let mut volumes = damaged_rar14_split_set(false, false);
+    volumes.pop();
+    let volumes = read_set(volumes);
+    let handler_calls = AtomicUsize::new(0);
+    let handler = |_: &rars::ArchiveMember, _: &Error| {
+        handler_calls.fetch_add(1, Ordering::Relaxed);
+        Ok(rars::ExtractionErrorAction::Continue)
+    };
+    let (result, written) = extract_set(
+        &volumes,
+        ArchiveReadOptions::new().with_member_error_handler(&handler),
+    );
+    assert!(result.is_err());
+    assert_eq!(handler_calls.load(Ordering::Relaxed), 0);
+    assert_eq!(written.borrow().len(), 2);
+}
+
 #[test]
 fn operation_wide_and_solid_member_limits_remain_terminal() {
     let handler_calls = AtomicUsize::new(0);

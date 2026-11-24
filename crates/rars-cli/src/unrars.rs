@@ -1006,7 +1006,7 @@ fn list_volumes(
         }
         totals.add(list(invocation, out, &volume_path, &volume, style));
         listed += 1;
-        if report_truncation(out, volume.truncation()) {
+        if report_truncation(out, volume.family(), volume.truncation()) {
             tally.fail(WARNING);
         }
         if !invocation.all_volumes || !volume.is_volume() {
@@ -1817,7 +1817,11 @@ fn run_members(
             let later = truncated
                 .into_inner()
                 .unwrap_or_else(PoisonError::into_inner);
-            let truncated = report_truncation(out, archive.truncation().or(later.as_ref()));
+            let truncated = report_truncation(
+                out,
+                archive.family(),
+                archive.truncation().or(later.as_ref()),
+            );
             tally.errors += usize::from(truncated);
             if header_errors > 0 {
                 tally.fail(CHECKSUM);
@@ -1833,8 +1837,15 @@ fn run_members(
         Err(error) => {
             tally.errors += 1;
             tally.fail(report_failure(out, archive, path, &error));
-            if let Some(member) = cut {
-                out.error(&format!("{:<20} - checksum error", display_name(&member)));
+            if let Some((member, encrypted)) = cut {
+                let member = display_name(&member);
+                out.error(
+                    &if encrypted && archive.family() != rars::ArchiveFamily::Rar50Plus {
+                        encrypted_checksum_line(&member)
+                    } else {
+                        format!("{member:<20} - checksum error")
+                    },
+                );
                 tally.errors += 1;
             }
             if header_errors > 0 {
@@ -2216,11 +2227,20 @@ where
 /// Says that an archive ends early, as unrar does, after its members are done.
 ///
 /// unrar says nothing about a file that stops at a block boundary, so neither
-/// does this when the cut can't have lost a member.
-fn report_truncation(out: Out, truncation: Option<&rars::Truncation>) -> bool {
+/// does this when the cut can't have lost a member. Nor does it about a
+/// RAR 1.4 archive or volume cut short anywhere: the member the cut is in
+/// fails its checksum, and that's all.
+fn report_truncation(
+    out: Out,
+    family: rars::ArchiveFamily,
+    truncation: Option<&rars::Truncation>,
+) -> bool {
     let Some(truncation) = truncation else {
         return false;
     };
+    if family == rars::ArchiveFamily::Rar13 {
+        return false;
+    }
     if truncation.members_complete && !truncation.started {
         return false;
     }
