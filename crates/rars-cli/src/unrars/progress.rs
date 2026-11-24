@@ -303,7 +303,7 @@ impl Progress {
         let Some(mut line) = state.verified.take_if(|line| line.output == output) else {
             return;
         };
-        line.shown = path.display().to_string();
+        line.shown = renamed(&line.shown, path);
         self.show(&mut line, true);
         self.finish_ok();
     }
@@ -392,6 +392,21 @@ impl ProgressState {
         let index = self.cursor + found;
         self.cursor = index + 1;
         Some(self.spans[index].clone())
+    }
+}
+
+/// `planned`, the path a line was to show, with the file name `published`
+/// ended up with, keeping the separators the rest of it was written with.
+fn renamed(planned: &str, published: &Path) -> String {
+    let old = Path::new(planned)
+        .file_name()
+        .map(|name| name.to_string_lossy());
+    let new = published.file_name().map(|name| name.to_string_lossy());
+    match (old, new) {
+        (Some(old), Some(new)) if planned.ends_with(old.as_ref()) => {
+            format!("{}{new}", &planned[..planned.len() - old.len()])
+        }
+        _ => published.display().to_string(),
     }
 }
 
