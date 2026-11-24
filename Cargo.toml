@@ -23,6 +23,7 @@ aes = { version = "0.9", features = ["zeroize"] }
 aho-corasick = "1.1"
 clap = { version = "4.6", features = ["derive", "wrap_help"] }
 blake2s_simd = "1.0"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crc32fast = "1.5"
 getrandom = "0.4"
 hmac = "0.13"

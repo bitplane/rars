@@ -408,9 +408,6 @@ jobs:
       - uses: pypa/cibuildwheel@v4.3.5
         env:
           CIBW_ARCHS: ${{ matrix.archs }}
-          # rars reads no Windows time zone and converts legacy times as UTC,
-          # so the tests' local times must be UTC too (see #634).
-          CIBW_ENVIRONMENT_WINDOWS: TZ=UTC0
         with:
           output-dir: dist
 

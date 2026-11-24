@@ -57,6 +57,12 @@ getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+# Windows has no zone database for `tzif` to read, so a legacy timestamp's
+# offset comes from the system's own time zone settings through chrono's
+# `Local`, which wraps them without `unsafe` here.
+[target.'cfg(windows)'.dependencies]
+chrono.workspace = true
+
 # The PPMd model's pool is an anonymous mapping, so pages it never touches are
 # never committed. Other targets keep a zeroed `Vec`.
 [target.'cfg(any(unix, windows))'.dependencies]

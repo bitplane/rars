@@ -1,7 +1,7 @@
 //! Timestamp conversions shared by archive consumers.
 //! Legacy DOS values follow the established extracting-machine local-zone policy.
 
-use crate::tzif::TimeZone;
+use crate::local_zone::LocalZone;
 use crate::{ArchiveFamily, TimeRefinement};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -59,7 +59,7 @@ impl StoredTimestamp {
         match self {
             Self::UnixSeconds(seconds) => {
                 let instant = i64::from(seconds);
-                let local = instant + i64::from(TimeZone::local().offset_at(instant));
+                let local = instant + i64::from(LocalZone::current().offset_at(instant));
                 Some(unix_datetime(u32::try_from(local).ok()?))
             }
             Self::DosLocal(_) => self.calendar_fields(),
@@ -153,7 +153,7 @@ pub(crate) fn extracted_system_time(
 /// what that costs.
 fn system_time_to_dos_time(time: SystemTime) -> Option<u32> {
     let instant = i64::try_from(time.duration_since(UNIX_EPOCH).ok()?.as_secs()).ok()?;
-    let local = instant.checked_add(i64::from(TimeZone::local().offset_at(instant)))?;
+    let local = instant.checked_add(i64::from(LocalZone::current().offset_at(instant)))?;
     let seconds = u64::try_from(local).ok()?;
     let days = i64::try_from(seconds / 86_400).ok()?;
     let seconds_of_day = seconds % 86_400;
@@ -192,7 +192,7 @@ fn dos_time_to_system_time(time: u32) -> Option<SystemTime> {
     let local = days
         .checked_mul(86_400)?
         .checked_add(i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))?;
-    let zone = TimeZone::local();
+    let zone = LocalZone::current();
     let instant = local.checked_sub(i64::from(zone.offset_for_local(local)))?;
     Some(UNIX_EPOCH + Duration::from_secs(u64::try_from(instant).ok()?))
 }

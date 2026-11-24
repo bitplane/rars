@@ -193,6 +193,12 @@ jobs:
           "$HOME\unrar-bin" | Out-File $env:GITHUB_PATH -Append -Encoding utf8
           if (-not (Test-Path "$HOME\unrar-bin\unrar.exe")) { throw 'unrar.exe not built' }
 
+      # The runners are on UTC, where reading a legacy time as local or as UTC
+      # gives the same answer. A zone with daylight saving tells them apart.
+      - name: Use a time zone other than UTC
+        if: runner.os == 'Windows'
+        run: tzutil /s "Pacific Standard Time"
+
       # Until this job existed the suite only ran in the release gate, so a
       # change could break it on master without any PR showing a failure.
       - name: Build the extension and run python/tests
