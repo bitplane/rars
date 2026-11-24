@@ -1410,3 +1410,60 @@ fn listings_show_rar5_times_in_local_time() {
         );
     }
 }
+
+/// Runs `unrars` with stdout piped, reads `keep` bytes of it, then closes
+/// the pipe, as `| head -c` does. Returns the exit code and stderr.
+fn unrars_into_closed_pipe(dir: &Path, args: &[&str], keep: usize) -> (Option<i32>, String) {
+    use std::io::Read;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_unrars"))
+        .current_dir(dir)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut kept = vec![0; keep];
+    stdout.read_exact(&mut kept).unwrap();
+    drop(stdout);
+    let output = child.wait_with_output().unwrap();
+    (output.status.code(), stderr(&output))
+}
+
+/// Issue #574: a reader that closes stdout early ends the run quietly, with
+/// the status a shell gives a process SIGPIPE kills, never a panic.
+#[cfg(unix)]
+#[test]
+fn a_closed_stdout_ends_the_run_quietly() {
+    let dir = scratch::case("unrars-broken-pipe");
+    let big: Vec<u8> = (0..4_000_000u32).map(|n| (n * 13 % 251) as u8).collect();
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(b"big.bin".to_vec(), big, None, None)
+        .unwrap();
+    for index in 0..3000 {
+        builder
+            .add_bytes(
+                format!("many/{index:04}.txt").into_bytes(),
+                b"x\n".to_vec(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    builder.write_to_path(&dir.join("big.rar"), None).unwrap();
+    for args in [
+        &["p", "-inul", "big.rar", "big.bin"][..],
+        &["p", "big.rar", "big.bin"],
+        &["l", "big.rar"],
+        &["v", "big.rar"],
+        &["lb", "big.rar"],
+        &["t", "big.rar"],
+        &["x", "-o+", "big.rar", "out/"],
+    ] {
+        let (code, errors) = unrars_into_closed_pipe(&dir, args, 100);
+        assert_eq!(code, Some(141), "{args:?}: {errors}");
+        assert!(errors.is_empty(), "{args:?}: {errors}");
+    }
+}
