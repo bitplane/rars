@@ -1315,7 +1315,7 @@ fn compress_streaming_members(
         .max(1);
 
     // One dictionary runs through solid members, so none can be stored
-    // instead once its packed bytes have gone out, and none goes straight.
+    // instead once its packed bytes have gone out.
     match (&resources.execution, plan.solid) {
         (Some(allowance), true) => compress_solid_chain(
             sources,
@@ -1328,6 +1328,7 @@ fn compress_streaming_members(
             advance,
             error_context,
             allowance,
+            straight,
             consume,
         ),
         (Some(allowance), false) => compress_independent_members(
@@ -1356,6 +1357,7 @@ fn compress_streaming_members(
             advance,
             error_context,
             &Allowance::default(),
+            straight,
             consume,
         ),
         (None, false) => compress_independent_members(
@@ -1962,6 +1964,7 @@ fn compress_solid_chain<B: Budget + Send + Sync>(
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     allowance: &B,
+    straight: &Straight<'_>,
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()>
 where
@@ -1987,7 +1990,24 @@ where
     let mut next = 0usize;
     // Members before this have been handed to `consume`.
     let mut handed = 0usize;
+    // Not yet opened: its first block starts a wave of its own.
+    let goes_straight = |stream: &MemberStream<B>| {
+        !stream.started && !stream.straight && straight(stream.member, stream.input_size)
+    };
     loop {
+        while next < streams.len() && !streams[next].has_more() {
+            next += 1;
+        }
+        // Waves end before such a member, so every member before it is
+        // packed, and is handed on here while no wave holds workspace.
+        if streams.get(next).is_some_and(&goes_straight) {
+            hand_on_done(&mut streams, &mut handed, consume)?;
+            debug_assert_eq!(handed, next, "members before it are out");
+            let stream = &mut streams[next];
+            stream.straight = true;
+            stream.packed = None;
+            consume(stream.member, Packing::Opening(stream.input_size))?;
+        }
         let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
         let reserved = required.saturating_mul(wave_capacity as u64);
         let permit = resources
@@ -1996,11 +2016,12 @@ where
         // Run boundaries depend on input and dictionary size, never on the
         // worker count. Adjacent blocks amortize history copies and seeding.
         let mut jobs = Records::new(wave_capacity, resources)?;
-        while jobs.len() < wave_capacity {
+        let mut before_straight = false;
+        while jobs.len() < wave_capacity && !before_straight {
             while next < streams.len() && !streams[next].has_more() {
                 next += 1;
             }
-            if next == streams.len() {
+            if next == streams.len() || (!jobs.is_empty() && goes_straight(&streams[next])) {
                 break;
             }
             let mut job = BlockJob {
@@ -2028,6 +2049,10 @@ where
                 let Some(stream) = streams.get_mut(next) else {
                     break;
                 };
+                if goes_straight(stream) {
+                    before_straight = true;
+                    break;
+                }
                 let start = job.data.len();
                 job.append(
                     read_block(stream, plan.block_size, advance)
@@ -2688,6 +2713,39 @@ mod tests {
             plan,
             filter_runs,
             1,
+            batch_capacity,
+            required,
+            resources,
+            advance,
+            error_context,
+            allowance,
+            &|_, _| false,
+            consume,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn solid_chain<B: Budget + Send + Sync>(
+        sources: &[EntrySource],
+        integrity: &[Integrity],
+        plan: &CompressPlan,
+        filter_runs: bool,
+        batch_capacity: usize,
+        required: u64,
+        resources: &WriterResources,
+        advance: &dyn CompressionProgress,
+        error_context: &(dyn Fn(usize, Error) -> Error + Sync),
+        allowance: &B,
+        consume: &mut ConsumePacked<'_>,
+    ) -> Result<()>
+    where
+        B::Charge: Send,
+    {
+        compress_solid_chain(
+            sources,
+            integrity,
+            plan,
+            filter_runs,
             batch_capacity,
             required,
             resources,
@@ -3429,7 +3487,7 @@ mod tests {
             let initial = [(8192, 0, None), (2048, 0, None), (0, 0, None)];
             let mut expected_integrity = initial;
             let encode = if solid {
-                compress_solid_chain::<Allowance>
+                solid_chain::<Allowance>
             } else {
                 independent::<Allowance>
             };
@@ -3466,7 +3524,7 @@ mod tests {
                 let allowance = Allowance::limited(limit);
                 let mut integrity = initial;
                 let encode = if solid {
-                    compress_solid_chain::<crate::codec::workspace::Limited>
+                    solid_chain::<crate::codec::workspace::Limited>
                 } else {
                     independent::<crate::codec::workspace::Limited>
                 };
@@ -3507,7 +3565,7 @@ mod tests {
 
             let allowance = Allowance::limited(4 * 1024 * 1024);
             let encode = if solid {
-                compress_solid_chain::<crate::codec::workspace::Limited>
+                solid_chain::<crate::codec::workspace::Limited>
             } else {
                 independent::<crate::codec::workspace::Limited>
             };
@@ -3560,7 +3618,7 @@ mod tests {
             let mut expected_integrity = [(size as u64, 0, None); 2];
             let mut actual_integrity = expected_integrity;
             let encode = if solid {
-                compress_solid_chain::<Allowance>
+                solid_chain::<Allowance>
             } else {
                 independent::<Allowance>
             };
@@ -3582,7 +3640,7 @@ mod tests {
             .unwrap();
             let allowance = Allowance::limited(64 * 1024 * 1024);
             let encode = if solid {
-                compress_solid_chain::<crate::codec::workspace::Limited>
+                solid_chain::<crate::codec::workspace::Limited>
             } else {
                 independent::<crate::codec::workspace::Limited>
             };

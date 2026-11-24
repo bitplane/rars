@@ -622,3 +622,133 @@ fn a_record_read_back_covers_headers_patched_in_place() {
         }
     }
 }
+
+fn solid(lock: Encryption) -> WriterOptions {
+    let mut options = options(lock);
+    options.features.solid = true;
+    options
+}
+
+fn solid_archive(
+    members: &[Vec<u8>],
+    lock: Encryption,
+    policy: FilterPolicy,
+    resources: &WriterResources,
+    output: CallerOutput<'_>,
+) -> crate::Result<()> {
+    write_archive_reporting(
+        &entries(members, lock),
+        solid(lock),
+        extras(lock).with_filter_policy(policy),
+        resources,
+        None,
+        output.streaming_above(ABOVE),
+    )
+}
+
+fn solid_seekable(
+    members: &[Vec<u8>],
+    lock: Encryption,
+    policy: FilterPolicy,
+    resources: &WriterResources,
+) -> crate::Result<Vec<u8>> {
+    let mut output = Cursor::new(Vec::new());
+    let output_ref = CallerOutput::seekable(&mut output);
+    solid_archive(members, lock, policy, resources, output_ref)?;
+    Ok(output.into_inner())
+}
+
+fn solid_streamed(
+    members: &[Vec<u8>],
+    lock: Encryption,
+    policy: FilterPolicy,
+    resources: &WriterResources,
+) -> crate::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let output_ref = CallerOutput::stream(&mut output);
+    solid_archive(members, lock, policy, resources, output_ref)?;
+    Ok(output)
+}
+
+#[test]
+fn a_large_solid_member_is_spooled_only_on_a_stream_output() {
+    let members = vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)];
+    for lock in every_encryption_case() {
+        let resources = WriterResources::default().with_max_spool_bytes(64 * 1024);
+        let archive = solid_seekable(&members, lock, FilterPolicy::None, &resources).unwrap();
+        assert_holds(&archive, &members, lock);
+
+        let error = solid_streamed(&members, lock, FilterPolicy::None, &resources).unwrap_err();
+        assert!(
+            matches!(error.root_cause(), Error::WriterSpoolLimitExceeded { .. }),
+            "{error}"
+        );
+        let unlimited = solid_streamed(
+            &members,
+            lock,
+            FilterPolicy::None,
+            &WriterResources::default(),
+        );
+        assert_holds(&unlimited.unwrap(), &members, lock);
+    }
+}
+
+#[test]
+fn large_solid_members_anywhere_in_the_chain_extract_from_either_output() {
+    let large = || text(600 * 1024, 5);
+    for members in [
+        vec![large(), text(4096, 1), text(4096, 2)],
+        vec![text(4096, 1), Vec::new(), large(), text(4096, 2)],
+        vec![text(4096, 1), text(4096, 2), large()],
+        vec![large(), samples(700 * 1024), text(4096, 3)],
+    ] {
+        for lock in every_encryption_case() {
+            for policy in [FilterPolicy::None, FilterPolicy::Auto] {
+                // Room for the small members only, so each large one went in place.
+                let capped = WriterResources::default().with_max_spool_bytes(64 * 1024);
+                let archive = solid_seekable(&members, lock, policy.clone(), &capped).unwrap();
+                assert_holds(&archive, &members, lock);
+                let resources = WriterResources::default();
+                let streamed = solid_streamed(&members, lock, policy, &resources).unwrap();
+                assert_holds(&streamed, &members, lock);
+            }
+        }
+    }
+}
+
+fn samples(len: usize) -> Vec<u8> {
+    (0..len / 4)
+        .flat_map(|at| {
+            let left = ((at as f64 / 40.0).sin() * 12_000.0) as i16;
+            let right = ((at as f64 / 55.0).cos() * 9_000.0) as i16;
+            [left.to_le_bytes(), right.to_le_bytes()].concat()
+        })
+        .collect()
+}
+
+#[test]
+fn an_in_place_solid_archive_does_not_depend_on_the_thread_count() {
+    let members = vec![
+        text(4096, 1),
+        text(1024 * 1024, 2),
+        samples(300 * 1024),
+        text(4096, 3),
+    ];
+    let lock = Encryption::headers_only(false);
+    let resources = WriterResources::default();
+    for policy in [FilterPolicy::None, FilterPolicy::Auto] {
+        let archive = solid_seekable(&members, lock, policy.clone(), &resources).unwrap();
+        assert_holds(&archive, &members, lock);
+        #[cfg(feature = "parallel")]
+        for threads in [1, 3] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let again = pool
+                .install(|| solid_seekable(&members, lock, policy.clone(), &resources))
+                .unwrap();
+            assert!(again == archive, "{threads} threads wrote another archive");
+        }
+    }
+}
