@@ -32,6 +32,8 @@ not (
     (binary_id(rars) & test(=rar50::write::compress::tests::joined_runs_code_the_bytes_their_runs_code_alone)) |
     (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_large_member_is_searched_on_the_block_paths_grid)) |
     (binary_id(rars) & test(=rar50::write::filter_policy::run_search_tests::a_member_too_long_for_one_search_is_filtered_on_both_paths)) |
+    (binary_id(rars) & test(=rar50::write::in_place_tests::a_large_solid_member_is_spooled_only_on_a_stream_output)) |
+    (binary_id(rars) & test(=rar50::write::in_place_tests::large_solid_members_anywhere_in_the_chain_extract_from_either_output)) |
     (binary_id(rars) & test(=rar50::write::tests::parallel_streaming_blocks_are_byte_identical_to_serial_blocks)) |
     (binary_id(rars) & test(=rar50::write::tests::streaming_entry_order_is_identical_at_one_and_many_job_budgets)) |
     (binary_id(rars-cli::cli) & test(=raising_the_memory_limit_never_changes_the_archive)) |

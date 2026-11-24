@@ -8,9 +8,10 @@
 //! an output that cannot be read back, needs every block length before the
 //! main header, in which case they are held until the last. Otherwise the main
 //! header reserves its locator offsets and they are patched at the end. On a seekable
-//! output, a large non-solid member goes out as it is packed, encrypted on the
-//! way if it has a password, behind a header patched once it is done, or
-//! stored over its attempt when packing does not pay and no filter was named.
+//! output, a large member goes out as it is packed (a solid one after its
+//! first run, which is spooled), encrypted on the way if it has a password,
+//! behind a header patched once it is done, or stored over its attempt when
+//! packing does not pay and no filter was named.
 //! The workspace admission budget is not an aggregate RAM or disk quota.
 //!
 //! Stored payloads are reread and verified during emission, or, when the output
@@ -486,9 +487,7 @@ pub(super) fn write_archive<'a>(
 
     // Large members go out as they are packed, behind a header patched once
     // they are done, when the archive can seek and nothing is held.
-    let straight_above = sink
-        .stream_above
-        .filter(|_| in_order && sink.can_seek() && !plan.compress.solid);
+    let straight_above = sink.stream_above.filter(|_| in_order && sink.can_seek());
     let straight = |_: usize, size: u64| straight_above.is_some_and(|above| size > above);
     let mut in_place: Option<InPlace> = None;
     compress::compress_members_in_order(
@@ -584,6 +583,7 @@ pub(super) fn write_archive<'a>(
             if let Some(input_size) = opening {
                 let opened = InPlace::open(
                     entry,
+                    index,
                     input_size,
                     &plan,
                     &mut sink,
@@ -1506,14 +1506,16 @@ struct InPlace {
     iv: Option<[u8; 16]>,
     /// Fixed by the declared size, so the archive does not depend on threads.
     width: usize,
-    /// Not under an explicit filter, which keeps whatever it packs to.
+    /// Neither solid nor under an explicit filter, which keep whatever they pack to.
     may_store: bool,
     written: u64,
 }
 
 impl InPlace {
+    #[allow(clippy::too_many_arguments)]
     fn open<'a>(
         entry: &'a ArchiveEntry,
+        index: usize,
         input_size: u64,
         plan: &EnginePlan<'_>,
         sink: &mut CancellableOutput<'_, '_>,
@@ -1543,7 +1545,7 @@ impl InPlace {
                 compress.algorithm_version,
                 compress.method,
                 compress.dictionary_size,
-                false,
+                compress.solid && index > 0,
             )?,
             input_size,
             payload_len: 0,
@@ -1552,7 +1554,7 @@ impl InPlace {
         let may_store = super::filter_policy::should_store_compressed_payload(
             input_size,
             input_size,
-            false,
+            compress.solid,
             &compress.filter_policy,
         );
         let width = reserved_width(input_size, may_store, cipher.is_some())?;

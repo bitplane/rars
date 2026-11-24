@@ -239,9 +239,10 @@ mod splitter_tests {
 /// encoder chooses can outgrow it.
 pub(crate) fn packed_most(input_size: u64) -> u64 {
     // The encoder never codes an empty block but perhaps the last, and gives a
-    // block one filter record at most. A block is five header bytes and at
-    // most 1,248 bytes of tables: twenty level lengths of eight bits, 446
-    // lengths of a fifteen-bit code and seven extra bits, and byte padding.
+    // block no more filter records than it has bytes: one at most, or in a
+    // solid run one per disjoint filtered range. A block is five header bytes
+    // and at most 1,248 bytes of tables: twenty level lengths of eight bits,
+    // 446 lengths of a fifteen-bit code and seven extra bits, and byte padding.
     const BLOCK_MOST: u64 = 5 + 1_248;
     // A filter record, or a match of fifteen main bits, nine length bits,
     // fifteen distance bits, 34 raw distance bits and a fifteen-bit align
@@ -1340,6 +1341,13 @@ pub(crate) fn filter_streaming_blocks_in_place<B: Budget>(
 ) -> Result<Buffer<Buffer<EncodeFilter, B>, B>> {
     let mut filters = normalized_filter_specs(data.len(), filters, allowance)?;
     filters.sort_unstable_by_key(|filter| filter.range.start);
+    // `packed_most` counts on no more records in a block than it has bytes.
+    debug_assert!(
+        filters
+            .windows(2)
+            .all(|pair| pair[0].range.end <= pair[1].range.start),
+        "solid filter ranges overlap"
+    );
     let mut placed = Buffer::with_capacity(filters.len(), allowance)?;
     for filter in filters.iter() {
         let Some((segment, file_offset)) = segments.iter().find(|(segment, _)| {
