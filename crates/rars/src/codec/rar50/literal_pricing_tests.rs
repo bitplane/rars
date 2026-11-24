@@ -228,6 +228,7 @@ fn empty_matches<B: Budget>(span: usize, allowance: &B) -> Result<BlockMatches<B
     Ok(BlockMatches {
         runs: Buffer::new(allowance),
         starts: Buffer::filled(span + 1, 0, allowance)?,
+        commits: Buffer::new(allowance),
     })
 }
 

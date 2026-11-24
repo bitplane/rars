@@ -1471,6 +1471,7 @@ fn shorter_equal_price_match_can_expose_a_better_continuation() {
     let mut matches = BlockMatches {
         runs: Buffer::new(&Allowance::default()),
         starts: Buffer::new(&Allowance::default()),
+        commits: Buffer::new(&Allowance::default()),
     };
     for pos in 0..data.len() {
         matches.starts.push(matches.runs.len() as u32).unwrap();
@@ -3609,6 +3610,7 @@ fn optimal_long_match_commitment_prunes_shorter_candidate_endpoints() {
         None,
         &runs,
         &starts,
+        &[],
         OptimalSlices {
             price: &mut price,
             arrive_length: &mut arrive_length,
@@ -6682,4 +6684,52 @@ fn no_member_packs_past_the_most_its_size_allows() {
             }
         }
     }
+}
+
+/// The parse can commit past where the collector committed, through a
+/// remembered distance the collector never sees, and land inside the
+/// collector's match. It must still find that match there rather than code
+/// the rest of it as literals.
+#[test]
+fn a_parse_landing_inside_the_collectors_match_still_takes_it() {
+    let mut data = noise(16 * 1024, 0x618);
+    let x = noise(600, 0x6181);
+    let y = noise(500, 0x6183);
+    // A short phrase copied at 10,000 puts that distance in the parse's
+    // memory and nothing else in it.
+    data.copy_within(0..100, 10_000);
+    // X is 10,000 back from where it is wanted, so the remembered distance
+    // reaches over all of it. A nearer copy of its start shadows the far one
+    // in the tree, so the collector commits only that short copy at 12,000,
+    // and then finds X's tail followed by Y, which runs on past X's end.
+    data[2_000..2_600].copy_from_slice(&x);
+    data[5_000..5_040].copy_from_slice(&x[..40]);
+    data[7_000..7_560].copy_from_slice(&x[40..]);
+    data[7_560..8_060].copy_from_slice(&y);
+    data[12_000..12_600].copy_from_slice(&x);
+    data[12_600..13_100].copy_from_slice(&y);
+
+    let options = EncodeOptions {
+        max_match_distance: 64 * 1024,
+        max_match_candidates: 16,
+        optimal_parse: true,
+        ..EncodeOptions::default()
+    }
+    .with_nice_match_length(32)
+    .with_parse_passes(1);
+    let packed = encode_lz_member_with_options(&data, 0, options).unwrap();
+    // The same with Y's second copy fresh noise, which nothing can match.
+    let mut control = data.clone();
+    control[12_600..13_100].copy_from_slice(&noise(500, 0x6185));
+    let unmatched = encode_lz_member_with_options(&control, 0, options).unwrap();
+    assert!(
+        packed.len() + 400 < unmatched.len(),
+        "Y's copy packed to {} bytes, against {} as noise",
+        packed.len(),
+        unmatched.len()
+    );
+    let decoded = Unpack50Decoder::new()
+        .decode_member(&packed, 0, data.len(), false, DecodeMode::Lz)
+        .unwrap();
+    assert!(decoded == data);
 }

@@ -189,6 +189,7 @@ fn prepared_pricing_preserves_all_paths_and_remembered_state() {
                             prices,
                             &matches.runs,
                             &matches.starts,
+                            &matches.commits,
                             result.slices(),
                             &mut reaches,
                         );

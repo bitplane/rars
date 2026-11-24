@@ -1605,6 +1605,72 @@ mod run_search_tests {
         assert_eq!(archive.read_member(b"period", None).unwrap().unwrap(), data);
     }
 
+    /// A table of 16-byte records, delta filtered, whose last field repeats
+    /// every 512 KiB. The shortest-path parse reaches most of it through a
+    /// remembered distance, which can carry it past where the search
+    /// committed to the far copy, and the rest of that copy then has to be
+    /// found where the parse lands. The archive is the same at any thread
+    /// count, and level 2 packs it no larger than level 1.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_record_table_packs_no_larger_at_level_two_on_any_thread_count() {
+        use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
+        use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
+        let root = crate::scratch::case("rar50-record-table-ladder");
+        let data: Vec<u8> = (0..65536u32)
+            .flat_map(|i| {
+                [0x40_0000 + i * 24, i * 3, 7, i.wrapping_mul(i) & 0xffff]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+            })
+            .collect();
+        let write = |level: u8, threads: usize| {
+            let entries = [ArchiveEntry::new(
+                "table",
+                EntrySource::from_bytes(data.clone()),
+            )];
+            let resources = WriterResources::new(1024 * 1024 * 1024).with_temp_dir(&*root);
+            let mut bytes = Vec::new();
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| {
+                    crate::rar50::write_streaming_archive_with_progress(
+                        &entries,
+                        WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                            .with_compression_level(level),
+                        ArchiveExtras::default().with_filter_policy(FilterPolicy::Auto),
+                        &resources,
+                        None,
+                        &mut bytes,
+                    )
+                })
+                .unwrap();
+            bytes
+        };
+        let one = write(1, 1);
+        let two = write(2, 1);
+        assert!(
+            two.len() <= one.len(),
+            "level 2 packed {} bytes against level 1's {}",
+            two.len(),
+            one.len()
+        );
+        for threads in [2, 8] {
+            assert!(
+                two == write(2, threads),
+                "{threads} threads changed the archive"
+            );
+        }
+        let archive = ArchiveReader::read(&two).unwrap();
+        archive.test(None).unwrap();
+        assert_eq!(archive.read_member(b"table", None).unwrap().unwrap(), data);
+    }
+
     #[cfg(target_pointer_width = "64")]
     #[test]
     fn an_explicit_filter_over_a_member_stops_at_4_gib() {

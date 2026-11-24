@@ -1907,6 +1907,9 @@ struct BlockMatches<B: Budget = Allowance> {
     /// Where each position's runs start in `runs`, with one extra entry to
     /// close the last position.
     starts: Buffer<u32, B>,
+    /// The matches the collector committed to, in order, whose interiors it
+    /// left unsearched.
+    commits: Buffer<match_finder::CommittedMatch, B>,
 }
 
 /// One match finder for a member's whole optimal parse, and the walk that asks
@@ -2161,6 +2164,7 @@ impl<B: Budget> OptimalCollector<B> {
             // matches at all lands, so the common case grows this once.
             runs: Buffer::with_capacity(span, &allowance)?,
             starts: Buffer::with_capacity(span + 1, &allowance)?,
+            commits: Buffer::new(&allowance),
         };
         if let CollectorFinder::Packed(finder) = &mut self.finder {
             finder
@@ -2173,13 +2177,15 @@ impl<B: Budget> OptimalCollector<B> {
                     MAX_ENCODER_MATCH_LENGTH,
                     &mut matches.runs,
                     &mut matches.starts,
+                    &mut matches.commits,
                 )
                 .map_err(Into::into)?;
             return Ok(matches);
         }
         // The first position past a match the parse will commit to. The parse
-        // reaches the same decision from the same lengths, so the two agree on
-        // which positions matter without having to be told.
+        // reaches the same decision from the same lengths, and where it steps
+        // over the position this one was found at, it looks the match up in
+        // `commits` instead; see [`match_finder::CommittedMatch`].
         let mut committed_through = block.start;
         for pos in block.clone() {
             matches.starts.push_admitted(matches.runs.len() as u32);
@@ -2276,12 +2282,16 @@ impl<B: Budget> OptimalCollector<B> {
             }
             // The parse can only take a match the block still has room for, so
             // the reach it will commit to is measured the way it measures it.
-            if let Some(&(length, _)) = matches.runs[before..].last() {
-                let reach = (length as usize)
+            if let Some(&run) = matches.runs[before..].last() {
+                let reach = (run.0 as usize)
                     .min(block.end - pos)
                     .min(MAX_ENCODER_MATCH_LENGTH);
                 if reach >= options.nice() {
                     committed_through = pos + reach;
+                    matches
+                        .commits
+                        .push(match_finder::CommittedMatch::at(pos, reach, run))
+                        .map_err(Into::into)?;
                 }
             }
         }
@@ -3347,6 +3357,7 @@ fn price_optimal_paths(
     prices: Option<&TokenPrices<'_>>,
     runs: &[(u32, u32)],
     starts: &[u32],
+    commits: &[match_finder::CommittedMatch],
     workspace: OptimalSlices<'_>,
     reaches: &mut [(usize, usize, usize)],
 ) {
@@ -3359,6 +3370,7 @@ fn price_optimal_paths(
             prices,
             runs,
             starts,
+            commits,
             workspace,
             reaches,
         );
@@ -3372,6 +3384,7 @@ fn price_optimal_paths(
         prices,
         runs,
         starts,
+        commits,
         workspace,
         reaches,
     );
@@ -3386,6 +3399,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
     prices: Option<&TokenPrices<'_>>,
     runs: &[(u32, u32)],
     starts: &[u32],
+    commits: &[match_finder::CommittedMatch],
     workspace: OptimalSlices<'_>,
     reaches: &mut [(usize, usize, usize)],
 ) {
@@ -3417,6 +3431,10 @@ fn price_optimal_paths_with_state<const RING: bool>(
     // The first position past a match the parse committed to. Nothing is
     // priced from the positions before it. See [`NICE_MATCH_LENGTH`].
     let mut committed_through = 0usize;
+    // Where a match the collector committed to may still reach after this
+    // parse's own commit ends, and the collector's commit to look at next.
+    let mut landed_until = 0usize;
+    let mut commit = 0usize;
     let match_prices = OptimalMatchPrices::new(prices);
     let nice = options.nice();
 
@@ -3515,7 +3533,17 @@ fn price_optimal_paths_with_state<const RING: bool>(
         // run at that distance gets. On text that was a fifth of every
         // endpoint priced, so such a run is left out.
         let repeat_reaches = reaches_len;
-        for &(length, distance) in &runs[starts[index] as usize..starts[index + 1] as usize] {
+        let mut found = &runs[starts[index] as usize..starts[index + 1] as usize];
+        // Nothing found here may be a position the collector stepped over,
+        // inside a match it committed to where this parse did not.
+        let tail;
+        if found.is_empty() && index < landed_until {
+            if let Some(run) = committed_tail(commits, &mut commit, pos) {
+                tail = [run];
+                found = &tail;
+            }
+        }
+        for &(length, distance) in found {
             let length = (length as usize).min(max_length);
             if length > longest {
                 let distance = distance as usize;
@@ -3567,8 +3595,23 @@ fn price_optimal_paths_with_state<const RING: bool>(
         // their encoder tables, so the endpoint has already been priced.
         if let Some(reach) = committed_reach {
             committed_through = index + reach;
+            landed_until = committed_through + MAX_ENCODER_MATCH_LENGTH;
         }
     }
+}
+
+/// What is left at `pos` of the match the collector committed to around it,
+/// if it committed to one, moving `commit` on past those behind `pos`.
+#[cold]
+fn committed_tail(
+    commits: &[match_finder::CommittedMatch],
+    commit: &mut usize,
+    pos: usize,
+) -> Option<(u32, u32)> {
+    while commits.get(*commit).is_some_and(|c| c.end <= pos) {
+        *commit += 1;
+    }
+    commits.get(*commit).and_then(|c| c.tail(pos))
 }
 
 /// Prices every path through the block and keeps the cheapest, instead of
@@ -3659,6 +3702,7 @@ fn optimal_tokens_in_workspace<B: Budget>(
         prices,
         &matches.runs,
         &matches.starts,
+        &matches.commits,
         OptimalSlices {
             price,
             arrive_length,
