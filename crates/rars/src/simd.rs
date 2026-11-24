@@ -1,4 +1,5 @@
-// The one module allowed `unsafe`, for SIMD loads, stores and dispatched calls.
+// Allowed `unsafe` for SIMD loads, stores and dispatched calls. The only other
+// module allowed it is `codec::ppmd::pool`, which maps the PPMd model.
 #![allow(unsafe_code)]
 
 #[cfg(all(
