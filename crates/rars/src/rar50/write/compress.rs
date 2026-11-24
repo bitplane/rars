@@ -1990,24 +1990,12 @@ where
     let mut next = 0usize;
     // Members before this have been handed to `consume`.
     let mut handed = 0usize;
-    // Not yet opened: its first block starts a wave of its own.
+    // Runs cross into it as into any member, so both outputs pack alike; the
+    // wave its first run is in ends with that run, and it opens after.
     let goes_straight = |stream: &MemberStream<B>| {
         !stream.started && !stream.straight && straight(stream.member, stream.input_size)
     };
     loop {
-        while next < streams.len() && !streams[next].has_more() {
-            next += 1;
-        }
-        // Waves end before such a member, so every member before it is
-        // packed, and is handed on here while no wave holds workspace.
-        if streams.get(next).is_some_and(&goes_straight) {
-            hand_on_done(&mut streams, &mut handed, consume)?;
-            debug_assert_eq!(handed, next, "members before it are out");
-            let stream = &mut streams[next];
-            stream.straight = true;
-            stream.packed = None;
-            consume(stream.member, Packing::Opening(stream.input_size))?;
-        }
         let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
         let reserved = required.saturating_mul(wave_capacity as u64);
         let permit = resources
@@ -2016,12 +2004,12 @@ where
         // Run boundaries depend on input and dictionary size, never on the
         // worker count. Adjacent blocks amortize history copies and seeding.
         let mut jobs = Records::new(wave_capacity, resources)?;
-        let mut before_straight = false;
-        while jobs.len() < wave_capacity && !before_straight {
+        let mut opens = false;
+        while jobs.len() < wave_capacity && !opens {
             while next < streams.len() && !streams[next].has_more() {
                 next += 1;
             }
-            if next == streams.len() || (!jobs.is_empty() && goes_straight(&streams[next])) {
+            if next == streams.len() {
                 break;
             }
             let mut job = BlockJob {
@@ -2049,10 +2037,7 @@ where
                 let Some(stream) = streams.get_mut(next) else {
                     break;
                 };
-                if goes_straight(stream) {
-                    before_straight = true;
-                    break;
-                }
+                opens |= goes_straight(stream);
                 let start = job.data.len();
                 job.append(
                     read_block(stream, plan.block_size, advance)
@@ -2126,11 +2111,45 @@ where
         )?;
         // The writer may need workspace of its own for what it is handed.
         drop(permit);
-        hand_on_done(&mut streams, &mut handed, consume)?;
+        hand_on_opening(&mut streams, &mut handed, straight, consume)?;
     }
-    hand_on_done(&mut streams, &mut handed, consume)?;
+    hand_on_opening(&mut streams, &mut handed, straight, consume)?;
     debug_assert_eq!(handed, streams.len(), "every member is handed on");
     Ok(())
+}
+
+/// A large member whose first run went into the spool opens once every
+/// member before it is out, and what it packed to so far follows its header.
+fn hand_on_opening<B: Budget>(
+    streams: &mut [MemberStream<B>],
+    handed: &mut usize,
+    straight: &Straight<'_>,
+    consume: &mut ConsumePacked<'_>,
+) -> Result<()> {
+    loop {
+        hand_on_done(streams, handed, consume)?;
+        let Some(stream) = streams.get_mut(*handed) else {
+            return Ok(());
+        };
+        if stream.straight || !stream.started || !straight(stream.member, stream.input_size) {
+            return Ok(());
+        }
+        consume(stream.member, Packing::Opening(stream.input_size))?;
+        let mut head = stream
+            .packed
+            .take()
+            .expect("a member is packed before it opens");
+        head.rewind()?;
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            let read = head.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            consume(stream.member, Packing::Packed(&chunk[..read]))?;
+        }
+        stream.straight = true;
+    }
 }
 
 /// Reads the next block from `stream`, checking the source has not grown.

@@ -8,9 +8,10 @@
 //! an output that cannot be read back, needs every block length before the
 //! main header, in which case they are held until the last. Otherwise the main
 //! header reserves its locator offsets and they are patched at the end. On a seekable
-//! output, a large member goes out as it is packed, encrypted on the
-//! way if it has a password, behind a header patched once it is done, or
-//! stored over its attempt when packing does not pay and no filter was named.
+//! output, a large member goes out as it is packed (a solid one after its
+//! first run, which is spooled), encrypted on the way if it has a password,
+//! behind a header patched once it is done, or stored over its attempt when
+//! packing does not pay and no filter was named.
 //! The workspace admission budget is not an aggregate RAM or disk quota.
 //!
 //! Stored payloads are reread and verified during emission, or, when the output

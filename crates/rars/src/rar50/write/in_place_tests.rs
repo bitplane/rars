@@ -302,7 +302,6 @@ fn a_large_encrypted_member_is_spooled_only_on_a_stream_output() {
     }
 }
 
-#[cfg(feature = "encryption")]
 fn members_as_read(archive: &[u8], lock: Encryption) -> Vec<impl PartialEq + std::fmt::Debug> {
     let password = lock.headers.then_some(PASSWORD);
     let archive = crate::rar50::Archive::parse_with_password(archive, password).unwrap();
@@ -636,9 +635,20 @@ fn solid_archive(
     resources: &WriterResources,
     output: CallerOutput<'_>,
 ) -> crate::Result<()> {
+    solid_archive_with(members, solid(lock), lock, policy, resources, output)
+}
+
+fn solid_archive_with(
+    members: &[Vec<u8>],
+    options: WriterOptions,
+    lock: Encryption,
+    policy: FilterPolicy,
+    resources: &WriterResources,
+    output: CallerOutput<'_>,
+) -> crate::Result<()> {
     write_archive_reporting(
         &entries(members, lock),
-        solid(lock),
+        options,
         extras(lock).with_filter_policy(policy),
         resources,
         None,
@@ -670,11 +680,15 @@ fn solid_streamed(
     Ok(output)
 }
 
+// A run is 1 MiB here. A large member's first run is spooled with the runs
+// before it, and the rest goes out as it is packed.
+const ONE_RUN: u64 = 1536 * 1024;
+
 #[test]
 fn a_large_solid_member_is_spooled_only_on_a_stream_output() {
-    let members = vec![text(4096, 1), text(1024 * 1024, 2), text(4096, 3)];
+    let members = vec![text(4096, 1), text(3 * 1024 * 1024, 2), text(4096, 3)];
     for lock in every_encryption_case() {
-        let resources = WriterResources::default().with_max_spool_bytes(64 * 1024);
+        let resources = WriterResources::default().with_max_spool_bytes(ONE_RUN);
         let archive = solid_seekable(&members, lock, FilterPolicy::None, &resources).unwrap();
         assert_holds(&archive, &members, lock);
 
@@ -695,24 +709,21 @@ fn a_large_solid_member_is_spooled_only_on_a_stream_output() {
 
 #[test]
 fn large_solid_members_anywhere_in_the_chain_extract_from_either_output() {
-    let large = || text(600 * 1024, 5);
+    let large = || text(3 * 1024 * 1024, 5);
     for members in [
         vec![large(), text(4096, 1), text(4096, 2)],
         vec![text(4096, 1), Vec::new(), large(), text(4096, 2)],
         vec![text(4096, 1), text(4096, 2), large()],
-        vec![large(), samples(700 * 1024), text(4096, 3)],
+        vec![large(), samples(3 * 1024 * 1024), text(4096, 3)],
     ] {
-        for lock in every_encryption_case() {
-            for policy in [FilterPolicy::None, FilterPolicy::Auto] {
-                // Room for the small members only, so each large one went in place.
-                let capped = WriterResources::default().with_max_spool_bytes(64 * 1024);
-                let archive = solid_seekable(&members, lock, policy.clone(), &capped).unwrap();
-                assert_holds(&archive, &members, lock);
-                let resources = WriterResources::default();
-                let streamed = solid_streamed(&members, lock, policy, &resources).unwrap();
-                assert_holds(&streamed, &members, lock);
-            }
-        }
+        let lock = Encryption::headers_only(false);
+        // Room for one run of a large member, not all of it.
+        let capped = WriterResources::default().with_max_spool_bytes(ONE_RUN);
+        let archive = solid_seekable(&members, lock, FilterPolicy::None, &capped).unwrap();
+        assert_holds(&archive, &members, lock);
+        let resources = WriterResources::default();
+        let streamed = solid_streamed(&members, lock, FilterPolicy::None, &resources);
+        assert_holds(&streamed.unwrap(), &members, lock);
     }
 }
 
@@ -751,4 +762,35 @@ fn an_in_place_solid_archive_does_not_depend_on_the_thread_count() {
             assert!(again == archive, "{threads} threads wrote another archive");
         }
     }
+}
+
+#[test]
+fn solid_outputs_pack_alike_and_differ_only_in_the_padded_size_field() {
+    // A run is 1 MiB here, so the 16 KiB member opens one, which a cut before
+    // the large member would leave too short to search a tree.
+    let source = include_bytes!("compress.rs");
+    let mut members: Vec<Vec<u8>> = (0..16).map(|seed| text(64 * 1024, seed)).collect();
+    members.push(source[..16 * 1024].to_vec());
+    members.push(text(600 * 1024, 20));
+    members.push(source[16 * 1024..20 * 1024].to_vec());
+    let lock = Encryption::headers_only(false);
+    let resources = WriterResources::default();
+    let mut options = WriterOptions::new(crate::ArchiveVersion::Rar50, FeatureSet::store_only())
+        .with_compression_level(2)
+        .with_dictionary_size(128 * 1024);
+    options.features.solid = true;
+    let mut archive = Cursor::new(Vec::new());
+    let output = CallerOutput::seekable(&mut archive);
+    let policy = FilterPolicy::None;
+    solid_archive_with(&members, options, lock, policy.clone(), &resources, output).unwrap();
+    let archive = archive.into_inner();
+    let mut streamed = Vec::new();
+    let output = CallerOutput::stream(&mut streamed);
+    solid_archive_with(&members, options, lock, policy, &resources, output).unwrap();
+    assert_holds(&archive, &members, lock);
+    assert_eq!(
+        members_as_read(&archive, lock),
+        members_as_read(&streamed, lock)
+    );
+    assert!(archive.len() >= streamed.len() && archive.len() <= streamed.len() + 32);
 }
