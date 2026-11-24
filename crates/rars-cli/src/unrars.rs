@@ -1049,13 +1049,28 @@ fn list_volumes(
 }
 
 /// The archive comment as unrar shows it: control codes as they are, except
-/// escape, which shows as `'\033'` so the comment can't drive a terminal.
+/// escape, which shows as `'\033'`, and the C1 controls, which show as `?`,
+/// so the comment can't drive a terminal.
 fn comment_text(archive: &Archive, password: Option<&[u8]>) -> Option<String> {
     let options = ArchiveReadOptions::with_optional_password(password);
     let comment = archive.comment_with_options(options).ok()??;
     let text = utf16_comment(archive.family(), &comment)
         .unwrap_or_else(|| String::from_utf8_lossy(&comment).into_owned());
-    Some(text.replace('\u{1b}', "'\\033'"))
+    Some(shown_comment(&text))
+}
+
+/// Escape as unrar shows it, and C1 controls (U+0080–U+009F) as `?`: some
+/// terminals act on those, U+009B in particular, without an escape byte.
+fn shown_comment(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\u{1b}' => shown.push_str("'\\033'"),
+            '\u{80}'..='\u{9f}' => shown.push('?'),
+            c => shown.push(c),
+        }
+    }
+    shown
 }
 
 /// A RAR 3 comment written as UTF-16, as RAR 3.x on Linux writes it: an even
@@ -2368,6 +2383,14 @@ fn missing_volume(error: &rars::Error) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn comments_cannot_drive_a_terminal() {
+        assert_eq!(
+            super::shown_comment("a\u{1b}[2Jb\u{9b}2Jc\td\n"),
+            "a'\\033'[2Jb?2Jc\td\n"
+        );
+    }
+
     use super::*;
 
     fn invocation(args: &[&str]) -> Invocation {
