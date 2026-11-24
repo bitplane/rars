@@ -18,9 +18,9 @@ library, a CLI, Python and TypeScript bindings.
 
 It started as an
 [agentic development experiment](https://bitplane.net/log/2026/05/rars/), and
-has since matured as it gained some users. It's still a bit slower than WinRAR,
-uses more memory and has slightly worse compression. It could use more testing
-at volume, too. Other than that it's in pretty good shape.
+has since matured as it gained some users. It compresses slower than WinRAR in
+the general case, but is faster to unpack. It could use more testing at volume,
+too. Other than that it's in pretty good shape.
 
 ## Install
 
