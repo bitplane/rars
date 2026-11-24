@@ -177,11 +177,23 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
             (wide ^ (wide >> 32)) as u32
         } else if MIN_MATCH == 6 {
             // Six bytes do not fit the 32-bit mix, so they get a 64-bit one,
-            // whose top bits depend on every byte.
-            let low =
-                u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]);
-            let high = u16::from_le_bytes([input[pos + 4], input[pos + 5]]);
-            let value = u64::from(low) | (u64::from(high) << 32);
+            // whose top bits depend on every byte. One eight-byte load where
+            // the input allows it, the same six bytes either way.
+            let value = match input.get(pos..pos + 8) {
+                Some(word) => {
+                    u64::from_le_bytes(word.try_into().expect("eight bytes")) & 0xFFFF_FFFF_FFFF
+                }
+                None => {
+                    let low = u32::from_le_bytes([
+                        input[pos],
+                        input[pos + 1],
+                        input[pos + 2],
+                        input[pos + 3],
+                    ]);
+                    u64::from(low)
+                        | (u64::from(u16::from_le_bytes([input[pos + 4], input[pos + 5]])) << 32)
+                }
+            };
             return (value.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - self.hash_bits)) as usize;
         } else {
             u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]])

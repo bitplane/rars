@@ -80,42 +80,28 @@ type Rar29LongMatchFinder = match_finder::MatchFinder<6>;
 /// The most candidates a parse walks for its chains to key on six bytes.
 ///
 /// A chain holds every earlier position that shares its key, newest first, and
-/// a parse that walks eight or sixteen of them never gets past the newest. On
-/// text the newest positions sharing four bytes are spaces, indentation and
-/// common words, which match four to eight bytes, and the copy that runs on
-/// for thirty is further down. Keyed on six bytes a chain holds far fewer of
-/// those, so the same walk reaches back to it. The four- and five-byte matches
-/// it can no longer offer come from [`NearMatches`] instead.
+/// a parse that walks a handful of them never gets past the newest. On text
+/// the newest positions sharing four bytes are spaces, indentation and common
+/// words, which match a few bytes, and the copy that runs on is further down.
+/// Keyed on six bytes a chain holds far fewer of those, so the same walk
+/// reaches back to it. The four- and five-byte matches it can no longer offer
+/// come from [`NearMatches`] instead.
 ///
-/// On 4 MiB of source, rar 3.93 `-m2` packs 693,278 bytes in 0.09 s. Keyed on
-/// four, the lazy parse needs about 1,024 candidates to get there, and takes
-/// 1.3 s. Levels 1 and 2 walk 8 and 16:
+/// A greedy parse walks half its candidates on six-byte chains. It is the
+/// fastest level, and a chain of positions sharing six bytes holds the copy
+/// that runs on near its head, where four-byte chains bury it.
 ///
-/// ```text
-///                      level 1     level 2
-/// keyed on four        811,771     755,045
-/// keyed on six         773,677     736,079
-///   and near matches   760,220     724,398
-/// ```
-///
-/// Keyed on six bytes, executables came out up to 3% larger without the near
-/// matches, which take that back and more. The near matches are most of the
-/// time this costs, since every position goes into their table: on the release
-/// bench's 32 MiB tars at one thread, level 1 takes 20% and 23% longer on text
-/// and executables, and level 2 6% and 11%.
-///
-/// Level 3 walks 64 candidates, and executables still came out larger there
-/// keyed on six. A short member is left keyed on four (see
-/// [`LONG_KEY_MIN_SPAN`]).
+/// A lazy parse walking 64 candidates, as level 3 does, already reaches most of
+/// what a long key would find, and executables come out larger keyed on six
+/// there. A short member keeps four-byte chains (see [`LONG_KEY_MIN_SPAN`]).
 const LONG_KEY_MAX_CANDIDATES: usize = 16;
 
 /// How many bytes a member and the history before it must span for its
 /// chains to key on six bytes.
 ///
 /// A member of a few tens of kilobytes keeps its chains short enough to walk
-/// in full, and keyed on six the corpus's small text classes came out up to
-/// 0.7% larger at level 2, all of it four- and five-byte matches further back
-/// than the near matches reach.
+/// in full. Keyed on six it loses the four- and five-byte matches further back
+/// than the near matches reach, and gains nothing.
 const LONG_KEY_MIN_SPAN: usize = 1024 * 1024;
 
 /// Whether a parse searching `options` walks few enough candidates to key its
@@ -3017,12 +3003,16 @@ fn parse_range<C: Candidates>(
     let random = std::cell::OnceCell::new();
     let looks_random = || *random.get_or_init(|| NearMatches::looks_random(&data[start..end]));
     // A parse that walks few candidates keeps near matches for the four- and
-    // five-byte matches a six-byte key cannot offer, and at short spans because
-    // they paid there too. Not in a block that looks random, at any level: on
-    // the release bench's 32 MiB of compressed files they took level 2 from
-    // 32,177,760 bytes to 32,119,035 for 46% more time.
+    // five-byte matches a six-byte key cannot offer. A lazy one keeps them on
+    // four-byte chains too, where they pay; a greedy one there has its chains'
+    // four-byte matches already, and goes without. Not in a block that looks
+    // random, at any level: there they cost more time than they find.
+    let walks_few_on = match options.lazy_matching {
+        true => walks_few(options),
+        false => finder.key() > MIN_CHAIN_MATCH,
+    };
     let near_pays =
-        (walks_few(options) || (options.lazy_matching && options.near_matches)) && !looks_random();
+        (walks_few_on || (options.lazy_matching && options.near_matches)) && !looks_random();
     // Filled from the history a near match can reach, so a block parses the
     // same whether the bytes before it were parsed in this call or another.
     let mut near = near_pays.then(|| {
@@ -3037,6 +3027,11 @@ fn parse_range<C: Candidates>(
         .filter(|_| looks_random())
         .map(|misses| misses.max(1));
     let mut misses = 0usize;
+    // A greedy parse keyed on six bytes is the fastest level, and keeps the
+    // near table to the positions it searches: the start of each match, not
+    // every byte inside it. The newest copy of a three-byte run inside a long
+    // match is one the six-byte chains usually find anyway.
+    let sparse_near = !options.lazy_matching && finder.key() > MIN_CHAIN_MATCH;
     let insert = |finder: &mut C, near: &mut Option<NearMatches>, pos: usize| {
         finder.insert(data, pos);
         if let Some(near) = near {
@@ -3072,8 +3067,15 @@ fn parse_range<C: Candidates>(
                 offset: offset as u32,
             });
             state.remember(length, offset);
-            for history_pos in pos..pos + length {
-                insert(finder, &mut near, history_pos);
+            if sparse_near {
+                insert(finder, &mut near, pos);
+                for history_pos in pos + 1..pos + length {
+                    finder.insert(data, history_pos);
+                }
+            } else {
+                for history_pos in pos..pos + length {
+                    insert(finder, &mut near, history_pos);
+                }
             }
             pos += length;
         } else if let Some(skip_after) = skip_after {
@@ -3570,19 +3572,19 @@ fn best_match(
 /// The newest position of each three-byte hash, for the matches the
 /// four-byte chains cannot offer: three bytes under 8 KiB.
 ///
-/// The lazy parse keeps it when asked. The shortest-path parse finds these
-/// matches its own way, and the levels that ask for it beat a lazy parse
-/// without them by 4% to 7% on binaries, much of which this takes back: on a
-/// 4 MiB shared object, with repeats of two and three bytes as well, the lazy
-/// parse at level 3 comes out 1.45 MB against 1.51 MB, and rar 3.93 `-m3`
-/// packs 1.45 MB. A greedy parse has no second look to undo a short match that
-/// costs it a longer one next, so it goes without three-byte ones.
+/// Only the lazy parse keeps it. The shortest-path parse finds these matches
+/// its own way, and the levels that ask for it beat a lazy parse without them
+/// by 4% to 7% on binaries, much of which this takes back: on a 4 MiB shared
+/// object, with repeats of two and three bytes as well, the lazy parse at
+/// level 3 comes out 1.45 MB against 1.51 MB, and rar 3.93 `-m3` packs
+/// 1.45 MB. A greedy parse has no second look to undo a short match that costs
+/// it a longer one next, so it goes without.
 ///
-/// A parse with chains keyed on six bytes always keeps it, for the four- and
-/// five-byte matches those chains cannot offer, greedy or not (see
-/// [`LONG_KEY_MAX_CANDIDATES`]). The newest copy under 8 KiB is most of what
-/// they were worth: a greedy parse takes it from four bytes, as its chains
-/// did.
+/// The exceptions are parses that walk few candidates (see
+/// [`LONG_KEY_MAX_CANDIDATES`]): a lazy one keeps it at any span, and a greedy
+/// one on six-byte chains, for the four- and five-byte matches those chains
+/// cannot offer. A greedy one takes nothing shorter from it than its chains
+/// would have.
 ///
 /// Two-byte matches at short offsets were offered too, and dropped. The lazy
 /// parse prices a literal at eight bits, so every one of them looked cheaper
@@ -3694,6 +3696,11 @@ fn best_match_before<C: Candidates>(
     if options.max_match_candidates == 0 || max_offset == 0 || max_length < 4 {
         return None;
     }
+    // See `LONG_KEY_MAX_CANDIDATES` for why a greedy parse walks half.
+    let walk = match !options.lazy_matching && finder.key() > MIN_CHAIN_MATCH {
+        true => (options.max_match_candidates / 2).max(1),
+        false => options.max_match_candidates,
+    };
     let mut best = None;
     let mut checked = 0usize;
     // A match shorter than four bytes is never taken, so a candidate that
@@ -3757,7 +3764,7 @@ fn best_match_before<C: Candidates>(
         if best.is_some_and(|candidate| candidate.length == max_length) {
             break;
         }
-        if checked >= options.max_match_candidates {
+        if checked >= walk {
             break;
         }
         candidate = finder.previous(candidate);
