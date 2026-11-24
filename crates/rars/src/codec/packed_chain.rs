@@ -766,6 +766,7 @@ impl<B: Budget> PackedMatchFinder<B> {
         max_match_length: usize,
         runs: &mut Buffer<(u32, u32), B>,
         starts: &mut Buffer<u32, B>,
+        commits: &mut Buffer<super::match_finder::CommittedMatch, B>,
     ) -> std::result::Result<(), B::Failure> {
         debug_assert!(block.start <= block.end && block.end <= input.len());
         let mut committed_through = block.start;
@@ -793,10 +794,11 @@ impl<B: Budget> PackedMatchFinder<B> {
                     runs,
                 )?;
             }
-            if let Some(&(length, _)) = runs[before..].last() {
-                let reach = (length as usize).min(remaining).min(max_match_length);
+            if let Some(&run) = runs[before..].last() {
+                let reach = (run.0 as usize).min(remaining).min(max_match_length);
                 if reach >= nice {
                     committed_through = pos + reach;
+                    commits.push(super::match_finder::CommittedMatch::at(pos, reach, run))?;
                 }
             }
         }
@@ -1182,6 +1184,7 @@ mod tests {
                         MAX_MATCH,
                         &mut found,
                         &mut starts,
+                        &mut Buffer::new(&allowance),
                     )
                     .unwrap();
                 collected.push((found.into_vec(), starts.into_vec()));
@@ -1469,13 +1472,33 @@ mod tests {
         let mut starts = Buffer::with_capacity(81, &allowance).unwrap();
         let output_bytes = allowance.used() - index_bytes;
         finder
-            .collect_block(&input, 4..20, 64, 128, 512, 16, &mut runs, &mut starts)
+            .collect_block(
+                &input,
+                4..20,
+                64,
+                128,
+                512,
+                16,
+                &mut runs,
+                &mut starts,
+                &mut Buffer::new(&allowance),
+            )
             .unwrap();
         assert_eq!(allowance.used(), index_bytes + output_bytes);
         assert!(!finder.packed.is_empty() && !finder.cursor.is_empty());
         assert_eq!(finder.next_position, 20);
         finder
-            .collect_block(&input, 20..80, 64, 128, 512, 16, &mut runs, &mut starts)
+            .collect_block(
+                &input,
+                20..80,
+                64,
+                128,
+                512,
+                16,
+                &mut runs,
+                &mut starts,
+                &mut Buffer::new(&allowance),
+            )
             .unwrap();
         assert!(finder.packed.is_empty() && finder.cursor.is_empty());
         assert_eq!(allowance.used(), output_bytes);

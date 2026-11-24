@@ -393,6 +393,45 @@ impl<B: Budget> MatchFinder<4, B> {
 /// The most runs [`TreeMatchFinder::matches`] reports for one position.
 pub(crate) const TREE_MAX_RUNS: usize = 8;
 
+/// A match an optimal parse's collector committed to, whose interior it does
+/// not search.
+///
+/// The parse commits too, but it can reach a long match sooner, through a
+/// remembered distance the collector never sees, step over the position where
+/// the collector committed, and land inside the collector's match with nothing
+/// searched there. Every byte to the end of that match would then be priced
+/// as a literal. So the parse looks up what is left of the committed match
+/// where it lands, which a search there would have found at least.
+#[cfg(feature = "write")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CommittedMatch {
+    start: usize,
+    /// The first position past the committed reach.
+    pub(crate) end: usize,
+    length: u32,
+    distance: u32,
+}
+
+#[cfg(feature = "write")]
+impl CommittedMatch {
+    /// `run`, found at `pos`, committed to as far as `reach`.
+    pub(crate) fn at(pos: usize, reach: usize, run: (u32, u32)) -> Self {
+        Self {
+            start: pos,
+            end: pos + reach,
+            length: run.0,
+            distance: run.1,
+        }
+    }
+
+    /// What is left of the committed match at `pos`, inside its reach, if
+    /// that is still a match.
+    pub(crate) fn tail(&self, pos: usize) -> Option<(u32, u32)> {
+        let length = (self.length as usize).checked_sub(pos.checked_sub(self.start)?)?;
+        (pos < self.end && length >= 4).then_some((length as u32, self.distance))
+    }
+}
+
 /// A binary-tree match finder, after LZMA's BT4.
 ///
 /// Positions sharing a hash of their first four bytes form a binary search
