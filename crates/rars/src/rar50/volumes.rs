@@ -87,7 +87,7 @@ where
                             }
                             Resume::Solid => session.passed_over(),
                         }
-                        last
+                        *last
                     }
                 };
                 resume = Some(last);
@@ -179,7 +179,7 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
 /// could still read that far.
 struct SplitFailure {
     error: Error,
-    last: Option<Archive>,
+    last: Option<Box<Archive>>,
 }
 
 impl From<Error> for SplitFailure {
@@ -223,7 +223,7 @@ where
         }
         Err(error) => Err(SplitFailure {
             error,
-            last: walk.into_last_volume().ok(),
+            last: walk.into_last_volume().ok().map(Box::new),
         }),
     }
 }
