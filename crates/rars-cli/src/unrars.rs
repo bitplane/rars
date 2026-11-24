@@ -68,9 +68,20 @@ enum Command {
     },
     Test,
     Print,
-    List {
-        bare: bool,
-    },
+    List(ListStyle),
+}
+
+/// How `l` and its kin show an archive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListStyle {
+    /// `l`: attributes, size, date and name.
+    Plain,
+    /// `v`: packed size, ratio and checksum as well.
+    Verbose,
+    /// `lt`: a block of fields for each member; `lta` for service blocks too.
+    Technical { all: bool },
+    /// `lb`: names only.
+    Bare,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,8 +265,11 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         "e" => Command::Extract { flat: true },
         "t" => Command::Test,
         "p" => Command::Print,
-        "l" | "v" | "lt" | "vt" | "lta" | "vta" => Command::List { bare: false },
-        "lb" | "vb" => Command::List { bare: true },
+        "l" => Command::List(ListStyle::Plain),
+        "v" => Command::List(ListStyle::Verbose),
+        "lt" | "vt" => Command::List(ListStyle::Technical { all: false }),
+        "lta" | "vta" => Command::List(ListStyle::Technical { all: true }),
+        "lb" | "vb" => Command::List(ListStyle::Bare),
         _ => return Err(Refused::Usage),
     };
     let mut invocation = Invocation {
@@ -478,8 +492,11 @@ fn run(invocation: &Invocation) -> i32 {
         quiet: invocation.quiet,
         stderr_only: invocation.stderr_only,
     };
-    let bare = invocation.command == Command::List { bare: true };
-    if invocation.banner && !bare && !out.silent && !out.quiet {
+    let quiet_command = matches!(
+        invocation.command,
+        Command::List(ListStyle::Bare) | Command::Print
+    );
+    if invocation.banner && !quiet_command && !out.silent && !out.quiet {
         out.print(format_args!("{}", banner()));
     }
     let mut password = match &invocation.password {
@@ -534,6 +551,11 @@ fn run_archive(
             if let Some(code) = report_open_failure(out, &path, &error) {
                 tally.fail(code);
             }
+            let listing =
+                matches!(invocation.command, Command::List(style) if style != ListStyle::Bare);
+            if listing && needs_password(&error) {
+                list_locked_headers(out, &path);
+            }
             return;
         }
     };
@@ -562,9 +584,9 @@ fn run_archive(
         }
     }
     match invocation.command {
-        Command::List { bare } => {
+        Command::List(style) => {
             let password = password.as_deref().map(Vec::as_slice);
-            list_volumes(invocation, out, path, archive, password, bare, tally);
+            list_volumes(invocation, out, path, archive, password, style, tally);
             tally.worked += 1;
         }
         _ => run_members(
@@ -594,57 +616,6 @@ fn first_volume(path: &Path, archive: &Archive) -> Option<PathBuf> {
                 .is_some_and(u8::is_ascii_uppercase);
             Some(path.with_extension(if upper { "RAR" } else { "rar" }))
         }
-    }
-}
-
-/// Lists an archive and, with `-v`, each later volume of its set in turn,
-/// then their grand total.
-fn list_volumes(
-    invocation: &Invocation,
-    out: Out,
-    path: &Path,
-    archive: Archive,
-    password: Option<&[u8]>,
-    bare: bool,
-    tally: &mut Tally,
-) {
-    let mut totals = (0, 0);
-    let mut listed = 0;
-    let mut next = Some((path.to_path_buf(), archive.clone()));
-    while let Some((volume_path, volume)) = next.take() {
-        if report_header_damage(out, &volume) > 0 {
-            tally.fail(CHECKSUM);
-        }
-        let (size, count) = list(invocation, out, &volume_path, &volume, bare);
-        totals = (totals.0 + size, totals.1 + count);
-        listed += 1;
-        if report_truncation(out, volume.truncation()) {
-            tally.fail(WARNING);
-        }
-        if !invocation.all_volumes || !volume.is_volume() {
-            break;
-        }
-        let Some(later) = archive
-            .volume_path(path, listed)
-            .filter(|later| later.is_file())
-        else {
-            break;
-        };
-        match read_archive(&later, password) {
-            Ok(volume) => next = Some((later, volume)),
-            Err(error) => {
-                if let Some(code) = report_open_failure(out, &later, &error) {
-                    tally.fail(code);
-                }
-            }
-        }
-    }
-    if invocation.all_volumes && !bare {
-        // unrar sets the grand total one column left of each volume's.
-        out.print(format_args!("{:>20}{:>21}\n", totals.0, totals.1));
-    }
-    if !bare {
-        out.print(format_args!("\n"));
     }
 }
 
@@ -809,33 +780,152 @@ fn io_reason(error: &rars::Error) -> String {
     }
 }
 
-/// Lists one archive or volume, returning the size and count of the files
-/// that start in it.
+/// What a listing's members add up to.
+#[derive(Clone, Copy, Default)]
+struct Totals {
+    size: u64,
+    packed: u64,
+    count: usize,
+}
+
+impl Totals {
+    fn add(&mut self, other: Self) {
+        self.size += other.size;
+        self.packed += other.packed;
+        self.count += other.count;
+    }
+}
+
+/// Lists an archive and, with `-v`, each later volume of its set in turn,
+/// then their grand total. The archive comment comes first.
+fn list_volumes(
+    invocation: &Invocation,
+    out: Out,
+    path: &Path,
+    archive: Archive,
+    password: Option<&[u8]>,
+    style: ListStyle,
+    tally: &mut Tally,
+) {
+    if style != ListStyle::Bare {
+        let options = ArchiveReadOptions::with_optional_password(password);
+        if let Ok(Some(comment)) = archive.comment_with_options(options) {
+            // Its lines as written, without control codes a terminal would act on.
+            let comment: String = String::from_utf8_lossy(&comment)
+                .chars()
+                .map(|c| {
+                    if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                        '?'
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            let newline = if comment.ends_with('\n') { "" } else { "\n" };
+            out.print(format_args!("\nArchive comment:\n{comment}{newline}\n"));
+        }
+    }
+    let mut totals = Totals::default();
+    let mut listed = 0;
+    let mut next = Some((path.to_path_buf(), archive.clone()));
+    while let Some((volume_path, volume)) = next.take() {
+        if report_header_damage(out, &volume) > 0 {
+            tally.fail(CHECKSUM);
+        }
+        totals.add(list(invocation, out, &volume_path, &volume, style));
+        listed += 1;
+        if report_truncation(out, volume.truncation()) {
+            tally.fail(WARNING);
+        }
+        if !invocation.all_volumes || !volume.is_volume() {
+            break;
+        }
+        let Some(later) = archive
+            .volume_path(path, listed)
+            .filter(|later| later.is_file())
+        else {
+            break;
+        };
+        match read_archive(&later, password) {
+            Ok(volume) => next = Some((later, volume)),
+            Err(error) => {
+                if let Some(code) = report_open_failure(out, &later, &error) {
+                    tally.fail(code);
+                }
+            }
+        }
+    }
+    // unrar sets the grand total one column left of each volume's.
+    if invocation.all_volumes {
+        match style {
+            ListStyle::Plain => {
+                out.print(format_args!("{:>21}{:>21}\n", totals.size, totals.count));
+            }
+            ListStyle::Verbose => out.print(format_args!(
+                "{:>21} {:>10} {:>4}{:>31}\n",
+                totals.size,
+                totals.packed,
+                ratio(totals.size, totals.packed),
+                totals.count
+            )),
+            ListStyle::Technical { .. } | ListStyle::Bare => {}
+        }
+    }
+    if style != ListStyle::Bare {
+        out.print(format_args!("\n"));
+    }
+}
+
+/// What `l` shows of an archive whose headers need a password it hasn't got.
+fn list_locked_headers(out: Out, path: &Path) {
+    let family = std::fs::File::open(path)
+        .and_then(|file| {
+            use std::io::Read;
+            let mut prefix = Vec::new();
+            file.take(1 << 20).read_to_end(&mut prefix)?;
+            Ok(prefix)
+        })
+        .ok()
+        .and_then(|prefix| ArchiveReader::detect(&prefix).ok())
+        .map(|signature| signature.family);
+    let format = match family {
+        Some(rars::ArchiveFamily::Rar50Plus) => "RAR 5",
+        _ => "RAR 4",
+    };
+    out.print(format_args!(
+        "\nArchive: {}\nDetails: {format}, encrypted headers\n  0 files\n\n",
+        path.display()
+    ));
+}
+
+/// Lists one archive or volume, returning what the files that start in it
+/// add up to.
 fn list(
     invocation: &Invocation,
     out: Out,
     path: &Path,
     archive: &Archive,
-    bare: bool,
-) -> (u64, usize) {
+    style: ListStyle,
+) -> Totals {
     // unrar lists the older copies `rar -ver` kept, `-ver` or not.
     let members: Vec<_> = archive
-        .members()
-        .filter(|member| invocation.selects(&member.meta.name))
-        .map(|member| member.meta.clone())
+        .member_refs()
+        .filter(|member| invocation.selects(member.name_bytes()))
         .collect();
-    if bare {
-        for meta in &members {
-            out.print(format_args!("{}\n", display_name(&meta.name)));
+    let mut totals = Totals::default();
+    for member in &members {
+        let meta = member.to_owned().meta;
+        // A member continued from an earlier volume counts where it starts.
+        if !meta.is_split_before {
+            totals.size += meta.unpacked_size;
+            totals.count += 1;
         }
+        totals.packed += meta.packed_size;
     }
-    // A member continued from an earlier volume counts where it starts.
-    let starting = members.iter().filter(|meta| !meta.is_split_before);
-    let totals = (
-        starting.clone().map(|meta| meta.unpacked_size).sum(),
-        starting.count(),
-    );
-    if bare {
+    if style == ListStyle::Bare {
+        for member in &members {
+            out.print(format_args!("{}\n", display_name(member.name_bytes())));
+        }
         return totals;
     }
     out.print(format_args!(
@@ -843,16 +933,30 @@ fn list(
         path.display(),
         details(archive)
     ));
-    out.print(format_args!(
-        " Attributes      Size     Date    Time   Name\n"
-    ));
-    out.print(format_args!(
-        "----------- ---------  ---------- -----  ----\n"
-    ));
-    for meta in &members {
+    match style {
+        ListStyle::Technical { all } => {
+            list_technical(out, archive, &members, all);
+            return totals;
+        }
+        ListStyle::Verbose => {
+            out.print(format_args!(
+                " Attributes       Size     Packed Ratio    Date    Time   Checksum  Name\n"
+            ));
+            out.print(format_args!("{VERBOSE_RULE}\n"));
+        }
+        _ => {
+            out.print(format_args!(
+                " Attributes       Size     Date    Time   Name\n"
+            ));
+            out.print(format_args!("{PLAIN_RULE}\n"));
+        }
+    }
+    for member in &members {
+        let meta = member.to_owned().meta;
+        let marker = if meta.is_encrypted { '*' } else { ' ' };
         let (date, time) = match meta
             .stored_modification_time()
-            .and_then(|time| time.calendar_fields())
+            .and_then(|time| time.local_calendar_fields())
         {
             Some((year, month, day, hour, minute, _)) => (
                 format!("{year:04}-{month:02}-{day:02}"),
@@ -860,39 +964,278 @@ fn list(
             ),
             None => ("????-??-??".to_string(), "??:??".to_string()),
         };
-        out.print(format_args!(
-            " {:<10} {:>9}  {date} {time}  {}\n",
-            attributes(meta),
-            meta.unpacked_size,
-            display_name(&meta.name)
-        ));
+        let name = display_name(&meta.name);
+        let attributes = attributes(&meta);
+        if style == ListStyle::Verbose {
+            let checksum = match (meta.is_directory, member_crc(*member)) {
+                (false, Some((crc, _))) => format!("{crc:08X}"),
+                _ => String::new(),
+            };
+            out.print(format_args!(
+                "{marker}{attributes:<10} {:>10} {:>10} {:>4}  {date} {time}  {checksum:<8}  {name}\n",
+                meta.unpacked_size,
+                meta.packed_size,
+                split_ratio(&meta),
+            ));
+        } else {
+            out.print(format_args!(
+                "{marker}{attributes:<10} {:>10}  {date} {time}  {name}\n",
+                meta.unpacked_size
+            ));
+        }
     }
-    out.print(format_args!(
-        "--------------------  ---------- -----  ----\n"
-    ));
-    out.print(format_args!(
-        " {:<10} {:>9}{:>21}\n",
-        "", totals.0, totals.1
-    ));
+    if style == ListStyle::Verbose {
+        out.print(format_args!("{VERBOSE_RULE}\n"));
+        out.print(format_args!(
+            "{:>22} {:>10} {:>4}{:>31}\n",
+            totals.size,
+            totals.packed,
+            ratio(totals.size, totals.packed),
+            totals.count
+        ));
+    } else {
+        out.print(format_args!("{PLAIN_RULE}\n"));
+        out.print(format_args!("{:>22}{:>21}\n", totals.size, totals.count));
+    }
     totals
 }
 
-/// The listing's `Details:` line: the format, then what unrar notes about the archive.
-fn details(archive: &Archive) -> String {
-    let mut details = match archive.family() {
-        rars::ArchiveFamily::Rar13 => "RAR 1.4",
-        rars::ArchiveFamily::Rar15To40 => "RAR 4",
-        rars::ArchiveFamily::Rar50Plus => "RAR 5",
-        _ => "RAR",
+const PLAIN_RULE: &str = "----------- ----------  ---------- -----  ----";
+const VERBOSE_RULE: &str =
+    "----------- ---------- ---------- ----- ---------- -----  --------  ----";
+
+/// The packed size as a share of the unpacked, as unrar rounds it.
+fn ratio(size: u64, packed: u64) -> String {
+    if size == 0 {
+        return "0%".to_string();
     }
-    .to_string();
-    if archive.is_volume() {
-        match archive.volume_index() {
-            Some(index) => details.push_str(&format!(", volume {}", index + 1)),
-            None => details.push_str(", volume"),
+    format!("{}%", u128::from(packed) * 100 / u128::from(size))
+}
+
+/// A member's ratio, or unrar's arrows for one split across volumes.
+fn split_ratio(meta: &rars::ArchiveMemberMeta) -> String {
+    match (meta.is_split_before, meta.is_split_after) {
+        (true, true) => "<->".to_string(),
+        (true, false) => "<--".to_string(),
+        (false, true) => "-->".to_string(),
+        (false, false) => ratio(meta.unpacked_size, meta.packed_size),
+    }
+}
+
+/// A member's stored CRC32, and whether it is keyed by the password.
+fn member_crc(member: rars::ArchiveMemberRef<'_>) -> Option<(u32, bool)> {
+    match member {
+        rars::ArchiveMemberRef::Rar50Plus(file) => {
+            let mac = file
+                .encryption
+                .as_ref()
+                .is_some_and(|encryption| encryption.flags & 0x0002 != 0);
+            file.data_crc32.map(|crc| (crc, mac))
+        }
+        rars::ArchiveMemberRef::Rar15To40(file) => Some((file.file_crc, false)),
+        _ => None,
+    }
+}
+
+/// `lt`: a block of fields for each member, and with `lta` for each RAR 5
+/// service block too.
+fn list_technical(out: Out, archive: &Archive, members: &[rars::ArchiveMemberRef<'_>], all: bool) {
+    for member in members {
+        technical_entry(out, *member, false);
+    }
+    if all {
+        if let Some(archive) = archive.as_rar50() {
+            for service in archive.services() {
+                technical_entry(out, rars::ArchiveMemberRef::Rar50Plus(service), true);
+            }
         }
     }
-    details
+}
+
+fn technical_entry(out: Out, member: rars::ArchiveMemberRef<'_>, service: bool) {
+    let meta = member.to_owned().meta;
+    let field = |label: &str, value: &dyn std::fmt::Display| {
+        out.print(format_args!("{label:>12}: {value}\n"));
+    };
+    field("Name", &display_name(&meta.name));
+    let link = match member {
+        rars::ArchiveMemberRef::Rar50Plus(file) => file.redirection.as_ref(),
+        _ => None,
+    };
+    let kind = if service {
+        "Service"
+    } else if meta.is_directory {
+        "Directory"
+    } else {
+        match link.map(|link| link.redirection_type) {
+            Some(1) => "Unix symbolic link",
+            Some(2) => "Windows symbolic link",
+            Some(3) => "Windows junction",
+            Some(4) => "Hard link",
+            Some(5) => "File reference",
+            Some(_) => "Link",
+            None => "File",
+        }
+    };
+    field("Type", &kind);
+    if let Some(link) = link {
+        field("Target", &display_name(&link.target_name));
+    }
+    if !meta.is_directory {
+        field("Size", &meta.unpacked_size);
+        field("Packed size", &meta.packed_size);
+        field("Ratio", &split_ratio(&meta));
+    }
+    if let Some((year, month, day, hour, minute, second)) = meta
+        .stored_modification_time()
+        .and_then(|time| time.local_calendar_fields())
+    {
+        let nanoseconds = meta
+            .modification_time()
+            .map_or(0, rars::Timestamp::nanoseconds);
+        field(
+            "mtime",
+            &format!(
+                "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02},{nanoseconds:09}"
+            ),
+        );
+    }
+    if !service {
+        field("Attributes", &attributes(&meta));
+    }
+    if !meta.is_directory {
+        match member_crc(member) {
+            Some((crc, true)) => field("CRC32 MAC", &format!("{crc:08X}")),
+            Some((crc, false)) => field("CRC32", &format!("{crc:08X}")),
+            None => {}
+        }
+    }
+    if let Some(host) = host_os(&meta) {
+        field("Host OS", &host);
+    }
+    if let Some(compression) = compression(member, meta.is_directory) {
+        field("Compression", &compression);
+    }
+    let mut flags = String::new();
+    if member.is_solid() {
+        flags.push_str("solid ");
+    }
+    if meta.is_encrypted {
+        flags.push_str("encrypted ");
+    }
+    if !flags.is_empty() {
+        field("Flags", &flags);
+    }
+    out.print(format_args!("\n"));
+}
+
+fn host_os(meta: &rars::ArchiveMemberMeta) -> Option<&'static str> {
+    let host = meta.host_os?;
+    Some(match (meta.family, host) {
+        (rars::ArchiveFamily::Rar50Plus, 0) => "Windows",
+        (rars::ArchiveFamily::Rar50Plus, 1) => "Unix",
+        (rars::ArchiveFamily::Rar15To40, 0) => "MS DOS",
+        (rars::ArchiveFamily::Rar15To40, 1) => "OS/2",
+        (rars::ArchiveFamily::Rar15To40, 2) => "Windows",
+        (rars::ArchiveFamily::Rar15To40, 3) => "Unix",
+        (rars::ArchiveFamily::Rar15To40, 4) => "Mac OS",
+        (rars::ArchiveFamily::Rar15To40, 5) => "BeOS",
+        _ => return None,
+    })
+}
+
+/// The compression line: format and decoder version, method and dictionary.
+fn compression(member: rars::ArchiveMemberRef<'_>, directory: bool) -> Option<String> {
+    let (format, method, dictionary) = match member {
+        rars::ArchiveMemberRef::Rar50Plus(file) => {
+            let info = file.decoded_compression_info().ok()?;
+            let format = match info.algorithm_version {
+                0 => "RAR 5.0(v50)",
+                _ => "RAR 7.0(v70)",
+            };
+            (format.to_string(), info.method, info.dictionary_size)
+        }
+        rars::ArchiveMemberRef::Rar15To40(file) => {
+            // Dictionary bits in the file flags: 64 KiB doubled each step.
+            let bits = (file.block.flags >> 5) & 7;
+            (
+                format!("RAR 1.5(v{})", file.unp_ver),
+                file.method.saturating_sub(0x30),
+                (64 * 1024) << bits,
+            )
+        }
+        _ => return None,
+    };
+    if directory {
+        return Some(format!("{format} -m{method}"));
+    }
+    Some(format!(
+        "{format} -m{method} -md={}",
+        dictionary_size(dictionary)
+    ))
+}
+
+/// A dictionary size as unrar writes it: `128k`, `4m`, `1g`.
+fn dictionary_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    match bytes {
+        _ if bytes >= KIB * KIB * KIB && bytes.is_multiple_of(KIB * KIB * KIB) => {
+            format!("{}g", bytes / (KIB * KIB * KIB))
+        }
+        _ if bytes >= KIB * KIB && bytes.is_multiple_of(KIB * KIB) => {
+            format!("{}m", bytes / (KIB * KIB))
+        }
+        _ => format!("{}k", bytes / KIB),
+    }
+}
+
+/// The listing's `Details:` line: the format, then what unrar notes about
+/// the archive, in unrar's order.
+fn details(archive: &Archive) -> String {
+    let mut details = vec![match archive.family() {
+        rars::ArchiveFamily::Rar13 => "RAR 1.4".to_string(),
+        rars::ArchiveFamily::Rar15To40 => "RAR 4".to_string(),
+        rars::ArchiveFamily::Rar50Plus => "RAR 5".to_string(),
+        _ => "RAR".to_string(),
+    }];
+    let (solid, recovery, locked, encrypted) = match archive {
+        Archive::Rar50Plus(archive) => (
+            archive.main.is_solid(),
+            archive.main.has_recovery_record(),
+            archive.main.is_locked(),
+            archive.main.encrypted_headers,
+        ),
+        Archive::Rar15To40(archive) => (
+            archive.main.is_solid(),
+            archive.main.has_recovery_record(),
+            // MHD_LOCK.
+            archive.main.flags & 0x0004 != 0,
+            archive.main.has_encrypted_headers(),
+        ),
+        _ => (false, false, false, false),
+    };
+    if solid {
+        details.push("solid".to_string());
+    }
+    if archive.is_volume() {
+        // unrar numbers RAR 5 volumes only.
+        match archive.volume_index() {
+            Some(index) if archive.family() == rars::ArchiveFamily::Rar50Plus => {
+                details.push(format!("volume {}", index + 1));
+            }
+            _ => details.push("volume".to_string()),
+        }
+    }
+    if recovery {
+        details.push("recovery record".to_string());
+    }
+    if locked {
+        details.push("lock".to_string());
+    }
+    if encrypted {
+        details.push("encrypted headers".to_string());
+    }
+    details.join(", ")
 }
 
 fn display_name(name: &[u8]) -> String {
