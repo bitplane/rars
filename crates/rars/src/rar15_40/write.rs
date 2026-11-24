@@ -1240,6 +1240,7 @@ struct Rar29Search {
     /// Whether every finalist is encoded in full rather than ranked by a
     /// trial, which only level 5 pays for.
     exhaustive: bool,
+    effort: SearchEffort,
 }
 
 impl Rar29Search {
@@ -1247,30 +1248,115 @@ impl Rar29Search {
     const MEMBER: Self = Self {
         file_offset: 0,
         exhaustive: false,
+        effort: SearchEffort::Full,
     };
 
     /// The search over `data` starting `file_offset` bytes into its member, for
-    /// a member written at `options`.
-    fn at(file_offset: usize, options: Rar29EncodeOptions) -> Self {
+    /// a member written at `options` and `effort`.
+    fn at(file_offset: usize, options: Rar29EncodeOptions, effort: SearchEffort) -> Self {
         // Level 5 is the only level with more than one shortest-path pass.
         Self {
             file_offset,
             exhaustive: options.optimal_parse_passes > 1,
+            effort,
         }
     }
+
+    /// The reduced searches price a sample within what it holds. A sample is
+    /// encoded on its own, so no match reaches past it, but a finder sized for
+    /// the member's dictionary clears a head per four bytes of that for every
+    /// sample: 4 MiB for each of the hundreds a tar of executables screens.
+    fn sample_options(&self, data: &[u8], options: Rar29EncodeOptions) -> Rar29EncodeOptions {
+        if self.effort == SearchEffort::Full {
+            return options;
+        }
+        let within = options.max_match_distance.min(data.len().max(1));
+        options.with_max_match_distance(within)
+    }
 }
+
+/// How much of the filter search a level pays for.
+///
+/// Levels 1 and 2 are there to be fast, and on a 32 MiB tar of executables the
+/// full search was 0.9 s of level 1's 1.7 s, against rar 3.93 `-m1` taking
+/// 0.33 s for the whole archive. What the reduced searches leave out, and what
+/// it cost on that tar at level 1, one thread:
+///
+/// ```text
+///                                              bytes        time
+/// full search                             11,113,370      1.73 s
+/// samples priced within themselves        11,113,366      1.54 s
+///   and no screened kinds at all          11,113,366      1.29 s
+///   and the x86 scanner trusted           11,121,941      1.11 s
+///   but delta and audio screened again    11,121,941      1.19 s
+/// no search at all                        12,086,138      0.78 s
+/// ```
+///
+/// A piece that looks random is not searched at all. Of the screened kinds,
+/// which have no detector and cost a sample encode each per 4 MiB piece, the
+/// reduced searches keep delta and the audio a statistic has picked out, and
+/// leave out RGB and Itanium. Without delta, a solid archive of the bench's
+/// 4 MiB of repetitive data came out 7,063 bytes at level 1 instead of 4,589.
+/// Over the bench corpus the RGB and Itanium screens were worth only the PNG
+/// icons, 1%. Trusting the scanner cost 0.2-0.3% on the large binaries, so
+/// level 2, which has to stay under rar 3.93 `-m2` there, still screens its
+/// regions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SearchEffort {
+    /// Levels 3 to 5, and an absent level.
+    Full,
+    /// Level 2.
+    Reduced,
+    /// Level 1: the reduced search, with the x86 scanner's regions taken as found.
+    Least,
+}
+
+impl SearchEffort {
+    fn for_method(lz_method: u8) -> Self {
+        match lz_method.saturating_sub(0x30) {
+            1 => Self::Least,
+            2 => Self::Reduced,
+            _ => Self::Full,
+        }
+    }
+
+    fn for_options(options: WriterOptions) -> Self {
+        Self::for_method(compression_method_for_level(options))
+    }
+
+    /// Whether the search skips `data` outright: a reduced search does not
+    /// look for filters in bytes that look random, which none of them shrink.
+    /// On a 32 MiB tar of already-compressed files that took level 1 from
+    /// 1.09 s to 0.69 s and came out 1,276 bytes smaller.
+    fn skips(self, data: &[u8]) -> bool {
+        self != Self::Full
+            && crate::codec::rar29::order0_entropy(data) > REDUCED_SEARCH_RANDOM_ABOVE_BITS
+    }
+}
+
+/// Above this much order-0 entropy, in bits a byte, a reduced search skips
+/// a piece; the near matches and the skipped literal runs judge blocks by the
+/// same line.
+const REDUCED_SEARCH_RANDOM_ABOVE_BITS: f64 = 7.5;
 
 impl crate::filter_search::FilterSearch for Rar29Search {
     type Options = Rar29EncodeOptions;
 
     fn screened_kinds(&self, data: &[u8]) -> Vec<FilterKind> {
-        let mut kinds = vec![FilterKind::Itanium];
+        let reduced = self.effort != SearchEffort::Full;
+        let mut kinds = Vec::new();
+        if !reduced {
+            kinds.push(FilterKind::Itanium);
+        }
         for channels in 1..=4 {
             kinds.push(FilterKind::Delta { channels });
             // Free to ask, and it keeps the screened set from doubling.
             if is_audio_filter_candidate(data, channels) {
                 kinds.push(FilterKind::Audio { channels });
             }
+        }
+        if reduced {
+            return kinds;
         }
         kinds.extend(
             AUTO_RGB_WIDTHS
@@ -1314,6 +1400,10 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         RAR29_X86_REGION_SAMPLE_SPAN
     }
 
+    fn trusts_x86_scanner(&self) -> bool {
+        self.effort == SearchEffort::Least
+    }
+
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Vec<u8>> {
         crate::codec::rar29::filtered_members(data, self.file_offset, filters)
             .map(|filtered| filtered.data)
@@ -1337,6 +1427,7 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         options: Rar29EncodeOptions,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Vec<u8>> {
+        let options = self.sample_options(data, options);
         match progress {
             Some(progress) => {
                 unpack29_encode_literals_with_options_and_progress(data, options, progress)
@@ -1353,6 +1444,7 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         options: Rar29EncodeOptions,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Vec<u8>> {
+        let options = self.sample_options(data, options);
         Unpack29Encoder::with_options(options)
             .encode_member_with_filters_and_progress(data, self.file_offset, filters, progress)
             .map_err(map_codec_cancel)
@@ -1374,6 +1466,7 @@ fn rar29_piece_filters(
     data: &[u8],
     file_offset: usize,
     options: Rar29EncodeOptions,
+    effort: SearchEffort,
     piece: usize,
     cancelled: &(dyn Fn() -> bool + Sync),
 ) -> Result<Vec<FilterSpec>> {
@@ -1382,12 +1475,12 @@ fn rar29_piece_filters(
     let search = |start: usize| -> Result<Vec<FilterSpec>> {
         let end = (start + piece).min(data.len());
         let bytes = &data[start..end];
-        if !crate::filter_search::search_applies_throughout(bytes) {
+        if !crate::filter_search::search_applies_throughout(bytes) || effort.skips(bytes) {
             return Ok(Vec::new());
         }
         let mut poll = |_| !cancelled();
         let found = crate::filter_search::choose_filter_specs(
-            &Rar29Search::at(file_offset + start, options),
+            &Rar29Search::at(file_offset + start, options, effort),
             bytes,
             search_options,
             Some(&mut poll),
@@ -1470,13 +1563,15 @@ fn encode_rar29_auto_filtered_member_with_progress(
     if include_ppmd && text {
         return encode_rar29_text_member(data, options, lz_method, progress);
     }
-    let searching = !text && crate::filter_search::search_applies_throughout(data);
+    let effort = SearchEffort::for_method(lz_method);
+    let searching =
+        !text && crate::filter_search::search_applies_throughout(data) && !effort.skips(data);
     let best = EncodedPayload {
         data: if searching && data.len() > RAR29_FILTER_SEARCH_BYTES {
             // Too long to search whole: searched a piece at a time, then coded
             // once under every piece's filters, at the member's own settings.
             let filters =
-                rar29_piece_filters(data, 0, options, RAR29_FILTER_SEARCH_BYTES, &|| {
+                rar29_piece_filters(data, 0, options, effort, RAR29_FILTER_SEARCH_BYTES, &|| {
                     progress.is_some_and(WorkTracker::is_cancelled)
                 })?;
             with_codec_progress(progress, |report| {
@@ -1502,7 +1597,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
             // encoded beside it is charged its own, and only while it runs.
             let each = crate::codec::rar29::member_encode_workspace(data.len(), lazy);
             let (filters, measured) = crate::filter_search::choose_filter_side_by_side(
-                &Rar29Search::at(0, options),
+                &Rar29Search::at(0, options, effort),
                 data,
                 lazy,
                 Some(&|walked| {
@@ -2857,6 +2952,7 @@ fn stream_member_admitted(
                         segment,
                         start,
                         encode_options,
+                        SearchEffort::for_options(options),
                         RAR29_FILTER_SEARCH_BYTES,
                         &|| progress.is_cancelled(),
                     )
@@ -3087,9 +3183,13 @@ fn probe_packed_len(
             &mut poll,
         ),
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
+            // Every level asks the same question, so the probe looks at every
+            // byte whichever level is writing.
             unpack29_encode_literals_with_options_and_progress(
                 sample,
-                rar29_encode_options_for_level(Some(1))?.with_max_match_distance(reach),
+                rar29_encode_options_for_level(Some(1))?
+                    .with_skip_literal_runs(None)
+                    .with_max_match_distance(reach),
                 &mut poll,
             )
         }
@@ -3581,6 +3681,22 @@ fn validate_header_encrypted_archive_options(
 /// candidates and the short matches would have taken level 1 to 10,619,423
 /// bytes in 1.56 s, and level 2 at 64 candidates to 10,335,057 in 3.11 s.
 ///
+/// Levels 1 and 2 also skip through literal runs in blocks that look random
+/// (see `EncodeOptions::skip_literal_runs`), and search for filters less (see
+/// `SearchEffort`). On a 32 MiB tar of already-compressed files the parse
+/// walked a chain of collisions at every byte: level 1 took 2.6 s where rar
+/// 3.93 `-m1` takes 0.33 s. Level 1 starts skipping after 16 misses in a row,
+/// level 2 after 128, because level 2 has to stay smaller than `-m2`
+/// (32,161,043 bytes) and the misses cost it bytes:
+///
+/// ```text
+/// misses before skipping       16          32          64         128
+/// level 2 bytes        32,185,035  32,165,514  32,151,105  32,142,011
+/// level 2 time             1.04 s      1.08 s      1.22 s      1.34 s
+/// ```
+///
+/// Not skipping, level 2 took 3.0 s for 32,132,416 bytes.
+///
 /// An absent level keeps the lazy parse at 128 candidates the writer has
 /// always used, rather than paying for level 5's.
 fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOptions> {
@@ -3589,8 +3705,10 @@ fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOption
             .with_lazy_matching(true)
             .with_near_matches(true),
         Some(0) => Rar29EncodeOptions::new(0),
-        Some(1) => Rar29EncodeOptions::new(8),
-        Some(2) => Rar29EncodeOptions::new(16).with_lazy_matching(true),
+        Some(1) => Rar29EncodeOptions::new(8).with_skip_literal_runs(Some(16)),
+        Some(2) => Rar29EncodeOptions::new(16)
+            .with_lazy_matching(true)
+            .with_skip_literal_runs(Some(128)),
         Some(3) => Rar29EncodeOptions::new(64)
             .with_lazy_matching(true)
             .with_near_matches(true),
@@ -4149,7 +4267,10 @@ fn encode_rar29_chain_member(
         && crate::filter_search::search_applies_throughout(data)
     {
         crate::filter_search::filter_candidates(
-            &Rar29Search::MEMBER,
+            &Rar29Search {
+                effort: SearchEffort::for_options(options),
+                ..Rar29Search::MEMBER
+            },
             data,
             rar29_encode_options_for_options(options)?,
         )?
@@ -5639,7 +5760,7 @@ mod tests {
         let start = 1024 * 1024;
         let at = super::Rar29Search {
             file_offset: start,
-            exhaustive: false,
+            ..super::Rar29Search::MEMBER
         };
         let whole = [FilterSpec::whole(FilterKind::E8)];
         let in_member = super::Rar29Search::MEMBER
@@ -5690,7 +5811,15 @@ mod tests {
         }
         let options = super::rar29_encode_options_for_options(rar40()).unwrap();
 
-        let specs = super::rar29_piece_filters(&data, 0, options, piece, &|| false).unwrap();
+        let specs = super::rar29_piece_filters(
+            &data,
+            0,
+            options,
+            super::SearchEffort::Full,
+            piece,
+            &|| false,
+        )
+        .unwrap();
 
         let ranges: Vec<_> = specs
             .iter()
@@ -5905,23 +6034,26 @@ mod tests {
     fn a_long_code_region_is_filtered_solid_or_not() {
         let data = script_then_code_with_a_costly_middle();
         let members = entries(&[("tool", &data)]);
-        let options = rar40().with_compression_level(1);
-        let unfiltered = in_memory_with(
-            &members,
-            options,
-            crate::MemberCoding::Filtered(crate::FilterPolicy::None),
-        );
-        let unfiltered = total_pack_size(&unfiltered);
-        for solid in [false, true] {
-            let mut options = options;
-            options.features.solid = solid;
-            let archive = in_memory_with(&members, options, crate::MemberCoding::Compressed);
-            assert_holds(&archive, &[("tool", &data)]);
-            let searched = total_pack_size(&archive);
-            assert!(
-                searched * 2 < unfiltered,
-                "solid {solid}: {searched} searched against {unfiltered} unfiltered"
+        // Level 1 takes the scanner's regions as found, level 2 screens them.
+        for level in [1, 2] {
+            let options = rar40().with_compression_level(level);
+            let unfiltered = in_memory_with(
+                &members,
+                options,
+                crate::MemberCoding::Filtered(crate::FilterPolicy::None),
             );
+            let unfiltered = total_pack_size(&unfiltered);
+            for solid in [false, true] {
+                let mut options = options;
+                options.features.solid = solid;
+                let archive = in_memory_with(&members, options, crate::MemberCoding::Compressed);
+                assert_holds(&archive, &[("tool", &data)]);
+                let searched = total_pack_size(&archive);
+                assert!(
+                    searched * 2 < unfiltered,
+                    "level {level}, solid {solid}: {searched} searched against {unfiltered} unfiltered"
+                );
+            }
         }
     }
 
