@@ -82,6 +82,33 @@ pub(crate) fn finish_member(
     solid: bool,
     result: Result<()>,
 ) -> Result<Option<Resume>> {
+    finish(handler, options, member, solid, result, false)
+}
+
+/// [`finish_member`] for a member split across volumes, once the volume
+/// holding its end has been read, so that the walk can carry on past it.
+/// Only the handler in the read options is asked, and never about a limit.
+pub(crate) fn finish_split_member(
+    options: ArchiveReadOptions<'_>,
+    member: impl FnOnce() -> ArchiveMember,
+    solid: bool,
+    error: Error,
+) -> Result<Resume> {
+    if error.kind() == crate::ErrorKind::ResourceLimit {
+        return Err(error);
+    }
+    finish(&mut None, options, member, solid, Err(error), true)
+        .map(|resume| resume.expect("a failed member resumes or fails"))
+}
+
+fn finish(
+    handler: &mut Option<&mut ErrorHandler<'_>>,
+    options: ArchiveReadOptions<'_>,
+    member: impl FnOnce() -> ArchiveMember,
+    solid: bool,
+    result: Result<()>,
+    split: bool,
+) -> Result<Option<Resume>> {
     let Err(error) = result else {
         return Ok(None);
     };
@@ -100,7 +127,7 @@ pub(crate) fn finish_member(
     }
     options.check_cancelled()?;
     let member = member();
-    if member.meta.is_split_before || member.meta.is_split_after {
+    if !split && (member.meta.is_split_before || member.meta.is_split_after) {
         return Err(error);
     }
     let action = match (handler.as_mut(), options.member_errors) {
