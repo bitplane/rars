@@ -1326,8 +1326,8 @@ mod tests {
 
     #[test]
     fn an_existing_directory_ends_the_masks() {
-        let dir = std::env::temp_dir();
-        let dir = dir.to_str().unwrap();
+        // A directory that is there, named without a trailing separator.
+        let dir = env!("CARGO_MANIFEST_DIR");
         let parsed = invocation(&["x", "a.rar", "*.txt", dir]);
         assert_eq!(parsed.destination, PathBuf::from(dir));
         assert_eq!(parsed.masks, vec![b"*.txt".to_vec()]);
