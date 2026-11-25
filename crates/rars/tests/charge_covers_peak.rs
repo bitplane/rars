@@ -230,41 +230,6 @@ impl Gap {
 const KNOWN_GAPS: &[Gap] = &[
     // At a 1 MiB dictionary.
     //
-    // RAR 2.0 charges a block's workspace for each block coded at once, and
-    // level 1's lazy parse holds well under half of that.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar20,
-        paths: &[Path::Whole],
-        levels: &[1],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    // RAR 2.0's optimal parse on two-symbol noise holds more than its charge.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar20,
-        paths: &[Path::Whole],
-        levels: &[5],
-        threads: Some(1),
-        input: Some(Input::TwoSymbol),
-        assertion: Assertion::Covered,
-        issue: 393,
-    },
-    // A RAR 2.0 chain holds far less than a member coded on its own, and is
-    // charged the same.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar20,
-        paths: &[Path::Solid],
-        levels: &[3, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
     // From level 3, RAR 4 tries PPMd on text, and is charged the trial's
     // models in full. Their pools are anonymous mappings, not heap
     // allocations, so the allocator here does not see them.
@@ -352,26 +317,6 @@ const KNOWN_GAPS: &[Gap] = &[
     },
     // At each level's fitted dictionary, for the causes above where an entry
     // gives none of its own.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar20,
-        paths: &[Path::Whole],
-        levels: &[1],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar20,
-        paths: &[Path::Solid],
-        levels: &[3, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
     Gap {
         tier: Tier::Fitted,
         writer: Writer::Rar4,

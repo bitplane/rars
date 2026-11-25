@@ -261,20 +261,6 @@ impl Unpack20Encoder {
 /// member.
 const BLOCK_SIZE: usize = 1024 * 1024;
 
-/// What coding one block holds beyond the member's own bytes: the window and
-/// block, the match finders, the tokens, and from level 3 up the shortest-path
-/// parse's steps and match lists. Peak RSS on brett, coding 256 MiB streamed
-/// with 1 MiB blocks, was 18–26 MB under the greedy parse. Level 5's live heap
-/// per block, at most 45 MiB on source, word text, random and zeros, gets the
-/// same headroom.
-const fn block_workspace(optimal_parse: bool) -> u64 {
-    if optimal_parse {
-        64 * 1024 * 1024
-    } else {
-        24 * 1024 * 1024
-    }
-}
-
 fn encode_member(
     input: &[u8],
     history: &[u8],
@@ -335,12 +321,123 @@ fn blocks_per_batch() -> usize {
     crate::parallel::threads().clamp(1, MAX_BLOCKS_SIDE_BY_SIDE)
 }
 
-/// A block's workspace per block coded at once, charged as if this member may fan out.
-pub(crate) fn coding_workspace(optimal_parse: bool, len: u64) -> u64 {
-    let blocks = len.div_ceil(BLOCK_SIZE as u64).max(1);
-    blocks
-        .min(blocks_per_batch() as u64)
-        .saturating_mul(block_workspace(optimal_parse))
+/// Price the largest batch, including a partial block if it fits in that batch.
+/// A streamed member has no length bound here and may retain the previous
+/// member's window allocation as history.
+pub(crate) fn coding_workspace(options: EncodeOptions, fixed_table: bool, len: Option<u64>) -> u64 {
+    let streamed = len.is_none();
+    let len = len.unwrap_or(u64::MAX);
+    let batch = len.min((blocks_per_batch() * BLOCK_SIZE) as u64) as usize;
+    let options = options.constrained();
+    let full = batch / BLOCK_SIZE;
+    let tail = batch % BLOCK_SIZE;
+    let mut workspace = full * block_workspace(options, fixed_table, len, BLOCK_SIZE);
+    if tail != 0 {
+        workspace += block_workspace(options, fixed_table, len, tail);
+    }
+    if streamed && fixed_table {
+        workspace += 2 * (batch + options.max_match_distance);
+    }
+    if fixed_table {
+        // A chain's charge otherwise sits within a few percent of its peak at
+        // one thread; leave room for allocator and platform differences.
+        workspace += SOLID_CHAIN_HEADROOM;
+    }
+    workspace as u64
+}
+
+const SOLID_CHAIN_HEADROOM: usize = 4 * 1024 * 1024;
+
+fn block_workspace(options: EncodeOptions, fixed_table: bool, len: u64, span: usize) -> usize {
+    let reach = options.max_match_distance;
+    let window_len = if fixed_table {
+        reach + span
+    } else {
+        len.min((reach + span) as u64) as usize
+    };
+    let pairs = (1 << 16) * size_of::<u32>();
+    // One token per byte at most. A pushed Vec doubles from its minimum capacity.
+    let tokens = span.max(4).next_power_of_two() * size_of::<EncodeToken>();
+    // A literal uses at most 15 bits. Match codes and their extra bits use at
+    // most that many per byte replaced. Leave room for tables and the end symbol.
+    let packed = ((15 * span).div_ceil(8) + 4 * 1024).next_power_of_two();
+    let parse = if options.optimal_parse && !fixed_table {
+        let window = (reach + 1).min(window_len);
+        let near = window.min(LONGER_FRESH_OFFSET);
+        let tree = match_finder::TreeMatchFinder::<Allowance>::bytes_for_window(window);
+        let chain = Rar20MatchFinder::bytes_for_reach(near, near) as usize;
+        // Each position can keep one chain match alongside the tree's runs.
+        // The list lives through collection, parsing and bit emission.
+        let runs = 1 + options
+            .max_match_candidates
+            .min(match_finder::TREE_MAX_RUNS);
+        let lists = span + (span * runs).max(4).next_power_of_two() * size_of::<FoundMatch>();
+        let steps = (span + 1) * size_of::<EncodeToken>();
+        let shortest_path = steps + pairs + size_of::<EdgePrices>() + packed;
+        let writing = steps.max(tokens) + 3 * packed;
+        lists + (tree + chain).max(shortest_path).max(writing)
+    } else {
+        let reach = reach.max(1).min(window_len);
+        let chain = Rar20MatchFinder::bytes_for_reach(reach, reach) as usize;
+        if fixed_table {
+            tokens + (chain + pairs).max(packed)
+        } else {
+            let literal_span = span.min(
+                LITERAL_TOTALS_SPAN.max(
+                    options
+                        .lazy_lookahead
+                        .max(1)
+                        .saturating_add(MAX_ENCODER_MATCH_LENGTH),
+                ),
+            );
+            let totals = (literal_span + 1).next_power_of_two() * size_of::<u32>();
+            tokens + (chain + pairs + totals + packed).max(2 * packed)
+        }
+    };
+    let commit = if options.try_audio && !fixed_table {
+        2 * packed + span
+    } else {
+        2 * packed
+    };
+    // The batch's shared input window can double when it grows to fit
+    // history. Allow a little more for Huffman tables and small scratch buffers.
+    2 * span + parse.max(commit) + 64 * 1024
+}
+
+#[cfg(all(
+    test,
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[test]
+fn coding_workspace_prices_the_parse_and_batch() {
+    let block = BLOCK_SIZE as u64;
+    let lazy = EncodeOptions::new(32)
+        .with_lazy_matching(true)
+        .with_try_audio(false);
+    let optimal = EncodeOptions::new(256)
+        .with_lazy_matching(true)
+        .with_lazy_lookahead(2)
+        .with_optimal_parse(true)
+        .with_extra_priced_passes(2);
+    let charges = [1, 4, 16].map(|threads| {
+        crate::parallel::private_pool(threads).install(|| {
+            let low = coding_workspace(lazy, false, Some(32 * block));
+            let high = coding_workspace(optimal, false, Some(32 * block));
+            assert!(2 * low < high);
+            assert!(
+                coding_workspace(optimal, true, Some(32 * block))
+                    <= low + SOLID_CHAIN_HEADROOM as u64
+            );
+            let single = coding_workspace(lazy, false, Some(block));
+            assert!(coding_workspace(lazy, false, Some(block / 2)) < single);
+            assert_eq!(low, threads as u64 * single);
+            (low, high)
+        })
+    });
+    assert!(charges
+        .windows(2)
+        .all(|pair| pair[0].0 < pair[1].0 && pair[0].1 < pair[1].1));
 }
 
 /// Returns the member's last reach, which a chain's next member continues from.
