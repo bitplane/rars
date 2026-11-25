@@ -5462,8 +5462,7 @@ mod stored_pipe_tests {
             store(crate::FeatureSet::store_only()),
             ArchiveExtras::default(),
         );
-        // Three blocks and an end-of-source probe per pass; 64 KiB and 8 KiB
-        // blocks took 48 and 384.
+        // Three blocks and an end-of-source probe per pass.
         let reads = reads.load(Ordering::SeqCst);
         assert!(reads <= 10, "{reads} reads");
         let archive = crate::ArchiveReader::read_owned(archive).unwrap();

@@ -296,7 +296,7 @@ const SHARED_WINDOW_LIMIT: usize = u32::MAX as usize / 6;
 ///
 /// A filtered run's part of the window holds its filtered bytes, which is
 /// what its own window held and what later runs' histories hold. It joins
-/// only when it has history, as it always has.
+/// only when it has history.
 ///
 /// In a solid `chain`, the wave's runs are consecutive runs of one stream
 /// that crosses members, so they group as one. A filtered run there already
@@ -628,24 +628,22 @@ fn absorbs_tail(plan: &CompressPlan, unread: u64) -> bool {
 
 /// How many of a member's runs one block job codes back to back.
 ///
-/// A run that follows another in its member seeds a tree from the
-/// dictionary before it, which is about a fifth of level 3's time. A job of
-/// several runs parses straight on instead, and a tree that has parsed up to
-/// a run holds what one seeded there would, so the archive is the same
-/// whatever this returns. Only how many jobs can run at once changes.
+/// A run that follows another in its member seeds a tree from the dictionary
+/// before it. A job of several runs parses straight on instead, and a tree that
+/// has parsed up to a run holds what one seeded there would, so the archive is
+/// the same whatever this returns. Only how many jobs can run at once changes.
 ///
 /// So runs are joined up only as far as every thread still has a job: the
 /// largest member is cut into a whole number of jobs per thread, where those
 /// jobs' windows fit the budget side by side. One thread codes a member in as
 /// few jobs as the budget allows, and a machine with more threads than runs
-/// codes every run on its own, as before. A run that walks chains, which only
-/// a member's short last run does, still starts a job of its own.
+/// codes every run on its own. A run that walks chains, which only a member's
+/// short last run does, still starts a job of its own.
 ///
 /// Where runs are shorter than the dictionary ([`member_run_size`]), threads
 /// count only as far as the budget holds a job for each, and a job of more
 /// than a dictionary holds whole dictionaries of runs: every job seeds a
-/// dictionary of history, so one thread codes the member a dictionary a job,
-/// as it did when that was one run.
+/// dictionary of history, so one thread codes the member a dictionary a job.
 fn runs_per_job(
     plan: &CompressPlan,
     largest: u64,
@@ -698,10 +696,9 @@ fn runs_per_job(
 /// each further run is held by the coordinator while it is read and its
 /// filters are searched, and then by the job's window.
 ///
-/// A job no longer than a dictionary is admitted as one run of a dictionary
-/// was before runs were cut shorter than it, which is what it holds: each
-/// further run once, and the whole budget when it needs more, one job at a
-/// time.
+/// A job no longer than a dictionary is admitted as one run of a dictionary,
+/// which is what it holds: each further run once, and the whole budget when it
+/// needs more, one job at a time.
 fn joined_admission(plan: &CompressPlan, admission: u64, joined: usize, memory_limit: u64) -> u64 {
     let run = member_run_size(plan) as u64;
     let further = (joined.saturating_sub(1) as u64).saturating_mul(run);
@@ -1375,11 +1372,10 @@ fn compress_streaming_members(
             .acquire_cancellable(required, plan.dictionary_size, &|| advance.is_cancelled())?;
         unreachable!("oversized workspace acquisition must fail");
     }
-    // `required` decided the route and stays the floor for the budget, so a
-    // write fails or succeeds as before. How many jobs run at once never
-    // changes the archive, so a wave reserves what each job holds instead.
-    // A budget set with `max_memory_bytes` keeps its own ledger and per-job
-    // windows, charged the planning workspace as before.
+    // `required` decided the route and stays the floor for the budget. How
+    // many jobs run at once never changes the archive, so a wave reserves what
+    // each job holds instead. A budget set with `max_memory_bytes` keeps its
+    // own ledger and per-job windows, charged the planning workspace.
     let required = if resources.execution.is_some() {
         required
     } else {
@@ -1973,8 +1969,6 @@ fn compress_fallback_members(
 /// order until it runs out, then the next member's, so a batch of small
 /// members still saturates the machine and a large member's runs in a wave
 /// are consecutive, which is what lets them share a window and an index.
-/// Taking one run from each member in turn left every run of a member in a
-/// wave of its own whenever there were as many members as threads.
 ///
 /// A run is coded from its own bytes and its member's history, so which
 /// runs share a wave never changes the archive. With `filter_runs`, each run

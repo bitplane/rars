@@ -1636,7 +1636,7 @@ impl<B: Budget> Huffman<B> {
     }
     /// Decodes from a 15-bit peek, with the results of reading bit by bit;
     /// see the RAR 5 decoder's `HuffmanState::decode`.
-    // Always inlined: it runs once per symbol, and as a call it cost 7%.
+    // Always inlined: it runs once per symbol.
     #[inline(always)]
     fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
         let (peek, available) = bits.peek15();

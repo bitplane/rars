@@ -100,10 +100,7 @@ pub use crate::writer_option::WriterOption;
 
 /// The features this format can honour for an archive of this shape.
 ///
-/// Deliberately blind to what the caller asked for. The check this replaced
-/// built its "allowed" set partly out of the request itself, which in several
-/// places decayed into assigning a flag to itself, so the flag was accepted
-/// whatever it said.
+/// Deliberately blind to what the caller asked for.
 pub fn supported_features(target: ArchiveVersion, shape: PlanShape) -> FeatureSet {
     FeatureSet {
         solid: supports(target, WriterOption::Feature(Feature::Solid), shape),
@@ -192,7 +189,7 @@ pub fn supports(target: ArchiveVersion, option: WriterOption, shape: PlanShape) 
         // RAR 1.3's volume writer has nowhere to carry the encryption state
         // from one volume to the next.
         WriterOption::Password => !(family_is(family, ArchiveFamily::Rar13) && shape.volumes),
-        // Every writer compresses to a budget now: RAR 5 sizes its blocks by
+        // Every writer compresses to a budget: RAR 5 sizes its blocks by
         // it, and the older ones use it to decide how many members to have in
         // flight. A legacy volume set is the exception: it writes one member
         // at a time, streaming a large one into the volumes.

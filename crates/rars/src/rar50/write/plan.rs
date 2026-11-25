@@ -259,9 +259,8 @@ impl MemberPlan {
 /// Whether a member that fits whole packs to the same bytes run by run, so
 /// it can take the runs.
 ///
-/// The whole path parses the member with one finder on one thread, so a
-/// 32 MiB tar took the same time at 22 threads as at one (#545). The runs
-/// path parses each run against a finder seeded from the dictionary before
+/// The whole path parses the member with one finder on one thread (#545). The
+/// runs path parses each run against a finder seeded from the dictionary before
 /// it, and runs as many runs at once as there are threads.
 ///
 /// The two agree when the parse is the lazy one, which walks hash chains on
@@ -526,7 +525,7 @@ mod tests {
                 }
             );
         }
-        // A range past the member's end fails whole, as it always has.
+        // A range past the member's end fails whole.
         settings.filter_policy =
             FilterPolicy::Explicit(crate::FilterSpec::range(delta, 0..size as usize + 1));
         let past = ExecutionPlan::new(&settings, [size].into_iter(), 1);

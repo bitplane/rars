@@ -47,9 +47,8 @@ pub struct WriterOptions {
 
 /// Which compression engine the RAR 2.9 family writer uses for a member.
 ///
-/// PPMd is an alternative to LZ, not a filter, even though the writer used to
-/// carry it as one. Keeping the two apart is what lets a filter be chosen
-/// without also deciding the engine.
+/// PPMd is an alternative to LZ, not a filter. Keeping the two apart is what
+/// lets a filter be chosen without also deciding the engine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum Rar29Method {
@@ -199,9 +198,7 @@ const RAR29_TEXT_SAMPLE_SIZE: usize = 8192;
 ///
 /// Sixteen is well past what falls out of text (a run of NUL in a source file
 /// is already unusual) and well short of the 512 byte blocks tar pads to.
-/// Measured across 400 binaries over 200 KB in `/usr/bin` and
-/// `/usr/lib/x86_64-linux-gnu`, 8, 16 and 32 all give the same answer, so the
-/// exact number is not load-bearing.
+/// The exact number is not load-bearing.
 const RAR29_NUL_RUN_IS_PADDING: usize = 16;
 
 /// The level an absent `--level` means for RAR 2.0, matching the method byte
@@ -211,21 +208,9 @@ const RAR29_AUDIO_SAMPLE_SIZE: usize = 8192;
 /// How much data one RAR 2.9 LZ block covers.
 ///
 /// Every block carries its own Huffman tables, so this is the distance over
-/// which the tables have to fit the data. A megabyte was far too long a lease:
-/// a binary's code and its data want different tables, and one set fitted to
-/// both is worse than either. Measured on `--level 5`, packed bytes:
-///
-/// ```text
-/// block         16K      32K      64K     128K       1M
-/// libc       686400   683942   684278   704689   797692
-/// python     632452   628926   627862   648835   738624
-/// mixed      136376   135530   135264   146831   149372
-/// lorem       16186    16186    16186    16186    16186
-/// ```
-///
-/// 64K is the best or within a rounding error of it on everything measured,
-/// and text does not care either way. The curve turns back up below 32K, where
-/// re-sending the tables starts to cost more than fitting them gains.
+/// which the tables have to fit the data. A binary's code and its data want
+/// different tables, and one set fitted to both is worse than either. Below
+/// 32K, re-sending the tables starts to cost more than fitting them gains.
 const RAR29_LZ_BLOCK_SIZE: usize = 64 * 1024;
 use crate::write_stream::STREAM_MEMBERS_ABOVE;
 
@@ -233,21 +218,15 @@ use crate::write_stream::STREAM_MEMBERS_ABOVE;
 /// a longer streamed segment, is searched a piece at a time and coded once
 /// under every piece's filters, as RAR 5 searches its runs.
 ///
-/// Searched whole, a 32 MiB tar of x86-64 executables and libraries came out
-/// 5.1% larger than rar 3.93's `-m3`: the x86 scanner proposes a handful of
-/// regions for the whole member, and its tables were judged a window too
-/// coarse for the few kilobytes of relocations each file holds. In 4 MiB
-/// pieces it came out 0.6% smaller than searched whole; 1 MiB and 512 KiB
-/// pieces did no better and searched for longer.
+/// Searched whole, the x86 scanner proposes a handful of regions for the
+/// whole member, and judges its tables a window too coarse for the few
+/// kilobytes of relocations each file holds.
 const RAR29_FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
 
 /// How much of a piece the RAR 2.9 table scanner judges at a time.
 ///
-/// rar 3.93 codes delta filters over regions as short as 768 bytes. On the
-/// same 32 MiB tar the default 16 KiB window found 3.2 MB of tables, and
-/// 2 KiB found enough more to take another 2% off the member at level 3, for
-/// 13% more time. 1 KiB took 0.4% more for another 15%; RAR 5's 256 bytes
-/// would cost more again, a filter record per table.
+/// rar 3.93 codes delta filters over regions as short as 768 bytes. RAR 5's
+/// 256 bytes would cost a filter record per table.
 const RAR29_TABLE_SCAN_WINDOW: usize = 2 * 1024;
 
 /// How much of an x86 region each RAR 2.9 screen sample stands for: a
@@ -995,8 +974,7 @@ fn admit_to_window(
 /// Encodes one member, choosing an engine and a filter independently.
 ///
 /// The two are separate questions: which engine compresses this content best,
-/// and which transform makes it easier to compress. They used to be one enum,
-/// which meant some combinations simply could not be asked for.
+/// and which transform makes it easier to compress.
 #[allow(clippy::too_many_arguments)]
 fn encode_rar29_policy_filtered_payload(
     data: &[u8],
@@ -1009,9 +987,7 @@ fn encode_rar29_policy_filtered_payload(
     resources: Option<&WriterResources>,
 ) -> Result<EncodedPayload> {
     // An empty member is stored whatever was asked for. A filter over it is a
-    // 0..0 range, which the codec refuses, so an archive holding one empty file
-    // used to compress every other member and then fail at the last step. Only
-    // the search path guarded this; every explicit policy walked into it.
+    // 0..0 range, which the codec refuses.
     if lz_method == 0x30 || data.is_empty() {
         return Ok(EncodedPayload {
             data: data.to_vec(),
@@ -1021,9 +997,7 @@ fn encode_rar29_policy_filtered_payload(
     // The method byte carries the level that was asked for, not which engine
     // answered. RAR 2.9 signals PPMd inside the stream (our own decoder takes
     // no method byte at all), and WinRAR 3.00 stamps 0x34 on the PPMd archive
-    // it writes at -m4. Stamping 0x35 on every PPMd payload only looked right
-    // while the trial ran at level 5, and made a level 3 archive claim to be a
-    // level 5 one as soon as it ran anywhere else.
+    // it writes at -m4.
     let ppmd = |filter: Option<&FilterSpec>| -> Result<EncodedPayload> {
         Ok(EncodedPayload {
             data: encode_rar29_ppmd_member(
@@ -1133,9 +1107,8 @@ fn encode_rar29_ppmd_member(
 /// Takes the resolved level, so an absent level and `--level 3` agree.
 ///
 /// Levels 1 and 2 ask for speed and skip it. Level 3 is the default, and the
-/// trial is worth about a fifth of the size on text for roughly twice the
-/// encode. WinRAR turns PPMd on one level later, at m4: on 4 MiB of text WinRAR
-/// 3.00 packs 657,294 bytes at m3 and 585,357 at m4, and rars 540,517 at both.
+/// trial pays for its second encode on text. WinRAR turns PPMd on one level
+/// later, at m4.
 fn ppmd_trial_pays(level: u8) -> bool {
     level >= 3
 }
@@ -1278,30 +1251,14 @@ impl Rar29Search {
 
 /// How much of the filter search a level pays for.
 ///
-/// Levels 1 and 2 are there to be fast, and on a 32 MiB tar of executables the
-/// full search was 0.9 s of level 1's 1.7 s, against rar 3.93 `-m1` taking
-/// 0.33 s for the whole archive. What the reduced searches leave out, and what
-/// it cost on that tar at level 1, one thread:
-///
-/// ```text
-///                                              bytes        time
-/// full search                             11,113,370      1.73 s
-/// samples priced within themselves        11,113,366      1.54 s
-///   and no screened kinds at all          11,113,366      1.29 s
-///   and the x86 scanner trusted           11,121,941      1.11 s
-///   but delta and audio screened again    11,121,941      1.19 s
-/// no search at all                        12,086,138      0.78 s
-/// ```
+/// Levels 1 and 2 are there to be fast, and the full search is most of level
+/// 1's time.
 ///
 /// A piece that looks random is not searched at all. Of the screened kinds,
 /// which have no detector and cost a sample encode each per 4 MiB piece, the
 /// reduced searches keep delta and the audio a statistic has picked out, and
-/// leave out RGB and Itanium. Without delta, a solid archive of the bench's
-/// 4 MiB of repetitive data came out 7,063 bytes at level 1 instead of 4,589.
-/// Over the bench corpus the RGB and Itanium screens were worth only the PNG
-/// icons, 1%. Trusting the scanner cost 0.2-0.3% on the large binaries, so
-/// level 2, which has to stay under rar 3.93 `-m2` there, still screens its
-/// regions.
+/// leave out RGB and Itanium. Trusting the scanner costs on large binaries,
+/// so level 2 still screens its regions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SearchEffort {
     /// Levels 3 to 5, and an absent level.
@@ -1327,8 +1284,6 @@ impl SearchEffort {
 
     /// Whether the search skips `data` outright: a reduced search does not
     /// look for filters in bytes that look random, which none of them shrink.
-    /// On a 32 MiB tar of already-compressed files that took level 1 from
-    /// 1.09 s to 0.69 s and came out 1,276 bytes smaller.
     ///
     /// Bytes can look random and not be. Noisy samples and pixels spread
     /// across every byte value, but their differences at the sample or pixel
@@ -1429,8 +1384,7 @@ impl crate::filter_search::FilterSearch for Rar29Search {
         self.exhaustive
     }
 
-    /// Unlike RAR 5, a greedy parse here really is cheaper. On a megabyte of
-    /// binary it measured 59ms against 91ms at full effort, and it ranks
+    /// Unlike RAR 5, a greedy parse here really is cheaper, and it ranks
     /// candidates the same way, so the screens and the trial run reduced and
     /// only the winner pays full price.
     fn screen_options(&self, options: Rar29EncodeOptions) -> Rar29EncodeOptions {
@@ -1573,18 +1527,7 @@ fn rar29_piece_filters(
 /// How many pieces of one member [`rar29_piece_filters`] searches at once,
 /// at most, when there are threads for them.
 ///
-/// On a 32 MiB tar of executables at four threads, min of three:
-///
-/// ```text
-/// at once   time    peak RSS       peak, MALLOC_TRIM_THRESHOLD_=0
-/// 1         1.66 s  131 MiB        121 MiB
-/// 2         1.31 s  188-208 MiB    121 MiB
-/// 4         1.18 s  210 MiB        121 MiB
-/// ```
-///
-/// Searched whole, the member took 1.14 s and peaked at 145 MiB, and rar 3.93
-/// `-m3` takes 1.40 s. What the searches hold at once is the same either way;
-/// the rest of the peak is memory each searching thread freed and the
+/// Each extra search adds to the peak memory its thread freed and the
 /// allocator kept. Two at a time beats rar 3.93 for the least of that.
 const PIECE_SEARCHES_AT_ONCE: usize = 2;
 
@@ -1615,8 +1558,8 @@ fn encode_rar29_auto_filtered_member_with_progress(
 ) -> Result<EncodedPayload> {
     // The search measures the unfiltered member as one of its own candidates
     // and returns the winner's bytes, so encoding the member plainly here as
-    // well was a second full pass over every binary member on the default
-    // settings. Text goes nowhere near the search, so it still needs one.
+    // well would be a second full pass over every binary member. Text goes
+    // nowhere near the search, so it still needs one.
     let text = text_score(data);
     if include_ppmd && text.reads_as_text() {
         return encode_rar29_text_member(data, options, lz_method, progress);
@@ -1710,17 +1653,13 @@ fn encode_rar29_text_member(
 ) -> Result<EncodedPayload> {
     // Encode the whole member with both engines, LZ at least by the screen's
     // parse, and keep the smaller. Neither size nor a sample predicts the
-    // winner: 8 MiB of content that repeats every 4 MiB packs to 843 KB under
-    // LZ and 1.44 MB under PPMd, and a sample narrower than the repeat
-    // distance cannot see the repetition. On a small
-    // sample archive overhead dominates, so 128 KiB of one phrase reads as a
-    // 45% PPMd win (118 bytes against 213). PPMd costs about three times LZ on
-    // the same bytes; `ppmd_trial_pays` decides which levels pay for both.
+    // winner: a sample narrower than the repeat distance cannot see the
+    // repetition, and on a small sample archive overhead dominates. PPMd costs
+    // about three times LZ on the same bytes; `ppmd_trial_pays` decides which
+    // levels pay for both.
     let models = ppmd_models_for_level(lz_method.saturating_sub(0x30));
     // PPMd wins almost every text member, so the LZ side of the trial is the
-    // lazy parse: on the bench's eight text classes at levels 4 and 5 the
-    // shortest-path parse changed no packed byte and doubled the time on the
-    // 4 MiB members.
+    // lazy parse.
     let options = options.with_optimal_parse_passes(0);
     let exhaustive = text_trial_exhaustive(lz_method.saturating_sub(0x30));
     let (_, best) = text_trial(data, options, models, exhaustive, &|encode| {
@@ -1751,9 +1690,7 @@ type TrialRun<'a> = dyn Fn(
 /// The escape tokens price themselves against costs measured off the stream
 /// they are shaping, so a member where every escape loses can still ratify a
 /// few before the measurements catch up, and a pure-literal stream is the
-/// direct check. What that costs is a few escapes, not a share of the member:
-/// over the bench's 89 text members it won on 59, the largest 35,149 bytes,
-/// and lost on every member past that, the 4 MiB and 32 MiB ones included.
+/// direct check. What that costs is a few escapes, not a share of the member.
 /// Past this length it is a whole second PPMd encode for nothing.
 const PPMD_LITERAL_TRIAL_BYTES: usize = 256 * 1024;
 
@@ -1769,13 +1706,9 @@ fn text_trial_exhaustive(level: u8) -> bool {
 ///
 /// LZ is first screened by the reduced parse the filter search ranks with,
 /// which costs about a fifth of the lazy one, and only coded in full where that
-/// screen comes within a fifth of the best PPMd. The lazy parse is at most 11%
-/// smaller than the screen on the bench's text (4 MiB of source), so a screen
-/// that far behind cannot be overturned; and PPMd won every text member
-/// there, by at least 8% over the screen. A member that repeats beyond what
-/// PPMd's escapes reach, which is where LZ wins, wins under the screen as
-/// well. Without the screen, a 32 MiB tar of text took 6.8 times rar 3.93's
-/// `-m3` to code at one thread.
+/// screen comes within a fifth of the best PPMd. A member that repeats beyond
+/// what PPMd's escapes reach, which is where LZ wins, wins under the screen as
+/// well.
 ///
 /// An exhaustive trial skips both screens and codes every candidate.
 ///
@@ -1890,29 +1823,15 @@ fn ppmd_models_for_options(options: WriterOptions) -> &'static [PpmdModelSize] {
 /// higher level can only find a smaller stream. Order 8 in 25 MB is what rar
 /// 3.00 declares at m5. A higher order needs the memory to hold its contexts:
 /// order 16 in 40 MB restarts its model partway through 4 MiB of man pages and
-/// loses to order 8, and in 64 MB it wins. Measured with escapes, packed bytes:
+/// loses to order 8, and in 64 MB it wins.
 ///
-/// ```text
-/// model           o8 25MB   o12 64MB   o16 64MB  o25 128MB
-/// man pages       539,345    535,071    534,221    534,134
-/// source tar      551,388    525,240    520,171    512,921
-/// ```
-///
-/// Small members code best as plain literals, where order 16 is worth 0.1% to
-/// 0.6% over order 8 on headers, logs and docs but loses 0.06% on the mixed
-/// class, which is why order 8 stays in the trial rather than being replaced.
+/// Small members code best as plain literals, where order 16 beats order 8 on
+/// headers, logs and docs but loses on the mixed class, which is why order 8
+/// stays in the trial rather than being replaced.
 ///
 /// A streamed member is coded under the model that wins on a sample from its
 /// middle, and past 64 MiB that sample still ranks the models the way the
-/// whole member does. With escapes, a 16 MiB sample against the whole:
-///
-/// ```text
-/// model                     o8 25MB     o16 64MB    o25 128MB
-/// C headers, sample       1,187,996    1,133,289    1,126,435
-/// C headers, 150 MB      14,203,877   13,672,734   13,581,772
-/// man and docs, sample    2,389,131    2,365,099    2,333,977
-/// man and docs, 120 MB   11,123,884   10,997,130   10,822,915
-/// ```
+/// whole member does.
 fn ppmd_models_for_level(level: u8) -> &'static [PpmdModelSize] {
     const ORDER_16: PpmdModelSize = PpmdModelSize {
         order: 16,
@@ -1963,15 +1882,10 @@ impl TextScore {
     /// filters: the search's own screen counts it against text, and a member
     /// that is a quarter padding or more is laid out in records, not written.
     /// The bench's 4 MiB of one phrase between 4 KiB runs of NUL is half
-    /// padding. It read as text, so at levels 1 and 2, which trial no PPMd, it
-    /// went unsearched and came out 7,063 and 6,953 bytes. Delta over it takes
-    /// that to 4,589 and 4,580, under WinRAR 3.x's 5,255 and 4,924.
+    /// padding.
     ///
     /// Text that pads less is still left alone, though the search's screen
-    /// sees more of a member and can disagree. Searched, the 32 MiB tar of
-    /// text the release bench uses, which carries some binaries the three
-    /// windows miss, came out 3.5% smaller at levels 1 and 2, for 77% and 30%
-    /// more time.
+    /// sees more of a member and can disagree.
     fn declines_filter_search(self) -> bool {
         self.reads_as_text() && self.padding * 4 < self.total + self.padding
     }
@@ -1991,10 +1905,7 @@ fn score_text_windows<'a>(windows: impl IntoIterator<Item = &'a [u8]>) -> TextSc
 
 /// Counts one sampled window as printable, NUL, total and padding bytes.
 ///
-/// Counting only ASCII read every non-English member as binary. The bench's
-/// text member is a set of translated man pages, 23% of it well-formed
-/// multibyte UTF-8, and it scored 77% against the 85% bar and went to LZ. A
-/// multibyte sequence is as much text as an ASCII letter. Accepting them costs
+/// A multibyte sequence is as much text as an ASCII letter. Accepting them costs
 /// no precision either, because random binary almost never forms one: a lead
 /// byte followed by a continuation byte is about 3% of positions, nowhere near
 /// enough to carry a binary member over the bar.
@@ -2015,11 +1926,8 @@ fn score_text_window(window: &[u8]) -> TextScore {
             // A run this long is padding rather than content, and padding says
             // nothing about what surrounds it, so it is left out of the count
             // instead of counted against the member. A tar pads every file to a
-            // 512 byte block and ends with a block of nothing, which put 27% NUL
-            // in front of a 1% bar and sent a tar of source files to LZ as if it
-            // were binary. What is left either side of the padding still decides
-            // it: a tar of text reads 99.8% text, and an ELF only climbs from
-            // 34% to 38%, nowhere near the bar.
+            // 512 byte block and ends with a block of nothing. What is left either
+            // side of the padding still decides it.
             if run < RAR29_NUL_RUN_IS_PADDING {
                 nul += run;
                 total += run;
@@ -3697,10 +3605,6 @@ fn report_compression_operation(
 }
 
 /// Everything this writer refuses, in one place, before anything is written.
-///
-/// The three near-identical checks this replaced each built a set of allowed
-/// features out of the target and the request together, compared it with the
-/// request, and on a mismatch said only that some feature was unsupported.
 fn validate_plan(
     options: WriterOptions,
     shape: PlanShape,
@@ -3723,9 +3627,7 @@ fn validate_plan(
         crate::write_plan::validate_option(options.target, WriterOption::CompressionMethod, shape)?;
     }
     // A filter policy routes the member through the RAR 2.9 engine, so the
-    // formats without one have to be turned away here. This used to be
-    // computed into the shape and then never asked about, which let RAR 1.5
-    // accept a policy and write an archive that failed its own checksum.
+    // formats without one have to be turned away here.
     if shape.filtered {
         crate::write_plan::validate_option(options.target, WriterOption::Filter, shape)?;
     }
@@ -3757,52 +3659,29 @@ fn validate_header_encrypted_archive_options(
 
 /// RAR 2.9 levels, as the LZ parse each one runs.
 ///
-/// Each level parses at least as well as the one below. Measured on the bench
-/// corpus's 4 MiB classes through LZ alone, no filter, packed bytes:
+/// Each level parses at least as well as the one below.
 ///
-/// ```text
-/// parse                    stripped ELF  unstripped ELF  man pages  source tar
-/// greedy, 8 candidates        1,887,716       1,627,511    757,447     811,633
-/// greedy, 32                  1,864,334       1,610,547    720,161     757,785
-/// lazy, 16                    1,822,607       1,545,989    709,905     755,377
-/// lazy, 64                    1,805,783       1,534,280    688,069     720,524
-/// lazy, 128                   1,800,583       1,531,317    682,125     709,487
-/// shortest path, 64, 1 pass   1,743,620       1,438,006    649,359     666,108
-/// shortest path, 128, 3       1,727,188       1,411,736    642,330     655,801
-/// ```
-///
-/// Lazy matching is worth 3-4% for well under a tenth more time, so it starts
-/// at level 2. Greedy past eight candidates was the old level 2, and it lost
-/// to level 1 on long repeats: the deeper search found a far match that scored
-/// better than the repeat offset it displaced, and paid for it on every period
-/// after. The shortest-path parse is worth another 3-7% and costs four to six
+/// Lazy matching costs little time, so it starts at level 2. Greedy past
+/// eight candidates loses to level 1 on long repeats: the deeper search finds
+/// a far match that scores better than the repeat offset it displaces, and
+/// pays for it on every period after. The shortest-path parse costs several
 /// times the lazy parse, so it takes the top two levels, which differ in how
 /// far they search and how often they re-price.
 ///
 /// From level 3 the lazy parse also takes the short matches its chains cannot
-/// offer (see `NearMatches`): on a 32 MiB tar of executables at level 3,
-/// 10,333,495 bytes became 10,099,860 for 6% more time. Levels 1 and 2 take
-/// them too, for what their chains miss: they walk few enough candidates that
-/// a long member's chains key on six bytes (see `LONG_KEY_MAX_CANDIDATES`).
+/// offer (see `NearMatches`). Levels 1 and 2 take them too, for what their
+/// chains miss: they walk few enough candidates that a long member's chains
+/// key on six bytes (see `LONG_KEY_MAX_CANDIDATES`).
 ///
 /// Levels 1 and 2 also skip through literal runs in blocks that look random
 /// (see `EncodeOptions::skip_literal_runs`), and search for filters less (see
-/// `SearchEffort`). On a 32 MiB tar of already-compressed files the parse
-/// walked a chain of collisions at every byte: level 1 took 2.6 s where rar
-/// 3.93 `-m1` takes 0.33 s. Level 1 starts skipping after 16 misses in a row,
-/// level 2 after 128, because level 2 has to stay smaller than `-m2`
-/// (32,161,043 bytes) and the misses cost it bytes:
+/// `SearchEffort`). On already-compressed data the parse would otherwise walk
+/// a chain of collisions at every byte. Level 1 starts skipping after 16
+/// misses in a row, level 2 after 128, because level 2 has to stay smaller
+/// than `-m2` and the misses cost it bytes.
 ///
-/// ```text
-/// misses before skipping       16          32          64         128
-/// level 2 bytes        32,185,035  32,165,514  32,151,105  32,142,011
-/// level 2 time             1.04 s      1.08 s      1.22 s      1.34 s
-/// ```
-///
-/// Not skipping, level 2 took 3.0 s for 32,132,416 bytes.
-///
-/// An absent level keeps the lazy parse at 128 candidates the writer has
-/// always used, rather than paying for level 5's.
+/// An absent level keeps the lazy parse at 128 candidates rather than paying
+/// for level 5's.
 fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOptions> {
     let options = match level {
         None => Rar29EncodeOptions::new(128)
@@ -3846,31 +3725,14 @@ fn rar29_encode_options_for_options(options: WriterOptions) -> Result<Rar29Encod
 /// RAR 2.0 levels: which parse, how many candidates it searches per position,
 /// how far a greedy parse looks ahead, and how many extra priced passes.
 ///
-/// Chosen from a sweep of all four over the bench corpus, ten small classes
-/// and six 4 MiB ones, one thread, interleaved min of five or more. Points on
-/// the frontier and the old levels, packed bytes over the corpus and seconds:
-///
-/// ```text
-/// parse     candidates  ahead  passes      bytes  seconds
-/// greedy            32      1       0  9,505,430     2.27  level 1, no audio trial
-/// greedy           128      1       0  9,421,925     5.49  level 2
-/// greedy           256      2       0  9,392,020     9.60  old level 3
-/// shortest           4      2       0  9,339,420     6.78
-/// shortest          16      2       0  9,163,014     8.16  level 3
-/// shortest         512      2       0  9,147,449     8.59  old level 4
-/// shortest          64      2       1  9,146,838    10.36  level 4
-/// shortest         256      2       2  9,146,446    12.03  level 5
-/// ```
-///
 /// The shortest-path parse searches a tree, not a chain, so a few candidates
-/// find most of what it can use: 16 is within 0.2% of 512, and a greedy parse
-/// gets nowhere near it at any depth. Past that, more candidates and passes buy
-/// under 0.01%, which is all levels 4 and 5 can still offer; they are spaced
-/// by time, as evenly as the levels below. A greedy parse is the faster choice
-/// below about six seconds, and there looking one byte ahead with twice the
-/// candidates beats looking two ahead in the same time. The shortest path
-/// keeps two: its greedy first pass only seeds the prices, and two seeds better
-/// on nine classes of the fifteen.
+/// find most of what it can use, and a greedy parse gets nowhere near it at
+/// any depth. Past that, more candidates and passes buy little, which is all
+/// levels 4 and 5 can still offer; they are spaced by time, as evenly as the
+/// levels below. A greedy parse is the faster choice at levels 1 and 2, and
+/// there looking one byte ahead with twice the candidates beats looking two
+/// ahead in the same time. The shortest path keeps two: its greedy first pass
+/// only seeds the prices, and two seeds better on most classes.
 fn rar20_encode_options_for_level(level: Option<u8>) -> Result<Rar20EncodeOptions> {
     let level = level.unwrap_or(RAR20_DEFAULT_LEVEL);
     let (candidates, lookahead, shortest_path, extra_passes) = match level {
@@ -3902,12 +3764,7 @@ fn rar20_encode_options_for_options(options: WriterOptions) -> Result<Rar20Encod
 }
 
 /// RAR 1.5 levels. Level 5 takes the priced parse RAR 1.4's level 5 has,
-/// since the two formats share the coder. Over the bench corpus it packs 3.5%
-/// smaller than the greedy parse level 5 had, and WinRAR 1.54's own archive
-/// of a text corpus 2.0% smaller where the greedy parse was 3.6% larger. One
-/// thread on 4 MiB inputs, it takes 2.4 to 3.2 times as long on binaries and
-/// 3.6 to 6.1 times on text, the same time RAR 1.4's level 5 takes; the greedy
-/// parse ran at level 4's speed.
+/// since the two formats share the coder.
 fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOptions> {
     let level = level.unwrap_or(5);
     match level {
@@ -4077,10 +3934,8 @@ impl SolidEncoder {
 
     /// The encoder a solid run starts with, its PPMd model already chosen.
     ///
-    /// A chain keeps the model its first PPMd member starts, so a chain that
-    /// let that member pick the model kept whatever suited the member: on the
-    /// bench's logs the largest model coded the first file smallest and the
-    /// whole run 23 bytes larger than the level below. So the start of the run,
+    /// A chain keeps the model its first PPMd member starts, and what suits
+    /// that member need not suit the run. So the start of the run,
     /// up to [`CHAIN_PPMD_TRIAL_BYTES`], is coded once under each model the
     /// level tries, and the run keeps the model that coded it smallest, earlier
     /// on a tie. A run that fits is coded exactly as its winner was, so a level
@@ -4179,11 +4034,6 @@ struct EncodedPayload {
 }
 
 /// Codes a filtered member, continuing the solid chain when there is one.
-///
-/// A filtered member used to be coded on its own whatever the archive said,
-/// while its header still claimed to continue the chain. That cost the whole
-/// benefit of `--solid`: three 400 KB members went from 550 KB to 1.2 MB, and
-/// the flag on the members was a plain lie about how they had been coded.
 fn encode_filtered_payload(
     data: &[u8],
     policy: &FilterPolicy,
@@ -4239,9 +4089,7 @@ fn encode_filtered_payload(
             )
             .map_err(map_codec_cancel)?,
         // Naming a filter, or none, says nothing about which engine should code
-        // the member. `--no-filter` used to answer that question too, and answer
-        // it LZ, so asking a solid archive not to filter its binaries also took
-        // PPMd away from its text.
+        // the member.
         FilterPolicy::Explicit(_) | FilterPolicy::None => {
             encode_rar29_chain_member(data, options, encoder, false, &mut advance)?
         }
@@ -4359,11 +4207,9 @@ fn encode_rar29_chain_member(
     search: bool,
     progress: &mut dyn FnMut(usize) -> bool,
 ) -> Result<Vec<u8>> {
-    // A chain used to be LZ and nothing else, so a solid archive got no PPMd at
-    // all and an explicit --method ppmd was quietly ignored. It is the same
-    // content question here as in a non-solid archive, so it gets the same
-    // answer and the same gate: a level willing to encode the member twice, and
-    // content that looks like PPMd will win on it.
+    // It is the same content question here as in a non-solid archive, so it
+    // gets the same answer and the same gate: a level willing to encode the
+    // member twice, and content that looks like PPMd will win on it.
     let level = compression_method_for_level(options).saturating_sub(0x30);
     let engine = match options.method {
         Rar29Method::Lz => ChainEngine::Lz,
@@ -4520,9 +4366,9 @@ fn writer_file_flags(
 
 /// Builds the comment block that goes inside a file header.
 ///
-/// RAR 1.3 and 1.4 wrote a bare size and the text, and this writer used to copy
-/// that. From 1.5 on it is the same comment block the archive comment uses,
-/// covered by the file header's size but not by its CRC.
+/// RAR 1.3 and 1.4 wrote a bare size and the text. From 1.5 on it is the same
+/// comment block the archive comment uses, covered by the file header's size
+/// but not by its CRC.
 fn encode_file_comment(comment: Option<&[u8]>) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     write_comment_header(&mut out, comment)?;
@@ -5841,9 +5687,9 @@ mod tests {
     fn x86_code_past_the_first_segment_streams_close_to_the_in_memory_ratio() {
         // With a 64 KiB window a segment is at most 2 MiB, at any thread
         // count, so every segment after the first starts past the targets.
-        // Searched as if it began the file, a later segment saw calls back
-        // to before its start as calls the filter cannot convert, and left
-        // them unfiltered: 387,556 bytes against 247,304 in memory.
+        // Searched as if it began the file, a later segment would see calls
+        // back to before its start as calls the filter cannot convert, and
+        // leave them unfiltered.
         let code = x86_calls(6 * 1024 * 1024);
         let members = entries(&[("code.bin", &code)]);
         let options = rar40().with_dictionary_size(64 * 1024);
@@ -6110,10 +5956,7 @@ mod tests {
 
     /// Sound the audio filter has turned into small noisy differences codes
     /// smaller as literals than with the short matches noise offers, and no
-    /// level codes it larger than literals alone. Level 1 was 13% over them
-    /// and level 2 under level 1 only by chance of length; at 1 MiB, where
-    /// level 1 keys its chains on six bytes and so finds fewer of those
-    /// matches, level 2 packed 10% larger than level 1.
+    /// level codes it larger than literals alone.
     #[test]
     fn no_level_codes_filtered_noise_larger_than_its_literals() {
         let data = noisy_mono8(256 * 1024);
@@ -6137,9 +5980,7 @@ mod tests {
     }
 
     /// Noisy pixels through the delta filter, a member long enough for level
-    /// 2's chains to key on six bytes. Level 3 keyed its own on four and
-    /// walked their 64 newest, all short matches, and packed larger than
-    /// level 2. It now keys on six in differences too.
+    /// 2's chains to key on six bytes. Level 3 keys on six in differences too.
     #[test]
     fn level_three_packs_delta_filtered_pixels_no_larger_than_level_two() {
         let data = noisy_rgb(1200 * 1024);
@@ -8208,7 +8049,7 @@ mod tests {
             assert_eq!(resources.workspace_in_use(), super::WRITE_WORKSPACE);
             drop(encoded);
 
-            // Writing it so is writing it stored, as level 0 always did.
+            // Writing it so is writing it stored, as level 0 does.
             let write = |coding| {
                 super::collect_archive(
                     &[super::Member::from_file(&entry)],
@@ -8786,9 +8627,7 @@ mod tests {
     };
     use crate::codec::rar29::{unpack29_decode, EncodeOptions};
 
-    /// A member comfortably past the 1 MiB ceiling the PPMd trial used to have.
-    /// Text this size kept the LZ bytes without PPMd ever being encoded to
-    /// compare against, all the way up to 16 MiB.
+    /// A member comfortably past 1 MiB.
     const OVER_THE_OLD_TRIAL_LIMIT: usize = 1024 * 1024 + 4096;
     use crate::filter_search::{
         auto_delta_filter_range, disjoint_filter_ranges, AUTO_DELTA_EDGE_SKIP,
@@ -8853,8 +8692,7 @@ mod tests {
         assert!(!super::is_text_ppmd_candidate(&data));
     }
 
-    /// The bench corpus is man pages in several languages, and counting only
-    /// ASCII scored the sample 77% against an 85% bar and sent it to LZ.
+    /// Man pages in other languages are text too.
     #[test]
     fn the_text_screen_reads_multibyte_utf8_as_text() {
         let line = "Überprüfen Sie die Größe der Datei — ändern Sie sie nicht. \
@@ -8931,8 +8769,7 @@ mod tests {
     }
 
     /// A tar pads every member to a 512 byte block and closes with a block of
-    /// nothing, which is 27% NUL in front of a 1% bar. The source tree in the
-    /// bench corpus was read as binary and packed 22% behind WinRAR 3.00 for it.
+    /// nothing, which is 27% NUL in front of a 1% bar.
     #[test]
     fn the_text_screen_reads_past_tar_padding() {
         let mut data = Vec::new();
@@ -8981,9 +8818,8 @@ mod tests {
     }
 
     /// Naming the level you were already getting must not change the archive.
-    /// The default resolves to method 0x33, the same as `--level 3`, but the
-    /// trial decision read the option rather than the level and the two came
-    /// out 24% apart on the same text.
+    /// The default resolves to method 0x33, the same as `--level 3`, so the
+    /// trial decision reads the level, not the option.
     #[test]
     fn the_default_level_and_level_three_agree_about_the_ppmd_trial() {
         let options = crate::rar15_40::WriterOptions {
@@ -9170,9 +9006,7 @@ mod tests {
         out
     }
 
-    /// Text past the trial limit used to keep the LZ bytes without ever
-    /// encoding PPMd to compare, which cost 24% on 2 MiB of man pages and 12%
-    /// on 4 MiB. The method byte cannot tell the two engines apart (PPMd and
+    /// The method byte cannot tell the two engines apart (PPMd and
     /// `-m5` LZ both write 0x35), so ask for the member both ways instead.
     #[test]
     fn text_over_the_trial_limit_is_measured_against_ppmd() {
@@ -9559,9 +9393,8 @@ mod tests {
         );
     }
 
-    /// Level 2 used to be a deeper greedy search than level 1, and on runs of
-    /// zeroes between a repeating phrase it found far matches that displaced
-    /// the repeat offset and packed larger than level 1 did.
+    /// On runs of zeroes between a repeating phrase, a deeper greedy search
+    /// finds far matches that displace the repeat offset.
     #[test]
     fn each_rar29_level_packs_no_larger_than_the_one_below() {
         let mut period = vec![0u8; 4096];
@@ -9637,9 +9470,8 @@ mod tests {
         assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
     }
 
-    /// A chain's PPMd member used to move its model's 19 KB of tables through
-    /// each call by value, and unoptimised that outgrew the 1 MiB main thread
-    /// Windows gives the CLI, on two lines of text in a solid archive.
+    /// Windows gives the CLI a 1 MiB main thread, and a chain's PPMd member
+    /// has to code on it unoptimised.
     #[test]
     fn a_solid_ppmd_chain_codes_on_a_1_mib_stack() {
         let text = word_text(48 * 1024);

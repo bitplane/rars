@@ -1643,13 +1643,9 @@ fn writes_compressed_rar50_archive_comment_service_record() {
 ///
 /// The capability conformance test in `write_plan.rs` proves the table and
 /// `validate_plan` agree, which is not the same as proving the writer agrees
-/// with either. Quick open was said in two places, `FeatureSet::quick_open` and
-/// an `ArchiveExtras` field, and validation only ever read the first: an archive
-/// asking through the feature set passed validation and then had its index
-/// dropped, and a volume set asking through the extras got past validation
-/// entirely and was dropped too. Both looked like success.
+/// with either.
 ///
-/// So this asks each writer for the index and goes looking for the block,
+/// This asks each writer for the index and goes looking for the block,
 /// rather than asking the table what it thinks.
 #[test]
 #[cfg(feature = "write")]
@@ -3002,9 +2998,7 @@ fn writes_compressed_rar50_recovery_service_record() {
     assert_eq!(extracted[0].data, payload);
 }
 
-/// A recovery record used to be asked for twice: once as a feature flag and
-/// once as a percentage, and the writer had to reject the case where the two
-/// disagreed. Only the percentage is asked for now, so they cannot.
+/// A recovery record is asked for only as a percentage.
 #[test]
 #[cfg(all(feature = "write", feature = "recovery"))]
 fn a_recovery_record_is_asked_for_by_percentage_alone() {
@@ -5268,13 +5262,9 @@ fn opens_rar50_archive_whose_password_check_is_all_zeroes() {
 }
 
 /// A stored, header-encrypted, split member reaches a verification path of its
-/// own, and that path used to apply the encrypted-checksum transform to any
-/// encrypted file rather than only to one whose crypt record sets the tweaked
-/// checksum flag. The archive extracted the right bytes and then failed on a
-/// checksum that had been transformed when the stored one had not been.
-///
-/// Compressed volume sets verify elsewhere, which is why the sibling
-/// `encrypted_multivol` fixtures never caught this.
+/// own, which applies the encrypted-checksum transform only to a file whose
+/// crypt record sets the tweaked checksum flag. Compressed volume sets verify
+/// elsewhere.
 #[test]
 #[cfg(feature = "encryption")]
 fn extracts_rar50_header_encrypted_stored_multivolume_archive() {
@@ -6539,8 +6529,7 @@ fn reference_rar_accepts_streaming_solid_archive() {
     );
 }
 
-/// The exact flag combination from issue #29, which used to abort trying to
-/// allocate more than ten gigabytes.
+/// The exact flag combination from issue #29.
 #[test]
 #[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
 fn streaming_writer_handles_solid_encrypted_headers_and_recovery_together() {
@@ -6853,8 +6842,6 @@ fn streaming_writer_writes_a_usable_quick_open_index() {
     features.quick_open = true;
 
     // Asked for through the feature set alone, which is the only way to ask.
-    // This used to say it twice, through an `ArchiveExtras` field as well, and
-    // that is why it passed while the feature set on its own was being dropped.
     let bytes = write_with_extras(&entries, features, rar50::ArchiveExtras::default());
 
     let archive = Archive::parse(&bytes).unwrap();
@@ -6952,11 +6939,8 @@ fn volume_payload(len: u32) -> Vec<u8> {
 /// What the capability table says about a RAR 5 volume set has to be what the
 /// volume writer does.
 ///
-/// The table used to promise comments, metadata and quick-open for split RAR 5
-/// sets while the writer refused all three, so refusals for other formats sent
-/// people to rar50 and rar50 failed too. The matrix test in write_plan.rs
-/// compares `supports` with `validate_plan`, which are two halves of the same
-/// table; nothing compared either with the writer.
+/// The matrix test in write_plan.rs compares `supports` with `validate_plan`,
+/// which are two halves of the same table.
 #[test]
 #[cfg(feature = "write")]
 fn the_volume_writer_refuses_exactly_what_the_table_refuses() {
@@ -7056,9 +7040,6 @@ fn a_file_comment_on_a_volume_set_is_refused_or_written() {
     );
 }
 
-/// A set with no members used to report success while writing no volumes at
-/// all: the member loop never ran, and the writer finished without asking the
-/// sink to start one. The volume writer that was deleted refused this.
 #[test]
 #[cfg(feature = "write")]
 fn a_volume_set_with_no_members_is_refused() {
@@ -7077,8 +7058,7 @@ fn a_volume_set_with_no_members_is_refused() {
 }
 
 /// Solid members are coded as one chain, so the filter search never runs for
-/// them. Both entry points have to say so; the archive path used to and the
-/// volume path silently dropped the request.
+/// them. Both entry points have to say so.
 #[test]
 #[cfg(feature = "write")]
 fn both_rar50_entry_points_refuse_a_filter_with_solid() {
@@ -7139,9 +7119,6 @@ fn write_volume_set(
     sink.take()
 }
 
-/// A volume set used to report nothing at all: the writer built its plan with
-/// `progress: None` and its compression stage was called without the callback
-/// the single-archive path uses.
 #[test]
 #[cfg(feature = "write")]
 fn a_volume_set_reports_compression_progress() {

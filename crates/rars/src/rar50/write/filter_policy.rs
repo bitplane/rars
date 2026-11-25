@@ -161,28 +161,9 @@ pub(super) fn should_store_compressed_payload(
 
 /// How hard each level looks for a match, and where the default sits.
 ///
-/// Each rung packs smaller than the one below. Up to level 4 each costs about
-/// half again to twice the one below; level 5 costs two and a half to three
-/// and a half times level 4. Over the bench corpus at one thread, whose
-/// members are at most 4 MiB, and 256 MiB of a tar of `/usr` at ten threads,
-/// where the wider windows of the upper levels show:
-///
-/// ```text
-///          bench corpus, 1 thread           /usr, 10 threads
-/// level     packed     vs 1    seconds      packed    seconds
-///   1    9,432,440       -       1.53    85,816,858     4.05
-///   2    9,085,836   -3.67%      2.84    81,000,174     7.02
-///   3    8,979,738   -4.80%      4.01    78,682,219    13.22
-///   4    8,961,647   -4.99%      5.58    77,616,826    22.68
-///   5    8,958,038   -5.03%     19.27    74,775,536    56.74
-/// ```
-///
-/// Level 3 is the default because it is the knee. Climbing to it from level 2
-/// saves 91 KB a second on the corpus and 374 KB a second on the tar; climbing
-/// on to level 4 saves 12 KB and 113 KB a second, an eighth and under a third
-/// as much. Level 5 searches filters exhaustively, which is most of what it
-/// costs over level 4 on the corpus, and its 16 MiB window is most of what it
-/// buys on the tar.
+/// Each rung packs smaller than the one below. Level 3 is the default because
+/// it is the knee. Level 5 searches filters exhaustively, which is most of what
+/// it costs over level 4, and its 16 MiB window is most of what it buys.
 fn match_candidates_for_level(level: u8) -> Result<usize> {
     match level {
         0 => Ok(0),
@@ -217,47 +198,22 @@ pub(super) fn encode_options_for_level(
     Ok(EncodeOptions::new(candidates)
         // Looking a byte or two further ahead before settling for the match at
         // hand is what level 1 parses with; the levels above it parse by
-        // shortest path and never ask. At level 1's eight candidates it costs
-        // time: over ten classes of the bench corpus it took 3.2% off the
-        // total, 1% to 4.3% a class, for a quarter more CPU (17% to 80% a
-        // class), and level 1 stayed six times cheaper than level 2. At 64
-        // candidates on 4 MiB of man pages it was both smaller and quicker,
-        // 4,383 bytes and half a second off, because a longer match covers
-        // ground the finder then does not have to search. A lookahead of four
-        // is worse than one.
+        // shortest path and never ask. A lookahead of four is worse than one.
         //
         // A deeper lazy rung between levels 1 and 2 loses to the shortest-path
-        // parse at a shallow search. At 64 candidates, nice length 256, it
-        // took 1.95% off level 1 on the bench corpus for 2.36 s against
-        // level 2's 3.68% for 2.91 s, and on 64 MiB of `/usr` at ten threads
-        // it packed to 21,212,799 bytes in 3.47 s against level 2's
-        // 20,789,115 in 1.74 s: chains over a 4 MiB window cost the lazy
-        // parse more than the tree costs the shortest-path one. With a 1 MiB
-        // window it was as quick as level 2 with one, and 2.7% larger.
+        // parse at a shallow search: chains over a 4 MiB window cost the lazy
+        // parse more than the tree costs the shortest-path one.
         .with_lazy_matching(level >= 1)
         .with_lazy_lookahead(2)
-        // Everything above level 1 parses by shortest path. Gap to each
-        // level's own WinRAR over the bench corpus, byte weighted, with the
-        // parse starting at each level:
-        //
-        // ```text
-        // parse from   m2       m3       m4       m5
-        // level 5   +7.27%   +4.13%   +4.16%   -0.38%
-        // level 4   +7.27%   +4.13%   -0.39%   -0.38%
-        // level 3   +3.36%   -0.62%   -0.39%   -0.38%
-        // level 2   -2.07%   -0.65%   -0.42%   -0.41%
-        // ```
-        //
-        // Search depth is worth tenths of a percent across that whole range and
-        // the parse is worth several, so there is no setting of the other knobs
-        // that makes a greedy rung competitive. What the depth still buys is
-        // the ordering: at 32, 128, 256 and 512 candidates the parse packs
+        // Everything above level 1 parses by shortest path. Search depth is
+        // worth far less than the parse, so there is no setting of the other
+        // knobs that makes a greedy rung competitive. What the depth still buys
+        // is the ordering: at 32, 128, 256 and 512 candidates the parse packs
         // steadily smaller for steadily more time, which is what a level is.
         //
-        // Level 1 keeps the lazy parse. It is the rung that exists to be
-        // quick, it beat WinRAR's own level 1 by 2.71% before it looked ahead
-        // at all, and it is the only place left to go when the shortest-path
-        // parse is too slow for the job.
+        // Level 1 keeps the lazy parse. It is the rung that exists to be quick,
+        // and it is the only place left to go when the shortest-path parse is
+        // too slow for the job.
         .with_optimal_parse(level >= 2)
         .with_nice_match_length(parse_effort_for_level(level).0)
         .with_parse_passes(parse_effort_for_level(level).1)
@@ -269,9 +225,7 @@ pub(super) fn encode_options_for_level(
 /// Search depth alone barely separates the parsing levels on a member that
 /// fits one window. These two are what does. A single pass at level 2 parses
 /// each block once, on guessed prices, rather than again on the prices the
-/// pass before produced: at level 3's other settings over the bench corpus,
-/// one pass and two took 3.32 s and 4.06 s and packed 0.43% apart. Nice
-/// length 256 at level 4 is 7% quicker than 512 on the corpus for 0.01%.
+/// pass before produced.
 fn parse_effort_for_level(level: u8) -> (usize, usize) {
     match level {
         2 => (32, 1),
@@ -284,9 +238,8 @@ fn parse_effort_for_level(level: u8) -> (usize, usize) {
 
 /// The encoder settings to try for a level, smallest output kept.
 ///
-/// Just one. Retrying a member at lower levels saved one byte over the whole
-/// bench corpus and cost level 5 a quarter of its time. The list stays for a
-/// setting that competes on something other than search depth.
+/// Just one. The list stays for a setting that competes on something other than
+/// search depth.
 pub(super) fn encode_option_candidates_for_level(
     level: Option<u8>,
     dictionary_size: u64,
@@ -310,9 +263,7 @@ pub(super) fn rar50_algorithm_version(options: WriterOptions, dictionary_size: u
 
 /// The level written into the member header.
 ///
-/// It is the resolved level, so an archive says what it was compressed at. An
-/// absent level used to write 1 while spending more search than `--level 5`
-/// did, which described neither what was asked for nor what was done.
+/// It is the resolved level, so an archive says what it was compressed at.
 pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
     let level = resolved_level(level);
     match_candidates_for_level(level)?;
@@ -324,26 +275,14 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
 /// The format goes far higher and `--dict-size` still does. What stops the
 /// writer reaching for it is that the hash chains lengthen with the window, so
 /// a wider one costs time that is not always repaid. How often it is repaid
-/// depends entirely on the data. Over 16 MiB of manpage text and 16 MiB of
-/// shared libraries at level 3:
+/// depends entirely on the data.
 ///
-/// ```text
-/// dictionary       text     seconds        binary     seconds
-///      1 MiB  3,480,749         6.6     4,646,481        14.1
-///      2 MiB  2,223,009         8.1     4,590,488        25.3
-///      4 MiB  2,061,307        14.8     4,514,109        53.0
-///      8 MiB  2,043,138        21.7     4,505,410        83.2
-///     16 MiB  2,040,730        27.6     4,507,232       105.0
-/// ```
+/// A 1 MiB cap costs text and buys binaries most of their speed. One number
+/// cannot serve both, so the level picks, which is what a level is for. Text
+/// keeps paying up to about 8 MiB; binaries stop at 4 and are slightly worse by
+/// 16.
 ///
-/// A 1 MiB cap costs text 41% and buys binaries most of their speed. One
-/// number cannot serve both, so the level picks, which is what a level is for.
-/// Text keeps paying up to about 8 MiB; binaries stop at 4 and are slightly
-/// worse by 16.
-///
-/// Level 2 sits between. On 64 MiB of a tar of `/usr` at ten threads, 1, 2
-/// and 4 MiB packed to 20,978,680, 20,789,115 and 20,570,079 bytes in 1.61,
-/// 1.74 and 2.42 seconds; 4 MiB is most of the way to level 3's time.
+/// Level 2 sits between.
 fn fitted_dictionary_cap(level: u8) -> u64 {
     let megabytes = match level {
         0..=1 => 1,
@@ -643,23 +582,11 @@ const SCREENED_KINDS: [FilterKind; 5] = [
 /// A binary's tables are mostly small: the relocations, symbols, dynamic
 /// section and unwind index of one executable come to a few kilobytes each,
 /// and a tar of executables has one set per file. At the shared search's
-/// 16 KiB windows, with two in a row needed, the scanner saw none of them on a
-/// 32 MiB tar of `/usr` executables, and level 3 packed it 2.9% larger than
-/// `rar` 7.12 `-m3`, which filters them. Over that tar, a 32 MiB tar of text
-/// and one of already-compressed files at level 3, 8 threads:
+/// 16 KiB windows, with two in a row needed, the scanner sees none of them.
 ///
-/// ```text
-/// window      binaries       text    compressed   binary seconds
-///  16 KiB    9,846,842  6,300,382    32,121,181             2.85
-///   1 KiB    9,548,200  6,126,292    32,121,456             2.77
-///  512 B     9,505,763  6,114,504    32,122,138             2.83
-///  256 B     9,479,434  6,119,311    32,124,377             2.82
-///  128 B     9,477,465  6,144,787    32,128,320             2.82
-/// ```
-///
-/// The scan costs the same per byte at any window size, and the time went
-/// nowhere. Below 256 bytes a window holds too few records to tell a table
-/// from chance, and text starts to lose.
+/// The scan costs the same per byte at any window size. Below 256 bytes a
+/// window holds too few records to tell a table from chance, and text starts to
+/// lose.
 const RAR50_TABLE_SCAN_WINDOW: usize = 256;
 
 struct Rar50OwnedSearch<B: Budget> {
@@ -699,10 +626,7 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
     /// shortest path, and below level 2, where that lazy parse is the real
     /// one, a greedy parse unless the search is exhaustive.
     ///
-    /// The screens and the trial encode about twice the member in samples. At
-    /// level 1 lazy matching was a tenth of the time on 64 MiB of a tar of
-    /// `/usr`, 0.5 s of 4.8 s, for 2 KB of 14.7 MB. Above it, the greedy parse
-    /// made 64 MiB of `/usr` files 0.12% larger at level 3.
+    /// The screens and the trial encode about twice the member in samples.
     fn screen_options(&self, options: EncodeOptions) -> EncodeOptions {
         if options.optimal_parse || self.exhaustive {
             options.with_optimal_parse(false)
@@ -790,12 +714,10 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
 /// under them.
 ///
 /// A member longer than one
-/// [`FILTER_SEARCH_BYTES`](super::plan::FILTER_SEARCH_BYTES) piece is
-/// searched a piece at a time, on the grid the block path cuts it into runs and pieces, with
-/// the same search each of those gets. Searched whole, one 32 MiB search had
-/// to pick a handful of x86 regions and samples for the whole member, and it
-/// came out 0.2% to 1.3% larger than the runs' searches on most binaries.
-/// Both paths now pick the same filters for a member.
+/// [`FILTER_SEARCH_BYTES`](super::plan::FILTER_SEARCH_BYTES) piece is searched
+/// a piece at a time, on the grid the block path cuts it into runs and pieces,
+/// with the same search each of those gets, so both paths pick the same filters
+/// for a member.
 fn choose_owned_filter<B: Budget>(
     data: &[u8],
     algorithm_version: u8,
@@ -922,20 +844,7 @@ fn piece_filters<B: Budget>(
 /// more than level 3's.
 ///
 /// The search only ranks filters. Its encodes are thrown away, and the run is
-/// coded again later against its history. Over 16 binary and 16 text 32 MiB
-/// slices of the bench tars, total packed size and search time, searching
-/// with what were then levels 3, 2 and 1:
-///
-/// ```text
-/// search parse              binary                text
-/// 128 candidates, 3 passes  167,933,642  367s    121,100,147  373s
-///  32 candidates, 2 passes  167,919,441  219s    121,075,675  213s
-/// lazy, 8 candidates        167,767,504  140s    121,255,533  163s
-/// ```
-///
-/// Level 3's parse changed eight members by at most 0.17% either way. Level
-/// 1's, then greedy, passes over delta filters the shortest-path parse uses:
-/// one text slice came out 1.05% larger.
+/// coded again later against its history.
 fn run_search_options(options: EncodeOptions) -> EncodeOptions {
     if !options.optimal_parse {
         return options;
@@ -986,8 +895,7 @@ pub(super) fn within_filter_reach(range: std::ops::Range<usize>) -> std::ops::Ra
 
 /// An explicit filter over a whole member of `len` bytes, cut to
 /// [`FILTER_REACH`], or `None` when nothing of it is left. A range the member
-/// cannot hold is passed on unchanged, for the encoder to refuse as it always
-/// has.
+/// cannot hold is passed on unchanged, for the encoder to refuse.
 pub(super) fn explicit_member_filter(spec: &FilterSpec, len: usize) -> Option<FilterSpec> {
     let range = spec.range.clone().unwrap_or(0..len);
     if range.end <= FILTER_REACH || range.start >= range.end || range.end > len {
@@ -1366,22 +1274,19 @@ mod run_search_tests {
             }
         }
         assert_eq!(specs.into_vec(), runs);
-        // The script in front no longer keeps the first run unsearched.
+        // The script in front does not keep the first run unsearched.
         assert!(runs
             .first()
             .is_some_and(|spec| spec.range.as_ref().is_some_and(|range| range.start < run)));
     }
 
-    /// A member longer than one filter search is filtered as well whole as
-    /// run by run, to the byte. The member opens with text, as a tar of
-    /// `/usr` can open with a script, which the whole-member search used to
-    /// read as text and give up on, and which kept the first run unsearched.
-    /// The two paths choose the same filters
+    /// A member longer than one filter search is filtered as well whole as run
+    /// by run, to the byte. The member opens with text, as a tar of `/usr` can
+    /// open with a script. The two paths choose the same filters
     /// (`a_large_member_is_searched_on_the_block_paths_grid`), and code them
-    /// alike: the member's last run is shorter than the history behind it
-    /// but over a quarter of it, so it searches a tree as the whole member
-    /// does. It searched chains before #419, and a filtered member came out a
-    /// few bytes apart on the two paths (#383).
+    /// alike: the member's last run is shorter than the history behind it but
+    /// over a quarter of it, so it searches a tree as the whole member does
+    /// (#383).
     #[test]
     fn a_member_too_long_for_one_search_is_filtered_on_both_paths() {
         use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
