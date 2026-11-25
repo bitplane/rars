@@ -25,6 +25,7 @@ clap = { version = "4.6", features = ["derive", "wrap_help"] }
 blake2s_simd = "1.0"
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 crc32fast = "1.5"
+encoding_rs = "0.8.44"
 getrandom = "0.4"
 hmac = "0.13"
 indicatif = "0.18.6"

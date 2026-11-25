@@ -348,8 +348,8 @@ jobs:
 
   # Every optional-feature combination of the library, without workspace
   # feature unification. Running the unit tests is most of each set's time, so
-  # every write set gets a job of its own; the read and recovery sets are
-  # quicker and share two jobs, reusing their dependency builds.
+  # the write sets are grouped by their other features and each group runs
+  # with and without cjk-names. The read and recovery sets share two jobs.
   unit-features:
     name: Library unit features (${{ matrix.group }})
     runs-on: ubuntu-latest
@@ -359,27 +359,32 @@ jobs:
       matrix:
         include:
           - group: read
-            features: none parallel encryption encryption,parallel
+            features: >-
+              none parallel encryption encryption,parallel
+              cjk-names parallel,cjk-names encryption,cjk-names encryption,parallel,cjk-names
           - group: recovery
-            features: recovery recovery,parallel recovery,encryption recovery,encryption,parallel
+            features: >-
+              recovery recovery,parallel recovery,encryption recovery,encryption,parallel
+              recovery,cjk-names recovery,parallel,cjk-names
+              recovery,encryption,cjk-names recovery,encryption,parallel,cjk-names
           - group: write
-            features: write
-            memory: write
+            features: write write,cjk-names
+            memory: write write,cjk-names
           - group: write+parallel
-            features: write,parallel
-            memory: write,parallel
+            features: write,parallel write,parallel,cjk-names
+            memory: write,parallel write,parallel,cjk-names
           - group: write+encryption
-            features: write,encryption
+            features: write,encryption write,encryption,cjk-names
           - group: write+encryption+parallel
-            features: write,encryption,parallel
+            features: write,encryption,parallel write,encryption,parallel,cjk-names
           - group: write+recovery
-            features: write,recovery
+            features: write,recovery write,recovery,cjk-names
           - group: write+recovery+parallel
-            features: write,recovery,parallel
+            features: write,recovery,parallel write,recovery,parallel,cjk-names
           - group: write+recovery+encryption
-            features: write,recovery,encryption
+            features: write,recovery,encryption write,recovery,encryption,cjk-names
           - group: write+recovery+encryption+parallel
-            features: write,recovery,encryption,parallel
+            features: write,recovery,encryption,parallel write,recovery,encryption,parallel,cjk-names
     env:
       CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0

@@ -2,8 +2,148 @@
 
 use rars::{
     filename::{decoded_name, LegacyNameEncoding},
-    ArchiveReader, ArchiveVersion, Builder,
+    ArchiveReader, ArchiveVersion, Builder, Error,
 };
+
+#[cfg(feature = "cjk-names")]
+#[test]
+fn cjk_code_pages_decode_legacy_names_in_listing_and_extraction() {
+    for (encoding, codec, name) in [
+        (
+            LegacyNameEncoding::Cp932,
+            encoding_rs::SHIFT_JIS,
+            "漫画/第1話/ページ01.jpg",
+        ),
+        (
+            LegacyNameEncoding::Cp936,
+            encoding_rs::GBK,
+            "漫画/第1话/第01页.jpg",
+        ),
+        (
+            LegacyNameEncoding::Cp949,
+            encoding_rs::EUC_KR,
+            "만화/제1화/페이지01.jpg",
+        ),
+        (
+            LegacyNameEncoding::Cp950,
+            encoding_rs::BIG5,
+            "漫畫/第1話/第01頁.jpg",
+        ),
+    ] {
+        let (raw, _, had_errors) = codec.encode(name);
+        assert!(!had_errors, "{encoding:?} could not encode {name}");
+        assert_eq!(
+            decoded_name(name.as_bytes(), true, Some(encoding))
+                .unwrap()
+                .as_ref(),
+            name.as_bytes()
+        );
+
+        for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar15] {
+            let mut builder = Builder::new(format).store(true);
+            builder
+                .add_bytes(raw.to_vec(), b"data".to_vec(), None, None)
+                .unwrap();
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let member = archive.members().next().unwrap();
+            assert!(!member.name_is_unicode());
+            assert_eq!(member.meta.name, raw.as_ref());
+            assert_eq!(
+                member.decoded_name(Some(encoding)).unwrap().as_ref(),
+                name.as_bytes()
+            );
+
+            let mut extracted = Vec::new();
+            archive
+                .extract_to(None, |meta| {
+                    assert!(!meta.name_is_unicode);
+                    assert_eq!(meta.name, raw.as_ref());
+                    extracted.push(
+                        decoded_name(&meta.name, meta.name_is_unicode, Some(encoding))?
+                            .into_owned(),
+                    );
+                    Ok(Box::new(std::io::sink()))
+                })
+                .unwrap();
+            assert_eq!(extracted, [name.as_bytes()]);
+        }
+    }
+}
+
+#[cfg(feature = "cjk-names")]
+#[test]
+fn malformed_cjk_names_fail_like_undefined_single_byte_names() {
+    let name = b"bad-\x81";
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(name.to_vec(), b"data".to_vec(), None, None)
+        .unwrap();
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let member = archive.members().next().unwrap();
+    let single_byte = member
+        .decoded_name(Some(LegacyNameEncoding::Windows1252))
+        .unwrap_err();
+    let cjk = member
+        .decoded_name(Some(LegacyNameEncoding::Cp932))
+        .unwrap_err();
+    assert_eq!(cjk.kind(), single_byte.kind());
+    assert_eq!(cjk.to_string(), single_byte.to_string());
+    assert!(matches!(cjk.root_cause(), Error::InvalidArgument(_)));
+}
+
+#[cfg(feature = "cjk-names")]
+#[test]
+fn cjk_code_page_aliases_are_case_insensitive() {
+    for (encoding, aliases) in [
+        (
+            LegacyNameEncoding::Cp932,
+            ["cp932", "shift_jis", "shift-jis", "sjis", "windows-31j"].as_slice(),
+        ),
+        (LegacyNameEncoding::Cp936, &["cp936", "gbk"]),
+        (LegacyNameEncoding::Cp949, &["cp949", "euc-kr", "uhc"]),
+        (LegacyNameEncoding::Cp950, &["cp950", "big5"]),
+    ] {
+        for alias in aliases {
+            assert_eq!(alias.parse::<LegacyNameEncoding>().unwrap(), encoding);
+            assert_eq!(
+                alias
+                    .to_ascii_uppercase()
+                    .parse::<LegacyNameEncoding>()
+                    .unwrap(),
+                encoding
+            );
+        }
+    }
+    assert!(matches!(
+        "cp999".parse::<LegacyNameEncoding>(),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[cfg(not(feature = "cjk-names"))]
+#[test]
+fn cjk_code_pages_report_the_disabled_feature() {
+    for (label, encoding) in [
+        ("shift_jis", LegacyNameEncoding::Cp932),
+        ("gbk", LegacyNameEncoding::Cp936),
+        ("euc-kr", LegacyNameEncoding::Cp949),
+        ("big5", LegacyNameEncoding::Cp950),
+    ] {
+        for error in [
+            label.parse::<LegacyNameEncoding>().unwrap_err(),
+            encoding.decode(b"ascii").unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                Error::FeatureDisabled {
+                    feature: "cjk-names"
+                }
+            ));
+            assert_eq!(error.kind(), rars::ErrorKind::UnsupportedFeature);
+            assert_eq!(error.to_string(), "Cargo feature cjk-names is disabled");
+        }
+    }
+}
 
 #[test]
 fn strict_code_pages_are_explicit_and_locale_independent() {

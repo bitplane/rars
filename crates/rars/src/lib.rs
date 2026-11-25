@@ -9,8 +9,9 @@
 //!
 //! All capabilities are enabled by default. Set `default-features = false` for
 //! sequential parsing and decoding without encoders, recovery algorithms, crypto
-//! dependencies or Rayon. Select `write`, `recovery`, `encryption` and `parallel`
-//! independently as needed. Encrypted writing needs `write` and `encryption`;
+//! dependencies, Rayon or CJK codepages for legacy names. Select `write`,
+//! `recovery`, `encryption`, `parallel` and `cjk-names` independently as needed.
+//! Encrypted writing needs `write` and `encryption`;
 //! writing recovery records needs `write` and `recovery`. Recovery repair does
 //! not require `write`. Unavailable encrypted or recovery operations report
 //! [`Error::FeatureDisabled`], while metadata remains readable where the format

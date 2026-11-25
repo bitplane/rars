@@ -8961,6 +8961,30 @@ fn legacy_name_encoding_controls_listing_and_extraction() {
 }
 
 #[test]
+fn legacy_name_encoding_lists_cp932_names() {
+    let work = scratch("legacy-name-cp932");
+    let archive = work.join("input.rar");
+    let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar29).store(true);
+    builder
+        .add_bytes(
+            b"\x96\x9f\x89\xe6/\x91\xe61\x98b/\x83y\x81[\x83W01.jpg".to_vec(),
+            b"payload".to_vec(),
+            None,
+            None,
+        )
+        .unwrap();
+    fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+
+    let result = Command::new(env!("CARGO_BIN_EXE_rars"))
+        .args(["info", "--legacy-name-encoding", "cp932"])
+        .arg(archive)
+        .output()
+        .unwrap();
+    assert!(result.status.success(), "{}", stderr(&result));
+    assert!(String::from_utf8_lossy(&result.stdout).contains("漫画/第1話/ページ01.jpg"));
+}
+
+#[test]
 fn legacy_name_encoding_rejects_undefined_bytes_and_preserves_unicode() {
     let work = scratch("name-encoding-refusal");
     for (format, name, success) in [
