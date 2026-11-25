@@ -76,60 +76,6 @@ memmap2.workspace = true
 [target.'cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))'.dependencies]
 rustix.workspace = true
 
-# Criterion pulls in alloca, which builds C; the benches only target hosts with
-# 64-bit atomics, so targets without them skip it and need no C cross-compiler.
 [dev-dependencies]
 # Tests ask the global pool how many threads extraction can really use.
 rayon = { workspace = true }
-
-[target.'cfg(target_has_atomic = "64")'.dev-dependencies]
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-
-[[bench]]
-name = "chunk_sizes"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "parallel"
-harness = false
-required-features = ["write", "parallel"]
-
-[[bench]]
-name = "member_lookup"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "huffman_tables"
-harness = false
-
-[[bench]]
-name = "streaming_decode"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "rar50_hash"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "huffman_decode"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "rar20_decode"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "delta_filter"
-harness = false
-required-features = ["write"]
-
-[[bench]]
-name = "recovery"
-harness = false
-required-features = ["write", "recovery", "parallel"]
