@@ -241,6 +241,38 @@ const BORDERLINE_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 652,
     },
+    // Four lazy solid jobs can charge 80.9 MiB against 32.3 MiB allocated when their peaks overlap less.
+    Gap {
+        tier: Tier::Small,
+        writer: Writer::Rar5,
+        paths: &[Path::Solid],
+        levels: &[1],
+        threads: Some(4),
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 654,
+    },
+    Gap {
+        tier: Tier::Fitted,
+        writer: Writer::Rar5,
+        paths: &[Path::Solid],
+        levels: &[1],
+        threads: Some(4),
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 654,
+    },
+    // Four workers can peak at 140.5 MiB for the three RAR 7 runs charged 302 MiB.
+    Gap {
+        tier: Tier::Small,
+        writer: Writer::Rar7,
+        paths: &[Path::Blocks],
+        levels: &[3],
+        threads: Some(4),
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 654,
+    },
 ];
 
 /// Every case that fails an assertion today, against the issue tracking it.
@@ -288,39 +320,16 @@ const KNOWN_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 393,
     },
-    // The lazy parse's charge is the same at every level, and level 1's
-    // short chains hold a fraction of it.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto, Path::Blocks, Path::Solid],
-        levels: &[1],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    // A wave of block jobs reserves admission for every job it could hold,
-    // which at four threads is more than a member of three runs uses.
+    // Level 2's three block jobs reserve up to 302 MiB for their concurrent parse scratch (140 MiB measured).
     Gap {
         tier: Tier::Small,
         writer: Writer::Rar5,
         paths: &[Path::Blocks],
-        levels: &[2, 3, 4, 5],
+        levels: &[2],
         threads: Some(4),
         input: None,
         assertion: Assertion::Loose,
-        issue: 393,
-    },
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar7,
-        paths: &[Path::Blocks],
-        levels: &[3, 5],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
+        issue: 654,
     },
     // At each level's fitted dictionary, for the causes above where an entry
     // gives none of its own.
@@ -384,28 +393,7 @@ const KNOWN_GAPS: &[Gap] = &[
         assertion: Assertion::Covered,
         issue: 393,
     },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto, Path::Blocks, Path::Solid],
-        levels: &[1],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    // A member two and a half dictionaries long is past one filter search, so
-    // with filters searched it is coded in runs too.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto],
-        levels: &[3],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
+    // Fitted level 2's three full parses can coincide: 387 MiB charged, 177 MiB measured.
     Gap {
         tier: Tier::Fitted,
         writer: Writer::Rar5,
@@ -414,7 +402,7 @@ const KNOWN_GAPS: &[Gap] = &[
         threads: Some(4),
         input: None,
         assertion: Assertion::Loose,
-        issue: 393,
+        issue: 654,
     },
 ];
 

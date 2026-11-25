@@ -618,6 +618,77 @@ fn incremental_streaming_fallback_fits_one_payload_of_staging() {
 }
 
 #[test]
+fn incremental_rar5_sources_fit_one_staged_payload() {
+    let root = scratch::case("rewrite-rar5-source-window");
+    let size = 128 * 1024;
+    let data = [
+        vec![b'a'; size],
+        Vec::new(),
+        b"x".to_vec(),
+        vec![b'b'; size],
+    ];
+    let mut original = Builder::new(ArchiveVersion::Rar50).store(true);
+    for (index, bytes) in data.iter().enumerate() {
+        original
+            .add_bytes(format!("f{index}").into_bytes(), bytes.clone(), None, None)
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(original.to_bytes().unwrap()).unwrap();
+    let staging = RewriteStaging {
+        directory: root.to_path_buf(),
+        max_staged_bytes: size as u64,
+    };
+    let resources = rars::WriterResources::default().with_temp_dir(&*root);
+    let run = || {
+        for (solid, store) in [(false, false), (true, false), (false, true)] {
+            let bytes = archive
+                .with_rewrite_sources(
+                    &[0, 1, 2, 3],
+                    ArchiveReadOptions::default(),
+                    &staging,
+                    None,
+                    |sources| {
+                        let mut output = Builder::new(ArchiveVersion::Rar50)
+                            .compression_level(Some(1))
+                            .solid(solid)
+                            .store(store);
+                        for (index, source) in sources.into_iter().enumerate() {
+                            output.add_source(
+                                format!("f{index}").into_bytes(),
+                                source,
+                                None,
+                                None,
+                            )?;
+                        }
+                        let mut bytes = Vec::new();
+                        output.write_to(&mut bytes, &resources, None)?;
+                        Ok(bytes)
+                    },
+                )
+                .unwrap();
+            let output = ArchiveReader::read_owned(bytes).unwrap();
+            for (index, expected) in data.iter().enumerate() {
+                assert_eq!(
+                    output.read_member_at(index, None).unwrap().as_ref(),
+                    Some(expected)
+                );
+            }
+            assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
+        }
+    };
+    #[cfg(feature = "parallel")]
+    for threads in [1, 2, 8] {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+            .install(run);
+    }
+    #[cfg(not(feature = "parallel"))]
+    run();
+}
+
+#[test]
 fn incremental_sources_decode_once_and_join_on_early_failure_or_panic() {
     let root = scratch::case("rewrite-incremental-once");
     let mut builder = Builder::new(ArchiveVersion::Rar50).solid(true);
