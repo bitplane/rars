@@ -338,8 +338,15 @@ pub(crate) fn coding_workspace(options: EncodeOptions, fixed_table: bool, len: O
     if streamed && fixed_table {
         workspace += 2 * (batch + options.max_match_distance);
     }
+    if fixed_table {
+        // A chain's charge otherwise sits within a few percent of its peak at
+        // one thread; leave room for allocator and platform differences.
+        workspace += SOLID_CHAIN_HEADROOM;
+    }
     workspace as u64
 }
+
+const SOLID_CHAIN_HEADROOM: usize = 4 * 1024 * 1024;
 
 fn block_workspace(options: EncodeOptions, fixed_table: bool, len: u64, span: usize) -> usize {
     let reach = options.max_match_distance;
@@ -418,7 +425,10 @@ fn coding_workspace_prices_the_parse_and_batch() {
             let low = coding_workspace(lazy, false, Some(32 * block));
             let high = coding_workspace(optimal, false, Some(32 * block));
             assert!(2 * low < high);
-            assert!(coding_workspace(optimal, true, Some(32 * block)) <= low);
+            assert!(
+                coding_workspace(optimal, true, Some(32 * block))
+                    <= low + SOLID_CHAIN_HEADROOM as u64
+            );
             let single = coding_workspace(lazy, false, Some(block));
             assert!(coding_workspace(lazy, false, Some(block / 2)) < single);
             assert_eq!(low, threads as u64 * single);
