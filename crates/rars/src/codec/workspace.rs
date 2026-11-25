@@ -246,6 +246,14 @@ impl<T, B: Budget> Buffer<T, B> {
         out.values = vec![value; len];
         Ok(out)
     }
+    /// [`Self::filled`] for values that are not `Clone`, each made by `make`.
+    pub(crate) fn filled_with(len: usize, make: impl FnMut() -> T, allowance: &B) -> Result<Self> {
+        let bytes = allocation_size::<T>(len)?;
+        let mut out = Self::new(allowance);
+        B::resize(&mut out.charge, bytes)?;
+        out.values = std::iter::repeat_with(make).take(len).collect();
+        Ok(out)
+    }
     /// Admit one exact allocation before copying slices that form a buffer.
     /// The total is checked first, so none of the copies can grow past its
     /// charged capacity.
