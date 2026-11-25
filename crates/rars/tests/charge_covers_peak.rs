@@ -265,15 +265,29 @@ const KNOWN_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 393,
     },
-    // From level 3, RAR 4 charges the PPMd models of a trial whether or not
-    // the member is text enough to run one.
+    // From level 3, RAR 4 tries PPMd on text, and is charged the trial's
+    // models in full. Their pools are anonymous mappings, not heap
+    // allocations, so the allocator here does not see them.
     Gap {
         tier: Tier::Small,
         writer: Writer::Rar4,
         paths: &[Path::Whole, Path::FiltersAuto, Path::Solid],
         levels: &[3, 4, 5],
         threads: None,
-        input: None,
+        input: Some(Input::Text),
+        assertion: Assertion::Loose,
+        issue: 393,
+    },
+    // Level 5's filter search codes its finalists side by side, each in room
+    // charged as it runs, and at four threads that room is more than binary
+    // records hold.
+    Gap {
+        tier: Tier::Small,
+        writer: Writer::Rar4,
+        paths: &[Path::FiltersAuto],
+        levels: &[5],
+        threads: Some(4),
+        input: Some(Input::Binary),
         assertion: Assertion::Loose,
         issue: 393,
     },
@@ -296,7 +310,7 @@ const KNOWN_GAPS: &[Gap] = &[
         tier: Tier::Small,
         writer: Writer::Rar4,
         paths: &[Path::Solid],
-        levels: &[1, 2],
+        levels: &[1, 2, 3, 4, 5],
         threads: None,
         input: None,
         assertion: Assertion::Covered,
@@ -412,7 +426,7 @@ const KNOWN_GAPS: &[Gap] = &[
         tier: Tier::Fitted,
         writer: Writer::Rar4,
         paths: &[Path::Solid],
-        levels: &[1, 2],
+        levels: &[1, 2, 3, 4, 5],
         threads: None,
         input: None,
         assertion: Assertion::Covered,

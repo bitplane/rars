@@ -959,12 +959,13 @@ fn admit_to_window(
         None => false,
     };
     let (unpacked_size, charge) = if streams {
-        (None, Some(streamed_workspace(options, coding)))
+        let ppmd = ppmd_held(member, options, coding, member.unpacked_size()?, None)?;
+        (None, Some(streamed_workspace(options, coding, ppmd)))
     } else {
         let unpacked_size = measure_member(member, options, progress)?;
         (
             Some(unpacked_size),
-            member_charge(member, options, coding, unpacked_size),
+            member_charge(member, options, coding, unpacked_size, None)?,
         )
     };
     let permit = match charge {
@@ -2132,13 +2133,93 @@ struct EncodedMember<'a> {
 /// member is copied and encrypted through.
 const WRITE_WORKSPACE: u64 = 1024 * 1024;
 
+/// The PPMd models a RAR 2.9 member holds while it is coded.
+///
+/// A model's pool is mapped and committed as the model touches it, so a
+/// model is charged at its full size: the most it can commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PpmdHeld {
+    /// The member builds none and continues no chain that holds one.
+    None,
+    /// The member codes LZ while its chain keeps the model an earlier member
+    /// started.
+    Chain,
+    /// The member is coded as PPMd: forced, or by the trial against LZ that
+    /// text gets at the levels where [`ppmd_trial_pays`].
+    Trial,
+}
+
+/// Which PPMd models coding `member` holds: the trial's only when the encoder
+/// will run one, which under `Auto` it does only for a member that reads as
+/// text, judged on the same windows the encoder judges it on. `chain` is the
+/// solid chain the member continues.
+///
+/// Reading those windows from a source opens it once more before it is
+/// loaded, so a source is read only where the incompressibility probe would
+/// open it too: at least [`crate::incompressible::MIN_MEMBER`] long, with no
+/// bound on how many members prepare at once. Any other source is charged
+/// the trial whenever the level runs one.
+fn ppmd_held(
+    member: &Member<'_>,
+    options: WriterOptions,
+    coding: &MemberCoding,
+    unpacked: u64,
+    chain: Option<&SolidEncoder>,
+) -> Result<PpmdHeld> {
+    let level = compression_method_for_level(options).saturating_sub(0x30);
+    if member.is_directory
+        || !coding.compresses()
+        || level == 0
+        || !matches!(
+            options.target,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        )
+    {
+        return Ok(PpmdHeld::None);
+    }
+    let codes_ppmd = match options.method {
+        Rar29Method::Ppmd => true,
+        Rar29Method::Lz => false,
+        Rar29Method::Auto => {
+            ppmd_trial_pays(level)
+                && (!text_is_cheap_to_read(&member.bytes, unpacked)
+                    || sampled_text(&member.bytes, unpacked)?.reads_as_text())
+        }
+    };
+    let chain_model =
+        matches!(chain, Some(SolidEncoder::Rar29(encoder)) if encoder.has_ppmd_model());
+    Ok(if codes_ppmd {
+        PpmdHeld::Trial
+    } else if chain_model {
+        PpmdHeld::Chain
+    } else {
+        PpmdHeld::None
+    })
+}
+
+/// Whether the text screen's windows can be read ahead of the member: see
+/// [`ppmd_held`].
+fn text_is_cheap_to_read(bytes: &MemberBytes<'_>, unpacked: u64) -> bool {
+    match bytes.source() {
+        None => true,
+        Some(source) => {
+            unpacked >= crate::incompressible::MIN_MEMBER
+                && source.max_preparation_window() == usize::MAX
+        }
+    }
+}
+
 /// Working memory one member needs while it is coded.
 ///
 /// This is the admission weight that decides how many members run at once, not
 /// a prediction: the encoder holds the member, its packed output, and a match
-/// finder sized by the block it works in. Text at the levels that try PPMd
-/// also holds two PPMd models at once, one per trial, and the escape search.
-fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) -> u64 {
+/// finder sized by the block it works in, and the PPMd models `ppmd` says.
+fn member_workspace(
+    options: WriterOptions,
+    unpacked: u64,
+    compressing: bool,
+    ppmd: PpmdHeld,
+) -> u64 {
     if !compressing {
         // A stored member is never loaded: it is written from the caller's
         // bytes or copied from its source, encrypted as it goes.
@@ -2150,17 +2231,18 @@ fn member_workspace(options: WriterOptions, unpacked: u64, compressing: bool) ->
         options.target,
         ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
     );
-    let level = compression_method_for_level(options).saturating_sub(0x30);
-    let ppmd_models = if rar29 && (ppmd_trial_pays(level) || options.method == Rar29Method::Ppmd) {
-        // A trial holds two models of one size at a time. A chain keeps its
-        // own beside two copies: a short member's escaped coding is kept
-        // while the same member codes again as literals.
-        let models = if options.features.solid { 3 } else { 2 };
-        (models * largest_ppmd_model(options)).saturating_add(
-            crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
-        )
-    } else {
-        0
+    let ppmd_models = match ppmd {
+        PpmdHeld::None => 0,
+        PpmdHeld::Chain => largest_ppmd_model(options),
+        PpmdHeld::Trial => {
+            // A trial holds two models of one size at a time. A chain keeps
+            // its own beside two copies: a short member's escaped coding is
+            // kept while the same member codes again as literals.
+            let models = if options.features.solid { 3 } else { 2 };
+            (models * largest_ppmd_model(options)).saturating_add(
+                crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
+            )
+        }
     };
     let optimal_parse = if rar29 {
         rar29_optimal_parse_workspace(options, unpacked)
@@ -2221,11 +2303,15 @@ fn encode_member<'a>(
     progress: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
     let unpacked_size = measure_member(member, options, progress)?;
-    let permit = member_charge(member, options, coding, unpacked_size)
-        .map(|charge| {
-            resources.acquire_serialising_cancellable(charge, &|| progress.is_cancelled())
-        })
-        .transpose()?;
+    let permit = member_charge(
+        member,
+        options,
+        coding,
+        unpacked_size,
+        solid_encoder.as_ref(),
+    )?
+    .map(|charge| resources.acquire_serialising_cancellable(charge, &|| progress.is_cancelled()))
+    .transpose()?;
     encode_measured(
         member,
         options,
@@ -2255,13 +2341,24 @@ fn measure_member(
 }
 
 /// What coding a member and then writing it holds; a directory holds nothing.
+/// `chain` is the solid chain the member continues.
 fn member_charge(
     member: &Member<'_>,
     options: WriterOptions,
     coding: &MemberCoding,
     unpacked_size: u64,
-) -> Option<u64> {
-    (!member.is_directory).then(|| member_workspace(options, unpacked_size, coding.compresses()))
+    chain: Option<&SolidEncoder>,
+) -> Result<Option<u64>> {
+    if member.is_directory {
+        return Ok(None);
+    }
+    let ppmd = ppmd_held(member, options, coding, unpacked_size, chain)?;
+    Ok(Some(member_workspace(
+        options,
+        unpacked_size,
+        coding.compresses(),
+        ppmd,
+    )))
 }
 
 /// [`encode_member`] once the member is measured and charged for. The charge
@@ -2646,8 +2743,9 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<TextScore> {
 
 /// A filter search holds a filtered segment and a candidate; a PPMd trial holds the sample and two models.
 ///
-/// A chain also holds its history and model, which the member codes against.
-fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
+/// A chain also holds its history, and its model when `ppmd` says it has or
+/// will have one, which the member codes against.
+fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdHeld) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
     if matches!(
@@ -2677,19 +2775,19 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding) -> u64 {
         0
     };
     let model = largest_ppmd_model(options);
-    let ppmd = if options.method == Rar29Method::Ppmd || trials_engines(options) {
+    let trial = if ppmd == PpmdHeld::Trial {
         segment.saturating_add(2 * model).saturating_add(
             crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
         )
     } else {
         0
     };
-    let chain = if options.features.solid {
-        dictionary.saturating_add(model)
-    } else {
-        0
+    let chain = match (options.features.solid, ppmd) {
+        (false, _) => 0,
+        (true, PpmdHeld::None) => dictionary,
+        (true, _) => dictionary.saturating_add(model),
     };
-    lz.saturating_add(search.max(ppmd)).saturating_add(chain)
+    lz.saturating_add(search.max(trial)).saturating_add(chain)
 }
 
 /// Where a streamed member's packed bytes go: one archive, or the fragments of a volume set.
@@ -2867,10 +2965,14 @@ fn stream_member_admitted(
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
     let _permit = match admitted {
         Some(permit) => permit,
-        None => resources
-            .acquire_serialising_cancellable(streamed_workspace(options, coding), &|| {
-                progress.is_cancelled()
-            })?,
+        None => {
+            let chain = solid.as_ref().and_then(|link| link.encoder.as_ref());
+            let ppmd = ppmd_held(member, options, coding, unpacked_size, chain)?;
+            resources.acquire_serialising_cancellable(
+                streamed_workspace(options, coding, ppmd),
+                &|| progress.is_cancelled(),
+            )?
+        }
     };
     // A member its samples say will not compress is stored without coding
     // any of it, and without choosing an engine for it.
@@ -5363,7 +5465,7 @@ mod tests {
         // with the threads its shortest-path parse spreads over.
         let (charge, room) = pool.install(|| {
             (
-                super::member_workspace(options, data.len() as u64, true),
+                super::member_workspace(options, data.len() as u64, true, super::PpmdHeld::None),
                 crate::codec::rar29::member_encode_workspace(data.len(), lazy),
             )
         });
@@ -7048,11 +7150,15 @@ mod tests {
     fn rar15_charges_an_index_whatever_the_member_size() {
         for level in [1, 3, 5] {
             let options = rar15(level, false);
-            let small = super::member_workspace(options, 1 << 20, true);
-            let large = super::member_workspace(options, 1 << 30, true);
+            let small = super::member_workspace(options, 1 << 20, true, super::PpmdHeld::None);
+            let large = super::member_workspace(options, 1 << 30, true, super::PpmdHeld::None);
             // Beyond the bytes it holds, a large member costs what a small one does.
             assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
-            let streamed = super::streamed_workspace(options, &crate::MemberCoding::Compressed);
+            let streamed = super::streamed_workspace(
+                options,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            );
             assert!(streamed < 16 * 1024 * 1024, "{streamed}");
         }
     }
@@ -7063,11 +7169,15 @@ mod tests {
         let _cap = crate::parallel::ThreadCap::set(Some(1));
         for level in [3, 5] {
             let options = rar20(level, false);
-            let small = super::member_workspace(options, 1 << 20, true);
-            let large = super::member_workspace(options, 1 << 30, true);
+            let small = super::member_workspace(options, 1 << 20, true, super::PpmdHeld::None);
+            let large = super::member_workspace(options, 1 << 30, true, super::PpmdHeld::None);
             // Beyond the bytes it holds, a large member costs what a small one does.
             assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
-            let streamed = super::streamed_workspace(options, &crate::MemberCoding::Compressed);
+            let streamed = super::streamed_workspace(
+                options,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            );
             assert!(streamed < 128 * 1024 * 1024, "{streamed}");
         }
     }
@@ -7797,9 +7907,10 @@ mod tests {
         solid.features.solid = true;
 
         for options in [independent, solid] {
-            let charge = super::streamed_workspace(options, &coding);
+            let ppmd = super::PpmdHeld::Trial;
+            let charge = super::streamed_workspace(options, &coding, ppmd);
             assert!(charge < 256 * MIB, "{} MiB", charge / MIB);
-            assert!(charge < super::member_workspace(options, 1 << 30, true));
+            assert!(charge < super::member_workspace(options, 1 << 30, true, ppmd));
         }
     }
 
@@ -8187,7 +8298,15 @@ mod tests {
                 let held = encoded.held.as_ref().unwrap().bytes();
                 assert!(held >= packed.capacity() as u64, "{case}");
                 assert!(
-                    held < super::member_workspace(options, data.len() as u64, true),
+                    held < super::member_charge(
+                        &member,
+                        options,
+                        &crate::MemberCoding::Compressed,
+                        data.len() as u64,
+                        None
+                    )
+                    .unwrap()
+                    .unwrap(),
                     "{case}"
                 );
                 assert_eq!(resources.workspace_in_use(), held, "{case}");
@@ -8532,9 +8651,12 @@ mod tests {
                         .iter()
                         .map(|member| {
                             let len = member.unpacked_size().unwrap();
-                            super::member_charge(member, options, &coding, len)
+                            let ppmd =
+                                super::ppmd_held(member, options, &coding, len, None).unwrap();
+                            super::member_charge(member, options, &coding, len, None)
+                                .unwrap()
                                 .unwrap_or(0)
-                                .max(super::streamed_workspace(options, &coding))
+                                .max(super::streamed_workspace(options, &coding, ppmd))
                         })
                         .max()
                         .unwrap();
@@ -8575,7 +8697,7 @@ mod tests {
         let charge = |target, level| {
             let mut options = super::WriterOptions::new(target, FeatureSet::default());
             options.compression_level = Some(level);
-            super::member_workspace(options, size, true)
+            super::member_workspace(options, size, true, super::PpmdHeld::None)
         };
         // RAR 2.0 holds the member and its packed form, and a block's parse for
         // each block it codes at once: one per thread, up to sixteen, and no
@@ -9512,22 +9634,23 @@ mod tests {
             options.compression_level = Some(level);
             options
         };
-        let charge = |level| super::member_workspace(at(level), 8 * MIB, true);
+        let trial = super::PpmdHeld::Trial;
+        let charge = |level| super::member_workspace(at(level), 8 * MIB, true, trial);
         // Two models of the largest size a level tries, and a parse workspace
         // per block that runs at once.
         let parse = crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE;
-        assert_eq!(charge(2), charge(1));
         assert!(charge(4) >= charge(3) + 2 * (64 - 25) * MIB + parse);
         assert!(charge(5) >= charge(4) + 2 * (128 - 64) * MIB);
         // A member of one block parses one block at a time.
         assert_eq!(
-            super::member_workspace(at(5), 1000, true) - super::member_workspace(at(3), 1000, true),
+            super::member_workspace(at(5), 1000, true, trial)
+                - super::member_workspace(at(3), 1000, true, trial),
             2 * (128 - 25) * MIB + parse
         );
         // Streamed, the parse is charged by the block, not by the member.
         let coding = crate::MemberCoding::Compressed;
-        let streamed = |options| super::streamed_workspace(options, &coding);
-        assert!(streamed(at(5)) < super::member_workspace(at(5), 1 << 30, true));
+        let streamed = |options| super::streamed_workspace(options, &coding, trial);
+        assert!(streamed(at(5)) < super::member_workspace(at(5), 1 << 30, true, trial));
         // A streamed trial holds two of the level's largest models, and a
         // chain keeps one between members.
         assert!(streamed(at(5)) >= streamed(at(3)) + 2 * (128 - 25) * MIB);
@@ -9543,9 +9666,87 @@ mod tests {
             options.method = super::Rar29Method::Ppmd;
             options
         };
-        assert!(super::member_workspace(forced(1), 8 * MIB, true) >= charge(1) + 2 * 25 * MIB);
-        assert!(super::member_workspace(forced(5), 8 * MIB, true) >= charge(1) + 2 * 128 * MIB);
+        let none = |level| super::member_workspace(at(level), 8 * MIB, true, super::PpmdHeld::None);
+        assert!(super::member_workspace(forced(1), 8 * MIB, true, trial) >= none(1) + 2 * 25 * MIB);
+        assert!(
+            super::member_workspace(forced(5), 8 * MIB, true, trial) >= none(1) + 2 * 128 * MIB
+        );
         assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
+    }
+
+    #[test]
+    fn rar29_charges_ppmd_models_only_to_members_that_build_one() {
+        const MIB: u64 = 1024 * 1024;
+        let text = word_text(MIB as usize);
+        let binary: Vec<u8> = (0..MIB as u32)
+            .flat_map(|word| word.to_le_bytes())
+            .collect();
+        let at = |level: u8, method| {
+            let mut options =
+                super::WriterOptions::new(ArchiveVersion::Rar40, FeatureSet::store_only());
+            options.compression_level = Some(level);
+            options.method = method;
+            options
+        };
+        let coding = crate::MemberCoding::Compressed;
+        let held = |data: &[u8], options, chain: Option<&super::SolidEncoder>| {
+            let entry = super::FileEntry {
+                name: b"member",
+                data,
+                file_time: 0,
+                file_attr: 0x20,
+                host_os: 3,
+                password: None,
+                file_comment: None,
+            };
+            super::ppmd_held(
+                &super::Member::from_file(&entry),
+                options,
+                &coding,
+                data.len() as u64,
+                chain,
+            )
+            .unwrap()
+        };
+        use super::PpmdHeld::{Chain, None as Nothing, Trial};
+        use super::Rar29Method::{Auto, Lz, Ppmd};
+        // The trial runs on text from level 3, and forced PPMd on anything.
+        assert_eq!(held(&text, at(3, Auto), None), Trial);
+        assert_eq!(held(&text, at(2, Auto), None), Nothing);
+        assert_eq!(held(&binary, at(5, Auto), None), Nothing);
+        assert_eq!(held(&text, at(5, Lz), None), Nothing);
+        assert_eq!(held(&binary, at(1, Ppmd), None), Trial);
+        // From a source, the windows are read ahead only of a member the
+        // incompressibility probe would open anyway.
+        let from_source = |data: &[u8]| {
+            let entry = super::StreamingEntry::new(
+                b"member".as_slice(),
+                crate::EntrySource::from_bytes(data.to_vec()),
+            );
+            let member = super::Member::from_streaming(&entry);
+            let len = data.len() as u64;
+            super::ppmd_held(&member, at(5, Auto), &coding, len, None).unwrap()
+        };
+        assert_eq!(from_source(&binary), Nothing);
+        assert_eq!(from_source(&binary[..64 * 1024]), Trial);
+        // Binary in a chain is charged the model the chain keeps, once it keeps one.
+        let mut solid = at(5, Auto);
+        solid.features.solid = true;
+        let mut chain = Some(super::SolidEncoder::for_target(solid).unwrap());
+        assert_eq!(held(&binary, solid, chain.as_ref()), Nothing);
+        super::encode_or_store_payload(&text, solid, &mut chain, None, None).unwrap();
+        assert!(
+            matches!(&chain, Some(super::SolidEncoder::Rar29(encoder)) if encoder.has_ppmd_model())
+        );
+        assert_eq!(held(&binary, solid, chain.as_ref()), Chain);
+        assert_eq!(held(&text, solid, chain.as_ref()), Trial);
+        // What the models add, whole and streamed.
+        let options = at(5, Auto);
+        let whole = |ppmd| super::member_workspace(options, 8 * MIB, true, ppmd);
+        assert!(whole(Trial) >= whole(Nothing) + 2 * 128 * MIB);
+        let streamed = |options, ppmd| super::streamed_workspace(options, &coding, ppmd);
+        assert!(streamed(options, Trial) >= streamed(options, Nothing) + 2 * 128 * MIB);
+        assert_eq!(streamed(solid, Chain), streamed(solid, Nothing) + 128 * MIB);
     }
 
     /// Windows gives the CLI a 1 MiB main thread, and a chain's PPMd member
