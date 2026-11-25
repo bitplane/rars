@@ -135,6 +135,36 @@ impl Iterator for Candidates<'_> {
 
 const MAX_LONG_MATCH_CANDIDATES: usize = 64;
 
+const SHORT_MATCH_SAMPLE: usize = 4096;
+const _: () = assert!(SHORT_MATCH_SAMPLE <= LOOKAHEAD);
+const DISTANT_SHORT_MATCH: usize = 16 * 1024;
+const STMODE_MIN_LITERALS: u32 = 16;
+
+/// Sample how often a two-byte pair repeats within the short-LZ distance.
+/// Uniform noise has about one such match per 256 bytes. Use a small hash
+/// table because only a rough distinction from match-rich input is needed.
+fn short_matches_are_sparse(input: &[u8]) -> bool {
+    let input = &input[..SHORT_MATCH_SAMPLE];
+    let mut previous = [u16::MAX; SHORT_MATCH_SAMPLE];
+    let mut hits = 0;
+    for (pos, pair) in input.windows(2).enumerate() {
+        let pair_value = u16::from_le_bytes([pair[0], pair[1]]);
+        let hash = usize::from(pair_value.wrapping_mul(0x9e37) >> 4);
+        let candidate = usize::from(std::mem::replace(&mut previous[hash], pos as u16));
+        if candidate < pos && pos - candidate <= 256 && input[candidate..candidate + 2] == *pair {
+            hits += 1;
+            if hits >= SHORT_MATCH_SAMPLE / 64 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn is_distant_triplet(token: MatchToken) -> bool {
+    matches!(token, MatchToken::LongLz(token) if token.length == 3 && token.distance as usize > DISTANT_SHORT_MATCH)
+}
+
 const MAX_LONG_LZ_DISTANCE: usize = 0x7fff;
 
 pub fn unpack15_encode(input: &[u8]) -> Result<Vec<u8>> {
@@ -321,7 +351,7 @@ impl Unpack15Encoder {
                 write_planned_flag_bits(&mut flags, flag_bits, flag);
                 payloads.push(EncodedToken::Literal(input[pos]));
                 flag_bits += flag.len();
-                if flag_bits == 8 && plan_num_huf >= 16 && pos + 1 < input.len() {
+                if flag_bits == 8 && plan_num_huf >= STMODE_MIN_LITERALS && pos + 1 < input.len() {
                     group_enters_stmode = true;
                 }
                 plan_num_huf += 1;
@@ -333,7 +363,7 @@ impl Unpack15Encoder {
             self.emit_payloads(payloads);
             if group_enters_stmode {
                 if self.options.stmode_literal_runs {
-                    self.emit_stmode_literal_run(input, None, &mut pos, input.len());
+                    self.emit_stmode_literal_run(input, None, &mut pos, input.len(), false);
                 }
                 self.emit_stmode_exit();
             }
@@ -449,6 +479,7 @@ impl Unpack15Encoder {
         MemberState {
             finder: Rar13MatchFinder::new(),
             pos: 0,
+            prefer_literal_runs: false,
             straddle: None,
             stmode_open: false,
             next_report: 0,
@@ -469,6 +500,16 @@ impl Unpack15Encoder {
     ) -> Result<()> {
         let base = member.finder.base;
         let last = base + input.len() == len;
+        if member.pos == 0
+            && len > DISTANT_SHORT_MATCH
+            && self.options.max_long_match_distance > DISTANT_SHORT_MATCH
+            && self.options.stmode_literal_runs
+            && !self.options.lazy_matching
+            && !self.options.priced_parse
+        {
+            member.prefer_literal_runs = short_matches_are_sparse(input);
+        }
+        let prefer_literal_runs = member.prefer_literal_runs;
         let limit = if last {
             input.len()
         } else {
@@ -485,6 +526,7 @@ impl Unpack15Encoder {
                 Some((&mut *buckets, &mut *plan, base)),
                 &mut pos,
                 limit,
+                prefer_literal_runs,
             ) {
                 member.pos = base + pos;
                 member.straddle = straddle;
@@ -519,15 +561,20 @@ impl Unpack15Encoder {
                     plan_encoder
                         .choose_lz_token(input, pos, buckets, state)
                         .filter(|token| {
-                            !self.options.lazy_matching
-                                || !should_lazy_emit_literal(
-                                    input,
-                                    pos,
-                                    buckets,
-                                    *token,
-                                    state.max_dist3,
-                                    self.options,
-                                )
+                            // An isolated triplet can prevent a run from
+                            // entering stmode for the sake of three bytes.
+                            (!prefer_literal_runs
+                                || plan_encoder.num_huf < STMODE_MIN_LITERALS
+                                || !is_distant_triplet(*token))
+                                && (!self.options.lazy_matching
+                                    || !should_lazy_emit_literal(
+                                        input,
+                                        pos,
+                                        buckets,
+                                        *token,
+                                        state.max_dist3,
+                                        self.options,
+                                    ))
                         })
                 };
                 if let Some(token) = token {
@@ -569,7 +616,10 @@ impl Unpack15Encoder {
                 let literal = input[pos];
                 payloads.push(EncodedToken::Literal(input[pos]));
                 flag_bits += flag.len();
-                if flag_bits == 8 && plan_encoder.num_huf >= 16 && pos + 1 < input.len() {
+                if flag_bits == 8
+                    && plan_encoder.num_huf >= STMODE_MIN_LITERALS
+                    && pos + 1 < input.len()
+                {
                     group_enters_stmode = true;
                 }
                 pos += 1;
@@ -585,6 +635,7 @@ impl Unpack15Encoder {
                         Some((&mut *buckets, &mut *plan, base)),
                         &mut pos,
                         limit,
+                        prefer_literal_runs,
                     )
                 {
                     member.stmode_open = true;
@@ -800,6 +851,7 @@ impl Unpack15Encoder {
         mut index: Option<(&mut Rar13MatchFinder, &mut Plan, usize)>,
         pos: &mut usize,
         limit: usize,
+        prefer_literal_runs: bool,
     ) -> bool {
         while *pos + 1 < input.len() {
             if *pos >= limit {
@@ -828,7 +880,7 @@ impl Unpack15Encoder {
                 .and_then(|(buckets, _, _)| {
                     find_lz_token(input, *pos, buckets, state, self.options)
                 })
-                .is_some()
+                .is_some_and(|token| !prefer_literal_runs || !is_distant_triplet(token))
             {
                 break;
             }
@@ -1282,6 +1334,9 @@ struct MemberState {
     finder: Rar13MatchFinder,
     /// The member position coded up to.
     pos: usize,
+    /// An isolated triplet rarely pays for exiting stmode and rebuilding the
+    /// literal run when short matches are scarce.
+    prefer_literal_runs: bool,
     straddle: Option<Straddle>,
     /// A stmode literal run reached the end of the window still open.
     stmode_open: bool,
@@ -1432,29 +1487,32 @@ fn should_lazy_emit_literal(
 }
 
 fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
-    if pos == 0 {
+    let first = *input.get(pos)?;
+    let limit = (input.len() - pos).min(10);
+    if limit < 2 {
         return None;
     }
 
-    let max_distance = pos.min(256);
+    let history = pos.saturating_sub(256);
     let mut best = ShortLz {
         distance: 0,
         length: 0,
     };
-    for distance in 1..=max_distance {
-        let mut length = 0usize;
-        while length < 10
-            && pos + length < input.len()
-            && input[pos + length] == input[pos + length - distance]
-        {
+    // Search nearest first so equal lengths keep the smaller distance.
+    for candidate in memchr::memrchr_iter(first, &input[history..pos]) {
+        let distance = pos - (history + candidate);
+        let mut length = 1;
+        while length < limit && input[pos + length] == input[pos + length - distance] {
             length += 1;
         }
-        // Distances increase, so the first match of a given length is nearest.
         if length >= 2 && length > best.length as usize {
             best = ShortLz {
                 distance: distance as u32,
                 length: length as u32,
             };
+            if length == limit {
+                break;
+            }
         }
     }
 

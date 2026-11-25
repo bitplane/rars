@@ -2215,6 +2215,7 @@ impl<B: Budget> OptimalCollector<B> {
                         pos,
                         len_limit,
                         avail.min(MAX_ENCODER_MATCH_LENGTH),
+                        block.end,
                         max_distance,
                         stretches.as_ref(),
                         stretch,
@@ -2295,6 +2296,7 @@ fn measure_past_nice<B: Budget>(
     pos: usize,
     len_limit: usize,
     limit: usize,
+    block_end: usize,
     max_distance: usize,
     stretches: Option<&match_finder::WindowIndex<B>>,
     stretch: usize,
@@ -2309,6 +2311,28 @@ fn measure_past_nice<B: Budget>(
     }
     last.0 = match_length(combined, pos, last.1 as usize, limit) as u32;
     let reach = last.0 as usize;
+    if stretches.is_none()
+        && last.1 > 1
+        && reach < limit
+        && pos + reach < block_end
+        && (1..=2).any(|ahead| {
+            let start = pos + ahead;
+            combined[start - 1] == combined[start]
+                && combined[start] == combined[start + 1]
+                && combined[start] == combined[pos + reach]
+                && match_length(combined, start, 1, reach + 1 - ahead) > reach - ahead
+        })
+    {
+        // A long match may start just before a byte run and end inside it.
+        // Keep its shorter lengths available and let the parse reach the run
+        // with a literal or two instead of committing to the distant match.
+        last.0 = (len_limit - 1) as u32;
+        let count = runs.len();
+        if count > before + 1 && runs[count - 2].0 == runs[count - 1].0 {
+            runs.pop();
+        }
+        return Ok(());
+    }
     let Some(stretches) = stretches.filter(|_| reach < limit) else {
         return Ok(());
     };

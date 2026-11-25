@@ -31,6 +31,50 @@ fn decode_solid_run(packed: &[Vec<u8>], members: &[&[u8]]) -> Vec<Vec<u8>> {
         .collect()
 }
 
+#[cfg(feature = "write")]
+fn long_literal_runs_ladder(format: crate::ArchiveVersion) {
+    let mut state = 1u32;
+    let noise: Vec<u8> = (0..20_000)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            state as u8
+        })
+        .collect();
+    let pack = |level| {
+        let mut builder = crate::Builder::new(format)
+            .solid(true)
+            .compression_level(Some(level));
+        builder
+            .add_bytes(b"noise".to_vec(), noise.clone(), None, None)
+            .unwrap();
+        let mut packed = Vec::new();
+        builder
+            .write_to(&mut packed, &crate::WriterResources::default(), None)
+            .unwrap();
+        packed.len()
+    };
+    let three = pack(3);
+    let four = pack(4);
+    assert!(
+        four <= three,
+        "level 4 packed {four} bytes against level 3's {three}"
+    );
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn rar14_long_literal_runs_ladder() {
+    long_literal_runs_ladder(crate::ArchiveVersion::Rar14);
+}
+
+#[cfg(feature = "write")]
+#[test]
+fn rar15_long_literal_runs_ladder() {
+    long_literal_runs_ladder(crate::ArchiveVersion::Rar15);
+}
+
 /// The short-LZ literal run does not survive a member boundary: the decoder
 /// clears it for every member, solid or not, so the encoder must too: a member
 /// ending mid-run would open the next with a break bit nothing reads.
