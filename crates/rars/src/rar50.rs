@@ -40,7 +40,8 @@ pub use write::{
     write_seekable_archive_with_progress, write_streaming_archive_to,
     write_streaming_archive_with_progress, write_streaming_volumes_to,
     write_streaming_volumes_with_progress, ArchiveEntry, ArchiveExtras, ArchiveMetadataEntry,
-    CollectedVolumes, Rar50Writer, ServiceEntry, VolumeOutput, VolumeSink, WriterOptions,
+    CollectedVolumes, Rar50Writer, ReadableVolumeOutput, ServiceEntry, VolumeOutput, VolumeSink,
+    WriterOptions,
 };
 
 const HEAD_MAIN: u64 = 1;

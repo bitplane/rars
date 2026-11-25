@@ -2997,6 +2997,19 @@ impl rars_rs::rar50::VolumeSink for PythonVolumeSink<'_> {
         &mut self,
         index: u64,
     ) -> rars_rs::Result<Box<dyn rars_rs::rar50::VolumeOutput>> {
+        Ok(Box::new(self.stage_volume(index)?))
+    }
+
+    fn start_readable_volume(
+        &mut self,
+        index: u64,
+    ) -> rars_rs::Result<Option<Box<dyn rars_rs::rar50::ReadableVolumeOutput>>> {
+        Ok(Some(Box::new(self.stage_volume(index)?)))
+    }
+}
+
+impl PythonVolumeSink<'_> {
+    fn stage_volume(&mut self, index: u64) -> rars_rs::Result<fs::File> {
         // Refuse a name that cannot exist before writing a volume that would need it.
         let part = usize::try_from(index).unwrap_or(usize::MAX);
         self.check_name(part, part.saturating_add(1))?;
@@ -3013,13 +3026,14 @@ impl rars_rs::rar50::VolumeSink for PythonVolumeSink<'_> {
             ));
             let temporary = self.first_path.with_file_name(name);
             match fs::OpenOptions::new()
+                .read(true)
                 .write(true)
                 .create_new(true)
                 .open(&temporary)
             {
                 Ok(file) => {
                     self.temporaries.push(temporary);
-                    return Ok(Box::new(file));
+                    return Ok(file);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error.into()),

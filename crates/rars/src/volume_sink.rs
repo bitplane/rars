@@ -1,10 +1,15 @@
 use crate::error::{Error, Result};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 
 /// One volume's output, seekable so a header can be finished after its data.
 pub trait VolumeOutput: Write + Seek + Send {}
 
 impl<T: Write + Seek + Send> VolumeOutput for T {}
+
+/// One volume's output that can also be read back.
+pub trait ReadableVolumeOutput: Read + Write + Seek + Send {}
+
+impl<T: Read + Write + Seek + Send> ReadableVolumeOutput for T {}
 
 /// Receives each volume of a multi-volume archive as it is finished.
 pub trait VolumeSink {
@@ -16,6 +21,22 @@ pub trait VolumeSink {
 
     /// Opens the output for volume `index`, numbered from zero.
     fn start_volume(&mut self, index: u64) -> Result<Box<dyn VolumeOutput>>;
+
+    /// Opens the output for volume `index` so that what is written to it can
+    /// be read back, or returns `None` when the sink cannot, and
+    /// [`start_volume`](Self::start_volume) is called for it instead.
+    ///
+    /// A RAR 5 set reads a volume back to build its recovery record, and to
+    /// write a large compressed member into it as the member is packed.
+    /// Without that, the volume's body or the packed member goes through
+    /// scratch storage first.
+    fn start_readable_volume(
+        &mut self,
+        index: u64,
+    ) -> Result<Option<Box<dyn ReadableVolumeOutput>>> {
+        let _ = index;
+        Ok(None)
+    }
 
     /// Called once volume `index` has been written and flushed.
     fn finish_volume(&mut self, index: u64, len: u64) -> Result<()> {
@@ -77,6 +98,21 @@ impl Write for CollectedVolume {
     }
 }
 
+impl Read for CollectedVolume {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let volumes = self
+            .volumes
+            .lock()
+            .expect("volume collector is not poisoned");
+        let volume = &volumes[self.index];
+        let available = &volume[self.position.min(volume.len())..];
+        let read = available.len().min(buf.len());
+        buf[..read].copy_from_slice(&available[..read]);
+        self.position += read;
+        Ok(read)
+    }
+}
+
 impl Seek for CollectedVolume {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
         let len = self
@@ -105,8 +141,8 @@ pub(crate) fn seek_within(position: usize, len: usize, from: SeekFrom) -> std::i
     Ok(target as usize)
 }
 
-impl VolumeSink for CollectedVolumes {
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn VolumeOutput>> {
+impl CollectedVolumes {
+    fn open(&mut self, index: u64) -> Result<CollectedVolume> {
         let mut volumes = self
             .volumes
             .lock()
@@ -116,11 +152,24 @@ impl VolumeSink for CollectedVolumes {
         }
         volumes.push(Vec::new());
         drop(volumes);
-        Ok(Box::new(CollectedVolume {
+        Ok(CollectedVolume {
             volumes: std::sync::Arc::clone(&self.volumes),
             index: index as usize,
             position: 0,
-        }))
+        })
+    }
+}
+
+impl VolumeSink for CollectedVolumes {
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn VolumeOutput>> {
+        Ok(Box::new(self.open(index)?))
+    }
+
+    fn start_readable_volume(
+        &mut self,
+        index: u64,
+    ) -> Result<Option<Box<dyn ReadableVolumeOutput>>> {
+        Ok(Some(Box::new(self.open(index)?)))
     }
 
     fn finish_volume(&mut self, index: u64, len: u64) -> Result<()> {
