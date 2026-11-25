@@ -16,6 +16,7 @@ not (
     (binary_id(rars) & test(=rar15_40::write::builder_path_tests::write_to_path_streams_a_large_member_as_a_seekable_archive_does)) |
     (binary_id(rars) & test(=rar15_40::write::tests::a_filter_friendly_member_streams_close_to_the_in_memory_ratio)) |
     (binary_id(rars) & test(=rar15_40::write::tests::a_member_whose_first_volume_does_not_compress_still_compresses_in_a_set)) |
+    (binary_id(rars) & test(=rar15_40::write::tests::a_member_searched_in_pieces_streams_the_archive_the_in_memory_writer_does)) |
     (binary_id(rars) & test(=rar15_40::write::tests::a_member_with_a_named_filter_streams_what_the_in_memory_writer_writes)) |
     (binary_id(rars) & test(=rar15_40::write::tests::a_named_filter_streams_on_a_solid_chain_and_through_a_pipe)) |
     (binary_id(rars) & test(=rar15_40::write::tests::a_password_protected_rar15_member_streams_without_padding)) |

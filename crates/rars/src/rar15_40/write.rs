@@ -223,6 +223,18 @@ use crate::write_stream::STREAM_MEMBERS_ABOVE;
 /// kilobytes of relocations each file holds.
 const RAR29_FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
 
+/// RAR 2.9 binary members longer than this stream even below the default
+/// threshold, [`STREAM_MEMBERS_ABOVE`].
+///
+/// Past [`RAR29_FILTER_SEARCH_BYTES`] a member is searched for filters a piece
+/// at a time whether it is held or streamed, so both paths write the same
+/// archive. Held whole, a member costs about three bytes per byte (itself, its
+/// filtered copy and the parse); streamed, its segment and finder cost the
+/// same whatever its length, which a member this long already exceeds. Text is
+/// left whole: its PPMd and LZ trial holds the member either way, and costs
+/// more time streamed.
+const RAR29_STREAM_BINARY_ABOVE: u64 = 16 * 1024 * 1024;
+
 /// How much of a piece the RAR 2.9 table scanner judges at a time.
 ///
 /// rar 3.93 codes delta filters over regions as short as 768 bytes. RAR 5's
@@ -2465,7 +2477,25 @@ fn streams_member(
     {
         return Ok(false);
     }
-    Ok(member.unpacked_size()? > stream_above)
+    let len = member.unpacked_size()?;
+    if len > stream_above {
+        return Ok(true);
+    }
+    // Only under the default threshold: a caller that names its own, as tests
+    // do to force either path, gets exactly that.
+    let binary_streams = stream_above == STREAM_MEMBERS_ABOVE
+        && len > RAR29_STREAM_BINARY_ABOVE
+        && matches!(
+            options.target,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        )
+        && options.method == Rar29Method::Auto
+        && matches!(
+            coding,
+            MemberCoding::Compressed
+                | MemberCoding::Filtered(FilterPolicy::None | FilterPolicy::Auto)
+        );
+    Ok(binary_streams && !sampled_text(&member.bytes, len)?.reads_as_text())
 }
 
 /// Decided before any of the member is coded, since nothing it codes can be taken back.
@@ -5523,6 +5553,54 @@ mod tests {
         let file = parsed.files().nth(1).unwrap();
         assert_eq!(file.method, 0x33);
         assert!(file.pack_size < large.len() as u64 / 2);
+    }
+
+    #[test]
+    fn a_member_searched_in_pieces_streams_the_archive_the_in_memory_writer_does() {
+        // Past one filter-search piece, so the in-memory writer searches it a
+        // piece at a time too.
+        let large = binary_member(super::RAR29_FILTER_SEARCH_BYTES + 64 * 1024 + 4321);
+        let members = entries(&[
+            ("before.txt", b"a member ahead of it on the chain\n"),
+            ("large.bin", &large),
+            ("after.bin", &large[1000..41000]),
+        ]);
+        let coding = || crate::MemberCoding::Filtered(crate::FilterPolicy::Auto);
+        for (level, solid) in [(3, false), (5, false), (3, true)] {
+            let mut options = rar40();
+            options.compression_level = Some(level);
+            options.features.solid = solid;
+
+            let out = streamed_with(&members, options, coding(), None).unwrap();
+
+            assert!(out.seeks > 0, "level {level}, solid {solid}: not streamed");
+            assert_eq!(
+                out.inner.into_inner(),
+                in_memory_with(&members, options, coding()),
+                "level {level}, solid {solid}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_binary_member_streams_below_the_threshold_and_text_does_not() {
+        let len = super::RAR29_STREAM_BINARY_ABOVE as usize + 1;
+        let binary = binary_member(len);
+        let text = word_text(len);
+        let streams = |data: &[u8], options: super::WriterOptions, coding| {
+            let entry = &entries(&[("member", data)])[0];
+            let member = super::Member::from_streaming(entry);
+            super::streams_member(&member, options, &coding, super::STREAM_MEMBERS_ABOVE).unwrap()
+        };
+        let auto = || crate::MemberCoding::Filtered(crate::FilterPolicy::Auto);
+
+        assert!(streams(&binary, rar40(), auto()));
+        assert!(!streams(&text, rar40(), auto()));
+        assert!(!streams(&binary[..len - 2], rar40(), auto()));
+        assert!(!streams(&binary, rar20(3, false), auto()));
+        let mut forced = rar40();
+        forced.method = super::Rar29Method::Lz;
+        assert!(!streams(&binary, forced, auto()));
     }
 
     #[test]
