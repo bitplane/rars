@@ -107,7 +107,7 @@ const TABLE_ASSUMED_REGIONS: u64 = 2;
 pub(crate) trait FilterSearch {
     /// The encoder settings a candidate is measured at. Compared, so the search
     /// can tell when a screen's encode is also a real measurement.
-    type Options: Copy + PartialEq;
+    type Options: Copy + PartialEq + Send + Sync;
 
     /// Every filter this format can encode that has no detector of its own, so
     /// the only way to know whether it helps is to try it. Given the member, so
@@ -235,7 +235,7 @@ type TableRegions<B> = Buffer<(Range<usize>, usize), B>;
 
 /// Search owners cannot detach bounded byte storage while candidates compete.
 pub(crate) trait OwnedSearch {
-    type Options: Copy + PartialEq;
+    type Options: Copy + PartialEq + Send + Sync;
     type Memory: Budget;
     fn allowance(&self) -> &Self::Memory;
     fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>>;
@@ -308,6 +308,21 @@ pub(crate) trait OwnedSearch {
         options: Self::Options,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Buffer<u8, Self::Memory>>;
+    /// `job(self, index)` for each index below `count`, in index order. The
+    /// jobs are encodes that do not depend on one another, none of them
+    /// longer than `longest` bytes. A failure is the lowest failing index's,
+    /// and nothing after it is returned.
+    ///
+    /// One after another here; [`SideBySideSearch`] runs them side by side.
+    fn each<T: Send>(
+        &self,
+        count: usize,
+        longest: usize,
+        job: &(dyn Fn(&Self, usize) -> Result<T> + Sync),
+    ) -> Result<Vec<T>> {
+        let _ = longest;
+        (0..count).map(|index| job(self, index)).collect()
+    }
 }
 struct UnlimitedSearch<'a, S>(&'a S, Allowance);
 impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
@@ -616,21 +631,34 @@ fn screen_kinds<S: OwnedSearch>(
     // format that screens at reduced effort, which RAR 2.9 does, is measuring
     // something else and keeps the two-encode path.
     let measures_the_member = sample.len() == data.len() && screen_options == options;
-    let baseline = search.encode_plain(sample, screen_options, None)?;
+    let kinds = search.screened_kinds(data)?;
+    // The plain sample, then each kind: what it packed to, and the bytes when
+    // they are a measurement.
+    let mut packed = search
+        .each(kinds.len() + 1, sample.len(), &|search: &S, index| {
+            let bytes = match index.checked_sub(1).map(|kind| kinds[kind]) {
+                None => search.encode_plain(sample, screen_options, None)?,
+                Some(kind) => {
+                    let filters = [FilterSpec::whole(kind)];
+                    if measures_the_member {
+                        search.encode_filtered(data, &filters, options, None)?
+                    } else {
+                        let transformed = search.filtered_bytes(sample, &filters)?;
+                        search.encode_plain(&transformed, screen_options, None)?
+                    }
+                }
+            };
+            Ok((bytes.len(), measures_the_member.then_some(bytes)))
+        })?
+        .into_iter();
+    let (baseline, plain) = packed.next().expect("the plain sample is encoded");
     let mut sampled = Buffer::new(search.allowance());
-    for kind in search.screened_kinds(data)? {
-        let filters = [FilterSpec::whole(kind)];
-        let packed = if measures_the_member {
-            search.encode_filtered(data, &filters, options, None)?
-        } else {
-            let transformed = search.filtered_bytes(sample, &filters)?;
-            search.encode_plain(&transformed, screen_options, None)?
-        };
-        let worth_a_range = screen_wins(packed.len(), baseline.len());
+    for (&kind, (packed, measured)) in kinds.iter().zip(packed) {
+        let worth_a_range = screen_wins(packed, baseline);
         if measures_the_member {
             outcome.kinds.try_push(ScreenedKind {
                 kind,
-                measured: Some(packed),
+                measured,
                 worth_a_range,
             })?;
         } else if worth_a_range {
@@ -643,7 +671,7 @@ fn screen_kinds<S: OwnedSearch>(
                     measured: None,
                     worth_a_range,
                 },
-                packed.len(),
+                packed,
             ))?;
         }
     }
@@ -665,10 +693,15 @@ fn screen_kinds<S: OwnedSearch>(
         .filter(|_| confirms)
     {
         let filters = [FilterSpec::whole(best.kind)];
-        let transformed = search.filtered_bytes(sample, &filters)?;
-        let filtered = search.encode_plain(&transformed, options, None)?.len();
-        let plain = search.encode_plain(sample, options, None)?.len();
-        if !screen_wins(filtered, plain) {
+        let confirmed = search.each(2, sample.len(), &|search: &S, index| {
+            Ok(if index == 0 {
+                let transformed = search.filtered_bytes(sample, &filters)?;
+                search.encode_plain(&transformed, options, None)?.len()
+            } else {
+                search.encode_plain(sample, options, None)?.len()
+            })
+        })?;
+        if !screen_wins(confirmed[0], confirmed[1]) {
             sampled.clear();
         }
     }
@@ -690,9 +723,7 @@ fn screen_kinds<S: OwnedSearch>(
             outcome.kinds.try_push(kind)?;
         }
     }
-    if measures_the_member {
-        outcome.plain = Some(baseline);
-    }
+    outcome.plain = plain;
     Ok(outcome)
 }
 
@@ -749,7 +780,7 @@ fn x86_screened_regions<S: OwnedSearch>(
         search.screen_options(options)
     };
     // The packed size of a region's samples under `kind`, or left alone.
-    let priced = |region: &Range<usize>, kind: Option<FilterKind>| -> Result<usize> {
+    let priced = |search: &S, region: &Range<usize>, kind: Option<FilterKind>| -> Result<usize> {
         let mut packed = 0;
         for within in x86_region_samples(region, search.x86_region_sample_span()) {
             packed += match kind {
@@ -762,6 +793,8 @@ fn x86_screened_regions<S: OwnedSearch>(
         }
         Ok(packed)
     };
+    // Every sample encode is within one region's screen sample.
+    let longest = SCREEN_SAMPLE_LEN.min(data.len());
     if search.trusts_x86_scanner() {
         return Ok(X86Screen {
             kept: Buffer::collect(regions.iter().cloned(), search.allowance())?,
@@ -770,29 +803,48 @@ fn x86_screened_regions<S: OwnedSearch>(
             jumps_cost_more: false,
         });
     }
+    // Scanner padding makes a region too short to sample possible only when
+    // the entire member is too short to provide a useful x86 sample.
+    let sampled = Buffer::collect(
+        regions
+            .iter()
+            .filter(|region| screen_sample_range(region.len()).len() >= SCREEN_SAMPLE_ALIGNMENT)
+            .cloned(),
+        search.allowance(),
+    )?;
+    // Each region left alone, then under the pair.
+    let first = search.each(2 * sampled.len(), longest, &|search: &S, index| {
+        let kind = (index % 2 == 1).then_some(FilterKind::E8E9);
+        priced(search, &sampled[index / 2], kind)
+    })?;
+    // No margin here, unlike the detectorless filters: the scanner has
+    // already ruled on where code is, so a small win on this sample is
+    // evidence rather than noise.
+    //
+    // The pair losing is not the calls losing. Where jumps are dense and
+    // short, as in unoptimised code, converting them costs more than the
+    // calls give back. Only a region the pair fails pays for this second
+    // question.
+    let failed = Buffer::collect(
+        first
+            .chunks(2)
+            .enumerate()
+            .filter(|(_, priced)| priced[1] > priced[0])
+            .map(|(region, _)| region),
+        search.allowance(),
+    )?;
+    let calls = search.each(failed.len(), longest, &|search: &S, index| {
+        priced(search, &sampled[failed[index]], Some(FilterKind::E8))
+    })?;
+    let mut calls = calls.into_iter();
     let mut kept = Buffer::new(search.allowance());
     let mut helped = false;
-    for region in regions {
-        if screen_sample_range(region.len()).len() < SCREEN_SAMPLE_ALIGNMENT {
-            // Scanner padding makes this possible only when the entire
-            // member is too short to provide a useful x86 sample.
-            continue;
-        }
-        let baseline = priced(region, None)?;
-        let pair = priced(region, Some(FilterKind::E8E9))?;
-        // No margin here, unlike the detectorless filters: the scanner has
-        // already ruled on where code is, so a small win on this sample is
-        // evidence rather than noise.
+    for (region, priced) in sampled.iter().zip(first.chunks(2)) {
+        let (baseline, pair) = (priced[0], priced[1]);
         if pair <= baseline {
             helped |= pair < baseline;
             kept.try_push((region.clone(), Some(pair)))?;
-            continue;
-        }
-        // The pair losing is not the calls losing. Where jumps are dense and
-        // short, as in unoptimised code, converting them costs more than the
-        // calls give back. Only a region the pair fails pays for this second
-        // question.
-        if priced(region, Some(FilterKind::E8))? < baseline {
+        } else if calls.next().expect("a failed region prices its calls") < baseline {
             helped = true;
             kept.try_push((region.clone(), None))?;
         }
@@ -808,22 +860,26 @@ fn x86_screened_regions<S: OwnedSearch>(
     }
 
     // Held back until the regions are known to be worth filtering at all. Asking
-    // per region inside the loop above priced the jump opcodes on members that
+    // per region inside the screen above priced the jump opcodes on members that
     // then declined every filter, which is a sample encode each for an answer
     // nothing reads.
-    let mut jumps_pay = false;
-    let mut jumps_cost_more = false;
-    for (region, pair) in kept.iter() {
-        let Some(pair) = pair else {
-            jumps_cost_more = true;
-            continue;
-        };
-        jumps_pay = true;
-        if search.prices_calls_alone() {
-            jumps_cost_more = true;
-            continue;
-        }
-        jumps_cost_more |= priced(region, Some(FilterKind::E8))? < *pair;
+    let jumps_pay = kept.iter().any(|(_, pair)| pair.is_some());
+    let mut jumps_cost_more = kept.iter().any(|(_, pair)| pair.is_none());
+    if jumps_pay && search.prices_calls_alone() {
+        jumps_cost_more = true;
+    } else if jumps_pay {
+        let paired = Buffer::collect(
+            kept.iter()
+                .filter_map(|(region, pair)| pair.map(|pair| (region.clone(), pair))),
+            search.allowance(),
+        )?;
+        let calls = search.each(paired.len(), longest, &|search: &S, index| {
+            priced(search, &paired[index].0, Some(FilterKind::E8))
+        })?;
+        jumps_cost_more |= calls
+            .iter()
+            .zip(paired.iter())
+            .any(|(&calls, &(_, pair))| calls < pair);
     }
 
     Ok(X86Screen {
@@ -1076,18 +1132,36 @@ fn table_screened_regions<S: OwnedSearch>(
     options: S::Options,
 ) -> Result<TableRegions<S::Memory>> {
     let screen_options = search.screen_options(options);
+    let sampled = Buffer::collect(
+        regions
+            .iter()
+            .filter(|(region, _)| {
+                screen_sample(&data[region.clone()]).len() >= SCREEN_SAMPLE_ALIGNMENT
+            })
+            .cloned(),
+        search.allowance(),
+    )?;
+    // Each region's sample left alone, then under delta at its stride.
+    let packed = search.each(
+        2 * sampled.len(),
+        SCREEN_SAMPLE_LEN.min(data.len()),
+        &|search: &S, index| {
+            let (region, stride) = &sampled[index / 2];
+            let sample = screen_sample(&data[region.clone()]);
+            if index % 2 == 0 {
+                return Ok(search.encode_plain(sample, screen_options, None)?.len());
+            }
+            let filters = [FilterSpec::whole(FilterKind::Delta { channels: *stride })];
+            let transformed = search.filtered_bytes(sample, &filters)?;
+            Ok(search
+                .encode_plain(&transformed, screen_options, None)?
+                .len())
+        },
+    )?;
     let mut kept = Buffer::new(search.allowance());
-    for (region, stride) in regions {
-        let sample = screen_sample(&data[region.clone()]);
-        if sample.len() < SCREEN_SAMPLE_ALIGNMENT {
-            continue;
-        }
-        let baseline = search.encode_plain(sample, screen_options, None)?;
-        let filters = [FilterSpec::whole(FilterKind::Delta { channels: *stride })];
-        let transformed = search.filtered_bytes(sample, &filters)?;
-        let filtered = search.encode_plain(&transformed, screen_options, None)?;
-        if screen_wins(filtered.len(), baseline.len()) {
-            kept.try_push((region.clone(), *stride))?;
+    for (region, packed) in sampled.iter().zip(packed.chunks(2)) {
+        if screen_wins(packed[1], packed[0]) {
+            kept.try_push(region.clone())?;
         }
     }
     Ok(kept)
@@ -1187,30 +1261,41 @@ fn tables_outside_code<S: OwnedSearch>(
     } else {
         FilterKind::E8
     };
-    let mut kept = Buffer::new(search.allowance());
-    for (region, stride) in tables {
-        // Sampled as the x86 screen samples a region, so a table as long as
-        // the code it lies in is not judged on whatever its middle holds.
-        let mut as_table = 0;
-        let mut as_code = 0;
-        for within in x86_region_samples(&region, search.x86_region_sample_span()) {
-            let in_code = code
-                .kept
-                .iter()
-                .any(|code| code.start < within.end && within.start < code.end);
-            if !in_code {
-                continue;
+    // Each table priced as a table, then as code. Sampled as the x86 screen
+    // samples a region, so a table as long as the code it lies in is not
+    // judged on whatever its middle holds.
+    let packed = search.each(
+        2 * tables.len(),
+        SCREEN_SAMPLE_LEN.min(data.len()),
+        &|search: &S, index| {
+            let (region, stride) = &tables[index / 2];
+            let mut packed = 0;
+            for within in x86_region_samples(region, search.x86_region_sample_span()) {
+                let in_code = code
+                    .kept
+                    .iter()
+                    .any(|code| code.start < within.end && within.start < code.end);
+                if !in_code {
+                    continue;
+                }
+                let filtered = if index % 2 == 0 {
+                    let filters = [FilterSpec::whole(FilterKind::Delta { channels: *stride })];
+                    search.filtered_bytes(&data[within], &filters)?
+                } else {
+                    filtered_sample(search, data, within, kind)?
+                };
+                packed += search.encode_plain(&filtered, screen_options, None)?.len();
             }
-            let filters = [FilterSpec::whole(FilterKind::Delta { channels: stride })];
-            let table = search.filtered_bytes(&data[within.clone()], &filters)?;
-            as_table += search.encode_plain(&table, screen_options, None)?.len();
-            let code = filtered_sample(search, data, within, kind)?;
-            as_code += search.encode_plain(&code, screen_options, None)?.len();
-        }
+            Ok(packed)
+        },
+    )?;
+    let mut kept = Buffer::new(search.allowance());
+    for (region, packed) in tables.into_iter().zip(packed.chunks(2)) {
+        let (as_table, as_code) = (packed[0], packed[1]);
         if as_code < as_table {
             continue;
         }
-        kept.try_push((region, stride))?;
+        kept.try_push(region)?;
     }
     Ok(kept)
 }
@@ -1343,46 +1428,62 @@ fn trial_size<S: OwnedSearch>(
     trial_options: S::Options,
     seen: &mut Buffer<(usize, u64, usize), S::Memory>,
 ) -> Result<usize> {
+    let windows = Buffer::collect(trial_windows(data.len()), search.allowance())?;
+    let known = &*seen;
+    // Each window's hash, what it packed to, and whether it was encoded here
+    // rather than found in `seen`. Two windows of one finalist never share an
+    // index, so only earlier finalists' windows are ever found.
+    let packed = search.each(
+        windows.len(),
+        TRIAL_WINDOW_LEN.min(data.len()),
+        &|search: &S, index| {
+            let window = windows[index].clone();
+            let mut cut = Buffer::new(search.allowance());
+            for spec in specs {
+                let range = spec.range.clone().unwrap_or(0..data.len());
+                let start = range.start.max(window.start);
+                let end = range.end.min(window.end);
+                if start < end {
+                    cut.try_push(FilterSpec::range(
+                        spec.kind,
+                        start - window.start..end - window.start,
+                    ))?;
+                }
+            }
+            let filtered;
+            let window_bytes = &data[window.clone()];
+            let bytes = if cut.is_empty() {
+                window_bytes
+            } else {
+                filtered = search.filtered_window(window_bytes, window.start, &cut)?;
+                &filtered[..]
+            };
+            let hash = {
+                use std::hash::{Hash, Hasher};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                bytes.hash(&mut hasher);
+                hasher.finish()
+            };
+            let found = known
+                .iter()
+                .find(|&&(seen_index, seen_hash, _)| seen_index == index && seen_hash == hash)
+                .map(|&(_, _, packed)| packed);
+            Ok(match found {
+                Some(packed) => (hash, packed, false),
+                None => (
+                    hash,
+                    search.encode_plain(bytes, trial_options, None)?.len(),
+                    true,
+                ),
+            })
+        },
+    )?;
     let mut total = 0;
-    for (index, window) in trial_windows(data.len()).enumerate() {
-        let mut cut = Buffer::new(search.allowance());
-        for spec in specs {
-            let range = spec.range.clone().unwrap_or(0..data.len());
-            let start = range.start.max(window.start);
-            let end = range.end.min(window.end);
-            if start < end {
-                cut.try_push(FilterSpec::range(
-                    spec.kind,
-                    start - window.start..end - window.start,
-                ))?;
-            }
+    for (index, (hash, packed, encoded)) in packed.into_iter().enumerate() {
+        total += packed;
+        if encoded {
+            seen.try_push((index, hash, packed))?;
         }
-        let filtered;
-        let window_bytes = &data[window.clone()];
-        let bytes = if cut.is_empty() {
-            window_bytes
-        } else {
-            filtered = search.filtered_window(window_bytes, window.start, &cut)?;
-            &filtered[..]
-        };
-        let hash = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            bytes.hash(&mut hasher);
-            hasher.finish()
-        };
-        let known = seen
-            .iter()
-            .find(|&&(seen_index, seen_hash, _)| seen_index == index && seen_hash == hash)
-            .map(|&(_, _, packed)| packed);
-        total += match known {
-            Some(packed) => packed,
-            None => {
-                let packed = search.encode_plain(bytes, trial_options, None)?.len();
-                seen.try_push((index, hash, packed))?;
-                packed
-            }
-        };
     }
     Ok(total)
 }
@@ -1426,24 +1527,39 @@ fn trial_winner<S: OwnedSearch>(
     {
         return Ok(None);
     }
-    let mut seen = Buffer::new(search.allowance());
     let mut best: Option<(usize, usize)> = None;
-    for (index, (specs, _)) in finalists.iter().enumerate() {
-        let packed = match (whole, specs.is_empty()) {
-            (true, true) => search.encode_plain(data, trial_options, None)?.len(),
-            (true, false) => search
-                .encode_filtered(data, specs, trial_options, None)?
-                .len(),
-            (false, true) => continue,
+    if whole {
+        let all = &*finalists;
+        let packed = search.each(all.len(), data.len(), &|search: &S, index| {
+            let specs = &all[index].0;
+            Ok(if specs.is_empty() {
+                search.encode_plain(data, trial_options, None)?.len()
+            } else {
+                search
+                    .encode_filtered(data, specs, trial_options, None)?
+                    .len()
+            })
+        })?;
+        for (index, packed) in packed.into_iter().enumerate() {
+            if best.is_none_or(|(_, best)| packed < best) {
+                best = Some((index, packed));
+            }
+        }
+    } else {
+        let mut seen = Buffer::new(search.allowance());
+        for (index, (specs, _)) in finalists.iter().enumerate() {
+            if specs.is_empty() {
+                continue;
+            }
             // The only filter a screen passed.
-            (false, false) if finalists.len() == 2 => {
+            if finalists.len() == 2 {
                 best = Some((index, 0));
                 break;
             }
-            (false, false) => trial_size(search, data, specs, trial_options, &mut seen)?,
-        };
-        if best.is_none_or(|(_, best)| packed < best) {
-            best = Some((index, packed));
+            let packed = trial_size(search, data, specs, trial_options, &mut seen)?;
+            if best.is_none_or(|(_, best)| packed < best) {
+                best = Some((index, packed));
+            }
         }
     }
     let (best, _) = best.expect("a trial has a candidate");
@@ -1519,18 +1635,43 @@ pub(crate) fn choose_filter<S: FilterSearch>(
 /// The filters [`choose_owned`] would pick, for a caller that encodes the
 /// member itself, under filters chosen for more than this one search. A
 /// winner the trial picks is not encoded at all.
-pub(crate) fn choose_filter_specs<S: FilterSearch>(
+///
+/// The search's independent encodes run side by side as
+/// [`SideBySideSearch`] runs them, in room `admit` grants, and `progress` is
+/// told what each encode walked as [`choose_filter_side_by_side`] tells it.
+/// The choice is the one made with the encodes in turn.
+pub(crate) fn choose_filter_specs<S, R>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-) -> Result<Vec<FilterSpec>> {
-    choose_owned_specs(
-        &UnlimitedSearch(search, Allowance::default()),
-        data,
-        options,
-        progress,
-    )
+    progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
+    admit: &(dyn Fn(usize) -> Option<R> + Sync),
+) -> Result<Vec<FilterSpec>>
+where
+    S: FilterSearch + Sync,
+{
+    let search = UnlimitedSearch(search, Allowance::default());
+    match progress {
+        Some(progress) => specs_only(
+            &SideBySideSearch {
+                search: &SharedReporting {
+                    search: &search,
+                    progress,
+                },
+                admit,
+            },
+            data,
+            options,
+        ),
+        None => specs_only(
+            &SideBySideSearch {
+                search: &search,
+                admit,
+            },
+            data,
+            options,
+        ),
+    }
     .map(|specs| specs.into_vec())
 }
 
@@ -1542,7 +1683,8 @@ pub(crate) fn choose_filter_specs<S: FilterSearch>(
 /// another leaves most threads idle for most of the search. Run beside each
 /// other, those serial stretches overlap. The plain member is a finalist the
 /// screen cannot measure on anything but a member one sample long, so beyond
-/// that it is encoded while the screens run.
+/// that it is encoded while the screens run. The screens' own sample encodes
+/// run side by side as well (see [`SideBySideSearch`]).
 ///
 /// The choice is [`choose_owned`]'s: the finalists are the same, the trial
 /// that ranks them is the same, each is encoded the same way whatever runs
@@ -1551,11 +1693,11 @@ pub(crate) fn choose_filter_specs<S: FilterSearch>(
 /// met, as when they ran in turn. When the trial picks the winner, there is
 /// only that one to encode.
 ///
-/// `admit` is asked for room before each encode beyond the first that would
-/// run at once, and the room it hands back is held until that encode's bytes
-/// have been compared and the losers dropped. When it has none, the search
-/// waits for the encodes in flight instead, so it runs within what `admit`
-/// grants and never waits on it.
+/// `admit(len)` is asked for room before each encode of up to `len` bytes
+/// beyond the first that would run at once, and the room it hands back is
+/// held until that encode's result has been compared and the losers dropped.
+/// When it has none, the search waits for the encodes in flight instead, so
+/// it runs within what `admit` grants and never waits on it.
 ///
 /// `progress` is told how many bytes an encode walked since it last reported,
 /// zero as each encode starts, from whichever thread runs it. False stops the
@@ -1565,27 +1707,155 @@ pub(crate) fn choose_filter_side_by_side<S, R>(
     data: &[u8],
     options: S::Options,
     progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
-    admit: &(dyn Fn() -> Option<R> + Sync),
+    admit: &(dyn Fn(usize) -> Option<R> + Sync),
 ) -> Result<(Vec<FilterSpec>, Vec<u8>)>
 where
     S: FilterSearch + Sync,
-    S::Options: Send + Sync,
     R: Send,
 {
     let search = UnlimitedSearch(search, Allowance::default());
     match progress {
         Some(progress) => side_by_side(
-            &SharedReporting {
-                search: &search,
-                progress,
+            &SideBySideSearch {
+                search: &SharedReporting {
+                    search: &search,
+                    progress,
+                },
+                admit,
             },
             data,
             options,
             admit,
         ),
-        None => side_by_side(&search, data, options, admit),
+        None => side_by_side(
+            &SideBySideSearch {
+                search: &search,
+                admit,
+            },
+            data,
+            options,
+            admit,
+        ),
     }
     .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
+}
+
+/// Runs the independent encodes a search hands to [`OwnedSearch::each`] side
+/// by side, as many at once as there are threads to nest on.
+///
+/// The first encode of each batch is the caller's to cover, as one encode in
+/// turn would be. Each one beside it runs in room `admit` grants for an
+/// encode that long, held until the batch is done; when `admit` has none, the
+/// batch is cut there and the rest wait for the next. With no room at all
+/// they run one at a time. The results come back in order, whichever finished
+/// first, so a search makes the same decisions from them as in turn.
+struct SideBySideSearch<'a, S, R> {
+    search: &'a S,
+    admit: &'a (dyn Fn(usize) -> Option<R> + Sync),
+}
+
+impl<S: OwnedSearch + Sync, R> OwnedSearch for SideBySideSearch<'_, S, R> {
+    type Options = S::Options;
+    type Memory = S::Memory;
+    fn allowance(&self) -> &Self::Memory {
+        self.search.allowance()
+    }
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, S::Memory>> {
+        self.search.screened_kinds(data)
+    }
+    fn detects_x86(&self) -> bool {
+        self.search.detects_x86()
+    }
+    fn prices_calls_alone(&self) -> bool {
+        self.search.prices_calls_alone()
+    }
+    fn max_delta_channels(&self) -> usize {
+        self.search.max_delta_channels()
+    }
+    fn table_scan_window(&self) -> usize {
+        self.search.table_scan_window()
+    }
+    fn x86_region_sample_span(&self) -> usize {
+        self.search.x86_region_sample_span()
+    }
+    fn screen_options(&self, options: Self::Options) -> Self::Options {
+        self.search.screen_options(options)
+    }
+    fn exhaustive(&self) -> bool {
+        self.search.exhaustive()
+    }
+    fn trusts_x86_scanner(&self) -> bool {
+        self.search.trusts_x86_scanner()
+    }
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
+        self.search.filtered_bytes(data, filters)
+    }
+    fn filtered_window(
+        &self,
+        data: &[u8],
+        offset: usize,
+        filters: &[FilterSpec],
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.search.filtered_window(data, offset, filters)
+    }
+    fn encode_plain(
+        &self,
+        data: &[u8],
+        options: Self::Options,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.search.encode_plain(data, options, progress)
+    }
+    fn encode_filtered(
+        &self,
+        data: &[u8],
+        filters: &[FilterSpec],
+        options: Self::Options,
+        progress: Option<&mut dyn FnMut(usize) -> bool>,
+    ) -> Result<Buffer<u8, S::Memory>> {
+        self.search
+            .encode_filtered(data, filters, options, progress)
+    }
+    fn each<T: Send>(
+        &self,
+        count: usize,
+        longest: usize,
+        job: &(dyn Fn(&Self, usize) -> Result<T> + Sync),
+    ) -> Result<Vec<T>> {
+        let at_once = if count > 1 && crate::parallel::may_nest() {
+            crate::parallel::threads()
+        } else {
+            1
+        };
+        let mut done = Vec::with_capacity(count);
+        let mut start = 0;
+        while start < count {
+            let mut end = start + 1;
+            let mut rooms = Vec::new();
+            while end < count && end - start < at_once {
+                match (self.admit)(longest) {
+                    Some(room) => rooms.push(room),
+                    None => break,
+                }
+                end += 1;
+            }
+            let (packed, failure) = if end - start > 1 {
+                crate::parallel::map_prefix((start..end).collect(), |index| job(self, index))
+            } else {
+                match job(self, start) {
+                    Ok(packed) => (vec![packed], None),
+                    Err(error) => (Vec::new(), Some(error)),
+                }
+            };
+            drop(rooms);
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            done.extend(packed);
+            start = end;
+        }
+        Ok(done)
+    }
 }
 
 /// Reports every encode of a search to one sink, from whichever thread runs it.
@@ -1681,11 +1951,10 @@ fn side_by_side<S, R>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    admit: &(dyn Fn() -> Option<R> + Sync),
+    admit: &(dyn Fn(usize) -> Option<R> + Sync),
 ) -> Result<FilterChoice<S::Memory>>
 where
     S: OwnedSearch + Sync,
-    S::Options: Send + Sync,
     R: Send,
 {
     let at_once = if crate::parallel::may_nest() {
@@ -1701,7 +1970,7 @@ where
     // Only a search that encodes every finalist in full is sure to encode the
     // plain member at these settings.
     let early = if at_once > 1 && data.len() > SCREEN_SAMPLE_LEN && search.exhaustive() {
-        admit()
+        admit(data.len())
     } else {
         None
     };
@@ -1744,11 +2013,10 @@ fn smallest<S, R>(
     options: S::Options,
     finalists: impl Iterator<Item = Finalist<S::Memory>>,
     at_once: usize,
-    admit: &(dyn Fn() -> Option<R> + Sync),
+    admit: &(dyn Fn(usize) -> Option<R> + Sync),
 ) -> Result<Option<FilterChoice<S::Memory>>>
 where
     S: OwnedSearch + Sync,
-    S::Options: Send + Sync,
 {
     let encode = |(specs, measured): Finalist<S::Memory>| -> Result<FilterChoice<S::Memory>> {
         let packed = match measured {
@@ -1771,7 +2039,7 @@ where
                     break;
                 }
                 if encodes > 0 {
-                    match admit() {
+                    match admit(data.len()) {
                         Some(room) => rooms.push(room),
                         None => break,
                     }
@@ -1838,12 +2106,33 @@ fn specs_only<S: OwnedSearch>(
     data: &[u8],
     options: S::Options,
 ) -> Result<Buffer<FilterSpec, S::Memory>> {
-    let mut finalists = ranked_finalists(search, data, options)?;
-    if finalists.len() == 1 {
-        let (specs, _) = finalists.pop().expect("one finalist");
-        return Ok(specs);
+    let finalists = ranked_finalists(search, data, options)?;
+    // Only the sizes are compared, as [`choose_filter_inner_from`] compares
+    // them: the smallest wins and the earliest takes a tie.
+    let packed = if finalists.len() == 1 {
+        vec![0]
+    } else {
+        search.each(finalists.len(), data.len(), &|search: &S, index| {
+            let (specs, measured) = &finalists[index];
+            Ok(match measured {
+                Some(packed) => packed.len(),
+                None if specs.is_empty() => search.encode_plain(data, options, None)?.len(),
+                None => search.encode_filtered(data, specs, options, None)?.len(),
+            })
+        })?
+    };
+    let mut best: Option<(usize, usize)> = None;
+    for (index, packed) in packed.into_iter().enumerate() {
+        if best.is_none_or(|(_, best)| packed < best) {
+            best = Some((index, packed));
+        }
     }
-    choose_filter_inner_from(search, data, options, finalists).map(|(specs, _)| specs)
+    let (best, _) = best.expect("the unfiltered member is always a finalist");
+    Ok(finalists
+        .into_iter()
+        .nth(best)
+        .map(|(specs, _)| specs)
+        .expect("the best is a finalist"))
 }
 
 pub(crate) fn choose_owned<S: OwnedSearch>(
@@ -3956,7 +4245,9 @@ mod tests {
             for granted in [0, 1, 2, 8] {
                 let search = Scripted::new(sizes);
                 let chosen = pool.install(|| {
-                    choose_filter_side_by_side(&search, &data, (), None, &|| room(&search, granted))
+                    choose_filter_side_by_side(&search, &data, (), None, &|_| {
+                        room(&search, granted)
+                    })
                 });
                 assert_eq!(
                     chosen.unwrap(),
@@ -3977,7 +4268,7 @@ mod tests {
             let search = Scripted::new(sizes);
             let chosen = pool.install(|| {
                 let _cap = crate::parallel::ThreadCap::set(Some(1));
-                choose_filter_side_by_side(&search, &data, (), None, &|| -> Option<()> {
+                choose_filter_side_by_side(&search, &data, (), None, &|_| -> Option<()> {
                     panic!("room asked for at one thread")
                 })
             });
@@ -4005,7 +4296,9 @@ mod tests {
             let serial = choose_filter(&search, &data, (), None).unwrap_err();
             for granted in [0, 1, 8] {
                 let chosen = pool.install(|| {
-                    choose_filter_side_by_side(&search, &data, (), None, &|| room(&search, granted))
+                    choose_filter_side_by_side(&search, &data, (), None, &|_| {
+                        room(&search, granted)
+                    })
                 });
                 assert_eq!(chosen.unwrap_err(), serial, "{failures:?} {granted}");
                 assert_eq!(search.rooms.load(SeqCst), 0);
@@ -4045,7 +4338,7 @@ mod tests {
                     starts.fetch_add(usize::from(bytes == 0), SeqCst);
                     true
                 }),
-                &|| room(&search, 8),
+                &|_| room(&search, 8),
             )
         })
         .unwrap();
@@ -4056,7 +4349,7 @@ mod tests {
         for granted in [0, 8] {
             let search = Scripted::new(sizes);
             let chosen = pool.install(|| {
-                choose_filter_side_by_side(&search, &data, (), Some(&|_| false), &|| {
+                choose_filter_side_by_side(&search, &data, (), Some(&|_| false), &|_| {
                     room(&search, granted)
                 })
             });
