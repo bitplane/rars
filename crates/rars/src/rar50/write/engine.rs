@@ -2958,6 +2958,9 @@ pub(super) fn write_volumes_above<'a>(
         fixed_len: 0,
         body_budget: None,
         fragments_in_volume: 0,
+        volume_full: false,
+        tail: None,
+        recutting: false,
         volume_index: 0,
         trailing_producer: None,
         trailing_len: 0,
@@ -3021,6 +3024,10 @@ pub(super) fn write_volumes_above<'a>(
             let member = match handed {
                 Handed::Member(member) => member,
                 Handed::Opening { input_size } => {
+                    // A member packed in place writes straight into the
+                    // volume, so what is held back goes in first. Its first
+                    // fragment fills the volume to where the body fits.
+                    writer.flush_tail().map_err(writing)?;
                     let opened = VolumeInPlace::open(
                         entry,
                         index,
@@ -3280,11 +3287,106 @@ struct VolumeWriter<'a> {
     /// `volume_size`, worked out the first time a fragment has to be cut.
     body_budget: Option<u64>,
     fragments_in_volume: u64,
+    /// A fragment that leaves the rest of its member for the next volume
+    /// has been cut in this one, so nothing more goes in it. A recovery record
+    /// over a longer body can be the shorter one and leave room for more, but
+    /// a reader takes a member that goes on in the volume it was split from
+    /// as interrupted.
+    volume_full: bool,
+    /// Fragments that ended their members past what the volume can hold.
+    tail: Option<Tail>,
+    /// The tail is being cut again, so every fragment has to fit.
+    recutting: bool,
     volume_index: u64,
     /// A later volume's producer record, written after its files when it closes.
     trailing_producer: Option<PreparedBlock<'static>>,
     /// Its length, which the volume's budget sets aside.
     trailing_len: u64,
+}
+
+/// The next fragment [`VolumeWriter::measure_fragment`] finds room for.
+struct FragmentRoom {
+    len: u64,
+    header: u64,
+}
+
+/// Fragments written since the volume's body last fitted in it.
+///
+/// Below about 200 KiB a recovery record over a shorter body can be the longer
+/// one, so a member can end where the volume would come out too long, and the
+/// members after it carry the body back within the volume. Until they do,
+/// their fragments are held here rather than in the volume. If the volume has
+/// to close first, they are cut again to fit.
+#[derive(Default)]
+struct Tail {
+    bytes: std::io::Cursor<Vec<u8>>,
+    fragments: Vec<HeldFragment>,
+}
+
+/// A fragment that ends its member, held in a [`Tail`], with what it takes to
+/// cut it again.
+struct HeldFragment {
+    name: Vec<u8>,
+    is_directory: bool,
+    mtime: Option<u32>,
+    mtime_nanoseconds: Option<u32>,
+    file_times: Option<crate::file_times::TimeRecord>,
+    attributes: u64,
+    host_os: u64,
+    unpacked_size: u64,
+    crc32: u32,
+    hash: Option<[u8; 32]>,
+    compression_info: u64,
+    encryption: Option<([u8; 16], [u8; 16], [u8; 12])>,
+    cut: Cut,
+    /// Where its payload starts in the tail.
+    payload_at: usize,
+}
+
+impl HeldFragment {
+    fn new(member: &VolumeMember, cut: Cut, payload_at: u64) -> Self {
+        Self {
+            name: member.name.to_vec(),
+            is_directory: member.is_directory,
+            mtime: member.mtime,
+            mtime_nanoseconds: member.mtime_nanoseconds,
+            file_times: member.file_times,
+            attributes: member.attributes,
+            host_os: member.host_os,
+            unpacked_size: member.unpacked_size,
+            crc32: member.crc32,
+            hash: member.hash,
+            compression_info: member.compression_info,
+            encryption: member.encryption,
+            cut,
+            payload_at: payload_at as usize,
+        }
+    }
+
+    /// The rest of the member, from the fragment's start, read from `tail`.
+    fn member<'a>(&'a self, tail: &[u8], resources: &WriterResources) -> Result<VolumeMember<'a>> {
+        let mut bytes = Bytes::new(resources);
+        bytes.extend_from_slice(&tail[self.payload_at..self.payload_at + self.cut.len as usize])?;
+        Ok(VolumeMember {
+            name: &self.name,
+            is_directory: self.is_directory,
+            mtime: self.mtime,
+            mtime_nanoseconds: self.mtime_nanoseconds,
+            file_times: self.file_times,
+            attributes: self.attributes,
+            host_os: self.host_os,
+            unpacked_size: self.unpacked_size,
+            crc32: self.crc32,
+            hash: self.hash,
+            compression_info: self.compression_info,
+            payload_len: self.cut.start + self.cut.len,
+            source: FragmentSource::Held {
+                bytes,
+                base: self.cut.start,
+            },
+            encryption: self.encryption,
+        })
+    }
 }
 
 impl VolumeWriter<'_> {
@@ -3311,29 +3413,65 @@ impl VolumeWriter<'_> {
             // A volume is closed only once the next fragment cannot fit in it,
             // because until then we cannot say whether it is the last one, and
             // its end-of-archive block has to say which.
-            let Some(fragment_len) = self.fragment_room(member, split_before, remaining)? else {
-                self.close_full_volume()?;
+            let Some(FragmentRoom {
+                len: fragment_len,
+                header: header_len,
+            }) = self.measure_fragment(member, split_before, remaining)?
+            else {
+                if self.tail.is_some() {
+                    self.recut_tail()?;
+                } else {
+                    self.close_full_volume()?;
+                }
                 continue;
             };
             let split_after = start + fragment_len < member.payload_len;
-            let body = self.body.as_mut().expect("volume started").io();
-            write_fragment(
-                &mut CancellableIo {
-                    inner: body,
-                    progress: self.progress,
-                },
-                member,
-                Cut {
-                    start,
-                    len: fragment_len,
-                    split_before,
-                },
-                split_after,
-                self.header_keys,
-                self.resources,
-                self.copy_work,
-            )?;
+            let cut = Cut {
+                start,
+                len: fragment_len,
+                split_before,
+            };
+            let ends_at = self
+                .used()?
+                .saturating_add(header_len)
+                .saturating_add(fragment_len);
+            let ends_past =
+                self.tail.is_some() || (self.recovery_percent.is_some() && !self.fits(ends_at)?);
+            if ends_past {
+                let tail = self.tail.get_or_insert_with(Tail::default);
+                let at = tail.bytes.position();
+                let header_len = write_fragment(
+                    &mut tail.bytes,
+                    member,
+                    cut,
+                    split_after,
+                    self.header_keys,
+                    self.resources,
+                    self.copy_work,
+                )?;
+                tail.fragments
+                    .push(HeldFragment::new(member, cut, at + header_len));
+                let used = self.used()?;
+                if self.fits(used)? {
+                    self.flush_tail()?;
+                }
+            } else {
+                let body = self.body.as_mut().expect("volume started").io();
+                write_fragment(
+                    &mut CancellableIo {
+                        inner: body,
+                        progress: self.progress,
+                    },
+                    member,
+                    cut,
+                    split_after,
+                    self.header_keys,
+                    self.resources,
+                    self.copy_work,
+                )?;
+            }
             self.fragments_in_volume += 1;
+            self.volume_full = split_after;
             start += fragment_len;
             split_before = true;
 
@@ -3341,6 +3479,35 @@ impl VolumeWriter<'_> {
                 return Ok(());
             }
         }
+    }
+
+    /// Writes the tail into the volume as it stands.
+    fn flush_tail(&mut self) -> Result<()> {
+        let Some(tail) = self.tail.take() else {
+            return Ok(());
+        };
+        let body = self.body.as_mut().expect("volume started").io();
+        CancellableIo {
+            inner: body,
+            progress: self.progress,
+        }
+        .write_all(tail.bytes.get_ref())?;
+        Ok(())
+    }
+
+    /// Cuts the tail's fragments again, each to fit where it lands, because
+    /// the volume has to close before anything brings its body back within
+    /// it.
+    fn recut_tail(&mut self) -> Result<()> {
+        let tail = self.tail.take().expect("a tail to cut again");
+        self.fragments_in_volume -= tail.fragments.len() as u64;
+        self.recutting = true;
+        let recut = tail.fragments.iter().try_for_each(|held| {
+            let mut member = held.member(tail.bytes.get_ref(), self.resources)?;
+            self.write_member_from(&mut member, held.cut.start, held.cut.split_before)
+        });
+        self.recutting = false;
+        recut
     }
 
     /// Closes a volume the next fragment does not fit in, unless it holds no
@@ -3357,37 +3524,84 @@ impl VolumeWriter<'_> {
     /// How much of the volume's budget is spoken for. A later volume's
     /// producer record joins the body when it closes.
     fn used(&mut self) -> Result<u64> {
-        Ok(self.body.as_mut().expect("volume started").len()? + self.trailing_len)
+        let tail = self
+            .tail
+            .as_ref()
+            .map_or(0, |tail| tail.bytes.get_ref().len() as u64);
+        Ok(self.body.as_mut().expect("volume started").len()? + self.trailing_len + tail)
     }
 
     /// The longest next fragment of `member` that still fits in this volume
-    /// with its header, or `None` when not even the header and one byte do.
-    /// A member with nothing left still needs room for its header.
+    /// with its header, or `None` when not even the header and one byte do,
+    /// or a fragment cut in this volume left the rest of its member for the
+    /// next. A member with nothing left still needs room for its header.
     fn fragment_room(
         &mut self,
         member: &VolumeMember,
         split_before: bool,
         remaining: u64,
     ) -> Result<Option<u64>> {
+        Ok(self
+            .measure_fragment(member, split_before, remaining)?
+            .map(|room| room.len))
+    }
+
+    /// [`Self::fragment_room`], with the length of the fragment's header.
+    ///
+    /// Under header encryption every header measured draws an IV, so a full
+    /// volume is refused only after the measurements an open one would make.
+    fn measure_fragment(
+        &mut self,
+        member: &VolumeMember,
+        split_before: bool,
+        remaining: u64,
+    ) -> Result<Option<FragmentRoom>> {
         let used = self.used()?;
         // Most of the time the rest of the member fits as it is, and one
         // layout check says so without working out the whole budget.
         let header = self.fragment_header_len(member, remaining, split_before)?;
         if self.fits(used.saturating_add(header).saturating_add(remaining))? {
-            return Ok(Some(remaining));
+            return Ok((!self.volume_full).then_some(FragmentRoom {
+                len: remaining,
+                header,
+            }));
         }
         let room = self.body_budget()?.saturating_sub(used);
         let mut len = remaining.min(room);
         let header = self.fragment_header_len(member, len, split_before)?;
         if header.saturating_add(len) > room {
-            // A shorter fragment never has a longer header, so this fits.
+            // A shorter fragment never has a longer header, so this is within
+            // the budget.
             len = room.saturating_sub(header);
         }
         if len == 0 && remaining > 0 {
             return Ok(None);
         }
-        let header = self.fragment_header_len(member, len, split_before)?;
-        Ok((header.saturating_add(len) <= room).then_some(len))
+        let mut header = self.fragment_header_len(member, len, split_before)?;
+        if self.volume_full {
+            return Ok(None);
+        }
+        // Within the budget is not always within the volume, since a recovery
+        // record over a shorter body can be the longer one. A fragment that
+        // ends its member may go past what fits, into the tail, for the next
+        // members to carry the body back. One that leaves the rest of its
+        // member for the next volume, or one cut again from the tail, is the
+        // last in the volume, so it steps down to the longest that fits.
+        if (len < remaining || self.recutting)
+            && !self.fits(used.saturating_add(header).saturating_add(len))?
+        {
+            loop {
+                if len == 0 {
+                    return Ok(None);
+                }
+                len -= 1;
+                header = self.fragment_header_len(member, len, split_before)?;
+                if self.fits(used.saturating_add(header).saturating_add(len))? {
+                    break;
+                }
+            }
+        }
+        Ok((header.saturating_add(len) <= room).then_some(FragmentRoom { len, header }))
     }
 
     /// A fragment header's size depends only on the fragment's length: the
@@ -3442,17 +3656,19 @@ impl VolumeWriter<'_> {
         Ok(self.volume_overhead(body_len)?.saturating_add(body_len) <= self.volume_size)
     }
 
-    /// The most body bytes this volume can hold and still come in at or under
+    /// A body this volume can hold and still come in at or under
     /// `volume_size` once its main header, recovery record and end block are
-    /// added.
+    /// added, where one byte more does not fit.
     ///
-    /// That overhead only grows with the body, through the main header's
+    /// The overhead mostly grows with the body, through the main header's
     /// variable-length offsets and the recovery record's size. So taking the
     /// overhead of the largest body there could be off the volume size gives a
     /// body that fits, and it is exact when the overhead did not shrink on the
     /// way down, which without a recovery record it never does. Whatever a
     /// smaller recovery record gives back is found by a binary search over
-    /// that gap.
+    /// that gap. A recovery record over a small body is not monotone in it,
+    /// so a shorter body than this does not always fit:
+    /// [`Self::fragment_room`] checks each fragment against [`Self::fits`].
     fn body_budget(&mut self) -> Result<u64> {
         if let Some(budget) = self.body_budget {
             return Ok(budget);
@@ -3462,8 +3678,8 @@ impl VolumeWriter<'_> {
             .volume_size
             .saturating_sub(self.volume_overhead(largest)?);
         let budget = if self.fits(fitting)? {
-            // The overhead never shrinks as the body grows, so nothing longer
-            // than the volume less the overhead of an empty body can fit.
+            // The search goes no further than the volume less the overhead of
+            // an empty body.
             let mut too_long = self.volume_size.saturating_sub(self.volume_overhead(0)?) + 1;
             while too_long - fitting > 1 {
                 let middle = fitting + (too_long - fitting) / 2;
@@ -3554,6 +3770,9 @@ impl VolumeWriter<'_> {
     fn finish(mut self) -> Result<()> {
         // The public volume entry point rejects empty member lists; each
         // nonempty member starts a volume, even when its payload is empty.
+        if self.tail.is_some() {
+            self.recut_tail()?;
+        }
         self.finish_volume(false)
     }
 
@@ -3580,6 +3799,7 @@ impl VolumeWriter<'_> {
             RAR50_SIGNATURE.len() as u64 + self.head_crypt_len + self.end_block(true)?.len() as u64;
         self.body_budget = None;
         self.fragments_in_volume = 0;
+        self.volume_full = false;
         Ok(())
     }
 
@@ -3644,6 +3864,10 @@ impl VolumeWriter<'_> {
 
     /// Takes the volume being filled, so the next one can start before it closes.
     fn take_volume(&mut self) -> FilledVolume {
+        debug_assert!(
+            self.tail.is_none(),
+            "a volume closes with nothing held back"
+        );
         let number = self.volume_index;
         self.volume_index += 1;
         FilledVolume {
@@ -4236,6 +4460,7 @@ impl Cutter<'_> {
             Error::WriterFailure("RAR 5 fragment header changed length when patched"),
         )?;
         writer.fragments_in_volume += 1;
+        writer.volume_full = fragment.is_some();
         let cut = CutFragment {
             cut: Cut {
                 start: self.start,
@@ -5341,6 +5566,9 @@ mod emission_ledger_tests {
                 fixed_len: 0,
                 body_budget: None,
                 fragments_in_volume: 0,
+                volume_full: false,
+                tail: None,
+                recutting: false,
                 volume_index: 0,
                 trailing_producer: None,
                 trailing_len: 0,

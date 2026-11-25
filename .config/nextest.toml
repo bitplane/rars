@@ -37,6 +37,7 @@ not (
     (binary_id(rars) & test(=rar50::write::in_place_tests::large_solid_members_anywhere_in_the_chain_extract_from_either_output)) |
     (binary_id(rars) & test(=rar50::write::volume_body_tests::large_members_ending_at_a_volume_edge_match_spooled_ones)) |
     (binary_id(rars) & test(=rar50::write::volume_body_tests::large_members_packed_into_the_volumes_match_spooled_ones)) |
+    (binary_id(rars) & test(=rar50::write::volume_body_tests::small_recovery_volumes_stay_within_the_volume_size)) |
     (binary_id(rars) & test(=rar50::write::tests::parallel_streaming_blocks_are_byte_identical_to_serial_blocks)) |
     (binary_id(rars) & test(=rar50::write::tests::streaming_entry_order_is_identical_at_one_and_many_job_budgets)) |
     (binary_id(rars-cli::cli) & test(=raising_the_memory_limit_never_changes_the_archive)) |
