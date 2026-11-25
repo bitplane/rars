@@ -1044,6 +1044,12 @@ impl Archive {
 
     /// Streams extracted entries to caller-provided writers.
     ///
+    /// `open` receives files and directories only. Links are left out in every
+    /// format: RAR 5 redirections (Unix and Windows symbolic links, junctions,
+    /// hard links and file copies) and RAR 1.5-4.x Unix symbolic links. A
+    /// legacy link's payload is still decoded and checked. Use
+    /// [`Self::extract_with_links`] to receive links as well.
+    ///
     /// Output is not transactional: integrity checks can fail after all bytes of
     /// a member have been written, and decode/filter or sink failures can leave
     /// a partial member. Earlier entries and callback side effects are not rolled
@@ -1062,7 +1068,7 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers with read options.
-    /// Has the failure and staging semantics of [`Self::extract_to`].
+    /// Has the link handling, failure and staging semantics of [`Self::extract_to`].
     pub fn extract_to_with_options<F>(
         &self,
         options: ArchiveReadOptions<'_>,
@@ -1101,6 +1107,7 @@ impl Archive {
     ///
     /// A split member's writer opens at its first part, so a later volume that
     /// turns out wrong leaves partial output, as with [`Self::extract_to`].
+    /// Links are left out, as there.
     pub fn extract_with_volumes<V, F>(
         &self,
         volumes: V,
@@ -1156,14 +1163,21 @@ impl Archive {
                         )
                     }
                 });
-                rar15_40::extract_from_feed(
-                    &mut feed,
-                    options,
-                    |meta| open(&rar15_40_meta(meta)),
-                    legacy
-                        .as_mut()
-                        .map(|link| link as &mut extraction_links::LegacyLink<'_>),
-                )
+                let open = |meta: &rar15_40::ExtractedEntryMeta| open(&rar15_40_meta(meta));
+                match legacy.as_mut() {
+                    Some(link) => rar15_40::extract_from_feed(
+                        &mut feed,
+                        options,
+                        open,
+                        Some(link as &mut extraction_links::LegacyLink<'_>),
+                    ),
+                    None => rar15_40::extract_from_feed(
+                        &mut feed,
+                        options,
+                        extraction_links::skip_legacy_links(open),
+                        None,
+                    ),
+                }
                 .map_err(|error| error.in_member_volume(feed.current_index()))
             }
             Self::Rar50Plus(first) => {
@@ -1293,7 +1307,8 @@ impl Archive {
     /// most one result per worker; this is not a byte or total-memory ceiling.
     ///
     /// Solid archives, split members, multivolume sets, and RAR 1.3/1.4
-    /// archives use the regular streaming extractor.
+    /// archives use the regular streaming extractor. Links are left out, as
+    /// with [`Self::extract_to`].
     pub fn extract_to_parallel_buffered<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2071,8 +2086,9 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
-/// Has the failure and staging semantics of [`Archive::extract_to`], including
-/// partial output from a split member when a later volume fails.
+/// Has the link handling, failure and staging semantics of
+/// [`Archive::extract_to`], including partial output from a split member when
+/// a later volume fails.
 pub fn extract_volumes_to<F>(archives: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2081,11 +2097,37 @@ where
 }
 
 /// Streams a multivolume archive set to caller-provided writers with read options.
-/// Has the failure and staging semantics of [`Archive::extract_to`].
+/// Has the link handling, failure and staging semantics of [`Archive::extract_to`].
 pub fn extract_volumes_to_with_options<F>(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_impl(archives, options, open, true)
+}
+
+/// Streams a volume set as [`extract_volumes_to_with_options`] does, but hands
+/// RAR 1.5-4.x Unix symbolic links to `open` as ordinary members whose data is
+/// the target, for callers that read or verify every payload.
+pub(crate) fn extract_volume_payloads<F>(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_impl(archives, options, open, false)
+}
+
+fn extract_volumes_impl<F>(
+    archives: &[Archive],
+    options: ArchiveReadOptions<'_>,
     mut open: F,
+    skip_links: bool,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2104,7 +2146,12 @@ where
         }
         ArchiveFamily::Rar15To40 => {
             let typed = rar15_40_volumes(archives)?;
-            rar15_40::extract_volumes_to(&typed, options, |meta| open(&rar15_40_meta(meta)))
+            let open = |meta: &rar15_40::ExtractedEntryMeta| open(&rar15_40_meta(meta));
+            if skip_links {
+                rar15_40::extract_volumes_to(&typed, options, open)
+            } else {
+                rar15_40::extract_volume_payloads(&typed, options, open)
+            }
         }
         ArchiveFamily::Rar50Plus => {
             let typed = rar50_volumes(archives)?;
@@ -2144,7 +2191,7 @@ where
         let typed = rar50_volumes(archives)?;
         return rar50::test_volumes_to(&typed, options, |meta| tested(&rar50_meta(meta)));
     }
-    extract_volumes_to_with_options(archives, options, |meta| {
+    extract_volume_payloads(archives, options, |meta| {
         tested(meta)?;
         Ok(Box::new(std::io::sink()) as Box<dyn Write>)
     })
@@ -2212,7 +2259,7 @@ pub fn read_volume_member_at_with_options(
     options.check_cancelled()?;
     let mut output_indices = member_read::volume_output_indices(archives);
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-    extract_volumes_to_with_options(archives, options, |meta| {
+    extract_volume_payloads(archives, options, |meta| {
         if output_indices.next() != Some(index) || meta.is_directory {
             return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
         }

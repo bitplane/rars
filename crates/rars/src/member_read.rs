@@ -193,7 +193,7 @@ pub fn read_volume_members_at_with_options(
     options.check_cancelled()?;
     let batch = ReadBatch::new(indices);
     let mut output_indices = volume_output_indices(archives);
-    crate::extract_volumes_to_with_options(archives, options, |meta| {
+    crate::extract_volume_payloads(archives, options, |meta| {
         let index = output_indices.next();
         if !meta.is_directory {
             if let Some(writer) = index.and_then(|index| batch.writer(index)) {

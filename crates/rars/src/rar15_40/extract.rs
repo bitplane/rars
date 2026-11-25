@@ -5,7 +5,7 @@ use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::rar29::Reader29State;
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
-use crate::extraction_links::{check_legacy_size, legacy_output, LegacyLink};
+use crate::extraction_links::{check_legacy_size, legacy_output, skip_legacy_links, LegacyLink};
 use crate::volume_extract::VolumeFeed;
 use std::io::{Read, Write};
 
@@ -389,8 +389,22 @@ impl FileHeader {
     }
 }
 
-/// Streams a multivolume archive set to caller-provided writers.
+/// Streams a multivolume archive set to caller-provided writers. Unix
+/// symbolic links are left out, as with [`Archive::extract_to`].
 pub fn extract_volumes_to<F>(
+    volumes: &[Archive],
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+) -> Result<()>
+where
+    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    extract_volumes_with_links(volumes, options, skip_legacy_links(open), None)
+}
+
+/// Streams a multivolume archive set as [`extract_volumes_to`] does, but hands
+/// Unix symbolic links to `open` as ordinary members whose data is the target.
+pub(crate) fn extract_volume_payloads<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
     open: F,
