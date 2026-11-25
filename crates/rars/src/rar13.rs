@@ -676,7 +676,9 @@ impl Archive {
         unpack15.read_control = budget.control.clone();
         let mut extracted_count = 0usize;
         let solid = self.main.is_solid();
-        let _read_ahead = self.source.bound_file_read_ahead(selector.is_some() && !solid);
+        let _read_ahead = self
+            .source
+            .bound_file_read_ahead(selector.is_some() && !solid);
         for entry in &self.entries {
             let selected = crate::extraction_control::select(
                 &mut selector,

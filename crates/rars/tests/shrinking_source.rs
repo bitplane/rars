@@ -1,5 +1,6 @@
 #![cfg(feature = "write")]
 
+use rars::atomic64::AtomicU64;
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ExtractionDecision,
     ExtractionOutcome,
@@ -7,8 +8,8 @@ use rars::{
 use std::cell::RefCell;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::rc::Rc;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 #[path = "support/scratch.rs"]
 mod scratch;
