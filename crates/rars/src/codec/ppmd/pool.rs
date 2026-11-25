@@ -14,6 +14,13 @@
 /// Zeroed bytes, read and written as a slice.
 pub(super) struct Pool(imp::Pool);
 
+/// The bytes of every pool alive now that the global allocator does not see:
+/// the mapped ones, at the size they were mapped, which is the most of each
+/// the model can commit.
+pub fn mapped_bytes() -> usize {
+    imp::MAPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 impl Pool {
     pub(super) fn empty() -> Self {
         Self(imp::Pool::empty())
@@ -48,6 +55,9 @@ impl std::fmt::Debug for Pool {
 #[cfg(any(unix, windows))]
 mod imp {
     use memmap2::{MmapMut, MmapOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    pub(super) static MAPPED: AtomicUsize = AtomicUsize::new(0);
 
     /// Even an empty pool is a mapping (memmap2 maps a page for it), so the
     /// model's every access reaches the slice without a branch.
@@ -60,7 +70,10 @@ mod imp {
 
         pub(super) fn zeroed(len: usize) -> Self {
             match MmapOptions::new().len(len).map_anon() {
-                Ok(map) => Self(map),
+                Ok(map) => {
+                    MAPPED.fetch_add(len, Relaxed);
+                    Self(map)
+                }
                 // Out of address space: fail as `vec![0; len]` would.
                 Err(_) => std::alloc::handle_alloc_error(
                     std::alloc::Layout::array::<u8>(len).expect("pool size fits a layout"),
@@ -78,10 +91,21 @@ mod imp {
             &mut self.0
         }
     }
+
+    impl Drop for Pool {
+        fn drop(&mut self) {
+            MAPPED.fetch_sub(self.0.len(), Relaxed);
+        }
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
 mod imp {
+    use std::sync::atomic::AtomicUsize;
+
+    /// A `Vec` pool is a heap allocation, which the allocator sees.
+    pub(super) static MAPPED: AtomicUsize = AtomicUsize::new(0);
+
     pub(super) struct Pool(Vec<u8>);
 
     impl Pool {

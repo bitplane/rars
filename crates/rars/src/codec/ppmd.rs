@@ -10,6 +10,8 @@
 
 mod pool;
 
+pub use pool::mapped_bytes as pool_mapped_bytes;
+
 #[cfg(any(test, feature = "write"))]
 use super::workspace::Allowance;
 use super::workspace::Budget;
