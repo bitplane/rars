@@ -1302,6 +1302,134 @@ fn a_solid_follower_of_an_lz_member_ended_on_padding_keeps_its_tables() {
     );
 }
 
+fn spread_literals(count: usize) -> Vec<u8> {
+    (0..count as u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+        .collect()
+}
+
+fn every_literal_member(symbols: &[LzSymbol<'_>]) -> Vec<u8> {
+    let tokens = encode_table_level_tokens(&every_literal_levels());
+    let mut bits = BitWriter::default();
+    write_table_description(&mut bits, &level_code_lengths(&tokens), &tokens);
+    write_lz_symbols(&mut bits, symbols);
+    bits.finish()
+}
+
+fn decode_whole_and_streamed(packed: &[u8], output_size: usize) -> [(Result<()>, Vec<u8>); 2] {
+    let whole = match unpack29_decode(packed, output_size) {
+        Ok(out) => (Ok(()), out),
+        Err(error) => (Err(error), Vec::new()),
+    };
+    let mut streamed = Vec::new();
+    let result =
+        Unpack29::new().decode_member_from_reader(&mut &packed[..], output_size, &mut streamed);
+    [whole, (result, streamed)]
+}
+
+#[test]
+fn literal_runs_longer_than_the_packed_window_decode_whole_and_streamed() {
+    let literals = spread_literals(1_200_000);
+    let packed =
+        every_literal_member(&[LzSymbol::Literals(&literals), LzSymbol::EndOfFileKeepTables]);
+    assert!(packed.len() > PACKED_WINDOW && literals.len() > STREAM_CHUNK);
+
+    for (result, out) in decode_whole_and_streamed(&packed, literals.len()) {
+        assert_eq!(result, Ok(()));
+        assert!(out == literals);
+    }
+}
+
+#[test]
+fn cancellation_stops_a_long_literal_run_within_the_poll_distance() {
+    let literals = spread_literals(1_200_000);
+    let packed =
+        every_literal_member(&[LzSymbol::Literals(&literals), LzSymbol::EndOfFileKeepTables]);
+    let stops: Vec<usize> = (4..12)
+        .map(|checks| {
+            let token = crate::ReadCancellation::new();
+            let mut decoder = Unpack29::new();
+            decoder.read_control = crate::read_control::ReadControl::new(Some(&token));
+            decoder.read_control.cancel_after_checks(checks);
+            assert_eq!(
+                decoder.decode_non_solid_member(&packed, literals.len()),
+                Err(Error::Cancelled)
+            );
+            decoder.current_pos()
+        })
+        .collect();
+
+    assert!(stops[0] > 0 && stops[stops.len() - 1] < literals.len());
+    // Polls come every 64 KiB of output; a burst adds at most 256 bytes.
+    for pair in stops.windows(2) {
+        assert!(
+            pair[1] > pair[0] && pair[1] - pair[0] <= 64 * 1024 + 256,
+            "{stops:?}"
+        );
+    }
+}
+
+#[test]
+fn a_declared_size_inside_a_literal_run_stops_it_there() {
+    let literals = spread_literals(4096);
+    let packed =
+        every_literal_member(&[LzSymbol::Literals(&literals), LzSymbol::EndOfFileKeepTables]);
+    for size in [1, 2, 255, 256, 257, 258, 511, 1000, 4095] {
+        let [whole, streamed] = decode_whole_and_streamed(&packed, size);
+        let trailing = Err(Error::InvalidData("RAR 2.9 LZ member has trailing data"));
+        assert_eq!(whole.0, trailing, "{size}");
+        assert_eq!(streamed.0, trailing, "{size}");
+        assert!(streamed.1 == literals[..size], "{size}");
+    }
+}
+
+#[test]
+fn a_literal_run_cut_short_inside_a_code_is_truncated() {
+    let literals = spread_literals(4096);
+    let packed = every_literal_member(&[LzSymbol::Literals(&literals)]);
+    // Nine-bit codes: no whole-byte cut past the tables ends on a code boundary.
+    for cut in [64, 65, 300, 301, 2000, packed.len() - 1] {
+        for (result, _) in decode_whole_and_streamed(&packed[..cut], literals.len()) {
+            assert_eq!(
+                result,
+                Err(Error::InvalidData("RAR 2.9 bitstream is truncated")),
+                "{cut}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_unassigned_code_inside_a_literal_run_is_invalid() {
+    // Literal 255 has no code, which leaves the all-ones nine-bit code free.
+    let mut levels = every_literal_levels();
+    levels[255] = 0;
+    let codes = canonical_codes(&levels[..MAIN_COUNT]);
+    let tokens = encode_table_level_tokens(&levels);
+    let literals: Vec<u8> = spread_literals(4096)
+        .into_iter()
+        .map(|byte| byte.min(254))
+        .collect();
+    for before in [0, 1, 300, 4096] {
+        let mut bits = BitWriter::default();
+        write_table_description(&mut bits, &level_code_lengths(&tokens), &tokens);
+        for &literal in &literals[..before] {
+            let code = codes[usize::from(literal)].unwrap();
+            bits.write_bits(u32::from(code.code), code.len);
+        }
+        bits.write_bits(0xffff, 16);
+        let packed = bits.finish();
+
+        for (result, _) in decode_whole_and_streamed(&packed, literals.len()) {
+            assert_eq!(
+                result,
+                Err(Error::InvalidData("RAR 2.9 invalid Huffman code")),
+                "{before}"
+            );
+        }
+    }
+}
+
 /// The second member of the pending-filter tests: E8 operands an x86 filter
 /// would rewrite if it reached them.
 const PAST_THE_BOUNDARY: &[u8] =
