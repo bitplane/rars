@@ -1485,30 +1485,35 @@ impl crate::filter_search::FilterSearch for Rar29Search {
 /// A piece that reads as text is not searched, as a whole member is not.
 ///
 /// The pieces are searched [`PIECE_SEARCHES_AT_ONCE`] at a time where there are
-/// threads for it. Which filters come back does not depend on how many ran at
-/// once, so the archive is the same at any thread count.
-fn rar29_piece_filters(
+/// threads for it, and each piece's search runs its independent encodes side
+/// by side in what `room` grants: asked for the bytes of one more encode at a
+/// time (see [`rar29_search_encode_workspace`]), and `None` keeps it to one.
+/// Which filters come back does not depend on how many ran at once, so the
+/// archive is the same at any thread count.
+fn rar29_piece_filters<R: Send>(
     data: &[u8],
     file_offset: usize,
     options: Rar29EncodeOptions,
     effort: SearchEffort,
     piece: usize,
     cancelled: &(dyn Fn() -> bool + Sync),
+    room: &(dyn Fn(u64) -> Option<R> + Sync),
 ) -> Result<Vec<FilterSpec>> {
     let search_options = options.with_optimal_parse_passes(0);
     let piece = piece.max(1);
+    let admit = |len: usize| room(rar29_search_encode_workspace(len, search_options));
     let search = |start: usize| -> Result<Vec<FilterSpec>> {
         let end = (start + piece).min(data.len());
         let bytes = &data[start..end];
         if !crate::filter_search::search_applies_throughout(bytes) || effort.skips(bytes) {
             return Ok(Vec::new());
         }
-        let mut poll = |_| !cancelled();
         let found = crate::filter_search::choose_filter_specs(
             &Rar29Search::at(file_offset + start, options, effort),
             bytes,
             search_options,
-            Some(&mut poll),
+            Some(&|_| !cancelled()),
+            &admit,
         )?;
         Ok(found
             .into_iter()
@@ -1535,6 +1540,15 @@ fn rar29_piece_filters(
         specs.extend(found.into_iter().flatten());
     }
     Ok(specs)
+}
+
+/// What one encode of up to `len` bytes holds in a filter search measuring at
+/// `options`, whether at those settings or the reduced ones its screens use.
+fn rar29_search_encode_workspace(len: usize, options: Rar29EncodeOptions) -> u64 {
+    use crate::filter_search::FilterSearch;
+    let screen = Rar29Search::MEMBER.screen_options(options);
+    crate::codec::rar29::member_encode_workspace(len, options)
+        .max(crate::codec::rar29::member_encode_workspace(len, screen))
 }
 
 /// How many pieces of one member [`rar29_piece_filters`] searches at once,
@@ -1585,10 +1599,15 @@ fn encode_rar29_auto_filtered_member_with_progress(
         data: if searching && data.len() > RAR29_FILTER_SEARCH_BYTES {
             // Too long to search whole: searched a piece at a time, then coded
             // once under every piece's filters, at the member's own settings.
-            let filters =
-                rar29_piece_filters(data, 0, options, effort, RAR29_FILTER_SEARCH_BYTES, &|| {
-                    progress.is_some_and(WorkTracker::is_cancelled)
-                })?;
+            let filters = rar29_piece_filters(
+                data,
+                0,
+                options,
+                effort,
+                RAR29_FILTER_SEARCH_BYTES,
+                &|| progress.is_some_and(WorkTracker::is_cancelled),
+                &|bytes| resources.and_then(|resources| resources.try_acquire(bytes)),
+            )?;
             with_codec_progress(progress, |report| {
                 if filters.is_empty() {
                     unpack29_encode_literals_with_options_and_progress(data, options, report)
@@ -1608,9 +1627,8 @@ fn encode_rar29_auto_filtered_member_with_progress(
             // filter suits the member does not depend on how hard the parse
             // tries, and the lazy encode stays in hand in case it codes smaller.
             let lazy = options.with_optimal_parse_passes(0);
-            // The member's own charge holds one finalist's encode. Each one
-            // encoded beside it is charged its own, and only while it runs.
-            let each = crate::codec::rar29::member_encode_workspace(data.len(), lazy);
+            // The member's own charge holds one of the search's encodes.
+            // Each one run beside it is charged its own, and only while it runs.
             let (filters, measured) = crate::filter_search::choose_filter_side_by_side(
                 &Rar29Search::at(0, options, effort),
                 data,
@@ -1622,7 +1640,11 @@ fn encode_rar29_auto_filtered_member_with_progress(
                         progress.is_none_or(|work| work.advance(walked as u64))
                     }
                 }),
-                &|| resources.and_then(|resources| resources.try_acquire(each)),
+                &|len| {
+                    resources.and_then(|resources| {
+                        resources.try_acquire(rar29_search_encode_workspace(len, lazy))
+                    })
+                },
             )?;
             if options.optimal_parse_passes == 0 {
                 measured
@@ -3143,6 +3165,7 @@ fn stream_member_admitted(
                         SearchEffort::for_options(options),
                         RAR29_FILTER_SEARCH_BYTES,
                         &|| progress.is_cancelled(),
+                        &|bytes| resources.try_acquire(bytes),
                     )
                     .map_err(|error| crate::codec::Error::Io(Box::new(error)))
                 };
@@ -5737,6 +5760,65 @@ mod tests {
         }
     }
 
+    /// A streamed member's piece searches run their encodes side by side in
+    /// the room the budget has, and write the same archive at any thread
+    /// count, and with a budget too tight to run any beside another.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn piece_searches_side_by_side_stream_the_archive_one_thread_writes() {
+        let piece = super::RAR29_FILTER_SEARCH_BYTES;
+        let table = relocations(2048);
+        let mut large = x86_calls(piece - table.len());
+        large.extend_from_slice(&table);
+        large.extend_from_slice(&noisy_stereo(320 * 1024));
+        let members = entries(&[("large.bin", &large)]);
+        let mut options = rar40();
+        options.compression_level = Some(3);
+        let coding = || crate::MemberCoding::Filtered(crate::FilterPolicy::Auto);
+        let write = |threads: usize, tight: bool| {
+            crate::parallel::private_pool(threads).install(|| {
+                let resources = if tight {
+                    // Room for the member alone: what it is charged is all there is.
+                    let member = super::Member::from_streaming(&members[0]);
+                    let ppmd =
+                        super::ppmd_held(&member, options, &coding(), large.len() as u64, None)
+                            .unwrap();
+                    crate::WriterResources::new(super::streamed_workspace(options, &coding(), ppmd))
+                } else {
+                    crate::WriterResources::default()
+                };
+                let mut out = SeekCounting::default();
+                super::write_seekable_archive_with_threshold(
+                    &members,
+                    options,
+                    coding(),
+                    None,
+                    &resources,
+                    None,
+                    &mut out,
+                    256 * 1024,
+                )
+                .unwrap();
+                assert!(out.seeks > 0, "not streamed");
+                assert_eq!(resources.workspace_in_use(), 0, "every room handed back");
+                (out.inner.into_inner(), resources.workspace_peak())
+            })
+        };
+        let (archive, alone) = write(1, false);
+        let parsed = crate::rar15_40::Archive::parse(&archive).unwrap();
+        assert!(parsed.files().next().unwrap().pack_size < large.len() as u64 / 2);
+        for threads in [2, 4, 16] {
+            let (side_by_side, peak) = write(threads, false);
+            assert!(side_by_side == archive, "{threads} threads");
+            assert!(peak > alone, "{threads} threads ran nothing side by side");
+            let (in_turn, _) = write(threads, true);
+            assert!(in_turn == archive, "{threads} threads in a tight budget");
+        }
+    }
+
     #[test]
     fn a_long_binary_member_streams_below_the_threshold_and_text_does_not() {
         let len = super::RAR29_STREAM_BINARY_ABOVE as usize + 1;
@@ -6008,6 +6090,7 @@ mod tests {
             super::SearchEffort::Full,
             piece,
             &|| false,
+            &|_| Some(()),
         )
         .unwrap();
 
@@ -6040,6 +6123,70 @@ mod tests {
             .encode_member_with_filters(&data, &specs)
             .unwrap();
         assert_eq!(unpack29_decode(&packed, data.len()).unwrap(), data);
+    }
+
+    /// A piece search runs its screens, trials and finalists side by side in
+    /// the room it is granted, hands all of it back, and chooses what it
+    /// chooses in turn at any thread count and with any room or none.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn piece_searches_choose_alike_side_by_side_and_in_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        struct Room<'a>(&'a AtomicUsize);
+        impl Drop for Room<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, SeqCst);
+            }
+        }
+        // Longer than one trial span, so the trial ranks finalists on
+        // windows, and with code, a table and samples for every screen.
+        let piece = 512 * 1024;
+        let table = relocations(1024);
+        let mut data = x86_calls(piece - table.len());
+        data.extend_from_slice(&table);
+        data.extend_from_slice(&noisy_stereo(piece));
+        data.truncate(2 * piece);
+        for level in [3, 5] {
+            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
+            let search = |threads: usize, granted: usize| {
+                let held = AtomicUsize::new(0);
+                let peak = AtomicUsize::new(0);
+                let specs = crate::parallel::private_pool(threads).install(|| {
+                    super::rar29_piece_filters(
+                        &data,
+                        0,
+                        options,
+                        super::SearchEffort::Full,
+                        piece,
+                        &|| false,
+                        &|bytes| {
+                            assert!(bytes > 0);
+                            let room = Room(&held);
+                            let now = held.fetch_add(1, SeqCst) + 1;
+                            peak.fetch_max(now, SeqCst);
+                            (now <= granted).then_some(room)
+                        },
+                    )
+                    .unwrap()
+                });
+                assert_eq!(held.into_inner(), 0, "room handed back");
+                (specs, peak.into_inner())
+            };
+            let (specs, _) = search(1, 0);
+            assert!(!specs.is_empty(), "level {level} found no filter");
+            for threads in [2, 4, 16] {
+                for granted in [0, 1, usize::MAX] {
+                    let (found, peak) = search(threads, granted);
+                    assert_eq!(found, specs, "level {level}, {threads} threads, {granted}");
+                    if granted == usize::MAX {
+                        assert!(peak > 1, "level {level}, {threads} threads ran in turn");
+                    }
+                }
+            }
+        }
     }
 
     /// Sixteen-bit stereo: two tones with noise in the low bits, which as
@@ -6120,6 +6267,7 @@ mod tests {
                         super::SearchEffort::Least,
                         piece,
                         &|| false,
+                        &|_| Some(()),
                     )
                     .unwrap()
                 })
