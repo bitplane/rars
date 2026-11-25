@@ -1,5 +1,54 @@
 use crate::codec::workspace::RefusingBudget;
 
+fn repeated_byte_runs_ladder(algorithm_version: u8) {
+    let mut state = 1u32;
+    let mut noise = |len| {
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                b'!' + (state % 90) as u8
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut period = noise(2000);
+    // The same byte precedes both runs. A distant match can start a byte
+    // before the second run but ends well before the run itself does.
+    period.push(b'{');
+    period.resize(period.len() + 353, 0);
+    period.extend(noise(450));
+    period.push(b'{');
+    period.resize(period.len() + 423, 0);
+    let data = period.repeat(5);
+
+    let one = EncodeOptions::new(8)
+        .with_lazy_matching(true)
+        .with_lazy_lookahead(2);
+    let two = EncodeOptions::new(16)
+        .with_optimal_parse(true)
+        .with_nice_match_length(32)
+        .with_parse_passes(1);
+    let one = encode_lz_member_with_options(&data, algorithm_version, one).unwrap();
+    let two = encode_lz_member_with_options(&data, algorithm_version, two).unwrap();
+    assert!(
+        two.len() <= one.len(),
+        "level 2 packed {} bytes against level 1's {}",
+        two.len(),
+        one.len()
+    );
+}
+
+#[test]
+fn rar50_repeated_byte_runs_ladder() {
+    repeated_byte_runs_ladder(0);
+}
+
+#[test]
+fn rar70_repeated_byte_runs_ladder() {
+    repeated_byte_runs_ladder(1);
+}
+
 fn assert_each_allocation_refusal<T>(
     mut work: impl FnMut(&RefusingBudget) -> crate::codec::Result<T>,
 ) -> usize {
