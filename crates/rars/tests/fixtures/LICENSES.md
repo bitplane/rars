@@ -20,7 +20,7 @@ filter archive.
 
 | File | What it is |
 |---|---|
-| `rar13/SFXSRC.EXE` | Made by running the DOS RAR 1.402 `s` command on `HELLO.TXT`, a 33-byte line this project wrote. The first 6.4 KiB are the self-extractor module that RAR 1.402 prepends to the archive; that module is RAR's own code, not this project's. It is kept because the format uses it to signal a self-extracting archive: readers must recognise the `RSFX` marker at offset 28 to tell a real RAR 1.4 self-extractor from an executable that only contains the archive signature. |
+| `rar13/SFXSRC.EXE` | Made by running the DOS RAR 1.402 `s` command on `HELLO.TXT`, a 33-byte line this project wrote. The first 6.4 KiB are the self-extractor module that RAR 1.402 prepends to the archive; that module is RAR's own code, not this project's. It is kept because the format uses it to signal a self-extracting archive: readers must recognise the `RSFX` marker at offset 28 to tell a real RAR 1.4 self-extractor from an executable that only contains the archive signature. It is kept in the repository and left out of the published crate. |
 
 ## Third-party fixtures
 

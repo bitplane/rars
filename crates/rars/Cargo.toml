@@ -11,6 +11,7 @@ repository.workspace = true
 documentation.workspace = true
 keywords.workspace = true
 categories.workspace = true
+exclude = ["tests/fixtures/rar13/SFXSRC.EXE"]
 
 [lints]
 workspace = true
