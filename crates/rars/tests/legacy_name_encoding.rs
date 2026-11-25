@@ -102,6 +102,7 @@ fn cjk_code_page_aliases_are_case_insensitive() {
         (LegacyNameEncoding::Cp936, &["cp936", "gbk"]),
         (LegacyNameEncoding::Cp949, &["cp949", "euc-kr", "uhc"]),
         (LegacyNameEncoding::Cp950, &["cp950", "big5"]),
+        (LegacyNameEncoding::Detect, &["detect", "auto"]),
     ] {
         for alias in aliases {
             assert_eq!(alias.parse::<LegacyNameEncoding>().unwrap(), encoding);
@@ -123,6 +124,14 @@ fn cjk_code_page_aliases_are_case_insensitive() {
 #[cfg(not(feature = "cjk-names"))]
 #[test]
 fn cjk_code_pages_report_the_disabled_feature() {
+    for label in ["detect", "auto"] {
+        assert!(matches!(
+            label.parse::<LegacyNameEncoding>(),
+            Err(Error::FeatureDisabled {
+                feature: "cjk-names"
+            })
+        ));
+    }
     for (label, encoding) in [
         ("shift_jis", LegacyNameEncoding::Cp932),
         ("gbk", LegacyNameEncoding::Cp936),
@@ -159,7 +168,7 @@ fn strict_code_pages_are_explicit_and_locale_independent() {
         let encoding: LegacyNameEncoding = label.parse().unwrap();
         assert_eq!(encoding.decode(bytes).unwrap(), expected);
     }
-    assert!("auto".parse::<LegacyNameEncoding>().is_err());
+    assert!("bogus".parse::<LegacyNameEncoding>().is_err());
     assert!(LegacyNameEncoding::Windows1252.decode(b"\x81").is_err());
     assert!(LegacyNameEncoding::Windows1251.decode(b"\x98").is_err());
     assert!(LegacyNameEncoding::Utf8.decode(b"\xff").is_err());
@@ -355,4 +364,129 @@ fn split_legacy_names_keep_their_encoding_classification() {
         Ok(Box::new(std::io::sink()))
     })
     .unwrap();
+}
+
+#[test]
+fn unresolved_detection_cannot_decode_names() {
+    let error =
+        Error::InvalidArgument("resolve Detect with Archive::detect_legacy_name_encoding first");
+    assert_eq!(
+        LegacyNameEncoding::Detect.decode(b"page.jpg"),
+        Err(error.clone())
+    );
+    for unicode in [false, true] {
+        assert_eq!(
+            decoded_name(b"page.jpg", unicode, Some(LegacyNameEncoding::Detect)),
+            Err(error.clone())
+        );
+    }
+}
+
+#[cfg(feature = "cjk-names")]
+#[test]
+fn detects_legacy_page_names_in_archives_and_volume_sets() {
+    use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_1251};
+    use LegacyNameEncoding::*;
+
+    for (expected, codec, book, prefix, suffix) in [
+        (Cp932, SHIFT_JIS, "漫画の冒険と旅の物語", "ページ", ""),
+        (Cp936, GBK, "漫画故事与旅行见闻", "第", "页"),
+        (Cp949, EUC_KR, "만화로 보는 여행 이야기", "페이지", ""),
+        (Cp950, BIG5, "漫畫故事與旅行見聞", "第", "頁"),
+        (
+            Windows1251,
+            WINDOWS_1251,
+            "Приключения и путешествия",
+            "Страница",
+            "",
+        ),
+    ] {
+        let names: Vec<_> = (1..=20)
+            .map(|index| format!("{book}/{prefix}{index:02}{suffix}.jpg"))
+            .collect();
+        for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar15] {
+            let mut builder = Builder::new(format).store(true);
+            for name in &names {
+                let (raw, _, errors) = codec.encode(name);
+                assert!(!errors, "{name}");
+                builder
+                    .add_bytes(raw.into_owned(), vec![42; 128], None, None)
+                    .unwrap();
+            }
+            let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+            let encoding = archive.detect_legacy_name_encoding();
+            assert_eq!(encoding, Some(expected), "{format:?} {book}");
+            let listed: Vec<_> = archive
+                .member_refs()
+                .map(|member| {
+                    assert!(!member.name_is_unicode());
+                    String::from_utf8(member.decoded_name(encoding).unwrap().into_owned()).unwrap()
+                })
+                .collect();
+            assert_eq!(listed, names);
+            let mut extracted = Vec::new();
+            archive
+                .extract_to(None, |meta| {
+                    let bytes =
+                        decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned();
+                    extracted.push(String::from_utf8(bytes).unwrap());
+                    Ok(Box::new(std::io::sink()))
+                })
+                .unwrap();
+            assert_eq!(extracted, names);
+
+            let archives: Vec<_> = builder
+                .volume_size(Some(512))
+                .build_volumes(None)
+                .unwrap()
+                .into_iter()
+                .map(|bytes| ArchiveReader::read_owned(bytes).unwrap())
+                .collect();
+            assert!(archives.len() > 1);
+            assert_eq!(
+                rars::detect_volume_legacy_name_encoding(&archives),
+                encoding
+            );
+        }
+    }
+}
+
+#[test]
+fn ascii_only_names_need_no_detected_encoding() {
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    for name in [b"page01.jpg", b"page02.jpg"] {
+        builder
+            .add_bytes(name.to_vec(), vec![], None, None)
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let encoding = archive.detect_legacy_name_encoding();
+    assert_eq!(encoding, None);
+    assert_eq!(
+        archive
+            .member_refs()
+            .map(|member| member.decoded_name(encoding).unwrap())
+            .collect::<Vec<_>>(),
+        [b"page01.jpg".as_slice(), b"page02.jpg".as_slice()]
+    );
+}
+
+#[cfg(feature = "cjk-names")]
+#[test]
+fn detection_rejects_a_guess_with_undefined_bytes() {
+    let names = [b"caf\xe9.jpg".as_slice(), b"bad-\x81.jpg"];
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
+    detector.feed(&names.join(&0), true);
+    assert_eq!(
+        detector.guess(None, chardetng::Utf8Detection::Allow),
+        encoding_rs::WINDOWS_1252
+    );
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    for name in names {
+        builder
+            .add_bytes(name.to_vec(), vec![], None, None)
+            .unwrap();
+    }
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    assert_eq!(archive.detect_legacy_name_encoding(), None);
 }

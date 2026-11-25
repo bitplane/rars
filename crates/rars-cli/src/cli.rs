@@ -62,7 +62,7 @@ pub(crate) struct PasswordArgs {
 
 #[derive(Args, Default)]
 pub(crate) struct ReadOptionsArgs {
-    /// Source encoding for legacy names without Unicode (e.g. cp850)
+    /// Source encoding for legacy names without Unicode (e.g. cp850 or detect)
     #[arg(long, value_name = "ENCODING")]
     pub legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     /// Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)

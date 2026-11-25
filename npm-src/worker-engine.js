@@ -79,6 +79,7 @@ function metadata(archive, password, options) {
     volumeIndex: archive.volumeIndex,
     isFirstVolume: archive.isFirstVolume,
     volumeNaming: archive.volumeNaming,
+    legacyNameEncoding: archive.legacyNameEncoding ?? null,
     comment: archive.readComment(password, options),
     truncation: archive.truncation(),
     headerDamage: archive.headerDamage(),

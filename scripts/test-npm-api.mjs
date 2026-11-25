@@ -28,18 +28,23 @@ console.log("npm source API rename checks passed");
 const { RarArchive } = createApi({
   prepareArchiveSources: async (input) => [input],
   setErrorFactory() {},
-  request: async () => ({
+  request: async (_, { readOptions }) => ({
+    legacyNameEncoding: readOptions.legacyNameEncoding === "detect" ? "windows-1252" : "cp850",
     entries: [
       { index: 0, name: "café", nameBytes: new TextEncoder().encode("café") },
       { index: 1, name: "café", nameBytes: new Uint8Array([99, 97, 102, 130]) },
     ],
   }),
 });
-const decoded = await RarArchive.open(new Uint8Array(), { legacyNameEncoding: "cp850" });
-assert.throws(() => decoded.get("café"), (error) => error.code === "AMBIGUOUS_ENTRY");
-assert.equal(decoded.getAll("café").length, 2);
-assert.equal(decoded.get(new Uint8Array([99, 97, 102, 130])).index, 1);
-assert.equal(decoded.get("missing"), undefined);
+for (const [requested, resolved] of [["cp850", "cp850"], ["detect", "windows-1252"]]) {
+  const decoded = await RarArchive.open(new Uint8Array(), { legacyNameEncoding: requested });
+  assert.equal(decoded.legacyNameEncoding, resolved);
+  assert.throws(() => { decoded.legacyNameEncoding = "utf-8"; }, TypeError);
+  assert.throws(() => decoded.get("café"), (error) => error.code === "AMBIGUOUS_ENTRY");
+  assert.equal(decoded.getAll("café").length, 2);
+  assert.equal(decoded.get(new Uint8Array([99, 97, 102, 130])).index, 1);
+  assert.equal(decoded.get("missing"), undefined);
+}
 console.log("npm decoded-name ambiguity checks passed");
 
 // Repeated raw names are distinct entries; names select the last one.

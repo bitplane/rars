@@ -204,8 +204,7 @@ pub(crate) fn validate_relative(name: &[u8]) -> Result<()> {
 
 /// Explicit source encoding for legacy names without a Unicode representation.
 /// These mappings are locale independent and shared by every binding.
-/// The CP932, CP936, CP949 and CP950 variants require the `cjk-names` feature
-/// for parsing and decoding.
+/// The CJK encodings and detection require the `cjk-names` feature.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LegacyNameEncoding {
@@ -220,8 +219,12 @@ pub enum LegacyNameEncoding {
     Cp936,
     Cp949,
     Cp950,
+    /// Resolve using the archive's legacy names before decoding.
+    Detect,
 }
 
+const UNRESOLVED_DETECT: Error =
+    Error::InvalidArgument("resolve Detect with Archive::detect_legacy_name_encoding first");
 const UNDEFINED_LEGACY_NAME_BYTE: &str = "undefined byte in selected legacy name encoding";
 
 #[cfg(not(feature = "cjk-names"))]
@@ -244,17 +247,18 @@ impl std::str::FromStr for LegacyNameEncoding {
             "cp936" | "gbk" => Self::Cp936,
             "cp949" | "euc-kr" | "uhc" => Self::Cp949,
             "cp950" | "big5" => Self::Cp950,
+            "detect" | "auto" => Self::Detect,
             _ => {
                 return Err(Error::InvalidArgument(concat!(
                     "unsupported legacy name encoding (use cp437, cp850, cp852, cp866, ",
-                    "windows-1251, windows-1252, utf-8, cp932, cp936, cp949 or cp950)"
+                    "windows-1251, windows-1252, utf-8, cp932, cp936, cp949, cp950 or detect)"
                 )));
             }
         };
         #[cfg(not(feature = "cjk-names"))]
         if matches!(
             encoding,
-            Self::Cp932 | Self::Cp936 | Self::Cp949 | Self::Cp950
+            Self::Cp932 | Self::Cp936 | Self::Cp949 | Self::Cp950 | Self::Detect
         ) {
             return Err(CJK_NAMES_DISABLED);
         }
@@ -263,9 +267,28 @@ impl std::str::FromStr for LegacyNameEncoding {
 }
 
 impl LegacyNameEncoding {
+    /// The canonical spelling accepted by the read options.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Cp437 => "cp437",
+            Self::Cp850 => "cp850",
+            Self::Cp852 => "cp852",
+            Self::Cp866 => "cp866",
+            Self::Windows1251 => "windows-1251",
+            Self::Windows1252 => "windows-1252",
+            Self::Utf8 => "utf-8",
+            Self::Cp932 => "cp932",
+            Self::Cp936 => "cp936",
+            Self::Cp949 => "cp949",
+            Self::Cp950 => "cp950",
+            Self::Detect => "detect",
+        }
+    }
+
     /// Strict decoding: undefined bytes never become replacement characters.
     pub fn decode(self, name: &[u8]) -> Result<String> {
         let table = match self {
+            Self::Detect => return Err(UNRESOLVED_DETECT),
             Self::Utf8 => {
                 return std::str::from_utf8(name)
                     .map(str::to_owned)
@@ -311,21 +334,65 @@ fn decode_cjk(name: &[u8], encoding: &'static encoding_rs::Encoding) -> Result<S
         .ok_or(Error::InvalidArgument(UNDEFINED_LEGACY_NAME_BYTE))
 }
 
-/// Interpret a legacy name without changing its stored identity. `unicode` means
-/// the format already supplied Unicode, which always takes precedence. Without
-/// an explicit encoding the existing bytes are returned unchanged.
+/// Interpret a legacy name without changing its stored identity. When `unicode`
+/// is true or no encoding is set, returns the existing bytes.
+/// Resolve [`LegacyNameEncoding::Detect`] before calling this function.
 pub fn decoded_name(
     name: &[u8],
     unicode: bool,
     encoding: Option<LegacyNameEncoding>,
 ) -> Result<Cow<'_, [u8]>> {
     match encoding {
+        Some(LegacyNameEncoding::Detect) => Err(UNRESOLVED_DETECT),
         Some(encoding) if !unicode => encoding
             .decode(name)
             .map(|text| Cow::Owned(text.into_bytes()))
             .map_err(|error| error.at_entry(name.to_vec(), "decoding legacy filename")),
         _ => Ok(Cow::Borrowed(name)),
     }
+}
+
+#[cfg(not(feature = "cjk-names"))]
+pub(crate) fn detect_legacy_name_encoding<'a>(
+    _archives: impl Iterator<Item = &'a crate::Archive> + Clone,
+) -> Option<LegacyNameEncoding> {
+    None
+}
+
+#[cfg(feature = "cjk-names")]
+pub(crate) fn detect_legacy_name_encoding<'a>(
+    archives: impl Iterator<Item = &'a crate::Archive> + Clone,
+) -> Option<LegacyNameEncoding> {
+    use encoding_rs::*;
+    use LegacyNameEncoding::*;
+
+    let mut names = archives
+        .flat_map(crate::Archive::member_refs)
+        .filter(|member| !member.name_is_unicode())
+        .map(crate::ArchiveMemberRef::name_bytes);
+    let mut non_ascii = names.clone().filter(|name| !name.is_ascii());
+    let mut detector = chardetng::EncodingDetector::new(chardetng::Iso2022JpDetection::Allow);
+    detector.feed(non_ascii.next()?, false);
+    for name in non_ascii {
+        // NUL cannot occur in a valid member path.
+        detector.feed(b"\0", false);
+        detector.feed(name, false);
+    }
+    detector.feed(b"", true);
+    let encoding = match detector.guess(None, chardetng::Utf8Detection::Allow) {
+        e if e == SHIFT_JIS => Cp932,
+        e if e == GBK || e == GB18030 => Cp936,
+        e if e == EUC_KR => Cp949,
+        e if e == BIG5 => Cp950,
+        e if e == UTF_8 => Utf8,
+        e if e == WINDOWS_1251 => Windows1251,
+        e if e == WINDOWS_1252 => Windows1252,
+        e if e == IBM866 => Cp866,
+        _ => return None,
+    };
+    names
+        .all(|name| encoding.decode(name).is_ok())
+        .then_some(encoding)
 }
 
 // High-byte mappings from Python's standard-library IBM/Microsoft codec tables.

@@ -27,10 +27,13 @@ export interface OperationOptions {
 
 /** Options given to `open()` are the defaults for later calls on that archive; a call's own fields override them one by one. Numbers must be safe integers; bigint supports all u64 values. */
 export interface ReadOptions extends OperationOptions {
-  /** Source encoding for names without Unicode; open() retains the decoded entry view. */
+  /**
+   * Source encoding for names without Unicode; open() retains the decoded entry view.
+   * Use "detect" to guess one encoding from the legacy names across the archive or volume set.
+   */
   legacyNameEncoding?:
     | "cp437" | "cp850" | "cp852" | "cp866" | "cp1251" | "cp1252" | "windows-1251" | "windows-1252" | "utf8" | "utf-8"
-    | "cp932" | "shift_jis" | "cp936" | "gbk" | "cp949" | "euc-kr" | "cp950" | "big5";
+    | "cp932" | "shift_jis" | "cp936" | "gbk" | "cp949" | "euc-kr" | "cp950" | "big5" | "detect";
   maxHeaderCount?: number | bigint;
   maxHeaderBytes?: number | bigint;
   maxMemberOutputBytes?: number | bigint;
@@ -225,6 +228,8 @@ export class RarEntry {
 export class RarArchive {
   static open(input: RarInput | readonly RarInput[], options?: OpenOptions): Promise<RarArchive>;
   readonly entries: readonly RarEntry[];
+  /** Resolved source encoding for legacy names, or null when raw bytes are used. */
+  readonly legacyNameEncoding: string | null;
   readonly family: ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;

@@ -34,6 +34,11 @@ impl Archive {
         options: ArchiveReadOptions<'_>,
         preserve: bool,
     ) -> Result<(Builder, Vec<RewritePayload>)> {
+        let mut options = options;
+        if !preserve && options.legacy_name_encoding == Some(filename::LegacyNameEncoding::Detect) {
+            options.legacy_name_encoding =
+                filename::detect_legacy_name_encoding(std::iter::once(self).chain(later_volumes));
+        }
         let password = options.password;
         let mut read = std::iter::once(self)
             .chain(later_volumes)

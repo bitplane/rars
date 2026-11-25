@@ -176,6 +176,7 @@ pub use streaming::{
 pub use timestamp::StoredTimestamp;
 pub use truncation::{TruncatedBlock, Truncation};
 pub use version::{ArchiveFamily, ArchiveVersion};
+pub use volume_extract::detect_volume_legacy_name_encoding;
 #[cfg(feature = "write")]
 pub use write_plan::{formats_supporting, supported_features, supports, MemberCoding, PlanShape};
 
@@ -1021,6 +1022,14 @@ impl Archive {
         ArchiveMembers {
             inner: self.member_refs(),
         }
+    }
+
+    /// Guesses one encoding for the archive's legacy member names without Unicode.
+    ///
+    /// Returns a concrete encoding only if there are non-ASCII legacy names and
+    /// every legacy name decodes under the guess. Requires the `cjk-names` feature.
+    pub fn detect_legacy_name_encoding(&self) -> Option<filename::LegacyNameEncoding> {
+        detect_volume_legacy_name_encoding(std::slice::from_ref(self))
     }
 
     /// Traverses member headers without allocating names or copying metadata.

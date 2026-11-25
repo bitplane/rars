@@ -726,13 +726,52 @@ await check("legacy filename views preserve bytes and Unicode names", async () =
     .add(new Uint8Array([129]), HELLO).bytes();
   await assert.rejects(RarArchive.open(bytes, { legacyNameEncoding: "windows-1252" }),
     (error) => error.code === "INVALID_OPTION");
-  await assert.rejects(RarArchive.open(bytes, { legacyNameEncoding: "auto" }),
+  await assert.rejects(RarArchive.open(bytes, { legacyNameEncoding: "bogus" }),
     (error) => error.code === "INVALID_OPTION");
   const parts = await new RarWriter({ version: "rar29", level: 0, volumeSize: 64000 })
     .add(raw, new Uint8Array(180000).fill(9)).volumes();
   const archive = await RarArchive.open(parts, { legacyNameEncoding: "cp850" });
   assert.equal(archive.entries[0].name, "café.txt");
   assert.equal((await archive.get("café.txt").bytes()).length, 180000);
+});
+
+
+await check("detect resolves legacy filenames across a volume set", async () => {
+  const writer = new RarWriter({ version: "rar29", level: 0, volumeSize: 64000 });
+  writer.add("cover.jpg", new Uint8Array(66000));
+  const names = ["cover.jpg"];
+  // "漫画/第1話/ページ" in CP932.
+  const prefix = [0x96, 0x9f, 0x89, 0xe6, 0x2f, 0x91, 0xe6, 0x31,
+    0x98, 0x62, 0x2f, 0x83, 0x79, 0x81, 0x5b, 0x83, 0x57];
+  for (let index = 1; index <= 20; index++) {
+    const suffix = `${String(index).padStart(2, "0")}.jpg`;
+    names.push(`漫画/第1話/ページ${suffix}`);
+    writer.add(new Uint8Array([...prefix, ...text.encode(suffix)]), new Uint8Array(10000).fill(index));
+  }
+  const parts = await writer.volumes();
+  assert.ok(parts.length > 1);
+  const first = await RarArchive.open(parts[0], { legacyNameEncoding: "detect" });
+  assert.equal(first.legacyNameEncoding, null);
+  const archive = await RarArchive.open(parts, { legacyNameEncoding: "detect" });
+  assert.equal(archive.legacyNameEncoding, "cp932");
+  assert.deepEqual(archive.entries.map((entry) => entry.name), names);
+  assert.equal((await archive.get(names.at(-1)).bytes())[0], 20);
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), "rars-detect-"));
+  try {
+    await archive.extractAll(directory);
+    assert.equal((await readFile(path.join(directory, names.at(-1))))[0], 20);
+    const streamed = path.join(directory, "streamed");
+    await first.extractAll(streamed, { volumes: parts.slice(1) });
+    assert.equal((await readFile(path.join(streamed, names.at(-1))))[0], 20);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+
+  const ascii = await new RarWriter({ version: "rar29", level: 0 }).add("page.jpg", HELLO).bytes();
+  const asciiArchive = await RarArchive.open(ascii, { legacyNameEncoding: "detect" });
+  assert.equal(asciiArchive.legacyNameEncoding, null);
+  assert.equal(asciiArchive.entries[0].name, "page.jpg");
 });
 
 
