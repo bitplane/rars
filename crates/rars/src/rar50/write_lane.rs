@@ -16,11 +16,13 @@ enum Outcome {
     Written,
     Sink(std::io::Error),
     Cancelled,
+    FlushFailed(Error),
 }
 
 struct Job<B: Budget> {
     writer: Box<dyn Write + Send>,
     data: Buffer<u8, B>,
+    verified_name: Option<Vec<u8>>,
 }
 
 struct Done {
@@ -74,8 +76,26 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         let thread = std::thread::Builder::new()
             .name("rars-write".into())
             .spawn(move || {
-                for Job { mut writer, data } in queued {
+                for Job {
+                    mut writer,
+                    data,
+                    verified_name,
+                } in queued
+                {
                     let outcome = write_member(&control, &mut *writer, &data);
+                    let outcome = match (outcome, verified_name) {
+                        (Outcome::Written, Some(name)) => {
+                            match crate::extraction_control::flush_verified(
+                                &control,
+                                &name,
+                                &mut *writer,
+                            ) {
+                                Ok(()) => Outcome::Written,
+                                Err(error) => Outcome::FlushFailed(error),
+                            }
+                        }
+                        (outcome, _) => outcome,
+                    };
                     drop(writer);
                     drop(data);
                     let cancelled = control.check().is_err();
@@ -171,7 +191,13 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         };
         let jobs = self.jobs.as_ref().expect("taken only on drop");
         // A send fails only once the thread has gone, which `settle` reports.
-        let _ = jobs.send(Job { writer, data });
+        let verified = file.cut_short_result(verified);
+        let verified_name = verified.is_ok().then(|| meta.name.clone());
+        let _ = jobs.send(Job {
+            writer,
+            data,
+            verified_name,
+        });
         self.pending = Some(Pending {
             file,
             meta,
@@ -189,10 +215,11 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         } = self.pending.take()?;
         let Done { outcome, cancelled } = self.wait();
         let result = match outcome {
-            Outcome::Written if !cancelled => file.cut_short_result(verified),
+            Outcome::Written if !cancelled => verified,
             Outcome::Written => budget.conclude(&file.name, None, None, verified),
             Outcome::Sink(error) => budget.conclude(&file.name, None, Some(error.into()), Ok(())),
             Outcome::Cancelled => budget.conclude(&file.name, None, None, Err(Error::Cancelled)),
+            Outcome::FlushFailed(error) => Err(error),
         };
         Some((file, self.settling.settle(&meta, result)))
     }

@@ -84,7 +84,7 @@ pub(crate) fn publish<M, B: Budget>(
     entry: Decoded<M, B>,
     open: &mut impl FnMut(&M) -> Result<Box<dyn Write>>,
     control: &ReadControl,
-    name: impl Fn(&M) -> Vec<u8>,
+    name: impl Fn(&M) -> &[u8],
     divert: impl FnOnce(&M, &[u8]) -> Result<bool>,
 ) -> Result<()> {
     control.check()?;
@@ -101,7 +101,8 @@ pub(crate) fn publish<M, B: Budget>(
             control.check()?;
             control
                 .write_all(&mut writer, &data)
-                .map_err(|error| Error::from(error).at_entry(name(&meta), "extracting"))?;
+                .map_err(|error| Error::from(error).at_entry(name(&meta).to_vec(), "extracting"))?;
+            crate::extraction_control::flush_verified(control, name(&meta), &mut *writer)?;
         }
     }
     control.check()

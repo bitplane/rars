@@ -1300,10 +1300,10 @@ impl Archive {
         file.check_output_limit(budget)?;
         let meta = file.metadata();
         options.check_cancelled()?;
-        let mut writer = open(&meta)?;
+        let writer = open(&meta)?;
         options.check_cancelled()?;
         if !meta.is_directory {
-            budget.run(&file.name, &mut writer, |writer| {
+            budget.run_verified(&file.name, writer, |writer| {
                 session.write_file_to(self, file, writer)
             })?;
         }
@@ -1604,7 +1604,7 @@ impl Archive {
                                     entry,
                                     &mut **open,
                                     &publication,
-                                    |meta| meta.name.clone(),
+                                    |meta| &meta.name,
                                     |_, _| Ok(false),
                                 ),
                             }
@@ -1786,7 +1786,7 @@ fn write_opened_entry<B: Budget>(
     archive: &Archive,
     file: &FileHeader,
     meta: &ExtractedEntryMeta,
-    mut writer: Box<dyn Write + Send>,
+    writer: Box<dyn Write + Send>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
     allowance: &B,
@@ -1810,13 +1810,9 @@ fn write_opened_entry<B: Budget>(
     } else {
         HistoryRetention::Retain
     };
-    budget.run(&file.name, &mut writer, |writer| {
+    budget.run_verified(&file.name, writer, |writer| {
         session.write_file_to_with_history(archive, file, writer, history)
     })?;
-    // An output can be created only once it is used, as one with nothing
-    // written; flushing it makes its failure this member's.
-    writer.flush()?;
-    drop(writer);
     options.check_cancelled()
 }
 

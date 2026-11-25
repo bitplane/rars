@@ -32,6 +32,18 @@ pub enum ExtractionErrorAction {
 pub(crate) type ErrorHandler<'a> =
     dyn FnMut(&ArchiveMember, &Error) -> Result<ExtractionErrorAction> + 'a;
 
+/// Completes a writer after all its data has been written and verified.
+pub(crate) fn flush_verified(
+    control: &crate::read_control::ReadControl,
+    name: &[u8],
+    writer: &mut dyn Write,
+) -> Result<()> {
+    control
+        .check()
+        .and_then(|()| writer.flush().map_err(Error::from))
+        .map_err(|error| error.at_entry(name.to_vec(), "extracting"))
+}
+
 /// The handler [`ArchiveReadOptions::with_member_error_handler`] sets.
 #[derive(Clone, Copy)]
 pub(crate) struct MemberErrorHandler<'a>(

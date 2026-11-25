@@ -270,14 +270,30 @@ pub(crate) fn legacy_output<B: Budget>(
     open: impl FnOnce() -> Result<Box<dyn Write>>,
     decode: impl FnOnce(&mut dyn Write) -> Result<()>,
 ) -> Result<()> {
+    if let Some(mut writer) = decode_legacy_output(meta, allowance, control, links, open, decode)? {
+        crate::extraction_control::flush_verified(control, &meta.name, &mut *writer)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn decode_legacy_output<B: Budget>(
+    meta: &crate::rar15_40::ExtractedEntryMeta,
+    allowance: &B,
+    control: &crate::read_control::ReadControl,
+    links: &mut Option<&mut LegacyLink<'_>>,
+    open: impl FnOnce() -> Result<Box<dyn Write>>,
+    decode: impl FnOnce(&mut dyn Write) -> Result<()>,
+) -> Result<Option<Box<dyn Write>>> {
     if links.is_some() && legacy_meta_is_link(meta) {
         let mut target = Buffer::new(allowance);
         decode(&mut target)?;
         emit_legacy_link(meta, &target, links, control)?;
+        Ok(None)
     } else {
-        decode(&mut *open()?)?;
+        let mut writer = open()?;
+        decode(&mut *writer)?;
+        Ok(Some(writer))
     }
-    Ok(())
 }
 
 #[cfg(test)]

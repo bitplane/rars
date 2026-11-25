@@ -712,12 +712,12 @@ impl Archive {
                 }
                 budget.check(u64::from(entry.header.unp_size), &meta.name)?;
                 options.check_cancelled()?;
-                let mut writer = match selected_writer.take() {
+                let writer = match selected_writer.take() {
                     Some(writer) => writer,
                     None => open(&meta)?,
                 };
                 options.check_cancelled()?;
-                budget.run(&meta.name, &mut writer, |mut writer| {
+                budget.run_verified(&meta.name, writer, |mut writer| {
                     if entry.is_stored() && !entry.is_encrypted() {
                         let result =
                             entry.write_stored_to(self, password, &mut writer, &unpack15.allowance);
