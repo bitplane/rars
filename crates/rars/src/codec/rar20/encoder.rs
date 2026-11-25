@@ -85,6 +85,7 @@ pub struct EncodeOptions {
     /// makes the output larger.
     pub extra_priced_passes: usize,
     pub try_audio: bool,
+    pub(crate) compact_solid_table: bool,
 }
 
 impl EncodeOptions {
@@ -97,6 +98,7 @@ impl EncodeOptions {
             optimal_parse: false,
             extra_priced_passes: 0,
             try_audio: true,
+            compact_solid_table: false,
         }
     }
 
@@ -151,7 +153,6 @@ impl Default for EncodeOptions {
 #[derive(Debug, Clone, Default)]
 pub struct Unpack20Encoder {
     history: Vec<u8>,
-    table: Option<FixedEncodeTable>,
     options: EncodeOptions,
 }
 
@@ -163,7 +164,6 @@ impl Unpack20Encoder {
     pub fn with_options(options: EncodeOptions) -> Self {
         Self {
             history: Vec::new(),
-            table: None,
             options: options.constrained(),
         }
     }
@@ -193,7 +193,7 @@ impl Unpack20Encoder {
         if len == 0 {
             return Ok(ControlFlow::Continue(()));
         }
-        let table = self.table()?;
+        let table = FixedEncodeTable::new(self.options.compact_solid_table);
         let (flow, history) = encode_streamed(
             input,
             len,
@@ -211,17 +211,6 @@ impl Unpack20Encoder {
         Ok(flow)
     }
 
-    fn table(&mut self) -> Result<FixedEncodeTable> {
-        match self.table {
-            Some(table) => Ok(table),
-            None => {
-                let table = FixedEncodeTable::new()?;
-                self.table = Some(table);
-                Ok(table)
-            }
-        }
-    }
-
     fn encode_member_inner(
         &mut self,
         input: &[u8],
@@ -230,7 +219,7 @@ impl Unpack20Encoder {
         if input.is_empty() {
             return Ok(Vec::new());
         }
-        let table = self.table()?;
+        let table = FixedEncodeTable::new(self.options.compact_solid_table);
         let packed = encode_member(
             input,
             &self.history,
@@ -662,6 +651,9 @@ fn table_lengths_for_tokens(
     fixed_table: Option<FixedEncodeTable>,
     more: bool,
 ) -> Result<[u8; TABLE_COUNT]> {
+    if let Some(table) = fixed_table {
+        return Ok(table.lengths());
+    }
     let mut main_frequencies = [0usize; MAIN_COUNT];
     main_frequencies[269] = usize::from(more);
     let mut offset_frequencies = [0usize; OFFSET_COUNT];
@@ -694,51 +686,14 @@ fn table_lengths_for_tokens(
         }
     }
     let mut table_lengths = [0u8; TABLE_COUNT];
-    let literal_len = if let Some(table) = fixed_table {
-        table.length
-    } else {
-        let main_symbol_count = main_frequencies
-            .iter()
-            .filter(|&&frequency| frequency != 0)
-            .count()
-            + offset_frequencies
-                .iter()
-                .filter(|&&frequency| frequency != 0)
-                .count()
-            + length_frequencies
-                .iter()
-                .filter(|&&frequency| frequency != 0)
-                .count();
-        literal_code_len(main_symbol_count)
-    };
-
-    if fixed_table.is_some() {
-        for len in &mut table_lengths[..256] {
-            *len = literal_len;
-        }
-        table_lengths[256] = literal_len;
-        for len in &mut table_lengths[270..270 + LENGTH_COUNT] {
-            *len = literal_len;
-        }
-        for len in &mut table_lengths[257..269] {
-            *len = literal_len;
-        }
-        for len in &mut table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT] {
-            *len = literal_len;
-        }
-        for len in &mut table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT] {
-            *len = literal_len;
-        }
-    } else {
-        table_lengths[..MAIN_COUNT]
-            .copy_from_slice(&huffman::lengths_for_frequency_array(&main_frequencies, 15));
-        table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT].copy_from_slice(
-            &huffman::lengths_for_frequency_array(&offset_frequencies, 15),
-        );
-        table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT].copy_from_slice(
-            &huffman::lengths_for_frequency_array(&length_frequencies, 15),
-        );
-    }
+    table_lengths[..MAIN_COUNT]
+        .copy_from_slice(&huffman::lengths_for_frequency_array(&main_frequencies, 15));
+    table_lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT].copy_from_slice(
+        &huffman::lengths_for_frequency_array(&offset_frequencies, 15),
+    );
+    table_lengths[MAIN_COUNT + OFFSET_COUNT..TABLE_COUNT].copy_from_slice(
+        &huffman::lengths_for_frequency_array(&length_frequencies, 15),
+    );
     Ok(table_lengths)
 }
 
@@ -850,14 +805,26 @@ fn write_lz_block(
 
 #[derive(Debug, Clone, Copy)]
 struct FixedEncodeTable {
-    length: u8,
+    compact: bool,
 }
 
 impl FixedEncodeTable {
-    fn new() -> Result<Self> {
-        Ok(Self {
-            length: literal_code_len(256 + LENGTH_COUNT + OFFSET_COUNT),
-        })
+    fn new(compact: bool) -> Self {
+        Self { compact }
+    }
+
+    fn lengths(self) -> [u8; TABLE_COUNT] {
+        let mut lengths = [9; TABLE_COUNT];
+        lengths[269] = 0; // No table switches in a fixed table.
+        if self.compact {
+            // Seven-bit match symbols fit alongside the nine-bit literals.
+            // Offsets and old-offset lengths have their own, smaller alphabets.
+            lengths[256..269].fill(7);
+            lengths[270..MAIN_COUNT].fill(7);
+            lengths[MAIN_COUNT..MAIN_COUNT + OFFSET_COUNT].fill(fixed_code_len(OFFSET_COUNT));
+            lengths[MAIN_COUNT + OFFSET_COUNT..].fill(fixed_code_len(LENGTH_COUNT));
+        }
+        lengths
     }
 }
 
@@ -2097,11 +2064,8 @@ fn short_slot_index(offset: usize) -> usize {
     SHORT_BASES.partition_point(|&base| base <= adjusted) - 1
 }
 
-fn literal_code_len(symbol_count: usize) -> u8 {
-    // A nonempty member always emits at least one token and there are at most
-    // TABLE_COUNT distinct symbols, so the result fits in u8.
-    let len = usize::BITS - (symbol_count - 1).leading_zeros();
-    len.max(1) as u8
+fn fixed_code_len(symbol_count: usize) -> u8 {
+    (usize::BITS - (symbol_count - 1).leading_zeros()) as u8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
