@@ -12,17 +12,9 @@
 //! piece is coded from the offsets the parse carried into it, and a token
 //! codes to the same symbols however the parse is cut.
 //!
-//! Fixed blocks of half the writer's 64 KiB packed a stripped binary 0.16%
-//! smaller and man pages 0.4% larger. Cut by price instead, 4 MiB of each
-//! binary at level 2, packed bytes:
-//!
-//! ```text
-//! unit                2 KiB        4 KiB        8 KiB     uncut
-//! stripped        1,662,740    1,663,811    1,664,759    1,672,761
-//! unstripped      1,523,404    1,524,558    1,525,492    1,534,221
-//! ```
-//!
-//! Halving the unit about quadruples the runs priced, for 0.07%, so 4 KiB.
+//! Fixed blocks of half the writer's 64 KiB pack a stripped binary smaller
+//! and man pages larger. Halving the unit about quadruples the runs priced, so
+//! 4 KiB.
 use super::*;
 
 /// How finely the cuts are placed.
@@ -185,8 +177,8 @@ pub(super) fn split(
 /// Near what [`priced`] says, without building a Huffman code: each alphabet
 /// at its entropy, and the table priced with lengths taken from the counts.
 ///
-/// Building the codes for every run of units took as long as level 2's whole
-/// lazy parse. This takes a fifth of that, and its cuts packed within 0.01%.
+/// Building the codes for every run of units takes as long as level 2's whole
+/// lazy parse.
 fn estimated(used: &Used, before: &[usize; TABLE_COUNT], after: &[usize; TABLE_COUNT]) -> f64 {
     let mut table = [0u8; TABLE_COUNT];
     let mut symbols = 0.0;

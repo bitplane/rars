@@ -52,8 +52,7 @@ fn words(len: usize, seed: u32) -> Vec<u8> {
     out
 }
 
-/// Runs of zeroes between a phrase repeating at an offset no block aligns to:
-/// the shape a deeper greedy search used to code larger than a shallow one.
+/// Runs of zeroes between a phrase repeating at an offset no block aligns to.
 fn runs_and_a_phrase(len: usize) -> Vec<u8> {
     let mut block = vec![0u8; 4096];
     for _ in 0..91 {

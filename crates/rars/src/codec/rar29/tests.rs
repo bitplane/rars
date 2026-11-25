@@ -489,8 +489,6 @@ fn related_text_member(seed: u64, lines: usize) -> Vec<u8> {
 
 /// WinRAR asks for a PPMd reset on 1 of the 68 PPMd blocks in a solid
 /// archive of 70 small files and carries the model through the other 67.
-/// Building a model per member instead is most of why that archive used to
-/// be 18% smaller than ours.
 #[test]
 fn a_solid_chain_carries_one_ppmd_model_across_its_members() {
     // Members small enough that a model built for one alone never warms up,
@@ -4992,8 +4990,8 @@ fn block_parsed_members_code_to_the_serial_parse_bytes() {
     assert_eq!(packed_fingerprint(&plain), (148_381, 3_735_200_713));
     assert_eq!(packed_fingerprint(&continued), (74_257, 1_312_368_026));
     assert_eq!(packed_fingerprint(&filtered), (239_799, 1_353_944_033));
-    // The PPMd search keys on whole matches now; it must not lose to the
-    // four-byte key it replaced, which packed this member to 109,636 bytes.
+    // The PPMd search keys on whole matches; it must not lose to a four-byte
+    // key, which packs this member to 109,636 bytes.
     assert!(ppmd.len() <= 109_636, "{}", ppmd.len());
 }
 
@@ -5149,8 +5147,7 @@ fn long_key_parses_code_the_same_at_every_thread_count_and_cut() {
 }
 
 /// A parser keeps links for a reach and a batch, and a batch is megabytes at
-/// any thread count. A member of a few kilobytes used to have all of them
-/// cleared for it, which took longer than compressing it.
+/// any thread count.
 #[test]
 fn a_small_member_keeps_links_for_its_own_length_and_parses_the_same() {
     let input = mixed_member(5000);
@@ -5452,7 +5449,7 @@ fn ppmd_members_code_to_the_bytes_before_the_search_ran_ahead() {
         .iter()
         .map(|member| packed_fingerprint(member))
         .collect();
-    // Captured from master, where the search ran in step with the model.
+    // Captured with the search in step with the model.
     assert_eq!(
         fingerprints,
         [
@@ -5461,7 +5458,7 @@ fn ppmd_members_code_to_the_bytes_before_the_search_ran_ahead() {
             (231_226, 2_092_742_637),
             (209_736, 3_414_149_300),
             // Its eleven delta records are declared as the coder reaches each
-            // one now, not all before the first byte; that was 301,487 bytes.
+            // one, not all before the first byte.
             (301_429, 2_669_515_988),
             (13_268, 4_063_589_940),
             (60, 1_624_776_514),

@@ -2232,8 +2232,8 @@ pub fn read_volume_member_at_with_options(
 /// RAR5 extended times also use this detail, with `add_second` always false.
 ///
 /// Kept apart from the timestamp rather than folded into it because
-/// [`ExtractedEntryMeta::file_time`] is the DOS value as stored, which has
-/// nowhere to put either part.
+/// [`ArchiveMemberMeta::stored_modification_time`] is the DOS value as
+/// stored, which has nowhere to put either part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TimeRefinement {
     /// Whether the true time is one second later than the DOS value.

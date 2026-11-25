@@ -25,8 +25,7 @@
 //! once the position it held has fallen out, so the two never overlap. That
 //! bounds the finder by the window instead of by the data, which is what lets
 //! one finder span every block of a member: rebuilding it per block meant
-//! rehashing the whole history each time, which measured at about 40% of the
-//! encode on a 16 MiB member.
+//! rehashing the whole history each time.
 //!
 //! Links are 32 bits, so the window costs four bytes per byte it covers rather
 //! than eight, and twice as many links share a cache line. Positions past four

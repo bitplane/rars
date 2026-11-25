@@ -30,9 +30,7 @@ const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 /// Every block carries its own Huffman tables, so smaller blocks pay for the
 /// extra tables and win back more by fitting each stretch of the data. Matches
 /// still reach back across boundaries into the history, so shortening a block
-/// costs no match range. Measured over the corpus, 64 KiB packs 6.4% smaller
-/// than a mebibyte and within 0.2% of the best size tried at any point between
-/// 16 KiB and 256 KiB. The streaming writer reads in the same units, so both
+/// costs no match range. The streaming writer reads in the same units, so both
 /// paths produce the same blocks for the same input.
 pub(crate) const LZ_BLOCK_SIZE: usize = 64 * 1024;
 
@@ -57,20 +55,9 @@ const _: () = assert!(MAX_LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
 /// The statistic is how many of the chunk's bytes the open block's model puts
 /// in the wrong place, so the limit reads as "extend while under one in a
 /// hundred and twenty-eight of the next chunk's bytes are distributed
-/// differently". Measured over the bench corpus, per 64 KiB chunk:
+/// differently".
 ///
-/// ```text
-/// class                       min   median      max
-/// large-compressible            0        0        0
-/// large-incompressible      3,243    3,751    5,133
-/// large-source-tree         6,274   16,972   54,003
-/// large-text                2,319   30,598   90,929
-/// large-bin-unstripped     18,298   38,875  110,933
-/// large-bin-stripped       13,982   60,996  113,086
-/// ```
-///
-/// Only data that does not move at all falls under 512, and the nearest class
-/// that does move sits four and a half times above it. That gap is the whole
+/// Only data that does not move at all falls under 512. That is the whole
 /// design: a block grows over data a fresh table set could not describe any
 /// better, and over nothing else.
 const BLOCK_DRIFT_DIVISOR: u64 = 128;
@@ -282,15 +269,10 @@ pub(crate) const MAX_DELTA_CHANNELS: usize = 32;
 /// second half matters more than it sounds. The parse prices every position in a
 /// block, because a cheaper path can arrive at any of them, so without it a
 /// 4 KiB match gets confirmed at all 4096 of its positions to learn what the
-/// first one already said. On a mebibyte that repeats, that cost level 5
-/// fifty-three seconds to save four bytes over level 3.
+/// first one already said.
 ///
-/// 512 is where committing is free. On a mebibyte of source at level 5 it packs
-/// two bytes smaller than pricing every position and finishes in 7.08s rather
-/// than 7.31s, and the repeating mebibyte drops to 1.19s. Committing sooner does
-/// buy time, and it is not worth it: at 128 the source packs 0.16% larger for
-/// 1.2x, at 64 it packs 0.47% larger for 1.5x, and neither closes the distance
-/// to WinRAR.
+/// 512 is where committing is free. Committing sooner buys time but packs
+/// larger.
 const NICE_MATCH_LENGTH: usize = 512;
 
 const MAX_MATCH_CANDIDATES: usize = 256;
@@ -1832,17 +1814,11 @@ enum MemberSearch<'a, B: Budget = Allowance> {
 /// into a tree is a descent per position, so bringing in history costs a
 /// search per byte, where a chain takes each byte with one store. A parse at
 /// least as long as the history it carries can afford that. A block job's run
-/// is a dictionary long, with a dictionary of history behind it. On 32 MiB of
-/// man pages and logs at level 3, chains of 128 packed such runs 2.5% larger
-/// than the tree does, for about a quarter less CPU.
+/// is a dictionary long, with a dictionary of history behind it.
 ///
 /// A member's last run is usually shorter than the history behind it. Down to
-/// a quarter of that history it still searches a tree: with a 16 MiB
-/// dictionary, the 4 MiB tail of a 20 MiB text member packs 0.36% smaller for
-/// 23% more CPU on one thread, and the tail of 103 MiB of headers 0.17%
-/// smaller for no measurable time (#407). A shorter scrap keeps the chains:
-/// seeding a tree from 16 MiB of history to parse a 64 KiB tail cost 30% more
-/// time for 69 bytes.
+/// a quarter of that history it still searches a tree (#407). A shorter scrap
+/// keeps the chains.
 pub(crate) fn searches_tree(window: usize, start: usize, options: EncodeOptions) -> bool {
     start.min(options.max_match_distance) <= (window - start).saturating_mul(4)
 }
@@ -1900,7 +1876,7 @@ impl<B: Budget> SharedMemberSearch<B> {
 /// block is bounded by the block size times [`NICE_MATCH_LENGTH`]. Nothing
 /// approaches that: the worst measured is about six runs per position, on a
 /// mebibyte of two-symbol noise, where every position has many candidates whose
-/// lengths creep up one byte at a time. That block cost three megabytes.
+/// lengths creep up one byte at a time.
 struct BlockMatches<B: Budget = Allowance> {
     /// Every position's runs, one position after another.
     runs: Buffer<(u32, u32), B>,
@@ -2144,9 +2120,7 @@ impl<B: Budget> OptimalCollector<B> {
     ///
     /// Searching stops where the parse stops pricing. A match that reaches
     /// [`NICE_MATCH_LENGTH`] is one the parse commits to and steps over, so the
-    /// positions it covers are not searched from either. Skipping the pricing
-    /// alone would have left the search doing all the work it used to: on a
-    /// mebibyte that repeats, one search per 4 KiB became a million.
+    /// positions it covers are not searched from either.
     fn collect(
         &mut self,
         combined: &[u8],
@@ -2215,9 +2189,7 @@ impl<B: Budget> OptimalCollector<B> {
                         // Leaving it out would save its descent but leave a
                         // hole the length of the match, and a third copy of
                         // something then finds only the first, which may have
-                        // left the window. 32 MiB of C headers and sources,
-                        // many repeated, packs 11.8% larger at an 8 MiB
-                        // dictionary with the holes.
+                        // left the window.
                         tree.matches(
                             combined,
                             pos,
@@ -2312,14 +2284,11 @@ const STRETCHES_AHEAD: usize = 8;
 /// The tree stops at the nearest copy of the nice length, and the copy that
 /// runs on can be further back. 4 MiB of a zero run and a phrase, repeating
 /// every 8,191 bytes, has dozens of nearer copies of each phrase start that
-/// end with the phrase. The parse took those and alternated two remembered
-/// distances at a dozen bits a token, 2 KB at every level. Given the period,
-/// it codes the rest as repeats of one match at a bit or two each: 247 bytes
-/// at level 5, where WinRAR's -m5 packs 394.
+/// end with the phrase. Given the period, the parse codes the rest as repeats
+/// of one match at a bit or two each.
 ///
 /// A parse that prices once keeps no stretches. It commits to the longest
-/// match at its nice length of 32 without pricing it, and on 4 MiB of text
-/// the far copies it then took packed 0.28% larger at level 2.
+/// match at its nice length of 32 without pricing it.
 #[allow(clippy::too_many_arguments)]
 fn measure_past_nice<B: Budget>(
     combined: &[u8],
@@ -3270,11 +3239,9 @@ impl MatchRunPrice<'_> {
     /// The loop every endpoint goes through.
     ///
     /// Endpoints are compared eight at a time, which the compiler does in
-    /// vector registers, and only a group with a winner is updated. On 64 MiB
-    /// of C headers at level 3 that was 3% quicker overall than a branch per
-    /// endpoint, and a branch-free update of all three arrays, which the
-    /// compiler vectorizes too, was no quicker than the branch: it stores
-    /// every endpoint where few of them win.
+    /// vector registers, and only a group with a winner is updated. A
+    /// branch-free update of all three arrays stores every endpoint where few
+    /// of them win.
     #[inline(always)]
     fn relax_lengths(
         &self,
@@ -3530,8 +3497,7 @@ fn price_optimal_paths_with_state<const RING: bool>(
         // A run at a remembered distance offers what that distance's own
         // reach above already offered, at the same prices: the reach was
         // measured out to the real end of the match, which is as far as any
-        // run at that distance gets. On text that was a fifth of every
-        // endpoint priced, so such a run is left out.
+        // run at that distance gets. Such a run is left out.
         let repeat_reaches = reaches_len;
         let mut found = &runs[starts[index] as usize..starts[index + 1] as usize];
         // Nothing found here may be a position the collector stepped over,

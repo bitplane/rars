@@ -36,10 +36,9 @@ const SCREEN_SAMPLE_ALIGNMENT: usize = 12;
 /// How much smaller a filter has to make the sample before it earns a
 /// whole-member encode, as a percentage.
 ///
-/// A filter that pays off does so by a mile: delta on 16-bit audio takes 43% off
-/// and on interleaved counters 96%. A sample that comes out a fraction of a
-/// percent smaller is measurement noise from the shorter history, and chasing it
-/// costs a whole-member encode per filter to find out.
+/// A filter that pays off does so by a mile. A sample that comes out a fraction
+/// of a percent smaller is measurement noise from the shorter history, and
+/// chasing it costs a whole-member encode per filter to find out.
 const SCREEN_MARGIN_PERCENT: usize = 1;
 
 /// How much of the member x86 detection has to cover before filtering the whole
@@ -50,8 +49,7 @@ const X86_CODE_COVERAGE_RATIO: (usize, usize) = (9, 10);
 ///
 /// Only used to scale a progress bar, and deliberately not measured: finding out
 /// means scanning the member, which is a whole extra pass to sharpen a
-/// percentage. Two to five is what the binaries measured came to, with an
-/// unstripped 25 MB outlier at eleven.
+/// percentage.
 const X86_ASSUMED_REGIONS: u64 = 4;
 
 /// Bytes at each end of a member that a ranged delta filter skips, because
@@ -403,9 +401,8 @@ pub(crate) fn encode_pass<T>(
     }
 }
 
-/// Observe every encode in a search, including sample screens which previously
-/// discarded the caller's progress/cancellation callback. The codec adapter and
-/// search decisions remain unchanged.
+/// Observe every encode in a search, including sample screens. The codec
+/// adapter and search decisions remain unchanged.
 struct ReportingSearch<'a, S> {
     search: &'a S,
     progress: std::cell::RefCell<&'a mut dyn FnMut(EncodeProgress) -> bool>,
@@ -501,18 +498,14 @@ const TEXT_SAMPLES: usize = 16;
 /// [`search_applies`], judged from samples spread across the whole of `data`
 /// rather than from its start.
 ///
-/// A member's first bytes need not say what the rest is. A tar of `/usr`
-/// can open with a script and go on to megabytes of ELF code, and judged by
-/// its first 8 KiB the whole member was taken for text and never searched.
-/// Cut into runs, the same bytes were searched wherever a run did not open
-/// with text, so the two paths came out 7% apart. Sixteen samples cost
+/// A member's first bytes need not say what the rest is. A tar of `/usr` can
+/// open with a script and go on to megabytes of ELF code. Sixteen samples cost
 /// nothing next to one encode, and the whole member and each of its runs are
 /// then judged by what they hold.
 ///
 /// The RAR 1.5 to 4 writer asks the same question of a whole member, of each
 /// segment of a streamed one and of each member of a solid chain, and gets the
-/// same answer. A shell script carrying an ELF payload had gone unsearched
-/// there too, and came out 4% to 5% larger at every level.
+/// same answer.
 pub(crate) fn search_applies_throughout(data: &[u8]) -> bool {
     if data.len() <= TEXT_SAMPLE_LEN * 2 {
         return search_applies(data);
@@ -561,9 +554,6 @@ fn screen_sample_range(len: usize) -> Range<usize> {
 /// screen then prices a filter doing half its work, and that is the price it
 /// turned regions down at. So the sample is filtered at its own offset in the
 /// data, as a filter over its range alone would leave it.
-///
-/// It used to be filtered as a copy of the data up to the sample's end, which
-/// is the same bytes, but a copy as long as the member for every sample.
 fn filtered_sample<S: OwnedSearch>(
     search: &S,
     data: &[u8],
@@ -596,13 +586,11 @@ struct ScreenOutcome<B: Budget> {
 
 /// Which of the detectorless filters shrink a sample of the member.
 ///
-/// These used to cost a whole-member encode each to prove they made the member
-/// bigger, which on a binary is most of the search. Whether they help is a local
-/// property of the byte layout, so a slice of the member answers it for a few
-/// per cent of the price. This measures the real filter rather than a statistic
-/// standing in for it, because the wins do not all show up as entropy: RAR's
-/// delta reorders into planes first, and what that buys is repetition the
-/// encoder can match, not a flatter byte histogram.
+/// Whether they help is a local property of the byte layout, so a slice of the
+/// member answers it for a few per cent of the price. This measures the real
+/// filter rather than a statistic standing in for it, because the wins do not
+/// all show up as entropy: RAR's delta reorders into planes first, and what
+/// that buys is repetition the encoder can match, not a flatter byte histogram.
 ///
 /// A member no bigger than one sample is a special case worth taking. There is
 /// no slice to approximate with, so the screen encodes it the way the writer
@@ -687,13 +675,13 @@ fn screen_kinds<S: OwnedSearch>(
     // A kind the sample shows losing to another by the same margin it has to
     // beat the plain member by is not worth a whole-member encode either. On
     // 16-bit stereo audio delta 2 and delta 4 both clear the screen, and delta
-    // 2 then cost two whole encodes, its own and its ranged one, to come out
-    // 6% behind delta 4 as the sample already said it would.
+    // 2 then costs two whole encodes, its own and its ranged one, to come out
+    // behind delta 4 as the sample already said it would.
     //
     // Only when the screen ran at the finalists' own settings. A screen at
     // reduced effort, as RAR 2.9 runs above its lowest level, is fit to say
     // whether a kind helps at all but not which of two helps more: on a few
-    // hundred bytes of stereo samples it ranked another kind 1% ahead of the
+    // hundred bytes of stereo samples it ranked another kind ahead of the
     // delta that won the real encode.
     let ranks = screen_options == options;
     let best = sampled.iter().map(|&(_, packed)| packed).min();
@@ -732,38 +720,29 @@ fn x86_code_regions<B: Budget>(data: &[u8], allowance: &B) -> Result<Buffer<Rang
 /// judged on their sum (see [`x86_region_samples`]).
 ///
 /// A region the filter makes bigger is dropped rather than counted against the
-/// rest, which is what keeps the debug data out of the ranged candidate. On a
-/// 20 MB unstripped binary that turns a filter worth 0.2% into one worth
-/// 0.4%; leaving it in was worse than not filtering at all. Ties are kept: a
-/// sample with no convertible opcodes in it is not evidence against the region
-/// it came from.
+/// rest, which is what keeps the debug data out of the ranged candidate. Ties
+/// are kept: a sample with no convertible opcodes in it is not evidence against
+/// the region it came from.
 ///
 /// A kept region is then asked the second question: does leaving the jump
 /// opcodes alone beat converting them as well. That decides whether the E8-only
 /// filter is worth a whole-member encode of its own, and the answer is usually
-/// no. Over twenty-four members it won seven times and never by more than
-/// 0.21%, while carrying the pair cost a third of the search; screening it here
-/// keeps the wins and spends the encode only where a sample gives a reason to.
+/// no. Screening it here keeps the wins and spends the encode only where a
+/// sample gives a reason to.
 ///
 /// A search that [`OwnedSearch::prices_calls_alone`] skips that question and
 /// measures both. RAR 5 searches a large member in 4 MiB pieces, where one
 /// sample per region often has to stand for a whole piece, and there it
-/// guessed wrong: on a 32 MiB slice of ELF binaries E8 alone came out 0.9%
-/// smaller over the member, and the samples priced it in four pieces of
-/// eight.
+/// guesses wrong.
 fn x86_screened_regions<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     regions: &[Range<usize>],
     options: S::Options,
 ) -> Result<X86Screen<S::Memory>> {
-    // At the screens' settings, unless the search is exhaustive. This used to
-    // run at the caller's own, on the grounds that it is a yes or no with no
-    // margin under it. But a tar of `/usr` has a region for nearly every
-    // file, and these samples came to 60% as many bytes as the member; at
-    // level 3 every one of them went through the shortest-path parse. At the
-    // screens' settings, 64 MiB of `/usr` at level 3 packed to within 75
-    // bytes of what it did, as files and as a tar.
+    // At the screens' settings, unless the search is exhaustive. A tar of
+    // `/usr` has a region for nearly every file, and at the caller's settings
+    // every sample would go through the shortest-path parse.
     let options = if search.exhaustive() {
         options
     } else {
@@ -811,10 +790,8 @@ fn x86_screened_regions<S: OwnedSearch>(
         }
         // The pair losing is not the calls losing. Where jumps are dense and
         // short, as in unoptimised code, converting them costs more than the
-        // calls give back, and the region was turned down with the calls
-        // never priced: on one 4 MiB run of a debug build the pair came out
-        // 1.3% bigger than no filter and the calls alone 7.6% smaller. Only a
-        // region the pair fails pays for this second question.
+        // calls give back. Only a region the pair fails pays for this second
+        // question.
         if priced(region, Some(FilterKind::E8))? < baseline {
             helped = true;
             kept.try_push((region.clone(), None))?;
@@ -863,21 +840,15 @@ fn x86_screened_regions<S: OwnedSearch>(
 /// How much of an x86 region each of its screen samples stands for.
 ///
 /// The same span RAR 5 searches a large member in, so a region no longer than
-/// one of its pieces is sampled once, in the middle, as it always was.
+/// one of its pieces is sampled once, in the middle.
 const X86_REGION_SAMPLE_SPAN: usize = 4 * 1024 * 1024;
 
 /// Where the x86 screen samples `region`: the middle of each of as many equal
 /// parts as it takes to keep each part within `span`, which is
 /// [`X86_REGION_SAMPLE_SPAN`] unless the format asks for less.
 ///
-/// One sample used to stand for a region however long. On a 32 MiB slice of a
-/// tar of `/usr/bin` the scanner proposed one region for the last 26 MiB of ELF
-/// executables, and its one 128 KiB sample came out 20 bytes bigger under the
-/// filter at one setting and 500 bytes smaller at another. Turning the region
-/// down also took the whole-member candidate away, so 19 MiB of code went
-/// unfiltered and the member came out 5% larger, at some levels and not
-/// others. Summed over a sample for each 4 MiB, the code in the region
-/// outweighs whatever one window happens to land on.
+/// Summed over a sample for each 4 MiB, the code in the region outweighs
+/// whatever one window happens to land on.
 fn x86_region_samples(
     region: &Range<usize>,
     span: usize,
@@ -913,17 +884,15 @@ struct X86Screen<B: Budget> {
 /// screen made of the regions the scanner proposed.
 ///
 /// The scanner proposes overlapping regions at several clustering distances.
-/// Pricing each with a whole-member encode is worth about a third of a percent
-/// at full effort, so this keeps the two that are structurally different: filter
-/// everything, or filter only where the screen saw code.
+/// This keeps the two that are structurally different: filter everything, or
+/// filter only where the screen saw code.
 ///
 /// Which of the two is worth an encode is mostly already known. Filtering
 /// everything covers the regions the screen rejected as well, so once it has
-/// rejected one, that candidate is asking to be told again that those bytes come
-/// out bigger; on all seven binaries measured the kept regions beat it. Filtering
-/// only the regions is the same thing as filtering everything when they cover
-/// nearly the whole member. So each case is worth one candidate per kind, not
-/// two.
+/// rejected one, that candidate is asking to be told again that those bytes
+/// come out bigger. Filtering only the regions is the same thing as filtering
+/// everything when they cover nearly the whole member. So each case is worth
+/// one candidate per kind, not two.
 ///
 /// And usually one kind rather than two, because the screen has already asked
 /// whether the jump opcodes are worth converting. That takes an unstripped
@@ -993,9 +962,7 @@ fn table_stride(window: &[u8], max_stride: usize) -> Option<usize> {
 ///
 /// One stride at a time over two slices the same length, counted a short run
 /// at a time in a byte that no run can overflow: a loop the compiler runs
-/// sixteen bytes to an instruction. Taking every stride at each byte in turn,
-/// as this did, was a quarter of the time spent writing a member with no
-/// table anywhere in it, and every member pays for the scan.
+/// sixteen bytes to an instruction.
 fn stride_hits(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1] {
     let mut hits = [0usize; MAX_TABLE_STRIDE + 1];
     let Some(current) = window.get(max_stride..) else {
@@ -1026,9 +993,7 @@ fn stride_hits(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1
 /// This is what the whole-member delta screens cannot see: a relocation table
 /// is a few hundred kilobytes of 24-byte records inside a binary that delta
 /// with stride 24 nearly halves, while the same filter over the whole member
-/// is a disaster. On a 3.6 MB shared object the table packed to 32,767 bytes
-/// against 59,512 unfiltered; delta 24 over the whole member came out 85%
-/// *bigger* than no filter at all. The filter has to cover the table and stop.
+/// is a disaster. The filter has to cover the table and stop.
 fn table_regions<B: Budget>(
     data: &[u8],
     max_stride: usize,
@@ -1159,11 +1124,8 @@ fn subtract_owned<B: Budget>(
 /// out of whatever the specs covered, and delta at the record stride takes
 /// their place. Empty specs come out as a tables-only candidate.
 ///
-/// The tables win where the two overlap. A verified table stride is worth
-/// tens of percent of its region where the x86 filter is worth a few. This
-/// used to build one bundled candidate that competed with the x86 finalists
-/// instead, and on an unstripped binary the x86-only finalist won, taking the
-/// tables down with the debug data they were bundled against. Grafting the
+/// The tables win where the two overlap. A verified table stride is worth tens
+/// of percent of its region where the x86 filter is worth a few. Grafting the
 /// tables into every finalist lets them ride with whichever x86 variant wins.
 fn graft_owned<B: Budget>(
     specs: Buffer<FilterSpec, B>,
@@ -1345,10 +1307,7 @@ const TRIAL_SPAN: usize = 256 * 1024;
 
 /// How long each trial window is.
 ///
-/// A quarter of the member. On 1 MiB pieces of a tar of `/usr` at level 1, the
-/// filter this picked came to 0.07% more than the best finalist encoded in
-/// full; an eighth of the member, as 64 KiB in each 512 KiB or 32 KiB in each
-/// 256 KiB, came to 0.11%.
+/// A quarter of the member.
 const TRIAL_WINDOW_LEN: usize = 64 * 1024;
 
 /// Where the trial encodes a member this long: the middle of each
@@ -1431,26 +1390,20 @@ fn trial_size<S: OwnedSearch>(
 /// The one finalist worth encoding at the caller's settings, or `None` when
 /// they should all be encoded in full and the smallest kept.
 ///
-/// Encoding every finalist in full was most of the time spent writing a
-/// binary: up to six encodes of the member to keep one. On 64 MiB of a tar of
-/// `/usr` the search was 70% of level 1 and half of level 3, for filters
-/// worth 7% to 8%. So the finalists are ranked by a trial, and only the winner
-/// is encoded.
+/// Encoding every finalist in full is up to six encodes of the member to keep
+/// one, so the finalists are ranked by a trial, and only the winner is encoded.
 ///
 /// The trial encodes a window from each [`TRIAL_SPAN`] of the member under
 /// each finalist, at the screens' settings (see [`trial_size`]). The smallest
 /// total wins and the earliest takes a tie.
 ///
 /// Leaving the member alone is not one of the candidates the windows rank.
-/// Every finalist but the plain member is there because a screen saw its
-/// filter win, and a window without the member's history behind it undersells
-/// the filters: x86 code converted to absolute addresses gains from calls to
-/// the same place far apart. Ranked with the others, the plain member won the
-/// trial on 1 MiB pieces of a tar of `/usr` that it lost by 7% in full, and
-/// the choice came to 0.35% more than the best finalist; left out, 0.07%. So
-/// when the screens pass only one filter, it is taken without a trial. A kind
-/// the screens pass has already beaten the plain sample at the caller's own
-/// settings (see [`screen_kinds`]).
+/// Every finalist but the plain member is there because a screen saw its filter
+/// win, and a window without the member's history behind it undersells the
+/// filters: x86 code converted to absolute addresses gains from calls to the
+/// same place far apart. So when the screens pass only one filter, it is taken
+/// without a trial. A kind the screens pass has already beaten the plain sample
+/// at the caller's own settings (see [`screen_kinds`]).
 ///
 /// A member no longer than one span has no history to lose. It is encoded
 /// whole under each finalist, the plain member included, and at the caller's
@@ -2129,7 +2082,7 @@ mod tests {
         let opens_with_binary = [&noise[..2048], &text_body[..]].concat();
         assert!(search_applies(&opens_with_binary));
         assert!(!search_applies_throughout(&opens_with_binary));
-        // A member of up to two samples is judged as it always was.
+        // A member of up to two samples is judged by `search_applies`.
         for len in [0, 1, TEXT_SAMPLE_LEN, 2 * TEXT_SAMPLE_LEN] {
             for data in [&opens_with_text[..len], &opens_with_binary[..len]] {
                 assert_eq!(search_applies_throughout(data), search_applies(data));
@@ -3019,9 +2972,8 @@ mod tests {
     }
 
     /// The E8-only filter costs a whole-member encode to ask whether leaving
-    /// the jump opcodes alone packs better. Over twenty-four members it won
-    /// seven times and never by more than 0.21%, so it only earns that encode
-    /// when a sample says it might.
+    /// the jump opcodes alone packs better, so it only earns that encode when a
+    /// sample says it might.
     #[test]
     fn the_jump_opcodes_are_priced_on_a_sample_before_they_earn_an_encode() {
         let (data, _) = code_then_debug();
@@ -3109,8 +3061,8 @@ mod tests {
         data
     }
 
-    /// The scan counts a stride at a time, in runs. This is the count it
-    /// replaced, a byte at a time and every stride at each.
+    /// The scan counts a stride at a time, in runs. This counts a byte at a
+    /// time and every stride at each.
     #[test]
     fn the_stride_scan_counts_what_a_byte_at_a_time_count_does() {
         fn byte_at_a_time(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1] {
@@ -3582,8 +3534,7 @@ mod tests {
     }
 
     /// A sample filtered as if it began the file converts no call that reaches
-    /// back past its first byte, which here is every call there is. The screen
-    /// used to price that, see no difference, and decline the filter.
+    /// back past its first byte, which here is every call there is.
     #[test]
     fn the_x86_screen_filters_a_sample_where_it_lies_in_the_member() {
         let data = calls_back_to_the_start(SCREEN_SAMPLE_LEN * 4);
@@ -3813,8 +3764,7 @@ mod tests {
     }
 
     /// Two ranges describing one region must come out as one range. Dropping
-    /// the second instead, which one copy of this used to do, loses coverage of
-    /// everything past the overlap.
+    /// the second instead loses coverage of everything past the overlap.
     #[test]
     fn overlapping_ranges_merge_rather_than_drop() {
         assert_eq!(

@@ -1,7 +1,6 @@
 //! A volume written straight into its output matches one whose body is
-//! spooled and copied in when the volume closes, as every volume was before
-//! #547. An output that cannot seek still takes the spooled route, so the two
-//! are compared byte for byte.
+//! spooled and copied in when the volume closes. An output that cannot seek
+//! still takes the spooled route, so the two are compared byte for byte.
 
 use super::{write_streaming_volumes_to, ArchiveEntry, ArchiveExtras, WriterOptions};
 use crate::rar50::{CollectedVolumes, VolumeOutput, VolumeSink};

@@ -3741,8 +3741,7 @@ pub(crate) fn resolve_password_args(args: &PasswordArgs) -> CliResult<Option<Pas
 /// Each job stays planned within the default limit, or within `limit` when
 /// that is lower, so raising it only lets more jobs run at once and never
 /// changes the archive. Planning a member within a raised limit codes it
-/// whole: on 256 MiB of binaries at level 5 that was 6.4% smaller but took
-/// 4.6 times as long, and at level 3 it was no smaller (#316).
+/// whole (#316).
 fn writer_resources(memory_limit: Option<usize>) -> rars::WriterResources {
     let resources = rars::WriterResources::default();
     match memory_limit {

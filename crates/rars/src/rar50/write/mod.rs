@@ -245,9 +245,7 @@ pub fn write_streaming_volumes_with_progress(
         .volumes(true)
         .filtered(extras.filter_policy != FilterPolicy::None);
     // One option at a time, so a refusal names the one that was asked for.
-    // This used to be a single check over all three, which reported a string
-    // naming every option it covered whichever one the caller had set. Quick
-    // open rides on the feature set, so `validate_plan` catches that one.
+    // Quick open rides on the feature set, so `validate_plan` catches that one.
     validate_plan(
         options,
         shape,
@@ -270,9 +268,8 @@ pub fn write_streaming_volumes_with_progress(
             "symbolic links are not supported in volume output",
         ));
     }
-    // A member's services are validated with it and then had nowhere to go:
-    // `prepare_volume_member` never reads them, so a file comment asked for on
-    // a split set was accepted and then dropped without a word.
+    // `prepare_volume_member` never reads a member's services, so a file
+    // comment asked for on a split set is refused here rather than dropped.
     if entries.iter().any(|entry| !entry.services.is_empty()) {
         crate::write_plan::validate_option(options.target, WriterOption::FileComment, shape)?;
     }
@@ -731,11 +728,7 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 ///
 /// Random data costs the most per window byte: 583 MiB through the tree at a
 /// 64 MiB dictionary, and 654 MiB through chains, whose deltas pack worst on
-/// it. Noise costs the most per block byte. The charge covers both at once,
-/// 4% to 9% over the worst peak: 143 MiB at 4 MiB, 179 MiB at 8 MiB, 251 MiB
-/// at 16 MiB, 683 MiB at 64 MiB. It was 13 bytes per window byte and 96 per
-/// block byte, 307 MiB at 16 MiB, which put level 5's dictionary over the
-/// default plan and halved it to level 4's (#407).
+/// it. Noise costs the most per block byte. The charge covers both at once.
 ///
 /// `block_size` is the largest block the parse can be holding, not the size the
 /// reader asks for: a block grows past that when the data it covers is not
@@ -1057,9 +1050,7 @@ fn validate_file_entry(name: &[u8]) -> Result<()> {
 
 /// Checks one member and everything hanging off it.
 ///
-/// Both entry points run this now. It used to be six near-identical validators,
-/// one per shape of member the builder took, and the streaming path ran none of
-/// them beyond the name.
+/// Both entry points run this.
 fn validate_entry(entry: &ArchiveEntry) -> Result<()> {
     validate_file_entry(&entry.name)?;
     if let Some(link) = &entry.redirection {
@@ -2002,8 +1993,8 @@ mod tests {
 
     /// The same measurement for a parse that searches a tree, which holds two
     /// links per window position where a chain holds one. Charging the chain's
-    /// four bytes for it let a fitted dictionary pick a window the budget could
-    /// not hold: at a 32 MiB limit a 16 MiB member peaked at 43 MB.
+    /// four bytes for it would let a fitted dictionary pick a window the budget
+    /// cannot hold.
     #[test]
     fn the_workspace_charge_covers_a_tree_search_too() {
         let block = crate::codec::rar50::LZ_BLOCK_SIZE;
@@ -2073,10 +2064,8 @@ mod tests {
         }
     }
 
-    /// Each level's dictionary fits the plan a default writer makes. Level 5's
-    /// 16 MiB was once charged 307 MiB against 256 and quietly halved to level
-    /// 4's 8 MiB, which cost 6.4% on binaries (#407). The other tests pass an
-    /// unlimited budget, so they could not see it.
+    /// Each level's dictionary fits the plan a default writer makes (#407). The
+    /// other tests pass an unlimited budget, so they cannot see it.
     #[test]
     fn every_level_keeps_its_dictionary_under_the_default_plan() {
         let limit = crate::WriterResources::default().planning_memory_limit();
@@ -2222,7 +2211,7 @@ mod tests {
 
         assert!(advances.load(Ordering::Relaxed) >= 1);
         assert!(intermediate.load(Ordering::Relaxed));
-        // Progress is now counted in input bytes, however many passes the
+        // Progress is counted in input bytes, however many passes the
         // filter search makes over them.
         assert_eq!(last.load(Ordering::Relaxed), data.len() as u64);
     }
@@ -2544,7 +2533,6 @@ mod tests {
 
     #[test]
     fn unfiltered_optimal_streaming_fits_a_ceiling_sized_for_its_members() {
-        // Charging every job a full 1 MiB optimal block asked for 173 MB here.
         let mut state = 0x1234_5678u32;
         let data: Vec<u8> = (0..160 * 1024)
             .map(|_| {
@@ -2855,8 +2843,7 @@ mod tests {
     #[test]
     fn level_one_looks_ahead_before_taking_a_match() {
         // Level 1 is the only rung that does not parse by shortest path, so
-        // it is the only one where lazy matching does anything. Without it,
-        // level 1 left about 3% of the bench corpus on the table.
+        // it is the only one where lazy matching does anything.
         let level_one = encode_options_for_level(Some(1), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
         assert!(
             level_one.lazy_matching,
@@ -2865,9 +2852,8 @@ mod tests {
         assert_eq!(level_one.lazy_lookahead, 2);
 
         // Source code, the kind of input the bench corpus's text and source
-        // classes hold: it came out about 3% smaller looking ahead, as they did.
-        // Lazy matching does not win everywhere. Words from a dozen-word
-        // vocabulary in a jumbled order packed 10% larger with it, so this
+        // classes hold. Lazy matching does not win everywhere. Words from a
+        // dozen-word vocabulary in a jumbled order pack larger with it, so this
         // checks real text rather than a synthetic one.
         let data = include_bytes!("../../codec/rar50/encoder.rs");
         let lazy = encode_lz_member_with_options(data, 0, level_one).unwrap();
@@ -2884,9 +2870,8 @@ mod tests {
     #[test]
     fn only_the_bottom_of_the_ladder_settles_for_a_lazy_parse() {
         // Level 1 is the rung that exists to be quick. Everything above it
-        // parses by shortest path, because on this corpus nothing else closes
-        // the distance to WinRAR at any rung: the parse is worth several
-        // percent and the search depth around it is worth tenths.
+        // parses by shortest path, because nothing else closes the distance to
+        // WinRAR at any rung.
         for level in 0..=1u8 {
             let options =
                 encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
@@ -2907,9 +2892,6 @@ mod tests {
 
     #[test]
     fn every_level_encodes_the_member_once() {
-        // Level 5 used to try levels four down to one as well and keep the
-        // smallest. Over the whole bench corpus that caught one byte, on one
-        // member, for four extra whole-member encodes.
         for level in 0..=5u8 {
             let candidates =
                 encode_option_candidates_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE)
@@ -2935,9 +2917,7 @@ mod tests {
 
     #[test]
     fn the_ladder_never_packs_larger_as_it_climbs() {
-        // A rung that costs more time and returns more bytes is a bug, and it
-        // was one: level 4 used to return level 3's output for half again the
-        // time, because the shortest-path parse only started at level 5.
+        // A rung that costs more time and returns more bytes is a bug.
         let long_tail = b"stable long match payload for RAR5 best-level search ".repeat(10);
         let mut data = Vec::new();
         data.extend_from_slice(b"abc");
@@ -2988,10 +2968,7 @@ mod tests {
         // parse can code as a distance once and then the repeat-last-match
         // symbol, a bit or two for each 4 KiB. The phrase's start also
         // matches dozens of nearer, shorter copies of itself. A finder that
-        // stopped at the first match long enough to commit to found one of
-        // those, and the parse alternated two remembered distances at a dozen
-        // bits a token: 2,056 bytes for 4 MiB at every level, where WinRAR's
-        // -m4 and -m5 packed 393.
+        // stops at the first match long enough to commit to finds one of those.
         let mut period = vec![0u8; 4096];
         period.extend(b"the quick brown fox jumps over the lazy dog. ".repeat(91));
         let data: Vec<u8> = period.iter().copied().cycle().take(256 * 1024).collect();

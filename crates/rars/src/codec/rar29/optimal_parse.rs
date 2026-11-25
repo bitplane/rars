@@ -23,9 +23,8 @@ const OPTIMAL_SPAN: usize = 64 * 1024;
 /// What one block's shortest-path parse holds: a node per position, the
 /// matches found at each, and the two-byte table.
 ///
-/// Peak RSS coding a 4 MiB stripped binary on six threads was 23 MB above
-/// level 3's, about 4 MB a parse. Charged per block that may parse at once,
-/// with room for one where every position keeps all its matches.
+/// Charged per block that may parse at once, with room for one where every
+/// position keeps all its matches.
 pub(crate) const OPTIMAL_PARSE_WORKSPACE: u64 = 8 * 1024 * 1024;
 
 /// A run reaching this far is taken without pricing the positions it covers.
@@ -40,15 +39,8 @@ const MAX_FOUND: usize = 16;
 /// The lazy parse never emits a two-byte match, so the first priced pass sees
 /// no code for any of them, and whatever this says is what decides whether it
 /// tries them at all. Pricing them as dear as the longest code means it never
-/// does, and each later pass only creeps towards them. Measured on 4 MiB of a
-/// stripped binary at 128 candidates, two passes, packed bytes:
-///
-/// ```text
-/// absent bits        4          6          8         11         13         15
-/// packed     1,727,247  1,727,618  1,730,083  1,733,284  1,738,607  1,741,882
-/// ```
-///
-/// Below 8 the binary gains a little more and text starts to lose, so 8.
+/// does, and each later pass only creeps towards them. Below 8 binaries gain
+/// a little more and text starts to lose, so 8.
 const ABSENT_BITS: u32 = 8;
 
 /// One block's matches, found once and shared by every range of it priced.

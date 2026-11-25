@@ -66,7 +66,7 @@ const PPMD_TOKEN_EMA_WEIGHT: f64 = 1.0 / 8.0;
 // after it are predicted from the token's own bytes and pay for the broken
 // context. That cost lands on the literals' ledger, not the token's, so the
 // token is charged a flat estimate of it here. 16 took matches that cost more
-// than the literals: 64 packs 4 MiB of Rust source 4% smaller.
+// than the literals.
 const PPMD_CONTEXT_BREAK_BITS: f64 = 64.0;
 // After a match is priced out, nearby positions almost always price out the
 // same way, so the search sleeps a few bytes rather than re-walking the hash
@@ -124,11 +124,7 @@ fn walks_few(options: EncodeOptions) -> bool {
 /// delta, audio or RGB filter has turned into differences are small numbers,
 /// and on noisy ones nearly every four bytes recur within a few hundred
 /// positions. Level 3's 64 newest positions sharing four bytes then match six
-/// or seven, and the copies that run on are further down. On 4 MiB of noisy
-/// 24-bit pixels through the delta filter, level 3 keyed on four took 6-7
-/// byte matches for 270,834 tokens and 8 or more for 105,776; keyed on six,
-/// 49,731 and 274,598, and it packed 930,117 bytes rather than 963,053, where
-/// level 2 packs 944,113.
+/// or seven, and the copies that run on are further down.
 fn keys_long(options: EncodeOptions, span: usize, differences: bool) -> bool {
     let walk_reaches = walks_few(options)
         || (differences && options.max_match_candidates > 0 && options.optimal_parse_passes == 0);
@@ -690,8 +686,7 @@ fn encode_ppmd_block(
 /// build a new one from the order and dictionary size that follow. Clearing it
 /// leaves the reader's model where it is, which is how a solid chain gets a
 /// model that has already read every member before this one. WinRAR does this
-/// on 67 of the 68 PPMd blocks in a solid archive of 70 small files, and the
-/// difference is most of why that archive is 18% smaller than ours was.
+/// on 67 of the 68 PPMd blocks in a solid archive of 70 small files.
 ///
 /// The model comes back out so the next block can continue it in turn.
 fn encode_ppmd_block_with_model(
@@ -763,12 +758,11 @@ const PPMD_EITHER_WAY_SAMPLE: usize = 1 << 20;
 /// model, whichever codes the member's start smaller, escapes on a tie.
 ///
 /// An escape prices itself against costs measured off the stream it shapes,
-/// so on text that rarely repeats it can lose to literals: a 4.3 MB source
-/// tar at order 25 packs 1.8% smaller without them. Coding the whole member
-/// twice to find out costs half as much again on text where escapes win, so
-/// past twice the sample only the sample is coded both ways, from copies of
-/// the model, and the member is coded once the way it chose. The model comes
-/// back from that coding, since that is what its reader holds.
+/// so on text that rarely repeats it can lose to literals. Coding the whole
+/// member twice to find out costs half as much again on text where escapes
+/// win, so past twice the sample only the sample is coded both ways, from
+/// copies of the model, and the member is coded once the way it chose. The
+/// model comes back from that coding, since that is what its reader holds.
 fn encode_ppmd_either_way(
     input: &[u8],
     max_match_distance: usize,
@@ -920,7 +914,7 @@ pub struct EncodeOptions {
     /// four-byte chains cannot offer. A greedy parse ignores it.
     ///
     /// A parse whose chains key on six bytes (at most
-    /// [`LONG_KEY_MAX_CANDIDATES`] candidates) keeps near matches whatever
+    /// `LONG_KEY_MAX_CANDIDATES` candidates) keeps near matches whatever
     /// this says, since they are where its short matches come from.
     pub near_matches: bool,
     /// In a block that looks random, how many positions in a row may offer no
@@ -930,7 +924,7 @@ pub struct EncodeOptions {
     /// Already-compressed data offers a match now and then and nothing in
     /// between, so a parse that looks everywhere walks a chain of collisions
     /// at every byte for nothing. A long repeat is still found a few bytes in.
-    /// See [`SKIP_RANDOM_ABOVE_BITS`] for which blocks look random.
+    /// See `SKIP_RANDOM_ABOVE_BITS` for which blocks look random.
     pub skip_literal_runs: Option<usize>,
 }
 
@@ -1009,9 +1003,8 @@ impl Default for EncodeOptions {
 
 /// Which engine a member of a solid chain is coded with.
 ///
-/// A chain used to be LZ and nothing else. Both engines keep state that carries
-/// from member to member, so this is a per-member choice inside one chain
-/// rather than a property of the archive.
+/// Both engines keep state that carries from member to member, so this is a
+/// per-member choice inside one chain rather than a property of the archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainEngine {
     Lz,
@@ -1929,8 +1922,7 @@ fn for_each_block(
                 },
                 || code_blocks(blocks, &mut *levels),
             );
-            // What coded before a failure is still handed on, as it was when
-            // each piece was coded as soon as it parsed.
+            // What coded before a failure is still handed on.
             for (packed, &(piece_end, block_end)) in packed.iter().zip(&places) {
                 if out(packed, piece_end)?.is_break() {
                     return Ok(ControlFlow::Break(()));
@@ -2825,8 +2817,7 @@ impl<'a> LzParser<'a> {
         let batch_bytes = Self::batch_bytes(block_size);
         // Reach plus a batch, so filling a batch only overwrites links nothing
         // in it can reach, and no more than the data, which then overwrites
-        // none. A batch is megabytes at any thread count: clearing links for
-        // one was most of the time spent on a member of a few kilobytes.
+        // none. A batch is megabytes at any thread count.
         let window = reach.saturating_add(batch_bytes).min(data.len());
         let mut finder = ChainFinder::for_reach(window, reach, long);
         for history_pos in 0..start {
@@ -3002,11 +2993,8 @@ fn piece_table(
 /// says it pays, and that guess prices a literal at eight bits. Where the
 /// literals cost far less, as in sound or pixels a filter has turned into
 /// small differences, the short matches noise offers cost more than the
-/// literals they replace. On 1 MiB of noisy 8-bit sound through the audio
-/// filter, every level's matches made it larger than its literals alone:
-/// 547,768 bytes at level 1 and 601,969 at level 2, where literals code to
-/// 518,873. The more a level searched, the more of those matches it found,
-/// so level 2 came out larger than level 1.
+/// literals they replace. The more a level searches, the more of those
+/// matches it finds.
 ///
 /// Weighing the two takes a count of the block's bytes, which most parses
 /// take anyway to judge whether they look random, and a count of the
@@ -3077,8 +3065,7 @@ fn parse_block<C: Candidates>(
     // tokens it was cut with may no longer code from. That can cost a piece
     // more than its own parse saved, so the cut parse stays if it was smaller.
     //
-    // One pass a piece. Level 5's three took its time on 4 MiB of a binary
-    // from 1.13 to 1.33 times what it was before cutting, for 0.03-0.06%.
+    // One pass a piece.
     let mut cut_bits = 0usize;
     let mut parsed_bits = 0usize;
     let mut parsed = Vec::with_capacity(pieces.len());
@@ -3399,8 +3386,7 @@ struct MatchCandidate {
 /// coded through contexts where the escape byte is rare, and the copied bytes
 /// never enter the model. On text the model predicts a repeated span for a
 /// fraction of a bit per byte, so a minimum-length match can cost several
-/// times the literals it replaces. Emitting every legal match is what left
-/// PPMd members 30-45% behind rar 3.00 on log-shaped text.
+/// times the literals it replaces.
 ///
 /// The literal average answers "what does a byte cost as a literal right
 /// now", which is the opportunity cost of a match, so it moves slowly. The
@@ -3483,12 +3469,12 @@ type Declare<'a> = &'a mut dyn FnMut(&mut PpmdEncoder, usize, usize) -> Result<(
 ///
 /// A record is coded behind the escape symbol, as an LZ match is, so it can be
 /// declared anywhere in the stream, and gives its start relative to where it
-/// is declared. Declaring every record before the first byte, as this coder
-/// once did, needs the whole member filtered first, and works only while the
-/// reader can hold every record pending at once: our decoder takes 8192, which
-/// a named filter's 120,000-byte records pass before a member is 1 GB. Declared
-/// as the coder reaches it, each record is applied and dropped long before the
-/// next arrives, and a member read whole codes to the bytes a streamed one does.
+/// is declared. Declaring every record before the first byte needs the whole
+/// member filtered first, and works only while the reader can hold every
+/// record pending at once: our decoder takes 8192, which a named filter's
+/// 120,000-byte records pass before a member is 1 GB. Declared as the coder
+/// reaches it, each record is applied and dropped long before the next
+/// arrives, and a member read whole codes to the bytes a streamed one does.
 struct PpmdFilters {
     /// The filter's records not yet applied, in member order.
     pieces: Option<(crate::FilterKind, FilterPieces)>,
@@ -4062,11 +4048,8 @@ fn best_match(
 ///
 /// Only the lazy parse keeps it. The shortest-path parse finds these matches
 /// its own way, and the levels that ask for it beat a lazy parse without them
-/// by 4% to 7% on binaries, much of which this takes back: on a 4 MiB shared
-/// object, with repeats of two and three bytes as well, the lazy parse at
-/// level 3 comes out 1.45 MB against 1.51 MB, and rar 3.93 `-m3` packs
-/// 1.45 MB. A greedy parse has no second look to undo a short match that costs
-/// it a longer one next, so it goes without.
+/// on binaries; this closes most of the gap. A greedy parse has no second look
+/// to undo a short match that costs it a longer one next, so it goes without.
 ///
 /// The exceptions are parses that walk few candidates (see
 /// [`LONG_KEY_MAX_CANDIDATES`]): a lazy one keeps it at any span, and a greedy
@@ -4074,12 +4057,10 @@ fn best_match(
 /// cannot offer. A greedy one takes nothing shorter from it than its chains
 /// would have.
 ///
-/// Two-byte matches at short offsets were offered too, and dropped. The lazy
-/// parse prices a literal at eight bits, so every one of them looked cheaper
-/// than the two literals it replaced, and random data offers one every few
-/// hundred bytes: a member of noise coded larger than stored. Over the bench
-/// corpus they were worth 0.3% on the unstripped ELF and cost up to 1.3% on
-/// text, and the totals came out within 0.03% of each other.
+/// Two-byte matches at short offsets are not offered. The lazy parse prices a
+/// literal at eight bits, so every one of them looks cheaper than the two
+/// literals it replaces, and random data offers one every few hundred bytes:
+/// a member of noise would code larger than stored.
 struct NearMatches {
     triples: Vec<u32>,
 }
@@ -4114,9 +4095,7 @@ impl NearMatches {
     /// for: more than 7.5.
     ///
     /// Already-compressed data offers a three-byte match now and then and
-    /// nothing longer, so every position looked one up for nothing. On a 32 MiB
-    /// tar of compressed files at level 3 that cost 15% more time for 0.11%,
-    /// where executables gain 2.3% for 6%.
+    /// nothing longer, so looking one up at every position is wasted.
     fn looks_random(entropy: f64) -> bool {
         entropy > SKIP_RANDOM_ABOVE_BITS
     }
@@ -4134,9 +4113,8 @@ impl NearMatches {
 /// Above this much order-0 entropy, in bits a byte, a block looks random
 /// enough for [`EncodeOptions::skip_literal_runs`] to apply.
 ///
-/// The threshold the near matches use. On a 32 MiB tar of already-compressed
-/// files, skipping from 7.8 bits rather than 7.5 kept 0.06% more at level 2
-/// for a fifth more time; waiting longer before skipping was the better knob.
+/// The threshold the near matches use; waiting longer before skipping is the
+/// better knob.
 const SKIP_RANDOM_ABOVE_BITS: f64 = 7.5;
 
 /// The order-0 entropy of `block` in bits a byte, 8 for an empty one.
@@ -4680,9 +4658,6 @@ fn canonical_codes(lengths: &[u8]) -> Vec<Option<HuffmanCode>> {
 
 /// Bits written most significant first, gathered in a word and moved to the
 /// bytes a word at a time.
-///
-/// Pushing each symbol into the bytes as it came was a quarter of the time
-/// level 1 spent on a binary.
 #[derive(Default)]
 struct BitWriter {
     bytes: Vec<u8>,
