@@ -222,6 +222,9 @@ mod splitter_tests {
     }
 }
 
+const MAX_BLOCK_HEADER_BYTES: u64 = 5;
+const MAX_BLOCK_TABLE_BYTES: u64 = 1_248;
+
 /// From format limits and two encoder invariants, so no tuning of what the
 /// encoder chooses can outgrow it.
 pub(crate) fn packed_most(input_size: u64) -> u64 {
@@ -230,7 +233,7 @@ pub(crate) fn packed_most(input_size: u64) -> u64 {
     // one byte of its block, and the filtered ranges are disjoint. A block is five header bytes
     // and at most 1,248 bytes of tables: twenty level lengths of eight bits,
     // 446 lengths of a fifteen-bit code and seven extra bits, and byte padding.
-    const BLOCK_MOST: u64 = 5 + 1_248;
+    const BLOCK_MOST: u64 = MAX_BLOCK_HEADER_BYTES + MAX_BLOCK_TABLE_BYTES;
     // A filter record, or a match of fifteen main bits, nine length bits,
     // fifteen distance bits, 34 raw distance bits and a fifteen-bit align
     // code, at most 91 bits; any token but a filter covers at least one byte.
@@ -1650,6 +1653,20 @@ fn pipelined_optimal_blocks<B: Budget, R: std::ops::Deref<Target = [EncodeFilter
     };
     let price =
         |(block, records, is_last, matches): (std::ops::Range<usize>, R, bool, BlockMatches<B>)| {
+            if !B::LIMITED && options.parse_passes == 1 && records.is_empty() {
+                let packed = encode_single_pass_block(
+                    combined,
+                    block.clone(),
+                    options,
+                    algorithm_version,
+                    distance_size,
+                    is_last,
+                    matches,
+                    None,
+                    allowance,
+                )?;
+                return Ok((block, packed));
+            }
             let mut tokens = optimal_tokens_for_matches(
                 combined,
                 block.clone(),
@@ -1764,20 +1781,9 @@ fn finder_window(options: EncodeOptions, reach: usize) -> usize {
 /// The framed block copies the payload after the tokens have been released.
 pub(crate) fn lazy_parse_workspace(options: EncodeOptions, window: usize, block: usize) -> u64 {
     let finder = finder_window(options, window);
-    let tokens = block.max(4).next_power_of_two() as u64 * size_of::<LazyToken>() as u64;
-    let symbols = MAIN_TABLE_SIZE + DISTANCE_TABLE_SIZE_70 + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE;
-    let tables = symbols as u64
-        * (size_of::<usize>()
-            + size_of::<u8>()
-            + size_of::<(u16, u8)>()
-            + size_of::<LevelToken>()
-            + 3 * size_of::<usize>()) as u64;
-    // Fifteen bits per literal, or at least four bytes per match. A match of
-    // up to nine bytes has no length extras. Longer matches amortize them.
-    let (distance_slot, _) = distance_slot_for_valid_match(options.max_match_distance.max(1));
-    let distance_bits = distance_slot_bit_count_valid(distance_slot) as u64;
-    let bits_per_byte = 15u64.max((3 * 15 + distance_bits.saturating_sub(4)).div_ceil(4));
-    let payload = (block as u64 * bits_per_byte).div_ceil(8);
+    let tokens = block.max(4).next_power_of_two() as u64 * size_of::<PackedToken>() as u64;
+    let tables = huffman_workspace();
+    let payload = unfiltered_payload_bytes(options, block as u64);
     Rar50MatchFinder::bytes_for_window(finder)
         .saturating_add(tables)
         .saturating_add(
@@ -1785,6 +1791,68 @@ pub(crate) fn lazy_parse_workspace(options: EncodeOptions, window: usize, block:
                 .saturating_add(payload)
                 .max(payload.saturating_mul(2)),
         )
+}
+
+fn huffman_workspace() -> u64 {
+    let symbols = MAIN_TABLE_SIZE + DISTANCE_TABLE_SIZE_70 + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE;
+    symbols as u64
+        * (size_of::<usize>()
+            + size_of::<u8>()
+            + size_of::<(u16, u8)>()
+            + size_of::<LevelToken>()
+            + 3 * size_of::<usize>()) as u64
+}
+
+fn unfiltered_payload_bytes(options: EncodeOptions, bytes: u64) -> u64 {
+    // Fifteen bits per literal, or at least four bytes per match. A match of
+    // up to nine bytes has no length extras. Longer matches amortize them.
+    let (distance_slot, _) = distance_slot_for_valid_match(options.max_match_distance.max(1));
+    let distance_bits = distance_slot_bit_count_valid(distance_slot) as u64;
+    let bits_per_byte = 15u64.max((3 * 15 + distance_bits.saturating_sub(4)).div_ceil(4));
+    bytes.saturating_mul(bits_per_byte).div_ceil(8)
+}
+
+/// Workspace for an unfiltered one-pass parse whose collector is a tree.
+pub(crate) fn single_pass_tree_workspace(
+    options: EncodeOptions,
+    window: usize,
+    run: usize,
+    block_size: usize,
+) -> u64 {
+    let bytes = run.min(PIPELINED_BLOCK_BYTES) as u64;
+    // A batch larger than half the pipe is one block. Otherwise it can
+    // include one short final block in addition to its full input chunks.
+    let pricing_blocks = run
+        .min(PIPELINED_BLOCK_BYTES / 2)
+        .div_ceil(block_size)
+        .max(1) as u64;
+    // While pricing a half-pipe, the collector may fill the other half.
+    let collected_blocks = pricing_blocks * 2;
+    let matches = bytes * (match_finder::TREE_MAX_RUNS * size_of::<(u32, u32)>()) as u64
+        + (bytes + collected_blocks) * size_of::<u32>() as u64
+        + (bytes / options.nice() as u64) * (2 * size_of::<match_finder::CommittedMatch>()) as u64
+        + collected_blocks * (4 * size_of::<match_finder::CommittedMatch>()) as u64;
+    // Pricing owns the match runs, three arrays and the distance-state ring.
+    // Backtracking and coding release the runs. Even the match start offsets
+    // alone cover the extra bytes per input byte those stages can need.
+    let per_byte = 3 * size_of::<u32>();
+    let per_block = 9 * size_of::<u32>()
+        + OPTIMAL_STATE_RING_SIZE * (size_of::<[u32; 4]>() + size_of::<u32>())
+        + (match_finder::TREE_MAX_RUNS + 4) * size_of::<(usize, usize, usize)>();
+    let with_offsets = per_byte + size_of::<u32>();
+    debug_assert!(2 * size_of::<u32>() + size_of::<PackedToken>() <= with_offsets);
+    debug_assert!(
+        unfiltered_payload_bytes(options, bytes) * 2 + bytes * size_of::<PackedToken>() as u64
+            <= bytes * with_offsets as u64
+    );
+    debug_assert!(huffman_workspace() + 4 * MAX_BLOCK_TABLE_BYTES <= per_block as u64);
+    let retained = unfiltered_payload_bytes(options, run as u64)
+        + (run.div_ceil(block_size) as u64) * (MAX_BLOCK_TABLE_BYTES + MAX_BLOCK_HEADER_BYTES + 1);
+    Rar50TreeMatchFinder::<Allowance>::bytes_for_window(finder_window(options, window)) as u64
+        + matches
+        + bytes * per_byte as u64
+        + pricing_blocks * per_block as u64
+        + retained
 }
 
 /// A finder for the whole member, seeded with the history it carries in. It
@@ -2515,7 +2583,7 @@ fn encode_lz_block_with_allowance<B: Budget>(
         }
     };
     if !options.optimal_parse {
-        let tokens = lazy_tokens::<B, LazyToken>(
+        let tokens = lazy_tokens::<B, PackedToken>(
             combined,
             block,
             search,
@@ -2525,7 +2593,7 @@ fn encode_lz_block_with_allowance<B: Budget>(
             allowance,
         )?;
         let payload = encode_token_payload(
-            tokens.iter().copied().map(LazyToken::decode),
+            tokens.iter().copied().map(PackedToken::decode),
             initial_filters,
             algorithm_version,
             distance_size,
@@ -2537,6 +2605,21 @@ fn encode_lz_block_with_allowance<B: Budget>(
             payload.bit_pos,
             true,
             is_last,
+            allowance,
+        );
+    }
+
+    if !B::LIMITED && options.parse_passes == 1 && initial_filters.is_empty() {
+        let matches = collect_optimal_matches(combined, block.clone(), search, options, allowance)?;
+        return encode_single_pass_block(
+            combined,
+            block,
+            options,
+            algorithm_version,
+            distance_size,
+            is_last,
+            matches,
+            progress,
             allowance,
         );
     }
@@ -2850,12 +2933,12 @@ enum EncodeToken {
     Match { length: usize, distance: usize },
 }
 
-/// A lazy token is a literal when its distance is zero. Match lengths need
+/// A packed token is a literal when its distance is zero. Match lengths need
 /// thirteen bits, leaving room for every distance the RAR 7 encoder accepts.
 #[derive(Clone, Copy)]
-struct LazyToken(u64);
+struct PackedToken(u64);
 
-impl LazyToken {
+impl PackedToken {
     const LENGTH_BITS: u32 = MAX_ENCODER_MATCH_LENGTH.ilog2() + 1;
     const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
 
@@ -2872,7 +2955,7 @@ impl LazyToken {
     }
 }
 
-impl From<EncodeToken> for LazyToken {
+impl From<EncodeToken> for PackedToken {
     fn from(token: EncodeToken) -> Self {
         match token {
             EncodeToken::Literal(byte) => Self(u64::from(byte)),
@@ -3763,27 +3846,52 @@ fn committed_tail(
 /// search would find, so every pass prices the same collection.
 fn optimal_tokens_in_workspace<B: Budget>(
     combined: &[u8],
-    block: std::ops::Range<usize>,
+    block: Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
     matches: &BlockMatches<B>,
     workspace: &mut OptimalWorkspace<B>,
 ) -> Result<Buffer<EncodeToken, B>> {
+    price_optimal_tokens::<B, EncodeToken, false>(
+        combined,
+        block,
+        options,
+        distance_size,
+        prices,
+        matches,
+        workspace,
+    )
+}
+
+fn price_optimal_tokens<B: Budget, T: From<EncodeToken>, const BOUNDED: bool>(
+    combined: &[u8],
+    block: Range<usize>,
+    options: EncodeOptions,
+    distance_size: usize,
+    prices: Option<&TokenPrices<'_>>,
+    matches: impl std::borrow::Borrow<BlockMatches<B>>,
+    workspace: &mut OptimalWorkspace<B>,
+) -> Result<Buffer<T, B>> {
     #[cfg(test)]
     convergence_tests::record_pricing_pass();
     let start = block.start;
     let end = block.end;
     let span = end - start;
 
-    let allowance = workspace.price.allowance().clone();
-    if !B::LIMITED && matches.runs.is_empty() {
+    let allowance = workspace.price.allowance();
+    let found = matches.borrow();
+    if !B::LIMITED && found.runs.is_empty() {
         // Every parse starts with empty distance memory. Without a collected
         // match, literals cannot introduce a remembered distance, so they are
         // the only path through this block under any set of table prices.
         // Limited parses retain their allocation and refusal order below.
         return Buffer::collect(
-            combined[block].iter().copied().map(EncodeToken::Literal),
+            combined[block]
+                .iter()
+                .copied()
+                .map(EncodeToken::Literal)
+                .map(T::from),
             &allowance,
         );
     }
@@ -3810,7 +3918,7 @@ fn optimal_tokens_in_workspace<B: Budget>(
     // Admit the largest candidate list once. Pricing only borrows already
     // charged arrays, so its inner loop is identical for both budget policies.
     // Each position contributes at most four remembered-distance candidates.
-    let longest_run = matches
+    let longest_run = found
         .starts
         .windows(2)
         .map(|pair| (pair[1] - pair[0]) as usize)
@@ -3828,9 +3936,9 @@ fn optimal_tokens_in_workspace<B: Budget>(
         options,
         distance_size,
         prices,
-        &matches.runs,
-        &matches.starts,
-        &matches.commits,
+        &found.runs,
+        &found.starts,
+        &found.commits,
         OptimalSlices {
             price,
             arrive_length,
@@ -3841,21 +3949,31 @@ fn optimal_tokens_in_workspace<B: Budget>(
         &mut reaches,
     );
 
+    if BOUNDED {
+        drop(matches);
+        *price = Buffer::new(&allowance);
+        *arrive_reps = Buffer::new(&allowance);
+        *arrive_last_length = Buffer::new(&allowance);
+        drop(reaches);
+    }
     let mut reversed = Buffer::new(&allowance);
     let mut index = span;
     while index > 0 {
+        if BOUNDED && reversed.len() == reversed.capacity() {
+            reversed.grow_in_place(reversed.capacity().max(2).saturating_mul(2).min(span))?;
+        }
         let length = arrive_length[index] as usize;
         if length == 0 {
             reversed
-                .push(EncodeToken::Literal(combined[start + index - 1]))
+                .push(T::from(EncodeToken::Literal(combined[start + index - 1])))
                 .map_err(Into::into)?;
             index -= 1;
         } else {
             reversed
-                .push(EncodeToken::Match {
+                .push(T::from(EncodeToken::Match {
                     length,
                     distance: arrive_distance[index] as usize,
-                })
+                }))
                 .map_err(Into::into)?;
             index -= length;
         }
@@ -3943,16 +4061,7 @@ fn encode_optimal_tokens<B: Budget>(
     allowance: &B,
 ) -> Result<Buffer<EncodeToken, B>> {
     let block_len = block.len();
-    let matches = match search {
-        MemberSearch::Optimal(collector) => collector.collect(combined, block.clone(), options)?,
-        _ => {
-            // A fresh index has no continuation once this block's matches
-            // are collected. Drop it before allocating pricing workspace.
-            let mut own =
-                OptimalCollector::with_allowance(combined, block.start, options, allowance)?;
-            own.collect(combined, block.clone(), options)?
-        }
-    };
+    let matches = collect_optimal_matches(combined, block.clone(), search, options, allowance)?;
     let tokens = optimal_tokens_for_matches(
         combined,
         block,
@@ -3966,6 +4075,67 @@ fn encode_optimal_tokens<B: Budget>(
         return Err(Error::Cancelled);
     }
     Ok(tokens)
+}
+
+fn collect_optimal_matches<B: Budget>(
+    combined: &[u8],
+    block: Range<usize>,
+    search: MemberSearch<'_, B>,
+    options: EncodeOptions,
+    allowance: &B,
+) -> Result<BlockMatches<B>> {
+    match search {
+        MemberSearch::Optimal(collector) => collector.collect(combined, block, options),
+        _ => {
+            // A fresh index has no continuation once this block's matches
+            // are collected. Drop it before allocating pricing workspace.
+            let mut own =
+                OptimalCollector::with_allowance(combined, block.start, options, allowance)?;
+            own.collect(combined, block, options)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_single_pass_block<B: Budget>(
+    combined: &[u8],
+    block: Range<usize>,
+    options: EncodeOptions,
+    algorithm_version: u8,
+    distance_size: usize,
+    is_last: bool,
+    matches: BlockMatches<B>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<u8, B>> {
+    let span = block.len();
+    let tokens = price_optimal_tokens::<B, PackedToken, true>(
+        combined,
+        block,
+        options,
+        distance_size,
+        None,
+        matches,
+        &mut OptimalWorkspace::new(allowance),
+    )?;
+    if progress.is_some_and(|report| !report(span)) {
+        return Err(Error::Cancelled);
+    }
+    let payload = encode_token_payload(
+        tokens.iter().copied().map(PackedToken::decode),
+        NO_RECORDS,
+        algorithm_version,
+        distance_size,
+        allowance,
+    )?;
+    drop(tokens);
+    encode_compressed_block_with_allowance(
+        &payload.bytes,
+        payload.bit_pos,
+        true,
+        is_last,
+        allowance,
+    )
 }
 
 fn lazy_tokens<B: Budget, T: From<EncodeToken>>(

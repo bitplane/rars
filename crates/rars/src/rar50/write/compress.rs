@@ -1483,9 +1483,15 @@ impl WaveWorkspace {
         history: u64,
         block: usize,
         filter_piece: u64,
+        tree_chunk_size: Option<usize>,
     ) -> Self {
         use crate::codec::rar50::{lazy_parse_workspace, MAX_LZ_BLOCK_SIZE};
-        let cap = len.checked_next_power_of_two().unwrap_or(len);
+        let cap = if tree_chunk_size.is_some() {
+            // A run can start with a non-power-of-two block and grow from it.
+            len.saturating_mul(2)
+        } else {
+            len.checked_next_power_of_two().unwrap_or(len)
+        };
         let block = block
             .min(MAX_LZ_BLOCK_SIZE)
             .min(usize::try_from(len).unwrap_or(usize::MAX));
@@ -1516,11 +1522,30 @@ impl WaveWorkspace {
         };
         // Optimal coding's window term includes room beside the finder links.
         // Lazy coding explicitly adds the window, which it owns per job.
-        let coding = scratch(reach, block).saturating_add(if options.optimal_parse {
-            len.saturating_add(cap)
+        let coding = if let Some(chunk) = tree_chunk_size {
+            let scratch = crate::codec::rar50::single_pass_tree_workspace(
+                options,
+                usize::try_from(window).unwrap_or(usize::MAX),
+                usize::try_from(len).unwrap_or(usize::MAX),
+                chunk,
+            );
+            // A worker growing its own window releases the separate run
+            // before parsing. Idle workers can still own both source buffers.
+            if history == 0 {
+                cap.saturating_add(scratch)
+            } else {
+                let grown = window.max(history.saturating_mul(2));
+                grown
+                    .saturating_add(scratch.max(cap))
+                    .max(cap.saturating_add(history))
+            }
         } else {
-            window.saturating_add(cap.saturating_mul(2))
-        });
+            scratch(reach, block).saturating_add(if options.optimal_parse {
+                len.saturating_add(cap)
+            } else {
+                window.saturating_add(cap.saturating_mul(2))
+            })
+        };
         Self {
             assembly: self.assembly.saturating_add(assembly),
             filter_inputs: self.filter_inputs.saturating_add(cap),
@@ -1554,6 +1579,7 @@ impl BlockWave {
         plan: &CompressPlan,
         filter_runs: bool,
         len: u64,
+        min_len: u64,
         history: u64,
         retained: u64,
         required: u64,
@@ -1571,6 +1597,8 @@ impl BlockWave {
             history,
             crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
             filter_piece,
+            single_pass_tree_chunk(plan, filter_runs, min_len, history)
+                .filter(|_| resources.execution.is_none()),
         );
         let charge = workspace.peak(retained);
         let scopes = self
@@ -1638,8 +1666,27 @@ impl BlockWave {
             history,
             block,
             filter_piece as u64,
+            single_pass_tree_chunk(plan, filter_runs, job.data.len() as u64, history)
+                .filter(|_| !B::LIMITED),
         );
     }
+}
+
+// A short run behind a long history can use chains, whose frontier has a
+// different limit. Before reading, use the smallest run the job could hold.
+fn single_pass_tree_chunk(
+    plan: &CompressPlan,
+    filter_runs: bool,
+    len: u64,
+    history: u64,
+) -> Option<usize> {
+    let options = plan.encode_options;
+    (options.optimal_parse
+        && options.parse_passes == 1
+        && !filter_runs
+        && !plan.solid
+        && history <= len.saturating_mul(4))
+    .then_some(plan.block_size)
 }
 
 /// The last block of a run can cross its nominal boundary, and a short
@@ -2227,6 +2274,7 @@ where
                     plan,
                     filter_runs,
                     len,
+                    stream.unread().min(member_run_size(plan) as u64),
                     history,
                     plan.encode_options.max_match_distance as u64,
                     required,
@@ -2409,6 +2457,7 @@ where
                 plan,
                 filter_runs,
                 job_size_bound(plan, 1, remaining),
+                0,
                 placed.min(dictionary),
                 dictionary,
                 required,

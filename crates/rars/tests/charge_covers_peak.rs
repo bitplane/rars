@@ -241,7 +241,7 @@ const BORDERLINE_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 652,
     },
-    // Four lazy solid jobs can charge 80.9 MiB against 32.3 MiB allocated when their peaks overlap less.
+    // The four solid coding peaks can coincide (80.9 MiB charged, 34.4/32.4 MiB measured by tier).
     Gap {
         tier: Tier::Small,
         writer: Writer::Rar5,
@@ -262,7 +262,7 @@ const BORDERLINE_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 654,
     },
-    // Four workers can peak at 140.5 MiB for the three RAR 7 runs charged 302 MiB.
+    // Three RAR 7 repricing jobs can overlap (302.0 MiB charged, 144.5 MiB measured).
     Gap {
         tier: Tier::Small,
         writer: Writer::Rar7,
@@ -319,17 +319,6 @@ const KNOWN_GAPS: &[Gap] = &[
         input: None,
         assertion: Assertion::Loose,
         issue: 393,
-    },
-    // Level 2's three block jobs reserve up to 302 MiB for their concurrent parse scratch (140 MiB measured).
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar5,
-        paths: &[Path::Blocks],
-        levels: &[2],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 654,
     },
     // At each level's fitted dictionary, for the causes above where an entry
     // gives none of its own.
@@ -392,17 +381,6 @@ const KNOWN_GAPS: &[Gap] = &[
         input: None,
         assertion: Assertion::Covered,
         issue: 393,
-    },
-    // Fitted level 2's three full parses can coincide: 387 MiB charged, 177 MiB measured.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::Blocks],
-        levels: &[2],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 654,
     },
 ];
 
