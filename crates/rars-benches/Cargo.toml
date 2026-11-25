@@ -1,5 +1,6 @@
 [package]
 name = "rars-benches"
+version = "0.13.1"
 publish = false
 edition.workspace = true
 rust-version.workspace = true
