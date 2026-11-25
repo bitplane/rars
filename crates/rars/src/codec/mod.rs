@@ -1,5 +1,6 @@
 //! RAR compression codecs, filters, PPMd, and RARVM components used by `rars`.
 
+mod cached_bits;
 mod canonical;
 pub(crate) mod fast;
 pub mod filters;

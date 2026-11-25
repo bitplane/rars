@@ -25,6 +25,7 @@ use standard_filters::{
 };
 use standard_filters::{apply_standard_filter_with_allowance, identify_standard_filter};
 
+use super::cached_bits::CachedBits;
 use super::filters::DeltaErrorMessages;
 #[cfg(all(test, feature = "write"))]
 use super::filters::MAX_DELTA_CHANNELS;
@@ -49,6 +50,8 @@ const SHORT_MATCH: usize = 64;
 // Matches at least this far back are copied in blocks of this width.
 const COPY_WIDTH: usize = 16;
 const STREAM_CHUNK: usize = 1024 * 1024;
+// Literals decoded per burst before the loop polls again.
+const LITERAL_BURST: usize = 256;
 // The most history a streamed member holds: the window, up to a quarter
 // window not yet trimmed, and the chunk being decoded.
 const STREAM_HISTORY: usize = MAX_HISTORY + MAX_HISTORY / 4 + STREAM_CHUNK;
@@ -825,12 +828,29 @@ impl<B: Budget> Reader29State<B> {
 
     fn decode_lz(&mut self, output_size: usize, src: &mut dyn Read) -> Result<()> {
         let mut poller = self.read_control.poller();
+        let mut literals = [0u8; LITERAL_BURST];
         while self.current_pos() < output_size {
             poller.check_codec(self.current_pos())?;
             self.bits.top_up(src)?;
             let symbol = self.main.decode(&mut self.bits)?;
             match symbol {
-                0..=255 => self.output.try_push(symbol as u8)?,
+                0..=255 => {
+                    self.output.try_push(symbol as u8)?;
+                    // Setting up the burst costs more than a match-heavy
+                    // stream gains from it when no literal follows.
+                    if B::LIMITED || !self.main.literal_follows(&self.bits) {
+                        continue;
+                    }
+                    // Past `top_up` at least the packed window's low-water
+                    // mark lies ahead, far more than a burst reads.
+                    let room = (output_size - self.current_pos()).min(LITERAL_BURST);
+                    let mut bits = CachedBits::at(&self.bits.input, self.bits.bit_pos);
+                    let count = bits.quick_literals(&self.main.state, &mut literals[..room]);
+                    self.bits.bit_pos = bits.position();
+                    self.output
+                        .extend_from_slice(&literals[..count])
+                        .map_err(Into::into)?;
+                }
                 256 => {
                     self.read_end_of_block()?;
                     return Ok(());
@@ -1649,6 +1669,11 @@ impl<B: Budget> Huffman<B> {
         )?;
         bits.bit_pos += len;
         Ok(symbol)
+    }
+    #[inline(always)]
+    fn literal_follows(&self, bits: &BitReader<B>) -> bool {
+        let entry = self.state.quick_entry(bits.peek15().0);
+        entry != 0 && entry < 256 << 4
     }
 }
 
