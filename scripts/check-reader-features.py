@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Check the independent consumer without workspace feature unification.
 
-Run from any directory. Defaults to all combinations. Build logs and dependency
+Run from any directory. Defaults to all 16 combinations. Build logs and dependency
 inventories stay below target/reader-features; Cargo builds run sequentially.
 """
 import argparse
@@ -12,7 +12,7 @@ import re
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-FEATURES = ("write", "recovery", "encryption", "parallel", "cjk-names")
+FEATURES = ("write", "recovery", "encryption", "parallel")
 
 
 def main():

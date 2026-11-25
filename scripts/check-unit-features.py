@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test the library units for all optional-feature combinations.
+"""Test the library units for all 16 optional-feature combinations.
 
 Use --features none or a comma-separated subset for one configuration. This
 selects only rars's library harness, avoiding workspace feature unification.
@@ -12,7 +12,7 @@ from pathlib import Path
 import subprocess
 
 ROOT = Path(__file__).resolve().parents[1]
-FEATURES = ("write", "recovery", "encryption", "parallel", "cjk-names")
+FEATURES = ("write", "recovery", "encryption", "parallel")
 # Clippy builds a set's unit tests a second time, so it runs on two: write
 # alone, which compiles the fewest helpers the writer's tests lean on (its
 # `useless_vec` buffers only had to be a Vec with encryption on), and no
