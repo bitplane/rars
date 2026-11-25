@@ -1487,29 +1487,32 @@ fn should_lazy_emit_literal(
 }
 
 fn find_short_lz(input: &[u8], pos: usize) -> Option<ShortLz> {
-    if pos == 0 {
+    let first = *input.get(pos)?;
+    let limit = (input.len() - pos).min(10);
+    if limit < 2 {
         return None;
     }
 
-    let max_distance = pos.min(256);
+    let history = pos.saturating_sub(256);
     let mut best = ShortLz {
         distance: 0,
         length: 0,
     };
-    for distance in 1..=max_distance {
-        let mut length = 0usize;
-        while length < 10
-            && pos + length < input.len()
-            && input[pos + length] == input[pos + length - distance]
-        {
+    // Search nearest first so equal lengths keep the smaller distance.
+    for candidate in memchr::memrchr_iter(first, &input[history..pos]) {
+        let distance = pos - (history + candidate);
+        let mut length = 1;
+        while length < limit && input[pos + length] == input[pos + length - distance] {
             length += 1;
         }
-        // Distances increase, so the first match of a given length is nearest.
         if length >= 2 && length > best.length as usize {
             best = ShortLz {
                 distance: distance as u32,
                 length: length as u32,
             };
+            if length == limit {
+                break;
+            }
         }
     }
 
