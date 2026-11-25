@@ -838,12 +838,209 @@ fn large_members_ending_at_a_volume_edge_match_spooled_ones() {
                     spooled.take() == packed.take(),
                     "{recovery:?}, {volume_size}"
                 ),
-                // A few of these sizes are refused however the member goes in.
-                (Err(spooled), Err(packed)) => {
-                    assert_eq!(spooled.to_string(), packed.to_string(), "{volume_size}")
-                }
                 (spooled, packed) => panic!("{recovery:?}, {volume_size}: {spooled:?} {packed:?}"),
             }
         }
     }
+}
+
+#[cfg(feature = "recovery")]
+fn extracted(volumes: &[Vec<u8>], password: Option<&[u8]>) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let archives: Vec<_> = volumes
+        .iter()
+        .map(|volume| {
+            crate::rar50::Archive::parse_owned_with_password(volume.clone(), password).unwrap()
+        })
+        .collect();
+    let options = match password {
+        Some(password) => ArchiveReadOptions::with_password(password),
+        None => ArchiveReadOptions::new(),
+    };
+    let extracted = Arc::new(Mutex::new(Vec::new()));
+    crate::rar50::extract_volumes_to(&archives, options, |meta| {
+        let file = Arc::new(Mutex::new((meta.name.clone(), Vec::new())));
+        extracted.lock().unwrap().push(file.clone());
+        Ok(Box::new(Shared(file)))
+    })
+    .unwrap();
+    let extracted = extracted.lock().unwrap();
+    extracted
+        .iter()
+        .map(|file| file.lock().unwrap().clone())
+        .collect()
+}
+
+/// Members a few volumes of 2 to 4 KiB hold, noise and text by turns.
+#[cfg(feature = "recovery")]
+fn small_members() -> Vec<(Vec<u8>, Vec<u8>)> {
+    (0..6)
+        .map(|index| {
+            let len = 700 + index * 1300;
+            let data = if index % 2 == 0 {
+                noise(len, index as u32)
+            } else {
+                text(len, index)
+            };
+            (format!("m{index}").into_bytes(), data)
+        })
+        .collect()
+}
+
+/// Writes `members` as `case` into volumes of `volume_size`, and checks none
+/// comes out longer.
+#[cfg(feature = "recovery")]
+fn write_small(
+    members: &[(Vec<u8>, Vec<u8>)],
+    case: Case,
+    volume_size: u64,
+    resources: &WriterResources,
+) -> crate::Result<Vec<Vec<u8>>> {
+    let entries: Vec<_> = members
+        .iter()
+        .map(|(name, data)| {
+            let entry = ArchiveEntry::new(name.clone(), EntrySource::from_bytes(data.clone()));
+            if case.password {
+                entry.with_password(b"secret".to_vec())
+            } else {
+                entry
+            }
+        })
+        .collect();
+    let mut sink = CollectedVolumes::new();
+    seeded(|| {
+        write_streaming_volumes_to(
+            &entries,
+            case.options(),
+            ArchiveExtras::default().with_recovery_percent(case.recovery),
+            volume_size,
+            &mut sink,
+            resources,
+        )
+    })?;
+    let volumes = sink.take();
+    for (index, volume) in volumes.iter().enumerate() {
+        assert!(
+            volume.len() as u64 <= volume_size,
+            "{case:?}, {volume_size}: volume {index} is {} bytes",
+            volume.len()
+        );
+    }
+    Ok(volumes)
+}
+
+#[cfg(feature = "recovery")]
+const STORED_WITH_RECOVERY: Case = Case {
+    level: 0,
+    solid: false,
+    password: false,
+    header_encryption: false,
+    blake2sp: false,
+    recovery: Some(3),
+};
+
+/// With a recovery record, a small volume's overhead does not only grow with
+/// its body: below about 200 KiB the record over a shorter body can be the
+/// longer one. These sizes put a member's end, the set's last one among
+/// them, where the volume would come out too long, or a member's next
+/// fragment back in the volume it was split from.
+#[cfg(feature = "recovery")]
+#[test]
+fn small_recovery_volumes_fit_where_a_shorter_body_has_a_longer_record() {
+    let scratch = crate::scratch::case("volume-recovery-small-edges");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    let packed = Case {
+        level: 1,
+        recovery: Some(10),
+        ..STORED_WITH_RECOVERY
+    };
+    for (case, volume_size) in [
+        (STORED_WITH_RECOVERY, 2078),
+        (STORED_WITH_RECOVERY, 2891),
+        (STORED_WITH_RECOVERY, 2913),
+        (packed, 2000),
+        (packed, 2991),
+    ] {
+        let volumes = write_small(&small_members(), case, volume_size, &resources)
+            .unwrap_or_else(|error| panic!("{case:?}, {volume_size}: {error}"));
+        assert!(
+            extracted(&volumes, None) == small_members(),
+            "{case:?}, {volume_size}"
+        );
+    }
+}
+
+/// Every volume size from 2000 to 4200 bytes, with members ending at every
+/// point of such volumes: each volume comes in within the volume size, or the
+/// set is refused as too small to hold a member header.
+#[cfg(feature = "recovery")]
+#[test]
+fn small_recovery_volumes_stay_within_the_volume_size() {
+    let scratch = crate::scratch::case("volume-recovery-small");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    let mixed = small_members();
+    let short_last = vec![
+        (b"a".to_vec(), noise(3 * 1024, 5)),
+        (b"b".to_vec(), text(200, 1)),
+        (b"c".to_vec(), Vec::new()),
+        (b"d".to_vec(), noise(5 * 1024 + 17, 6)),
+        (b"e".to_vec(), text(40, 2)),
+    ];
+    let stored = STORED_WITH_RECOVERY;
+    let mut runs = vec![
+        (&mixed, stored),
+        (
+            &mixed,
+            Case {
+                level: 1,
+                recovery: Some(10),
+                ..stored
+            },
+        ),
+        (
+            &short_last,
+            Case {
+                level: 3,
+                blake2sp: true,
+                recovery: Some(5),
+                ..stored
+            },
+        ),
+    ];
+    if cfg!(feature = "encryption") {
+        runs.push((
+            &short_last,
+            Case {
+                password: true,
+                header_encryption: true,
+                ..stored
+            },
+        ));
+    }
+    let mut written = 0;
+    for (members, case) in runs {
+        for volume_size in 2000..4200 {
+            let volumes = match write_small(members, case, volume_size, &resources) {
+                Ok(volumes) => volumes,
+                Err(error) => {
+                    assert_eq!(
+                        error.to_string(),
+                        "invalid argument: RAR 5 volume size is too small to hold a member header",
+                        "{case:?}, {volume_size}"
+                    );
+                    continue;
+                }
+            };
+            // Extracting every set would double the test's time, and sets a
+            // few bytes apart are cut much alike.
+            if volume_size % 7 == 0 {
+                let password = case.password.then_some(b"secret".as_slice());
+                assert!(
+                    extracted(&volumes, password) == *members,
+                    "{case:?}, {volume_size}"
+                );
+            }
+            written += 1;
+        }
+    }
+    assert!(written > 0);
 }

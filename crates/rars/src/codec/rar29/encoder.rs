@@ -754,6 +754,16 @@ fn encode_ppmd_block_with_model(
 /// How much of a member [`encode_ppmd_either_way`] codes both ways to choose.
 const PPMD_EITHER_WAY_SAMPLE: usize = 1 << 20;
 
+/// How many codings of a `len` byte member [`encode_ppmd_either_way`] holds
+/// at once: the escaped one while it codes the literals when it codes the
+/// whole member both ways, and otherwise one at a time.
+pub(crate) fn ppmd_either_way_codings(len: usize) -> u64 {
+    match len <= PPMD_EITHER_WAY_SAMPLE.saturating_mul(2) {
+        true => 2,
+        false => 1,
+    }
+}
+
 /// Codes a PPMd block with LZ escapes or as plain literals, from the same
 /// model, whichever codes the member's start smaller, escapes on a tie.
 ///
@@ -2932,6 +2942,13 @@ fn parse_ranges(
 /// The shortest-path parse's own workspace is not included; a caller that
 /// asks for it charges [`OPTIMAL_PARSE_WORKSPACE`] per block parsing at once.
 pub(crate) fn member_encode_workspace(len: usize, options: EncodeOptions) -> u64 {
+    let earlier = len as u64;
+    side_encode_workspace(len, options).saturating_add(earlier.saturating_add(earlier / 8))
+}
+
+/// [`member_encode_workspace`] for an encode run beside the one that keeps
+/// the best so far, which holds no earlier encode's bytes.
+pub(crate) fn side_encode_workspace(len: usize, options: EncodeOptions) -> u64 {
     let options = options.constrained();
     let reach = options.max_match_distance.min(MAX_HISTORY);
     // A filtered member's blocks are never longer than a plain one's.
@@ -2957,7 +2974,56 @@ pub(crate) fn member_encode_workspace(len: usize, options: EncodeOptions) -> u64
     finder
         .saturating_add(tokens)
         .saturating_add(len)
-        .saturating_add(packed.saturating_mul(2))
+        .saturating_add(packed)
+}
+
+/// The most [`Unpack29Encoder::encode_lz_streamed`] holds beside the chain's
+/// history, for a member longer than one block: the window it reads segments
+/// of four reaches into after the reach before them, which doubles from one
+/// segment to two, the match finder, and one parse batch's tokens and packed
+/// blocks.
+///
+/// The shortest-path parse's own workspace is not included, as for
+/// [`member_encode_workspace`].
+pub(crate) fn streamed_lz_workspace(options: EncodeOptions) -> u64 {
+    let options = options.constrained();
+    let reach = options.max_match_distance.min(MAX_HISTORY);
+    let block = options
+        .block_size
+        .filter(|&size| size != 0)
+        .unwrap_or(reach)
+        .max(1);
+    let batch = LzParser::batch_bytes(block);
+    let segment = reach.saturating_mul(4).div_ceil(batch).max(1) * batch;
+    let window = segment.saturating_mul(2) as u64;
+    let finder = Rar29MatchFinder::bytes_for_reach(reach.saturating_add(batch), reach);
+    let token = std::mem::size_of::<EncodeToken>() as u64;
+    let per_byte = match options.split_blocks {
+        true => 2 * token + 2,
+        false => token + 1,
+    };
+    let batch = batch as u64;
+    let packed = batch.saturating_add(batch / 8);
+    window
+        .saturating_add(finder)
+        .saturating_add(batch.saturating_mul(per_byte))
+        .saturating_add(packed)
+}
+
+/// The most a streamed PPMd member holds beside its model and the chain's
+/// history: the window it reads a segment and the look-ahead into after the
+/// reach before them, which doubles from one read to two, and with `escapes`
+/// the escape search over it.
+pub(crate) fn streamed_ppmd_workspace(escapes: Option<usize>) -> u64 {
+    let reach = escapes.map_or(0, |distance| distance.min(MAX_HISTORY));
+    let lookahead = escapes.map_or(0, |_| PPMD_STREAM_LOOKAHEAD);
+    let read = reach
+        .saturating_mul(4)
+        .max(PPMD_STREAM_SEGMENT)
+        .saturating_add(lookahead);
+    let window = read.saturating_mul(2) as u64;
+    let search = escapes.map_or(0, ppmd_search_workspace);
+    window.saturating_add(search)
 }
 
 /// What coding a `len` byte member into a solid chain holds beyond what coding
@@ -3911,15 +3977,14 @@ fn search_half(
     });
 }
 
-/// The most an escape search holds: links over the reach and a batch, the heads, and a batch found.
+/// The most an escape search holds: the finder [`PpmdMatchSearch::new`]
+/// builds over the reach and a batch, and a batch found.
 pub(crate) fn ppmd_search_workspace(max_match_distance: usize) -> u64 {
     let batch = PpmdMatchSearch::MAX_BATCH;
-    let links = max_match_distance
-        .min(MAX_HISTORY)
-        .saturating_add(batch)
-        .next_power_of_two();
+    let reach = max_match_distance.min(MAX_HISTORY);
+    let finder = PpmdMatchFinder::bytes_for_reach(reach.saturating_add(batch), reach);
     let found = batch * std::mem::size_of::<Option<(u8, u32)>>();
-    (links as u64 + (1 << 20)) * 4 + found as u64
+    finder.saturating_add(found as u64)
 }
 
 /// The longest escape match at `pos`, nearest first on a tie: up to
@@ -4004,9 +4069,7 @@ struct PpmdWalk {
     pos: usize,
     max_offset: usize,
     max_length: usize,
-    /// The next candidate, or [`match_finder::NO_POSITION`] once the search is over.
-    candidate: usize,
-    checked: usize,
+    chain: match_finder::ChainWalk,
     best: Option<(usize, usize)>,
 }
 
@@ -4023,60 +4086,83 @@ impl PpmdWalk {
         if max_offset < 2 || max_length < MIN_PPMD_MATCH_LENGTH {
             return None;
         }
+        // An escape match is at least two bytes back. Chains step strictly
+        // back, so only the first candidates can be nearer.
+        let mut first = finder.first(input, pos, pos);
+        while first != match_finder::NO_POSITION && pos - first < 2 {
+            first = finder.previous(first);
+        }
         Some(Self {
             pos,
             max_offset,
             max_length,
-            candidate: finder.first(input, pos, pos),
-            checked: 0,
+            chain: match_finder::ChainWalk::new(first, MAX_MATCH_CANDIDATES),
             best: None,
         })
     }
 
-    fn stop(&mut self) -> bool {
-        self.candidate = match_finder::NO_POSITION;
-        false
+    /// Looks at one candidate; false once the search is over.
+    #[inline]
+    fn step(&mut self, input: &[u8], finder: &impl Candidates) -> bool {
+        let mut rule = LongestEscape {
+            input,
+            pos: self.pos,
+            max_length: self.max_length,
+            best: self.best,
+        };
+        let more = self
+            .chain
+            .step(
+                input,
+                self.pos,
+                self.max_length,
+                self.max_offset,
+                |candidate| finder.previous(candidate),
+                &mut rule,
+            )
+            .unwrap_or_else(|never| match never {});
+        self.best = rule.best;
+        more
+    }
+}
+
+/// The escape search's chain rule: the longest match of at least
+/// [`MIN_PPMD_MATCH_LENGTH`], nearest first on a tie.
+struct LongestEscape<'a> {
+    input: &'a [u8],
+    pos: usize,
+    max_length: usize,
+    best: Option<(usize, usize)>,
+}
+
+impl match_finder::ChainRule for LongestEscape<'_> {
+    type Error = std::convert::Infallible;
+
+    /// Only a candidate reaching past the current best, or the minimum, can win.
+    #[inline]
+    fn probe(&mut self, _offset: usize) -> Option<usize> {
+        Some(
+            self.best
+                .map_or(MIN_PPMD_MATCH_LENGTH - 1, |(best_length, _)| best_length),
+        )
     }
 
-    /// Looks at one candidate; false once the search is over.
-    fn step(&mut self, input: &[u8], finder: &impl Candidates) -> bool {
-        let (pos, candidate) = (self.pos, self.candidate);
-        if candidate == match_finder::NO_POSITION {
-            return false;
+    #[inline]
+    fn measure(&self, _candidate: usize, offset: usize) -> usize {
+        match_length(self.input, self.pos, offset, self.max_length)
+    }
+
+    #[inline]
+    fn consider(&mut self, length: usize, offset: usize) -> std::result::Result<bool, Self::Error> {
+        if length >= MIN_PPMD_MATCH_LENGTH
+            && self.best.is_none_or(|(best_length, best_offset)| {
+                length > best_length || (length == best_length && offset < best_offset)
+            })
+        {
+            self.best = Some((length, offset));
+            return Ok(length == self.max_length);
         }
-        // MatchFinder chains contain only previously inserted positions and
-        // each link moves strictly backwards.
-        let offset = pos - candidate;
-        if offset > self.max_offset {
-            return self.stop();
-        }
-        self.candidate = finder.previous(candidate);
-        if offset < 2 {
-            return true;
-        }
-        self.checked += 1;
-        // Only a candidate reaching past the current best (or the minimum) can
-        // win, so probe that one byte before measuring the whole match.
-        let probe = self
-            .best
-            .map_or(MIN_PPMD_MATCH_LENGTH - 1, |(best_length, _)| best_length);
-        if input[candidate + probe] == input[pos + probe] {
-            let length = match_length(input, pos, offset, self.max_length);
-            if length >= MIN_PPMD_MATCH_LENGTH
-                && self.best.is_none_or(|(best_length, best_offset)| {
-                    length > best_length || (length == best_length && offset < best_offset)
-                })
-            {
-                self.best = Some((length, offset));
-                if length == self.max_length {
-                    return self.stop();
-                }
-            }
-        }
-        if self.checked >= MAX_MATCH_CANDIDATES {
-            return self.stop();
-        }
-        true
+        Ok(false)
     }
 }
 
@@ -4220,15 +4306,11 @@ fn best_match_before<C: Candidates>(
         false => options.max_match_candidates,
     };
     let mut best = None;
-    let mut checked = 0usize;
     // A match shorter than four bytes is never taken, so a candidate that
     // differs anywhere in the first four is not measured at all. On data with
     // nothing to find that is nearly every candidate: the old offsets at every
     // position, and the collisions every chain is made of.
     let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
-    let shares_prefix = |candidate: usize| {
-        u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap()) == prefix
-    };
     // A remembered offset codes a repeat as short as two bytes, which a lazy
     // parse keeping near matches takes where it prices in. A greedy one takes
     // near matches only as long as its chains would have offered.
@@ -4247,7 +4329,7 @@ fn best_match_before<C: Candidates>(
         let from = pos - offset;
         let shares = match near {
             Some(_) => input[from..from + 2] == input[pos..pos + 2],
-            None => shares_prefix(from),
+            None => shares_prefix(input, prefix, from),
         };
         if !shares {
             continue;
@@ -4260,32 +4342,27 @@ fn best_match_before<C: Candidates>(
             return Some(best);
         }
     }
-    let mut candidate = match max_length >= finder.key() {
-        true => finder.first(input, pos, limit),
-        false => match_finder::NO_POSITION,
-    };
-    while candidate != match_finder::NO_POSITION {
-        // MatchFinder chains contain only previously inserted positions and
-        // each link moves strictly backwards.
-        let offset = pos - candidate;
-        if offset > max_offset {
-            break;
-        }
-        checked += 1;
-        // A candidate can only improve on the current best when it matches at
-        // least one byte past the best length, so probe that byte first.
-        let best_length = best.map_or(0, |best: MatchCandidate| best.length);
-        if input[candidate + best_length] == input[pos + best_length] && shares_prefix(candidate) {
-            let length = match_length(input, pos, offset, max_length);
-            consider_match_candidate(&mut best, state, length, offset, MIN_CHAIN_MATCH);
-        }
-        if best.is_some_and(|candidate| candidate.length == max_length) {
-            break;
-        }
-        if checked >= walk {
-            break;
-        }
-        candidate = finder.previous(candidate);
+    if max_length >= finder.key() {
+        let mut rule = CodedCost {
+            input,
+            pos,
+            max_length,
+            prefix,
+            state,
+            best,
+        };
+        match_finder::walk_chain(
+            input,
+            pos,
+            finder.first(input, pos, limit),
+            max_length,
+            max_offset,
+            walk,
+            |candidate| finder.previous(candidate),
+            &mut rule,
+        )
+        .unwrap_or_else(|never| match never {});
+        best = rule.best;
     }
     if let Some(near) = near.filter(|_| best.is_none_or(|best| best.length < NEAR_MATCH_LIMIT)) {
         if let Some(from) = near.candidate(input, pos) {
@@ -4300,6 +4377,46 @@ fn best_match_before<C: Candidates>(
         }
     }
     best
+}
+
+fn shares_prefix(input: &[u8], prefix: u32, candidate: usize) -> bool {
+    u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap()) == prefix
+}
+
+/// The chain walk of [`best_match_before`]: keeps the candidate scoring best
+/// against its coded cost, starting from the best remembered offset.
+struct CodedCost<'a> {
+    input: &'a [u8],
+    pos: usize,
+    max_length: usize,
+    prefix: u32,
+    state: &'a EncoderMatchState,
+    best: Option<MatchCandidate>,
+}
+
+impl match_finder::ChainRule for CodedCost<'_> {
+    type Error = std::convert::Infallible;
+
+    /// A candidate can only improve on the best when it matches at least one
+    /// byte past the best length.
+    #[inline]
+    fn probe(&mut self, _offset: usize) -> Option<usize> {
+        Some(self.best.map_or(0, |best| best.length))
+    }
+
+    #[inline]
+    fn measure(&self, candidate: usize, offset: usize) -> usize {
+        if !shares_prefix(self.input, self.prefix, candidate) {
+            return 0;
+        }
+        match_length(self.input, self.pos, offset, self.max_length)
+    }
+
+    #[inline]
+    fn consider(&mut self, length: usize, offset: usize) -> std::result::Result<bool, Self::Error> {
+        consider_match_candidate(&mut self.best, self.state, length, offset, MIN_CHAIN_MATCH);
+        Ok(self.best.is_some_and(|best| best.length == self.max_length))
+    }
 }
 
 fn match_length(input: &[u8], pos: usize, offset: usize, max_length: usize) -> usize {

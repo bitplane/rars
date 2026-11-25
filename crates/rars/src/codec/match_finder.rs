@@ -309,13 +309,8 @@ pub(crate) fn walk_chain<R: ChainRule>(
             break;
         }
         remaining -= 1;
-        if rule.probe(distance).is_none_or(|probe| {
-            probe < max_length && input[candidate + probe] == input[pos + probe]
-        }) {
-            let length = rule.measure(candidate, distance);
-            if length != 0 && rule.consider(length, distance)? {
-                break;
-            }
+        if visit(input, pos, candidate, distance, max_length, rule)? {
+            break;
         }
         if remaining == 0 {
             break;
@@ -323,6 +318,81 @@ pub(crate) fn walk_chain<R: ChainRule>(
         candidate = previous(candidate);
     }
     Ok(())
+}
+
+/// Probe, measure and consider one candidate. Returns true to end the walk.
+#[inline(always)]
+fn visit<R: ChainRule>(
+    input: &[u8],
+    pos: usize,
+    candidate: usize,
+    distance: usize,
+    max_length: usize,
+    rule: &mut R,
+) -> std::result::Result<bool, R::Error> {
+    if rule
+        .probe(distance)
+        .is_none_or(|probe| probe < max_length && input[candidate + probe] == input[pos + probe])
+    {
+        let length = rule.measure(candidate, distance);
+        if length != 0 && rule.consider(length, distance)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// [`walk_chain`] one candidate at a time, for a caller that interleaves
+/// several walks to keep their loads in flight together.
+#[cfg(feature = "write")]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ChainWalk {
+    candidate: usize,
+    remaining: usize,
+}
+
+#[cfg(feature = "write")]
+impl ChainWalk {
+    #[inline]
+    pub(crate) fn new(candidate: usize, remaining: usize) -> Self {
+        Self {
+            candidate,
+            remaining,
+        }
+    }
+
+    /// Look at the next candidate. Returns false once the walk is over, and
+    /// keeps returning false after that.
+    #[inline(always)]
+    pub(crate) fn step<R: ChainRule>(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        max_length: usize,
+        max_distance: usize,
+        previous: impl Fn(usize) -> usize,
+        rule: &mut R,
+    ) -> std::result::Result<bool, R::Error> {
+        let candidate = self.candidate;
+        if candidate == NO_POSITION || self.remaining == 0 {
+            return Ok(false);
+        }
+        let distance = pos - candidate;
+        if distance > max_distance {
+            self.remaining = 0;
+            return Ok(false);
+        }
+        self.remaining -= 1;
+        if visit(input, pos, candidate, distance, max_length, rule)? {
+            self.remaining = 0;
+            return Ok(false);
+        }
+        if self.remaining == 0 {
+            return Ok(false);
+        }
+        self.candidate = previous(candidate);
+        Ok(true)
+    }
 }
 
 // Fusing insertion and lookup shares one hash and skips the self link.

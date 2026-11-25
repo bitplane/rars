@@ -11,6 +11,10 @@ mod match_finder;
 pub(crate) mod packed_chain;
 pub(crate) mod packed_window;
 mod ppmd;
+/// For tests that count memory with a global allocator, which cannot see a
+/// PPMd pool mapped outside it.
+#[doc(hidden)]
+pub use ppmd::pool_mapped_bytes;
 pub mod rar13;
 pub mod rar20;
 pub mod rar29;
