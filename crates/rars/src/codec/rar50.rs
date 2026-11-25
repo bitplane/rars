@@ -32,8 +32,9 @@ pub(crate) use encoder::{
     encode_filtered_run, encode_owned_member, filter_run_in_place,
     filter_streaming_blocks_in_place, filtered_owned_member, filtered_run_bytes,
     lazy_parse_workspace, packed_index_fits, packed_most, searches_tree,
-    streaming_blocks_in_window, streaming_blocks_with_finder, BlockSplitter, EncodeFilter,
-    FilteredRunBlocks, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS, MAX_LZ_BLOCK_SIZE,
+    single_pass_tree_workspace, streaming_blocks_in_window, streaming_blocks_with_finder,
+    BlockSplitter, EncodeFilter, FilteredRunBlocks, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS,
+    MAX_LZ_BLOCK_SIZE,
 };
 #[cfg(all(test, feature = "write"))]
 pub(crate) use encoder::{
