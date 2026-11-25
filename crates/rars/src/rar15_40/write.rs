@@ -2251,10 +2251,9 @@ fn member_workspace(
     };
     unpacked
         .saturating_mul(held_per_byte(options))
-        .saturating_add(dictionary.saturating_mul(12))
         .saturating_add(ppmd_models)
         .saturating_add(optimal_parse)
-        .saturating_add(coder_workspace(options, unpacked))
+        .saturating_add(coder_workspace(options, Some(unpacked), dictionary, 12))
         .saturating_add(2 * 1024 * 1024)
 }
 
@@ -2272,17 +2271,31 @@ fn rar29_optimal_parse_workspace(options: WriterOptions, unpacked: u64) -> u64 {
     parses.saturating_mul(crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE)
 }
 
-/// RAR 1.5's match index over its 64 KiB window, or RAR 2.0's parse of each
-/// block it codes at once.
-fn coder_workspace(options: WriterOptions, unpacked: u64) -> u64 {
-    match options.target {
-        ArchiveVersion::Rar15 => crate::codec::rar13::ENCODER_WORKSPACE,
-        ArchiveVersion::Rar20 => crate::codec::rar20::coding_workspace(
-            rar20_encode_options_for_options(options).is_ok_and(|options| options.optimal_parse),
-            unpacked,
-        ),
-        _ => 0,
-    }
+/// The retained dictionary and, for RAR 1.5 and 2.0, the codec's own allocation.
+fn coder_workspace(
+    options: WriterOptions,
+    unpacked: Option<u64>,
+    dictionary: u64,
+    dictionary_factor: u64,
+) -> u64 {
+    let (dictionary, coding) = match options.target {
+        ArchiveVersion::Rar15 => (dictionary, crate::codec::rar13::ENCODER_WORKSPACE),
+        ArchiveVersion::Rar20 => {
+            let encode_options = rar20_encode_options_for_options(options).unwrap_or_default();
+            (
+                encode_options.max_match_distance as u64,
+                crate::codec::rar20::coding_workspace(
+                    encode_options,
+                    options.features.solid,
+                    unpacked,
+                ),
+            )
+        }
+        _ => (dictionary, 0),
+    };
+    dictionary
+        .saturating_mul(dictionary_factor)
+        .saturating_add(coding)
 }
 
 /// Bytes held per member byte while it is coded: the member and its packed
@@ -2753,10 +2766,7 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdH
         ArchiveVersion::Rar15 | ArchiveVersion::Rar20
     ) {
         // A window, the parse of each block in a batch, and a chain's history.
-        return dictionary
-            .saturating_mul(2)
-            .saturating_add(coder_workspace(options, u64::MAX))
-            .saturating_add(2 * 1024 * 1024);
+        return coder_workspace(options, None, dictionary, 2).saturating_add(2 * 1024 * 1024);
     }
     let segment = engine_sample_len(options) as u64;
     let lz = dictionary
@@ -3301,7 +3311,7 @@ fn probe_workspace(options: WriterOptions) -> Result<u64> {
             let long = rar20_probe_len(encode_options) as u64;
             shared(
                 long,
-                crate::codec::rar20::coding_workspace(encode_options.optimal_parse, long),
+                crate::codec::rar20::coding_workspace(encode_options, false, Some(long)),
             )
         }
         _ => shared(sample, sample.saturating_mul(12)),
@@ -8704,7 +8714,13 @@ mod tests {
         // more than the member's eight. Pin one thread for the per-byte bound.
         let blocks = crate::parallel::threads().clamp(1, 16).min(8) as u64;
         for level in [2, 3, 4, 5] {
-            let block = crate::codec::rar20::coding_workspace(level >= 3, 1);
+            let block = crate::codec::rar20::coding_workspace(
+                super::rar20_encode_options_for_level(Some(level))
+                    .unwrap()
+                    .with_max_match_distance(64 * 1024),
+                false,
+                Some(1 << 20),
+            );
             let one = {
                 let _cap = crate::parallel::ThreadCap::set(Some(1));
                 charge(ArchiveVersion::Rar20, level)

@@ -469,6 +469,12 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// cap moves the output by at most five bytes.
     const MAX_RUNS: usize = TREE_MAX_RUNS;
 
+    /// What the tree's heads and two links per window slot allocate.
+    #[cfg(feature = "write")]
+    pub(crate) fn bytes_for_window(window: usize) -> usize {
+        ((1 << Self::HASH_BITS) + 2 * window.max(1).next_power_of_two()) * size_of::<u32>()
+    }
+
     /// Builds a finder that remembers the last `window` positions, at eight
     /// bytes of links per byte of window.
     pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
