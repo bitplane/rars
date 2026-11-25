@@ -1845,81 +1845,113 @@ fn best_match(
     if options.max_match_candidates == 0 || max_offset == 0 || max_length < 3 {
         return None;
     }
-    let mut best: Option<(usize, usize)> = None;
-    let mut best_score = isize::MIN;
-    let mut reach_cache = PricedReach {
-        offsets: 0..0,
-        score: isize::MIN,
-        length: 0,
+    let mut rule = FreshMatchRule {
+        input,
+        pos,
+        max_length,
+        cost_model,
+        prefix: &input[pos..pos + 3],
+        best: None,
+        best_score: isize::MIN,
+        reach_cache: PricedReach {
+            offsets: 0..0,
+            score: isize::MIN,
+            length: 0,
+        },
     };
-    let mut checked = 0usize;
-    // No match under three bytes is encodable, so a candidate that differs in
-    // its first three needs no measuring. On data with nothing to find that
-    // is every candidate at every position.
-    let prefix = &input[pos..pos + 3];
-    let mut candidate = finder.first(input, pos);
-    while candidate != match_finder::NO_POSITION {
-        // Callers search before inserting this position, so every candidate is older.
-        let offset = pos - candidate;
-        if offset > max_offset {
-            break;
-        }
-        checked += 1;
-        let best_length = best.map_or(0, |(length, _)| length);
-        // The shortest match that could still displace the best. A candidate
-        // shorter than that cannot win, and one byte decides whether it is.
-        let must_reach = match cost_model {
-            None => best_length + 1,
-            Some(model) if best_score != isize::MIN => {
+    match_finder::walk_chain(
+        input,
+        pos,
+        finder.first(input, pos),
+        max_length,
+        max_offset,
+        options.max_match_candidates,
+        |candidate| finder.previous(candidate),
+        &mut rule,
+    )
+    .unwrap_or_else(|never| match never {});
+    rule.best
+}
+
+struct FreshMatchRule<'a, 'model> {
+    input: &'a [u8],
+    pos: usize,
+    max_length: usize,
+    cost_model: Option<&'a CostModel<'model>>,
+    prefix: &'a [u8],
+    best: Option<(usize, usize)>,
+    best_score: isize,
+    reach_cache: PricedReach,
+}
+
+impl match_finder::ChainRule for FreshMatchRule<'_, '_> {
+    type Error = std::convert::Infallible;
+
+    #[inline]
+    fn probe(&mut self, offset: usize) -> Option<usize> {
+        let must_reach = match self.cost_model {
+            None => self.best.map_or(0, |(length, _)| length + 1),
+            Some(model) if self.best_score != isize::MIN => {
                 // Offsets only grow along the chain, so one slot's threshold
                 // serves every candidate until the slot or the best changes.
-                if !(reach_cache.offsets.contains(&offset) && reach_cache.score == best_score) {
-                    reach_cache = priced_reach(model, input, pos, offset, best_score, max_length);
+                if !(self.reach_cache.offsets.contains(&offset)
+                    && self.reach_cache.score == self.best_score)
+                {
+                    self.reach_cache = priced_reach(
+                        model,
+                        self.input,
+                        self.pos,
+                        offset,
+                        self.best_score,
+                        self.max_length,
+                    );
                 }
-                reach_cache.length
+                self.reach_cache.length
             }
             Some(_) => 0,
         };
-        // A best match reaching `max_length` breaks the loop, so without a
-        // cost model `must_reach` never passes it.
-        let reachable = (must_reach <= 1
-            || (must_reach <= max_length
-                && input[candidate + must_reach - 1] == input[pos + must_reach - 1]))
-            && input[candidate..candidate + 3] == *prefix;
-        if reachable {
-            let length = super::super::fast::match_length(input, pos, offset, max_length);
-            let encodable = length >= 3 + match_length_adjustment(offset);
-            let better = encodable
-                && match cost_model {
-                    Some(model) => {
-                        let score = model
-                            .selected_score(SelectedMatch::Fresh { length, offset }, input, pos)
-                            .unwrap_or(isize::MIN);
-                        let better = best.is_none()
-                            || score > best_score
-                            || (score == best_score && length > best_length);
-                        if better {
-                            best_score = score;
-                        }
-                        better
-                    }
-                    // The hash chain visits nearest matches first, so an
-                    // equal-length later candidate cannot have a smaller offset.
-                    None => length > best_length,
-                };
-            if better {
-                best = Some((length, offset));
-                if length == max_length {
-                    break;
-                }
-            }
-        }
-        if checked >= options.max_match_candidates {
-            break;
-        }
-        candidate = finder.previous(candidate);
+        (must_reach > 1).then(|| must_reach - 1)
     }
-    best
+
+    #[inline]
+    fn measure(&self, candidate: usize, offset: usize) -> usize {
+        if self.input[candidate..candidate + 3] != *self.prefix {
+            return 0;
+        }
+        match_length_at_offset(self.input, self.pos, self.max_length, offset)
+    }
+
+    #[inline]
+    fn consider(&mut self, length: usize, offset: usize) -> std::result::Result<bool, Self::Error> {
+        if length < 3 + match_length_adjustment(offset) {
+            return Ok(false);
+        }
+        let best_length = self.best.map_or(0, |(length, _)| length);
+        let better = match self.cost_model {
+            Some(model) => {
+                let score = model
+                    .selected_score(
+                        SelectedMatch::Fresh { length, offset },
+                        self.input,
+                        self.pos,
+                    )
+                    .unwrap_or(isize::MIN);
+                let better = self.best.is_none()
+                    || score > self.best_score
+                    || (score == self.best_score && length > best_length);
+                if better {
+                    self.best_score = score;
+                }
+                better
+            }
+            // The chain visits nearest matches first, so ties keep the best.
+            None => length > best_length,
+        };
+        if better {
+            self.best = Some((length, offset));
+        }
+        Ok(better && length == self.max_length)
+    }
 }
 
 struct PricedReach {
