@@ -5,7 +5,11 @@
 #[path = "support/scratch.rs"]
 mod scratch;
 
-use rars::{ArchiveReader, ArchiveVersion, Builder, WriteProgressEvent, WriterResources};
+use rars::rar50::{self, ArchiveEntry, ArchiveExtras, FilterPolicy, WriterOptions};
+use rars::{
+    ArchiveReader, ArchiveVersion, Builder, EntrySource, FeatureSet, WriteProgress,
+    WriteProgressEvent, WriterResources,
+};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,9 +38,12 @@ fn note_files(dir: &Path, saw_file: &AtomicBool) {
     }
 }
 
-/// Writes `builder` with spools in `dir`, watching it from the output and from
+/// Runs `write` with spools in `dir`, watching it from the output and from
 /// progress. Returns the archive and whether any spool file appeared.
-fn write_watched(builder: &Builder, resources: &WriterResources, dir: &Path) -> (Vec<u8>, bool) {
+fn watched(
+    dir: &Path,
+    write: impl FnOnce(&mut (dyn Write + Send), &dyn WriteProgress) -> rars::Result<()>,
+) -> (Vec<u8>, bool) {
     let saw_file = Arc::new(AtomicBool::new(false));
     let progress = {
         let dir = dir.to_path_buf();
@@ -48,11 +55,15 @@ fn write_watched(builder: &Builder, resources: &WriterResources, dir: &Path) -> 
         dir: dir.to_path_buf(),
         saw_file: saw_file.clone(),
     };
-    builder
-        .write_to(&mut output, resources, Some(&progress))
-        .unwrap();
+    write(&mut output, &progress).unwrap();
     assert_eq!(std::fs::read_dir(dir).unwrap().count(), 0);
     (output.out, saw_file.load(Ordering::Relaxed))
+}
+
+fn write_watched(builder: &Builder, resources: &WriterResources, dir: &Path) -> (Vec<u8>, bool) {
+    watched(dir, |output, progress| {
+        builder.write_to(output, resources, Some(progress))
+    })
 }
 
 fn noise(len: usize, mut seed: u32) -> Vec<u8> {
@@ -164,25 +175,54 @@ fn spools_in_memory_write_the_archive_spools_on_disk_do() {
 #[test]
 fn a_tight_budget_sends_spools_to_disk_and_stays_within_it() {
     let root = scratch::case("memory-spools-tight");
-    let mut builder = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
-    for seed in 1..=4 {
-        let name = format!("member{seed}").into_bytes();
-        builder
-            .add_bytes(name, nibbles(1024 * 1024, seed), None, None)
-            .unwrap();
-    }
-    // Room for one job, which needs nearly all of it, and little beside: the
-    // next job's admission moves the last member's spool to disk.
-    let limit = 69 * 1024 * 1024;
+    let entries: Vec<_> = (1..=4)
+        .map(|seed| {
+            let data = nibbles(1024 * 1024, seed);
+            ArchiveEntry::new(format!("member{seed}"), EntrySource::from_bytes(data))
+        })
+        .collect();
+    // A named dictionary and no filters plan the same jobs under any budget,
+    // so only the budget differs between the writes below. One thread runs one
+    // job at a time, and each member is handed on before the next job starts.
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    let write = |resources: &WriterResources| {
+        let (archive, saw_file) = watched(&root, |output, progress| {
+            pool.install(|| {
+                rar50::write_streaming_archive_with_progress(
+                    &entries,
+                    WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
+                        .with_compression_level(1)
+                        .with_dictionary_size(1024 * 1024),
+                    ArchiveExtras::default().with_filter_policy(FilterPolicy::None),
+                    resources,
+                    Some(progress),
+                    output,
+                )
+            })
+        });
+        (archive, saw_file, resources.workspace_peak())
+    };
+    // With room to spare, the budget is at its fullest while a job runs and
+    // its member's spool grows beside it.
+    let roomy = WriterResources::new(256 * 1024 * 1024).with_temp_dir(&*root);
+    let (roomy, spilled, peak) = write(&roomy);
+    assert!(!spilled, "a spool went to disk with room to spare");
+    // One byte short of that, the budget still admits each job, but not the
+    // job and its spool's last growth together.
+    let limit = peak - 1;
     let tight = WriterResources::new(limit).with_temp_dir(&*root);
-    let (archive, saw_file) = write_watched(&builder, &tight, &root);
+    let (archive, saw_file, tight_peak) = write(&tight);
     assert!(saw_file, "every spool stayed in memory");
-    assert!(tight.workspace_peak() <= limit);
+    assert!(tight_peak <= limit);
     let on_disk = WriterResources::new(limit)
         .with_temp_dir(&*root)
         .with_max_memory_bytes(u64::MAX / 2);
-    let (expected, _) = write_watched(&builder, &on_disk, &root);
+    let (expected, _, _) = write(&on_disk);
     assert!(archive == expected, "the archive changed");
+    assert!(archive == roomy, "the archive changed with the budget");
     ArchiveReader::read_owned(archive)
         .unwrap()
         .test(None)
