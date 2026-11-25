@@ -918,6 +918,27 @@ impl MemoryBudget {
 }
 
 impl MemoryPermit {
+    /// Extends a running wave without waiting while it holds workspace.
+    #[cfg(feature = "write")]
+    pub(crate) fn try_grow_to(&mut self, bytes: u64) -> bool {
+        if bytes <= self.bytes {
+            return true;
+        }
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .expect("memory budget lock poisoned");
+        let extra = bytes - self.bytes;
+        if extra > self.budget.limit - *used {
+            return false;
+        }
+        *used += extra;
+        self.bytes += extra;
+        self.budget.peak.fetch_max(*used, Ordering::Relaxed);
+        true
+    }
+
     /// Hands back all but `bytes` of the charge, once the work that needed the
     /// rest is done. A permit never grows.
     pub(crate) fn shrink_to(&mut self, bytes: u64) {

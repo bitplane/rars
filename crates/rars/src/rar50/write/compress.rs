@@ -1302,6 +1302,16 @@ enum Packing<'b> {
 }
 type ConsumePacked<'a> = dyn FnMut(usize, Packing<'_>) -> Result<()> + 'a;
 
+/// Scoped sources can retain their payloads through member emission.
+fn source_preparation_window(sources: &[EntrySource]) -> usize {
+    sources
+        .iter()
+        .map(EntrySource::max_preparation_window)
+        .min()
+        .unwrap_or(usize::MAX)
+        .max(1)
+}
+
 /// Members' checksums are independent, so a window of them is hashed across the pool.
 fn hash_stored_members(
     sources: &[EntrySource],
@@ -1321,7 +1331,7 @@ fn hash_stored_members(
     )?;
     crate::parallel::map_slice_windowed(
         &jobs,
-        crate::parallel::default_window(),
+        crate::parallel::default_window().min(source_preparation_window(sources)),
         |&(index, size), opens| {
             let block = super::stored_block_len(size) as u64;
             let permit = if opens {
@@ -1374,42 +1384,23 @@ fn compress_streaming_members(
             .acquire_cancellable(required, plan.dictionary_size, &|| advance.is_cancelled())?;
         unreachable!("oversized workspace acquisition must fail");
     }
-    // `required` decided the route and stays the floor for the budget. How
-    // many jobs run at once never changes the archive, so a wave reserves what
-    // each job holds instead. A budget set with `max_memory_bytes` keeps its
-    // own ledger and per-job windows, charged the planning workspace.
-    let required = if resources.execution.is_some() {
-        required
-    } else {
-        // Admission can be above the planning charge, as at level 5. When it
-        // is above the whole budget, one job at a time takes all of it: see
-        // `joined_admission`.
-        admission
-    };
-    // A budget with its own ledger admits each job for one dictionary's
-    // window, which is one run unless runs are cut shorter.
+    let batch_capacity = crate::parallel::threads();
     let runs_per_job = if plan.solid {
         1
-    } else if resources.execution.is_some() {
-        run_size(plan) / member_run_size(plan)
     } else {
         runs_per_job(
             plan,
             integrity.iter().map(|&(size, ..)| size).max().unwrap_or(0),
-            required,
-            resources.memory_limit(),
-            crate::parallel::threads(),
+            admission,
+            resources
+                .execution
+                .as_ref()
+                .map_or(resources.memory_limit(), |ledger| {
+                    resources.memory_limit().min(ledger.available())
+                }),
+            batch_capacity,
         )
     };
-    let required = if resources.execution.is_some() {
-        required
-    } else {
-        joined_admission(plan, required, runs_per_job, resources.memory_limit())
-    };
-    let batch_capacity = usize::try_from(resources.memory_limit() / required)
-        .unwrap_or(usize::MAX)
-        .min(crate::parallel::threads())
-        .max(1);
 
     // One dictionary runs through solid members, so none can be stored
     // instead once its packed bytes have gone out.
@@ -1475,29 +1466,201 @@ fn compress_streaming_members(
     }
 }
 
-/// Keep estimated codec admission separate from actual coordinator capacity.
-/// Assembly runs on the coordinator; workers receive only their fixed scopes.
-/// Retained history and spool capacity reduce the next wave's available space.
-fn streaming_wave_capacity(
-    maximum: usize,
-    _required: u64,
-    _plan: &CompressPlan,
-    _resources: &WriterResources,
-) -> usize {
-    if let Some(ledger) = &_resources.execution {
-        // Run growth/replacement, block assembly and history copies coexist.
-        // Descriptor capacity is still checked by its owners before dispatch.
-        let assembly = (run_size(_plan) as u64)
-            .saturating_mul(8)
-            .saturating_add((_plan.block_size as u64).saturating_mul(4));
-        let per_job = _required
-            .saturating_add(assembly)
-            .saturating_add(crate::codec::workspace::RESERVATION_BYTES);
-        return maximum
-            .min(usize::try_from(ledger.available() / per_job.max(1)).unwrap_or(usize::MAX))
-            .max(1);
+/// Assembly, filter selection and coding hold different sets of buffers.
+#[derive(Default, Clone, Copy)]
+struct WaveWorkspace {
+    assembly: u64,
+    filter_inputs: u64,
+    filter_search: u64,
+    coding: u64,
+}
+
+impl WaveWorkspace {
+    fn add_job(
+        self,
+        options: EncodeOptions,
+        len: u64,
+        history: u64,
+        block: usize,
+        filter_piece: u64,
+    ) -> Self {
+        use crate::codec::rar50::{lazy_parse_workspace, MAX_LZ_BLOCK_SIZE};
+        let cap = len.checked_next_power_of_two().unwrap_or(len);
+        let block = block
+            .min(MAX_LZ_BLOCK_SIZE)
+            .min(usize::try_from(len).unwrap_or(usize::MAX));
+        let window = len.saturating_add(history);
+        let reach = window.min(options.max_match_distance as u64);
+        let scratch = |reach: u64, block: usize| {
+            if options.optimal_parse {
+                super::streaming_lz_workspace(reach, block, true)
+            } else {
+                lazy_parse_workspace(options, usize::try_from(reach).unwrap_or(usize::MAX), block)
+            }
+        };
+        // While the coordinator builds windows, the assembled jobs can still
+        // own their original histories and their run buffers.
+        let assembly = cap
+            .saturating_mul(2)
+            .saturating_add(window)
+            .saturating_add(history);
+        let search = if filter_piece > 0 {
+            let piece = filter_piece.min(filter_search_bytes() as u64);
+            scratch(
+                piece.min(options.max_match_distance as u64),
+                piece.min(MAX_LZ_BLOCK_SIZE as u64) as usize,
+            )
+            .saturating_add(piece.saturating_mul(2))
+        } else {
+            0
+        };
+        // Optimal coding's window term includes room beside the finder links.
+        // Lazy coding explicitly adds the window, which it owns per job.
+        let coding = scratch(reach, block).saturating_add(if options.optimal_parse {
+            len.saturating_add(cap)
+        } else {
+            window.saturating_add(cap.saturating_mul(2))
+        });
+        Self {
+            assembly: self.assembly.saturating_add(assembly),
+            filter_inputs: self.filter_inputs.saturating_add(cap),
+            filter_search: self.filter_search.saturating_add(search),
+            coding: self.coding.saturating_add(coding),
+        }
     }
-    maximum
+
+    fn peak(self, retained: u64) -> u64 {
+        let filters = self.filter_inputs.saturating_add(self.filter_search);
+        self.assembly
+            .max(filters)
+            .max(self.coding)
+            .saturating_add(retained)
+    }
+}
+
+#[derive(Default)]
+struct BlockWave {
+    workspace: WaveWorkspace,
+    permit: Option<crate::streaming::MemoryPermit>,
+    // The hard ledger also holds the scopes' control blocks and any existing
+    // coordinator allocations, such as retained histories and spool storage.
+    scopes: u64,
+}
+
+impl BlockWave {
+    #[allow(clippy::too_many_arguments)]
+    fn admit(
+        &mut self,
+        plan: &CompressPlan,
+        filter_runs: bool,
+        len: u64,
+        history: u64,
+        retained: u64,
+        required: u64,
+        resources: &WriterResources,
+        advance: &dyn CompressionProgress,
+    ) -> Result<bool> {
+        let filter_piece = if filter_runs && plan.filter_policy == FilterPolicy::Auto {
+            len
+        } else {
+            0
+        };
+        let workspace = self.workspace.add_job(
+            plan.encode_options,
+            len,
+            history,
+            crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+            filter_piece,
+        );
+        let charge = workspace.peak(retained);
+        let scopes = self
+            .scopes
+            .saturating_add(required.saturating_add(crate::codec::workspace::RESERVATION_BYTES));
+        if let Some(permit) = &mut self.permit {
+            if resources.execution.as_ref().is_some_and(|ledger| {
+                let incoming = len
+                    .saturating_mul(4)
+                    .saturating_add(history.saturating_mul(2));
+                scopes.saturating_add(incoming) > ledger.available()
+            }) || !permit.try_grow_to(charge)
+            {
+                return Ok(false);
+            }
+        } else {
+            self.permit = Some(resources.acquire_cancellable(
+                charge.min(resources.memory_limit()),
+                plan.dictionary_size,
+                &|| advance.is_cancelled(),
+            )?);
+        }
+        self.scopes = scopes;
+        Ok(true)
+    }
+
+    fn record<B: Budget>(
+        &mut self,
+        job: &BlockJob<B>,
+        plan: &CompressPlan,
+        filter_runs: bool,
+        history: u64,
+    ) {
+        let mut block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
+        if !plan.encode_options.optimal_parse && (plan.solid || !filter_runs) {
+            let mut start = 0;
+            block = job
+                .blocks
+                .iter()
+                .map(|&(_, end, _)| {
+                    let len = end - start;
+                    start = end;
+                    len
+                })
+                .max()
+                .unwrap_or(0);
+        }
+        let filter_piece = if !filter_runs || plan.filter_policy != FilterPolicy::Auto {
+            0
+        } else if job.segments.is_empty() {
+            job.runs(job.data.len())
+                .map(|run| run.len())
+                .max()
+                .unwrap_or(0)
+        } else {
+            job.segments
+                .iter()
+                .map(|(segment, _)| segment.len())
+                .max()
+                .unwrap_or(0)
+        };
+        self.workspace = self.workspace.add_job(
+            plan.encode_options,
+            job.data.len() as u64,
+            history,
+            block,
+            filter_piece as u64,
+        );
+    }
+}
+
+/// The last block of a run can cross its nominal boundary, and a short
+/// independent tail can be absorbed by the preceding run.
+fn job_size_bound(plan: &CompressPlan, joined: usize, unread: u64) -> u64 {
+    let run = if plan.solid {
+        run_size(plan)
+    } else {
+        member_run_size(plan)
+    };
+    let end_slack = crate::codec::rar50::MAX_LZ_BLOCK_SIZE.saturating_sub(plan.block_size);
+    let tail = if !plan.solid && run < run_size(plan) {
+        plan.encode_options.max_match_distance / 4
+    } else {
+        0
+    };
+    let nominal = (run as u64).saturating_mul(joined as u64);
+    let bound = nominal
+        .saturating_add((end_slack as u64).saturating_mul(joined as u64))
+        .saturating_add(tail as u64);
+    unread.min(bound)
 }
 
 /// Compresses independent whole members concurrently, with each workspace
@@ -1516,11 +1679,14 @@ fn compress_members_whole(
     straight: &Straight<'_>,
     consume: &mut Consume<'_>,
 ) -> Result<()> {
+    let source_window = source_preparation_window(sources);
     let mut start = 0;
     while start < sources.len() {
         if advance.is_cancelled() || resources.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let end_of_window = start.saturating_add(source_window).min(members.len());
+        let members = &members[..end_of_window];
         if let Execution::Blocks { run_filters, .. } = members[start].execution {
             let end = runs_lookahead(members, integrity, start, straight);
             if members[start..end]
@@ -1994,9 +2160,9 @@ fn compress_independent_members<B: Budget + Send + Sync>(
 where
     B::Charge: Send,
 {
+    let group_capacity = batch_capacity.min(source_preparation_window(sources));
     let mut group_start = 0;
     while group_start < sources.len() {
-        let group_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
         let group_end = group_start
             .saturating_add(group_capacity)
             .min(sources.len());
@@ -2039,14 +2205,10 @@ where
                     consume(stream.member, Packing::Opening(stream.input_size))?;
                 }
             }
-            let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
-            let reserved = required.saturating_mul(wave_capacity as u64);
-            let _permit = resources
-                .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
-
-            let mut jobs = Records::new(wave_capacity, resources)?;
+            let mut wave = BlockWave::default();
+            let mut jobs = Records::new(batch_capacity, resources)?;
             let mut misses = 0usize;
-            while jobs.len() < wave_capacity && misses < streams.len() {
+            while jobs.len() < batch_capacity && misses < streams.len() {
                 let member = cursor;
                 let stream = &mut streams[member];
                 if !stream.has_more() {
@@ -2056,6 +2218,21 @@ where
                 }
                 misses = 0;
                 if offsets[member] == 0 && !stream.straight && goes_straight(stream) {
+                    break;
+                }
+
+                let history = offsets[member].min(plan.encode_options.max_match_distance) as u64;
+                let len = job_size_bound(plan, runs_per_job, stream.unread());
+                if !wave.admit(
+                    plan,
+                    filter_runs,
+                    len,
+                    history,
+                    plan.encode_options.max_match_distance as u64,
+                    required,
+                    resources,
+                    advance,
+                )? {
                     break;
                 }
 
@@ -2099,6 +2276,7 @@ where
                     run_start = job.data.len();
                     job.seams.push_growing(run_start)?;
                 }
+                wave.record(&job, plan, filter_runs, history);
                 offsets[member] += job.data.len();
                 if filter_runs {
                     // Histories are kept below, once the filters are known.
@@ -2120,18 +2298,7 @@ where
                         explicit_run_filter(job, spec)?;
                     }
                 } else {
-                    // The wave reserved workspace for `wave_capacity` jobs
-                    // whether or not it filled that many, so that many
-                    // searches fit at once. A member of two runs has eight
-                    // pieces to search at level 5.
-                    choose_run_filters(
-                        &mut jobs,
-                        wave_capacity,
-                        plan,
-                        required,
-                        resources,
-                        advance,
-                    )?;
+                    choose_run_filters(&mut jobs, plan, required, resources, advance)?;
                 }
                 for job in jobs.iter_mut() {
                     let (member, _, _) = job.blocks[0];
@@ -2192,21 +2359,8 @@ fn compress_solid_chain<B: Budget + Send + Sync>(
 where
     B::Charge: Send,
 {
-    let mut streams = Records::collect(
-        sources.iter().enumerate().map(|(member, source)| {
-            MemberStream::new(
-                member,
-                source,
-                integrity[member].0,
-                plan.blake2sp,
-                resources,
-                advance,
-                allowance,
-            )
-            .map_err(|error| error_context(member, error))
-        }),
-        resources,
-    )?;
+    let source_window = source_preparation_window(sources);
+    let mut streams = Records::new(sources.len(), resources)?;
 
     let mut history = Buffer::new(allowance);
     let mut next = 0usize;
@@ -2217,21 +2371,50 @@ where
     let goes_straight = |stream: &MemberStream<B>| {
         !stream.started && !stream.straight && straight(stream.member, stream.input_size)
     };
-    loop {
-        let wave_capacity = streaming_wave_capacity(batch_capacity, required, plan, resources);
-        let reserved = required.saturating_mul(wave_capacity as u64);
-        let permit = resources
-            .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())?;
-
-        // Run boundaries depend on input and dictionary size, never on the
-        // worker count. Adjacent blocks amortize history copies and seeding.
-        let mut jobs = Records::new(wave_capacity, resources)?;
+    let mut remaining = 0u64;
+    let mut placed = 0u64;
+    while handed < sources.len() {
+        if handed == streams.len() {
+            // Empty members can open during preparation. Admit their sources
+            // in the same window as the ones read while assembling runs.
+            let end = handed.saturating_add(source_window).min(sources.len());
+            for member in handed..end {
+                let size = integrity[member].0;
+                let stream = MemberStream::new(
+                    member,
+                    &sources[member],
+                    size,
+                    plan.blake2sp,
+                    resources,
+                    advance,
+                    allowance,
+                )
+                .map_err(|error| error_context(member, error))?;
+                streams.push(stream)?;
+                remaining = remaining.saturating_add(size);
+            }
+        }
+        let mut wave = BlockWave::default();
+        let mut jobs = Records::new(batch_capacity, resources)?;
         let mut opens = false;
-        while jobs.len() < wave_capacity && !opens {
+        while jobs.len() < batch_capacity && !opens {
             while next < streams.len() && !streams[next].has_more() {
                 next += 1;
             }
             if next == streams.len() {
+                break;
+            }
+            let dictionary = plan.encode_options.max_match_distance as u64;
+            if !wave.admit(
+                plan,
+                filter_runs,
+                job_size_bound(plan, 1, remaining),
+                placed.min(dictionary),
+                dictionary,
+                required,
+                resources,
+                advance,
+            )? {
                 break;
             }
             let mut job = BlockJob {
@@ -2285,14 +2468,15 @@ where
             if !filter_runs {
                 history.remember(&job.data, plan.encode_options.max_match_distance)?;
             }
+            wave.record(&job, plan, filter_runs, placed.min(dictionary));
+            remaining = remaining.saturating_sub(job.data.len() as u64);
+            placed = placed.saturating_add(job.data.len() as u64);
             jobs.push(job)?;
         }
 
         if filter_runs && !jobs.is_empty() {
             // A solid run can hold many members, each searched on its own.
-            // The wave reserved workspace for `wave_capacity` jobs whether or
-            // not it filled that many, so that many searches fit at once.
-            choose_run_filters(&mut jobs, wave_capacity, plan, required, resources, advance)?;
+            choose_run_filters(&mut jobs, plan, required, resources, advance)?;
             for job in jobs.iter_mut() {
                 job.history = Buffer::copied(&history, allowance)?;
                 if !job.filters.is_empty() {
@@ -2315,27 +2499,25 @@ where
             }
         }
 
-        if jobs.is_empty() {
-            break;
+        if !jobs.is_empty() {
+            if resources.execution.is_none() {
+                share_member_windows(&mut jobs, plan, true, allowance)?;
+            }
+            compress_wave(
+                jobs,
+                plan,
+                required,
+                &mut streams,
+                resources,
+                advance,
+                error_context,
+                consume,
+            )?;
         }
-        if resources.execution.is_none() {
-            share_member_windows(&mut jobs, plan, true, allowance)?;
-        }
-        compress_wave(
-            jobs,
-            plan,
-            required,
-            &mut streams,
-            resources,
-            advance,
-            error_context,
-            consume,
-        )?;
         // The writer may need workspace of its own for what it is handed.
-        drop(permit);
+        drop(wave);
         hand_on_opening(&mut streams, &mut handed, straight, consume)?;
     }
-    hand_on_opening(&mut streams, &mut handed, straight, consume)?;
     debug_assert_eq!(handed, streams.len(), "every member is handed on");
     Ok(())
 }
@@ -2482,106 +2664,81 @@ fn explicit_run_range(
     (start < end).then(|| start - run.start..end - run.start)
 }
 
-/// Chooses each run's filters, in parallel and against the same admission as
-/// the wave that will code them: at most `concurrent` searches at a time,
-/// which is as many as the wave has workspace reserved for.
-///
-/// A run is searched in pieces of
-/// [`FILTER_SEARCH_BYTES`](super::plan::FILTER_SEARCH_BYTES), so one search
-/// fits the budget whatever the dictionary, and the pieces' ranges are offset
-/// into the run.
-fn choose_run_filters<B: Budget + Send + Sync>(
-    jobs: &mut Records<BlockJob<B>>,
-    concurrent: usize,
+/// Each admitted job searches its own pieces in order. At most one search
+/// holds scratch for that job at a time.
+fn choose_run_filters<B: Budget>(
+    jobs: &mut [BlockJob<B>],
     plan: &CompressPlan,
     required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
-) -> Result<()>
-where
-    B::Charge: Send,
-{
-    // A piece is a stretch of one member: the bytes to search and how far
-    // into the member they start. A solid run holds a segment per member; any
-    // other run is all one member's.
-    let piece = filter_search_bytes();
-    let mut pieces = Records::new(0, resources)?;
-    for (index, job) in jobs.iter().enumerate() {
-        // A job of several runs searches each as it would a job of its own.
-        let runs: Vec<_> = job
+) -> Result<()> {
+    let searches = Records::collect(jobs.iter().map(Ok), resources)?;
+    let found = if resources.execution.is_some() {
+        run_jobs_admitted(
+            searches,
+            resources,
+            advance,
+            |_| required,
+            |job, worker, progress, allowance| {
+                choose_job_filters(job, plan, worker, progress, allowance)
+            },
+        )?
+    } else {
+        run_jobs(searches, resources, advance, |job, progress| {
+            choose_job_filters(job, plan, resources, progress, &Allowance::default())
+        })?
+    };
+    for (job, filters) in jobs.iter_mut().zip(found) {
+        job.filters = filters;
+    }
+    Ok(())
+}
+
+fn choose_job_filters<B: Budget, C: Budget>(
+    job: &BlockJob<B>,
+    plan: &CompressPlan,
+    resources: &WriterResources,
+    progress: &dyn CompressionProgress,
+    allowance: &C,
+) -> Result<Records<crate::FilterSpec>> {
+    let runs;
+    let segments = if job.segments.is_empty() {
+        // A joined job searches on the same grid as its runs would alone.
+        runs = job
             .runs(job.data.len())
             .map(|run| {
                 let offset = job.offset + run.start;
                 (run, offset)
             })
-            .collect();
-        let segments = if job.segments.is_empty() {
-            &runs[..]
-        } else {
-            &job.segments[..]
-        };
-        for (segment, file_offset) in segments {
-            let mut start = segment.start;
-            while start < segment.end {
-                let end = (start + piece).min(segment.end);
-                pieces.push_growing((index, start..end, file_offset + (start - segment.start)))?;
-                start = end;
+            .collect::<Vec<_>>();
+        &runs[..]
+    } else {
+        &job.segments[..]
+    };
+    let mut filters = Records::new(0, resources)?;
+    let piece = filter_search_bytes();
+    for (segment, file_offset) in segments {
+        for start in (segment.start..segment.end).step_by(piece) {
+            let end = (start + piece).min(segment.end);
+            let offset = file_offset + (start - segment.start);
+            let specs = super::filter_policy::run_filters_with_allowance(
+                &job.data[start..end],
+                offset,
+                plan.algorithm_version,
+                plan.encode_options,
+                &|| progress.is_cancelled(),
+                allowance,
+            )?;
+            for spec in specs {
+                let span = spec
+                    .range
+                    .map_or(start..end, |r| start + r.start..start + r.end);
+                filters.push_growing(crate::FilterSpec::range(spec.kind, span))?;
             }
         }
     }
-    let mut chosen = Records::new(pieces.len(), resources)?;
-    for batch in pieces.chunks(concurrent.max(1)) {
-        let searches = Records::collect(
-            batch.iter().map(|(index, range, file_offset)| {
-                Ok((&jobs[*index].data[range.clone()], *file_offset))
-            }),
-            resources,
-        )?;
-        let found = if resources.execution.is_some() {
-            run_jobs_admitted(
-                searches,
-                resources,
-                advance,
-                |_| required,
-                |(data, offset), worker, progress, allowance| {
-                    let specs = super::filter_policy::run_filters_with_allowance(
-                        data,
-                        offset,
-                        plan.algorithm_version,
-                        plan.encode_options,
-                        &|| progress.is_cancelled(),
-                        allowance,
-                    )?;
-                    Records::collect(specs.iter().cloned().map(Ok), worker)
-                },
-            )?
-        } else {
-            run_jobs(searches, resources, advance, |(data, offset), progress| {
-                let specs = super::filter_policy::run_filters_with_allowance(
-                    data,
-                    offset,
-                    plan.algorithm_version,
-                    plan.encode_options,
-                    &|| progress.is_cancelled(),
-                    &Allowance::default(),
-                )?;
-                Records::collect(specs.iter().cloned().map(Ok), resources)
-            })?
-        };
-        for specs in found {
-            chosen.push(specs)?;
-        }
-    }
-    for ((index, range, _), specs) in pieces.iter().zip(chosen) {
-        let filters = &mut jobs[*index].filters;
-        for spec in specs {
-            let span = spec.range.map_or(range.clone(), |r| {
-                range.start + r.start..range.start + r.end
-            });
-            filters.push_growing(crate::FilterSpec::range(spec.kind, span))?;
-        }
-    }
-    Ok(())
+    Ok(filters)
 }
 
 /// Compresses a wave of blocks in parallel, then appends the results to their
@@ -3948,11 +4105,7 @@ mod tests {
                 candidates: vec![options].into(),
                 blake2sp: true,
             };
-            let required = super::super::streaming_lz_workspace(
-                plan.dictionary_size,
-                crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-                false,
-            );
+            let required = super::super::plan::lazy_streaming_workspace(options, size as u64);
             // Automatic mode is forced through its existing streaming fallback.
             let max_workers = if plan.filter_policy == FilterPolicy::Auto {
                 1
@@ -4060,8 +4213,8 @@ mod tests {
             assert_eq!(opens.load(Ordering::Relaxed), 1);
             assert_eq!(ledger.used(), 0);
             let sources = [EntrySource::from_bytes(vec![7; 8192])];
-            // Below the fixed 3 MiB every streaming job is charged, whatever its input.
-            let too_small = Allowance::limited(1024 * 1024);
+            // Even a short run needs the finder's hash heads.
+            let too_small = Allowance::limited(64 * 1024);
             let constrained = resources
                 .clone()
                 .with_execution_allowance(too_small.clone());
@@ -4241,7 +4394,9 @@ mod tests {
     fn whole_member_ledger_selects_fitting_waves_before_opening_sources() {
         use std::sync::{atomic::AtomicUsize, Arc, Barrier};
         let scratch = crate::scratch::case("whole-member-ledger");
-        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(65536)
+            .with_optimal_parse(true);
         let plan = CompressPlan {
             algorithm_version: 0,
             encode_options: options,
@@ -4570,7 +4725,9 @@ mod tests {
     #[test]
     fn whole_member_sources_open_only_after_combined_admission() {
         use std::sync::{atomic::AtomicUsize, Arc};
-        let encode_options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let encode_options = EncodeOptions::new(8)
+            .with_max_match_distance(65536)
+            .with_optimal_parse(true);
         let plan = CompressPlan {
             algorithm_version: 0,
             encode_options,
@@ -5813,7 +5970,7 @@ mod incompressible_probe_tests {
 
     /// Too little memory to code a block, enough to sample and hash.
     fn too_small_to_code() -> WriterResources {
-        WriterResources::new(16 * 1024 * 1024)
+        WriterResources::new(8 * 1024 * 1024)
     }
 
     fn checksums(data: &[u8]) -> (u32, Option<[u8; 32]>) {

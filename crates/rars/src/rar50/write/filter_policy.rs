@@ -343,11 +343,11 @@ pub(super) fn dictionary_size_for_options(
 /// Reserve for a full block job, including room for per-run filters.
 pub(super) fn fitted_dictionary_workspace(level: u8, dictionary: u64) -> Result<u64> {
     let options = encode_options_for_level(Some(level), dictionary)?;
-    let code = super::streaming_lz_workspace(
-        dictionary,
-        crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-        options.optimal_parse,
-    );
+    let code = if options.optimal_parse {
+        super::streaming_lz_workspace(dictionary, crate::codec::rar50::MAX_LZ_BLOCK_SIZE, true)
+    } else {
+        super::plan::lazy_streaming_workspace(options, u64::MAX)
+    };
     Ok(super::plan::block_admission(code, options, u64::MAX, true))
 }
 

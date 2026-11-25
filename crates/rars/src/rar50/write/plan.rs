@@ -146,12 +146,11 @@ impl ExecutionPlan {
             // A solid chain cannot search a member whole: its members code
             // against each other. It searches each run on its own instead, as
             // a member too large to search whole does, when that fits.
-            let search = whole_member_workspace(
-                largest.min(search_piece(settings.encode_options)),
-                settings,
-            );
-            let run_filters =
-                settings.solid && settings.filter_policy == FilterPolicy::Auto && search <= limit;
+            let piece = largest.min(search_piece(settings.encode_options));
+            let run_filters = settings.solid
+                && settings.filter_policy == FilterPolicy::Auto
+                && whole_member_routing_workspace(piece, settings) <= limit;
+            let search = whole_member_workspace(piece, settings);
             return Ok(Self::Blocks {
                 workspace: if run_filters {
                     workspace.max(search)
@@ -169,13 +168,10 @@ impl ExecutionPlan {
         }
         Ok(Self::IndependentMembers(Records::collect(
             sizes.map(|size| {
-                let required = if size == 0 {
-                    0
-                } else {
-                    whole_member_workspace(size, settings)
-                };
+                let required = whole_member_workspace(size, settings);
+                let routing = whole_member_routing_workspace(size, settings);
                 // A run's search is a piece of the member's, so it fits too.
-                if required <= limit && codes_alike_in_runs(settings, size) {
+                if routing <= limit && codes_alike_in_runs(settings, size) {
                     return Ok(MemberPlan::in_runs(
                         settings,
                         size,
@@ -184,14 +180,18 @@ impl ExecutionPlan {
                     ));
                 }
                 let fallback = match &settings.filter_policy {
-                    _ if required <= limit => None,
-                    FilterPolicy::Auto => {
-                        Some(FallbackReason::AutomaticFilterWorkspace { required, limit })
-                    }
+                    _ if routing <= limit => None,
+                    FilterPolicy::Auto => Some(FallbackReason::AutomaticFilterWorkspace {
+                        required: routing,
+                        limit,
+                    }),
                     // A range the member cannot hold is left to fail as it
                     // would whole.
                     FilterPolicy::Explicit(spec) if spec_fits(spec, size) => {
-                        Some(FallbackReason::ExplicitFilterWorkspace { required, limit })
+                        Some(FallbackReason::ExplicitFilterWorkspace {
+                            required: routing,
+                            limit,
+                        })
                     }
                     _ => None,
                 };
@@ -249,8 +249,12 @@ impl MemberPlan {
         // charged the same.
         let search =
             whole_member_workspace(size.min(search_piece(settings.encode_options)), settings);
+        let routing = whole_member_routing_workspace(
+            size.min(search_piece(settings.encode_options)),
+            settings,
+        );
         let run_filters =
-            search <= limit || matches!(settings.filter_policy, FilterPolicy::Explicit(_));
+            routing <= limit || matches!(settings.filter_policy, FilterPolicy::Explicit(_));
         Self {
             execution: Execution::Blocks {
                 fallback,
@@ -306,15 +310,33 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
                 .candidates
                 .iter()
                 .any(|options| options.optimal_parse));
-    super::streaming_lz_workspace(
-        settings.dictionary_size,
-        input.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
-        optimal,
-    )
+    if optimal {
+        super::streaming_lz_workspace(
+            settings.dictionary_size,
+            input.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
+            true,
+        )
+    } else {
+        lazy_streaming_workspace(settings.encode_options, input)
+    }
 }
 
-/// What one block job holds, for fitting the dictionary and admitting jobs
-/// against the memory budget.
+/// The window and packed run remain live beside the codec's block scratch.
+pub(super) fn lazy_streaming_workspace(options: EncodeOptions, input: u64) -> u64 {
+    let run = input.min(super::compress::run_size_for_distance(options.max_match_distance) as u64);
+    let history = input.min(options.max_match_distance as u64);
+    let window = history.saturating_add(run);
+    let block = run.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize;
+    crate::codec::rar50::lazy_parse_workspace(
+        options,
+        usize::try_from(window).unwrap_or(usize::MAX),
+        block,
+    )
+    .saturating_add(window)
+    .saturating_add(run.saturating_mul(2))
+}
+
+/// What a full block job holds, for fitting the dictionary.
 ///
 /// A job's peak is the larger of its two phases, plus what the coordinator
 /// keeps for it through both:
@@ -347,11 +369,6 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
 /// filter search alone       133.4            143.3           167.3
 /// charged here           159 (151 unfiltered)  195           283
 /// ```
-///
-/// Several jobs of one member share a window, so a wave of them peaks below
-/// as many lone jobs: at four threads, two-symbol noise peaked at 117.8 MiB a
-/// job at level 3, and 225.7 at level 5. A wave still reserves this for every
-/// job it could hold.
 pub(super) fn block_admission(
     code: u64,
     options: EncodeOptions,
@@ -361,12 +378,16 @@ pub(super) fn block_admission(
     let run = super::compress::run_size_for_distance(options.max_match_distance) as u64;
     let search = if run_filters {
         let piece = input.min(search_piece(options));
-        super::streaming_lz_workspace(
-            piece,
-            piece.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
-            options.optimal_parse,
-        )
-        .saturating_add(piece.saturating_mul(2))
+        if options.optimal_parse {
+            super::streaming_lz_workspace(
+                piece,
+                piece.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
+                true,
+            )
+            .saturating_add(piece.saturating_mul(2))
+        } else {
+            lazy_whole_member_workspace(piece, options)
+        }
     } else {
         0
     };
@@ -400,6 +421,39 @@ pub(super) struct CompressPlan {
 /// Working memory a member needs to be filtered as a whole: the member, the
 /// filtered copy, and the candidate packed outputs being compared.
 pub(super) fn whole_member_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
+    if input_size == 0 {
+        return 0;
+    }
+    if !plan.encode_options.optimal_parse
+        && plan.candidates.iter().all(|options| !options.optimal_parse)
+    {
+        return plan
+            .candidates
+            .iter()
+            .copied()
+            .chain(std::iter::once(plan.encode_options))
+            .map(|options| lazy_whole_member_workspace(input_size, options))
+            .max()
+            .unwrap_or(0);
+    }
+    whole_member_routing_workspace(input_size, plan)
+}
+
+fn lazy_whole_member_workspace(input: u64, options: EncodeOptions) -> u64 {
+    let block = input.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize;
+    crate::codec::rar50::lazy_parse_workspace(
+        options,
+        usize::try_from(input).unwrap_or(usize::MAX),
+        block,
+    )
+    .saturating_add(input.saturating_mul(4))
+}
+
+/// Routing is part of the archive's encoding plan, so it uses a fixed estimate.
+fn whole_member_routing_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
+    if input_size == 0 {
+        return 0;
+    }
     let optimal = plan.encode_options.optimal_parse
         || plan.candidates.iter().any(|options| options.optimal_parse);
     let reach = plan
@@ -447,7 +501,7 @@ mod tests {
     fn automatic_fallback_records_the_admission_boundary_and_reason() {
         let settings = settings();
         let size = 2 * 1024 * 1024;
-        let required = whole_member_workspace(size, &settings);
+        let required = whole_member_routing_workspace(size, &settings);
         let at_limit = ExecutionPlan::new(&settings, [size].into_iter(), required);
         assert_eq!(at_limit.members()[0].execution, Execution::WholeMember);
         let below = ExecutionPlan::new(&settings, [size].into_iter(), required - 1);
@@ -462,13 +516,17 @@ mod tests {
             }
         );
         // Charged for one run's filter search, which is smaller than the member.
-        let search = whole_member_workspace(search_piece(settings.encode_options), &settings);
-        assert_eq!(below.members()[0].workspace, search);
+        let search =
+            whole_member_routing_workspace(search_piece(settings.encode_options), &settings);
+        assert_eq!(
+            below.members()[0].workspace,
+            whole_member_workspace(search_piece(settings.encode_options), &settings)
+        );
         assert!(search < required);
 
         // A member no longer than one search cannot search a part of itself.
         let size = search_piece(settings.encode_options);
-        let required = whole_member_workspace(size, &settings);
+        let required = whole_member_routing_workspace(size, &settings);
         let below = ExecutionPlan::new(&settings, [size].into_iter(), required - 1);
         assert!(matches!(
             below.members()[0].execution,
@@ -511,7 +569,7 @@ mod tests {
         let delta = crate::FilterKind::Delta { channels: 1 };
         settings.filter_policy = FilterPolicy::Explicit(crate::FilterSpec::whole(delta));
         let size = 2 * search_piece(settings.encode_options);
-        let required = whole_member_workspace(size, &settings);
+        let required = whole_member_routing_workspace(size, &settings);
         let at_limit = ExecutionPlan::new(&settings, [size].into_iter(), required);
         assert_eq!(at_limit.members()[0].execution, Execution::WholeMember);
         // Even when a run's search would not fit, the filter is still applied.
@@ -575,7 +633,8 @@ mod tests {
         settings.solid = true;
         let sizes = || [3 * 1024 * 1024u64, 5 * 1024 * 1024].into_iter();
         let streaming = streaming_workspace(&settings, true, 8 * 1024 * 1024);
-        let search = whole_member_workspace(search_piece(settings.encode_options), &settings);
+        let search =
+            whole_member_routing_workspace(search_piece(settings.encode_options), &settings);
         assert!(search > streaming);
 
         // The search is charged beside the chain, and decides nothing about
@@ -583,7 +642,7 @@ mod tests {
         let roomy = ExecutionPlan::new(&settings, sizes(), search);
         assert!(matches!(
             roomy,
-            ExecutionPlan::Blocks { workspace, run_filters: true, .. } if workspace == search
+            ExecutionPlan::Blocks { workspace, run_filters: true, .. } if workspace == whole_member_workspace(search_piece(settings.encode_options), &settings).max(streaming)
         ));
         let tight = ExecutionPlan::new(&settings, sizes(), search - 1);
         assert!(matches!(
