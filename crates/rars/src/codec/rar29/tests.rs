@@ -5458,7 +5458,7 @@ fn ppmd_members_code_to_the_bytes_before_the_search_ran_ahead() {
         fingerprints,
         [
             (228_677, 1_472_184_063),
-            (230_348, 1_494_863_526),
+            (230_342, 4_512_142),
             (231_226, 2_092_742_637),
             (209_736, 3_414_149_300),
             // Its eleven delta records are declared as the coder reaches each

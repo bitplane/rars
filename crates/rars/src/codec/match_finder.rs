@@ -101,14 +101,29 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
         links.saturating_add(heads).saturating_mul(4)
     }
 
+    /// The most heads [`MatchFinder::for_reach`] hangs chains off, as bits.
+    ///
+    /// The 32-byte finder searches for long matches only, so a chain that
+    /// shares its bucket with unrelated strings is mostly misses; it takes
+    /// more heads than the LZ finders, whose collisions are a different trade.
+    #[cfg(feature = "write")]
+    const MAX_REACH_HASH_BITS: u32 = match MIN_MATCH {
+        32 => 23,
+        _ => 20,
+    };
+
+    /// Bits of heads beyond one head per position of reach.
+    #[cfg(feature = "write")]
+    const REACH_HASH_SLACK: u32 = match MIN_MATCH {
+        32 => 1,
+        _ => 0,
+    };
+
     /// Heads follow the reach, not the window, so filling ahead offers the same candidates.
     #[cfg(feature = "write")]
     fn reach_hash_bits(reach: usize) -> u32 {
-        reach
-            .max(1)
-            .next_power_of_two()
-            .trailing_zeros()
-            .clamp(Self::HASH_BITS, 20)
+        (reach.max(1).next_power_of_two().trailing_zeros() + Self::REACH_HASH_SLACK)
+            .clamp(Self::HASH_BITS, Self::MAX_REACH_HASH_BITS)
     }
 }
 
@@ -1228,6 +1243,20 @@ mod tests {
 
     #[test]
     #[cfg(feature = "write")]
+    fn the_long_match_finder_takes_two_heads_per_position_of_reach() {
+        let heads = |reach| MatchFinder::<32>::for_reach(reach, reach).head.len();
+        assert_eq!(heads(1000), 1 << 17);
+        assert_eq!(heads(1 << 20), 1 << 21);
+        assert_eq!(heads(4 << 20), 1 << 23);
+        assert_eq!(heads(16 << 20), 1 << 23);
+        assert_eq!(
+            MatchFinder::<6>::for_reach(4 << 20, 4 << 20).head.len(),
+            1 << 20
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "write")]
     fn a_finder_for_a_reach_is_priced_at_what_it_allocates() {
         for (window, reach) in [(1, 1), (1000, 1000), (5000, 4 << 20), (6 << 20, 4 << 20)] {
             let finder = MatchFinder::<4>::for_reach(window, reach);
@@ -1235,6 +1264,12 @@ mod tests {
                 MatchFinder::<4>::bytes_for_reach(window, reach),
                 4 * (finder.head.len() + finder.prev.len()) as u64,
                 "window {window}, reach {reach}"
+            );
+            let finder = MatchFinder::<32>::for_reach(window, reach);
+            assert_eq!(
+                MatchFinder::<32>::bytes_for_reach(window, reach),
+                4 * (finder.head.len() + finder.prev.len()) as u64,
+                "long finder, window {window}, reach {reach}"
             );
         }
     }
