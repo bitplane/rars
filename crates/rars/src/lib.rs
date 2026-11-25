@@ -111,6 +111,7 @@ pub use rewrite_plan::{rewrite_payload_bytes, RewritePayload};
 mod rewrite_staging;
 #[cfg(feature = "write")]
 pub use rewrite_staging::RewriteStaging;
+mod local_zone;
 mod memory_limit;
 mod output_pipeline;
 mod simd;
@@ -124,6 +125,9 @@ mod truncation;
 #[doc(hidden)]
 pub mod volume_order;
 pub use file_times::{FileTimes, Timestamp};
+// Windows has no zone database, so there it is only built to be tested.
+#[cfg(any(not(windows), test))]
+#[cfg_attr(windows, allow(dead_code))]
 mod tzif;
 pub mod version;
 mod volume_extract;

@@ -24,6 +24,9 @@
 //! type table, so `Etc/GMT+5` resolves correctly with an empty transition list.
 //! After 2037 a daylight-saving zone freezes at its final offset, which needs a
 //! file stamped past 2038 *and* stored in a pre-RAR-5 archive to notice.
+//!
+//! Windows has no zone database, so this module serves every other platform;
+//! [`crate::local_zone`] chooses between them.
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
