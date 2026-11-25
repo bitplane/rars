@@ -3865,9 +3865,13 @@ fn rar29_encode_options_for_level(level: Option<u8>) -> Result<Rar29EncodeOption
         Some(2) => Rar29EncodeOptions::new(16)
             .with_lazy_matching(true)
             .with_skip_literal_runs(Some(128)),
-        Some(3) => Rar29EncodeOptions::new(64)
-            .with_lazy_matching(true)
-            .with_near_matches(true),
+        Some(3) => {
+            let mut options = Rar29EncodeOptions::new(64)
+                .with_lazy_matching(true)
+                .with_near_matches(true);
+            options.table_match_candidates = Some(16);
+            options
+        }
         Some(4) => Rar29EncodeOptions::new(64)
             .with_lazy_matching(true)
             .with_near_matches(true)
@@ -9682,6 +9686,27 @@ mod tests {
                 below = archive.len();
             }
         }
+    }
+
+    #[test]
+    fn rar29_record_table_keeps_the_level_three_ladder() {
+        let data: Vec<u8> = (0..8192u32)
+            .flat_map(|i| {
+                [0x40_0000 + i * 24, i * 3, 7, (i * i) & 0xffff]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+            })
+            .collect();
+        let members = entries(&[("table", &data)]);
+        let packed = |level| {
+            let options =
+                super::WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only())
+                    .with_dictionary_size(256 * 1024)
+                    .with_compression_level(level);
+            in_memory_with(&members, options, crate::MemberCoding::Compressed).len()
+        };
+        let (two, three) = (packed(2), packed(3));
+        assert!(three <= two, "level 3 packed {three} bytes, level 2 {two}");
     }
 
     #[test]

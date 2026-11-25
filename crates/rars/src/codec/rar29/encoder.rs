@@ -149,6 +149,15 @@ fn codes_differences(records: &[OwnedVmFilterRecord], len: usize) -> bool {
     covered >= len.div_ceil(2) && len > 0
 }
 
+fn codes_record_table(records: &[OwnedVmFilterRecord], len: usize) -> bool {
+    records.iter().try_fold(0, |end, record| {
+        (record.block_start == end
+            && record.code == RAR3_DELTA_FILTER_BYTECODE
+            && matches!(record.init_regs.as_slice(), [(0, channels)] if *channels > 4))
+        .then_some(end + record.block_size)
+    }) == Some(len)
+}
+
 /// The chains a parse walks, keyed as [`keys_long`] says.
 enum ChainFinder {
     Short(Rar29MatchFinder),
@@ -898,6 +907,7 @@ fn filter_in_place(
 #[non_exhaustive]
 pub struct EncodeOptions {
     pub max_match_candidates: usize,
+    pub(crate) table_match_candidates: Option<usize>,
     pub lazy_matching: bool,
     pub lazy_lookahead: usize,
     pub max_match_distance: usize,
@@ -932,6 +942,7 @@ impl EncodeOptions {
     pub const fn new(max_match_candidates: usize) -> Self {
         Self {
             max_match_candidates,
+            table_match_candidates: None,
             lazy_matching: false,
             lazy_lookahead: 1,
             max_match_distance: MAX_ENCODER_MATCH_OFFSET,
@@ -1861,13 +1872,10 @@ fn for_each_block(
     ends.push(len);
     let per_batch = (LzParser::batch_bytes(block_size) / block_size).max(1);
     // Segments bound what a parser holds, for one re-hashed reach each.
-    let per_segment = per_batch
-        * reach
-            .saturating_mul(4)
-            .div_ceil(per_batch * block_size)
-            .max(1);
+    let segment_goal = reach.saturating_mul(4);
+    let per_segment = per_batch * segment_goal.div_ceil(per_batch * block_size).max(1);
     let mut block_start = 0;
-    let mut long = None;
+    let mut search = None;
     for segment in ends.chunks(per_segment) {
         let segment_end = *segment.last().expect("chunks are never empty");
         let behind = reach.min(block_start);
@@ -1877,9 +1885,19 @@ fn for_each_block(
         } = input.segment(block_start, behind, segment_end, reach)?;
         let base = combined.len() - (segment_end - block_start);
         // The first segment starts with all the history the member reaches.
-        let long = *long.get_or_insert_with(|| {
+        let (long, options) = *search.get_or_insert_with(|| {
             let differences = codes_differences(&records, segment_end - block_start);
-            keys_long(options, len + base, differences)
+            let long = keys_long(options, len + base, differences);
+            let mut parse = options;
+            if let Some(limit) = options.table_match_candidates {
+                // Longer matches can eat into runs of cheap same-length
+                // repeats in delta planes. Cap the walk for whole tables
+                // that fit in the first segment at any thread count.
+                if len <= segment_goal.max(block_size) && codes_record_table(&records, len) {
+                    parse.max_match_candidates = limit;
+                }
+            }
+            (long, parse)
         });
         let mut parser = LzParser::new(&combined, base, options, block_size, long);
         let origin = block_start;
