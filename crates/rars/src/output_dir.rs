@@ -723,7 +723,12 @@ fn refused_walk(error: crate::Error, name: &[u8]) -> crate::Error {
 
 /// What `create_dir_all` says of a file where a directory goes.
 fn file_in_the_way() -> io::Error {
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    return io::Error::from_raw_os_error(rustix::io::Errno::EXIST.raw_os_error());
+    #[cfg(all(
+        unix,
+        not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+    ))]
     return io::Error::from_raw_os_error(libc::EEXIST);
     #[cfg(not(unix))]
     return io::ErrorKind::AlreadyExists.into();
@@ -733,7 +738,26 @@ fn file_in_the_way() -> io::Error {
 /// by descriptor finds it can't open it as a directory, `ENOTDIR`, so it is
 /// reported as `create_dir_all` would.
 fn like_create_dir_all(error: crate::Error, directory: &Path) -> crate::Error {
-    #[cfg(unix)]
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+    {
+        let not_a_directory = matches!(
+            error.root_cause(),
+            crate::Error::Io(io) if io
+                .source()
+                .downcast_ref::<io::Error>()
+                .and_then(io::Error::raw_os_error)
+                == Some(rustix::io::Errno::NOTDIR.raw_os_error())
+        );
+        if not_a_directory
+            && fs::symlink_metadata(directory).is_ok_and(|metadata| !metadata.is_dir())
+        {
+            return file_in_the_way().into();
+        }
+    }
+    #[cfg(all(
+        unix,
+        not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+    ))]
     {
         let not_a_directory = matches!(
             error.root_cause(),

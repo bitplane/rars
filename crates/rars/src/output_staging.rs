@@ -366,12 +366,42 @@ pub fn open_in_place(
 }
 
 fn replace_in_place(path: &Path) -> std::io::Result<File> {
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create(true);
-    #[cfg(unix)]
+    // O_NONBLOCK fails a FIFO with no reader instead of waiting for one.
+    #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
     {
+        use rustix::fs::{Mode, OFlags};
+        use rustix::io::Errno;
+        let file = File::from(
+            rustix::fs::open(
+                path,
+                OFlags::WRONLY
+                    | OFlags::CREATE
+                    | OFlags::NOFOLLOW
+                    | OFlags::NONBLOCK
+                    | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o666),
+            )
+            .map_err(|error| match error {
+                Errno::LOOP | Errno::NXIO => refused_in_place(),
+                error => error.into(),
+            })?,
+        );
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.nlink() > 1 {
+            return Err(refused_in_place());
+        }
+        file.set_len(0)?;
+        Ok(file)
+    }
+    #[cfg(all(
+        unix,
+        not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+    ))]
+    {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true);
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-        // O_NONBLOCK fails a FIFO with no reader instead of waiting for one.
         let file = options
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(path)
@@ -388,6 +418,8 @@ fn replace_in_place(path: &Path) -> std::io::Result<File> {
     }
     #[cfg(windows)]
     {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true);
         use std::os::windows::fs::OpenOptionsExt;
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         let file = options
@@ -401,6 +433,8 @@ fn replace_in_place(path: &Path) -> std::io::Result<File> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true);
         let file = options.open(path)?;
         file.set_len(0)?;
         Ok(file)
