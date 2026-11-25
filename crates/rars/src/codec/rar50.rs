@@ -3025,6 +3025,60 @@ impl HuffmanTable {
 #[derive(Debug)]
 struct HuffmanState<B: Budget> {
     state: super::canonical::Huffman<B>,
+    literals: ByteLiterals,
+}
+
+/// Fewer 8-bit literal codes than this and a group of seven is too often
+/// broken by another code for [`BitReader::literal_burst`] to try one.
+const BATCH_LITERALS: usize = 232;
+// `ByteLiterals::Range` needs `first <= 128 <= end` for its lane arithmetic.
+const _: () = assert!(BATCH_LITERALS > 128);
+
+/// How a table's 8-bit literal codes map from the code byte to the literal,
+/// so seven of them can be taken from 56 buffered bits without seven
+/// dependent lookups. Canonical codes of one length run in symbol order, so
+/// the 8-bit literals hold one contiguous run of code bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ByteLiterals {
+    Scalar,
+    /// All 256 literals are 8 bits: code byte `c` is literal `c`.
+    All,
+    /// 255 literals are 8 bits on codes 0..=254, skipping literal `hole`;
+    /// byte 255 starts every other code.
+    Gap {
+        hole: u8,
+    },
+    /// Code bytes `first..end` are literals, read from the quick table.
+    Range {
+        first: u8,
+        end: u16,
+    },
+}
+
+impl ByteLiterals {
+    fn of(lengths: &[u8], count: &[u16; 16]) -> Self {
+        let literals = &lengths[..lengths.len().min(256)];
+        let eights = literals.iter().filter(|&&length| length == 8).count();
+        if eights < BATCH_LITERALS {
+            return Self::Scalar;
+        }
+        let first = (1..8).fold(0usize, |code, length| {
+            code + (usize::from(count[length]) << (8 - length))
+        });
+        if eights == 256 {
+            Self::All
+        } else if eights == 255 && first == 0 {
+            let hole = literals.iter().position(|&length| length != 8);
+            Self::Gap {
+                hole: hole.unwrap_or(literals.len()) as u8,
+            }
+        } else {
+            Self::Range {
+                first: first as u8,
+                end: (first + eights) as u16,
+            }
+        }
+    }
 }
 
 impl<B: Budget> HuffmanState<B> {
@@ -3047,11 +3101,17 @@ impl<B: Budget> HuffmanState<B> {
 
         Ok(Self {
             state: super::canonical::Huffman::from_counts_with_lookup(lengths, count, allowance)?,
+            literals: if B::LIMITED {
+                ByteLiterals::Scalar
+            } else {
+                ByteLiterals::of(lengths, &count)
+            },
         })
     }
     fn try_clone(&self) -> Result<Self> {
         Ok(Self {
             state: self.state.try_clone()?,
+            literals: self.literals,
         })
     }
     #[inline(always)]
@@ -3221,9 +3281,104 @@ impl<'a> BitReader<'a> {
         if B::LIMITED {
             return 0;
         }
+        match table.literals {
+            ByteLiterals::Scalar => self.literal_run::<B, 0>(table, end, out),
+            ByteLiterals::All => self.literal_run::<B, 1>(table, end, out),
+            ByteLiterals::Gap { .. } => self.literal_run::<B, 2>(table, end, out),
+            ByteLiterals::Range { .. } => self.literal_run::<B, 3>(table, end, out),
+        }
+    }
+
+    /// `SHAPE` is the [`ByteLiterals`] variant, so each loop carries only
+    /// its own batch step.
+    #[inline(always)]
+    fn literal_run<B: Budget, const SHAPE: u8>(
+        &mut self,
+        table: &HuffmanState<B>,
+        end: usize,
+        out: &mut [u8],
+    ) -> usize {
+        const LANES: u64 = 0x0101_0101_0101_0101;
+        const HIGH: u64 = 0x8080_8080_8080_8080;
+        // The low byte of the window is past the seven codes; flagging it
+        // caps a count of clean leading lanes at seven.
+        const SEVEN: u64 = 0xffff_ffff_ffff_ff00;
+        const STOP: u64 = 0x80;
+        let (low, high) = match table.literals {
+            ByteLiterals::Gap { hole } => (u64::from(hole & 127) * LANES, u64::from(hole)),
+            ByteLiterals::Range { first, end: stop } => {
+                (u64::from(first) * LANES, u64::from(stop - 128) * LANES)
+            }
+            _ => (0, 0),
+        };
         let mut bits = *self;
         let mut count = 0;
         while count < out.len() && bits.position() < end {
+            // Seven 8-bit codes need no more than their own 56 bits, though
+            // the quick index is wider, so a full window decides the group.
+            if SHAPE != 0 && out.len() - count >= 8 && end - bits.position() >= 56 {
+                if bits.cache_bits < 56 {
+                    bits.refill();
+                }
+                if bits.cache_bits >= 56 {
+                    let window = bits.cache;
+                    // Lanes are biased into 128..=255 before each per-lane
+                    // subtraction so none borrows from its neighbour. A lane
+                    // at or past the gap's hole decodes one higher.
+                    let gap = |codes: u64| {
+                        let biased = (codes | HIGH) - low;
+                        let past = if high < 128 {
+                            biased | codes
+                        } else {
+                            biased & codes
+                        };
+                        codes + ((past & HIGH) >> 7)
+                    };
+                    let (rejected, bytes) = match SHAPE {
+                        1 => (0, window),
+                        2 => {
+                            let codes = window & SEVEN;
+                            let escape = codes & (codes << 1) & (codes << 2) & (codes << 3);
+                            (escape & (escape << 4) & HIGH & SEVEN, codes)
+                        }
+                        _ => {
+                            let biased = window | HIGH;
+                            let below = !((biased - low) | window);
+                            let above = (biased - high) & window;
+                            let mut bytes = 0u64;
+                            for lane in 0..7 {
+                                let code = (window >> (56 - 8 * lane)) & 255;
+                                let entry = table.quick_entry((code as u32) << 7);
+                                bytes |= u64::from(entry >> 4 & 255) << (56 - 8 * lane);
+                            }
+                            ((below | above) & HIGH & SEVEN, bytes)
+                        }
+                    };
+                    // A whole group skips a constant 56 bits, so the next
+                    // group's window does not wait on this one's check.
+                    if rejected == 0 {
+                        let bytes = if SHAPE == 2 { gap(bytes) } else { bytes };
+                        out[count..count + 8].copy_from_slice(&bytes.to_be_bytes());
+                        bits.skip(56);
+                        count += 7;
+                        continue;
+                    }
+                    let taken = (rejected | STOP).leading_zeros() as usize / 8;
+                    if taken != 0 {
+                        // Clearing the rejected lanes keeps a 255 from
+                        // carrying into the lanes taken.
+                        let bytes = if SHAPE == 2 {
+                            gap(bytes & !(u64::MAX >> (taken * 8)))
+                        } else {
+                            bytes
+                        };
+                        out[count..count + 8].copy_from_slice(&bytes.to_be_bytes());
+                        bits.skip(taken * 8);
+                        count += taken;
+                        continue;
+                    }
+                }
+            }
             let (peek, available) = bits.peek15();
             let entry = table.quick_entry(peek);
             let len = (entry & 15) as usize;

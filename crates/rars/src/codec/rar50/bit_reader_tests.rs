@@ -1,4 +1,4 @@
-use super::{Allowance, BitReader, Error, HuffmanState, Result};
+use super::{Allowance, BitReader, ByteLiterals, Error, HuffmanState, Result};
 
 fn bitwise_read(input: &[u8], cursor: &mut usize, count: u8) -> Result<u32> {
     let count = usize::from(count);
@@ -225,6 +225,88 @@ fn wide_reads_keep_every_bit_and_refuse_without_consuming() {
                             "{context}"
                         );
                         assert_eq!(actual.position(), start, "{context}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn byte_table(eights: &[usize], tens: &[usize], fours: &[usize]) -> HuffmanState<Allowance> {
+    let mut lengths = vec![0u8; 306];
+    for (symbols, length) in [(eights, 8), (tens, 10), (fours, 4)] {
+        for &symbol in symbols {
+            lengths[symbol] = length;
+        }
+    }
+    HuffmanState::from_lengths(&lengths, &Allowance::default()).unwrap()
+}
+
+#[test]
+fn eight_bit_literal_batches_match_the_generic_decoder() {
+    let all = byte_table(&(0..256).collect::<Vec<_>>(), &[], &[]);
+    assert_eq!(all.literals, ByteLiterals::All);
+    let mut tables = vec![all];
+    for hole in [0, 1, 127, 128, 200, 254, 255] {
+        let eights: Vec<_> = (0..256).filter(|&symbol| symbol != hole).collect();
+        let table = byte_table(&eights, &[hole, 256, 257, 258], &[]);
+        assert_eq!(table.literals, ByteLiterals::Gap { hole: hole as u8 });
+        tables.push(table);
+    }
+    // A 4-bit match code moves the literal run up to start at code 16.
+    let range = byte_table(
+        &(0..232).collect::<Vec<_>>(),
+        &(232..264).collect::<Vec<_>>(),
+        &[264],
+    );
+    assert_eq!(
+        range.literals,
+        ByteLiterals::Range {
+            first: 16,
+            end: 248
+        }
+    );
+    tables.push(range);
+    let scalar = byte_table(
+        &(0..231).collect::<Vec<_>>(),
+        &(231..306).collect::<Vec<_>>(),
+        &[],
+    );
+    assert_eq!(scalar.literals, ByteLiterals::Scalar);
+    tables.push(scalar);
+
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let input: Vec<u8> = (0..160)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Mostly full bytes, so batches run long before a code breaks them.
+            if state.is_multiple_of(5) {
+                255
+            } else {
+                (state >> 32) as u8
+            }
+        })
+        .collect();
+    for (index, table) in tables.iter().enumerate() {
+        for size in [0, 6, 7, 8, 9, 16, 160] {
+            let input = &input[..size];
+            for start in [0, 1, 5, 8] {
+                if start > size * 8 {
+                    continue;
+                }
+                for end in [start + 55, start + 56, start + 57, start + 300, usize::MAX] {
+                    for room in [0, 1, 6, 7, 8, 9, 15, 16, 64, 256] {
+                        let context = format!(
+                            "table={index}, size={size}, start={start}, end={end}, room={room}"
+                        );
+                        let (expected, position) = generic_literals(table, input, start, end, room);
+                        let mut bits = BitReader::at(input, start);
+                        let mut out = [0u8; 256];
+                        let count = bits.literal_burst(table, end, &mut out[..room]);
+                        assert_eq!(&out[..count], &expected[..], "{context}");
+                        assert_eq!(bits.position(), position, "{context}");
                     }
                 }
             }
