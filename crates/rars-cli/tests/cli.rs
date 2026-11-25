@@ -832,7 +832,19 @@ fn test_warns_about_a_member_whose_data_ends_before_its_declared_size() {
     ] {
         let case = format!("{version:?} solid={solid}");
         let path = dir.join(format!("{version:?}-{solid}.rar"));
-        let (members, _) = salvage_fixture(&path, version, solid);
+        let members = if version == rars::ArchiveVersion::Rar20 {
+            // RAR 2.0 has no end-of-member code. m2's three literals end on
+            // a byte boundary, so an oversized header cannot turn padding
+            // into a token. m3 and m4 each copy three bytes from distance 3.
+            fs::copy(fixture_rar15_40("solid_early_end_rar20.rar"), &path).unwrap();
+            [b"a".as_slice(), b"b", b"abc", b"abc", b"abc"]
+                .into_iter()
+                .enumerate()
+                .map(|(index, data)| (format!("m{index}.txt"), data.to_vec()))
+                .collect()
+        } else {
+            salvage_fixture(&path, version, solid).0
+        };
         raise_declared_size(&path, 2, 10);
         let len = members[2].1.len();
         for threads in ["1", "4"] {

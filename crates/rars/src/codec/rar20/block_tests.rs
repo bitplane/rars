@@ -168,7 +168,7 @@ fn a_streamed_solid_member_continues_the_chain_as_an_in_memory_one_does() {
     let first = text(30_000, 9);
     let second = [text(40_000, 9), first[..5_000].to_vec()].concat();
     let options = EncodeOptions::default().with_max_match_distance(64 * 1024);
-    let table = FixedEncodeTable::new().unwrap();
+    let table = FixedEncodeTable::new(false);
     let mut chain = Unpack20Encoder::with_options(options);
     let packed_first = chain.encode_member(&first).unwrap();
 
@@ -306,6 +306,60 @@ fn every_byte_of_a_member_is_counted_once_whatever_the_level() {
 }
 
 #[test]
+fn solid_rar20_level_three_keeps_the_ladder() {
+    use crate::rar15_40::{write_compressed_archive, Archive, FileEntry, WriterOptions};
+    use crate::{ArchiveVersion, FeatureSet};
+
+    let prose = text(16 * 1024, 7);
+    let header: String = (0..128)
+        .map(|i| format!("#define OPTION_{i} {}\n", i % 16))
+        .collect();
+    let mut state = 0x6772_0001;
+    let grey: Vec<_> = (0..256)
+        .flat_map(|y| (0..512).map(move |x| (x + y) / 8))
+        .map(|shade| (shade + (xorshift(&mut state) % 4) as usize) as u8)
+        .collect();
+
+    let members = [
+        (b"text.txt".as_slice(), prose.as_slice()),
+        (b"options.h".as_slice(), header.as_bytes()),
+        (b"grey.raw".as_slice(), grey.as_slice()),
+    ];
+    let entries = members.map(|(name, data)| FileEntry {
+        name,
+        data,
+        file_time: 0,
+        file_attr: 0x20,
+        host_os: 3,
+        password: None,
+        file_comment: None,
+    });
+    let mut features = FeatureSet::store_only();
+    features.solid = true;
+    let options = WriterOptions::new(ArchiveVersion::Rar20, features);
+    let encode =
+        |level| write_compressed_archive(&entries, options.with_compression_level(level)).unwrap();
+    let (two, three) = (encode(2), encode(3));
+    assert!(
+        three.len() <= two.len(),
+        "level 3 {} bytes, level 2 {}",
+        three.len(),
+        two.len()
+    );
+
+    let packed = Archive::parse(&three).unwrap();
+    assert!(packed.main.is_solid());
+    let mut decoder = Unpack20::new();
+    let files: Vec<_> = packed.files().collect();
+    assert_eq!(files.len(), members.len());
+    for (index, (file, (_, data))) in files.iter().zip(members).enumerate() {
+        assert_eq!(file.is_solid(), index != 0);
+        let payload = file.packed_data(&packed).unwrap();
+        assert_eq!(decoder.decode_member(&payload, data.len()).unwrap(), data);
+    }
+}
+
+#[test]
 fn blocks_coded_side_by_side_code_to_the_one_thread_bytes() {
     let data = [
         text(70_000, 16),
@@ -328,30 +382,45 @@ fn blocks_coded_side_by_side_code_to_the_one_thread_bytes() {
         fingerprints.push((packed.len(), crate::crc32::crc32(&packed)));
     }
     // A solid member runs its blocks on in the fixed table, after a history.
-    let table = FixedEncodeTable::new().unwrap();
     let (history, member) = data.split_at(50_000);
-    let options = EncodeOptions::default().with_max_match_distance(64 * 1024);
-    let continue_chain = || {
-        encode_member_in_blocks(member, history, Some(table), options, false, None, BLOCK).unwrap()
-    };
-    let continued = side_by_side(continue_chain);
-    let one_thread = {
-        let _cap = crate::parallel::ThreadCap::set(Some(1));
-        continue_chain()
-    };
-    assert_eq!(one_thread, continued);
-    let mut decoder = Unpack20::new();
-    decoder
-        .decode_member(
-            &encode_member(history, &[], Some(table), options, false, None).unwrap(),
-            history.len(),
-        )
-        .unwrap();
-    assert_eq!(
-        decoder.decode_member(&continued, member.len()).unwrap(),
-        member
-    );
-    fingerprints.push((continued.len(), crate::crc32::crc32(&continued)));
+    let level_three = EncodeOptions::new(16)
+        .with_lazy_matching(true)
+        .with_lazy_lookahead(2);
+    for (options, compact) in [(EncodeOptions::default(), false), (level_three, true)] {
+        let options = options.with_max_match_distance(64 * 1024);
+        let table = FixedEncodeTable::new(compact);
+        let continue_chain = || {
+            encode_member_in_blocks(member, history, Some(table), options, false, None, BLOCK)
+                .unwrap()
+        };
+        let continued = {
+            let _cap = crate::parallel::ThreadCap::set(Some(1));
+            continue_chain()
+        };
+        #[cfg(all(
+            feature = "parallel",
+            not(all(target_arch = "wasm32", target_os = "unknown"))
+        ))]
+        for threads in [2, 8] {
+            let many = crate::parallel::private_pool(threads).install(continue_chain);
+            assert!(
+                many == continued,
+                "{threads} threads changed the solid member"
+            );
+        }
+        let mut decoder = Unpack20::new();
+        decoder
+            .decode_member(
+                &encode_member(history, &[], Some(table), options, false, None).unwrap(),
+                history.len(),
+            )
+            .unwrap();
+        assert_eq!(
+            decoder.decode_member(&continued, member.len()).unwrap(),
+            member
+        );
+        fingerprints.push((continued.len(), crate::crc32::crc32(&continued)));
+    }
     // Each block starts from no recent offsets, whatever the thread count.
     assert_eq!(
         fingerprints,
@@ -360,6 +429,7 @@ fn blocks_coded_side_by_side_code_to_the_one_thread_bytes() {
             (50_277, 2_194_122_934),
             (48_319, 1_718_131_757),
             (63_269, 1_086_982_408),
+            (61_609, 1_804_705_426),
         ]
     );
 }

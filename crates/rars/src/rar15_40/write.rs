@@ -3905,6 +3905,18 @@ fn rar20_encode_options_for_options(options: WriterOptions) -> Result<Rar20Encod
         .with_max_match_distance(dictionary_size_for_options(options)?))
 }
 
+fn rar20_solid_encode_options(options: WriterOptions) -> Result<Rar20EncodeOptions> {
+    let level = options.compression_level.unwrap_or(RAR20_DEFAULT_LEVEL);
+    let mut encode = rar20_encode_options_for_options(options)?;
+    // The solid chain keeps fixed tables and only runs the greedy parse.
+    // Shorter match codes give the higher levels smaller blocks in one pass.
+    encode.compact_solid_table = level >= 3;
+    if level == 4 {
+        encode.max_match_candidates = 32;
+    }
+    Ok(encode)
+}
+
 /// RAR 1.5 levels. Level 5 takes the priced parse RAR 1.4's level 5 has,
 /// since the two formats share the coder.
 fn rar15_encode_options_for_level(level: Option<u8>) -> Result<Rar15EncodeOptions> {
@@ -4061,7 +4073,7 @@ impl SolidEncoder {
                 rar15_encode_options_for_level(options.compression_level)?,
             ))),
             ArchiveVersion::Rar20 => Self::Rar20(Unpack20Encoder::with_options(
-                rar20_encode_options_for_options(options)?,
+                rar20_solid_encode_options(options)?,
             )),
             ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40 => {
                 Self::Rar29(Box::new(

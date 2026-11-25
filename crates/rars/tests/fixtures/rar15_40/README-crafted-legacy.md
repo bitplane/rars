@@ -35,3 +35,18 @@ archive-level `MHD_SOLID` and position.
 The second member is 46 packed bytes standing for 2700 unpacked, so extraction
 can only succeed by carrying the window across. The same edit to a RAR 2.0
 archive breaks it, which is where the flag starts being read.
+
+## solid_early_end_rar20.rar
+
+A 284-byte solid RAR 2.0 chain of five stored-name members (`m0.txt` to
+`m4.txt`), with the bitstream written by hand. The first member carries one
+table in which `a`, `b` and `c` take 8-bit codes, repeat-last (256) a 7-bit
+code and distance 3 a code of its own. Each member ends on a byte boundary,
+and `m3.txt` and `m4.txt` are matches copying the output before them.
+
+RAR 2.0 has no end-of-member symbol, so a member stops at its declared size.
+The CLI test raises `m2.txt`'s declared size past its data. Because the member
+ends on a byte boundary, decoding reaches the end of its packed data, with no
+padding bits that could be read as a further symbol. The test checks the
+early-end warning and that every later member still extracts. UnRAR 7.20
+accepts the fixture with the raised size and extracts all five payloads.
