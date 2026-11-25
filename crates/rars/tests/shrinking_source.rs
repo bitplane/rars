@@ -255,6 +255,62 @@ fn check_path(members: &[(&[u8], Vec<u8>)]) {
     }
 }
 
+#[cfg(all(
+    feature = "parallel",
+    not(all(target_arch = "wasm32", target_os = "unknown"))
+))]
+#[test]
+fn extract_large_member_from_a_truncated_path_in_rayon_pools() {
+    // Exceed the 16 MiB buffered decode threshold, with enough variation
+    // to give the streaming decoder multiple 256 KiB packed batches.
+    const SIZE: usize = 24 << 20;
+    let mut expected = Vec::with_capacity(SIZE + 64);
+    let mut state = 1u32;
+    while expected.len() < SIZE {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        writeln!(expected, "record {state:08x} accepted by synthetic worker").unwrap();
+    }
+    expected.truncate(SIZE);
+
+    let dir = scratch::case("shrinking-parallel-source");
+    let path = dir.join("archive.rar");
+    let mut builder = Builder::new(ArchiveVersion::Rar50).compression_level(Some(1));
+    builder
+        .add_bytes(b"large.txt".to_vec(), expected.clone(), None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"later.txt".to_vec(), b"discarded".to_vec(), None, None)
+        .unwrap();
+    builder.write_to_path(&path, None).unwrap();
+    drop(builder);
+
+    let archive = ArchiveReader::read_path(&path).unwrap();
+    let mut files = archive.as_rar50().unwrap().files();
+    let first = files.next().unwrap();
+    assert!(!first.is_stored());
+    assert!(first.block.data_range.len() > 2 * (256 << 10));
+    let packed_end = first.block.data_range.end;
+    assert!(files.next().unwrap().block.data_range.start > packed_end);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_len(packed_end as u64)
+        .unwrap();
+
+    for threads in [1, 2, 8] {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let options = ArchiveReadOptions::new()
+            .with_threads(threads)
+            .with_rar50_decode_workers(threads);
+        let output = pool.install(|| extract(&archive, options, b"large.txt", "truncated path"));
+        assert!(output == expected, "truncated path with {threads} threads");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn thread_bytes_read() -> Option<(u64, u64)> {
     let stats = std::fs::read_to_string("/proc/thread-self/io").ok()?;
