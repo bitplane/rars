@@ -68,6 +68,8 @@ mod member_read;
 mod member_reader;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 pub use member_reader::{MemberReader, MembersIter};
+#[doc(hidden)]
+pub mod output_dir;
 mod output_limit;
 #[doc(hidden)]
 pub mod output_links;
@@ -95,6 +97,8 @@ mod read_control;
 #[doc(hidden)]
 pub mod read_session;
 pub use read_control::ReadCancellation;
+mod extract_dir;
+pub use extract_dir::{extract_volumes_to_dir, ExtractDirOptions, ExtractedDir, SkippedLink};
 mod extraction_control;
 mod extraction_links;
 mod file_times;
@@ -159,6 +163,7 @@ pub use filename::{entry_relative_path, validate_entry_name};
 pub use filter::{
     formats_supporting_filter, FilterKind, FilterPolicy, FilterSpec, UnsupportedFilterKind,
 };
+pub use output_staging::OverwritePolicy;
 #[cfg(any(feature = "write", feature = "recovery"))]
 pub use progress::{WriteOperation, WriteProgress, WriteProgressEvent};
 pub use rar15_40::SkippedBlock;
@@ -1060,7 +1065,8 @@ impl Archive {
     /// format: RAR 5 redirections (Unix and Windows symbolic links, junctions,
     /// hard links and file copies) and RAR 1.5-4.x Unix symbolic links. A
     /// legacy link's payload is still decoded and checked. Use
-    /// [`Self::extract_with_links`] to receive links as well.
+    /// [`Self::extract_with_links`] to receive links as well, or
+    /// [`Self::extract_to_dir`] to extract into a directory.
     ///
     /// Output is not transactional: integrity checks can fail after all bytes of
     /// a member have been written, and decode/filter or sink failures can leave

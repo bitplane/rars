@@ -175,9 +175,12 @@ pub fn refused_output(error: Error, name: &[u8]) -> Error {
     }
 }
 
+/// What extraction into a directory does with a file already at a destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OverwritePolicy {
+    /// Refuses it with an [`std::io::ErrorKind::AlreadyExists`] error.
     Never,
+    /// Replaces it.
     Always,
     /// Writes beside what is there as `name(N).ext`, keeping both.
     Rename,
