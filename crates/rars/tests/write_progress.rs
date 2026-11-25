@@ -278,7 +278,10 @@ fn cancellation_interrupts_encrypted_volume_preparation() {
     struct NoVolumes;
     impl rar50::VolumeSink for NoVolumes {
         fn start_volume(&mut self, _: u64) -> rars::Result<Box<dyn rar50::VolumeOutput>> {
-            panic!("cancelled encryption must not publish a volume");
+            Ok(Box::new(Cursor::new(Vec::new())))
+        }
+        fn finish_volume(&mut self, _: u64, _: u64) -> rars::Result<()> {
+            panic!("cancelled encryption must not finish a volume");
         }
     }
     let scratch = scratch::case("cancel-volume-encryption");
@@ -292,7 +295,8 @@ fn cancellation_interrupts_encrypted_volume_preparation() {
         EntrySource::from_opener(256 * 1024, move || {
             Ok(Box::new(Input {
                 data: Cursor::new(vec![b'a'; 256 * 1024]),
-                // Stored, the member is first opened to be encrypted.
+                // Stored, the member is first opened to be encrypted into
+                // its first volume.
                 cancel: (opens.fetch_add(1, Ordering::Relaxed) == 0).then(|| cancel.clone()),
             }))
         }),
@@ -443,13 +447,17 @@ fn cancellation_on_final_compression_update_prevents_archive_and_volume_emission
                 assert_eq!(result, Err(Error::Cancelled));
                 assert!(reporter.member_finished.load(Ordering::Relaxed));
                 assert!(reporter.cancelled.load(Ordering::Relaxed));
-                // A single archive writes its member as it finishes, ahead of
-                // the final update, but is never closed.
+                // The member is written as it finishes, ahead of the final
+                // update, but the archive or its volume is never closed.
                 const END_OF_ARCHIVE: [u8; 8] = [0x1d, 0x77, 0x56, 0x51, 0x03, 0x05, 0x04, 0x00];
-                assert_eq!(reporter.emitted.load(Ordering::Relaxed), !volumes);
+                assert!(reporter.emitted.load(Ordering::Relaxed));
                 assert_eq!(output.is_empty(), volumes);
                 assert!(!output.ends_with(&END_OF_ARCHIVE));
-                assert!(sink.take().is_empty());
+                let started = sink.take();
+                assert_eq!(started.len(), usize::from(volumes));
+                assert!(started
+                    .iter()
+                    .all(|volume| !volume.ends_with(&END_OF_ARCHIVE)));
                 assert_eq!(resources.managed_memory_in_use(), 0);
                 assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
             }

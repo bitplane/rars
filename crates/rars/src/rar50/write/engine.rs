@@ -2304,6 +2304,167 @@ enum FragmentSource {
         /// once, front to back, whatever volumes it is cut across.
         reader: Option<Box<dyn crate::EntryReader>>,
     },
+    Encrypted(Box<Enciphered>),
+}
+
+/// A member encrypted as its fragments are written. The cipher runs as one
+/// chain over the member, so its plaintext is read once, front to back, and
+/// ciphertext past the end of one fragment waits for the next.
+struct Enciphered {
+    plain: FragmentSource,
+    plain_len: u64,
+    plain_read: u64,
+    /// Taken once the plaintext runs out and the final block is padded.
+    cipher: Option<OutgoingCipher>,
+    /// MACs the checksums of a member hashed on its copy.
+    keys: Rar50Keys,
+    pending: Bytes,
+    pending_len: usize,
+    pending_at: usize,
+}
+
+impl Enciphered {
+    const PLAIN_CHUNK: u64 = 64 * 1024;
+
+    fn new(
+        plain: FragmentSource,
+        plain_len: u64,
+        keys: Rar50Keys,
+        iv: [u8; 16],
+        resources: &WriterResources,
+    ) -> Result<Self> {
+        Ok(Self {
+            plain,
+            plain_len,
+            plain_read: 0,
+            cipher: Some(OutgoingCipher::new(&keys, iv, resources)?),
+            keys,
+            // A chunk, the partial block the cipher holds back before it, and
+            // the final padding after it.
+            pending: Bytes::zeroed(Self::PLAIN_CHUNK as usize + 32, resources)?,
+            pending_len: 0,
+            pending_at: 0,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_range(
+        &mut self,
+        start: u64,
+        len: u64,
+        output: &mut dyn Write,
+        want_checksums: bool,
+        blake2sp: bool,
+        resources: &WriterResources,
+        copy_work: Option<&WorkTracker<'_>>,
+    ) -> Result<Emitted> {
+        let mut fragment = want_checksums.then(|| ChecksumSink::new(blake2sp));
+        let mut output = Tee {
+            output,
+            mirror: fragment.as_mut().map(|sink| sink as &mut dyn Write),
+        };
+        let mut member = None;
+        let mut left = len;
+        // The last fragment runs the cipher to its end, so even an empty
+        // member has its copy closed and checked.
+        let last = start + len == padded_to_cipher_block(self.plain_len)?;
+        loop {
+            let take = left.min((self.pending_len - self.pending_at) as u64) as usize;
+            output.write_all(&self.pending[self.pending_at..self.pending_at + take])?;
+            self.pending_at += take;
+            left -= take as u64;
+            if left == 0 && !(last && self.cipher.is_some()) {
+                break;
+            }
+            let Some(cipher) = self.cipher.as_mut() else {
+                return Err(Error::WriterFailure(
+                    "RAR 5 encrypted member ran out of ciphertext",
+                ));
+            };
+            self.pending_len = 0;
+            self.pending_at = 0;
+            let chunk = (self.plain_len - self.plain_read).min(Self::PLAIN_CHUNK);
+            let emitted = self.plain.emit_range(
+                self.plain_read,
+                chunk,
+                &mut EncryptingInto {
+                    cipher,
+                    pending: PendingFill {
+                        buffer: &mut self.pending,
+                        len: &mut self.pending_len,
+                    },
+                },
+                false,
+                blake2sp,
+                resources,
+                copy_work,
+            )?;
+            self.plain_read += chunk;
+            if let Some(copied) = emitted.member {
+                member = Some(FragmentChecksums {
+                    crc32: self.keys.checked_crc_mac(copied.crc32)?,
+                    hash: copied
+                        .hash
+                        .map(|hash| self.keys.checked_hash_mac(hash))
+                        .transpose()?,
+                });
+            }
+            if self.plain_read == self.plain_len {
+                if let Some(cipher) = self.cipher.take() {
+                    cipher.finish(&mut PendingFill {
+                        buffer: &mut self.pending,
+                        len: &mut self.pending_len,
+                    })?;
+                }
+            }
+        }
+        Ok(Emitted {
+            fragment: fragment.map(FragmentChecksums::from),
+            member,
+        })
+    }
+}
+
+/// Encrypts the plaintext written to it into the pending ciphertext.
+struct EncryptingInto<'a> {
+    cipher: &'a mut OutgoingCipher,
+    pending: PendingFill<'a>,
+}
+
+impl Write for EncryptingInto<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.cipher
+            .write(bytes, &mut self.pending)
+            .map_err(std::io::Error::other)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct PendingFill<'a> {
+    buffer: &'a mut Bytes,
+    len: &'a mut usize,
+}
+
+impl Write for PendingFill<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let end = *self.len + bytes.len();
+        let Some(room) = self.buffer.get_mut(*self.len..end) else {
+            return Err(std::io::Error::other(
+                "RAR 5 pending ciphertext outgrew its buffer",
+            ));
+        };
+        room.copy_from_slice(bytes);
+        *self.len = end;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// What copying a fragment learnt about the bytes copied.
@@ -2318,7 +2479,11 @@ impl FragmentSource {
     /// Whether the member is read from its source as it is cut into volumes,
     /// and hashed then.
     fn hashed_on_copy(&self) -> bool {
-        matches!(self, Self::Stored { prepared, .. } if prepared.hashed_on_copy)
+        match self {
+            Self::Packed(_) => false,
+            Self::Stored { prepared, .. } => prepared.hashed_on_copy,
+            Self::Encrypted(enciphered) => enciphered.plain.hashed_on_copy(),
+        }
     }
 
     /// Copies a fragment's bytes to `output`, returning their checksums when
@@ -2335,9 +2500,21 @@ impl FragmentSource {
         resources: &WriterResources,
         copy_work: Option<&WorkTracker<'_>>,
     ) -> Result<Emitted> {
+        if let Self::Encrypted(enciphered) = self {
+            return enciphered.emit_range(
+                start,
+                len,
+                output,
+                want_checksums,
+                blake2sp,
+                resources,
+                copy_work,
+            );
+        }
         let mut fragment = want_checksums.then(|| ChecksumSink::new(blake2sp));
         let mut member = None;
         match self {
+            Self::Encrypted(_) => unreachable!("encrypted members are cut above"),
             Self::Packed(spool) => {
                 spool.copy_range_to(
                     start,
@@ -2532,6 +2709,20 @@ pub(super) fn write_volumes<'a>(
         None
     };
 
+    // Every member's salt and IV are drawn before any volume header's, so a
+    // set draws its entropy in one order however its members and volumes
+    // interleave.
+    let mut member_ivs = Records::new(entries.len(), resources)?;
+    for entry in entries {
+        member_ivs.push(match entry.password.as_deref() {
+            Some(password) => {
+                write_keys.for_password(password)?;
+                Some(fresh_iv()?)
+            }
+            None => None,
+        })?;
+    }
+
     let mut sources = Records::new(entries.len(), resources)?;
     for entry in entries {
         sources.push(entry.source.clone())?;
@@ -2551,74 +2742,11 @@ pub(super) fn write_volumes<'a>(
         crate::WriteOperation::Compression,
         total_input,
     );
-    // A stored member is not read until it is copied, and is hashed then: a
-    // fragment's header is patched after its bytes in every volume, so the
-    // last one can take the member's checksums from the copy.
-    let mut compressed = Records::new(entries.len(), resources)?;
-    compress::compress_members_in_order(
-        &sources,
-        &plan.compress,
-        resources,
-        &MemberProgress {
-            entries,
-            work: &work,
-        },
-        &|index, error| member_error(error, &entries[index].name, "compressing"),
-        true,
-        &|_, _| false,
-        &mut |_, handed| match handed {
-            Handed::Member(member) => compressed.push(member),
-            _ => unreachable!("no member goes out straight"),
-        },
-    )?;
-    if !work.finish() {
-        return Err(Error::Cancelled);
-    }
-    if let Some(progress) = plan.progress {
-        progress.report(crate::WriteProgressEvent::OperationFinished {
-            operation: crate::WriteOperation::Compression,
-            total_bytes: Some(total_input),
-            total_entries: Some(total_entries),
-            pass: 1,
-        });
-    }
-
-    report_emission(plan.progress, true);
-    // A set of stored members is read as it is copied, or encrypted, which
-    // compression skipped, so that is the progress it reports.
+    // A set of stored members is read as it is cut into volumes, which
+    // compression skipped, so that is the progress it reports, with an entry
+    // for each member hashed on its copy.
     let copy_work = (plan.compress.method == 0)
         .then(|| WorkTracker::new(plan.progress, crate::WriteOperation::Emission, total_input));
-    // Each member hashed on its copy is reported as an entry where it is read:
-    // as it is encrypted, or else as it is cut into volumes.
-    let copied = |index: usize, read_here: bool| {
-        copy_work
-            .as_ref()
-            .filter(|_| read_here)
-            .map(|work| (work, index, &entries[index].name, entries.len()))
-    };
-    let mut members = Records::new(entries.len(), resources)?;
-    for (index, (entry, member)) in entries.iter().zip(compressed).enumerate() {
-        check_cancelled(plan.progress)?;
-        let size = member.input_size;
-        let reported = copied(index, member.checksums_pending && entry.password.is_some());
-        if let Some((work, index, name, total)) = reported {
-            work.entry_started(index, total, name, size);
-        }
-        members.push(
-            prepare_volume_member(
-                entry,
-                member,
-                &plan,
-                &mut write_keys,
-                resources,
-                copy_work.as_ref(),
-            )
-            .map_err(|error| member_error(error, &entry.name, "preparing volume payload"))?,
-        )?;
-        if let Some((work, index, name, total)) = reported {
-            work.entry_finished(index, total, name, size);
-        }
-    }
 
     let mut writer = VolumeWriter {
         volume_size,
@@ -2639,18 +2767,67 @@ pub(super) fn write_volumes<'a>(
         trailing_len: 0,
     };
 
-    for (index, mut member) in members.into_iter().enumerate() {
-        let size = member.unpacked_size;
-        let reported = copied(index, member.source.hashed_on_copy());
-        if let Some((work, index, name, total)) = reported {
-            work.entry_started(index, total, name, size);
-        }
-        writer
-            .write_member(&mut member)
-            .map_err(|error| member_error(error, member.name, "writing volume member"))?;
-        if let Some((work, index, name, total)) = reported {
-            work.entry_finished(index, total, name, size);
-        }
+    // Members go into the volumes in order as their windows finish. A stored
+    // member is not read until it is copied, and is hashed then: a fragment's
+    // header is patched after its bytes in every volume, so the last one can
+    // take the member's checksums from the copy.
+    let mut emitting = false;
+    compress::compress_members_in_order(
+        &sources,
+        &plan.compress,
+        resources,
+        &MemberProgress {
+            entries,
+            work: &work,
+        },
+        &|index, error| member_error(error, &entries[index].name, "compressing"),
+        true,
+        &|_, _| false,
+        &mut |index, handed| {
+            let Handed::Member(member) = handed else {
+                unreachable!("no member goes out straight")
+            };
+            check_cancelled(plan.progress)?;
+            if !emitting {
+                report_emission(plan.progress, true);
+                emitting = true;
+            }
+            let entry = &entries[index];
+            let size = member.input_size;
+            let mut member = prepare_volume_member(
+                entry,
+                member,
+                member_ivs[index],
+                &plan,
+                &mut write_keys,
+                resources,
+            )
+            .map_err(|error| member_error(error, &entry.name, "preparing volume payload"))?;
+            let reported = copy_work
+                .as_ref()
+                .filter(|_| member.source.hashed_on_copy());
+            if let Some(work) = reported {
+                work.entry_started(index, entries.len(), &entry.name, size);
+            }
+            writer
+                .write_member(&mut member)
+                .map_err(|error| member_error(error, member.name, "writing volume member"))?;
+            if let Some(work) = reported {
+                work.entry_finished(index, entries.len(), &entry.name, size);
+            }
+            Ok(())
+        },
+    )?;
+    if !work.finish() {
+        return Err(Error::Cancelled);
+    }
+    if let Some(progress) = plan.progress {
+        progress.report(crate::WriteProgressEvent::OperationFinished {
+            operation: crate::WriteOperation::Compression,
+            total_bytes: Some(total_input),
+            total_entries: Some(total_entries),
+            pass: 1,
+        });
     }
     writer.finish()?;
     check_cancelled(plan.progress)?;
@@ -2658,116 +2835,65 @@ pub(super) fn write_volumes<'a>(
     Ok(())
 }
 
-/// Compresses and, if needed, encrypts one member into a form that can be cut
-/// at any byte boundary.
+/// Turns one compressed member into a form that can be cut at any byte
+/// boundary. An encrypted member is encrypted as its fragments are written.
 fn prepare_volume_member<'a>(
     entry: &'a ArchiveEntry,
     member: CompressedMember,
+    iv: Option<[u8; 16]>,
     plan: &EnginePlan<'_>,
     write_keys: &mut WriteKeys<'a>,
     resources: &WriterResources,
-    copy_work: Option<&WorkTracker<'_>>,
 ) -> Result<VolumeMember<'a>> {
-    let progress = plan.progress;
-    check_cancelled(progress)?;
+    check_cancelled(plan.progress)?;
     let compression_info = compress::member_compression_info(&plan.compress, &member)?;
     let plain_len = if member.store {
         member.input_size
     } else {
         member.packed.len()
     };
-
-    match entry.password.as_deref() {
-        Some(password) => {
-            let (salt, keys) = write_keys.for_password(password)?;
-            let iv = fresh_iv()?;
-
-            // A volume boundary can fall anywhere, and the cipher runs as one
-            // chain over the member, so encrypt it up front into scratch
-            // storage and slice the ciphertext.
-            let mut encrypted = Spool::create(resources)?;
-            const ENCRYPT_CHUNK: usize = 64 * 1024;
-            let _permit = resources.acquire_cancellable(ENCRYPT_CHUNK as u64, 0, &|| {
-                progress.is_some_and(ProgressReporter::is_cancelled)
-            })?;
-            let (mut crc32, mut hash) = (member.crc32, member.hash);
-            if member.store {
-                let hashed_on_copy = member.checksums_pending;
-                let source = PreparedSource::new(&entry.source, &member, hashed_on_copy);
-                let mut reader = source.open(copy_work.filter(|_| hashed_on_copy))?;
-                encrypt_reader_to(
-                    &mut reader,
-                    plain_len,
-                    &mut encrypted,
-                    &keys,
-                    iv,
-                    ENCRYPT_CHUNK,
-                    progress,
-                    resources,
-                )
-                .map_err(|error| short_copy_error(hashed_on_copy, error))?;
-                // The member is hashed as it is encrypted, if it was not before.
-                if let Some(copied) = reader.finish(&source, source.len)? {
-                    (crc32, hash) = copied.finish();
-                }
-            } else {
-                let mut packed = member.packed;
-                packed.rewind()?;
-                encrypt_reader_to(
-                    &mut packed,
-                    plain_len,
-                    &mut encrypted,
-                    &keys,
-                    iv,
-                    ENCRYPT_CHUNK,
-                    progress,
-                    resources,
-                )?;
-            }
-            let payload_len = encrypted.len();
-            encrypted.park();
-            Ok(VolumeMember {
-                name: &entry.name,
-                is_directory: entry.is_directory,
-                mtime: entry.mtime,
-                mtime_nanoseconds: entry.mtime_nanoseconds,
-                file_times: entry.file_times,
-                attributes: entry.attributes,
-                host_os: entry.host_os,
-                unpacked_size: member.input_size,
-                crc32: keys.checked_crc_mac(crc32)?,
-                hash: hash.map(|hash| keys.checked_hash_mac(hash)).transpose()?,
-                compression_info,
-                payload_len,
-                source: FragmentSource::Packed(encrypted),
-                encryption: Some((salt, iv, keys.checked_password_record()?)),
-            })
+    let (crc32, hash) = (member.crc32, member.hash);
+    let plain = if member.store {
+        FragmentSource::Stored {
+            emitted: Owned::new(ChecksumSink::new(member.hash.is_some()), resources)?,
+            prepared: PreparedSource::new(&entry.source, &member, member.checksums_pending),
+            reader: None,
         }
-        None => Ok(VolumeMember {
-            name: &entry.name,
-            is_directory: entry.is_directory,
-            mtime: entry.mtime,
-            mtime_nanoseconds: entry.mtime_nanoseconds,
-            file_times: entry.file_times,
-            attributes: entry.attributes,
-            host_os: entry.host_os,
-            unpacked_size: member.input_size,
-            crc32: member.crc32,
-            hash: member.hash,
-            compression_info,
-            payload_len: plain_len,
-            source: if member.store {
-                FragmentSource::Stored {
-                    emitted: Owned::new(ChecksumSink::new(member.hash.is_some()), resources)?,
-                    prepared: PreparedSource::new(&entry.source, &member, member.checksums_pending),
-                    reader: None,
-                }
-            } else {
-                FragmentSource::Packed(member.packed)
-            },
-            encryption: None,
-        }),
+    } else {
+        FragmentSource::Packed(member.packed)
+    };
+    let mut volume_member = VolumeMember {
+        name: &entry.name,
+        is_directory: entry.is_directory,
+        mtime: entry.mtime,
+        mtime_nanoseconds: entry.mtime_nanoseconds,
+        file_times: entry.file_times,
+        attributes: entry.attributes,
+        host_os: entry.host_os,
+        unpacked_size: member.input_size,
+        crc32,
+        hash,
+        compression_info,
+        payload_len: plain_len,
+        source: plain,
+        encryption: None,
+    };
+    if let Some(password) = entry.password.as_deref() {
+        let (salt, keys) = write_keys.for_password(password)?;
+        let iv = iv.expect("an IV is drawn for every member with a password");
+        volume_member.crc32 = keys.checked_crc_mac(crc32)?;
+        volume_member.hash = hash.map(|hash| keys.checked_hash_mac(hash)).transpose()?;
+        volume_member.payload_len = padded_to_cipher_block(plain_len)?;
+        volume_member.encryption = Some((salt, iv, keys.checked_password_record()?));
+        volume_member.source = FragmentSource::Encrypted(Box::new(Enciphered::new(
+            volume_member.source,
+            plain_len,
+            keys,
+            iv,
+            resources,
+        )?));
     }
+    Ok(volume_member)
 }
 
 /// Where the body of the volume being filled goes.
@@ -3972,7 +4098,11 @@ mod emission_ledger_tests {
                     let mut sink = super::super::CollectedVolumes::new();
                     let error =
                         write_volumes(&entries, settings, 1024, &mut sink, &resources).unwrap_err();
-                    assert!(sink.take().is_empty());
+                    // The member went out as it finished; its volume was
+                    // never closed.
+                    let started = sink.take();
+                    assert_eq!(started.len(), usize::from(!empty));
+                    assert!(started.iter().all(|volume| !volume.is_empty()));
                     error
                 } else {
                     let mut output = Vec::new();
@@ -3998,8 +4128,7 @@ mod emission_ledger_tests {
                 assert!(progress.armed.load(Ordering::Relaxed));
                 assert!(progress.cancelled.load(Ordering::Relaxed));
                 assert!(!progress.finished.load(Ordering::Relaxed));
-                let wrote_member = !volumes && !empty;
-                assert_eq!(progress.emitted.load(Ordering::Relaxed), wrote_member);
+                assert_eq!(progress.emitted.load(Ordering::Relaxed), !empty);
                 assert_eq!(resources.workspace_in_use(), 0);
                 assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
             }
@@ -5115,49 +5244,12 @@ mod emission_ledger_tests {
         assert_eq!(error.kind(), crate::ErrorKind::Io);
         assert_eq!(
             error.entry_context(),
-            Some((b"payload".as_slice(), "preparing volume payload"))
+            Some((b"payload".as_slice(), "writing volume member"))
         );
-        // Stored, the member is read once, as it is encrypted.
+        // Stored, the member is read once, as it is encrypted into its volumes.
         assert_eq!(opens.load(Ordering::Relaxed), 1);
-        assert!(volumes.take().is_empty());
-    }
-
-    #[test]
-    #[cfg(feature = "encryption")]
-    fn encrypted_compressed_volume_payload_propagates_spool_refusal() {
-        let scratch = crate::scratch::case("encrypted-volume-spool-refusal");
-        let resources = WriterResources::default().with_temp_dir(&*scratch);
-        let entry = ArchiveEntry::new(
-            b"payload".to_vec(),
-            crate::EntrySource::from_bytes(vec![b'A'; 64 * 1024]),
-        )
-        .with_password(b"secret");
-        let mut settings = plan(false);
-        settings.compress.method = 1;
-        settings.recovery_percent = None;
-        let member = compress::compress_members_reporting(
-            std::slice::from_ref(&entry.source),
-            settings.compress.clone(),
-            &resources,
-            &|_| true,
-        )
-        .unwrap()
-        .remove(0);
-        assert!(!member.store);
-
-        let constrained = resources.clone().with_max_spool_bytes(0);
-        let error = prepare_volume_member(
-            &entry,
-            member,
-            &settings,
-            &mut WriteKeys::default(),
-            &constrained,
-            None,
-        )
-        .err()
-        .expect("encrypted ciphertext must be charged to its spool");
-        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
-        assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        // The volume it was going into is left unfinished.
+        assert_eq!(volumes.take().len(), 1);
     }
 }
 
