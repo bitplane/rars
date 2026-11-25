@@ -93,12 +93,24 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     /// What [`MatchFinder::for_reach`] allocates for this window and reach.
     #[cfg(feature = "write")]
     pub(crate) fn bytes_for_reach(window: usize, reach: usize) -> u64 {
+        Self::bytes_with_hash_bits(window, Self::reach_hash_bits(reach))
+    }
+
+    #[cfg(feature = "write")]
+    pub(crate) fn bytes_for_window(window: usize) -> u64 {
+        Self::bytes_with_hash_bits(window, Self::HASH_BITS)
+    }
+
+    #[cfg(feature = "write")]
+    fn bytes_with_hash_bits(window: usize, hash_bits: u32) -> u64 {
         let links = window
             .max(1)
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX) as u64;
-        let heads = 1u64 << Self::reach_hash_bits(reach);
-        links.saturating_add(heads).saturating_mul(4)
+        let heads = 1u64 << hash_bits;
+        links
+            .saturating_add(heads)
+            .saturating_mul(size_of::<u32>() as u64)
     }
 
     /// The most heads [`MatchFinder::for_reach`] hangs chains off, as bits.

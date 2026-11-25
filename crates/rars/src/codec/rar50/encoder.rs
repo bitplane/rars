@@ -1760,6 +1760,33 @@ fn finder_window(options: EncodeOptions, reach: usize) -> usize {
     options.max_match_distance.min(reach).max(LZ_BLOCK_SIZE)
 }
 
+/// Chain links and heads, one block of tokens, Huffman tables and the payload.
+/// The framed block copies the payload after the tokens have been released.
+pub(crate) fn lazy_parse_workspace(options: EncodeOptions, window: usize, block: usize) -> u64 {
+    let finder = finder_window(options, window);
+    let tokens = block.max(4).next_power_of_two() as u64 * size_of::<LazyToken>() as u64;
+    let symbols = MAIN_TABLE_SIZE + DISTANCE_TABLE_SIZE_70 + ALIGN_TABLE_SIZE + LENGTH_TABLE_SIZE;
+    let tables = symbols as u64
+        * (size_of::<usize>()
+            + size_of::<u8>()
+            + size_of::<(u16, u8)>()
+            + size_of::<LevelToken>()
+            + 3 * size_of::<usize>()) as u64;
+    // Fifteen bits per literal, or at least four bytes per match. A match of
+    // up to nine bytes has no length extras. Longer matches amortize them.
+    let (distance_slot, _) = distance_slot_for_valid_match(options.max_match_distance.max(1));
+    let distance_bits = distance_slot_bit_count_valid(distance_slot) as u64;
+    let bits_per_byte = 15u64.max((3 * 15 + distance_bits.saturating_sub(4)).div_ceil(4));
+    let payload = (block as u64 * bits_per_byte).div_ceil(8);
+    Rar50MatchFinder::bytes_for_window(finder)
+        .saturating_add(tables)
+        .saturating_add(
+            tokens
+                .saturating_add(payload)
+                .max(payload.saturating_mul(2)),
+        )
+}
+
 /// A finder for the whole member, seeded with the history it carries in. It
 /// keeps growing as the blocks are parsed, so it is sized to the widest window
 /// the member could ever want rather than to any one block.
@@ -2487,7 +2514,34 @@ fn encode_lz_block_with_allowance<B: Budget>(
             ))
         }
     };
-    let mut tokens = encode_tokens_with_allowance(
+    if !options.optimal_parse {
+        let tokens = lazy_tokens::<B, LazyToken>(
+            combined,
+            block,
+            search,
+            options,
+            distance_size,
+            progress,
+            allowance,
+        )?;
+        let payload = encode_token_payload(
+            tokens.iter().copied().map(LazyToken::decode),
+            initial_filters,
+            algorithm_version,
+            distance_size,
+            allowance,
+        )?;
+        drop(tokens);
+        return encode_compressed_block_with_allowance(
+            &payload.bytes,
+            payload.bit_pos,
+            true,
+            is_last,
+            allowance,
+        );
+    }
+
+    let mut tokens = encode_optimal_tokens(
         combined,
         block,
         search,
@@ -2533,7 +2587,30 @@ fn encode_token_block_with_allowance<B: Budget>(
     is_last: bool,
     allowance: &B,
 ) -> Result<Buffer<u8, B>> {
-    let lengths = table_lengths_with_allowance(tokens, &[], distance_size, allowance)?;
+    let payload = encode_token_payload(
+        tokens.iter().copied(),
+        &[],
+        algorithm_version,
+        distance_size,
+        allowance,
+    )?;
+    encode_compressed_block_with_allowance(
+        &payload.bytes,
+        payload.bit_pos,
+        true,
+        is_last,
+        allowance,
+    )
+}
+
+fn encode_token_payload<B: Budget>(
+    tokens: impl Iterator<Item = EncodeToken> + Clone,
+    filters: &[EncodeFilter],
+    algorithm_version: u8,
+    distance_size: usize,
+    allowance: &B,
+) -> Result<BitWriter<B>> {
+    let lengths = table_lengths_for_stream(tokens.clone(), filters, distance_size, allowance)?;
 
     let main_table = EncoderCodeTable::from_lengths(&lengths.main, allowance)?;
     let distance_table = EncoderCodeTable::from_lengths(&lengths.distance, allowance)?;
@@ -2541,8 +2618,13 @@ fn encode_token_block_with_allowance<B: Budget>(
     let length_table = EncoderCodeTable::from_lengths(&lengths.length, allowance)?;
     let (table_data, table_bits) =
         encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
-    let payload_bits =
-        token_stream_bits_after_tables(tokens, &[], &lengths, distance_size, table_bits)?;
+    let payload_bits = token_stream_bits_after_tables(
+        tokens.clone(),
+        filters,
+        &lengths,
+        distance_size,
+        table_bits,
+    )?;
     let mut writer = BitWriter {
         bytes: table_data,
         bit_pos: table_bits,
@@ -2551,7 +2633,12 @@ fn encode_token_block_with_allowance<B: Budget>(
         .bytes
         .reserve_total_capacity(payload_bits.div_ceil(8))?;
     let mut state = EncoderMatchState::default();
-    for &token in tokens {
+    for token in filters
+        .iter()
+        .copied()
+        .map(EncodeToken::Filter)
+        .chain(tokens)
+    {
         match token {
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_present_symbol(256);
@@ -2622,7 +2709,7 @@ fn encode_token_block_with_allowance<B: Budget>(
     }
 
     debug_assert_eq!(writer.bit_pos, payload_bits);
-    encode_compressed_block_with_allowance(&writer.bytes, payload_bits, true, is_last, allowance)
+    Ok(writer)
 }
 
 #[derive(Debug)]
@@ -2761,6 +2848,42 @@ enum EncodeToken {
     Filter(EncodeFilter),
     Literal(u8),
     Match { length: usize, distance: usize },
+}
+
+/// A lazy token is a literal when its distance is zero. Match lengths need
+/// thirteen bits, leaving room for every distance the RAR 7 encoder accepts.
+#[derive(Clone, Copy)]
+struct LazyToken(u64);
+
+impl LazyToken {
+    const LENGTH_BITS: u32 = MAX_ENCODER_MATCH_LENGTH.ilog2() + 1;
+    const LENGTH_MASK: u64 = (1 << Self::LENGTH_BITS) - 1;
+
+    fn decode(self) -> EncodeToken {
+        let distance = (self.0 >> Self::LENGTH_BITS) as usize;
+        if distance == 0 {
+            EncodeToken::Literal(self.0 as u8)
+        } else {
+            EncodeToken::Match {
+                length: (self.0 & Self::LENGTH_MASK) as usize,
+                distance,
+            }
+        }
+    }
+}
+
+impl From<EncodeToken> for LazyToken {
+    fn from(token: EncodeToken) -> Self {
+        match token {
+            EncodeToken::Literal(byte) => Self(u64::from(byte)),
+            EncodeToken::Match { length, distance } => {
+                debug_assert!((distance as u64) <= (u64::MAX >> Self::LENGTH_BITS));
+                debug_assert!((length as u64) <= Self::LENGTH_MASK);
+                Self(((distance as u64) << Self::LENGTH_BITS) | length as u64)
+            }
+            EncodeToken::Filter(_) => unreachable!("filters are stored separately"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2911,6 +3034,15 @@ fn table_lengths_with_allowance<B: Budget>(
     distance_size: usize,
     allowance: &B,
 ) -> Result<OwnedLengths<B>> {
+    table_lengths_for_stream(tokens.iter().copied(), filters, distance_size, allowance)
+}
+
+fn table_lengths_for_stream<B: Budget>(
+    tokens: impl Iterator<Item = EncodeToken>,
+    filters: &[EncodeFilter],
+    distance_size: usize,
+    allowance: &B,
+) -> Result<OwnedLengths<B>> {
     let mut main_frequencies = Buffer::filled(MAIN_TABLE_SIZE, 0usize, allowance)?;
     main_frequencies[256] = filters.len();
     let mut distance_frequencies = Buffer::filled(distance_size, 0usize, allowance)?;
@@ -2918,7 +3050,7 @@ fn table_lengths_with_allowance<B: Budget>(
     let mut length_frequencies = Buffer::filled(LENGTH_TABLE_SIZE, 0usize, allowance)?;
     let mut state = EncoderMatchState::default();
     for token in tokens {
-        match *token {
+        match token {
             EncodeToken::Filter(_) => main_frequencies[256] += 1,
             EncodeToken::Literal(byte) => main_frequencies[byte as usize] += 1,
             EncodeToken::Match { length, distance } => {
@@ -2972,11 +3104,17 @@ fn token_stream_bits<B: Budget>(
     };
     let allowance = lengths.main.allowance();
     let (_, bits) = encode_table_slices(lengths.slices(), version, &allowance)?;
-    token_stream_bits_after_tables(tokens, filters, lengths, distance_size, bits)
+    token_stream_bits_after_tables(
+        tokens.iter().copied(),
+        filters,
+        lengths,
+        distance_size,
+        bits,
+    )
 }
 
 fn token_stream_bits_after_tables<B: Budget>(
-    tokens: &[EncodeToken],
+    tokens: impl Iterator<Item = EncodeToken>,
     filters: &[EncodeFilter],
     lengths: &OwnedLengths<B>,
     distance_size: usize,
@@ -2991,7 +3129,7 @@ fn token_stream_bits_after_tables<B: Budget>(
         .iter()
         .copied()
         .map(EncodeToken::Filter)
-        .chain(tokens.iter().copied())
+        .chain(tokens)
     {
         match token {
             EncodeToken::Literal(byte) => bits += prices.literal(byte),
@@ -3757,6 +3895,7 @@ fn encode_tokens_with_progress(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn encode_tokens_with_allowance<B: Budget>(
     combined: &[u8],
@@ -3765,38 +3904,81 @@ fn encode_tokens_with_allowance<B: Budget>(
     options: EncodeOptions,
     distance_size: usize,
     initial_filters: &[EncodeFilter],
-    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
     allowance: &B,
 ) -> Result<Buffer<EncodeToken, B>> {
-    let start = block.start;
-    let end = block.end;
     if options.optimal_parse {
-        let matches = match search {
-            MemberSearch::Optimal(collector) => {
-                collector.collect(combined, block.clone(), options)?
-            }
-            _ => {
-                // A fresh index has no continuation once this block's matches
-                // are collected. Drop it before allocating pricing workspace.
-                let mut own =
-                    OptimalCollector::with_allowance(combined, start, options, allowance)?;
-                own.collect(combined, block.clone(), options)?
-            }
-        };
-        let tokens = optimal_tokens_for_matches(
+        encode_optimal_tokens(
             combined,
             block,
+            search,
             options,
             distance_size,
             initial_filters,
-            &matches,
+            progress,
             allowance,
-        )?;
-        if progress.is_some_and(|report| !report(end - start)) {
-            return Err(Error::Cancelled);
-        }
-        return Ok(tokens);
+        )
+    } else {
+        lazy_tokens::<B, EncodeToken>(
+            combined,
+            block,
+            search,
+            options,
+            distance_size,
+            progress,
+            allowance,
+        )
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_optimal_tokens<B: Budget>(
+    combined: &[u8],
+    block: std::ops::Range<usize>,
+    search: MemberSearch<'_, B>,
+    options: EncodeOptions,
+    distance_size: usize,
+    initial_filters: &[EncodeFilter],
+    progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<EncodeToken, B>> {
+    let block_len = block.len();
+    let matches = match search {
+        MemberSearch::Optimal(collector) => collector.collect(combined, block.clone(), options)?,
+        _ => {
+            // A fresh index has no continuation once this block's matches
+            // are collected. Drop it before allocating pricing workspace.
+            let mut own =
+                OptimalCollector::with_allowance(combined, block.start, options, allowance)?;
+            own.collect(combined, block.clone(), options)?
+        }
+    };
+    let tokens = optimal_tokens_for_matches(
+        combined,
+        block,
+        options,
+        distance_size,
+        initial_filters,
+        &matches,
+        allowance,
+    )?;
+    if progress.is_some_and(|report| !report(block_len)) {
+        return Err(Error::Cancelled);
+    }
+    Ok(tokens)
+}
+
+fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
+    combined: &[u8],
+    block: Range<usize>,
+    search: MemberSearch<'_, B>,
+    options: EncodeOptions,
+    distance_size: usize,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<T, B>> {
+    let start = block.start;
+    let end = block.end;
 
     let mut own;
     let finder = match search {
@@ -3828,7 +4010,7 @@ fn encode_tokens_with_allowance<B: Budget>(
             );
             if emit_literal {
                 tokens
-                    .push(EncodeToken::Literal(combined[pos]))
+                    .push(T::from(EncodeToken::Literal(combined[pos])))
                     .map_err(Into::into)?;
                 finder.insert(combined, pos);
                 pos += 1;
@@ -3839,7 +4021,7 @@ fn encode_tokens_with_allowance<B: Budget>(
                 length, distance, ..
             } = candidate;
             tokens
-                .push(EncodeToken::Match { length, distance })
+                .push(T::from(EncodeToken::Match { length, distance }))
                 .map_err(Into::into)?;
             state.remember(length, distance);
             for history_pos in pos..pos + length {
@@ -3848,7 +4030,7 @@ fn encode_tokens_with_allowance<B: Budget>(
             pos += length;
         } else {
             tokens
-                .push(EncodeToken::Literal(combined[pos]))
+                .push(T::from(EncodeToken::Literal(combined[pos])))
                 .map_err(Into::into)?;
             finder.insert(combined, pos);
             pos += 1;

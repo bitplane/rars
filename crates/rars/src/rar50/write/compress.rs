@@ -3948,11 +3948,7 @@ mod tests {
                 candidates: vec![options].into(),
                 blake2sp: true,
             };
-            let required = super::super::streaming_lz_workspace(
-                plan.dictionary_size,
-                crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-                false,
-            );
+            let required = super::super::plan::lazy_streaming_workspace(options, size as u64);
             // Automatic mode is forced through its existing streaming fallback.
             let max_workers = if plan.filter_policy == FilterPolicy::Auto {
                 1
@@ -4060,8 +4056,8 @@ mod tests {
             assert_eq!(opens.load(Ordering::Relaxed), 1);
             assert_eq!(ledger.used(), 0);
             let sources = [EntrySource::from_bytes(vec![7; 8192])];
-            // Below the fixed 3 MiB every streaming job is charged, whatever its input.
-            let too_small = Allowance::limited(1024 * 1024);
+            // Even a short run needs the finder's hash heads.
+            let too_small = Allowance::limited(64 * 1024);
             let constrained = resources
                 .clone()
                 .with_execution_allowance(too_small.clone());
@@ -4241,7 +4237,9 @@ mod tests {
     fn whole_member_ledger_selects_fitting_waves_before_opening_sources() {
         use std::sync::{atomic::AtomicUsize, Arc, Barrier};
         let scratch = crate::scratch::case("whole-member-ledger");
-        let options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(65536)
+            .with_optimal_parse(true);
         let plan = CompressPlan {
             algorithm_version: 0,
             encode_options: options,
@@ -4570,7 +4568,9 @@ mod tests {
     #[test]
     fn whole_member_sources_open_only_after_combined_admission() {
         use std::sync::{atomic::AtomicUsize, Arc};
-        let encode_options = EncodeOptions::new(8).with_max_match_distance(65536);
+        let encode_options = EncodeOptions::new(8)
+            .with_max_match_distance(65536)
+            .with_optimal_parse(true);
         let plan = CompressPlan {
             algorithm_version: 0,
             encode_options,
@@ -5813,7 +5813,7 @@ mod incompressible_probe_tests {
 
     /// Too little memory to code a block, enough to sample and hash.
     fn too_small_to_code() -> WriterResources {
-        WriterResources::new(16 * 1024 * 1024)
+        WriterResources::new(8 * 1024 * 1024)
     }
 
     fn checksums(data: &[u8]) -> (u32, Option<[u8; 32]>) {
