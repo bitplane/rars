@@ -27,12 +27,15 @@ where
     let mut budget = OutputBudget::new(options);
     let mut session = DecoderSession::with_allowance(volume.main.is_solid(), password, allowance);
     session.read_control = budget.control.clone();
-    let mut skip = 0;
+    let mut skip = feed.first_file();
     loop {
         let mut resume = None;
         let count = volume.files().count();
         for (index, file) in volume.files().enumerate().skip(skip) {
             options.check_cancelled()?;
+            if !feed.take_member() {
+                return Ok(());
+            }
             if file.is_split_before() {
                 return Err(Error::InvalidHeader(
                     "RAR 1.5 split entry is missing its first part",
@@ -142,6 +145,7 @@ where
             }
         }
         if let Some(last) = resume {
+            feed.finished_split();
             // A continuation is always the first file of its volume.
             volume = last;
             skip = 1;

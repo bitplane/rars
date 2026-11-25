@@ -702,11 +702,15 @@ await check("RAR5 decoder and volume budgets reach WASM", async () => {
     if (modern) writer.add("b.txt", SECOND);
     const parts = await writer.volumes();
     const volumes = await RarArchive.open(parts);
-    await assert.rejects(volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length - (modern ? 0 : 1) }), limited);
+    await assert.rejects(volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length - 1 }), limited);
     await assert.rejects(volumes.test({ maxMemberOutputBytes: payload.length - 1 }), limited);
-    assert.deepEqual(await volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length + SECOND.length }), payload);
+    assert.deepEqual(await volumes.entries[0].bytes({ maxTotalOutputBytes: payload.length }), payload);
     // b.txt starts after a.bin has filled the first volumes.
-    if (modern) assert.equal(volumes.get("b.txt").volumeIndex, parts.length - 1);
+    if (modern) {
+      const last = volumes.get("b.txt");
+      assert.equal(last.volumeIndex, parts.length - 1);
+      assert.deepEqual(await last.bytes({ maxTotalOutputBytes: SECOND.length }), SECOND);
+    }
   }
 });
 

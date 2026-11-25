@@ -32,13 +32,16 @@ where
     session.decoder.read_control = budget.control.clone();
     session.scratch = options.rar50_scratch;
 
-    let mut skip = 0;
+    let mut skip = feed.first_file();
     loop {
         let mut resume = None;
         let files: Vec<&FileHeader> = volume.files().collect();
         let count = files.len();
         for (index, &file) in files.iter().enumerate().skip(skip) {
             options.check_cancelled()?;
+            if !feed.take_member() {
+                return Ok(());
+            }
             if file.is_split_before() || file.is_split_after() {
                 // Split members are terminal, so keep admission ahead of their
                 // structural, decryption and checksum errors.
@@ -115,7 +118,9 @@ where
                 options.check_cancelled()?;
                 continue;
             }
-            session.read_ahead(&volume, &files, index);
+            if !feed.selection_finished() {
+                session.read_ahead(&volume, &files, index);
+            }
             let result = (|| {
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
                 file.check_output_limit(&budget)?;
@@ -148,6 +153,7 @@ where
         }
         session.end_volume();
         if let Some(last) = resume {
+            feed.finished_split();
             // A continuation is always the first file of its volume.
             volume = last;
             skip = 1;

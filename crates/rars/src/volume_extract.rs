@@ -10,6 +10,39 @@ pub fn detect_volume_legacy_name_encoding(
 }
 
 pub(crate) type Volumes<'p, A> = dyn Iterator<Item = crate::Result<A>> + Send + 'p;
+pub(crate) type VolumeCompletion<'p> = dyn FnMut(usize) + Send + 'p;
+
+#[derive(Clone, Copy)]
+pub(crate) struct VolumeSelection {
+    pub(crate) volume: usize,
+    pub(crate) first_file: usize,
+    pub(crate) members: usize,
+}
+
+pub(crate) enum VolumeInput<'a> {
+    Arriving(Option<Box<VolumeCompletion<'a>>>),
+    Selected(VolumeSelection),
+}
+
+impl<'a> VolumeInput<'a> {
+    pub(crate) fn feed<'p, 'o, A: PlacedVolume>(
+        self,
+        volumes: &'p mut Volumes<'p, A>,
+        options: crate::ArchiveReadOptions<'o>,
+    ) -> VolumeFeed<'p, 'o, A>
+    where
+        'a: 'p,
+    {
+        match self {
+            Self::Arriving(completion) => {
+                VolumeFeed::arriving(volumes, options).with_completion(completion)
+            }
+            Self::Selected(selection) => {
+                VolumeFeed::complete(volumes, options).with_selection(selection)
+            }
+        }
+    }
+}
 
 /// A failed split member and the volume holding its end, if available.
 pub(crate) struct SplitFailure<A> {
@@ -71,6 +104,9 @@ pub(crate) struct VolumeFeed<'p, 'o, A> {
     stop_at_last: bool,
     ended: bool,
     options: crate::ArchiveReadOptions<'o>,
+    completion: Option<Box<VolumeCompletion<'p>>>,
+    completed: usize,
+    selection: Option<VolumeSelection>,
 }
 
 impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
@@ -79,14 +115,9 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
         volumes: &'p mut Volumes<'p, A>,
         options: crate::ArchiveReadOptions<'o>,
     ) -> Self {
-        Self {
-            volumes,
-            index: 0,
-            previous_number: None,
-            stop_at_last: true,
-            ended: false,
-            options,
-        }
+        let mut feed = Self::complete(volumes, options);
+        feed.stop_at_last = true;
+        feed
     }
 
     pub(crate) fn complete(
@@ -100,6 +131,54 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
             stop_at_last: false,
             ended: false,
             options,
+            completion: None,
+            completed: 0,
+            selection: None,
+        }
+    }
+
+    pub(crate) fn with_completion(mut self, completion: Option<Box<VolumeCompletion<'p>>>) -> Self {
+        self.completion = completion;
+        self
+    }
+
+    pub(crate) fn with_selection(mut self, selection: VolumeSelection) -> Self {
+        self.index = selection.volume;
+        self.selection = Some(selection);
+        self
+    }
+
+    pub(crate) fn first_file(&self) -> usize {
+        self.selection.map_or(0, |selection| selection.first_file)
+    }
+
+    pub(crate) fn take_member(&mut self) -> bool {
+        match &mut self.selection {
+            Some(selection) if selection.members == 0 => false,
+            Some(selection) => {
+                selection.members -= 1;
+                true
+            }
+            None => true,
+        }
+    }
+
+    pub(crate) fn selection_finished(&self) -> bool {
+        self.selection
+            .is_some_and(|selection| selection.members == 0)
+    }
+
+    /// Split extraction may retain earlier sources until the member is checked.
+    pub(crate) fn finished_split(&mut self) {
+        self.finish_before(self.current_index());
+    }
+
+    fn finish_before(&mut self, index: usize) {
+        if let Some(completion) = &mut self.completion {
+            for finished in self.completed..index {
+                completion(finished);
+            }
+            self.completed = index;
         }
     }
 
@@ -141,6 +220,10 @@ impl<'p, 'o, A: PlacedVolume> VolumeFeed<'p, 'o, A> {
 
     /// The volume after one whose members are all done, unless it says it was the last.
     pub(crate) fn after(&mut self, end: VolumeEnd) -> crate::Result<Option<A>> {
+        self.finish_before(self.index);
+        if self.selection_finished() {
+            return Ok(None);
+        }
         if !self.stop_at_last {
             return self.next();
         }

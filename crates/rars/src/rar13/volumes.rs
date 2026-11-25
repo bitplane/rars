@@ -24,13 +24,16 @@ where
     let mut unpack15 = Decoder15::with_allowance(allowance);
     unpack15.read_control = budget.control.clone();
     let mut extracted_count = 0usize;
-    let mut skip = 0;
+    let mut skip = feed.first_file();
 
     loop {
         let mut resume = None;
         let count = volume.entries.len();
         for (index, entry) in volume.entries.iter().enumerate().skip(skip) {
             options.check_cancelled()?;
+            if !feed.take_member() {
+                return Ok(());
+            }
             let solid = volume.main.is_solid() && extracted_count != 0;
             if entry.is_split_before() {
                 return Err(Error::InvalidHeader(
@@ -120,6 +123,7 @@ where
             }
         }
         if let Some(last) = resume {
+            feed.finished_split();
             // A continuation is always the first entry of its volume.
             volume = last;
             skip = 1;
