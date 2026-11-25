@@ -3,13 +3,9 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
 use pyo3::{create_exception, PyErr};
-use rars_rs::filename::relative_path as output_relative_path;
 use rars_rs::filename::LegacyNameEncoding;
-use rars_rs::output_links::{create_link_output, link_source_path};
-use rars_rs::output_staging::{
-    failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
-};
-use rars_rs::output_tree::{FileDir, HeldFile, OutputTree, TreeEntry};
+use rars_rs::output_dir::{DirMode, DirOutputs};
+use rars_rs::output_staging::{failed_entry_name, OverwritePolicy};
 use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
 use rars_rs::ExtractedLink;
 use std::borrow::Cow;
@@ -4454,66 +4450,20 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
     }
 }
 
-/// Stages each file and publishes it once verified, so a hard link or FIFO at the destination is never written through, unless writing in place.
+/// The library's directory outputs, with each file's bytes counted for progress.
 struct ExtractOutputs<'a> {
-    out_dir: &'a Path,
-    family: rars_rs::ArchiveFamily,
-    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
-    overwrite: OverwritePolicy,
-    in_place: bool,
-    flatten: bool,
-    flat_names: rars_rs::output_staging::FlatNames,
-    renames: rars_rs::output_staging::RenameCounters,
-    /// Destinations taken under `Rename`, so a repeated stored path fails as in the CLI.
-    rename_claims: HashSet<PathBuf>,
-    times: Option<rars_rs::output_times::OutputTimes>,
-    staging: Option<ExtractionStaging>,
-    staged: usize,
-    pending: Option<PendingOutput>,
-    published: Vec<PathBuf>,
-    /// Where each output went, by its stored path, for hard links and copies.
-    created: HashMap<PathBuf, PathBuf>,
-    skipped_links: Vec<SkippedLink>,
+    outputs: DirOutputs<'a>,
     progress: Option<Arc<ReadProgress>>,
-    /// Members `on_member_error` went past, whose pending output is dropped.
-    failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
-    /// The output directory walked by descriptor, where the platform allows,
-    /// once it exists. Each directory is opened once without following a
-    /// symlink, and files are created and published relative to it.
-    out_tree: Option<OutputTree>,
-    /// Where files stage by descriptor in the staging storage, and its path.
-    staged_files: Option<(FileDir, PathBuf)>,
 }
 
-/// Where staged files go in a staging storage walked by descriptor. Links
-/// stage beside it under their numbers.
-const STAGED_FILES: &str = "files";
+/// What an extraction wrote, and the links it left out.
+type Extracted = rars_rs::ExtractedDir;
 
-struct PendingOutput {
-    /// None when the member is written in place.
-    staged: Option<PathBuf>,
-    /// Staged by descriptor: the directory it is in and its name there.
-    staged_at: Option<(FileDir, std::ffi::OsString)>,
-    /// Written in place by descriptor: the file, once the library is done writing it.
-    held: Option<Arc<OnceLock<fs::File>>>,
-    stored: PathBuf,
-    destination: PathBuf,
-    meta: rars_rs::ExtractedEntryMeta,
-    /// A legacy symlink's target, buffered until verified.
-    link_target: Option<Arc<Mutex<Vec<u8>>>>,
+trait WarnSkippedLinks {
+    fn warn(self, py: Python<'_>) -> PyResult<Vec<PathBuf>>;
 }
 
-struct SkippedLink {
-    name: Vec<u8>,
-    target: Vec<u8>,
-}
-
-struct Extracted {
-    paths: Vec<PathBuf>,
-    skipped_links: Vec<SkippedLink>,
-}
-
-impl Extracted {
+impl WarnSkippedLinks for Extracted {
     /// Raises nothing unless the warnings filter turns a skipped link into an error.
     fn warn(self, py: Python<'_>) -> PyResult<Vec<PathBuf>> {
         for link in &self.skipped_links {
@@ -4555,432 +4505,32 @@ impl<'a> ExtractOutputs<'a> {
         progress: Option<Arc<ReadProgress>>,
         failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
     ) -> Self {
-        Self {
-            out_dir,
-            family,
-            encoding: options.legacy_name_encoding,
+        let mode = DirMode {
             overwrite: mode.overwrite,
             in_place: mode.in_place,
+            restore_times: mode.restore_times,
             flatten: mode.flatten,
-            flat_names: Default::default(),
-            renames: Default::default(),
-            rename_claims: HashSet::new(),
-            times: mode
-                .restore_times
-                .then(rars_rs::output_times::OutputTimes::new),
-            staging: None,
-            staged: 0,
-            pending: None,
-            published: Vec::new(),
-            created: HashMap::new(),
-            skipped_links: Vec::new(),
+            exists_hint: "; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
+        };
+        Self {
+            outputs: DirOutputs::new(out_dir, family, options.legacy_name_encoding, mode, failed),
             progress,
-            failed,
-            out_tree: None,
-            staged_files: None,
         }
-    }
-
-    /// The output directory walked by descriptor, opened once it exists, or
-    /// made first if `create`. `None` where the platform has no such walk.
-    fn tree(&mut self, create: bool) -> rars_rs::Result<Option<&mut OutputTree>> {
-        if self.out_tree.is_none() && rars_rs::output_tree::AVAILABLE {
-            if create {
-                fs::create_dir_all(self.out_dir)?;
-            }
-            self.out_tree = OutputTree::open(self.out_dir)?;
-        }
-        Ok(self.out_tree.as_mut())
-    }
-
-    /// Drops the walks' open directories, after a change made by path.
-    fn forget_walks(&mut self) {
-        if let Some(tree) = &mut self.out_tree {
-            tree.forget();
-        }
-    }
-
-    /// Stored path for link lookups, and destination, which flattening
-    /// reduces to the base name. Refuses a symlink on the way to it or at it.
-    /// With the output directory walked by descriptor, also what is there now.
-    fn destination(
-        &mut self,
-        meta: &rars_rs::ExtractedEntryMeta,
-    ) -> rars_rs::Result<(PathBuf, PathBuf, Option<TreeEntry>)> {
-        let refuse = |error| refused_output(error, &meta.name);
-        let (stored, relative) =
-            output_names(meta, self.family, self.encoding, self.flatten).map_err(refuse)?;
-        let path = self.out_dir.join(&relative);
-        if let Some(tree) = self.tree(false).map_err(refuse)? {
-            return match tree.lstat(&relative).map_err(refuse)? {
-                TreeEntry::Symlink => Err(refuse(rars_rs::Error::UnsafePath(
-                    "unsafe archive path crosses symlink",
-                ))),
-                entry => Ok((stored, path, Some(entry))),
-            };
-        }
-        rars_rs::filename::checked_output_path(self.out_dir, &relative).map_err(refuse)?;
-        if let Some(staging) = &self.staging {
-            staging.reject_alias(&path).map_err(refuse)?;
-        }
-        Ok((stored, path, None))
-    }
-
-    /// The time to give a published file, if any.
-    fn modified_time(&self, meta: &rars_rs::ExtractedEntryMeta) -> Option<std::time::SystemTime> {
-        self.times.as_ref()?;
-        meta.modified
-            .and_then(|time| std::time::SystemTime::try_from(time).ok())
-    }
-
-    fn claim(
-        &mut self,
-        destination: &Path,
-        meta: &rars_rs::ExtractedEntryMeta,
-    ) -> rars_rs::Result<()> {
-        if self.flatten {
-            let relative = destination
-                .strip_prefix(self.out_dir)
-                .expect("checked output path is under the output directory");
-            return self
-                .flat_names
-                .claim(relative, &meta.name, self.overwrite)
-                .map_err(|error| refused_output(error, &meta.name));
-        }
-        if self.overwrite == OverwritePolicy::Rename
-            && !meta.is_directory
-            && !self.rename_claims.insert(destination.to_path_buf())
-        {
-            return Err(rars_rs::Error::InvalidHeader(
-                "multiple archive entries map to the same output path",
-            ));
-        }
-        if self.encoding.is_some() && self.published.iter().any(|path| path == destination) {
-            return Err(rars_rs::Error::InvalidArgument(
-                "multiple entries map to the same decoded output path",
-            ));
-        }
-        Ok(())
     }
 
     fn open(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
-        let writer = self.open_file(meta)?;
+        let writer = self.outputs.open(meta)?;
         Ok(match &self.progress {
             Some(progress) if !meta.is_directory => progress.counted(&meta.name, writer),
             _ => writer,
         })
     }
 
-    /// The library has verified the previous member by the time it asks for another output.
-    fn open_file(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
-        self.publish_pending()?;
-        if self.flatten && meta.is_directory {
-            return Ok(Box::new(io::sink()));
-        }
-        let (stored, destination, existing) = self.destination(meta)?;
-        self.claim(&destination, meta)?;
-        if meta.is_directory {
-            self.create_directory(&destination, existing.as_ref(), &meta.name)?;
-            self.record_published(stored, destination, meta, true);
-            return Ok(Box::new(io::sink()));
-        }
-        let exists = match &existing {
-            Some(entry) => *entry != TreeEntry::Missing,
-            None => fs::symlink_metadata(&destination).is_ok(),
-        };
-        if self.overwrite == OverwritePolicy::Never && exists {
-            return Err(already_exists(&destination).into());
-        }
-        if self.in_place {
-            return self.open_in_place(stored, destination, meta);
-        }
-        self.open_staged(stored, destination, meta)
-    }
-
-    /// Makes a directory member, and any missing parents.
-    fn create_directory(
-        &mut self,
-        destination: &Path,
-        existing: Option<&TreeEntry>,
-        name: &[u8],
-    ) -> rars_rs::Result<()> {
-        let relative = destination
-            .strip_prefix(self.out_dir)
-            .expect("checked output path is under the output directory");
-        if matches!(existing, Some(TreeEntry::Other(_))) {
-            // What `create_dir_all` says of a file in the way.
-            return Err(io::Error::from_raw_os_error(libc::EEXIST).into());
-        }
-        match self.tree(true)? {
-            Some(tree) => {
-                tree.create_dirs(relative)
-                    .map_err(|error| like_create_dir_all(refused_walk(error, name), destination))?;
-            }
-            None => fs::create_dir_all(destination)?,
-        }
-        Ok(())
-    }
-
-    /// Opens a member at its destination by the overwrite policy, never
-    /// following a symlink and never writing through a hard link or
-    /// anything but a regular file.
-    fn open_in_place(
-        &mut self,
-        stored: PathBuf,
-        destination: PathBuf,
-        meta: &rars_rs::ExtractedEntryMeta,
-    ) -> rars_rs::Result<Box<dyn Write>> {
-        let parent = destination
-            .parent()
-            .expect("checked output path has a file name")
-            .to_path_buf();
-        self.tree(true)?;
-        let (destination, writer, held): (_, Box<dyn Write>, _) = match &mut self.out_tree {
-            Some(tree) => {
-                let relative = destination
-                    .strip_prefix(self.out_dir)
-                    .expect("checked output path is under the output directory");
-                let (dir, _) = tree.parent_dir(relative).map_err(|error| {
-                    like_create_dir_all(refused_walk(error, &meta.name), &parent)
-                })?;
-                let name = relative.file_name().expect("output path has a name");
-                let (destination, file) = match self.overwrite {
-                    OverwritePolicy::Never => {
-                        let file = dir.create_file(name, 0o666)?;
-                        (destination, file)
-                    }
-                    OverwritePolicy::Rename => {
-                        dir.create_numbered(&destination, 0o666, &mut self.renames)?
-                    }
-                    OverwritePolicy::Always => {
-                        let opened = dir.open_in_place(name, 0o666)?;
-                        if opened.len > 0 {
-                            opened.file.set_len(0)?;
-                        }
-                        (destination, opened.file)
-                    }
-                };
-                let (writer, held) = HeldFile::new(file);
-                (destination, Box::new(writer), Some(held))
-            }
-            None => {
-                fs::create_dir_all(&parent)?;
-                // Creating the parents may have raced a symlink into place.
-                let (_, destination, _) = self.destination(meta)?;
-                let (destination, file) = rars_rs::output_staging::open_in_place(
-                    &destination,
-                    self.overwrite,
-                    &mut self.renames,
-                )?;
-                (destination, Box::new(file), None)
-            }
-        };
-        self.pending = Some(PendingOutput {
-            staged: None,
-            staged_at: None,
-            held,
-            stored,
-            destination,
-            meta: meta.clone(),
-            link_target: None,
-        });
-        Ok(writer)
-    }
-
-    /// The staging storage, made on first use. Where the output directory is
-    /// walked by descriptor, so is the storage, and the walks refuse it.
-    fn staging(&mut self) -> rars_rs::Result<&ExtractionStaging> {
-        if self.staging.is_none() {
-            let staging = ExtractionStaging::new(self.out_dir)?;
-            if let Some(tree) = self.tree(false)? {
-                if let Some(mut storage) = OutputTree::open(&staging.root)? {
-                    tree.forbid(storage.identity());
-                    let files = storage.file_dir(Path::new(STAGED_FILES))?;
-                    self.staged_files = Some((files, staging.root.join(STAGED_FILES)));
-                }
-            }
-            self.staging = Some(staging);
-        }
-        Ok(self.staging.as_ref().expect("made above"))
-    }
-
-    /// Stages a member's file, to publish once it verifies.
-    fn open_staged(
-        &mut self,
-        stored: PathBuf,
-        destination: PathBuf,
-        meta: &rars_rs::ExtractedEntryMeta,
-    ) -> rars_rs::Result<Box<dyn Write>> {
-        self.staging()?;
-        let staging = self.staging.as_ref().expect("made above");
-        if self.staged_files.is_none() {
-            staging
-                .reject_alias(&destination)
-                .map_err(|error| refused_output(error, &meta.name))?;
-        } else if destination.starts_with(&staging.root) {
-            // Walked before the storage was there to refuse.
-            return Err(refused_output(
-                rars_rs::Error::InvalidHeader("archive path conflicts with extraction storage"),
-                &meta.name,
-            ));
-        }
-        let index = self.staged.to_string();
-        let (staged, staged_at, file) = match &self.staged_files {
-            Some((dir, root)) => {
-                let name = std::ffi::OsString::from(index);
-                let file = dir.create_file(&name, 0o666)?;
-                (root.join(&name), Some((dir.clone(), name)), file)
-            }
-            None => {
-                let staged = staging.root.join(index);
-                let file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staged)?;
-                (staged, None, file)
-            }
-        };
-        self.staged += 1;
-        self.pending = Some(PendingOutput {
-            staged: Some(staged),
-            staged_at,
-            held: None,
-            stored,
-            destination,
-            meta: meta.clone(),
-            link_target: None,
-        });
-        Ok(Box::new(file))
-    }
-
-    fn publish_pending(&mut self) -> rars_rs::Result<()> {
-        let Some(pending) = self.pending.take() else {
-            return Ok(());
-        };
-        // The library reports a failed member before it asks for the next output.
-        let failed = self.failed.is_some_and(|failed| {
-            let mut failed = lock(failed);
-            let gone_past = failed.contains(&pending.meta.name);
-            failed.clear();
-            gone_past
-        });
-        if failed {
-            if let Some(staged) = &pending.staged {
-                let _ = fs::remove_file(staged);
-            }
-            return Ok(());
-        }
-        if let Some(target) = pending.link_target {
-            let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
-            rars_rs::output_links::check_legacy_symlink_target(
-                &pending.meta.name,
-                target.len() as u64,
-                Some(&target),
-            )?;
-            return self.link(
-                &pending.meta,
-                ExtractedLink::Symlink {
-                    target: &target,
-                    directory: false,
-                },
-            );
-        }
-        let Some(staged) = &pending.staged else {
-            // Written in place: by descriptor, its time goes on through its own.
-            let later = match (&pending.held, self.modified_time(&pending.meta)) {
-                (Some(held), Some(modified)) => !held
-                    .get()
-                    .is_some_and(|file| file.set_modified(modified).is_ok()),
-                _ => true,
-            };
-            self.record_published(pending.stored, pending.destination, &pending.meta, later);
-            return Ok(());
-        };
-        if let Some((dir, name)) = &pending.staged_at {
-            if let Some(published) = self.publish_by_descriptor(&pending, dir, name)? {
-                self.record_published(pending.stored, published.0, &pending.meta, published.1);
-                return Ok(());
-            }
-            // The filesystem can't rename it into place: publish it by path.
-            self.forget_walks();
-        }
-        fs::create_dir_all(
-            pending
-                .destination
-                .parent()
-                .expect("checked output path has a file name"),
-        )?;
-        // Creating the parents may have raced a symlink into place.
-        let (_, destination, _) = self.destination(&pending.meta)?;
-        let destination = publish_verified_output(
-            staged,
-            &destination,
-            self.overwrite,
-            None,
-            &mut self.renames,
-        )?;
-        self.record_published(pending.stored, destination, &pending.meta, true);
-        Ok(())
-    }
-
-    /// Publishes a file staged by descriptor, renaming it from the storage
-    /// into the output directory's walked descriptors after giving it its
-    /// time. Returns where it landed and whether its time still needs
-    /// setting, or `None` when the filesystem can't rename it into place.
-    fn publish_by_descriptor(
-        &mut self,
-        pending: &PendingOutput,
-        dir: &FileDir,
-        name: &std::ffi::OsStr,
-    ) -> rars_rs::Result<Option<(PathBuf, bool)>> {
-        let later = match self.modified_time(&pending.meta) {
-            Some(modified) => dir.set_metadata(name, Some(modified), None).is_err(),
-            None => true,
-        };
-        let relative = pending
-            .destination
-            .strip_prefix(self.out_dir)
-            .expect("checked output path is under the output directory");
-        let parent = pending
-            .destination
-            .parent()
-            .expect("checked output path has a file name");
-        let tree = self
-            .out_tree
-            .as_mut()
-            .expect("files stage by descriptor only beside an output tree");
-        let published = dir
-            .publish(
-                name,
-                tree,
-                relative,
-                &pending.destination,
-                self.overwrite,
-                &mut self.renames,
-            )
-            .map_err(|error| {
-                like_create_dir_all(refused_walk(error, &pending.meta.name), parent)
-            })?;
-        Ok(published.map(|published| (published, later)))
-    }
-
-    /// Buffers a legacy symlink's target; the link is made once the target is verified.
     fn open_legacy_link(
         &mut self,
         meta: &rars_rs::ExtractedEntryMeta,
     ) -> rars_rs::Result<Box<dyn Write>> {
-        self.publish_pending()?;
-        let target = Arc::new(Mutex::new(Vec::new()));
-        self.pending = Some(PendingOutput {
-            staged: None,
-            staged_at: None,
-            held: None,
-            stored: PathBuf::new(),
-            destination: PathBuf::new(),
-            meta: meta.clone(),
-            link_target: Some(Arc::clone(&target)),
-        });
-        Ok(Box::new(SharedBuffer(target)))
+        self.outputs.open_legacy_link(meta)
     }
 
     fn link(
@@ -4988,145 +4538,15 @@ impl<'a> ExtractOutputs<'a> {
         meta: &rars_rs::ExtractedEntryMeta,
         link: ExtractedLink<'_>,
     ) -> rars_rs::Result<()> {
-        self.publish_pending()?;
-        let (stored, destination, existing) = self.destination(meta)?;
-        let relative = destination
-            .strip_prefix(self.out_dir)
-            .expect("checked output path is under the output directory")
-            .to_path_buf();
-        let Some(target) = rars_rs::output_links::link_target(
-            self.out_dir,
-            &relative,
-            meta,
-            link,
-            self.family,
-            self.flatten,
-        )?
-        else {
-            self.skipped_links.push(SkippedLink {
-                name: meta.name.clone(),
-                target: link.target().to_vec(),
-            });
-            return Ok(());
-        };
-        self.claim(&destination, meta)?;
-        if self.in_place {
-            let created = create_link_output(
-                self.out_dir,
-                &relative,
-                &target,
-                link,
-                self.overwrite,
-                &self.created,
-                &mut self.renames,
-            );
-            // Made by path, which can remove a directory the walks hold.
-            self.forget_walks();
-            let (path, file) = created?;
-            self.record_published(stored, path, meta, file);
-            return Ok(());
-        }
-        let exists = match &existing {
-            Some(entry) => *entry != TreeEntry::Missing,
-            None => fs::symlink_metadata(&destination).is_ok(),
-        };
-        if self.overwrite == OverwritePolicy::Never && exists {
-            return Err(already_exists(&destination).into());
-        }
-        let root = self.staging()?.root.clone();
-        let (staged, file) = create_link_output(
-            &root,
-            Path::new(&self.staged.to_string()),
-            &target,
-            link,
-            OverwritePolicy::Never,
-            &self.created,
-            &mut self.renames,
-        )?;
-        self.staged += 1;
-        let source = match link {
-            ExtractedLink::HardLink { .. } => {
-                Some(link_source_path(&target, &self.created)?.to_path_buf())
-            }
-            _ => None,
-        };
-        fs::create_dir_all(
-            destination
-                .parent()
-                .expect("checked output path has a file name"),
-        )?;
-        // Made by path: walk afresh.
-        self.forget_walks();
-        // Creating the parents may have raced a symlink into place.
-        let (_, destination, _) = self.destination(meta)?;
-        if self.overwrite == OverwritePolicy::Always
-            && fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir())
-        {
-            fs::remove_dir(&destination)?;
-        }
-        let published = publish_verified_output(
-            &staged,
-            &destination,
-            self.overwrite,
-            source.as_deref(),
-            &mut self.renames,
-        );
-        // Replacing a directory removes it, wherever the walks hold it.
-        self.forget_walks();
-        self.record_published(stored, published?, meta, file);
-        Ok(())
+        self.outputs.link(meta, link)
     }
 
-    /// Symlinks keep their own times: setting them would follow the link.
-    fn record_published(
-        &mut self,
-        stored: PathBuf,
-        path: PathBuf,
-        meta: &rars_rs::ExtractedEntryMeta,
-        restore_times: bool,
-    ) {
-        if let (Some(times), true) = (&mut self.times, restore_times) {
-            times.opened(path.clone(), meta);
-            times.finish();
-        }
-        self.created.insert(stored, path.clone());
-        self.published.push(path);
+    fn publish_pending(&mut self) -> rars_rs::Result<()> {
+        self.outputs.publish_pending()
     }
 
-    /// A member still in flight when extraction failed never reaches its destination.
-    fn finish(mut self, result: rars_rs::Result<()>) -> rars_rs::Result<Extracted> {
-        let published = match result {
-            Ok(()) => self.publish_pending(),
-            Err(error) => {
-                let verified = matches!(
-                    (failed_entry_name(&error), &self.pending),
-                    (Some(failed), Some(pending)) if failed != pending.meta.name.as_slice()
-                );
-                if verified {
-                    // The extraction's own error wins over a failure to publish.
-                    let _ = self.publish_pending();
-                }
-                Err(error)
-            }
-        };
-        let restored = match &self.times {
-            Some(times) => times.restore(),
-            None => Ok(()),
-        };
-        published?;
-        restored?;
-        let mut paths = std::mem::take(&mut self.published);
-        if self.flatten && self.overwrite == OverwritePolicy::Always {
-            // A member that replaced an earlier one is listed once, where it last landed.
-            let mut seen = HashSet::new();
-            paths.reverse();
-            paths.retain(|path| seen.insert(path.clone()));
-            paths.reverse();
-        }
-        Ok(Extracted {
-            paths,
-            skipped_links: std::mem::take(&mut self.skipped_links),
-        })
+    fn finish(self, result: rars_rs::Result<()>) -> rars_rs::Result<Extracted> {
+        self.outputs.finish(result)
     }
 }
 
@@ -5822,55 +5242,6 @@ fn parse_version(value: &str) -> PyResult<rars_rs::ArchiveVersion> {
         })
 }
 
-/// The member's stored relative path, and where it goes relative to the output directory.
-fn output_names(
-    meta: &rars_rs::ExtractedEntryMeta,
-    family: rars_rs::ArchiveFamily,
-    encoding: Option<rars_rs::filename::LegacyNameEncoding>,
-    flatten: bool,
-) -> rars_rs::Result<(PathBuf, PathBuf)> {
-    // Retain the binding's conservative name preflight (including legacy
-    // backslash traversal) before applying host-aware destination conversion.
-    rars_rs::validate_entry_name(meta.name.clone())?;
-    let rar50 = family == rars_rs::ArchiveFamily::Rar50Plus;
-    let name = if rar50 {
-        rars_rs::output_links::rar50_native_name(
-            &meta.name,
-            meta.attr_source == rars_rs::AttrSource::Unix,
-        )
-    } else {
-        rars_rs::filename::decoded_name(&meta.name, meta.name_is_unicode, encoding)?.into_owned()
-    };
-    let stored = output_relative_path(&name, !rar50)?;
-    let relative = if flatten {
-        rars_rs::output_staging::flat_relative(&stored)
-    } else {
-        stored.clone()
-    };
-    Ok((stored, relative))
-}
-
-/// Names the member a walk refused, as the checks by path did. Errors from
-/// the filesystem itself pass through as they would from `create_dir_all`.
-fn refused_walk(error: rars_rs::Error, name: &[u8]) -> rars_rs::Error {
-    match error {
-        rars_rs::Error::Io(_) => error,
-        error => refused_output(error, name),
-    }
-}
-
-/// `create_dir_all` reports a file where `directory` goes as `EEXIST`. A walk
-/// by descriptor finds it can't open it as a directory, `ENOTDIR`, so it is
-/// reported as `create_dir_all` would.
-fn like_create_dir_all(error: rars_rs::Error, directory: &Path) -> rars_rs::Error {
-    if io_errno(&error) == Some(libc::ENOTDIR)
-        && fs::symlink_metadata(directory).is_ok_and(|metadata| !metadata.is_dir())
-    {
-        return io::Error::from_raw_os_error(libc::EEXIST).into();
-    }
-    error
-}
-
 fn archive_base_name(path: &Path) -> PyResult<Vec<u8>> {
     let file_name = path
         .file_name()
@@ -5924,17 +5295,6 @@ fn map_open_error(error: rars_rs::Error) -> PyErr {
         return NotRarFile::new_err(error.to_string());
     }
     map_error(error)
-}
-
-/// What `overwrite=False` raises, naming the file and the ways past it.
-fn already_exists(destination: &Path) -> io::Error {
-    io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        format!(
-            "{} already exists; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
-            destination.display()
-        ),
-    )
 }
 
 /// The errno Python picks an `OSError` subclass by, such as `FileExistsError`.
@@ -6358,7 +5718,7 @@ mod tests {
                 (&b"/absolute"[..], false, None),
                 (&b"../parent"[..], false, None),
             ] {
-                let result = output_relative_path(name, separator);
+                let result = rars_rs::filename::relative_path(name, separator);
                 match expected {
                     Some(expected) => assert_eq!(result.unwrap(), PathBuf::from(expected)),
                     None => assert!(result.is_err()),
