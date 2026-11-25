@@ -47,15 +47,15 @@ def test_limit_is_lazy_per_write_and_counts_only_retained_payloads(tmp_path):
     destination = tmp_path / "existing.rar"
     destination.write_bytes(b"keep")
     builder = rars.RarBuilder.from_archive(
-        rars.RarFile(source_archive()), max_staged_bytes=14,
+        rars.RarFile(source_archive()), max_staged_bytes=13,
     )
     with pytest.raises(rars.LimitExceeded, match="rewrite staging limit"):
         builder.write(destination, overwrite=True)
     assert destination.read_bytes() == b"keep"
     assert list(tmp_path.iterdir()) == [destination]
-    builder.remove("first")
+    builder.remove("second")
     builder.write(destination, overwrite=True)
-    assert rars.RarFile(destination).read("second") == b"second payload"
+    assert rars.RarFile(destination).read("first") == b"first payload"
     assert list(tmp_path.iterdir()) == [destination]
 
 
