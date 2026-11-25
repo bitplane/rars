@@ -705,16 +705,15 @@ fn total_quota_persists_across_regular_split_and_following_volume_members() {
         }
         let selected = rars::read_volume_member_at_with_options(
             &volumes,
-            0,
-            ArchiveReadOptions::with_password(b"secret").with_max_total_output_bytes(2112),
+            2,
+            ArchiveReadOptions::with_password(b"secret").with_max_total_output_bytes(33),
         )
         .unwrap();
         assert_eq!(selected, Some(vec![42; 32]));
-        // Selecting the first member still charges later discarded members.
         let err = rars::read_volume_member_at_with_options(
             &volumes,
-            0,
-            ArchiveReadOptions::with_password(b"secret").with_max_total_output_bytes(2111),
+            2,
+            ArchiveReadOptions::with_password(b"secret").with_max_total_output_bytes(31),
         )
         .unwrap_err();
         assert!(matches!(

@@ -528,3 +528,71 @@ fn rar3_volumes_rars_writes_record_their_numbers() {
         .unwrap();
     assert_eq!(numbers(&[single], None), [None]);
 }
+
+#[test]
+fn completion_releases_prefetched_volumes_after_the_split_member() {
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let data = noise(7, 30_000);
+        let mut builder = Builder::new(version)
+            .store(true)
+            .volume_size(Some(VOLUME_SIZE));
+        builder
+            .add_bytes(b"split".to_vec(), data.clone(), None, None)
+            .unwrap();
+        let bytes = builder.build_volumes(None).unwrap();
+        let last = bytes.len() - 1;
+        assert!(last >= 2);
+        let (archives, retired): (Vec<_>, Vec<_>) = bytes
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let (mut archive, retired) = retirable(bytes);
+                if index != last {
+                    // Stdin volumes carry the unpacked size only in the final header.
+                    match &mut archive {
+                        Archive::Rar15To40(volume) => {
+                            for block in &mut volume.blocks {
+                                if let rars::rar15_40::Block::File(file) = block {
+                                    file.block.flags |= 0x0100;
+                                    file.unp_size = u64::MAX;
+                                    assert_eq!(file.known_unp_size(), None);
+                                }
+                            }
+                        }
+                        Archive::Rar50Plus(volume) => {
+                            for block in &mut volume.blocks {
+                                if let rars::rar50::Block::File(file) = block {
+                                    file.file_flags |= 0x0008;
+                                    assert_eq!(file.known_unpacked_size(), None);
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                (archive, retired)
+            })
+            .unzip();
+        let completed = Mutex::new(Vec::new());
+        let (outputs, open) = collector();
+        archives[0]
+            .extract_with_volumes_and_completion(
+                archives[1..].iter().map(|archive| {
+                    assert!(completed.lock().unwrap().is_empty());
+                    Ok(archive.clone())
+                }),
+                ArchiveReadOptions::new().with_max_total_output_bytes(data.len() as u64),
+                open,
+                |index| {
+                    retired[index].store(true, Ordering::SeqCst);
+                    completed.lock().unwrap().push(index);
+                },
+            )
+            .unwrap();
+        assert_eq!(outputs.lock().unwrap()[b"split".as_slice()], data);
+        assert_eq!(
+            completed.into_inner().unwrap(),
+            (0..archives.len()).collect::<Vec<_>>()
+        );
+    }
+}

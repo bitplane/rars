@@ -1119,14 +1119,16 @@ impl Archive {
     /// a volume marked as the last; RAR 1.3 to 2.0 volumes carry no such mark,
     /// so it is advanced once more there and must end rather than wait.
     /// Volumes are read front to back: once volume N+1 is pulled, nothing reads
-    /// volume N again, except to name a damaged volume after a member has
-    /// already failed. The exception is a RAR 5 member whose earlier parts do not
-    /// record its size; its later volumes are pulled before it is decoded.
+    /// volume N again in the ordinary streaming path. Split members may fetch
+    /// later volumes to learn their size or reread earlier fragments to diagnose
+    /// damage. Use [`Self::extract_with_volumes_and_completion`] to know when
+    /// a source can be removed.
     /// It may be advanced from a worker thread, and cancellation cannot
     /// interrupt it while it blocks.
     ///
-    /// A split member's writer opens at its first part, so a later volume that
-    /// turns out wrong leaves partial output, as with [`Self::extract_to`].
+    /// When a split member is decoded as its volumes arrive, its writer opens
+    /// at its first part. A later volume that turns out wrong can leave partial
+    /// output, as with [`Self::extract_to`].
     /// The writer is flushed after the reassembled member has been verified.
     /// Links are left out, as there.
     pub fn extract_with_volumes<V, F>(
@@ -1143,12 +1145,62 @@ impl Archive {
         self.extract_arriving(volumes, options, &mut open, None)
     }
 
+    /// Extracts as [`Self::extract_with_volumes`] does and reports spent volumes.
+    ///
+    /// After `completed(index)` is called, extraction will never read that
+    /// volume again. Indices start at zero for `self` and are reported in order,
+    /// including the final volume on success. A split member may delay completion
+    /// of earlier volumes until its verification and any diagnostic reads finish.
+    /// As with the volume provider, the callback may run on a worker thread.
+    pub fn extract_with_volumes_and_completion<V, F, C>(
+        &self,
+        volumes: V,
+        options: ArchiveReadOptions<'_>,
+        mut open: F,
+        completed: C,
+    ) -> Result<()>
+    where
+        V: IntoIterator<Item = Result<Archive>>,
+        V::IntoIter: Send,
+        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        C: FnMut(usize) + Send,
+    {
+        self.extract_volume_feed(
+            volumes,
+            options,
+            &mut open,
+            None,
+            volume_extract::VolumeInput::Arriving(Some(Box::new(completed))),
+        )
+    }
+
     pub(crate) fn extract_arriving<V>(
         &self,
         volumes: V,
         options: ArchiveReadOptions<'_>,
         open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        link: Option<&mut extraction_links::ArchiveLink<'_>>,
+    ) -> Result<()>
+    where
+        V: IntoIterator<Item = Result<Archive>>,
+        V::IntoIter: Send,
+    {
+        self.extract_volume_feed(
+            volumes,
+            options,
+            open,
+            link,
+            volume_extract::VolumeInput::Arriving(None),
+        )
+    }
+
+    fn extract_volume_feed<V>(
+        &self,
+        volumes: V,
+        options: ArchiveReadOptions<'_>,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut link: Option<&mut extraction_links::ArchiveLink<'_>>,
+        input: volume_extract::VolumeInput<'_>,
     ) -> Result<()>
     where
         V: IntoIterator<Item = Result<Archive>>,
@@ -1157,22 +1209,30 @@ impl Archive {
         let _cap = crate::parallel::ThreadCap::set(options.threads);
         let mut volumes = volumes.into_iter();
         options.check_cancelled()?;
+        let arriving = matches!(&input, volume_extract::VolumeInput::Arriving(_));
+        let annotate = |error: Error, index| {
+            if arriving {
+                error.in_member_volume(index)
+            } else {
+                error
+            }
+        };
         match self {
             Self::Rar13(first) => {
                 let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
                     Self::Rar13(volume) => Some(volume),
                     _ => None,
                 });
-                let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                let mut feed = input.feed(&mut set, options);
                 rar13::extract_from_feed(&mut feed, options, |meta| open(&rar13_meta(meta)))
-                    .map_err(|error| error.in_member_volume(feed.current_index()))
+                    .map_err(|error| annotate(error, feed.current_index()))
             }
             Self::Rar15To40(first) => {
                 let mut set = with_later_volumes(first, &mut volumes, |volume| match volume {
                     Self::Rar15To40(volume) => Some(volume),
                     _ => None,
                 });
-                let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                let mut feed = input.feed(&mut set, options);
                 let mut legacy = link.map(|link| {
                     move |meta: &rar15_40::ExtractedEntryMeta, target: &[u8]| {
                         link(
@@ -1192,30 +1252,33 @@ impl Archive {
                         open,
                         Some(link as &mut extraction_links::LegacyLink<'_>),
                     ),
-                    None => rar15_40::extract_from_feed(
+                    None if arriving => rar15_40::extract_from_feed(
                         &mut feed,
                         options,
                         extraction_links::skip_legacy_links(open),
                         None,
                     ),
+                    None => rar15_40::extract_from_feed(&mut feed, options, open, None),
                 }
-                .map_err(|error| error.in_member_volume(feed.current_index()))
+                .map_err(|error| annotate(error, feed.current_index()))
             }
             Self::Rar50Plus(first) => {
-                let mut order = volume_order::VolumeOrder::after(self);
+                let mut order = arriving.then(|| volume_order::VolumeOrder::after(self));
                 let mut checked = volumes.by_ref().enumerate().map(|(index, volume)| {
                     let volume = volume?;
-                    order.next(&volume).map_err(|error| Error::InVolume {
-                        index: index + 1,
-                        source: Box::new(error),
-                    })?;
+                    if let Some(order) = &mut order {
+                        order.next(&volume).map_err(|error| Error::InVolume {
+                            index: index + 1,
+                            source: Box::new(error),
+                        })?;
+                    }
                     Ok(volume)
                 });
                 let mut set = with_later_volumes(first, &mut checked, |volume| match volume {
                     Self::Rar50Plus(volume) => Some(volume),
                     _ => None,
                 });
-                let mut feed = volume_extract::VolumeFeed::arriving(&mut set, options);
+                let mut feed = input.feed(&mut set, options);
                 let emit = link.is_some();
                 rar50::extract_from_feed(
                     &mut feed,
@@ -1227,7 +1290,7 @@ impl Archive {
                     },
                     rar50::Redirections::emit(emit),
                 )
-                .map_err(|error| error.in_member_volume(feed.current_index()))
+                .map_err(|error| annotate(error, feed.current_index()))
             }
         }
     }
@@ -2280,6 +2343,25 @@ where
 /// Continuation headers are folded into the member that began on an earlier
 /// volume. Packed sizes are accumulated across all fragments.
 pub fn volume_members(archives: &[Archive]) -> Result<Vec<ArchiveMember>> {
+    check_volume_members(archives)?;
+    let mut members: Vec<ArchiveMember> = Vec::new();
+    for (_, _, fragment) in volume_fragments(archives) {
+        let member = fragment.to_owned();
+        if member.meta.is_split_before {
+            let previous = members.last_mut().expect("validated first fragment");
+            previous.meta.packed_size = previous
+                .meta
+                .packed_size
+                .saturating_add(member.meta.packed_size);
+            previous.meta.is_split_after = member.meta.is_split_after;
+        } else {
+            members.push(member);
+        }
+    }
+    Ok(members)
+}
+
+fn check_volume_members(archives: &[Archive]) -> Result<()> {
     let Some(first) = archives.first() else {
         return Err(Error::InvalidHeader("volume set is empty"));
     };
@@ -2290,30 +2372,30 @@ pub fn volume_members(archives: &[Archive]) -> Result<Vec<ArchiveMember>> {
         return Err(Error::InvalidHeader("mixed archive families in volume set"));
     }
     volume_order::check_set(archives)?;
-
-    let mut members: Vec<ArchiveMember> = Vec::new();
-    for archive in archives {
-        for member in archive.members() {
-            if member.meta.is_split_before {
-                let Some(previous) = members.last_mut() else {
-                    return Err(Error::InvalidHeader(
-                        "volume set starts with a continuation",
-                    ));
-                };
-                previous.meta.packed_size = previous
-                    .meta
-                    .packed_size
-                    .saturating_add(member.meta.packed_size);
-                previous.meta.is_split_after = member.meta.is_split_after;
-            } else {
-                members.push(member);
-            }
-        }
+    if volume_fragments(archives)
+        .next()
+        .is_some_and(|(_, _, member)| member.is_split_before())
+    {
+        return Err(Error::InvalidHeader(
+            "volume set starts with a continuation",
+        ));
     }
-    Ok(members)
+    Ok(())
+}
+
+fn volume_fragments(
+    archives: &[Archive],
+) -> impl Iterator<Item = (usize, usize, ArchiveMemberRef<'_>)> {
+    archives.iter().enumerate().flat_map(|(volume, archive)| {
+        archive
+            .member_refs()
+            .enumerate()
+            .map(move |(file, member)| (volume, file, member))
+    })
 }
 
 /// Returns one logical member from a volume set by archive-order index.
+/// See [`read_volume_member_at_with_options`] for decoding and quota rules.
 pub fn read_volume_member_at(
     archives: &[Archive],
     index: usize,
@@ -2326,25 +2408,61 @@ pub fn read_volume_member_at(
     )
 }
 
-/// Reads one logical volume member with per-call policies. The current volume
-/// traversal decodes the whole set; discarded output also counts against quotas.
+/// Reads one logical volume member with per-call policies. For a non-solid set,
+/// only the selected member is decoded and only its fragment sources are read.
+/// Solid sets also decode the preceding members to keep their compression
+/// history. Their discarded output counts against quotas. Missing members,
+/// directories and RAR 5 redirections return `None`.
 pub fn read_volume_member_at_with_options(
     archives: &[Archive],
     index: usize,
     options: ArchiveReadOptions<'_>,
 ) -> Result<Option<Vec<u8>>> {
-    let _cap = crate::parallel::ThreadCap::set(options.threads);
     options.check_cancelled()?;
+    check_volume_members(archives)?;
+    let Some((volume, file, member)) = volume_fragments(archives)
+        .filter(|(_, _, member)| !member.is_split_before())
+        .nth(index)
+    else {
+        return Ok(None);
+    };
+    if member.is_directory() || member.is_redirection() {
+        return Ok(None);
+    }
+
+    let solid = archives.iter().any(Archive::is_solid);
+    let selection = if solid {
+        volume_extract::VolumeSelection {
+            volume: 0,
+            first_file: 0,
+            members: index + 1,
+        }
+    } else {
+        volume_extract::VolumeSelection {
+            volume,
+            first_file: file,
+            members: 1,
+        }
+    };
     let mut output_indices = member_read::volume_output_indices(archives);
     let collected = std::sync::Arc::new(std::sync::Mutex::new(None::<Vec<u8>>));
-    extract_volume_payloads(archives, options, |meta| {
-        if output_indices.next() != Some(index) || meta.is_directory {
-            return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
-        }
-        let sink = SharedBuffer(std::sync::Arc::clone(&collected));
-        *sink.lock() = Some(Vec::new());
-        Ok(Box::new(sink) as Box<dyn Write>)
-    })?;
+    let (first, later) = archives[selection.volume..]
+        .split_first()
+        .expect("selected volume exists");
+    first.extract_volume_feed(
+        later.iter().cloned().map(Ok),
+        options,
+        &mut |_| {
+            if solid && output_indices.next() != Some(index) {
+                return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
+            }
+            let sink = SharedBuffer(std::sync::Arc::clone(&collected));
+            *sink.lock() = Some(Vec::new());
+            Ok(Box::new(sink) as Box<dyn Write>)
+        },
+        None,
+        volume_extract::VolumeInput::Selected(selection),
+    )?;
     let taken = collected
         .lock()
         .expect("member buffer mutex is not poisoned")
