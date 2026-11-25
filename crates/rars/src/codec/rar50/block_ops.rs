@@ -2,9 +2,9 @@
 //! as operations; replaying them in order resolves what earlier blocks decide.
 use super::{
     distance_from_slot_parts, distance_slot_bit_count, length_bonus, length_from_slot_parts,
-    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, DecodedChunk,
-    Error, PendingFilter, ReaderTables, Result, StreamDecodeError, StreamingOutput, LITERAL_BURST,
-    SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
+    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, Buffer,
+    DecodedChunk, Error, Overrun, PendingFilter, ReaderState, ReaderTables, Result,
+    StreamDecodeError, StreamingOutput, LITERAL_BURST, SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
 };
 use crate::read_control::Poller;
 use std::hint::select_unpredictable;
@@ -326,6 +326,305 @@ impl BlockOps {
     }
 }
 
+/// Where the buffered decoder writes a member: flat, with its filters kept for the end.
+pub(super) struct Flat<'a, B: Budget> {
+    pub(super) output: &'a mut Buffer<u8, B>,
+    pub(super) filters: &'a mut Buffer<PendingFilter, B>,
+    pub(super) output_size: usize,
+    pub(super) dictionary_size: usize,
+    pub(super) overrun: &'a mut Option<Overrun>,
+}
+
+// The most a replay allocates before the member has written anything.
+#[cfg(not(test))]
+const FIRST_ROOM: usize = 16 << 20;
+#[cfg(test)]
+const FIRST_ROOM: usize = 4 << 10;
+
+/// Writes a [`Flat`] output into zeroed room so most copies skip capacity and length checks.
+pub(super) struct Replay<'f, 'a, B: Budget> {
+    flat: &'f mut Flat<'a, B>,
+    // Bytes from here on are scratch that fixed-width copies may overwrite;
+    // at least SHORT_MATCH of them always follow.
+    pub(super) written: usize,
+}
+
+impl<'f, 'a, B: Budget> Replay<'f, 'a, B> {
+    /// Replaces the empty flat output with zeroed room.
+    pub(super) fn begin(flat: &'f mut Flat<'a, B>) -> Result<Self> {
+        debug_assert!(flat.output.is_empty());
+        let room = flat.output_size.min(FIRST_ROOM) + SHORT_MATCH;
+        *flat.output = Buffer::filled(room, 0, &flat.output.allowance())?;
+        Ok(Self { flat, written: 0 })
+    }
+
+    /// Cuts the room back so the flat output is what the serial decoder would hold.
+    pub(super) fn finish(self) {
+        self.flat.output.truncate(self.written);
+    }
+
+    pub(super) fn output_size(&self) -> usize {
+        self.flat.output_size
+    }
+
+    pub(super) fn full(&self) -> bool {
+        self.written >= self.flat.output_size
+    }
+
+    /// Copies this short need no check before they write.
+    #[inline(always)]
+    fn budget(&self) -> usize {
+        (self.flat.output.len() - SHORT_MATCH).min(self.flat.output_size) - self.written
+    }
+
+    /// Makes `count` more bytes fit; never asked past the declared size.
+    fn make_room(&mut self, count: usize) -> Result<()> {
+        if count <= self.budget() {
+            return Ok(());
+        }
+        // Doubles, as a growing Vec would, but never past the declared size.
+        let stored = self.flat.output.len() - SHORT_MATCH;
+        let room = (self.written + count)
+            .max(stored.saturating_mul(2))
+            .min(self.flat.output_size)
+            .max(self.written + count);
+        let mut grown = Buffer::filled(room + SHORT_MATCH, 0, &self.flat.output.allowance())?;
+        grown[..self.written].copy_from_slice(&self.flat.output[..self.written]);
+        *self.flat.output = grown;
+        Ok(())
+    }
+
+    /// Within [`Self::budget`], so a short run can over-copy a fixed width.
+    #[inline(always)]
+    fn push_literals(&mut self, literals: &[u8], count: usize) {
+        let at = self.written;
+        let out = &mut self.flat.output[..];
+        match literals.first_chunk::<SHORT_MATCH>() {
+            Some(bytes) if count <= SHORT_MATCH => {
+                out[at..at + SHORT_MATCH].copy_from_slice(bytes);
+            }
+            _ => out[at..at + count].copy_from_slice(&literals[..count]),
+        }
+        self.written += count;
+    }
+
+    /// As `ReaderState::copy_match`, a match reaching past the window writes zeroes.
+    #[inline(always)]
+    fn zero_fills(&self, state: &ReaderState<B>, distance: usize) -> bool {
+        distance == 0
+            || distance > self.flat.dictionary_size
+            || distance > state.history_window + self.written
+    }
+
+    /// Within [`Self::budget`], so no copy needs a capacity check.
+    #[inline(always)]
+    fn copy_in_room(
+        &mut self,
+        state: &ReaderState<B>,
+        distance: usize,
+        length: usize,
+        zero_fill: bool,
+    ) {
+        let at = self.written;
+        let out = &mut self.flat.output[..];
+        if zero_fill {
+            out[at..at + length].fill(0);
+        } else if distance <= at {
+            copy_from_output(out, at, distance, length);
+        } else {
+            let history_distance = distance - at;
+            let index = state.history.len() - history_distance;
+            if length <= SHORT_MATCH && history_distance >= SHORT_MATCH {
+                let bytes = state.history[index..]
+                    .first_chunk::<SHORT_MATCH>()
+                    .expect("history_distance covers the chunk");
+                out[at..at + SHORT_MATCH].copy_from_slice(bytes);
+            } else {
+                let take = length.min(history_distance);
+                out[at..at + take].copy_from_slice(&state.history[index..index + take]);
+                // The rest starts at this member's first byte.
+                if take < length {
+                    copy_from_output(out, at + take, distance, length - take);
+                }
+            }
+        }
+        self.written += length;
+    }
+
+    /// Reports the part past the declared size, as the serial decoder does.
+    fn copy_match(
+        &mut self,
+        state: &ReaderState<B>,
+        distance: usize,
+        length: usize,
+    ) -> Result<Option<Overrun>> {
+        let visible = length.min(self.flat.output_size - self.written);
+        self.make_room(visible)?;
+        let zero_fill = self.zero_fills(state, distance);
+        self.copy_in_room(state, distance, visible, zero_fill);
+        Ok(Overrun::of(distance, zero_fill, length - visible))
+    }
+}
+
+/// Needs SHORT_MATCH spare bytes past the match, which fixed-width copies overwrite.
+#[inline(always)]
+fn copy_from_output(out: &mut [u8], at: usize, distance: usize, length: usize) {
+    let source = at - distance;
+    if distance >= length {
+        if length <= SHORT_MATCH && distance >= SHORT_MATCH {
+            let bytes: [u8; SHORT_MATCH] = *out[source..]
+                .first_chunk()
+                .expect("distance covers the chunk");
+            out[at..at + SHORT_MATCH].copy_from_slice(&bytes);
+        } else {
+            out.copy_within(source..source + length, at);
+        }
+    } else if distance >= SHORT_MATCH {
+        // Each piece reads only bytes already written, so the overlap repeats.
+        for offset in (0..length).step_by(SHORT_MATCH) {
+            let bytes: [u8; SHORT_MATCH] = *out[source + offset..]
+                .first_chunk()
+                .expect("distance covers the chunk");
+            out[at + offset..at + offset + SHORT_MATCH].copy_from_slice(&bytes);
+        }
+    } else if distance == 1 {
+        let byte = out[source];
+        out[at..at + length].fill(byte);
+    } else {
+        // Copying what is already repeated doubles the run each time.
+        let mut done = 0;
+        while done < length {
+            let take = (length - done).min(at + done - source);
+            out.copy_within(source..source + take, at + done);
+            done += take;
+        }
+    }
+}
+
+/// Where a buffered replay stopped in its list.
+#[derive(PartialEq, Eq)]
+pub(super) enum Walked {
+    /// Every operation applied.
+    All,
+    /// At the end of a block's symbols, before the next block's.
+    BlockEnd,
+    Within,
+}
+
+impl BlockOps {
+    /// [`Self::apply`] for the buffered decoder, which owns the repeat state and history.
+    pub(super) fn apply_buffered<B: Budget>(
+        &self,
+        state: &mut ReaderState<B>,
+        out: &mut Replay<'_, '_, B>,
+        poller: &mut Poller,
+        reached: &mut Reached,
+    ) -> Result<Walked> {
+        let output_size = out.output_size();
+        let mut literals = self.literals.as_slice();
+        let mut block_filters = self.filters.iter();
+        let mut budget = out.budget();
+        for &op in &self.ops {
+            if out.full() {
+                return Ok(if op.tag() == BLOCK {
+                    Walked::BlockEnd
+                } else {
+                    Walked::Within
+                });
+            }
+            poller.check_codec(out.written)?;
+            let prefix = op.prefix();
+            // Strictly within the budget, so the output cannot have filled.
+            if prefix < budget {
+                out.push_literals(literals, prefix);
+                literals = &literals[prefix..];
+                reached.symbols += prefix;
+                budget -= prefix;
+            } else {
+                let visible = prefix.min(output_size - out.written);
+                out.make_room(visible)?;
+                out.push_literals(literals, visible);
+                literals = &literals[prefix..];
+                reached.symbols += visible;
+                if out.full() {
+                    return Ok(Walked::Within);
+                }
+                budget = out.budget();
+            }
+            let tag = op.tag();
+            match tag {
+                MATCH | REPEAT | REPEAT_LAST => {
+                    reached.symbols += 1;
+                    let index = if tag == MATCH { 3 } else { op.value() };
+                    let distance = if tag == MATCH {
+                        op.value()
+                    } else {
+                        pick(state.reps, index)
+                    };
+                    if tag == REPEAT {
+                        initialized(distance)?;
+                    }
+                    let length = if tag == REPEAT_LAST {
+                        state.last_length
+                    } else {
+                        op.length()
+                    };
+                    // Selects, as in `apply`: the kinds of symbol interleave at random.
+                    let [r0, r1, r2, r3] = state.reps;
+                    state.reps = [
+                        distance,
+                        select_unpredictable(index >= 1, r0, r1),
+                        select_unpredictable(index >= 2, r1, r2),
+                        select_unpredictable(index >= 3, r2, r3),
+                    ];
+                    state.last_length = length;
+                    if length <= budget {
+                        let zero_fill = out.zero_fills(state, distance);
+                        out.copy_in_room(state, distance, length, zero_fill);
+                        budget -= length;
+                    } else {
+                        *out.flat.overrun = out.copy_match(state, distance, length)?;
+                        budget = out.budget();
+                    }
+                }
+                LITERALS => {
+                    let (run, rest) = literals.split_at(op.value());
+                    literals = rest;
+                    let visible = run.len().min(output_size - out.written);
+                    reached.symbols += visible;
+                    for piece in run[..visible].chunks(LITERAL_POLL) {
+                        poller.check_codec(out.written)?;
+                        out.make_room(piece.len())?;
+                        out.push_literals(piece, piece.len());
+                    }
+                    if visible < run.len() {
+                        return Ok(Walked::Within);
+                    }
+                    budget = out.budget();
+                }
+                FILTER => {
+                    reached.symbols += 1;
+                    let mut filter = *block_filters.next().expect("one filter per filter op");
+                    filter.start = out
+                        .written
+                        .checked_add(filter.start)
+                        .ok_or(Error::InvalidData("RAR 5 filter start overflows"))?;
+                    out.flat.filters.try_push(filter)?;
+                }
+                REPEAT_CHECK => {
+                    initialized(pick(state.reps, op.value()))?;
+                }
+                BLOCK => {
+                    reached.blocks += 1;
+                    reached.symbols = 0;
+                }
+                tag => unreachable!("operation tag {tag}"),
+            }
+        }
+        Ok(Walked::All)
+    }
+}
+
 /// The replay's unchecked copies, which only replay can keep within a budget.
 impl<B: Budget> StreamingOutput<B> {
     /// Bytes that can be written before a flush, a growth, the output limit
@@ -475,4 +774,50 @@ fn initialized(distance: usize) -> Result<usize> {
         ));
     }
     Ok(distance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Allowance;
+    use super::*;
+
+    #[test]
+    fn replayed_matches_copy_as_one_byte_at_a_time_would() {
+        let allowance = Allowance::default();
+        let history: Vec<u8> = (0..200u32).map(|i| (i * 7 + 3) as u8).collect();
+        let head: Vec<u8> = (0..40u8).map(|i| i ^ 0x5a).collect();
+        // Distances past the head start in history; short ones overlap the match itself.
+        for distance in 1..=history.len() + head.len() {
+            for length in 0..=100 {
+                let mut state = ReaderState::new(&allowance);
+                state.history = Buffer::copied(&history, &allowance).unwrap();
+                state.history_window = history.len();
+                let mut output = Buffer::new(&allowance);
+                let mut filters = Buffer::new(&allowance);
+                let mut overrun = None;
+                let mut flat = Flat {
+                    output: &mut output,
+                    filters: &mut filters,
+                    output_size: head.len() + length,
+                    dictionary_size: 1 << 20,
+                    overrun: &mut overrun,
+                };
+                let mut out = Replay::begin(&mut flat).unwrap();
+                out.push_literals(&head, head.len());
+                let zero_fill = out.zero_fills(&state, distance);
+                out.copy_in_room(&state, distance, length, zero_fill);
+                out.finish();
+
+                let mut expected = [&history[..], &head[..]].concat();
+                for _ in 0..length {
+                    expected.push(expected[expected.len() - distance]);
+                }
+                assert_eq!(
+                    output.to_vec(),
+                    expected[history.len()..],
+                    "distance {distance}, length {length}"
+                );
+            }
+        }
+    }
 }

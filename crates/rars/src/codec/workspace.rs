@@ -26,7 +26,7 @@ impl Allowance {
     }
 }
 
-pub(crate) trait Budget: Clone + std::fmt::Debug + Send + Sync {
+pub(crate) trait Budget: Clone + std::fmt::Debug + Send + Sync + 'static {
     type Charge: std::fmt::Debug + Send + Sync;
     type Failure: Into<Error>;
     fn grow<T>(
@@ -356,6 +356,17 @@ impl<T, B: Budget> Buffer<T, B> {
             &mut self.charge,
             allocation_size::<T>(self.values.capacity())?,
         )
+    }
+    /// Lets the allocator move the values without a second copy alive, for
+    /// a budget that need not count both at once.
+    pub(crate) fn grow_in_place(&mut self, capacity: usize) -> Result<()> {
+        debug_assert!(!B::LIMITED);
+        if capacity <= self.values.capacity() {
+            return Ok(());
+        }
+        B::resize(&mut self.charge, allocation_size::<T>(capacity)?)?;
+        self.values.reserve_exact(capacity - self.values.len());
+        Ok(())
     }
     pub(crate) fn shrink_to(&mut self, capacity: usize) -> Result<()> {
         self.values.shrink_to(capacity);

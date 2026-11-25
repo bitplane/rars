@@ -1,6 +1,6 @@
 //! Pool threads decode batches of blocks to operations; the calling thread
 //! reads ahead and replays them, so output and errors match the serial decoder.
-use super::block_ops::{skip_symbols, BlockOps, Reached, Repeats, Stop};
+use super::block_ops::{skip_symbols, BlockOps, Reached, Repeats, Replay, Stop, Walked};
 use super::{
     read_compressed_block_salvaging, read_table_lengths_with_allowance,
     refuse_stream_past_declared, Budget, DecodedChunk, Error, OwnedCompressedBlock, PendingFilter,
@@ -15,14 +15,14 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 const MAX_AHEAD_BYTES: usize = 32 * 1024 * 1024;
 // Packed bytes that make a batch worth a task of its own.
 #[cfg(not(any(test, fuzzing)))]
-const BATCH_BYTES: usize = 256 * 1024;
+pub(super) const BATCH_BYTES: usize = 256 * 1024;
 #[cfg(any(test, fuzzing))]
-const BATCH_BYTES: usize = 256;
+pub(super) const BATCH_BYTES: usize = 256;
 
-type Tables<B> = Arc<ReaderTables<B>>;
+pub(super) type Tables<B> = Arc<ReaderTables<B>>;
 
 /// A block's own tables, or the ones before it, and where its symbols start.
-fn enter<B: Budget>(
+pub(super) fn enter<B: Budget>(
     block: &OwnedCompressedBlock<B>,
     algorithm_version: u8,
     previous: Option<&Tables<B>>,
@@ -40,12 +40,12 @@ fn enter<B: Budget>(
 }
 
 /// Operations for a batch's blocks up to `stop`, which ended block `index`.
-struct Decoded<B: Budget> {
-    ops: BlockOps,
-    index: usize,
-    stop: Stop,
+pub(super) struct Decoded<B: Budget> {
+    pub(super) ops: BlockOps,
+    pub(super) index: usize,
+    pub(super) stop: Stop,
     // The tables of each block begun, in order.
-    tables: Vec<Tables<B>>,
+    pub(super) tables: Vec<Tables<B>>,
 }
 
 enum Turn<B: Budget> {
@@ -55,9 +55,9 @@ enum Turn<B: Budget> {
 }
 
 /// Consecutive blocks decoded as one task.
-struct Batch<B: Budget> {
-    blocks: Vec<OwnedCompressedBlock<B>>,
-    algorithm_version: u8,
+pub(super) struct Batch<B: Budget> {
+    pub(super) blocks: Vec<OwnedCompressedBlock<B>>,
+    pub(super) algorithm_version: u8,
     // The tables in effect before the first block, if it needs them.
     inherited: Option<Tables<B>>,
     turn: Mutex<Turn<B>>,
@@ -65,8 +65,22 @@ struct Batch<B: Budget> {
 }
 
 impl<B: Budget> Batch<B> {
+    pub(super) fn new(
+        blocks: Vec<OwnedCompressedBlock<B>>,
+        algorithm_version: u8,
+        inherited: Option<Tables<B>>,
+    ) -> Self {
+        Self {
+            blocks,
+            algorithm_version,
+            inherited,
+            turn: Mutex::new(Turn::Queued),
+            ready: Condvar::new(),
+        }
+    }
+
     /// Decodes blocks from `index` on until one does not end cleanly.
-    fn decode_from(
+    pub(super) fn decode_from(
         &self,
         index: usize,
         ops: &mut BlockOps,
@@ -103,7 +117,7 @@ impl<B: Budget> Batch<B> {
     }
 
     /// A worker's turn: skipped if the batch was claimed or the decode ended.
-    fn run(&self, spare: &Mutex<Vec<BlockOps>>, abandoned: &AtomicBool) {
+    pub(super) fn run(&self, spare: &Mutex<Vec<BlockOps>>, abandoned: &AtomicBool) {
         {
             let mut turn = self.turn.lock().unwrap();
             if abandoned.load(Ordering::Relaxed) || !matches!(*turn, Turn::Queued) {
@@ -117,7 +131,7 @@ impl<B: Budget> Batch<B> {
     }
 
     /// Decodes here if no worker has started, so this never waits on idle work.
-    fn take(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded<B> {
+    pub(super) fn take(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded<B> {
         let mut turn = self.turn.lock().unwrap();
         loop {
             match std::mem::replace(&mut *turn, Turn::Running) {
@@ -187,13 +201,11 @@ impl<R: Read, B: Budget> Scan<'_, R, B> {
             }
         }
         let newest_tables = blocks.iter().rposition(|block| block.header.has_tables);
-        let batch = Arc::new(Batch {
+        let batch = Arc::new(Batch::new(
             blocks,
-            algorithm_version: self.algorithm_version,
-            inherited: self.inherited.clone(),
-            turn: Mutex::new(Turn::Queued),
-            ready: Condvar::new(),
-        });
+            self.algorithm_version,
+            self.inherited.clone(),
+        ));
         if let Some(index) = newest_tables {
             self.unparsed = Some((Arc::clone(&batch), index));
         }
@@ -202,7 +214,7 @@ impl<R: Read, B: Budget> Scan<'_, R, B> {
 }
 
 /// Just the workers, since idle threads of a larger pool spin-yield on every spawn; shared so concurrent members stay within them.
-fn decode_pool(workers: usize) -> Option<Arc<rayon::ThreadPool>> {
+pub(super) fn decode_pool(workers: usize) -> Option<Arc<rayon::ThreadPool>> {
     static POOLS: Mutex<DecodePools> = Mutex::new(DecodePools::new());
     POOLS
         .lock()
@@ -253,7 +265,7 @@ fn in_place_scope<'scope, R>(
 }
 
 // Counting the block itself bounds a run of empty blocks too.
-fn held_bytes<B: Budget>(block: &OwnedCompressedBlock<B>) -> usize {
+pub(super) fn held_bytes<B: Budget>(block: &OwnedCompressedBlock<B>) -> usize {
     block.payload.len() + std::mem::size_of::<OwnedCompressedBlock<B>>()
 }
 
@@ -262,7 +274,7 @@ fn batch_bytes<B: Budget>(batch: &Batch<B>) -> usize {
 }
 
 /// The serial decoder's check, from where it would have stopped in the newest block.
-fn refuse_past_declared_in_batch<B: Budget>(
+pub(super) fn refuse_past_declared_in_batch<B: Budget>(
     batch: &Batch<B>,
     tables: &[Tables<B>],
     reached: &Reached,
@@ -282,6 +294,74 @@ fn refuse_past_declared_in_batch<B: Budget>(
 }
 
 impl<B: Budget> ReaderState<B> {
+    /// Leaves `reached_tables` as the serial decoder would; true when every block was reached.
+    pub(super) fn replay_batch(
+        &mut self,
+        batch: &Batch<B>,
+        spare: &Mutex<Vec<BlockOps>>,
+        out: &mut Replay<'_, '_, B>,
+        reached_tables: &mut Option<Tables<B>>,
+    ) -> (Result<()>, bool) {
+        let mut poller = self.read_control.poller();
+        let Decoded {
+            mut ops,
+            mut index,
+            mut stop,
+            mut tables,
+        } = batch.take(spare);
+        let mut reached = Reached::default();
+        let mut in_symbols = false;
+        let replayed = loop {
+            let walked = match ops.apply_buffered(self, out, &mut poller, &mut reached) {
+                Ok(walked) => walked,
+                Err(error) => {
+                    in_symbols = true;
+                    break Err(error);
+                }
+            };
+            if out.full() {
+                // A block whose every symbol was replayed has nothing past the declared size.
+                if walked == Walked::BlockEnd
+                    || walked == Walked::All && matches!(stop, Stop::BlockEnd)
+                {
+                    break Ok(());
+                }
+                let refused = refuse_past_declared_in_batch(batch, &tables, &reached);
+                in_symbols = refused.is_err();
+                break refused;
+            }
+            ops.clear();
+            (index, stop) = match stop {
+                Stop::Failed(error) => {
+                    in_symbols = tables.len() > index;
+                    break Err(error);
+                }
+                Stop::Full(bit_pos) => {
+                    let block = &batch.blocks[index];
+                    let stop = ops.decode(
+                        &tables[tables.len() - 1],
+                        &block.payload,
+                        bit_pos,
+                        block.header.payload_bits,
+                    );
+                    (index, stop)
+                }
+                Stop::BlockEnd if index + 1 == batch.blocks.len() => break Ok(()),
+                Stop::BlockEnd => batch.decode_from(index + 1, &mut ops, &mut tables),
+            };
+        };
+        if let Some(reached) = reached.blocks.checked_sub(1) {
+            *reached_tables = Some(Arc::clone(&tables[reached]));
+        }
+        if in_symbols {
+            *reached_tables = None;
+        }
+        if let Ok(mut spare) = spare.lock() {
+            spare.push(ops);
+        }
+        (replayed, reached.blocks == batch.blocks.len())
+    }
+
     pub(super) fn decode_blocks_ahead<E>(
         &mut self,
         workers: usize,
@@ -297,7 +377,7 @@ impl<B: Budget> ReaderState<B> {
             distances: &mut self.reps,
             last_length: &mut self.last_length,
         };
-        let mut reached_tables = self.tables.take().map(Arc::new);
+        let mut reached_tables = self.tables.take();
         let mut scan = Scan {
             input,
             algorithm_version,
@@ -399,11 +479,7 @@ impl<B: Budget> ReaderState<B> {
 
         // A solid successor continues from the last block replayed, not the last scanned.
         drop(scan);
-        self.tables = match reached_tables.map(Arc::try_unwrap) {
-            Some(Ok(tables)) => Some(tables),
-            Some(Err(shared)) => Some(shared.try_clone()?),
-            None => None,
-        };
+        self.tables = reached_tables;
         result
     }
 }

@@ -33,8 +33,9 @@ where
     let mut skip = 0;
     loop {
         let mut resume = None;
-        let count = volume.files().count();
-        for (index, file) in volume.files().enumerate().skip(skip) {
+        let files: Vec<&FileHeader> = volume.files().collect();
+        let count = files.len();
+        for (index, &file) in files.iter().enumerate().skip(skip) {
             options.check_cancelled()?;
             if file.is_split_before() || file.is_split_after() {
                 // Split members are terminal, so keep admission ahead of their
@@ -112,6 +113,7 @@ where
                 options.check_cancelled()?;
                 continue;
             }
+            session.read_ahead(&volume, &files, index);
             let result = (|| {
                 file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
                 file.check_output_limit(&budget)?;
@@ -142,6 +144,7 @@ where
                 None => {}
             }
         }
+        session.end_volume();
         if let Some(last) = resume {
             // A continuation is always the first file of its volume.
             volume = last;

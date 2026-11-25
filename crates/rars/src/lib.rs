@@ -239,15 +239,19 @@ pub struct ArchiveReadOptions<'a> {
     /// codec calls are outside its scope. Earlier members may already be emitted
     /// when a later member exceeds the limit; its output callback is not opened.
     pub rar50_dictionary_size_limit: Option<u64>,
-    /// The most pool threads that decode one streamed RAR5/7 member's blocks
-    /// ahead of its output; zero decodes on the calling thread alone. Unset
+    /// The most pool threads that decode RAR5/7 blocks ahead of the output:
+    /// one streamed member's, and in a solid archive, the members after the
+    /// one being written; zero decodes on the calling thread alone. Unset
     /// uses one fewer than the pool's threads, at most eight.
     ///
     /// Output, errors and the point where a damaged member stops are the same
     /// at every setting. Each worker holds one batch of blocks, about 256 KiB
     /// packed (a single larger block is at most 16 MiB), and up to 8 MiB of
-    /// decoded operations; about 32 MiB of packed input is read ahead at most.
-    /// Members at or below `rar50_buffered_decode_limit`, readers with
+    /// decoded operations. About 32 MiB of a streamed member's packed input
+    /// is read ahead at most. A solid archive's later members are read ahead
+    /// up to three more than there are workers, while their packed input and
+    /// decoded operations stay under about 12 MiB; one larger member is still
+    /// taken. Buffered members of an archive that is not solid, readers with
     /// `max_reader_workspace_bytes` and calls made from inside the thread pool
     /// decode serially. Needs the `parallel` feature.
     pub rar50_decode_workers: Option<usize>,

@@ -108,18 +108,29 @@ impl OutputBudget {
             sink_error: None,
         };
         let result = work(&mut guarded);
+        let (exceeded, sink_error) = (guarded.exceeded, guarded.sink_error);
+        self.conclude(name, exceeded, sink_error, result)
+    }
+
+    /// Shared with a member written on another thread, so its errors read as [`Self::run`]'s.
+    pub(crate) fn conclude<T>(
+        &self,
+        name: &[u8],
+        exceeded: Option<Error>,
+        sink_error: Option<Error>,
+        result: Result<T>,
+    ) -> Result<T> {
         // Older decoders/error adapters may wrap or replace the sentinel. Keep
         // the refusal out of band so it cannot become bad-password/checksum/I/O.
         // Also preserve destination failures that legacy codecs turn into
         // generic decode errors, including the original I/O source.
-        match (guarded.exceeded, guarded.sink_error) {
+        match (exceeded, sink_error) {
             (Some(error), _) => Err(error.at_entry(name.to_vec(), "limiting output")),
             (None, Some(error)) => Err(error.at_entry(name.to_vec(), "extracting")),
-            (None, None) => guarded
-                .budget
+            (None, None) => self
                 .control
                 .finish(result)
-                .and_then(|value| guarded.budget.control.check().map(|()| value))
+                .and_then(|value| self.control.check().map(|()| value))
                 .map_err(|error| {
                     if error.kind() == crate::ErrorKind::Cancelled
                         && error.entry_context().is_none()
