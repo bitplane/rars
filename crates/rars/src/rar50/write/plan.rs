@@ -7,7 +7,7 @@ use crate::{Result, WriterResources};
 
 /// How much of a run one filter search covers when a member is too large to
 /// search whole. Larger dictionaries make longer runs, and this keeps each
-/// search inside the default planning limit at every level.
+/// search inside the default routing limit at every level.
 pub(super) const FILTER_SEARCH_BYTES: usize = 4 * 1024 * 1024;
 
 #[cfg(test)]
@@ -53,8 +53,9 @@ pub(super) fn with_filter_search_bytes<T: Send>(bytes: usize, run: impl FnOnce()
 }
 
 /// The most one filter search covers: a run, or a piece of one.
-fn search_piece(settings: &CompressPlan) -> u64 {
-    super::compress::run_size(settings).min(filter_search_bytes()) as u64
+fn search_piece(options: EncodeOptions) -> u64 {
+    super::compress::run_size_for_distance(options.max_match_distance).min(filter_search_bytes())
+        as u64
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,9 +126,9 @@ impl ExecutionPlan {
         sizes: impl ExactSizeIterator<Item = u64>,
         resources: &WriterResources,
     ) -> Result<Self> {
-        // Output follows from these decisions, so they use the budget for one
-        // job, which a thread count never changes.
-        let limit = resources.planning_memory_limit();
+        // The default routing threshold stays at 256 MiB to preserve
+        // whole-member and filter choices as the dictionary budget changes.
+        let limit = resources.routing_memory_limit();
         // Select the requested mode before estimating its active workspace.
         if settings.method == 0 {
             return Ok(Self::Stored);
@@ -145,7 +146,10 @@ impl ExecutionPlan {
             // A solid chain cannot search a member whole: its members code
             // against each other. It searches each run on its own instead, as
             // a member too large to search whole does, when that fits.
-            let search = whole_member_workspace(largest.min(search_piece(settings)), settings);
+            let search = whole_member_workspace(
+                largest.min(search_piece(settings.encode_options)),
+                settings,
+            );
             let run_filters =
                 settings.solid && settings.filter_policy == FilterPolicy::Auto && search <= limit;
             return Ok(Self::Blocks {
@@ -154,7 +158,12 @@ impl ExecutionPlan {
                 } else {
                     workspace
                 },
-                admission: block_admission(settings, true, largest, run_filters),
+                admission: block_admission(
+                    workspace,
+                    settings.encode_options,
+                    largest,
+                    run_filters,
+                ),
                 run_filters,
             });
         }
@@ -217,7 +226,7 @@ impl ExecutionPlan {
                 settings,
                 size,
                 FallbackReason::InPlace,
-                resources.planning_memory_limit(),
+                resources.routing_memory_limit(),
             );
         }
     }
@@ -238,7 +247,8 @@ impl MemberPlan {
         // search each run as if it were a member of its own when that fits; an
         // explicit filter is coded the same way, without the search, so it is
         // charged the same.
-        let search = whole_member_workspace(size.min(search_piece(settings)), settings);
+        let search =
+            whole_member_workspace(size.min(search_piece(settings.encode_options)), settings);
         let run_filters =
             search <= limit || matches!(settings.filter_policy, FilterPolicy::Explicit(_));
         Self {
@@ -251,7 +261,7 @@ impl MemberPlan {
             } else {
                 blocks
             },
-            admission: block_admission(settings, false, size, run_filters),
+            admission: block_admission(blocks, settings.encode_options, size, run_filters),
         }
     }
 }
@@ -303,10 +313,8 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
     )
 }
 
-/// What one block job is admitted for when the writer decides how many run at
-/// once: the budget divided by this, up to the thread count. Unlike the
-/// planning charges above, it decides nothing about the output, so it can
-/// follow what a job holds rather than what a member would hold coded whole.
+/// What one block job holds, for fitting the dictionary and admitting jobs
+/// against the memory budget.
 ///
 /// A job's peak is the larger of its two phases, plus what the coordinator
 /// keeps for it through both:
@@ -317,12 +325,10 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
 /// - **Searching its filters.** One search at a time per job, over a piece of
 ///   at most [`FILTER_SEARCH_BYTES`] coded without history: the same parts
 ///   over the piece, plus its filtered copy and the packed finalists. The
-///   planning charge prices this search as a whole member, with the tree's
-///   coefficients and four copies of the piece, which is why a filtered job
-///   was charged 247 MiB at a 4 MiB dictionary while peaking near 130.
+///   routing estimate prices this search as a whole member, with the tree's
+///   coefficients and four copies of the piece.
 /// - **Held by the coordinator.** The member's history kept for its next run,
-///   and the run's bytes while its filters are searched. The planning charge
-///   leaves these out, and at 16 MiB they took a single job past it.
+///   and the run's bytes while its filters are searched.
 ///
 /// Live allocation peaks in MiB, counted by a global allocator over a whole
 /// write at one thread, where each wave holds one job, on members two and a
@@ -340,40 +346,34 @@ fn streaming_workspace(settings: &CompressPlan, include_candidates: bool, input:
 /// three-symbol noise        133.7            178.4           268.2
 /// filter search alone       133.4            143.3           167.3
 /// charged here           159 (151 unfiltered)  195           283
-/// planning charge        247 (143 unfiltered)  247 (179)     251
 /// ```
 ///
 /// Several jobs of one member share a window, so a wave of them peaks below
 /// as many lone jobs: at four threads, two-symbol noise peaked at 117.8 MiB a
 /// job at level 3, and 225.7 at level 5. A wave still reserves this for every
 /// job it could hold.
-///
-/// At level 5 this is above the planning charge and the planning limit, so
-/// one thread's default budget, [`crate::DEFAULT_WRITER_MEMORY_LIMIT`], is
-/// this charge for level 5 rather than that limit. A smaller budget gives a
-/// lone job the whole of it, and on noise the job peaks past it. What glibc
-/// keeps after a free is not counted here, as in the other charges.
 pub(super) fn block_admission(
-    settings: &CompressPlan,
-    include_candidates: bool,
+    code: u64,
+    options: EncodeOptions,
     input: u64,
     run_filters: bool,
 ) -> u64 {
-    let code = streaming_workspace(settings, include_candidates, input);
+    let run = super::compress::run_size_for_distance(options.max_match_distance) as u64;
     let search = if run_filters {
-        let piece = input.min(search_piece(settings));
+        let piece = input.min(search_piece(options));
         super::streaming_lz_workspace(
             piece,
             piece.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize,
-            settings.encode_options.optimal_parse,
+            options.optimal_parse,
         )
         .saturating_add(piece.saturating_mul(2))
     } else {
         0
     };
-    let history = (settings.encode_options.max_match_distance as u64).min(input);
-    let run = (super::compress::run_size(settings) as u64).min(input);
-    code.max(search).saturating_add(history).saturating_add(run)
+    let history = (options.max_match_distance as u64).min(input);
+    code.max(search)
+        .saturating_add(history)
+        .saturating_add(run.min(input))
 }
 
 #[derive(Debug)]
@@ -462,12 +462,12 @@ mod tests {
             }
         );
         // Charged for one run's filter search, which is smaller than the member.
-        let search = whole_member_workspace(search_piece(&settings), &settings);
+        let search = whole_member_workspace(search_piece(settings.encode_options), &settings);
         assert_eq!(below.members()[0].workspace, search);
         assert!(search < required);
 
         // A member no longer than one search cannot search a part of itself.
-        let size = search_piece(&settings);
+        let size = search_piece(settings.encode_options);
         let required = whole_member_workspace(size, &settings);
         let below = ExecutionPlan::new(&settings, [size].into_iter(), required - 1);
         assert!(matches!(
@@ -510,7 +510,7 @@ mod tests {
         let mut settings = settings();
         let delta = crate::FilterKind::Delta { channels: 1 };
         settings.filter_policy = FilterPolicy::Explicit(crate::FilterSpec::whole(delta));
-        let size = 2 * search_piece(&settings);
+        let size = 2 * search_piece(settings.encode_options);
         let required = whole_member_workspace(size, &settings);
         let at_limit = ExecutionPlan::new(&settings, [size].into_iter(), required);
         assert_eq!(at_limit.members()[0].execution, Execution::WholeMember);
@@ -575,7 +575,7 @@ mod tests {
         settings.solid = true;
         let sizes = || [3 * 1024 * 1024u64, 5 * 1024 * 1024].into_iter();
         let streaming = streaming_workspace(&settings, true, 8 * 1024 * 1024);
-        let search = whole_member_workspace(search_piece(&settings), &settings);
+        let search = whole_member_workspace(search_piece(settings.encode_options), &settings);
         assert!(search > streaming);
 
         // The search is charged beside the chain, and decides nothing about
@@ -657,7 +657,7 @@ mod tests {
                 Execution::Blocks {
                     fallback: FallbackReason::AutomaticFilterWorkspace {
                         required: whole_member_workspace(size, &settings),
-                        limit: DEFAULT_WRITER_PLANNING_LIMIT,
+                        limit: resources.routing_memory_limit(),
                     },
                     run_filters: true,
                 }
@@ -740,14 +740,12 @@ mod tests {
         }
         assert_eq!(largest.1, 5);
         assert_eq!(largest.0.next_multiple_of(MIB), DEFAULT_WRITER_MEMORY_LIMIT);
-        // Planning stays where it was, below what the job is admitted for.
-        assert!(DEFAULT_WRITER_PLANNING_LIMIT < largest.0);
+        assert_eq!(
+            largest.0.next_multiple_of(MIB),
+            DEFAULT_WRITER_PLANNING_LIMIT
+        );
     }
 
-    /// A default `WriterResources` at one thread holds a level 5 block job for
-    /// its whole `block_admission` charge, where the planning limit alone
-    /// would have clamped it to the budget. The plan is the one an explicit
-    /// planning-limit budget makes, so the archive is unchanged.
     #[test]
     fn one_default_thread_admits_a_level_5_job_unclamped() {
         let resources = WriterResources::with_default_planning(DEFAULT_WRITER_MEMORY_LIMIT);
@@ -761,12 +759,38 @@ mod tests {
         assert_eq!(permit.bytes(), admission);
         drop(permit);
 
-        let explicit = WriterResources::default().with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
-        let (planned, _) = default_job(5, false, &explicit);
-        assert_eq!(planned.dictionary_size, settings.dictionary_size);
-        assert_eq!(planned.encode_options, settings.encode_options);
-        // At that budget the same job is clamped to all of it.
-        assert!(admission > explicit.memory_limit());
+        let tight = WriterResources::default().with_memory_limit(admission - 1);
+        let (planned, charge) = default_job(5, false, &tight);
+        assert_eq!(planned.dictionary_size, settings.dictionary_size / 2);
+        assert!(charge <= tight.memory_limit());
+    }
+
+    #[test]
+    fn default_planning_keeps_the_whole_member_threshold() {
+        const MIB: u64 = 1024 * 1024;
+        let resources = WriterResources::with_default_planning(DEFAULT_WRITER_MEMORY_LIMIT);
+        let (settings, _) = default_job(3, false, &resources);
+        let size = 8 * MIB;
+        let required = whole_member_workspace(size, &settings);
+        assert!(required > 256 * MIB && required <= DEFAULT_WRITER_PLANNING_LIMIT);
+        let default_with_limit = resources.with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
+        for resources in [WriterResources::default(), default_with_limit] {
+            let plan =
+                ExecutionPlan::with_resources(&settings, [size].into_iter(), &resources).unwrap();
+            assert_eq!(
+                plan.members()[0].execution,
+                Execution::Blocks {
+                    fallback: FallbackReason::AutomaticFilterWorkspace {
+                        required,
+                        limit: 256 * MIB,
+                    },
+                    run_filters: true,
+                }
+            );
+        }
+        let custom =
+            ExecutionPlan::new(&settings, [size].into_iter(), DEFAULT_WRITER_PLANNING_LIMIT);
+        assert_eq!(custom.members()[0].execution, Execution::WholeMember);
     }
 
     #[test]

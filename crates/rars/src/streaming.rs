@@ -16,20 +16,19 @@ use std::sync::{Arc, Condvar, Mutex};
 ///
 /// What the largest job a default writer plans is admitted for: a RAR 5 level 5
 /// block job at its fitted 16 MiB dictionary with filters searched, so one
-/// thread holds that job whole. A test pins it to that job's admission charge.
-/// What gets written is planned within [`DEFAULT_WRITER_PLANNING_LIMIT`]
-/// instead, which is lower: a job's admission also counts what the coordinator
-/// holds for it, which decides nothing about the output.
-pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = 283 * 1024 * 1024;
+/// thread can admit that job in full.
+pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = DEFAULT_WRITER_PLANNING_LIMIT;
 
-/// The budget for one job that a default writer plans within (256 MiB).
+/// The budget for fitting a RAR 5 or RAR 7 dictionary with default resources
+/// (283 MiB).
 ///
-/// It decides what gets written: each RAR 5 level's dictionary, and whether a
-/// member is coded whole. A default [`WriterResources`] plans within it at every
-/// thread count, and keeps planning within it when
-/// [`WriterResources::with_memory_limit`] gives a budget at or above it, so
-/// neither changes the archive.
-pub const DEFAULT_WRITER_PLANNING_LIMIT: u64 = 256 * 1024 * 1024;
+/// This covers a full block job's admission charge, including the workspace
+/// held by the coordinator. The budget is the same at every thread count.
+/// Default resources use a separate 256 MiB threshold for whole-member coding
+/// and filter routing to preserve the archive bytes.
+pub const DEFAULT_WRITER_PLANNING_LIMIT: u64 = 283 * 1024 * 1024;
+
+const DEFAULT_WRITER_ROUTING_LIMIT: u64 = 256 * 1024 * 1024;
 
 /// What each worker thread past the first adds to the default budget: one RAR 5
 /// block job at the default level and dictionary, so every thread can hold one.
@@ -301,8 +300,8 @@ impl WriteCancellation {
 /// bare-WASM spool payload and index capacity, excluding other writer memory.
 pub struct WriterResources {
     memory_limit: u64,
-    /// The budget for one job, which decides what gets written.
     planning_limit: u64,
+    routing_limit: u64,
     temp_dir: Option<Arc<PathBuf>>,
     budget: Arc<MemoryBudget>,
     spool_budget: Option<Arc<StorageBudget>>,
@@ -328,19 +327,20 @@ impl WriterResources {
     pub(crate) fn with_default_planning(memory_limit: u64) -> Self {
         let mut resources = Self::new(memory_limit);
         resources.planning_limit = DEFAULT_WRITER_PLANNING_LIMIT.min(memory_limit);
+        resources.routing_limit = DEFAULT_WRITER_ROUTING_LIMIT.min(memory_limit);
         resources
     }
 
     /// A budget of `memory_limit`, with each job planned within the same limit.
     ///
     /// Unlike [`WriterResources::default`], which plans within
-    /// [`DEFAULT_WRITER_PLANNING_LIMIT`], the budget here also decides what
-    /// gets written, so `new(DEFAULT_WRITER_MEMORY_LIMIT)` can write a
-    /// different archive from the default.
+    /// [`DEFAULT_WRITER_PLANNING_LIMIT`] and caps whole-member coding and filter
+    /// routing at 256 MiB, this uses `memory_limit` for both decisions.
     pub fn new(memory_limit: u64) -> Self {
         Self {
             memory_limit,
             planning_limit: memory_limit,
+            routing_limit: memory_limit,
             temp_dir: None,
             budget: Arc::new(MemoryBudget::new(memory_limit)),
             spool_budget: None,
@@ -363,6 +363,7 @@ impl WriterResources {
     pub fn with_memory_limit(mut self, limit: u64) -> Self {
         self.memory_limit = limit;
         self.planning_limit = self.planning_limit.min(limit);
+        self.routing_limit = self.routing_limit.min(limit);
         self.budget = Arc::new(MemoryBudget::new(limit));
         self
     }
@@ -586,11 +587,14 @@ impl WriterResources {
         self.memory_limit
     }
 
-    /// What one job may plan to use: the dictionary it fits and how it splits
-    /// a member are decided within this, so the output never depends on how
-    /// many jobs run at once.
+    /// The one-job budget for fitting the dictionary.
     pub(crate) fn planning_memory_limit(&self) -> u64 {
         self.planning_limit
+    }
+
+    /// The one-job threshold for whole-member coding and per-run filters.
+    pub(crate) fn routing_memory_limit(&self) -> u64 {
+        self.routing_limit
     }
 
     pub fn temp_dir(&self) -> Option<&Path> {
@@ -1256,12 +1260,16 @@ mod tests {
             raised.planning_memory_limit(),
             DEFAULT_WRITER_PLANNING_LIMIT
         );
-        // Between the planning limit and the one-thread default, as an explicit
-        // 256 MiB is, the archive is still the default one.
-        let between = WriterResources::default().with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
+        assert_eq!(raised.routing_memory_limit(), DEFAULT_WRITER_ROUTING_LIMIT);
+        let at_default =
+            WriterResources::default().with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
         assert_eq!(
-            between.planning_memory_limit(),
+            at_default.planning_memory_limit(),
             DEFAULT_WRITER_PLANNING_LIMIT
+        );
+        assert_eq!(
+            at_default.routing_memory_limit(),
+            DEFAULT_WRITER_ROUTING_LIMIT
         );
         let one_thread =
             WriterResources::with_default_planning(scaled_writer_memory_limit(1, None));
@@ -1273,6 +1281,7 @@ mod tests {
         let lowered = WriterResources::default().with_memory_limit(64 * MIB);
         assert_eq!(lowered.memory_limit(), 64 * MIB);
         assert_eq!(lowered.planning_memory_limit(), 64 * MIB);
+        assert_eq!(lowered.routing_memory_limit(), 64 * MIB);
         let quota = WriterResources::default()
             .with_max_memory_bytes(MIB)
             .with_memory_limit(512 * MIB);
