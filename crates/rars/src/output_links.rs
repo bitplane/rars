@@ -58,8 +58,8 @@ where
 /// on a worker thread, and members after it opened before it is verified.
 ///
 /// `settled(meta, verified)` follows every call to `open`, on the calling
-/// thread and in archive order: `true` once that member is written, verified
-/// and its output dropped, `false` when the open or the member failed, before
+/// thread and in archive order: `true` once that member is written, verified,
+/// flushed and its output dropped, `false` when the open or the member failed, before
 /// the member error handler hears of it. An error from `settled` is the
 /// member's own. A link is reported once every member opened before it has
 /// settled, and before any member after it is opened. Only a member that has

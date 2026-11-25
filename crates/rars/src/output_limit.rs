@@ -99,6 +99,29 @@ impl OutputBudget {
         writer: W,
         work: impl FnOnce(&mut LimitedWriter<'_, W>) -> Result<T>,
     ) -> Result<T> {
+        self.guard(name, writer, false, work)
+    }
+
+    /// [`Self::run`] for a member's own writer. `work` writes the member and
+    /// checks it; once it has passed, the writer is flushed, so a flush means
+    /// the member is complete and verified. A member that fails is not
+    /// flushed, and a flush error fails the member as a write error does.
+    pub(crate) fn write_member<W: Write, T>(
+        &mut self,
+        name: &[u8],
+        writer: W,
+        work: impl FnOnce(&mut LimitedWriter<'_, W>) -> Result<T>,
+    ) -> Result<T> {
+        self.guard(name, writer, true, work)
+    }
+
+    fn guard<W: Write, T>(
+        &mut self,
+        name: &[u8],
+        writer: W,
+        flush: bool,
+        work: impl FnOnce(&mut LimitedWriter<'_, W>) -> Result<T>,
+    ) -> Result<T> {
         self.control.check()?;
         let mut guarded = LimitedWriter {
             writer,
@@ -107,7 +130,12 @@ impl OutputBudget {
             exceeded: None,
             sink_error: None,
         };
-        let result = work(&mut guarded);
+        let result = work(&mut guarded).and_then(|value| {
+            if flush {
+                guarded.flush()?;
+            }
+            Ok(value)
+        });
         let (exceeded, sink_error) = (guarded.exceeded, guarded.sink_error);
         self.conclude(name, exceeded, sink_error, result)
     }

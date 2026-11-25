@@ -21,6 +21,8 @@ enum Outcome {
 struct Job<B: Budget> {
     writer: Box<dyn Write + Send>,
     data: Buffer<u8, B>,
+    /// The member passed its checks, so its writer is flushed once written.
+    verified: bool,
 }
 
 struct Done {
@@ -74,8 +76,13 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         let thread = std::thread::Builder::new()
             .name("rars-write".into())
             .spawn(move || {
-                for Job { mut writer, data } in queued {
-                    let outcome = write_member(&control, &mut *writer, &data);
+                for Job {
+                    mut writer,
+                    data,
+                    verified,
+                } in queued
+                {
+                    let outcome = write_member(&control, &mut *writer, &data, verified);
                     drop(writer);
                     drop(data);
                     let cancelled = control.check().is_err();
@@ -171,7 +178,11 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         };
         let jobs = self.jobs.as_ref().expect("taken only on drop");
         // A send fails only once the thread has gone, which `settle` reports.
-        let _ = jobs.send(Job { writer, data });
+        let _ = jobs.send(Job {
+            writer,
+            data,
+            verified: verified.is_ok(),
+        });
         self.pending = Some(Pending {
             file,
             meta,
@@ -223,8 +234,14 @@ impl<B: Budget> Drop for Lane<'_, '_, '_, B> {
     }
 }
 
-/// `LimitedWriter`'s writes for a member under no output limit.
-fn write_member(control: &ReadControl, writer: &mut dyn Write, mut bytes: &[u8]) -> Outcome {
+/// `LimitedWriter`'s writes for a member under no output limit, then the
+/// flush [`OutputBudget::write_member`] gives a verified member.
+fn write_member(
+    control: &ReadControl,
+    writer: &mut dyn Write,
+    mut bytes: &[u8],
+    verified: bool,
+) -> Outcome {
     while !bytes.is_empty() {
         if control.check().is_err() {
             return Outcome::Cancelled;
@@ -239,6 +256,14 @@ fn write_member(control: &ReadControl, writer: &mut dyn Write, mut bytes: &[u8])
             Ok(written) => bytes = &bytes[written..],
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(error) => return Outcome::Sink(error),
+        }
+    }
+    if verified {
+        if control.check().is_err() {
+            return Outcome::Cancelled;
+        }
+        if let Err(error) = writer.flush() {
+            return Outcome::Sink(error);
         }
     }
     Outcome::Written

@@ -119,7 +119,7 @@ where
                 file.check_output_limit(&budget)?;
                 let mut writer = open(&meta)?;
                 options.check_cancelled()?;
-                budget.run(&file.name, &mut writer, |writer| {
+                budget.write_member(&file.name, &mut writer, |writer| {
                     session.write_file_to(&volume, file, writer)
                 })
             })();
@@ -286,7 +286,7 @@ where
     };
     let mut writer = open(&meta)?;
     budget
-        .run(&first.name, &mut writer, |mut writer| {
+        .write_member(&first.name, &mut writer, |mut writer| {
             if first.is_stored() {
                 let allowance = session.allowance.clone();
                 return write_stored(

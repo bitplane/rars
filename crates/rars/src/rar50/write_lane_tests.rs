@@ -14,12 +14,15 @@ enum Event {
 struct Log {
     files: Vec<(Vec<u8>, Vec<u8>)>,
     events: Vec<Event>,
+    /// Each output flushed, in the order of the flushes.
+    flushes: Vec<Vec<u8>>,
     wrote_elsewhere: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
 enum Fault {
     Refuse,
+    RefuseFlush,
     Panic,
 }
 
@@ -35,7 +38,7 @@ impl Write for Output {
         match self.fault {
             Some(Fault::Refuse) => return Err(std::io::Error::other("refused")),
             Some(Fault::Panic) => panic!("output panicked"),
-            None => {}
+            Some(Fault::RefuseFlush) | None => {}
         }
         let mut log = self.log.lock().unwrap();
         log.wrote_elsewhere |= std::thread::current().id() != self.caller;
@@ -44,13 +47,20 @@ impl Write for Output {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        let mut log = self.log.lock().unwrap();
+        let name = log.files[self.index].0.clone();
+        log.flushes.push(name);
+        match self.fault {
+            Some(Fault::RefuseFlush) => Err(std::io::Error::other("flush refused")),
+            _ => Ok(()),
+        }
     }
 }
 
 struct Run {
     files: Vec<(Vec<u8>, Vec<u8>)>,
     events: Vec<Event>,
+    flushes: Vec<Vec<u8>>,
     error: Option<String>,
     wrote_elsewhere: bool,
 }
@@ -152,6 +162,7 @@ fn run(archive: &Archive, threads: usize, setup: Setup<'_>) -> Run {
     Run {
         files: log.files,
         events: log.events,
+        flushes: log.flushes,
         error: result.err().map(|error| error.to_string()),
         wrote_elsewhere: log.wrote_elsewhere,
     }
@@ -167,7 +178,26 @@ fn assert_lane_matches_serial(archive: &Archive, setup: Setup<'_>) -> Run {
     );
     assert_eq!(lane.files, serial.files, "outputs");
     assert_eq!(lane.error, serial.error, "error");
+    assert_eq!(lane.flushes, serial.flushes, "flushes");
+    assert_flushed_once_verified(&lane, setup);
     lane
+}
+
+/// Each member that settles verified was flushed exactly once, and no other
+/// member was, except one whose flush is what failed it.
+fn assert_flushed_once_verified(run: &Run, setup: Setup<'_>) {
+    let refused_flush = setup
+        .faulty
+        .filter(|(_, fault)| *fault == Fault::RefuseFlush)
+        .map(|(name, _)| name);
+    for event in &run.events {
+        let Event::Settled(name, verified) = event else {
+            continue;
+        };
+        let flushes = run.flushes.iter().filter(|seen| *seen == name).count();
+        let expected = usize::from(*verified || refused_flush == Some(name.as_slice()));
+        assert_eq!(flushes, expected, "{name:?} settled {verified}");
+    }
 }
 
 #[test]
@@ -176,25 +206,30 @@ fn a_solid_chain_is_written_off_the_calling_thread_as_it_is_serially() {
     let lane = assert_lane_matches_serial(&archive(&members), Setup::default());
     assert_eq!(lane.files, members);
     assert!(lane.wrote_elsewhere);
+    let names: Vec<_> = members.iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(lane.flushes, names);
 }
 
 #[test]
 fn an_output_that_fails_settles_as_it_does_serially() {
     let members = members();
     let archive = archive(&members);
-    for failing in [0, 1, 9, members.len() - 1] {
-        let name = members[failing].0.as_slice();
-        for action in [
-            ExtractionErrorAction::Abort,
-            ExtractionErrorAction::Continue,
-        ] {
-            let setup = Setup {
-                faulty: Some((name, Fault::Refuse)),
-                action: Some(action),
-                ..Setup::default()
-            };
-            let lane = assert_lane_matches_serial(&archive, setup);
-            assert!(lane.events.contains(&Event::Handled(name.to_vec())));
+    for fault in [Fault::Refuse, Fault::RefuseFlush] {
+        for failing in [0, 1, 9, members.len() - 1] {
+            let name = members[failing].0.as_slice();
+            for action in [
+                ExtractionErrorAction::Abort,
+                ExtractionErrorAction::Continue,
+            ] {
+                let setup = Setup {
+                    faulty: Some((name, fault)),
+                    action: Some(action),
+                    ..Setup::default()
+                };
+                let lane = assert_lane_matches_serial(&archive, setup);
+                assert!(lane.events.contains(&Event::Handled(name.to_vec())));
+                assert!(lane.events.contains(&Event::Settled(name.to_vec(), false)));
+            }
         }
     }
 }

@@ -93,7 +93,7 @@ where
                 budget.check(u64::from(entry.header.unp_size), &meta.name)?;
                 let mut writer = open(&meta)?;
                 options.check_cancelled()?;
-                budget.run(&meta.name, &mut writer, |mut writer| {
+                budget.write_member(&meta.name, &mut writer, |mut writer| {
                     entry
                         .write_compressed_to(&volume, password, &mut unpack15, solid, &mut writer)
                         .map_err(|error| entry.entry_error("extracting", error))?;
@@ -228,7 +228,7 @@ where
     let mut writer = open(&meta)?;
     options.check_cancelled()?;
     budget
-        .run(&meta.name, &mut writer, |mut writer| {
+        .write_member(&meta.name, &mut writer, |mut writer| {
             let mut checksum = Rar13Checksum::new();
             {
                 let mut reader = packed_reader(

@@ -99,8 +99,10 @@ pub(crate) fn publish<M, B: Budget>(
             }
             let mut writer = open(&meta)?;
             control.check()?;
+            // The worker verified `data`, so the member is complete once written.
             control
                 .write_all(&mut writer, &data)
+                .and_then(|()| writer.flush())
                 .map_err(|error| Error::from(error).at_entry(name(&meta), "extracting"))?;
         }
     }

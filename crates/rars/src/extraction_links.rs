@@ -62,7 +62,7 @@ impl Archive {
     /// archive order. Solid archives and total-output-limited operations use
     /// sequential decoding, as does RAR5 with a scratch policy. Earlier
     /// callback side effects are retained on failure; ordinary file writers have
-    /// the staging requirements of [`Archive::extract_to`]. Metadata retains raw
+    /// the flushing and staging semantics of [`Archive::extract_to`]. Metadata retains raw
     /// archive names, including in errors. The writer-only APIs such as
     /// [`Archive::extract_to`] leave links out in every format.
     pub fn extract_with_links<F, L>(
@@ -107,7 +107,7 @@ impl Archive {
     }
 }
 
-/// Extract a volume set with the link and staging semantics of
+/// Extract a volume set with the link, flushing and staging semantics of
 /// [`Archive::extract_with_links`]. Split legacy targets are verified after
 /// reassembly, and reported once at the final fragment.
 pub fn extract_volumes_with_links<F, L>(

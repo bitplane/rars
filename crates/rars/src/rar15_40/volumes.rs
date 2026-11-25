@@ -102,7 +102,7 @@ where
                     &mut links,
                     || open(&meta),
                     |writer| {
-                        budget.run(&file.name, writer, |mut writer| {
+                        budget.write_member(&file.name, writer, |mut writer| {
                             if file.is_stored() {
                                 file.write_stored_with_allowance(
                                     &volume,
@@ -293,7 +293,7 @@ where
         links,
         || open(&meta),
         |writer| {
-            budget.run(&first.name, writer, |mut writer| {
+            budget.write_member(&first.name, writer, |mut writer| {
                 if first.is_stored() {
                     return write_stored(
                         first,

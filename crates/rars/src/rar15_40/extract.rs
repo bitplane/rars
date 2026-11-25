@@ -390,7 +390,8 @@ impl FileHeader {
 }
 
 /// Streams a multivolume archive set to caller-provided writers. Unix
-/// symbolic links are left out, as with [`Archive::extract_to`].
+/// symbolic links are left out, and each file's writer is flushed once its
+/// member has passed its checksum, as with [`Archive::extract_to`].
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,

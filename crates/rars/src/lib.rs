@@ -1056,10 +1056,20 @@ impl Archive {
     /// back. The amount written before an error depends on the decoding path;
     /// even a complete payload must not be treated as verified on failure.
     ///
+    /// Each file's writer is flushed exactly once, after all of the member's
+    /// data has been written and has passed its checksum, or once it is all
+    /// written for a member that records none. A flush therefore means that
+    /// member is complete and verified. A member that fails its checksum, its
+    /// decode or a limit is not flushed, even where its bytes were delivered
+    /// first, as under salvage. The writers `open` returns for directories are
+    /// never flushed or written. An error from the flush fails the member as a
+    /// write error does, and reaches a member error handler where one is set.
+    /// A flush is not a sync: durability, such as [`std::fs::File::sync_all`],
+    /// stays the caller's choice.
+    ///
     /// For verified publication, write to caller-owned staging storage and
-    /// publish it only after extraction succeeds. Output quotas do not provide
-    /// staging or rollback. This method does not flush or sync returned writers;
-    /// callers must check any required flush/sync before publishing staged output.
+    /// publish it only after extraction succeeds, or as each member's writer is
+    /// flushed. Output quotas do not provide staging or rollback.
     pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1068,7 +1078,8 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers with read options.
-    /// Has the link handling, failure and staging semantics of [`Self::extract_to`].
+    /// Has the link handling, flushing, failure and staging semantics of
+    /// [`Self::extract_to`].
     pub fn extract_to_with_options<F>(
         &self,
         options: ArchiveReadOptions<'_>,
@@ -1107,7 +1118,9 @@ impl Archive {
     ///
     /// A split member's writer opens at its first part, so a later volume that
     /// turns out wrong leaves partial output, as with [`Self::extract_to`].
-    /// Links are left out, as there.
+    /// Links are left out, and each writer is flushed once its member has
+    /// passed its checksum, as there; a split member's is flushed only after
+    /// its last part.
     pub fn extract_with_volumes<V, F>(
         &self,
         volumes: V,
@@ -1219,7 +1232,9 @@ impl Archive {
     /// does not consume output quotas and is not verified. Parsing limits and
     /// passwords needed to read encrypted headers still apply before this call.
     ///
-    /// `Extract` uses the same decoding and output accounting as [`Self::extract_to`].
+    /// `Extract` uses the same decoding and output accounting as [`Self::extract_to`],
+    /// and its writer is flushed exactly once, after the member has passed its
+    /// checksum, as there. A member that fails, or is skipped, is not flushed.
     /// Its writer can already have been opened when admission fails. Callback,
     /// source, decoding, integrity and sink errors stop extraction immediately;
     /// partial output has the failure semantics documented on that method.
@@ -1275,6 +1290,8 @@ impl Archive {
     ///
     /// Solid or split-member failures, resource-limit failures, cancellation and
     /// errors returned by either callback are fatal and cannot be continued.
+    /// An error writing or flushing a member's writer is that member's own,
+    /// and goes to `on_error`.
     /// Parsing errors occur before this API and cannot be recovered here.
     pub fn extract_with_control_and_errors<F, E>(
         &self,
@@ -1308,7 +1325,9 @@ impl Archive {
     ///
     /// Solid archives, split members, multivolume sets, and RAR 1.3/1.4
     /// archives use the regular streaming extractor. Links are left out, as
-    /// with [`Self::extract_to`].
+    /// with [`Self::extract_to`]. Each writer is flushed exactly once, as
+    /// there, after its member's verified bytes are written to it, on whichever
+    /// path wrote them.
     pub fn extract_to_parallel_buffered<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2086,9 +2105,10 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
 }
 
 /// Streams a multivolume archive set to caller-provided writers.
-/// Has the link handling, failure and staging semantics of
+/// Has the link handling, flushing, failure and staging semantics of
 /// [`Archive::extract_to`], including partial output from a split member when
-/// a later volume fails.
+/// a later volume fails. A split member's writer is flushed only once its last
+/// part has passed its checksum.
 pub fn extract_volumes_to<F>(archives: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2097,7 +2117,8 @@ where
 }
 
 /// Streams a multivolume archive set to caller-provided writers with read options.
-/// Has the link handling, failure and staging semantics of [`Archive::extract_to`].
+/// Has the link handling, flushing, failure and staging semantics of
+/// [`extract_volumes_to`].
 pub fn extract_volumes_to_with_options<F>(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,

@@ -1982,7 +1982,9 @@ impl Archive {
     /// Streams extracted entries to caller-provided writers.
     ///
     /// Unix symbolic links are left out: `open` is never called for them.
-    /// [`crate::Archive::extract_with_links`] reports them.
+    /// [`crate::Archive::extract_with_links`] reports them. Each file's writer
+    /// is flushed once its member has passed its checksum, as
+    /// [`crate::Archive::extract_to`] describes.
     pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2142,7 +2144,7 @@ impl Archive {
             links,
             || open(&meta),
             |writer| {
-                budget.run(&file.name, writer, |writer| {
+                budget.write_member(&file.name, writer, |writer| {
                     decode_member_into(self, file, options.password, session, allowance, writer)
                 })
             },

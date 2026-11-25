@@ -1040,6 +1040,9 @@ impl Redirections {
 }
 
 impl Archive {
+    /// Streams extracted entries to caller-provided writers. Each file's writer
+    /// is flushed once its member has passed its checksum, as
+    /// [`crate::Archive::extract_to`] describes.
     pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, mut open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1303,7 +1306,7 @@ impl Archive {
         let mut writer = open(&meta)?;
         options.check_cancelled()?;
         if !meta.is_directory {
-            budget.run(&file.name, &mut writer, |writer| {
+            budget.write_member(&file.name, &mut writer, |writer| {
                 session.write_file_to(self, file, writer)
             })?;
         }
@@ -1810,12 +1813,9 @@ fn write_opened_entry<B: Budget>(
     } else {
         HistoryRetention::Retain
     };
-    budget.run(&file.name, &mut writer, |writer| {
+    budget.write_member(&file.name, &mut writer, |writer| {
         session.write_file_to_with_history(archive, file, writer, history)
     })?;
-    // An output can be created only once it is used, as one with nothing
-    // written; flushing it makes its failure this member's.
-    writer.flush()?;
     drop(writer);
     options.check_cancelled()
 }
@@ -2241,7 +2241,9 @@ fn rar50_buffered_decode_limit(options: crate::ArchiveReadOptions<'_>) -> u64 {
 /// members. Above it, a filter the streaming decoder cannot hold returns a typed
 /// limit error. Direct sinks
 /// can receive data before an integrity or decoding failure; callers requiring
-/// verified publication must stage output until extraction succeeds.
+/// verified publication must stage output until its writer is flushed, which
+/// happens once the member has passed its checksum, or until extraction
+/// succeeds.
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,

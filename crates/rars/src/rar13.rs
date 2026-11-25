@@ -598,7 +598,9 @@ impl Archive {
         self.source.range_reader(range)
     }
 
-    /// Streams extracted entries to caller-provided writers.
+    /// Streams extracted entries to caller-provided writers. Each file's writer
+    /// is flushed once its member has passed its checksum, as
+    /// [`crate::Archive::extract_to`] describes.
     pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -717,7 +719,7 @@ impl Archive {
                     None => open(&meta)?,
                 };
                 options.check_cancelled()?;
-                budget.run(&meta.name, &mut writer, |mut writer| {
+                budget.write_member(&meta.name, &mut writer, |mut writer| {
                     if entry.is_stored() && !entry.is_encrypted() {
                         let result =
                             entry.write_stored_to(self, password, &mut writer, &unpack15.allowance);
@@ -1165,7 +1167,9 @@ impl Entry {
     }
 }
 
-/// Streams a multivolume archive set to caller-provided writers.
+/// Streams a multivolume archive set to caller-provided writers. Each file's
+/// writer is flushed once its member has passed its checksum, as
+/// [`crate::extract_volumes_to`] describes.
 pub fn extract_volumes_to<F>(volumes: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
