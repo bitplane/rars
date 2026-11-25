@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 trait ReadSeek: Read + Seek + Send {}
@@ -88,8 +89,11 @@ const OPEN_FILE_LIMIT: usize = 32;
 pub(crate) struct FileSource {
     path: PathBuf,
     handle: Mutex<Option<Arc<File>>>,
+    // Workers and archive clones share this limit. Concurrent extractions of
+    // the same source can lose cross-range read-ahead while a guard is active.
+    read_ahead_limits: AtomicUsize,
     #[cfg(test)]
-    reads: std::sync::atomic::AtomicUsize,
+    reads: AtomicUsize,
 }
 
 static OPEN_FILES: Mutex<VecDeque<Weak<FileSource>>> = Mutex::new(VecDeque::new());
@@ -99,6 +103,7 @@ impl FileSource {
         Self {
             path: path.to_path_buf(),
             handle: Mutex::new(None),
+            read_ahead_limits: AtomicUsize::new(0),
             #[cfg(test)]
             reads: Default::default(),
         }
@@ -171,6 +176,14 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+pub(crate) struct FileReadAheadLimit<'a>(&'a FileSource);
+
+impl Drop for FileReadAheadLimit<'_> {
+    fn drop(&mut self) {
+        self.0.read_ahead_limits.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub(crate) struct FileCursor {
     source: Arc<FileSource>,
     position: u64,
@@ -201,9 +214,7 @@ impl FileCursor {
 
     fn read_disk(&self, bytes: &mut [u8]) -> std::io::Result<usize> {
         #[cfg(test)]
-        self.source
-            .reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.source.reads.fetch_add(1, Ordering::Relaxed);
         read_at(&*self.source.handle()?, bytes, self.position)
     }
 
@@ -235,7 +246,12 @@ impl Read for FileCursor {
                 .take()
                 .map(|window| window.data)
                 .unwrap_or_default();
-            data.resize(READ_AHEAD, 0);
+            let read_ahead = if self.source.read_ahead_limits.load(Ordering::Relaxed) != 0 {
+                READ_AHEAD.min(self.end.saturating_sub(self.position) as usize)
+            } else {
+                READ_AHEAD
+            };
+            data.resize(read_ahead, 0);
             let count = self.read_disk(&mut data)?;
             data.truncate(count);
             self.window = Some(Window {
@@ -330,6 +346,17 @@ impl ArchiveSource {
         Self::File(Arc::new(FileSource::new(path)))
     }
 
+    /// Keep file read-ahead inside each range while controlled extraction is active.
+    pub(crate) fn bound_file_read_ahead(&self, enabled: bool) -> Option<FileReadAheadLimit<'_>> {
+        match self {
+            Self::File(source) if enabled => {
+                source.read_ahead_limits.fetch_add(1, Ordering::Relaxed);
+                Some(FileReadAheadLimit(source))
+            }
+            _ => None,
+        }
+    }
+
     #[cfg(test)]
     fn is_open(&self) -> bool {
         matches!(self, Self::File(source) if source.handle.lock().unwrap().is_some())
@@ -338,7 +365,7 @@ impl ArchiveSource {
     #[cfg(test)]
     fn disk_reads(&self) -> usize {
         match self {
-            Self::File(source) => source.reads.load(std::sync::atomic::Ordering::Relaxed),
+            Self::File(source) => source.reads.load(Ordering::Relaxed),
             _ => 0,
         }
     }
@@ -485,6 +512,41 @@ mod tests {
             .unwrap();
         assert_eq!(rest, data[300..]);
         assert_eq!(source.disk_reads(), 1);
+    }
+
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn read_ahead_limits_apply_to_existing_cursors_on_workers() {
+        let (_scratch, path) = volume("source-read-ahead-limit", &[0; 4096]);
+        let source = ArchiveSource::file(&path);
+        let mut existing = source.owned_range_reader(0..32).unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        let check_fill = |reader: &mut RangeReader<'_>, expected| {
+            reader.read_exact(&mut [0]).unwrap();
+            let RangeReader::File(reader) = reader else {
+                panic!("expected a file cursor");
+            };
+            assert_eq!(reader.inner.window.as_ref().unwrap().data.len(), expected);
+        };
+
+        let first = source.bound_file_read_ahead(true).unwrap();
+        let second = source.bound_file_read_ahead(true).unwrap();
+        drop(first);
+        pool.install(|| {
+            check_fill(&mut existing, 32);
+            let mut opened_on_worker = source.owned_range_reader(64..96).unwrap();
+            check_fill(&mut opened_on_worker, 32);
+        });
+        drop(second);
+
+        let mut unbounded = source.owned_range_reader(128..160).unwrap();
+        check_fill(&mut unbounded, 4096 - 128);
     }
 
     #[test]
