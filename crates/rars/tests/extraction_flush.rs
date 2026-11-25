@@ -106,6 +106,14 @@ impl Recordings {
         assert_eq!(written, size, "{case:?}, {name:?}");
     }
 
+    /// `name` got no flush, if it was opened at all.
+    fn assert_never_flushed(&self, name: &[u8], case: impl std::fmt::Debug) {
+        if let Some(events) = self.0.get(name) {
+            let events = events.lock().unwrap();
+            assert!(!events.contains(&Event::Flush), "{case:?}: {events:?}");
+        }
+    }
+
     fn assert_unflushed(&self, name: &[u8]) {
         let events = self.0[name].lock().unwrap();
         assert_eq!(events.last(), Some(&Event::Drop));
@@ -358,16 +366,69 @@ fn every_extractor_flushes_each_file_once_after_all_writes() {
     }
 }
 
-fn split_set(version: ArchiveVersion, store: bool) -> (Vec<Archive>, usize) {
-    let mut state = 365u32;
-    let data: Vec<_> = (0..30_000)
+#[test]
+fn read_options_keep_one_flush_after_all_writes() {
+    let variants = [
+        ("one thread", ArchiveReadOptions::new().with_threads(1)),
+        ("two threads", ArchiveReadOptions::new().with_threads(2)),
+        ("four threads", ArchiveReadOptions::new().with_threads(4)),
+        (
+            "streamed",
+            ArchiveReadOptions::new().with_rar50_buffered_decode_limit(0),
+        ),
+        (
+            "workspace limit",
+            ArchiveReadOptions::new().with_max_reader_workspace_bytes(64 << 20),
+        ),
+        (
+            "member limit",
+            ArchiveReadOptions::new().with_max_member_output_bytes(1 << 20),
+        ),
+        (
+            "total limit",
+            ArchiveReadOptions::new().with_max_total_output_bytes(1 << 20),
+        ),
+    ];
+    for version in VERSIONS {
+        for (store, solid) in [(true, false), (false, false), (false, true)] {
+            let archive = ArchiveReader::read_owned(fixture(version, store, solid)).unwrap();
+            for (label, options) in variants {
+                for parallel in [false, true] {
+                    let case = (version, store, solid, label, parallel);
+                    let mut recordings = Recordings::default();
+                    let open = |meta: &rars::ExtractedEntryMeta| recordings.open(&meta.name);
+                    if parallel {
+                        archive.extract_to_parallel_buffered_with_options(options, open)
+                    } else {
+                        archive.extract_to_with_options(options, open)
+                    }
+                    .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+                    for member in archive.members() {
+                        recordings.assert_flushed(
+                            &member.meta.name,
+                            member.meta.unpacked_size as usize,
+                            case,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn noise(len: usize, mut state: u32) -> Vec<u8> {
+    (0..len)
         .map(|_| {
             state ^= state << 13;
             state ^= state >> 17;
             state ^= state << 5;
             state as u8
         })
-        .collect();
+        .collect()
+}
+
+fn split_set(version: ArchiveVersion, store: bool) -> (Vec<Archive>, usize) {
+    let data = noise(30_000, 365);
     let len = data.len();
     let mut builder = builder(version, store, false).volume_size(Some(4096));
     add(&mut builder, FIRST, data);
@@ -439,21 +500,42 @@ fn parallel_buffered_flushes_at_each_thread_count() {
             .unwrap();
         pool.install(|| {
             for version in VERSIONS {
-                let archive = ArchiveReader::read_owned(fixture(version, false, false)).unwrap();
-                let mut recordings = Recordings::default();
-                Api::Parallel
-                    .extract(std::slice::from_ref(&archive), &mut recordings)
-                    .unwrap();
-                for member in archive.members() {
-                    recordings.assert_flushed(
-                        &member.meta.name,
-                        member.meta.unpacked_size as usize,
-                        (threads, version),
-                    );
+                for many in [false, true] {
+                    let bytes = if many {
+                        many_members(version)
+                    } else {
+                        fixture(version, false, false)
+                    };
+                    let archive = ArchiveReader::read_owned(bytes).unwrap();
+                    let mut recordings = Recordings::default();
+                    Api::Parallel
+                        .extract(std::slice::from_ref(&archive), &mut recordings)
+                        .unwrap();
+                    for member in archive.members() {
+                        recordings.assert_flushed(
+                            &member.meta.name,
+                            member.meta.unpacked_size as usize,
+                            (threads, version, many),
+                        );
+                    }
                 }
             }
         });
     }
+}
+
+/// Enough members of varied size that parallel extraction has many in flight.
+fn many_members(version: ArchiveVersion) -> Vec<u8> {
+    let mut builder = builder(version, false, false);
+    for index in 0..40u32 {
+        let name = format!("m{index:02}").into_bytes();
+        add(
+            &mut builder,
+            &name,
+            noise(100 + index as usize * 397, index + 1),
+        );
+    }
+    builder.to_bytes().unwrap()
 }
 
 fn damaged_stored_archive(version: ArchiveVersion, hash: bool) -> Archive {
@@ -523,6 +605,24 @@ fn bad_checksum_never_flushes_even_when_bytes_are_salvaged() {
             recordings.assert_unflushed(FIRST);
             let len = archive.members().nth(1).unwrap().meta.unpacked_size as usize;
             recordings.assert_flushed(SECOND, len, (version, hash, salvage));
+
+            let mut recordings = Recordings::default();
+            let failures = std::sync::atomic::AtomicUsize::new(0);
+            let handler = |member: &rars::ArchiveMember, error: &Error| {
+                assert_eq!(member.meta.name, FIRST);
+                assert_checksum_error(error, hash);
+                failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(ExtractionErrorAction::Continue)
+            };
+            archive
+                .extract_to_parallel_buffered_with_options(
+                    options.with_member_error_handler(&handler),
+                    |meta| recordings.open(&meta.name),
+                )
+                .unwrap();
+            assert_eq!(failures.into_inner(), 1);
+            recordings.assert_never_flushed(FIRST, (version, hash, salvage));
+            recordings.assert_flushed(SECOND, len, (version, hash, salvage));
         }
     }
 }
@@ -551,6 +651,116 @@ fn assert_my_error(error: &Error) {
         source = source
             .source()
             .unwrap_or_else(|| panic!("missing original I/O error: {error:?}"));
+    }
+}
+
+/// A 4 KiB first member with no long repeats, then a short second one.
+fn uneven_fixture(version: ArchiveVersion, store: bool) -> Vec<u8> {
+    let mut builder = builder(version, store, false);
+    let letters = noise(4096, 77)
+        .into_iter()
+        .map(|b| b"abcdefg "[usize::from(b % 8)])
+        .collect();
+    add(&mut builder, FIRST, letters);
+    add(&mut builder, SECOND, b"after the failure".to_vec());
+    builder.to_bytes().unwrap()
+}
+
+/// Extracts sequentially and in parallel with a handler that carries on, and
+/// checks that only `FIRST` failed and was never flushed.
+fn assert_only_first_fails_unflushed(
+    archive: &Archive,
+    options: ArchiveReadOptions<'_>,
+    case: impl std::fmt::Debug + Copy + Sync,
+) {
+    for parallel in [false, true] {
+        let failures = std::sync::atomic::AtomicUsize::new(0);
+        let handler = |member: &rars::ArchiveMember, _: &Error| {
+            assert_eq!(member.meta.name, FIRST, "{case:?}");
+            failures.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(ExtractionErrorAction::Continue)
+        };
+        let options = options.with_member_error_handler(&handler);
+        let mut recordings = Recordings::default();
+        let open = |meta: &rars::ExtractedEntryMeta| recordings.open(&meta.name);
+        if parallel {
+            archive.extract_to_parallel_buffered_with_options(options, open)
+        } else {
+            archive.extract_to_with_options(options, open)
+        }
+        .unwrap_or_else(|e| panic!("{case:?} parallel={parallel}: {e}"));
+        assert_eq!(failures.into_inner(), 1, "{case:?} parallel={parallel}");
+        recordings.assert_never_flushed(FIRST, (case, parallel));
+        recordings.assert_flushed(SECOND, 17, (case, parallel));
+    }
+}
+
+#[test]
+fn a_member_that_outgrows_its_declared_size_mid_write_is_never_flushed() {
+    // RAR 1.3 copies stored data even when the declared size is smaller, so
+    // the writer is opened and the limit trips while writing.
+    let mut archive =
+        ArchiveReader::read_owned(uneven_fixture(ArchiveVersion::Rar13, true)).unwrap();
+    let Archive::Rar13(inner) = &mut archive else {
+        unreachable!()
+    };
+    inner.entries[0].header.unp_size = 500;
+    let options = ArchiveReadOptions::new().with_max_member_output_bytes(1000);
+    let mut recordings = Recordings::default();
+    let error = archive
+        .extract_to_with_options(options, |meta| recordings.open(&meta.name))
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::ResourceLimit, "{error:?}");
+    assert!(recordings.0.contains_key(FIRST));
+    recordings.assert_unflushed(FIRST);
+}
+
+#[test]
+fn damaged_compressed_data_is_never_flushed() {
+    for version in VERSIONS {
+        let mut bytes = uneven_fixture(version, false);
+        let range = match ArchiveReader::read(&bytes).unwrap() {
+            Archive::Rar13(inner) => inner.entries[0].packed_range.clone(),
+            Archive::Rar15To40(inner) => inner.files().next().unwrap().packed_range.clone(),
+            Archive::Rar50Plus(inner) => inner.files().next().unwrap().block.data_range.clone(),
+            _ => unreachable!(),
+        };
+        for at in [range.start + 1, range.start + range.len() / 2] {
+            bytes[at] ^= 0x5a;
+        }
+        let archive = ArchiveReader::read_owned(bytes).unwrap();
+        assert!(!archive.members().next().unwrap().meta.is_stored);
+        assert_only_first_fails_unflushed(&archive, ArchiveReadOptions::new(), version);
+    }
+}
+
+#[test]
+fn a_member_without_a_checksum_is_flushed_after_all_its_data() {
+    for (store, solid) in [(true, false), (false, false), (false, true)] {
+        let mut archive =
+            ArchiveReader::read_owned(fixture(ArchiveVersion::Rar50, store, solid)).unwrap();
+        let Archive::Rar50Plus(inner) = &mut archive else {
+            unreachable!()
+        };
+        for block in &mut inner.blocks {
+            if let rar50::Block::File(file) = block {
+                file.hash = None;
+                file.data_crc32 = None;
+            }
+        }
+        for api in [Api::Options, Api::ParallelOptions, Api::Rar50Settled] {
+            let case = (store, solid, api);
+            let mut recordings = Recordings::default();
+            api.extract(std::slice::from_ref(&archive), &mut recordings)
+                .unwrap_or_else(|e| panic!("{case:?}: {e}"));
+            for member in archive.members() {
+                recordings.assert_flushed(
+                    &member.meta.name,
+                    member.meta.unpacked_size as usize,
+                    case,
+                );
+            }
+        }
     }
 }
 
