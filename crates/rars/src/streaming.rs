@@ -3,6 +3,8 @@ use crate::{Error, Result};
 mod memory_spool;
 pub(crate) mod output;
 pub(crate) mod preparation;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod spool_store;
 #[cfg(test)]
 use crate::atomic64::AtomicU64;
 use std::fmt;
@@ -291,8 +293,12 @@ impl WriteCancellation {
 #[derive(Clone, Debug)]
 /// Shared compression-workspace and temporary-file policy for streaming writers.
 ///
-/// Native RAR5 writers retain packed payloads on disk and bound active input and
+/// Native RAR5 writers retain packed payloads in spools and bound active input and
 /// spool handles by compression concurrency, rather than the archive entry count.
+/// A native spool stays in memory while it holds at most 4 MiB and this workspace
+/// budget has that memory free, charged to the budget as it grows; past either it
+/// moves to a temporary file. A job that needs the room moves held spools to disk
+/// rather than waiting for them, so spools never delay or refuse work.
 /// The workspace limit is not a total process-RAM or temporary-disk quota. On bare
 /// WebAssembly (`wasm32-unknown-unknown`), spools stay in memory and their retained
 /// payloads are additional to this limit. `with_max_spool_bytes` separately caps
@@ -310,6 +316,9 @@ pub struct WriterResources {
     preparation_budget: Option<Arc<StorageBudget>>,
     cancellation: Option<WriteCancellation>,
     pub(crate) execution: Option<crate::codec::workspace::Limited>,
+    /// Starts every spool on disk, for tests that watch spool files.
+    #[cfg(test)]
+    spools_on_disk: bool,
 }
 
 impl Default for WriterResources {
@@ -349,7 +358,15 @@ impl WriterResources {
             preparation_budget: None,
             cancellation: None,
             execution: None,
+            #[cfg(test)]
+            spools_on_disk: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_spools_on_disk(mut self) -> Self {
+        self.spools_on_disk = true;
+        self
     }
 
     /// Replace the compression workspace budget, keeping the rest of the policy.
@@ -373,7 +390,9 @@ impl WriterResources {
     /// Caller-owned inputs and external sinks, allocator/runtime overhead, stacks
     /// and OS memory are excluded. This is not a process-RAM limit.
     /// Legacy writers refuse this policy. The estimated workspace policy remains
-    /// independent. Configure before execution; clones share the new ledger.
+    /// independent. Spools start in temporary files under this ceiling rather
+    /// than borrowing workspace memory. Configure before execution; clones share
+    /// the new ledger.
     pub fn with_max_memory_bytes(mut self, limit: u64) -> Self {
         self.execution = Some(crate::codec::workspace::Allowance::limited(limit));
         self
@@ -397,7 +416,8 @@ impl WriterResources {
     }
 
     /// Cap the sum of live logical spool lengths, including reserved growth.
-    /// Native spools use files; bare-WASM spools use memory. This does not cap
+    /// Native spools use the workspace budget's free memory, then files; bare-WASM
+    /// spools use memory. This does not cap
     /// filesystem allocation, Vec capacity, codec workspace or final output.
     /// Zero allows empty spools only. Growth fails immediately rather than waiting.
     ///
@@ -841,13 +861,44 @@ impl CapacityCharge {
     }
 }
 
-#[derive(Debug)]
 struct MemoryBudget {
     limit: u64,
     used: Mutex<u64>,
     changed: Condvar,
     /// The most ever in use at once.
     peak: crate::atomic64::AtomicU64,
+    /// Acquirers waiting for room. Spools held in memory do not grow while
+    /// any are.
+    waiting: std::sync::atomic::AtomicUsize,
+    /// Spools that may hold memory against this budget, to move to disk when
+    /// an acquirer needs the room.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    spools: Mutex<Vec<std::sync::Weak<Mutex<spool_store::Backing>>>>,
+}
+
+impl fmt::Debug for MemoryBudget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemoryBudget")
+            .field("limit", &self.limit)
+            .field("used", &self.used)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Counts an acquirer as waiting for as long as it lives.
+struct Waiting<'b>(&'b std::sync::atomic::AtomicUsize);
+
+impl<'b> Waiting<'b> {
+    fn new(waiting: &'b std::sync::atomic::AtomicUsize) -> Self {
+        waiting.fetch_add(1, Ordering::SeqCst);
+        Self(waiting)
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl MemoryBudget {
@@ -857,6 +908,9 @@ impl MemoryBudget {
             used: Mutex::new(0),
             changed: Condvar::new(),
             peak: crate::atomic64::AtomicU64::new(0),
+            waiting: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            spools: Mutex::new(Vec::new()),
         }
     }
 
@@ -865,11 +919,22 @@ impl MemoryBudget {
         bytes: u64,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<MemoryPermit> {
+        let mut waiting = None;
         // Call user cancellation code outside the budget mutex: a callback can
         // release a permit, and must not deadlock with its own admission wait.
         loop {
             if cancelled() {
                 return Err(Error::Cancelled);
+            }
+            let used = self.used.lock().expect("memory budget lock poisoned");
+            let used = match self.admit(used, bytes) {
+                Ok(permit) => return Ok(permit),
+                Err(used) => used,
+            };
+            waiting.get_or_insert_with(|| Waiting::new(&self.waiting));
+            drop(used);
+            if self.reclaim(bytes) {
+                continue;
             }
             let used = self.used.lock().expect("memory budget lock poisoned");
             let used = match self.admit(used, bytes) {
@@ -884,6 +949,58 @@ impl MemoryBudget {
                     .expect("memory budget lock poisoned while waiting"),
             );
         }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn register_spool(&self, backing: &Arc<Mutex<spool_store::Backing>>) {
+        let mut spools = self.spools.lock().expect("spool registry lock poisoned");
+        // Drop dead entries whenever the list doubles, so it stays in
+        // proportion to the spools alive.
+        if spools.len().is_power_of_two() {
+            spools.retain(|spool| spool.strong_count() != 0);
+        }
+        spools.push(Arc::downgrade(backing));
+    }
+
+    /// Moves spools held in memory to disk until `bytes` are free. Says
+    /// whether any moved.
+    ///
+    /// Moves none if all of them would still leave too little free. A spool
+    /// that cannot move, because its temporary file cannot be made or
+    /// written, stays in memory and is tried again on the next call.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn reclaim(&self, bytes: u64) -> bool {
+        let spools: Vec<_> = {
+            let mut spools = self.spools.lock().expect("spool registry lock poisoned");
+            spools.retain(|spool| spool.strong_count() != 0);
+            spools.iter().filter_map(std::sync::Weak::upgrade).collect()
+        };
+        let lock = spool_store::lock;
+        let free = || {
+            self.limit
+                .saturating_sub(*self.used.lock().expect("memory budget lock poisoned"))
+        };
+        let held: u64 = spools.iter().map(|spool| lock(spool).held_bytes()).sum();
+        if held == 0 || free().saturating_add(held) < bytes {
+            return false;
+        }
+        let mut moved = false;
+        for spool in &spools {
+            if free() >= bytes {
+                break;
+            }
+            let mut backing = lock(spool);
+            if backing.held_bytes() != 0 && backing.spill().is_ok_and(|file| file.is_some()) {
+                moved = true;
+            }
+        }
+        moved
+    }
+
+    /// Bare WebAssembly spools are not charged here, so there is nothing to move.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    fn reclaim(&self, _bytes: u64) -> bool {
+        false
     }
 }
 
@@ -912,6 +1029,13 @@ impl MemoryBudget {
     }
 
     fn try_acquire(self: &Arc<Self>, bytes: u64) -> Option<MemoryPermit> {
+        let used = self.used.lock().expect("memory budget lock poisoned");
+        if let Ok(permit) = self.admit(used, bytes) {
+            return Some(permit);
+        }
+        if !self.reclaim(bytes) {
+            return None;
+        }
         let used = self.used.lock().expect("memory budget lock poisoned");
         self.admit(used, bytes).ok()
     }
@@ -959,37 +1083,90 @@ impl MemoryPermit {
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
+
+    /// Grows the charge to `bytes` if that much is free now and no acquirer
+    /// is waiting for room. Spools held in memory grow this way, so they only
+    /// ever take memory nobody else is asking for.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn try_grow_for_spool(&mut self, bytes: u64) -> bool {
+        if bytes <= self.bytes {
+            return true;
+        }
+        let mut used = self
+            .budget
+            .used
+            .lock()
+            .expect("memory budget lock poisoned");
+        let growth = bytes - self.bytes;
+        if self.budget.waiting.load(Ordering::SeqCst) != 0
+            || self.budget.limit.saturating_sub(*used) < growth
+        {
+            return false;
+        }
+        *used += growth;
+        self.budget
+            .peak
+            .fetch_max(*used, std::sync::atomic::Ordering::Relaxed);
+        self.bytes = bytes;
+        true
+    }
 }
 
 /// Where a spool keeps its bytes.
 ///
-/// A file on every real platform, which is the point: the RAR 5 writer spools
-/// so that a member larger than the memory budget still gets written. Bare
-/// WebAssembly has no filesystem, so there it is a buffer, and the budget stops
-/// covering their retained storage. The optional logical spool quota applies
-/// to both backends, independently of Vec capacity. Both are `Read + Write + Seek`.
+/// On every real platform, memory while the spool is small and the workspace
+/// budget has room for it, and a temporary file past that: the RAR 5 writer
+/// spools so that a member larger than the memory budget still gets written.
+/// Bare WebAssembly has no filesystem, so there it is a buffer, and the budget
+/// stops covering their retained storage. The optional logical spool quota
+/// applies to both backends, independently of Vec capacity. Both are
+/// `Read + Write + Seek`.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-type SpoolStore = File;
+type SpoolStore = spool_store::SpoolStore;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 type SpoolStore = memory_spool::MemorySpool;
 
 /// Owns a temporary payload until drop; parking releases only its handle.
 /// Writes are unbuffered, so parking requires no flush and preserves the cursor.
-/// The file must live until assembly finishes, even when no handle is open.
+/// The payload must live until assembly finishes, even when no handle is open.
 pub(crate) struct Spool {
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-    path: PathBuf,
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     _path_charge: Option<CapacityCharge>,
-    file: Option<SpoolStore>,
+    file: SpoolStore,
     len: u64,
     pos: u64,
     charge: Option<StorageCharge>,
 }
 
 impl Spool {
+    /// A spool held in memory against the workspace budget until it outgrows
+    /// what one spool may hold or the budget refuses it, then a temporary file.
+    ///
+    /// A managed allocation ceiling ([`WriterResources::with_max_memory_bytes`])
+    /// refuses rather than lends, so spools under one go straight to disk.
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
+        #[cfg(test)]
+        if resources.spools_on_disk {
+            return Self::create_on_disk(resources);
+        }
+        if resources.execution.is_some() {
+            return Self::create_on_disk(resources);
+        }
+        let backing =
+            spool_store::Backing::in_memory(&resources.budget, resources.temp_dir.clone());
+        Ok(Self {
+            _path_charge: None,
+            file: SpoolStore::writer(backing, None),
+            len: 0,
+            pos: 0,
+            charge: StorageCharge::new(resources),
+        })
+    }
+
+    /// A spool that starts in a temporary file.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    pub(crate) fn create_on_disk(resources: &WriterResources) -> Result<Self> {
         Self::create_with_sequence(resources, crate::temp_file::next_sequence)
     }
 
@@ -1011,9 +1188,8 @@ impl Spool {
             next_sequence,
         )?;
         Ok(Self {
-            path,
             _path_charge: path_charge,
-            file: Some(file),
+            file: SpoolStore::writer(spool_store::Backing::on_disk(path), Some(file)),
             len: 0,
             pos: 0,
             charge: StorageCharge::new(resources),
@@ -1024,7 +1200,7 @@ impl Spool {
     pub(crate) fn create(resources: &WriterResources) -> Result<Self> {
         crate::temp_file::next_sequence();
         Ok(Self {
-            file: Some(memory_spool::MemorySpool::new(resources)),
+            file: memory_spool::MemorySpool::new(resources),
             len: 0,
             pos: 0,
             charge: StorageCharge::new(resources),
@@ -1042,19 +1218,27 @@ impl Spool {
     /// Bare WASM has no handle to release and must retain the in-memory bytes.
     pub(crate) fn park(&mut self) {
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        {
-            self.file = None;
-        }
+        self.file.park();
     }
 
     fn file(&mut self) -> std::io::Result<&mut SpoolStore> {
-        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        if self.file.is_none() {
-            let mut file = File::options().read(true).write(true).open(&self.path)?;
-            file.seek(SeekFrom::Start(self.pos))?;
-            self.file = Some(file);
-        }
-        Ok(self.file.as_mut().expect("spool backing store is present"))
+        Ok(&mut self.file)
+    }
+
+    #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+    fn path_capacity(&self) -> usize {
+        self.file.backing().lock().unwrap().path_capacity()
+    }
+
+    /// The spool's temporary file, if its bytes are on disk.
+    #[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+    pub(crate) fn path(&self) -> Option<PathBuf> {
+        self.file
+            .backing()
+            .lock()
+            .unwrap()
+            .path()
+            .map(Path::to_path_buf)
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -1163,10 +1347,11 @@ impl Read for Spool {
 impl Spool {
     pub(crate) fn into_source(mut self) -> EntrySource {
         self.park();
+        let backing = self.file.backing().clone();
         let owner = Arc::new(self);
         EntrySource::from_opener(owner.len(), move || {
             Ok(Box::new(SpoolReader {
-                file: std::fs::File::open(&owner.path)?,
+                file: SpoolStore::reader(backing.clone()),
                 _owner: owner.clone(),
             }))
         })
@@ -1195,7 +1380,7 @@ impl Spool {
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 struct SpoolReader {
-    file: std::fs::File,
+    file: SpoolStore,
     _owner: Arc<Spool>,
 }
 
@@ -1222,9 +1407,16 @@ impl Seek for Spool {
 
 impl Drop for Spool {
     fn drop(&mut self) {
-        self.file = None;
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        if let Err(error) = std::fs::remove_file(&self.path) {
+        self.file.park();
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let path = self
+            .file
+            .backing()
+            .lock()
+            .map_or(None, |mut backing| backing.close());
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        if let Some(Err(error)) = path.map(std::fs::remove_file) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 // The backing file may still occupy storage. Keep that debt in
                 // the shared quota group instead of admitting replacement bytes.
@@ -1469,7 +1661,7 @@ mod tests {
         let ledger = crate::codec::workspace::Allowance::limited(4096);
         let resources = resources.with_execution_allowance(ledger.clone());
         let mut spool = Spool::create(&resources).unwrap();
-        let capacity = spool.path.capacity() as u64;
+        let capacity = spool.path_capacity() as u64;
         assert_eq!(ledger.used(), capacity);
         spool.write_all(b"payload").unwrap();
         spool.park();
@@ -1603,12 +1795,12 @@ mod tests {
         let resources = WriterResources::default()
             .with_temp_dir(&*root)
             .with_max_spool_bytes(10);
-        let mut spool = Spool::create(&resources).unwrap();
+        let mut spool = Spool::create_on_disk(&resources).unwrap();
         spool.write_all(b"abc").unwrap();
         spool.park();
-        let mut read_only = File::open(&spool.path).unwrap();
+        let mut read_only = File::open(spool.path().unwrap()).unwrap();
         read_only.seek(SeekFrom::Start(3)).unwrap();
-        spool.file = Some(read_only);
+        spool.file.replace_file(read_only);
         assert!(spool.write_all(b"1234567").is_err());
         assert_eq!(spool_used(&resources), 3);
         assert_eq!(spool.len(), 3);
@@ -1682,10 +1874,10 @@ mod tests {
         let resources = WriterResources::default()
             .with_temp_dir(&*root)
             .with_max_spool_bytes(3);
-        let mut spool = Spool::create(&resources).unwrap();
+        let mut spool = Spool::create_on_disk(&resources).unwrap();
         spool.write_all(b"abc").unwrap();
         spool.park();
-        let original = spool.path.clone();
+        let original = spool.path().unwrap();
         // Force removal to fail without relying on root/Windows permissions.
         std::fs::rename(&original, root.join("orphan")).unwrap();
         std::fs::create_dir(&original).unwrap();
@@ -1700,9 +1892,9 @@ mod tests {
     fn spool_cleanup_failure_without_quota_does_not_panic() {
         let root = crate::scratch::case("spool-unlimited-cleanup");
         let resources = WriterResources::default().with_temp_dir(&*root);
-        let mut spool = Spool::create(&resources).unwrap();
+        let mut spool = Spool::create_on_disk(&resources).unwrap();
         spool.write_all(b"abc").unwrap();
-        let original = spool.path.clone();
+        let original = spool.path().unwrap();
         std::fs::rename(&original, root.join("orphan")).unwrap();
         std::fs::create_dir(&original).unwrap();
         drop(spool);
@@ -1720,7 +1912,7 @@ mod tests {
             ".rars-spool-{}-ffffffffffffffff",
             std::process::id()
         ));
-        assert_eq!(spool.path, path);
+        assert_eq!(spool.path().unwrap(), path);
         assert!(path.is_file());
         drop(spool);
         assert!(!path.exists());
@@ -1741,7 +1933,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(sequence, 2);
-        assert_eq!(spool.path, root.join(name(1)));
+        assert_eq!(spool.path().unwrap(), root.join(name(1)));
         drop(spool);
 
         for sequence in 1..128 {
@@ -1855,10 +2047,10 @@ mod tests {
         }
         assert!(spool.copy_to(&mut FailingSink).is_err());
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        assert!(spool.file.is_none());
+        assert!(spool.file.is_parked());
         assert!(spool.copy_range_to(0, 7, &mut Vec::new()).is_err());
         #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
-        assert!(spool.file.is_none());
+        assert!(spool.file.is_parked());
         bytes.clear();
         spool.copy_to(&mut bytes).unwrap();
         assert_eq!(bytes, b"abXYZf");
@@ -1867,14 +2059,159 @@ mod tests {
     }
 
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    mod held_spools {
+        use super::super::spool_store::MEMORY_SPOOL_LIMIT;
+        use super::*;
+
+        fn files(dir: &Path) -> usize {
+            std::fs::read_dir(dir).unwrap().count()
+        }
+
+        #[test]
+        fn a_small_spool_is_charged_memory_and_makes_no_file() {
+            let root = crate::scratch::case("held-spool-small");
+            let resources = WriterResources::default().with_temp_dir(&*root);
+            let mut spool = Spool::create_parked(&resources).unwrap();
+            spool.write_all(b"abcdef").unwrap();
+            spool.seek_to(2).unwrap();
+            spool.park();
+            spool.write_all(b"XY").unwrap();
+            spool.seek_to(9).unwrap();
+            spool.write_all(b"!").unwrap();
+            assert_eq!(spool.len(), 10);
+            assert_eq!(files(&root), 0);
+            assert!(spool.path().is_none());
+            assert_eq!(resources.workspace_in_use(), 4096);
+            let mut bytes = Vec::new();
+            spool.copy_range_to(1, 4, &mut bytes).unwrap();
+            assert_eq!(bytes, b"bXYe");
+            let source = spool.into_source();
+            let mut read = Vec::new();
+            source.open().unwrap().read_to_end(&mut read).unwrap();
+            assert_eq!(read, b"abXYef\0\0\0!");
+            assert_eq!(files(&root), 0);
+            drop(source);
+            assert_eq!(resources.workspace_in_use(), 0);
+        }
+
+        #[test]
+        fn a_spool_past_the_limit_moves_to_disk_mid_write() {
+            let root = crate::scratch::case("held-spool-large");
+            let resources = WriterResources::default()
+                .with_temp_dir(&*root)
+                .with_max_spool_bytes(u64::MAX);
+            let data: Vec<u8> = (0..MEMORY_SPOOL_LIMIT + 5000).map(|i| i as u8).collect();
+            let mut spool = Spool::create(&resources).unwrap();
+            let (head, tail) = data.split_at(MEMORY_SPOOL_LIMIT - 3000);
+            spool.write_all(head).unwrap();
+            assert_eq!(files(&root), 0);
+            assert!(resources.workspace_in_use() >= head.len() as u64);
+            spool.write_all(tail).unwrap();
+            assert_eq!(files(&root), 1);
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert_eq!(spool_used(&resources), data.len() as u64);
+            let mut copied = Vec::new();
+            spool.copy_to(&mut copied).unwrap();
+            assert!(copied == data);
+            drop(spool);
+            assert_eq!(files(&root), 0);
+            assert_eq!(spool_used(&resources), 0);
+        }
+
+        #[test]
+        fn a_budget_refusing_growth_sends_the_spool_to_disk() {
+            let root = crate::scratch::case("held-spool-tight");
+            let limit = 8 * 1024;
+            let resources = WriterResources::new(limit).with_temp_dir(&*root);
+            let mut spool = Spool::create(&resources).unwrap();
+            spool.write_all(&[1; 4096]).unwrap();
+            assert_eq!(files(&root), 0);
+            // Doubling would hold the old 4 KiB beside a new 8 KiB.
+            spool.write_all(&[2; 4096]).unwrap();
+            assert_eq!(files(&root), 1);
+            assert_eq!(resources.workspace_in_use(), 0);
+            assert!(resources.workspace_peak() <= limit);
+            let mut copied = Vec::new();
+            spool.copy_to(&mut copied).unwrap();
+            assert_eq!(copied[..4096], [1; 4096]);
+            assert_eq!(copied[4096..], [2; 4096]);
+        }
+
+        #[test]
+        fn a_held_spool_does_not_grow_while_an_acquirer_waits() {
+            let resources = WriterResources::new(1 << 20);
+            let budget = resources.budget.clone();
+            let _waiting = Waiting::new(&budget.waiting);
+            let root = crate::scratch::case("held-spool-waiter");
+            let resources = resources.with_temp_dir(&*root);
+            let mut spool = Spool::create(&resources).unwrap();
+            spool.write_all(b"payload").unwrap();
+            assert_eq!(files(&root), 1);
+            assert_eq!(resources.workspace_in_use(), 0);
+        }
+
+        #[test]
+        fn acquirers_move_held_spools_to_disk_for_room() {
+            let root = crate::scratch::case("held-spool-reclaim");
+            let limit = 1 << 20;
+            let resources = WriterResources::new(limit).with_temp_dir(&*root);
+            let mut first = Spool::create(&resources).unwrap();
+            first.write_all(&[3; 300 * 1024]).unwrap();
+            let mut second = Spool::create(&resources).unwrap();
+            second.write_all(&[4; 1000]).unwrap();
+            let source = second.into_source();
+            let mut reader = source.open().unwrap();
+            let mut start = [0; 10];
+            reader.read_exact(&mut start).unwrap();
+            assert_eq!(files(&root), 0);
+
+            // A non-waiting acquirer takes the room it needs and no more.
+            let permit = resources.try_acquire(limit - 4096).unwrap();
+            assert_eq!(files(&root), 1);
+            drop(permit);
+            // A waiting one moves the rest.
+            let permit = resources.acquire(limit, 0).unwrap();
+            assert_eq!(files(&root), 2);
+            assert_eq!(resources.workspace_in_use(), limit);
+            drop(permit);
+
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).unwrap();
+            assert_eq!(start.len() + rest.len(), 1000);
+            assert!(rest.iter().all(|&byte| byte == 4));
+            first.write_all(b"tail").unwrap();
+            assert_eq!(first.len(), 300 * 1024 + 4);
+            let mut copied = Vec::new();
+            first.copy_to(&mut copied).unwrap();
+            assert!(copied[..300 * 1024].iter().all(|&byte| byte == 3));
+            assert_eq!(&copied[300 * 1024..], b"tail");
+            drop((first, reader, source));
+            assert_eq!(files(&root), 0);
+            assert_eq!(resources.workspace_in_use(), 0);
+        }
+
+        #[test]
+        fn a_dropped_spool_is_never_moved_to_disk() {
+            let root = crate::scratch::case("held-spool-closed");
+            let resources = WriterResources::default().with_temp_dir(&*root);
+            let mut spool = Spool::create(&resources).unwrap();
+            spool.write_all(b"payload").unwrap();
+            let backing = spool.file.backing().clone();
+            drop(spool);
+            assert!(backing.lock().unwrap().spill().unwrap().is_none());
+            assert_eq!(files(&root), 0);
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[test]
     fn spool_cleanup_owns_both_active_and_parked_files() {
         let scratch = crate::scratch::case("spool-cleanup");
         let resources = WriterResources::default().with_temp_dir(&*scratch);
         for parked in [false, true] {
-            let mut spool = Spool::create(&resources).unwrap();
+            let mut spool = Spool::create_on_disk(&resources).unwrap();
             spool.write_all(b"private compressed payload").unwrap();
-            let path = spool.path.clone();
+            let path = spool.path().unwrap();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
