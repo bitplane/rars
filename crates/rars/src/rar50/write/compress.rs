@@ -1486,7 +1486,12 @@ impl WaveWorkspace {
         tree_chunk_size: Option<usize>,
     ) -> Self {
         use crate::codec::rar50::{lazy_parse_workspace, MAX_LZ_BLOCK_SIZE};
-        let cap = len.checked_next_power_of_two().unwrap_or(len);
+        let cap = if tree_chunk_size.is_some() {
+            // A run can start with a non-power-of-two block and grow from it.
+            len.saturating_mul(2)
+        } else {
+            len.checked_next_power_of_two().unwrap_or(len)
+        };
         let block = block
             .min(MAX_LZ_BLOCK_SIZE)
             .min(usize::try_from(len).unwrap_or(usize::MAX));
@@ -1526,10 +1531,14 @@ impl WaveWorkspace {
             );
             // A worker growing its own window releases the separate run
             // before parsing. Idle workers can still own both source buffers.
-            let grown = window.max(history.saturating_mul(2));
-            grown
-                .saturating_add(scratch.max(cap))
-                .max(cap.saturating_add(history))
+            if history == 0 {
+                cap.saturating_add(scratch)
+            } else {
+                let grown = window.max(history.saturating_mul(2));
+                grown
+                    .saturating_add(scratch.max(cap))
+                    .max(cap.saturating_add(history))
+            }
         } else {
             scratch(reach, block).saturating_add(if options.optimal_parse {
                 len.saturating_add(cap)
