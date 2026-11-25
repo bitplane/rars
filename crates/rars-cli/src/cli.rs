@@ -313,6 +313,9 @@ pub(crate) struct AddArgs {
     /// candidates through LZ, which forcing PPMd leaves nothing to measure.
     #[arg(long)]
     pub ppmd: bool,
+    /// Read inputs from this directory and store names relative to it
+    #[arg(short = 'C', long = "base-dir", value_name = "DIR")]
+    pub base_dir: Option<std::path::PathBuf>,
     /// Output archive path
     #[arg(value_name = "ARCHIVE")]
     pub archive: std::path::PathBuf,
