@@ -1,12 +1,16 @@
 // The workspace denies `unsafe_code`, but any module can lift that with one
-// attribute. This keeps the one exception, `crates/rars/src/simd.rs`, the only
-// one: a new exception should be argued for in review and added to
-// `ALLOWED` here, not slipped in as a one-line opt-out.
+// attribute. This keeps the exceptions to the files in `ALLOWED`: the library's
+// one is `crates/rars/src/simd.rs`. A new exception should be argued for in
+// review and added there, not slipped in as a one-line opt-out.
 
 use std::path::{Path, PathBuf};
 
 /// Files allowed to lift the `unsafe_code` lint, relative to the repository.
-const ALLOWED: &[&str] = &["crates/rars/src/simd.rs"];
+const ALLOWED: &[&str] = &[
+    "crates/rars/src/simd.rs",
+    // A counting `#[global_allocator]` forwarding to `System`.
+    "crates/rars/tests/charge_covers_peak.rs",
+];
 
 const CHECKER: &str = "crates/rars/tests/unsafe_code_policy.rs";
 
@@ -46,8 +50,9 @@ fn only_simd_lifts_the_unsafe_code_lint() {
     }
     assert!(
         offenders.is_empty(),
-        "`unsafe` is confined to crates/rars/src/simd.rs. The workspace denies \
-         the `unsafe_code` lint, and only that module may lift it. Find a safe \
+        "`unsafe` is confined to the files in ALLOWED: in the library, \
+         crates/rars/src/simd.rs. The workspace denies the `unsafe_code` lint, \
+         and only those files may lift it. Find a safe \
          alternative (a vetted crate's safe API, as the PPMd pool uses \
          memmap2), or make the case for a new exception in review and add the \
          file to ALLOWED in {CHECKER}. Found:\n{}",
