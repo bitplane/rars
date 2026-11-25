@@ -918,7 +918,7 @@ pub(crate) fn streaming_blocks_with_finder<B: Budget>(
 }
 
 /// [`streaming_blocks_in_window`] for a run whose tree its group seeded,
-/// [`run_trees`] given the same window, run and options.
+/// [`seed_run_tree`] or [`seed_chain`] given the same window, run and options.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn streaming_blocks_with_tree<B: Budget>(
     window: &[u8],
@@ -1108,6 +1108,12 @@ pub(crate) fn filter_run_in_place<B: Budget>(
         records.push_admitted(block_records);
     }
     Ok((ends, records))
+}
+
+/// The end of each block [`filter_run_in_place`] cuts a run of `data` into,
+/// which it decides from the bytes before they are filtered.
+pub(crate) fn filtered_run_cuts(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    MemberBlocks::new(data, 0).map(|block| block.end)
 }
 
 /// One run of a member, `file_offset` bytes in, with `filters` ranged over the
@@ -1956,7 +1962,7 @@ pub(crate) enum RunFinder<B: Budget> {
     Tree(Rar50TreeMatchFinder<B>),
 }
 
-/// What [`run_trees`] holds besides the trees it returns.
+/// What [`seed_chain`] holds besides the trees it returns.
 pub(crate) fn run_trees_workspace(options: EncodeOptions) -> u64 {
     if !options.optimal_parse {
         return 0;
@@ -1973,9 +1979,10 @@ fn seeds_from_shared(run: &Range<usize>, options: EncodeOptions) -> bool {
     run.start > 0 && run.end - run.start >= options.nice()
 }
 
-/// How [`run_trees`] seeds `runs`: in chains of consecutive runs, given as
-/// ranges of their indexes, each seeded from one shared tree when it holds
-/// several runs and on its own otherwise. Runs in no chain seed their own.
+/// How `runs` are seeded: in chains of consecutive runs, given as ranges of
+/// their indexes, each seeded from one shared tree when it holds several runs
+/// ([`seed_chain`]) and on its own otherwise ([`seed_run_tree`]). Runs in no
+/// chain seed their own.
 ///
 /// A shared tree puts each position in once, but in order: a run's tree is
 /// ready only once everything before its history's end is in. Positions of
@@ -2042,74 +2049,42 @@ pub(crate) fn seed_chains(
     }
 }
 
-/// The trees runs of one window seed, each run given by where it starts and
-/// ends in `window`, seeded on every thread this one may fan out to: one for
-/// each run seeded here, in the order of `runs`, or `None` where none is.
+/// The tree a run of `window` would seed alone, from the dictionary before
+/// it, split by hash between the threads this one may fan out to.
 ///
-/// The runs are seeded in `chains`, which [`seed_chains`] made for them, side
-/// by side. Each chain is split between threads by hash, so one whose order
-/// is slow leaves threads to the others. A chain of several runs holds a
-/// shared tree beside their trees while it seeds ([`run_trees_workspace`]).
-///
-/// Every run must search a tree ([`searches_tree`]) in its window trimmed to
-/// a dictionary before its start, as [`streaming_blocks_in_window`] trims it,
-/// and they must come in order. Each tree is the one the run would have
-/// seeded, so the output does not change.
-#[allow(clippy::type_complexity)]
-pub(crate) fn run_trees<B: Budget + Sync>(
+/// The run need not search a tree in a window of its own
+/// ([`searches_tree`]): the tail of a run that does is coded on the tree
+/// that run's parse has built, which holds what this one does.
+pub(crate) fn seed_run_tree<B: Budget>(
     window: &[u8],
-    runs: &[Range<usize>],
-    chains: &[Range<usize>],
+    run: Range<usize>,
     options: EncodeOptions,
     allowance: &B,
-) -> Result<Option<Buffer<Option<Rar50TreeMatchFinder<B>>, B>>>
-where
-    Rar50TreeMatchFinder<B>: Send,
-{
-    debug_assert!(runs.iter().all(|run| run.end <= window.len()));
-    if chains.is_empty() {
-        return Ok(None);
-    }
-    let mut seeded: Vec<_> = chains
-        .iter()
-        .map(|chain| (chain.clone(), Ok(Vec::new())))
-        .collect();
-    crate::parallel::for_each_mut(&mut seeded, |_, (chain, trees)| {
-        *trees = seed_chain(window, &runs[chain.clone()], options, allowance);
-    });
-    let mut trees = Buffer::with_capacity(runs.len(), allowance)?;
-    for _ in runs {
-        trees.push_admitted(None);
-    }
-    for (chain, seeded) in seeded {
-        for (slot, tree) in trees[chain].iter_mut().zip(seeded?) {
-            *slot = Some(tree);
-        }
-    }
-    Ok(Some(trees))
+) -> Result<Rar50TreeMatchFinder<B>> {
+    let history = tree_history(run.start, options);
+    // The run's own window, as its collector would seed it.
+    let combined = &window[history.start..run.end];
+    Rar50TreeMatchFinder::seeded(
+        finder_window(options, combined.len()),
+        combined,
+        0..history.len(),
+        |pos| tree_len_limit(combined, pos, options),
+        options.max_match_candidates,
+        match_finder::seed_shares(history.len()),
+        allowance,
+    )
 }
 
-/// The trees of one of [`seed_chains`]'s chains.
-fn seed_chain<B: Budget>(
+/// The trees of one of [`seed_chains`]'s chains of several runs of `window`,
+/// in their order, seeded from one shared tree ([`run_trees_workspace`]).
+/// Each is the one [`seed_run_tree`] would seed for its run, so the output
+/// does not change.
+pub(crate) fn seed_chain<B: Budget>(
     window: &[u8],
     runs: &[Range<usize>],
     options: EncodeOptions,
     allowance: &B,
 ) -> Result<Vec<Rar50TreeMatchFinder<B>>> {
-    if let [run] = runs {
-        let history = tree_history(run.start, options);
-        // The run's own window, as its collector would seed it.
-        let combined = &window[history.start..run.end];
-        return Ok(vec![Rar50TreeMatchFinder::seeded(
-            finder_window(options, combined.len()),
-            combined,
-            0..history.len(),
-            |pos| tree_len_limit(combined, pos, options),
-            options.max_match_candidates,
-            match_finder::seed_shares(history.len()),
-            allowance,
-        )?]);
-    }
     let mut seed = match_finder::SeedTree::with_allowance(options.max_match_distance, allowance)?;
     runs.iter()
         .map(|run| {
@@ -2125,6 +2100,29 @@ fn seed_chain<B: Budget>(
             )
         })
         .collect()
+}
+
+/// The trees [`seed_run_tree`] and [`seed_chain`] seed for `runs` of `window`
+/// in `chains`, one for each run, or `None` where no chain holds it.
+#[cfg(all(test, feature = "parallel"))]
+pub(crate) fn run_trees(
+    window: &[u8],
+    runs: &[Range<usize>],
+    chains: &[Range<usize>],
+    options: EncodeOptions,
+    allowance: &Allowance,
+) -> Result<Vec<Option<Rar50TreeMatchFinder<Allowance>>>> {
+    let mut trees: Vec<Option<_>> = runs.iter().map(|_| None).collect();
+    for chain in chains {
+        let seeded = match &runs[chain.clone()] {
+            [run] => vec![seed_run_tree(window, run.clone(), options, allowance)?],
+            chained => seed_chain(window, chained, options, allowance)?,
+        };
+        for (slot, tree) in trees[chain.clone()].iter_mut().zip(seeded) {
+            *slot = Some(tree);
+        }
+    }
+    Ok(trees)
 }
 
 /// Whether an optimal parse of `window` from `start` searches a binary tree.
@@ -2169,7 +2167,6 @@ fn collector_at<B: Budget>(
             })
         }
         Some(RunFinder::Tree(tree)) => {
-            debug_assert!(searches_tree(combined.len(), at, options));
             OptimalCollector::with_tree(combined, at, tree, options, allowance)
         }
         None => OptimalCollector::with_allowance(combined, at, options, allowance),
@@ -2410,9 +2407,7 @@ fn runs_seeded_together_code_as_runs_seeded_alone() {
                 seed_chains(&window, &runs, options),
             ];
             for chains in &layouts {
-                let trees = run_trees(&window, &runs, chains, options, &allowance)
-                    .unwrap()
-                    .expect("runs are seeded");
+                let trees = run_trees(&window, &runs, chains, options, &allowance).unwrap();
                 for ((run, tree), alone) in runs.iter().zip(trees).zip(&alone) {
                     // A run left out seeds its own, as `alone` did.
                     let Some(tree) = tree else {
