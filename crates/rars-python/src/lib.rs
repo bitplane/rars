@@ -4,6 +4,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::relative_path as output_relative_path;
+use rars_rs::filename::LegacyNameEncoding;
 use rars_rs::output_links::{create_link_output, link_source_path};
 use rars_rs::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
@@ -1349,6 +1350,9 @@ impl RarFile {
     /// `options` cover opening and are the defaults for every later call; a call's own
     /// `options` replace them whole. `cancellation` covers opening alone.
     ///
+    /// With `legacy_name_encoding="detect"`, opening reads the available
+    /// volume headers to choose one encoding for their legacy filenames.
+    ///
     /// `salvage=True` reads what survives. Opening reads past damaged headers,
     /// listed in `header_damage`, and lists a member the file is cut short
     /// inside, as `truncation` says. A volume set may begin late or end early,
@@ -1396,10 +1400,18 @@ impl RarFile {
             })?,
         };
         let mut file = file.with_set(first_volume_only, volumes);
-        if salvage {
+        if salvage && file.archive.is_volume() {
             file.salvage_set(py, options)?;
+        } else {
+            file.detect_opened_encoding(py, options)?;
         }
         Ok(file)
+    }
+
+    /// The resolved source encoding for legacy filenames.
+    #[getter]
+    fn legacy_name_encoding(&self) -> Option<&'static str> {
+        self.encoding.map(LegacyNameEncoding::as_str)
     }
 
     fn namelist(&self, py: Python<'_>) -> PyResult<Vec<String>> {
@@ -1443,7 +1455,7 @@ impl RarFile {
         on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<u8>> {
         self.check_open()?;
-        let call_options = self.call_options(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation, volumes.is_some())?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1468,7 +1480,7 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
         on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Py<PyAny>> {
-        let call_options = self.call_options(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation, volumes.is_some())?;
         let options = call_options.as_ref();
         let data = self.read(
             py,
@@ -1502,7 +1514,7 @@ impl RarFile {
         on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Vec<Vec<u8>>> {
         self.check_open()?;
-        let call_options = self.call_options(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation, volumes.is_some())?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let indices = members
@@ -1538,7 +1550,7 @@ impl RarFile {
         flatten: bool,
     ) -> PyResult<PathBuf> {
         self.check_open()?;
-        let call_options = self.call_options(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation, volumes.is_some())?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let Overwrite(overwrite) = overwrite;
@@ -1546,10 +1558,12 @@ impl RarFile {
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "extracting");
-        let options = watched(
+        let mut options = watched(
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
+        let in_set = self.needs_later_volumes(target);
+        let prepared = self.resolve_call_encoding(py, volumes, &mut options, in_set)?;
         let mode = OutputMode {
             overwrite,
             in_place,
@@ -1557,10 +1571,11 @@ impl RarFile {
             flatten,
         };
         let chosen = |index: usize| index == target;
-        let extracted = if self.needs_later_volumes(target) {
+        let extracted = if in_set {
             self.extract_from_set(
                 py,
                 volumes,
+                prepared,
                 options,
                 Some(&HashSet::from([target])),
                 &out_dir,
@@ -1660,7 +1675,7 @@ impl RarFile {
                 "on_member_error reads every member, so it can't be combined with members",
             ));
         }
-        let call_options = self.call_options(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation, volumes.is_some())?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let mode = OutputMode {
@@ -1680,10 +1695,17 @@ impl RarFile {
             })
             .transpose()?;
         let progress = ReadProgress::new(options, "extracting");
-        let options = watched(
+        let mut options = watched(
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
+        let in_set = match &selected {
+            None => volumes.is_some() || self.archive.is_volume() && !self.salvaged_alone(),
+            Some(selected) => selected
+                .iter()
+                .any(|&index| self.needs_later_volumes(index)),
+        };
+        let prepared = self.resolve_call_encoding(py, volumes, &mut options, in_set)?;
         let member_errors =
             MemberErrors::new(on_member_error, options.legacy_name_encoding, keep_broken)?;
         let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
@@ -1698,16 +1720,11 @@ impl RarFile {
             None => options,
         };
         let failed = member_errors.as_ref().map(|errors| &errors.failed);
-        let in_set = match &selected {
-            None => volumes.is_some() || self.archive.is_volume() && !self.salvaged_alone(),
-            Some(selected) => selected
-                .iter()
-                .any(|&index| self.needs_later_volumes(index)),
-        };
         let extracted = if in_set {
             self.extract_from_set(
                 py,
                 volumes,
+                prepared,
                 options,
                 selected.as_ref(),
                 &out_dir,
@@ -1755,14 +1772,17 @@ impl RarFile {
         on_member_error: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         self.check_open()?;
-        let call_options = self.call_options(options, progress, cancellation)?;
+        let call_options = self.call_options(options, progress, cancellation, volumes.is_some())?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "testing");
-        let options = watched(
+        let mut options = watched(
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
+        let first = &self.archive;
+        let alone = volumes.is_none() && (!first.is_volume() || self.salvaged_alone());
+        let prepared = self.resolve_call_encoding(py, volumes, &mut options, !alone)?;
         let member_errors =
             MemberErrors::new(on_member_error, options.legacy_name_encoding, false)?;
         let handler = |member: &rars_rs::ArchiveMember, error: &rars_rs::Error| {
@@ -1776,8 +1796,6 @@ impl RarFile {
             Some(_) => options.with_member_error_handler(&handler),
             None => options,
         };
-        let first = &self.archive;
-        let alone = volumes.is_none() && (!first.is_volume() || self.salvaged_alone());
         if let Some(progress) = &progress {
             if alone {
                 progress.begin(first, &|_| true, true);
@@ -1804,7 +1822,7 @@ impl RarFile {
                 Some(run) => py
                     .detach(|| rars_rs::extract_volumes_to_with_options(&run, options, sink))
                     .map_err(map_error),
-                None => self.extract_set(py, volumes, options, |volumes| {
+                None => self.extract_prepared_set(py, volumes, prepared, options, |volumes| {
                     let all = |_: usize| true;
                     let volumes = tracked(progress.as_deref(), volumes, &all);
                     first.extract_with_volumes(volumes, options, sink)
@@ -1849,7 +1867,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
         self.check_open()?;
-        let call_options = self.call_options(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation, false)?;
         let options = call_options.as_ref();
         let password = py_password(password)?.or_else(|| self.password.clone());
         py.detach(|| {
@@ -1875,7 +1893,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Option<Vec<u8>>> {
         self.check_open()?;
-        let call_options = self.call_options(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation, false)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -1898,7 +1916,7 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
     ) -> PyResult<Vec<u8>> {
         self.check_open()?;
-        let call_options = self.call_options(options, None, cancellation)?;
+        let call_options = self.call_options(options, None, cancellation, false)?;
         let options = call_options.as_ref();
         check_read_options_cancellation(options)?;
         let index = self.resolve_index(py, member)?;
@@ -2091,9 +2109,21 @@ impl RarFile {
         options: Option<&ReadOptions>,
         progress: Option<&Bound<'_, PyAny>>,
         cancellation: Option<&CancellationToken>,
+        new_volumes: bool,
     ) -> PyResult<Option<ReadOptions>> {
         let defaults = self.options.as_ref().map(ReadOptions::policies);
-        ReadOptions::for_call(options.or(defaults.as_ref()), progress, cancellation)
+        let mut call =
+            ReadOptions::for_call(options.or(defaults.as_ref()), progress, cancellation)?;
+        if new_volumes && options.is_none_or(|options| options.encoding.is_none()) {
+            let requested = defaults
+                .as_ref()
+                .and_then(|options| options.legacy_name_encoding.as_deref());
+            if requested.is_some_and(|value| value.parse() == Ok(LegacyNameEncoding::Detect)) {
+                call.get_or_insert_with(ReadOptions::default).encoding =
+                    Some(LegacyNameEncoding::Detect);
+            }
+        }
+        Ok(call)
     }
 
     fn with_set(mut self, first_volume_only: bool, volumes: Option<Py<PyTuple>>) -> Self {
@@ -2193,6 +2223,25 @@ impl RarFile {
             ),
             _ => map_error(error),
         })
+    }
+
+    fn extract_prepared_set<T: Send>(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        prepared: Option<Vec<rars_rs::Archive>>,
+        options: rars_rs::ArchiveReadOptions<'_>,
+        run: impl FnOnce(
+                &mut (dyn Iterator<Item = rars_rs::Result<rars_rs::Archive>> + Send),
+            ) -> rars_rs::Result<T>
+            + Send,
+    ) -> PyResult<T> {
+        match prepared {
+            Some(volumes) => py
+                .detach(|| run(&mut volumes.into_iter().map(Ok)))
+                .map_err(map_error),
+            None => self.extract_set(py, volumes, options, run),
+        }
     }
 
     /// Reads the set's headers first when every volume is already to hand, so progress has a total from its first event.
@@ -2303,6 +2352,29 @@ impl RarFile {
         )
     }
 
+    fn detect_opened_encoding(
+        &mut self,
+        py: Python<'_>,
+        settings: Option<&ReadOptions>,
+    ) -> PyResult<()> {
+        let mut options = self.extraction_options(settings, self.password.as_deref());
+        if options.legacy_name_encoding == Some(LegacyNameEncoding::Detect) {
+            self.resolve_call_encoding(py, None, &mut options, false)?;
+            self.set_detected_encoding(options.legacy_name_encoding);
+            self.first = SetListing::new(
+                member_infos(&self.archive, self.encoding, &self.identity).map_err(map_error)?,
+            );
+        }
+        Ok(())
+    }
+
+    fn set_detected_encoding(&mut self, encoding: Option<LegacyNameEncoding>) {
+        self.encoding = encoding;
+        if let Some(options) = &mut self.options {
+            options.encoding = encoding;
+        }
+    }
+
     /// For `salvage=True`: reads the set's later volumes, those given or found by
     /// name, and leaves out the members they hold only part of.
     fn salvage_set(&mut self, py: Python<'_>, settings: Option<&ReadOptions>) -> PyResult<()> {
@@ -2318,6 +2390,9 @@ impl RarFile {
             run.extend(self.extract_set(py, None, options, |volumes| {
                 volumes.collect::<rars_rs::Result<Vec<_>>>()
             })?);
+        }
+        if settings.and_then(|settings| settings.encoding) == Some(LegacyNameEncoding::Detect) {
+            self.set_detected_encoding(rars_rs::detect_volume_legacy_name_encoding(&run));
         }
         // Only a volume's first or last member can be incomplete; name it as `RarInfo` would.
         let mut names = HashMap::new();
@@ -2409,6 +2484,7 @@ impl RarFile {
         &self,
         py: Python<'_>,
         volumes: Option<&Bound<'_, PyAny>>,
+        prepared: Option<Vec<rars_rs::Archive>>,
         options: rars_rs::ArchiveReadOptions<'_>,
         selected: Option<&HashSet<usize>>,
         out_dir: &Path,
@@ -2421,7 +2497,7 @@ impl RarFile {
         if let Some(progress) = progress {
             self.begin_set(py, volumes, options, progress, &chosen);
         }
-        self.extract_set(py, volumes, options, |volumes| {
+        self.extract_prepared_set(py, volumes, prepared, options, |volumes| {
             let mut volumes = tracked(progress.map(Arc::as_ref), volumes, &chosen);
             let outputs = std::cell::RefCell::new(ExtractOutputs::new(
                 out_dir,
@@ -2527,10 +2603,13 @@ impl RarFile {
         }
         let password = py_password(password)?.or_else(|| self.password.clone());
         let progress = ReadProgress::new(options, "reading");
-        let options = watched(
+        let mut options = watched(
             &progress,
             self.extraction_options(options, password.as_deref()),
         );
+        if on_member_error.is_some() {
+            self.resolve_call_encoding(py, volumes, &mut options, false)?;
+        }
         let salvage = options.salvage;
         let member_errors =
             MemberErrors::new(on_member_error, options.legacy_name_encoding, false)?;
@@ -2666,6 +2745,39 @@ impl RarFile {
         options
     }
 
+    /// Detect across the headers available to this call and retain them for extraction
+    /// when the caller supplied a volume iterator.
+    fn resolve_call_encoding(
+        &self,
+        py: Python<'_>,
+        volumes: Option<&Bound<'_, PyAny>>,
+        options: &mut rars_rs::ArchiveReadOptions<'_>,
+        needs_set: bool,
+    ) -> PyResult<Option<Vec<rars_rs::Archive>>> {
+        if options.legacy_name_encoding != Some(LegacyNameEncoding::Detect) {
+            return Ok(None);
+        }
+        let later = if volumes.is_some()
+            || !self.first_volume_only && (self.lists_later_volumes() || needs_set)
+        {
+            self.extract_set(py, volumes, *options, |later| {
+                volumes_to_last(&self.archive, later, true).collect::<rars_rs::Result<Vec<_>>>()
+            })?
+        } else {
+            Vec::new()
+        };
+        options.legacy_name_encoding = if later.is_empty() {
+            self.archive.detect_legacy_name_encoding()
+        } else {
+            let run: Vec<_> = std::iter::once(&self.archive)
+                .chain(&later)
+                .cloned()
+                .collect();
+            rars_rs::detect_volume_legacy_name_encoding(&run)
+        };
+        Ok(needs_set.then_some(later))
+    }
+
     fn from_bytes(
         py: Python<'_>,
         bytes: Vec<u8>,
@@ -2701,7 +2813,9 @@ impl RarFile {
         let archive = py
             .detach(|| read(python_read_options(options, password.as_deref())))
             .map_err(map_open_error)?;
-        let encoding = options.and_then(|settings| settings.encoding);
+        let encoding = options
+            .and_then(|settings| settings.encoding)
+            .filter(|encoding| *encoding != LegacyNameEncoding::Detect);
         let identity = Arc::new(());
         let infos = member_infos(&archive, encoding, &identity).map_err(map_error)?;
         let truncation = archive
@@ -3769,6 +3883,7 @@ fn check_password(
         .map(|archive| -> PyResult<Py<RarFile>> {
             let mut file = RarFile::parse(py, password, options, |_| Ok(archive))?;
             file.path = path;
+            file.detect_opened_encoding(py, options)?;
             Py::new(py, file)
         })
         .transpose()?;

@@ -8987,13 +8987,28 @@ fn legacy_name_encoding_lists_cp932_names() {
         .unwrap();
     fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
 
+    for encoding in ["cp932", "detect"] {
+        let result = Command::new(env!("CARGO_BIN_EXE_rars"))
+            .args(["info", "--legacy-name-encoding", encoding])
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(result.status.success(), "{}", stderr(&result));
+        assert!(String::from_utf8_lossy(&result.stdout).contains("漫画/第1話/ページ01.jpg"));
+    }
+
+    let out = work.join("out");
     let result = Command::new(env!("CARGO_BIN_EXE_rars"))
-        .args(["info", "--legacy-name-encoding", "cp932"])
-        .arg(archive)
+        .args(["x", "--legacy-name-encoding", "detect"])
+        .arg(&archive)
+        .arg(&out)
         .output()
         .unwrap();
     assert!(result.status.success(), "{}", stderr(&result));
-    assert!(String::from_utf8_lossy(&result.stdout).contains("漫画/第1話/ページ01.jpg"));
+    assert_eq!(
+        fs::read(out.join("漫画/第1話/ページ01.jpg")).unwrap(),
+        b"payload"
+    );
 }
 
 #[test]

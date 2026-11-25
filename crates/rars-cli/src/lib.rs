@@ -34,6 +34,7 @@ use password::{
     read_archive_path_prompting_with_options, resolve_password, Password,
 };
 use progress::CliProgress;
+use rars::filename::LegacyNameEncoding;
 use rars::output_staging::{failed_entry_name, refused_output, FileIdentity};
 use rars::output_tree::{OutputTree, TreeEntry};
 use rars::rar13::{self, WriterOptions as Rar13WriterOptions};
@@ -177,7 +178,10 @@ fn cmd_info(args: InfoArgs) -> CliResult<()> {
                 print_terse_header(path, &archive);
             }
             warn_archive_structure(Path::new(path), &archive);
-            let options = args.read_options.options(password, scratch.as_ref());
+            let mut options = args.read_options.options(password, scratch.as_ref());
+            if options.legacy_name_encoding == Some(LegacyNameEncoding::Detect) {
+                options.legacy_name_encoding = archive.detect_legacy_name_encoding();
+            }
             match archive {
                 DetectedArchive::Rar13(archive) => {
                     if args.verbose {
@@ -412,7 +416,7 @@ fn info_rar15_40_terse(
                     file.pack_size,
                     display_legacy_name(
                         &file.name,
-                        file.unicode_name.is_some(),
+                        file.name_is_unicode(),
                         options.legacy_name_encoding,
                     )?,
                 ))
@@ -448,7 +452,7 @@ fn info_rar15_40_verbose(
     for (index, file) in archive.files().enumerate() {
         println!(
             "  #{index}: {} pack={} unp={} method={:#04x} flags={:#06x} attr={:#010x} crc={:#010x} ver={}",
-            display_legacy_name(&file.name, file.unicode_name.is_some(), options.legacy_name_encoding)?,
+            display_legacy_name(&file.name, file.name_is_unicode(), options.legacy_name_encoding)?,
             file.pack_size,
             file.unp_size,
             file.method,
@@ -1111,13 +1115,16 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
         family,
     ));
     let kept = KeptBroken::default();
+    let mut options = args
+        .read_options
+        .options(password_bytes(&password), scratch.as_ref());
+    if options.legacy_name_encoding == Some(LegacyNameEncoding::Detect) {
+        options.legacy_name_encoding = rars::detect_volume_legacy_name_encoding(&archives);
+    }
     let mut skipped = 0;
     for run in &runs {
         skipped += skip_incomplete_members(&paths[run.clone()], &mut archives[run.clone()]);
     }
-    let options = args
-        .read_options
-        .options(password_bytes(&password), scratch.as_ref());
     let mut passed_over = PassedOver::default();
     for run in runs {
         let (paths, archives) = (&paths[run.clone()], &archives[run]);

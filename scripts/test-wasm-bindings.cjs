@@ -104,7 +104,7 @@ check('options retain conversion exceptions and exact reader limits', () => {
     const archive = new engine.RarFile(data, undefined, {maxHeaderCount: value});
     archive.test();archive.free();
   }
-  for (const settings of [{legacyNameEncoding: 1}, {legacyNameEncoding: 'auto'}])
+  for (const settings of [{legacyNameEncoding: 1}, {legacyNameEncoding: 'bogus'}])
     refuses(() => new engine.RarFile(data, undefined, settings), 'INVALID_OPTION');
   refuses(() => new engine.RarFile(data, 1), 'INVALID_OPTION');
   refuses(() => engine.RarFile.openVolumes([]), 'INVALID_ARCHIVE');

@@ -37,7 +37,7 @@ export function createApi(runtime) {
       const encoding = options.legacyNameEncoding;
       if (typeof encoding !== "string" || ![
         "cp437", "cp850", "cp852", "cp866", "cp1251", "cp1252", "windows-1251", "windows-1252", "utf8", "utf-8",
-        "cp932", "shift_jis", "shift-jis", "sjis", "windows-31j", "cp936", "gbk", "cp949", "euc-kr", "uhc", "cp950", "big5",
+        "cp932", "shift_jis", "shift-jis", "sjis", "windows-31j", "cp936", "gbk", "cp949", "euc-kr", "uhc", "cp950", "big5", "detect", "auto",
       ].includes(encoding.toLowerCase())) {
         throw new RarError("INVALID_OPTION", "unsupported legacyNameEncoding");
       }
@@ -142,6 +142,11 @@ export function createApi(runtime) {
   class RarArchive {
     #nameEntries = new Map();
     #indexedEntries;
+    #legacyNameEncoding;
+
+    get legacyNameEncoding() {
+      return this.#legacyNameEncoding;
+    }
 
     static async open(input, options) {
       const operation = operationOptions(options);
@@ -157,7 +162,7 @@ export function createApi(runtime) {
 
     constructor(sources, password, metadata, defaults) {
       this._defaults = defaults;
-      this._legacyNameEncoding = defaults.legacyNameEncoding;
+      this.#legacyNameEncoding = metadata.legacyNameEncoding ?? null;
       this._sources = sources;
       // The volume a set opened by path stopped short of, to name if it turns out missing.
       this._volumeNotFound = metadata.volumeNotFound;
@@ -235,7 +240,7 @@ export function createApi(runtime) {
 
     get(name) {
       const matches = this.#matchingEntries(name, false);
-      if (this._legacyNameEncoding != null && typeof name === "string"
+      if (this.legacyNameEncoding !== null && typeof name === "string"
           && matches.some((entry) => !sameName(entry.nameBytes, matches[0].nameBytes))) {
         throw new RarError("AMBIGUOUS_ENTRY", "decoded name is ambiguous; use getAll() or an entry index");
       }

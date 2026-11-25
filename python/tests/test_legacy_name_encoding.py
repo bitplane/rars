@@ -45,7 +45,7 @@ def test_shared_encoding_mappings(encoding, raw, expected):
 
 def test_invalid_options_and_undefined_bytes_fail(tmp_path):
     with pytest.raises(ValueError, match="unsupported legacy"):
-        rars.ReadOptions(legacy_name_encoding="auto")
+        rars.ReadOptions(legacy_name_encoding="bogus")
     builder = rars.RarBuilder(version="rar29", level=0)
     builder.add_bytes(b"x", b"bad-\x81")
     options = rars.ReadOptions(legacy_name_encoding="windows-1252")
@@ -104,3 +104,40 @@ def test_volume_extraction_uses_name_policy(tmp_path, format):
     rars.RarFile(paths[0]).extractall(out, options=rars.ReadOptions(legacy_name_encoding="cp850"),
                                       volumes=paths[1:])
     assert (out / "café.txt").read_bytes() == payload
+
+
+@pytest.mark.parametrize("volume_set", [False, True])
+def test_detect_resolves_legacy_names(tmp_path, volume_set):
+    names = [f"漫画の冒険と旅の物語/ページ{index:02}.jpg" for index in range(1, 21)]
+    builder = rars.RarBuilder(version="rar29", level=0, volume_size=1024 if volume_set else None)
+    payload = b"page" * 64
+    cover = b"cover" * 500
+    if volume_set:
+        builder.add_bytes(cover, b"cover.jpg")
+    for name in names:
+        builder.add_bytes(payload, name.encode("cp932"))
+    options = rars.ReadOptions(legacy_name_encoding="DeTeCt")
+    if volume_set:
+        first, *later = builder.write(tmp_path / "pages.rar")
+        archive = rars.RarFile(first.read_bytes(), volumes=later, options=options)
+        first_only = rars.RarFile(first.read_bytes(), options=options)
+        assert first_only.legacy_name_encoding is None
+        first_only.extractall(tmp_path / "override", volumes=iter(later))
+    else:
+        archive = rars.RarFile(builder.to_bytes(), options=options)
+        raw_archive = rars.RarFile(builder.to_bytes())
+        raw_archive.extractall(tmp_path / "override", options=options)
+    assert archive.legacy_name_encoding == "cp932"
+    assert archive.namelist() == (["cover.jpg"] + names if volume_set else names)
+    archive.extractall(tmp_path / "opened")
+    for name in names:
+        assert (tmp_path / "opened" / name).read_bytes() == payload
+        assert (tmp_path / "override" / name).read_bytes() == payload
+
+
+def test_detect_ascii_names_use_the_default_view():
+    builder = rars.RarBuilder(version="rar15", level=0)
+    builder.add_bytes(b"page", "page01.jpg")
+    archive = rars.RarFile(builder.to_bytes(), options=rars.ReadOptions(legacy_name_encoding="auto"))
+    assert archive.legacy_name_encoding is None
+    assert archive.namelist() == ["page01.jpg"]

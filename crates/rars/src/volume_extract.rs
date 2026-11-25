@@ -1,6 +1,14 @@
 use crate::source::RangeReader;
 use std::io::{Read, Result, Write};
 
+/// Guesses one encoding for the legacy member names across all the volumes.
+/// The same rules apply as for [`crate::Archive::detect_legacy_name_encoding`].
+pub fn detect_volume_legacy_name_encoding(
+    archives: &[crate::Archive],
+) -> Option<crate::filename::LegacyNameEncoding> {
+    crate::filename::detect_legacy_name_encoding(archives.iter())
+}
+
 pub(crate) type Volumes<'p, A> = dyn Iterator<Item = crate::Result<A>> + Send + 'p;
 
 /// A failed split member and the volume holding its end, if available.

@@ -322,6 +322,9 @@ class RarFile:
         or raises it.
 
         `mode` may only be `"r"`, as `RarFile` only reads; `RarBuilder` writes."""
+    @property
+    def legacy_name_encoding(self) -> str | None:
+        """The resolved source encoding for legacy filenames."""
     def namelist(self) -> list[str]: ...
     def infolist(self) -> list[RarInfo]: ...
     def getinfo(self, member: _Member) -> RarInfo: ...

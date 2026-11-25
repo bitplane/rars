@@ -13,6 +13,8 @@ export class RarArchive {
   /** With `salvage`, a first volume's path brings the later volumes found beside it until one is missing. */
   static open(input: NodeRarInput | readonly NodeRarInput[], options?: OpenOptions): Promise<RarArchive>;
   readonly entries: readonly import("./base.js").RarEntry[];
+  /** Resolved source encoding for legacy names, or null when raw bytes are used. */
+  readonly legacyNameEncoding: string | null;
   readonly family: import("./base.js").ArchiveFamily;
   readonly sfxOffset: number;
   readonly needsPassword: boolean;

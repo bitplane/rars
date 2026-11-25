@@ -5,6 +5,7 @@
 //! facade assembled by `scripts/build-npm.sh`; wasm-bindgen classes are not
 //! exposed from the npm package.
 
+use rars_rs::filename::LegacyNameEncoding;
 use rars_rs::{ArchiveVersion, Builder};
 use wasm_bindgen::prelude::*;
 
@@ -469,6 +470,8 @@ pub struct RarFile {
     archives: Vec<rars_rs::Archive>,
     password: Option<Vec<u8>>,
     infos: Vec<RarInfo>,
+    encoding: Option<LegacyNameEncoding>,
+    detect_encoding: bool,
     /// Each member's first part: its volume, and its index within that volume.
     places: Vec<(usize, usize)>,
     /// The split members `salvage` left out, as part of each is in a volume not given.
@@ -533,15 +536,21 @@ impl RarFile {
         let options = read_options(password.as_deref(), &settings)?;
         let mut archives =
             vec![rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?];
+        let detect_encoding = options.legacy_name_encoding == Some(LegacyNameEncoding::Detect);
+        let encoding = if detect_encoding {
+            rars_rs::detect_volume_legacy_name_encoding(&archives)
+        } else {
+            options.legacy_name_encoding
+        };
         // A volume on its own reads as a lone archive once its split members are gone.
         let incomplete = if options.salvage {
-            drop_incomplete(&mut archives, options.legacy_name_encoding).map_err(js_error)?
+            drop_incomplete(&mut archives, encoding).map_err(js_error)?
         } else {
             Vec::new()
         };
         let infos = archives[0]
             .members()
-            .map(|member| info_with_encoding(member, options.legacy_name_encoding))
+            .map(|member| info_with_encoding(member, encoding))
             .collect::<rars_rs::Result<Vec<_>>>()
             .map_err(js_error)?;
         let places = (0..infos.len()).map(|index| (0, index)).collect();
@@ -549,6 +558,8 @@ impl RarFile {
             archives,
             password,
             infos,
+            encoding,
+            detect_encoding,
             places,
             incomplete,
         })
@@ -576,9 +587,15 @@ impl RarFile {
                 rars_rs::ArchiveReader::read_owned_with_options(data, options).map_err(js_error)?,
             );
         }
+        let detect_encoding = options.legacy_name_encoding == Some(LegacyNameEncoding::Detect);
+        let encoding = if detect_encoding {
+            rars_rs::detect_volume_legacy_name_encoding(&archives)
+        } else {
+            options.legacy_name_encoding
+        };
         // A salvaged set may begin late or end early: what it holds only part of is left out.
         let incomplete = if options.salvage {
-            drop_incomplete(&mut archives, options.legacy_name_encoding).map_err(js_error)?
+            drop_incomplete(&mut archives, encoding).map_err(js_error)?
         } else {
             Vec::new()
         };
@@ -599,7 +616,7 @@ impl RarFile {
             .into_iter()
             .zip(places.iter().map(|&(volume, _)| volume))
             .map(|(member, volume_index)| {
-                info_with_encoding(member, options.legacy_name_encoding).map(|info| RarInfo {
+                info_with_encoding(member, encoding).map(|info| RarInfo {
                     volume_index,
                     ..info
                 })
@@ -610,9 +627,17 @@ impl RarFile {
             archives,
             password,
             infos,
+            encoding,
+            detect_encoding,
             places,
             incomplete,
         })
+    }
+
+    /// The resolved source encoding for legacy filenames.
+    #[wasm_bindgen(getter, js_name = legacyNameEncoding)]
+    pub fn legacy_name_encoding(&self) -> Option<String> {
+        self.encoding.map(|encoding| encoding.as_str().to_owned())
     }
 
     /// Where the file ends early, or undefined: `{ block, name, offset, started,
@@ -858,13 +883,20 @@ impl RarFile {
         member_error: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        let options = read_options(password.as_deref(), &settings)?;
+        let mut options = read_options(password.as_deref(), &settings)?;
+        let mut next_volume = next_volume;
+        let volumes = self.resolve_call_encoding(&mut options, &mut next_volume)?;
         let report =
             member_errors::Reporting::start(member_error, options.legacy_name_encoding, false);
         let options = report
             .as_ref()
             .map_or(options, |report| report.handling(options));
-        let result = self.test_with(options, progress, next_volume);
+        let result = Self::test_with(
+            volumes.as_deref().unwrap_or(&self.archives),
+            options,
+            progress,
+            next_volume,
+        );
         if let Some(report) = report {
             report.finish()?;
         }
@@ -999,7 +1031,9 @@ impl RarFile {
         use std::collections::HashSet;
         use std::rc::Rc;
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        let options = read_options(password.as_deref(), &settings)?;
+        let mut options = read_options(password.as_deref(), &settings)?;
+        let mut next_volume = next_volume;
+        let volumes = self.resolve_call_encoding(&mut options, &mut next_volume)?;
         let report = member_errors::Reporting::start(
             member_error,
             options.legacy_name_encoding,
@@ -1018,14 +1052,15 @@ impl RarFile {
         });
         let chosen = |name: &[u8]| selected.as_ref().is_none_or(|set| set.contains(name));
         // Later volumes still to arrive have members not listed yet.
-        let total = next_volume.is_none().then(|| {
+        let total = (next_volume.is_none() && volumes.is_none()).then(|| {
             self.infos
                 .iter()
                 .filter(|info| chosen(&info.name) && !info.link && !info.directory)
                 .map(|info| info.size as u64)
                 .sum()
         });
-        let family = self.archives[0].family();
+        let archives = volumes.as_deref().unwrap_or(&self.archives);
+        let family = archives[0].family();
         let encoding = options.legacy_name_encoding;
         let tree = JsTree(read_link);
         let raised: RefCell<Option<JsValue>> = RefCell::new(None);
@@ -1128,16 +1163,16 @@ impl RarFile {
                 // A salvaged set may end early: it is the volumes it was opened with, and
                 // waits for no more. A volume on its own reads as a lone archive once its
                 // split members are gone.
-                Ok(if self.archives.len() == 1 {
-                    self.archives[0].extract_with_links(options, open, link)
+                Ok(if archives.len() == 1 {
+                    archives[0].extract_with_links(options, open, link)
                 } else {
-                    rars_rs::extract_volumes_with_links(&self.archives, options, open, link)
+                    rars_rs::extract_volumes_with_links(archives, options, open, link)
                 }
                 .and_then(|()| flush()))
             } else {
-                with_later_volumes(&self.archives, options, next_volume, |later| {
+                with_later_volumes(archives, options, next_volume, |later| {
                     rars_rs::output_links::extract_arriving_with_links(
-                        &self.archives[0],
+                        &archives[0],
                         later,
                         options,
                         open,
@@ -1233,22 +1268,63 @@ impl RarFile {
         Ok(())
     }
 
+    fn resolve_call_encoding(
+        &self,
+        options: &mut rars_rs::ArchiveReadOptions<'_>,
+        next_volume: &mut Option<js_sys::Function>,
+    ) -> Result<Option<Vec<rars_rs::Archive>>, JsValue> {
+        match options.legacy_name_encoding {
+            Some(LegacyNameEncoding::Detect) if next_volume.is_some() => {
+                let volumes = with_later_volumes(
+                    &self.archives,
+                    *options,
+                    next_volume.take(),
+                    |mut later| {
+                        let mut volumes = vec![self.archives[0].clone()];
+                        while !ends_volume_set(volumes.last().expect("the first volume is present"))
+                        {
+                            let Some(volume) = later.next() else { break };
+                            volumes.push(volume?);
+                        }
+                        Ok(volumes)
+                    },
+                )?
+                .map_err(js_error)?;
+                options.legacy_name_encoding =
+                    rars_rs::detect_volume_legacy_name_encoding(&volumes);
+                Ok(Some(volumes))
+            }
+            Some(LegacyNameEncoding::Detect) => {
+                options.legacy_name_encoding = if self.detect_encoding {
+                    self.encoding
+                } else {
+                    rars_rs::detect_volume_legacy_name_encoding(&self.archives)
+                };
+                Ok(None)
+            }
+            None => {
+                options.legacy_name_encoding = self.encoding;
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// `test` once its options are settled.
     fn test_with(
-        &self,
+        archives: &[rars_rs::Archive],
         options: rars_rs::ArchiveReadOptions<'_>,
         progress: Option<js_sys::Function>,
         next_volume: Option<js_sys::Function>,
     ) -> Result<(), JsValue> {
         // A volume on its own is the start of its set, so running out of it is a
         // missing volume, as extraction and Python have it. Salvage stops there.
-        let lone_volume =
-            !options.salvage && self.archives.len() == 1 && self.archives[0].is_volume();
+        let lone_volume = !options.salvage && archives.len() == 1 && archives[0].is_volume();
         if next_volume.is_some() || lone_volume {
             return progress::watching(progress, || {
                 let count = progress::ReadCount::with_total("testing", None);
-                let result = with_later_volumes(&self.archives, options, next_volume, |later| {
-                    self.archives[0].extract_with_volumes(later, options, |_| {
+                let result = with_later_volumes(archives, options, next_volume, |later| {
+                    archives[0].extract_with_volumes(later, options, |_| {
                         Ok(count.counted(Box::new(std::io::sink())))
                     })
                 });
@@ -1260,15 +1336,13 @@ impl RarFile {
             .map_err(js_error);
         }
         if progress.is_some() {
-            return progress::watching(progress, || test_counted(&self.archives, options))
+            return progress::watching(progress, || test_counted(archives, options))
                 .map_err(js_error);
         }
-        if self.archives.len() == 1 {
-            return self.archives[0]
-                .test_with_options(options)
-                .map_err(js_error);
+        if archives.len() == 1 {
+            return archives[0].test_with_options(options).map_err(js_error);
         }
-        rars_rs::extract_volumes_to_with_options(&self.archives, options, |_| {
+        rars_rs::extract_volumes_to_with_options(archives, options, |_| {
             Ok(Box::new(std::io::sink()) as Box<dyn std::io::Write>)
         })
         .map_err(js_error)
@@ -1302,7 +1376,8 @@ impl RarFile {
             ));
         }
         let password = password_bytes(password)?.or_else(|| self.password.clone());
-        let options = read_options(password.as_deref(), settings)?;
+        let mut options = read_options(password.as_deref(), settings)?;
+        self.resolve_call_encoding(&mut options, &mut None)?;
         let salvage = options.salvage;
         let report =
             member_errors::Reporting::start(member_error, options.legacy_name_encoding, false);
@@ -1434,6 +1509,21 @@ impl Iterator for Arriving<'_> {
                 )))
             }
         }
+    }
+}
+
+fn ends_volume_set(archive: &rars_rs::Archive) -> bool {
+    if !archive.is_volume() {
+        return true;
+    }
+    match archive {
+        rars_rs::Archive::Rar15To40(archive) => archive.blocks.iter().any(
+            |block| matches!(block, rars_rs::rar15_40::Block::End(end) if !end.has_next_volume()),
+        ),
+        rars_rs::Archive::Rar50Plus(archive) => archive.blocks.iter().any(
+            |block| matches!(block, rars_rs::rar50::Block::End(end) if !end.has_next_volume()),
+        ),
+        _ => false,
     }
 }
 
@@ -1873,7 +1963,8 @@ impl RarBuilder {
         max_staged_bytes: Option<f64>,
     ) -> Result<RarBuilder, JsValue> {
         let password = password_bytes(password)?.or_else(|| archive.password.clone());
-        let options = read_options(password.as_deref(), &settings)?;
+        let mut options = read_options(password.as_deref(), &settings)?;
+        archive.resolve_call_encoding(&mut options, &mut None)?;
         let (first, later) = archive
             .archives
             .split_first()
@@ -2347,6 +2438,8 @@ mod host_tests {
         let file = super::RarFile {
             places: (0..infos.len()).map(|index| (0, index)).collect(),
             infos,
+            encoding: None,
+            detect_encoding: false,
             archives: vec![archive],
             password: None,
             incomplete: Vec::new(),
