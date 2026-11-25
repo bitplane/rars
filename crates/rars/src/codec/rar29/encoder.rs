@@ -754,6 +754,16 @@ fn encode_ppmd_block_with_model(
 /// How much of a member [`encode_ppmd_either_way`] codes both ways to choose.
 const PPMD_EITHER_WAY_SAMPLE: usize = 1 << 20;
 
+/// How many codings of a `len` byte member [`encode_ppmd_either_way`] holds
+/// at once: the escaped one while it codes the literals when it codes the
+/// whole member both ways, and otherwise one at a time.
+pub(crate) fn ppmd_either_way_codings(len: usize) -> u64 {
+    match len <= PPMD_EITHER_WAY_SAMPLE.saturating_mul(2) {
+        true => 2,
+        false => 1,
+    }
+}
+
 /// Codes a PPMd block with LZ escapes or as plain literals, from the same
 /// model, whichever codes the member's start smaller, escapes on a tie.
 ///
@@ -2932,6 +2942,13 @@ fn parse_ranges(
 /// The shortest-path parse's own workspace is not included; a caller that
 /// asks for it charges [`OPTIMAL_PARSE_WORKSPACE`] per block parsing at once.
 pub(crate) fn member_encode_workspace(len: usize, options: EncodeOptions) -> u64 {
+    let earlier = len as u64;
+    side_encode_workspace(len, options).saturating_add(earlier.saturating_add(earlier / 8))
+}
+
+/// [`member_encode_workspace`] for an encode run beside the one that keeps
+/// the best so far, which holds no earlier encode's bytes.
+pub(crate) fn side_encode_workspace(len: usize, options: EncodeOptions) -> u64 {
     let options = options.constrained();
     let reach = options.max_match_distance.min(MAX_HISTORY);
     // A filtered member's blocks are never longer than a plain one's.
@@ -2957,7 +2974,56 @@ pub(crate) fn member_encode_workspace(len: usize, options: EncodeOptions) -> u64
     finder
         .saturating_add(tokens)
         .saturating_add(len)
-        .saturating_add(packed.saturating_mul(2))
+        .saturating_add(packed)
+}
+
+/// The most [`Unpack29Encoder::encode_lz_streamed`] holds beside the chain's
+/// history, for a member longer than one block: the window it reads segments
+/// of four reaches into after the reach before them, which doubles from one
+/// segment to two, the match finder, and one parse batch's tokens and packed
+/// blocks.
+///
+/// The shortest-path parse's own workspace is not included, as for
+/// [`member_encode_workspace`].
+pub(crate) fn streamed_lz_workspace(options: EncodeOptions) -> u64 {
+    let options = options.constrained();
+    let reach = options.max_match_distance.min(MAX_HISTORY);
+    let block = options
+        .block_size
+        .filter(|&size| size != 0)
+        .unwrap_or(reach)
+        .max(1);
+    let batch = LzParser::batch_bytes(block);
+    let segment = reach.saturating_mul(4).div_ceil(batch).max(1) * batch;
+    let window = segment.saturating_mul(2) as u64;
+    let finder = Rar29MatchFinder::bytes_for_reach(reach.saturating_add(batch), reach);
+    let token = std::mem::size_of::<EncodeToken>() as u64;
+    let per_byte = match options.split_blocks {
+        true => 2 * token + 2,
+        false => token + 1,
+    };
+    let batch = batch as u64;
+    let packed = batch.saturating_add(batch / 8);
+    window
+        .saturating_add(finder)
+        .saturating_add(batch.saturating_mul(per_byte))
+        .saturating_add(packed)
+}
+
+/// The most a streamed PPMd member holds beside its model and the chain's
+/// history: the window it reads a segment and the look-ahead into after the
+/// reach before them, which doubles from one read to two, and with `escapes`
+/// the escape search over it.
+pub(crate) fn streamed_ppmd_workspace(escapes: Option<usize>) -> u64 {
+    let reach = escapes.map_or(0, |distance| distance.min(MAX_HISTORY));
+    let lookahead = escapes.map_or(0, |_| PPMD_STREAM_LOOKAHEAD);
+    let read = reach
+        .saturating_mul(4)
+        .max(PPMD_STREAM_SEGMENT)
+        .saturating_add(lookahead);
+    let window = read.saturating_mul(2) as u64;
+    let search = escapes.map_or(0, ppmd_search_workspace);
+    window.saturating_add(search)
 }
 
 /// What coding a `len` byte member into a solid chain holds beyond what coding
@@ -3911,15 +3977,14 @@ fn search_half(
     });
 }
 
-/// The most an escape search holds: links over the reach and a batch, the heads, and a batch found.
+/// The most an escape search holds: the finder [`PpmdMatchSearch::new`]
+/// builds over the reach and a batch, and a batch found.
 pub(crate) fn ppmd_search_workspace(max_match_distance: usize) -> u64 {
     let batch = PpmdMatchSearch::MAX_BATCH;
-    let links = max_match_distance
-        .min(MAX_HISTORY)
-        .saturating_add(batch)
-        .next_power_of_two();
+    let reach = max_match_distance.min(MAX_HISTORY);
+    let finder = PpmdMatchFinder::bytes_for_reach(reach.saturating_add(batch), reach);
     let found = batch * std::mem::size_of::<Option<(u8, u32)>>();
-    (links as u64 + (1 << 20)) * 4 + found as u64
+    finder.saturating_add(found as u64)
 }
 
 /// The longest escape match at `pos`, nearest first on a tie: up to

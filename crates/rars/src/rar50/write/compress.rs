@@ -25,11 +25,12 @@ use super::filter_policy::{
     within_filter_reach,
 };
 use super::FilterPolicy;
-use crate::codec::packed_chain::{PackedMatchFinder, SharedPackedIndex};
+use crate::codec::packed_chain::SharedPackedIndex;
 use crate::codec::rar50::EncodeOptions;
 use crate::codec::rar50::{
-    filter_streaming_blocks_in_place, streaming_blocks_in_window, streaming_blocks_with_finder,
-    BlockSplitter, EncodeFilter,
+    filter_streaming_blocks_in_place, run_trees, run_trees_workspace, streaming_blocks_in_window,
+    streaming_blocks_with_finder, streaming_blocks_with_tree, BlockSplitter, EncodeFilter,
+    RunFinder,
 };
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::Crc32;
@@ -258,15 +259,16 @@ struct BlockJob<B: Budget> {
     shared: Option<SharedRun<B>>,
 }
 
-/// A run's part of its group's window, and for a run that walks chains, a
-/// finder over the group's index standing where the run's own would.
+/// A run's part of its group's window, and a finder standing where the run's
+/// own would: over the group's index for a run that walks chains, or the tree
+/// a run that searches one would have seeded.
 struct SharedRun<B: Budget> {
     window: std::sync::Arc<Buffer<u8, B>>,
     /// Where the run starts and ends in `window`.
     start: usize,
     end: usize,
-    /// None for a run that searches a tree, which it builds for itself.
-    finder: Option<PackedMatchFinder<B>>,
+    /// None for a run that seeds its own tree.
+    finder: Option<RunFinder<B>>,
     /// For a filtered run, the blocks it is coded in and their records. Its
     /// part of `window` already holds the filtered bytes.
     filtered: Option<crate::codec::rar50::FilteredRunBlocks<B>>,
@@ -390,7 +392,51 @@ where
     crate::parallel::for_each_mut(&mut builds, |_, (group, window_len, result)| {
         *result = share_group(group, *window_len, options, allowance);
     });
-    builds.into_iter().try_for_each(|(_, _, result)| result)
+    // One group at a time, since each seeds on every thread and holds a seed
+    // tree while it does, which the wave is charged for once.
+    for (group, _, result) in builds.iter_mut() {
+        std::mem::replace(result, Ok(()))?;
+        if !chain {
+            seed_group_trees(group, options, allowance)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seeds the trees of a group's runs that search one from a single tree,
+/// where their histories overlap ([`run_trees`]). Each run gets the tree it
+/// would have seeded itself.
+fn seed_group_trees<B: Budget>(
+    group: &mut [&mut BlockJob<B>],
+    options: EncodeOptions,
+    allowance: &B,
+) -> Result<()> {
+    let trees: Vec<usize> = (0..group.len())
+        .filter(|&index| {
+            group[index]
+                .shared
+                .as_ref()
+                .is_some_and(|shared| shared.finder.is_none())
+        })
+        .collect();
+    let Some(&first) = trees.first() else {
+        return Ok(());
+    };
+    let window = std::sync::Arc::clone(&group[first].shared.as_ref().expect("a shared run").window);
+    let runs: Vec<std::ops::Range<usize>> = trees
+        .iter()
+        .map(|&index| {
+            let shared = group[index].shared.as_ref().expect("a shared run");
+            debug_assert!(std::sync::Arc::ptr_eq(&shared.window, &window));
+            shared.start..shared.end
+        })
+        .collect();
+    if let Some(seeded) = run_trees(&window, &runs, options, allowance)? {
+        for (&index, tree) in trees.iter().zip(seeded) {
+            group[index].shared.as_mut().expect("a shared run").finder = tree.map(RunFinder::Tree);
+        }
+    }
+    Ok(())
 }
 
 fn share_group<B: Budget + Send + Sync>(
@@ -480,7 +526,8 @@ where
     } else {
         SharedPackedIndex::finders_over(&window, &chain_at, allowance)?
     }
-    .into_iter();
+    .into_iter()
+    .map(RunFinder::Packed);
     let window = std::sync::Arc::new(window);
     let runs = group.iter_mut().zip(bounds).zip(chains).zip(filtered);
     for (((job, (start, end)), chain), filtered) in runs {
@@ -1554,11 +1601,13 @@ impl WaveWorkspace {
         }
     }
 
-    fn peak(self, retained: u64) -> u64 {
+    /// `seed` is held beside the coded jobs' trees while their windows are
+    /// shared out, before any of them codes.
+    fn peak(self, retained: u64, seed: u64) -> u64 {
         let filters = self.filter_inputs.saturating_add(self.filter_search);
         self.assembly
             .max(filters)
-            .max(self.coding)
+            .max(self.coding.saturating_add(seed))
             .saturating_add(retained)
     }
 }
@@ -1570,6 +1619,12 @@ struct BlockWave {
     // The hard ledger also holds the scopes' control blocks and any existing
     // coordinator allocations, such as retained histories and spool storage.
     scopes: u64,
+    /// The member of the last job that seeds a tree from history, and how
+    /// many of its jobs in a row do.
+    seeding: Option<(usize, usize)>,
+    /// Whether a member has two jobs that seed trees, which may then share a
+    /// seed tree ([`seed_group_trees`]).
+    shared_seed: bool,
 }
 
 impl BlockWave {
@@ -1585,7 +1640,21 @@ impl BlockWave {
         required: u64,
         resources: &WriterResources,
         advance: &dyn CompressionProgress,
+        seeding: Option<usize>,
     ) -> Result<bool> {
+        let seeding = match seeding {
+            Some(member) => Some(match self.seeding {
+                Some((last, count)) if last == member => (member, count + 1),
+                _ => (member, 1),
+            }),
+            None => self.seeding,
+        };
+        let shared_seed = self.shared_seed || seeding.is_some_and(|(_, count)| count >= 2);
+        let seed = if shared_seed {
+            run_trees_workspace(plan.encode_options)
+        } else {
+            0
+        };
         let filter_piece = if filter_runs && plan.filter_policy == FilterPolicy::Auto {
             len
         } else {
@@ -1600,7 +1669,7 @@ impl BlockWave {
             single_pass_tree_chunk(plan, filter_runs, min_len, history)
                 .filter(|_| resources.execution.is_none()),
         );
-        let charge = workspace.peak(retained);
+        let charge = workspace.peak(retained, seed);
         let scopes = self
             .scopes
             .saturating_add(required.saturating_add(crate::codec::workspace::RESERVATION_BYTES));
@@ -1622,6 +1691,8 @@ impl BlockWave {
             )?);
         }
         self.scopes = scopes;
+        self.seeding = seeding;
+        self.shared_seed = shared_seed;
         Ok(true)
     }
 
@@ -2280,6 +2351,9 @@ where
                     required,
                     resources,
                     advance,
+                    // Only a run with history seeds a tree, and only a wave
+                    // whose windows are shared seeds them together.
+                    (history > 0 && resources.execution.is_none()).then_some(member),
                 )? {
                     break;
                 }
@@ -2463,6 +2537,7 @@ where
                 required,
                 resources,
                 advance,
+                None,
             )? {
                 break;
             }
@@ -2974,10 +3049,21 @@ fn encode_shared_block_job<B: Budget>(
         None => (&boundaries[..], solid_records.as_deref()),
     };
     let packed = match finder {
-        Some(finder) => streaming_blocks_with_finder(
+        Some(RunFinder::Packed(finder)) => streaming_blocks_with_finder(
             &window[..end],
             start,
             finder,
+            cuts,
+            records,
+            plan.algorithm_version,
+            plan.encode_options,
+            Some(&mut block_done),
+            allowance,
+        )?,
+        Some(RunFinder::Tree(tree)) => streaming_blocks_with_tree(
+            &window[..end],
+            start,
+            tree,
             cuts,
             records,
             plan.algorithm_version,

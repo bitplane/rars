@@ -907,7 +907,40 @@ pub(crate) fn streaming_blocks_with_finder<B: Budget>(
     streaming_blocks_from(
         window,
         start,
-        Some(finder),
+        Some(RunFinder::Packed(finder)),
+        blocks,
+        records,
+        algorithm_version,
+        options,
+        block_done,
+        allowance,
+    )
+}
+
+/// [`streaming_blocks_in_window`] for a run whose tree its group seeded,
+/// [`run_trees`] given the same window, run and options.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn streaming_blocks_with_tree<B: Budget>(
+    window: &[u8],
+    start: usize,
+    tree: Rar50TreeMatchFinder<B>,
+    blocks: &[(usize, bool)],
+    records: Option<&[Buffer<EncodeFilter, B>]>,
+    algorithm_version: u8,
+    options: EncodeOptions,
+    block_done: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<Buffer<u8, B>, B>> {
+    if start > window.len() || !options.optimal_parse {
+        return Err(Error::InvalidData(
+            "RAR 5 shared tree needs an optimal parse within its window",
+        ));
+    }
+    let skip = tree_history(start, options).start;
+    streaming_blocks_from(
+        &window[skip..],
+        start - skip,
+        Some(RunFinder::Tree(tree)),
         blocks,
         records,
         algorithm_version,
@@ -921,7 +954,7 @@ pub(crate) fn streaming_blocks_with_finder<B: Budget>(
 fn streaming_blocks_from<B: Budget>(
     combined: &[u8],
     start: usize,
-    mut finder: Option<crate::codec::packed_chain::PackedMatchFinder<B>>,
+    mut finder: Option<RunFinder<B>>,
     blocks: &[(usize, bool)],
     records: Option<&[Buffer<EncodeFilter, B>]>,
     algorithm_version: u8,
@@ -1903,6 +1936,91 @@ enum MemberSearch<'a, B: Budget = Allowance> {
     Optimal(&'a mut OptimalCollector<B>),
 }
 
+/// The history a tree seeded for a parse from `start` holds.
+fn tree_history(start: usize, options: EncodeOptions) -> Range<usize> {
+    start.saturating_sub(options.max_match_distance)..start
+}
+
+/// How far a tree descent at `pos` compares, in a window that ends with
+/// `combined`.
+fn tree_len_limit(combined: &[u8], pos: usize, options: EncodeOptions) -> usize {
+    (combined.len() - pos).min(options.nice())
+}
+
+/// A finder handed to a run that shares its window with the runs around it,
+/// standing where the run's own would.
+pub(crate) enum RunFinder<B: Budget> {
+    /// Over the group's packed index, for a run that walks chains.
+    Packed(crate::codec::packed_chain::PackedMatchFinder<B>),
+    /// The tree a run that searches one would have seeded.
+    Tree(Rar50TreeMatchFinder<B>),
+}
+
+/// What [`run_trees`] holds besides the trees it returns.
+pub(crate) fn run_trees_workspace(options: EncodeOptions) -> u64 {
+    if !options.optimal_parse {
+        return 0;
+    }
+    match_finder::SeedTree::<Allowance>::bytes_for_reach(options.max_match_distance) as u64
+}
+
+/// The trees runs of one window seed, each run given by where it starts and
+/// ends in `window`, seeded from one tree rather than each from its own:
+/// one for each run with history that a shared tree can seed, in the order of
+/// `runs`, or `None` where sharing saves nothing.
+///
+/// Every run must search a tree ([`searches_tree`]) in its window trimmed to
+/// a dictionary before its start, as [`streaming_blocks_in_window`] trims it,
+/// and they must come in order. Each tree is the one the run would have
+/// seeded, so the output does not change.
+#[allow(clippy::type_complexity)]
+pub(crate) fn run_trees<B: Budget>(
+    window: &[u8],
+    runs: &[Range<usize>],
+    options: EncodeOptions,
+    allowance: &B,
+) -> Result<Option<Buffer<Option<Rar50TreeMatchFinder<B>>, B>>> {
+    // A descent compares at most `nice` bytes, and a run's own window ends
+    // where the run does, so the seed tree's descents compare as far as the
+    // run's would only if no run ends within that of its history.
+    let seeds = |run: &Range<usize>| {
+        debug_assert!(run.start <= run.end && run.end <= window.len());
+        run.start > 0 && run.end - run.start >= options.nice()
+    };
+    let histories = || {
+        runs.iter()
+            .filter(|run| seeds(run))
+            .map(|run| tree_history(run.start, options))
+    };
+    let (Some(first), Some(last)) = (histories().next(), histories().next_back()) else {
+        return Ok(None);
+    };
+    // Sharing pays only where the histories overlap.
+    let seeded: usize = histories().map(|history| history.len()).sum();
+    if seeded <= last.end - first.start {
+        return Ok(None);
+    }
+    let mut seed = match_finder::SeedTree::with_allowance(options.max_match_distance, allowance)?;
+    let mut trees = Buffer::with_capacity(runs.len(), allowance)?;
+    for run in runs {
+        if !seeds(run) {
+            trees.push_admitted(None);
+            continue;
+        }
+        let history = tree_history(run.start, options);
+        let reach = run.end - history.start;
+        trees.push_admitted(Some(seed.seed(
+            window,
+            history,
+            finder_window(options, reach),
+            |pos| tree_len_limit(window, pos, options),
+            options.max_match_candidates,
+            allowance,
+        )?));
+    }
+    Ok(Some(trees))
+}
+
 /// Whether an optimal parse of `window` from `start` searches a binary tree.
 ///
 /// A tree finds what a chain walk of the same depth misses. But the only way
@@ -1928,21 +2046,25 @@ pub(crate) fn packed_index_fits(window: usize, start: usize, options: EncodeOpti
         && window <= u32::MAX as usize / 6
 }
 
-/// The collector a run's blocks share from `at`: over a finder handed out by a
-/// shared index when there is one, built for the window otherwise.
+/// The collector a run's blocks share from `at`: over a finder handed out by
+/// the run's group when there is one, built for the window otherwise.
 fn collector_at<B: Budget>(
     combined: &[u8],
     at: usize,
-    finder: Option<crate::codec::packed_chain::PackedMatchFinder<B>>,
+    finder: Option<RunFinder<B>>,
     options: EncodeOptions,
     allowance: &B,
 ) -> Result<OptimalCollector<B>> {
     match finder {
-        Some(finder) => {
+        Some(RunFinder::Packed(finder)) => {
             debug_assert_eq!(finder.position(), at.min(combined.len().saturating_sub(3)));
             Ok(OptimalCollector {
                 finder: CollectorFinder::Packed(finder),
             })
+        }
+        Some(RunFinder::Tree(tree)) => {
+            debug_assert!(searches_tree(combined.len(), at, options));
+            OptimalCollector::with_tree(combined, at, tree, options, allowance)
         }
         None => OptimalCollector::with_allowance(combined, at, options, allowance),
     }
@@ -2122,6 +2244,86 @@ fn a_seeded_tree_collects_what_a_tree_that_parsed_the_history_does() {
     assert!(found > 0);
 }
 
+/// Runs of one window seeded from a shared tree code the bytes each codes
+/// seeding its own, at any thread count.
+#[test]
+#[cfg(feature = "parallel")]
+fn runs_seeded_together_code_as_runs_seeded_alone() {
+    const KIB: usize = 1024;
+    let mut state = 0x7ee5_0b5e_5eed_4321u64;
+    let mut window: Vec<u8> = (0..3 * 1024 * KIB)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            b"abcdefgh"[(state % 8) as usize]
+        })
+        .collect();
+    window.copy_within(0..256 * KIB, 1024 * KIB);
+    window.copy_within(1024 * KIB..1280 * KIB, 2560 * KIB);
+    let options = EncodeOptions {
+        max_match_distance: 1024 * KIB,
+        max_match_candidates: 16,
+        optimal_parse: true,
+        ..EncodeOptions::default()
+    }
+    .with_nice_match_length(64)
+    .with_parse_passes(2);
+    let allowance = Allowance::default();
+    let runs: Vec<Range<usize>> = (1..6)
+        .map(|run| run * 512 * KIB..(run + 1) * 512 * KIB)
+        .collect();
+    let blocks = [(256 * KIB, false), (512 * KIB, false)];
+    let alone: Vec<Vec<Buffer<u8>>> = runs
+        .iter()
+        .map(|run| {
+            let skip = tree_history(run.start, options).start;
+            assert!(searches_tree(run.end - skip, run.start - skip, options));
+            streaming_blocks_in_window(
+                &window[..run.end],
+                run.start,
+                &blocks,
+                None,
+                0,
+                options,
+                None,
+                &allowance,
+            )
+            .unwrap()
+            .into_iter()
+            .collect()
+        })
+        .collect();
+    for threads in [1, 2, 8] {
+        crate::parallel::private_pool(threads).install(|| {
+            let trees = run_trees(&window, &runs, options, &allowance)
+                .unwrap()
+                .expect("the runs' histories overlap");
+            for ((run, tree), alone) in runs.iter().zip(trees).zip(&alone) {
+                let together = streaming_blocks_with_tree(
+                    &window[..run.end],
+                    run.start,
+                    tree.expect("every run has history"),
+                    &blocks,
+                    None,
+                    0,
+                    options,
+                    None,
+                    &allowance,
+                )
+                .unwrap();
+                assert!(
+                    together
+                        .iter()
+                        .map(|block| &block[..])
+                        .eq(alone.iter().map(|block| &block[..])),
+                    "run {run:?} at {threads} threads differs"
+                );
+            }
+        });
+    }
+}
+
 enum CollectorFinder<B: Budget = Allowance> {
     Packed(super::super::packed_chain::PackedMatchFinder<B>),
 
@@ -2151,41 +2353,18 @@ impl<B: Budget> OptimalCollector<B> {
         allowance: &B,
     ) -> Result<Self> {
         if searches_tree(combined.len(), start, options) {
-            let window = finder_window(options, combined.len());
-            let mut tree = Rar50TreeMatchFinder::with_allowance(window, allowance)?;
-            let mut stretches = if options.parse_passes > 1 {
-                Some(match_finder::WindowIndex::with_allowance(
-                    window,
-                    MAX_ENCODER_MATCH_LENGTH,
-                    allowance,
-                )?)
-            } else {
-                None
-            };
             // The history goes in as the collector would have put it there had
             // it parsed it: every position, each with the descent a search
-            // makes. Nothing is reported, so nothing is allocated.
-            let mut nothing = Buffer::new(allowance);
-            for pos in start.saturating_sub(options.max_match_distance)..start {
-                if let Some(stretches) = &mut stretches {
-                    stretches.insert(combined, pos);
-                }
-                let avail = combined.len() - pos;
-                if avail >= 4 {
-                    tree.matches(
-                        combined,
-                        pos,
-                        avail.min(options.nice()),
-                        0,
-                        options.max_match_candidates,
-                        &mut nothing,
-                    )
-                    .map_err(Into::into)?;
-                }
-            }
-            return Ok(Self {
-                finder: CollectorFinder::Tree(tree, stretches),
-            });
+            // makes.
+            let tree = Rar50TreeMatchFinder::seeded(
+                finder_window(options, combined.len()),
+                combined,
+                tree_history(start, options),
+                |pos| tree_len_limit(combined, pos, options),
+                options.max_match_candidates,
+                allowance,
+            )?;
+            return Self::with_tree(combined, start, tree, options, allowance);
         }
         if packed_index_fits(combined.len(), start, options) {
             // Captured bounded jobs can store each complete hash chain as a
@@ -2205,6 +2384,33 @@ impl<B: Budget> OptimalCollector<B> {
             finder: CollectorFinder::Chains(member_finder_with_allowance(
                 combined, start, options, allowance,
             )?),
+        })
+    }
+
+    /// The collector over `tree`, which holds what
+    /// [`Self::with_allowance`] would have seeded one with at `start`.
+    fn with_tree(
+        combined: &[u8],
+        start: usize,
+        tree: Rar50TreeMatchFinder<B>,
+        options: EncodeOptions,
+        allowance: &B,
+    ) -> Result<Self> {
+        let stretches = if options.parse_passes > 1 {
+            let mut stretches = match_finder::WindowIndex::with_allowance(
+                finder_window(options, combined.len()),
+                MAX_ENCODER_MATCH_LENGTH,
+                allowance,
+            )?;
+            for pos in tree_history(start, options) {
+                stretches.insert(combined, pos);
+            }
+            Some(stretches)
+        } else {
+            None
+        };
+        Ok(Self {
+            finder: CollectorFinder::Tree(tree, stretches),
         })
     }
 

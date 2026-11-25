@@ -34,6 +34,7 @@
 
 use super::workspace::{Allowance, Budget, Buffer};
 use super::Result;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
 /// Sentinel for "no position" in `head`/`prev` chains.
 pub(crate) const NO_POSITION: usize = usize::MAX;
@@ -621,13 +622,22 @@ impl CommittedMatch {
 /// with the chain finder's `prev`, and the same rules keep slot reuse and the
 /// window from ever overlapping. Truncated links are read back with the
 /// position being searched for as the reference, which is always the newest.
+///
+/// Positions with different hashes never link to each other, so each hash's
+/// tree is built by its own insertions alone. That is what lets a
+/// [`SeedTree`] put history in on several threads at once, each owning a
+/// share of the hashes. The links are atomics for that only: every access is
+/// relaxed, and no link is touched by two threads at once.
 #[derive(Debug)]
 pub(crate) struct TreeMatchFinder<B: Budget = Allowance> {
-    head: Buffer<u32, B>,
+    head: Buffer<AtomicU32, B>,
     /// Two links per window slot: the child whose bytes compare lesser first,
     /// then the greater-or-equal one, in LZMA's layout.
-    son: Buffer<u32, B>,
+    son: Buffer<AtomicU32, B>,
     mask: usize,
+    /// Positions before this count as fallen out of the window. Only a
+    /// [`SeedTree`] raises it from zero.
+    oldest: usize,
 }
 
 impl TreeMatchFinder {
@@ -665,20 +675,96 @@ impl<B: Budget> TreeMatchFinder<B> {
             .checked_next_power_of_two()
             .ok_or(super::Error::InvalidData("finder window overflows"))?;
         Ok(Self {
-            head: Buffer::filled(1 << Self::HASH_BITS, NO_LINK, allowance)?,
+            head: Buffer::filled_with(1 << Self::HASH_BITS, || AtomicU32::new(NO_LINK), allowance)?,
             // Zero rather than the sentinel for the same reason as the chain
             // finder's `prev`: a slot is always written during its position's
-            // own insertion before any link can lead to it, and untouched
-            // zeroes let the allocator defer the pages.
-            son: Buffer::filled(
+            // own insertion before any link can lead to it.
+            son: Buffer::filled_with(
                 window
                     .checked_mul(2)
                     .ok_or(super::Error::InvalidData("finder window overflows"))?,
-                0,
+                || AtomicU32::new(0),
                 allowance,
             )?,
             mask: window - 1,
+            oldest: 0,
         })
+    }
+
+    /// Builds a finder for `window` holding `history`, each position put in
+    /// with the descent [`Self::matches`] makes at `len_limit(pos)` and `cut`,
+    /// reporting nothing. `history` must fit in the window, and `len_limit`
+    /// must keep to [`Self::matches`]'s rules.
+    #[cfg(feature = "write")]
+    pub(crate) fn seeded(
+        window: usize,
+        input: &[u8],
+        history: std::ops::Range<usize>,
+        len_limit: impl Fn(usize) -> usize + Sync,
+        cut: usize,
+        allowance: &B,
+    ) -> Result<Self> {
+        let finder = Self::with_allowance(window, allowance)?;
+        debug_assert!(history.len() <= finder.mask + 1);
+        finder.insert_range(input, history, &len_limit, cut, 1);
+        Ok(finder)
+    }
+
+    /// Inserts the positions of `range` that have four bytes left, as
+    /// [`Self::seeded`] does, split between `shares` threads by hash.
+    ///
+    /// Each hash's positions still go in in order, so the links come out the
+    /// same on any number of threads, provided no position of `range` shares
+    /// a slot with one a descent can still reach: everything from
+    /// [`Self::oldest`] to the end of `range` must fit in the window.
+    #[cfg(feature = "write")]
+    fn insert_range(
+        &self,
+        input: &[u8],
+        range: std::ops::Range<usize>,
+        len_limit: &(impl Fn(usize) -> usize + Sync),
+        cut: usize,
+        shares: usize,
+    ) {
+        debug_assert!(shares == 1 || range.end - range.start.min(self.oldest) <= self.mask + 1);
+        let end = range
+            .end
+            .min(input.len().saturating_sub(Self::MIN_MATCH - 1));
+        let insert = |share: usize| {
+            for pos in range.start..end {
+                let hash = self.hash(input, pos);
+                if shares == 1 || (hash * shares) >> Self::HASH_BITS == share {
+                    let inserted =
+                        self.descend::<true>(input, pos, hash, len_limit(pos), 0, cut, None);
+                    debug_assert!(
+                        inserted.is_ok(),
+                        "a descent reporting nothing allocates nothing"
+                    );
+                }
+            }
+        };
+        if shares <= 1 {
+            insert(0);
+        } else {
+            let mut each = vec![(); shares];
+            crate::parallel::for_each_mut(&mut each, |share, _| insert(share));
+        }
+    }
+
+    fn hash(&self, input: &[u8], pos: usize) -> usize {
+        mix(
+            u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]),
+            Self::HASH_BITS,
+        )
+    }
+
+    /// Each hash's head and the two child links of each window slot, for
+    /// tests to compare whole trees.
+    #[cfg(test)]
+    fn links(&self) -> (Vec<u32>, Vec<u32>) {
+        let read =
+            |links: &Buffer<AtomicU32, B>| links.iter().map(|link| link.load(Relaxed)).collect();
+        (read(&self.head), read(&self.son))
     }
 
     #[cfg(feature = "write")]
@@ -723,15 +809,35 @@ impl<B: Budget> TreeMatchFinder<B> {
         cut: usize,
         out: &mut Buffer<(u32, u32), B>,
     ) -> std::result::Result<(), B::Failure> {
+        let hash = self.hash(input, pos);
+        self.descend::<FAST>(input, pos, hash, len_limit, max_distance, cut, Some(out))
+    }
+
+    /// The descent of [`Self::matches`], reporting to `out` when there is one.
+    /// It touches only the links of `hash`'s tree and of `pos`'s slot, so
+    /// descents for different hashes can run side by side.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn descend<const FAST: bool>(
+        &self,
+        input: &[u8],
+        pos: usize,
+        hash: usize,
+        len_limit: usize,
+        max_distance: usize,
+        cut: usize,
+        mut out: Option<&mut Buffer<(u32, u32), B>>,
+    ) -> std::result::Result<(), B::Failure> {
         // The tree collector calls this only when at least four bytes remain.
         // Unlike the chain finder, it skips near-end positions before calling.
         debug_assert!(len_limit >= Self::MIN_MATCH && pos + len_limit <= input.len());
-        let hash = mix(
-            u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]),
-            Self::HASH_BITS,
-        );
-        let mut current = resolve(pos, self.head[hash]);
-        self.head[hash] = pos as u32;
+        let link = |slot: usize| self.son[slot].load(Relaxed);
+        let set = |slot: usize, value: u32| self.son[slot].store(value, Relaxed);
+        // A load and a store rather than a swap, which would be a locked
+        // instruction: no other thread touches this hash.
+        let head = &self.head[hash];
+        let mut current = resolve(pos, head.load(Relaxed));
+        head.store(pos as u32, Relaxed);
         // The two attachment points still waiting for a subtree, starting as
         // the new position's own child slots. Each step down hangs the node
         // just compared on one of them and moves that side into the node's
@@ -747,16 +853,17 @@ impl<B: Budget> TreeMatchFinder<B> {
         let mut longest = Self::MIN_MATCH - 1;
         let mut budget = cut;
         let mut floor = pos;
-        let first = out.len();
+        let lowest = pos.saturating_sub(self.mask).max(self.oldest);
+        let first = out.as_ref().map_or(0, |out| out.len());
         loop {
             // A candidate that does not step back is a reused slot or the
             // sentinel; one further back than the window has fallen out of it.
             // Either ends the descent, sealing both attachment points so no
             // stale link survives below them. A spent budget ends it the same
             // way, dropping whatever subtree the budget could not reach.
-            if current >= floor || pos - current > self.mask || budget == 0 {
-                self.son[ptr0] = NO_LINK;
-                self.son[ptr1] = NO_LINK;
+            if current >= floor || current < lowest || budget == 0 {
+                set(ptr0, NO_LINK);
+                set(ptr1, NO_LINK);
                 return Ok(());
             }
             budget -= 1;
@@ -774,7 +881,8 @@ impl<B: Budget> TreeMatchFinder<B> {
                     }
                 }
                 if len > longest {
-                    if pos - current <= max_distance {
+                    if let Some(out) = out.as_deref_mut().filter(|_| pos - current <= max_distance)
+                    {
                         let run = (len as u32, (pos - current) as u32);
                         if out.len() - first == Self::MAX_RUNS {
                             // Full: the shortest run gives way, and the
@@ -792,24 +900,156 @@ impl<B: Budget> TreeMatchFinder<B> {
                         // position's prefix, so the new position adopts its
                         // children and the node drops out as the farther of
                         // two interchangeable candidates.
-                        self.son[ptr1] = self.son[pair];
-                        self.son[ptr0] = self.son[pair + 1];
+                        set(ptr1, link(pair));
+                        set(ptr0, link(pair + 1));
                         return Ok(());
                     }
                 }
             }
             if input[current + len] < input[pos + len] {
-                self.son[ptr1] = current as u32;
+                set(ptr1, current as u32);
                 ptr1 = pair + 1;
                 len1 = len;
-                current = resolve(pos, self.son[ptr1]);
+                current = resolve(pos, link(ptr1));
             } else {
-                self.son[ptr0] = current as u32;
+                set(ptr0, current as u32);
                 ptr0 = pair;
                 len0 = len;
-                current = resolve(pos, self.son[ptr0]);
+                current = resolve(pos, link(ptr0));
             }
         }
+    }
+}
+
+/// One tree that seeds the trees of several runs over one window, so history
+/// the runs share goes in once rather than once per run.
+///
+/// A run's tree holds the dictionary before it, every position put in by a
+/// descent. A position's place in its hash's tree depends only on the
+/// positions newer than it, since each insertion puts the new position at the
+/// root and splits the tree beneath it. So a tree that took in more history
+/// than a run's, from further back, holds the run's tree within it: the
+/// older positions only ever hang below the run's, and a descent reaches them
+/// after it has passed every position the run's own tree has. A descent's
+/// `cut` is spent in the same order, so it stops at the same position or
+/// among the older ones. Cutting the older positions off as a run's tree is
+/// copied out leaves exactly the tree the run would have seeded.
+///
+/// The tree is built a hash share per thread. Its window is the dictionary,
+/// and positions older than the history being seeded count as out of it, so
+/// no slot an insertion overwrites can be reached by another thread's
+/// descent.
+#[cfg(feature = "write")]
+#[derive(Debug)]
+pub(crate) struct SeedTree<B: Budget = Allowance> {
+    tree: TreeMatchFinder<B>,
+    /// The first position not yet inserted.
+    next: usize,
+}
+
+#[cfg(feature = "write")]
+impl<B: Budget> SeedTree<B> {
+    /// A share of the hashes is only worth a thread when it has this much
+    /// history to insert: every share reads every position to find its own.
+    const MIN_SHARE: usize = 256 * 1024;
+
+    /// What [`Self::with_allowance`] allocates for a dictionary of `reach`.
+    pub(crate) fn bytes_for_reach(reach: usize) -> usize {
+        TreeMatchFinder::<B>::bytes_for_window(reach)
+    }
+
+    /// A seed tree for histories up to `reach` long.
+    pub(crate) fn with_allowance(reach: usize, allowance: &B) -> Result<Self> {
+        Ok(Self {
+            tree: TreeMatchFinder::with_allowance(reach, allowance)?,
+            next: 0,
+        })
+    }
+
+    /// The tree [`TreeMatchFinder::seeded`] builds for `window` from
+    /// `history` of `input`, with positions counted from `history.start`, as
+    /// a run whose input starts there counts them.
+    ///
+    /// Histories must come in order, neither end before the last one's, and
+    /// none longer than the reach. Every position of a history must be
+    /// inserted at the same `len_limit` as any later history's run would
+    /// insert it at.
+    pub(crate) fn seed(
+        &mut self,
+        input: &[u8],
+        history: std::ops::Range<usize>,
+        window: usize,
+        len_limit: impl Fn(usize) -> usize + Sync,
+        cut: usize,
+        allowance: &B,
+    ) -> Result<TreeMatchFinder<B>> {
+        debug_assert!(history.start >= self.tree.oldest && history.end >= self.next);
+        debug_assert!(history.len() <= self.tree.mask + 1);
+        self.tree.oldest = history.start;
+        let from = self.next.max(history.start);
+        let shares = Self::shares(history.end - from);
+        self.tree
+            .insert_range(input, from..history.end, &len_limit, cut, shares);
+        self.next = history.end;
+        self.copy(input, history, window, allowance)
+    }
+
+    fn shares(positions: usize) -> usize {
+        if crate::parallel::may_nest() {
+            crate::parallel::threads()
+                .min(positions / Self::MIN_SHARE)
+                .max(1)
+        } else {
+            1
+        }
+    }
+
+    /// `history`'s part of the tree, in a finder of its own for `window`.
+    fn copy(
+        &self,
+        input: &[u8],
+        history: std::ops::Range<usize>,
+        window: usize,
+        allowance: &B,
+    ) -> Result<TreeMatchFinder<B>> {
+        let copy = TreeMatchFinder::with_allowance(window, allowance)?;
+        debug_assert!(history.len() <= copy.mask + 1);
+        let Some(newest) = history.end.checked_sub(1) else {
+            return Ok(copy);
+        };
+        let base = history.start;
+        // A link to a position before the history is a link to nothing in
+        // the run's tree.
+        let rebase = |link: u32| match resolve(newest, link) {
+            NO_POSITION => NO_LINK,
+            pos if pos < base => NO_LINK,
+            pos => (pos - base) as u32,
+        };
+        for (to, from) in copy.head.iter().zip(self.tree.head.iter()) {
+            to.store(rebase(from.load(Relaxed)), Relaxed);
+        }
+        // Only positions that were inserted have links of their own.
+        let end = history.end.min(
+            input
+                .len()
+                .saturating_sub(TreeMatchFinder::<B>::MIN_MATCH - 1),
+        );
+        let span = end.saturating_sub(base);
+        let pieces = Self::shares(span);
+        let mut each = vec![(); pieces];
+        crate::parallel::for_each_mut(&mut each, |piece, _| {
+            let first = base + span * piece / pieces;
+            let last = base + span * (piece + 1) / pieces;
+            for pos in first..last {
+                let from = (pos & self.tree.mask) << 1;
+                let to = ((pos - base) & copy.mask) << 1;
+                for side in 0..2 {
+                    copy.son[to + side]
+                        .store(rebase(self.tree.son[from + side].load(Relaxed)), Relaxed);
+                }
+            }
+        });
+        Ok(copy)
     }
 }
 
@@ -1176,8 +1416,7 @@ mod tests {
                 // Only this hash and the touched child slots can change.
                 // Compare the full topology periodically and at final expiry.
                 if pos % 127 == 0 || pos == input.len() - 4 {
-                    assert_eq!(&fast.head[..], &scalar.head[..]);
-                    assert_eq!(&fast.son[..], &scalar.son[..]);
+                    assert_eq!(fast.links(), scalar.links());
                 }
             }
         }
@@ -1481,5 +1720,84 @@ mod tests {
         // Below the boundary the stored half wrapped and `newest` did not, so
         // the two are only comparable through the subtraction.
         assert_eq!(resolve(newest, u32::MAX - 1), FOUR_GIB - 2);
+    }
+
+    /// Few symbols with long copies, so descents run deep, hit the cut and
+    /// match whole limits.
+    #[cfg(all(feature = "write", feature = "parallel"))]
+    fn busy_input(len: usize) -> Vec<u8> {
+        let mut state = 0x5eed_7ee5_0b5e_1234u64;
+        let mut input: Vec<u8> = (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                b"abcd"[(state % 4) as usize]
+            })
+            .collect();
+        input.copy_within(0..len / 8, len / 3);
+        input.copy_within(len / 3..len / 3 + len / 8, len / 2);
+        input
+    }
+
+    /// Each run's tree out of a shared seed tree is the one it would have
+    /// seeded on its own, link for link, on any number of threads: for runs
+    /// whose history is the start of the input, runs a whole reach in, and
+    /// a run whose history starts past everything seeded before it.
+    #[test]
+    #[cfg(all(feature = "write", feature = "parallel"))]
+    fn a_seed_tree_hands_each_run_the_tree_it_would_have_seeded() {
+        const KIB: usize = 1024;
+        let input = busy_input(5 * 1024 * KIB);
+        let reach = 1024 * KIB;
+        let (nice, cut) = (48, 12);
+        let allowance = super::Allowance::default();
+        let runs = [
+            512 * KIB..1024 * KIB,
+            1024 * KIB..1536 * KIB,
+            1536 * KIB..2048 * KIB,
+            2048 * KIB..3072 * KIB,
+            4608 * KIB..5 * 1024 * KIB,
+        ];
+        let window = |run: &std::ops::Range<usize>| reach.min(run.end);
+        let history = |run: &std::ops::Range<usize>| run.start.saturating_sub(reach)..run.start;
+        let expected: Vec<_> = runs
+            .iter()
+            .map(|run| {
+                let base = history(run).start;
+                let own = &input[base..run.end];
+                TreeMatchFinder::seeded(
+                    window(run),
+                    own,
+                    0..run.start - base,
+                    |pos| (own.len() - pos).min(nice),
+                    cut,
+                    &allowance,
+                )
+                .unwrap()
+                .links()
+            })
+            .collect();
+        for threads in [1, 2, 8] {
+            crate::parallel::private_pool(threads).install(|| {
+                let mut seed = super::SeedTree::with_allowance(reach, &allowance).unwrap();
+                for (run, expected) in runs.iter().zip(&expected) {
+                    let tree = seed
+                        .seed(
+                            &input,
+                            history(run),
+                            window(run),
+                            |pos| (input.len() - pos).min(nice),
+                            cut,
+                            &allowance,
+                        )
+                        .unwrap();
+                    assert!(
+                        tree.links() == *expected,
+                        "run {run:?} at {threads} threads differs"
+                    );
+                }
+            });
+        }
     }
 }
