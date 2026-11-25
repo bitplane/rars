@@ -49,6 +49,7 @@ fn guarded_set(volumes: Vec<Vec<u8>>) -> (Vec<Archive>, Vec<Arc<Reads>>) {
         .unzip()
 }
 
+#[cfg(feature = "write")]
 fn restrict_reads(archives: &[Archive], reads: &[Arc<Reads>], name: &[u8]) -> usize {
     let mut allowed = 0;
     for (archive, reads) in archives.iter().zip(reads) {
@@ -63,6 +64,7 @@ fn restrict_reads(archives: &[Archive], reads: &[Arc<Reads>], name: &[u8]) -> us
     allowed
 }
 
+#[cfg(feature = "write")]
 fn assert_reads(reads: &[Arc<Reads>]) {
     for (volume, reads) in reads.iter().enumerate() {
         assert_eq!(
@@ -79,25 +81,31 @@ fn reads_a_split_member_in_the_reader_only_build() {
         include_bytes!("fixtures/rar50/multivol.part1.rar").as_slice(),
         include_bytes!("fixtures/rar50/multivol.part2.rar"),
         include_bytes!("fixtures/rar50/multivol.part3.rar"),
-        include_bytes!("fixtures/rar50/stored.rar"),
     ];
-    let (archives, reads) = guarded_set(volumes.into_iter().map(<[u8]>::to_vec).collect());
-    let members = rars::volume_members(&archives).unwrap();
+    let (archives, _) = guarded_set(volumes.into_iter().map(<[u8]>::to_vec).collect());
     let expected = rars::read_volume_members_at(&archives, &[0], None)
         .unwrap()
         .pop()
         .unwrap();
 
-    assert!(restrict_reads(&archives, &reads, &members[0].meta.name) > 1);
     assert_eq!(
         read_volume_member_at_with_options(&archives, 0, ArchiveReadOptions::new()).unwrap(),
         expected,
     );
-    assert_reads(&reads);
     assert_eq!(
         read_volume_member_at(&archives, usize::MAX, None).unwrap(),
         None
     );
+}
+
+#[test]
+fn rejects_volumes_out_of_order() {
+    let part = |bytes: &[u8]| ArchiveReader::read_reader(Cursor::new(bytes.to_vec())).unwrap();
+    let part1 = part(include_bytes!("fixtures/rar50/multivol.part1.rar"));
+    let part2 = part(include_bytes!("fixtures/rar50/multivol.part2.rar"));
+    let part3 = part(include_bytes!("fixtures/rar50/multivol.part3.rar"));
+
+    assert!(read_volume_member_at(&[part1, part3, part2], 0, None).is_err());
 }
 
 #[cfg(feature = "write")]

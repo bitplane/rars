@@ -2419,6 +2419,7 @@ pub fn read_volume_member_at_with_options(
     options: ArchiveReadOptions<'_>,
 ) -> Result<Option<Vec<u8>>> {
     options.check_cancelled()?;
+    volume_order::check_set(archives)?;
     check_volume_members(archives)?;
     let Some((volume, file, member)) = volume_fragments(archives)
         .filter(|(_, _, member)| !member.is_split_before())
