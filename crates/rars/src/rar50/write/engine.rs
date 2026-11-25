@@ -2112,13 +2112,167 @@ fn recovery_service(
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
 ) -> Result<RecoveryService> {
+    let (payload, payload_len, payload_crc32) = recovery_payload(
+        recovery_percent,
+        prefix,
+        prefix_len,
+        || Spool::create(resources),
+        resources,
+        progress,
+    )?;
+    let header = recovery_header(
+        recovery_percent,
+        payload_len,
+        payload_crc32,
+        header_keys,
+        resources,
+    )?;
+    Ok(RecoveryService { header, payload })
+}
+
+/// Writes the recovery record of the `prefix_len` bytes of a volume at
+/// `start`, read back from its output, straight after them. Its payload goes
+/// out first, behind room for its header, which needs the payload's checksum.
+fn write_recovery_read_back(
+    recovery_percent: u64,
+    output: &mut dyn super::ReadableVolumeOutput,
+    start: u64,
+    prefix_len: u64,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<u64> {
+    let block_len = recovery_block_len(
+        prefix_len,
+        recovery_percent,
+        header_keys.is_some(),
+        resources,
+    )?;
+    let end = start + prefix_len;
+    let header_room = block_len - recovery_payload_len(prefix_len, recovery_percent)?;
+    output.seek(SeekFrom::Start(end))?;
+    output.write_all(&vec![0; header_room as usize])?;
+    let shared = std::cell::RefCell::new(output);
+    let (_, payload_len, payload_crc32) = recovery_payload(
+        recovery_percent,
+        &mut SharedReader {
+            output: &shared,
+            start,
+            len: prefix_len,
+            at: 0,
+        },
+        prefix_len,
+        || {
+            Ok(SharedAppender {
+                output: &shared,
+                at: end + header_room,
+            })
+        },
+        resources,
+        progress,
+    )?;
+    let header = recovery_header(
+        recovery_percent,
+        payload_len,
+        payload_crc32,
+        header_keys,
+        resources,
+    )?;
+    if header.len() as u64 + payload_len != block_len {
+        return Err(Error::WriterFailure(
+            "RAR 5 recovery record is not the length its volume was laid out for",
+        ));
+    }
+    let output = shared.into_inner();
+    output.seek(SeekFrom::Start(end))?;
+    output.write_all(&header)?;
+    output.seek(SeekFrom::Start(end + block_len))?;
+    Ok(block_len)
+}
+
+/// Reads part of an output that is also being written elsewhere, so it seeks
+/// to its own position before every read.
+struct SharedReader<'s, 'o> {
+    output: &'s std::cell::RefCell<&'o mut dyn super::ReadableVolumeOutput>,
+    start: u64,
+    len: u64,
+    at: u64,
+}
+
+impl Read for SharedReader<'_, '_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let mut output = self.output.borrow_mut();
+        output.seek(SeekFrom::Start(self.start + self.at))?;
+        let want = buffer.len().min(self.len.saturating_sub(self.at) as usize);
+        let read = output.read(&mut buffer[..want])?;
+        self.at += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for SharedReader<'_, '_> {
+    fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+        let at = match from {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::Current(delta) => self.at.checked_add_signed(delta),
+            SeekFrom::End(delta) => self.len.checked_add_signed(delta),
+        };
+        self.at = at.ok_or_else(|| std::io::Error::other("read back before the volume"))?;
+        Ok(self.at)
+    }
+}
+
+/// Appends to an output that is also being read elsewhere.
+struct SharedAppender<'s, 'o> {
+    output: &'s std::cell::RefCell<&'o mut dyn super::ReadableVolumeOutput>,
+    at: u64,
+}
+
+impl Write for SharedAppender<'_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let mut output = self.output.borrow_mut();
+        output.seek(SeekFrom::Start(self.at))?;
+        let written = output.write(bytes)?;
+        self.at += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.output.borrow_mut().flush()
+    }
+}
+
+fn recovery_payload_len(prefix_len: u64, recovery_percent: u64) -> Result<u64> {
+    #[cfg(not(feature = "recovery"))]
+    {
+        let _ = (prefix_len, recovery_percent);
+        Err(Error::FeatureDisabled {
+            feature: "recovery",
+        })
+    }
+    #[cfg(feature = "recovery")]
+    {
+        Ok(plan_inline_recovery(prefix_len, recovery_percent)?.payload_size()?)
+    }
+}
+
+/// Builds the recovery payload over `prefix` into the output `payload`
+/// opens, and returns that with the payload's length and CRC32.
+fn recovery_payload<W: Write>(
+    recovery_percent: u64,
+    prefix: &mut (impl Read + Seek),
+    prefix_len: u64,
+    payload: impl FnOnce() -> Result<W>,
+    resources: &WriterResources,
+    progress: Option<ProgressReporter<'_>>,
+) -> Result<(W, u64, u32)> {
     #[cfg(not(feature = "recovery"))]
     {
         let _ = (
             recovery_percent,
             prefix,
             prefix_len,
-            header_keys,
+            payload,
             resources,
             progress,
         );
@@ -2129,21 +2283,21 @@ fn recovery_service(
     #[cfg(feature = "recovery")]
     {
         if let Some(allowance) = &resources.execution {
-            return recovery_service_with_allowance(
+            return recovery_payload_with_allowance(
                 recovery_percent,
                 prefix,
                 prefix_len,
-                header_keys,
+                payload,
                 resources,
                 progress,
                 allowance,
             );
         }
-        recovery_service_with_allowance(
+        recovery_payload_with_allowance(
             recovery_percent,
             prefix,
             prefix_len,
-            header_keys,
+            payload,
             resources,
             progress,
             &crate::codec::workspace::Allowance::default(),
@@ -2152,15 +2306,15 @@ fn recovery_service(
 }
 
 #[cfg(feature = "recovery")]
-fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
+fn recovery_payload_with_allowance<W: Write, B: crate::codec::workspace::Budget>(
     recovery_percent: u64,
     prefix: &mut (impl Read + Seek),
     prefix_len: u64,
-    header_keys: Option<&HeaderEncryptionKeys>,
+    payload: impl FnOnce() -> Result<W>,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
     allowance: &B,
-) -> Result<RecoveryService> {
+) -> Result<(W, u64, u32)> {
     let plan = plan_inline_recovery(prefix_len, recovery_percent)?;
     let (mode, required) = choose_recovery_memory_mode(plan, resources.memory_limit())?;
     let (mode, required) = if let Some(allowance) = &resources.execution {
@@ -2182,7 +2336,7 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
         }
         crate::recovery::rar5::RecoveryMemoryMode::Resident => None,
     };
-    let mut payload = Spool::create(resources)?;
+    let mut payload = payload()?;
     let built = streamed_recovery_with_allowance(
         &mut CancellableIo {
             inner: prefix,
@@ -2211,56 +2365,56 @@ fn recovery_service_with_allowance<B: crate::codec::workspace::Budget>(
     })?;
 
     debug_assert_eq!(built.plan.payload_size(), Ok(built.payload_len));
+    Ok((payload, built.payload_len, built.payload_crc32))
+}
 
+fn recovery_header(
+    recovery_percent: u64,
+    payload_len: u64,
+    payload_crc32: u32,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+) -> Result<Bytes> {
     let mut service_data = Bytes::new(resources);
     service_data.vint(recovery_percent)?;
     let mut extra = Bytes::new(resources);
     write_extra_record(&mut extra, FHEXTRA_SUBDATA, &service_data)?;
-    let specific = stored_file_specific(
-        b"RR",
-        built.payload_len,
-        built.payload_crc32,
-        0,
-        None,
-        0,
-        resources,
-    )?;
-    let header = match header_keys {
+    let specific = stored_file_specific(b"RR", payload_len, payload_crc32, 0, None, 0, resources)?;
+    match header_keys {
         Some(keys) => encrypted_header_block(
             &keys.keys,
             HEAD_SERVICE,
             HFL_EXTRA | HFL_DATA,
-            Some(built.payload_len),
+            Some(payload_len),
             &specific,
             &extra,
             &[],
             resources,
-        )?,
+        ),
         None => block_header_image(
             HEAD_SERVICE,
             HFL_EXTRA | HFL_DATA,
-            Some(built.payload_len),
+            Some(payload_len),
             &specific,
             &extra,
             resources,
-        )?,
-    };
-    Ok(RecoveryService { header, payload })
+        ),
+    }
 }
 
 /// Positions count from the archive, as the output may hold a prefix before it.
-struct ReadBack<'a> {
-    output: &'a mut dyn crate::write_stream::ReadSeekWrite,
+struct ReadBack<'a, O: ?Sized> {
+    output: &'a mut O,
     start: u64,
 }
 
-impl Read for ReadBack<'_> {
+impl<O: Read + ?Sized> Read for ReadBack<'_, O> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.output.read(buffer)
     }
 }
 
-impl Seek for ReadBack<'_> {
+impl<O: Seek + ?Sized> Seek for ReadBack<'_, O> {
     fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
         let from = match from {
             SeekFrom::Start(at) => SeekFrom::Start(self.start + at),
@@ -2296,7 +2450,16 @@ impl Write for Tee<'_> {
 
 /// Where a member's payload bytes come from when a volume set slices them up.
 enum FragmentSource {
-    Packed(Spool),
+    /// Spooled, from payload offset `base` on.
+    Packed {
+        spool: Spool,
+        base: u64,
+    },
+    /// Held in memory, from payload offset `base` on.
+    Held {
+        bytes: Bytes,
+        base: u64,
+    },
     Stored {
         prepared: PreparedSource,
         emitted: Owned<ChecksumSink>,
@@ -2480,7 +2643,7 @@ impl FragmentSource {
     /// and hashed then.
     fn hashed_on_copy(&self) -> bool {
         match self {
-            Self::Packed(_) => false,
+            Self::Packed { .. } | Self::Held { .. } => false,
             Self::Stored { prepared, .. } => prepared.hashed_on_copy,
             Self::Encrypted(enciphered) => enciphered.plain.hashed_on_copy(),
         }
@@ -2515,15 +2678,27 @@ impl FragmentSource {
         let mut member = None;
         match self {
             Self::Encrypted(_) => unreachable!("encrypted members are cut above"),
-            Self::Packed(spool) => {
+            Self::Packed { spool, base } => {
                 spool.copy_range_to(
-                    start,
+                    start - *base,
                     len,
                     &mut Tee {
                         output,
                         mirror: fragment.as_mut().map(|sink| sink as &mut dyn Write),
                     },
                 )?;
+            }
+            Self::Held { bytes, base } => {
+                let at = (start - *base) as usize;
+                let range = bytes
+                    .get(at..at + len as usize)
+                    .ok_or(Error::WriterFailure(
+                        "RAR 5 held fragment is shorter than expected",
+                    ))?;
+                output.write_all(range)?;
+                if let Some(fragment) = fragment.as_mut() {
+                    fragment.update(range);
+                }
             }
             Self::Stored {
                 prepared,
@@ -2683,12 +2858,33 @@ impl compress::CompressionProgress for MemberProgress<'_, '_> {
 /// Writes a multi-volume archive, handing each volume to `sink` as it is
 /// finished rather than keeping the set in memory. No volume is longer than
 /// `volume_size` bytes, headers and recovery record included.
+#[cfg(test)]
 pub(super) fn write_volumes<'a>(
     entries: &'a [ArchiveEntry],
     plan: EnginePlan<'a>,
     volume_size: u64,
     sink: &mut dyn super::VolumeSink,
     resources: &WriterResources,
+) -> Result<()> {
+    write_volumes_above(
+        entries,
+        plan,
+        volume_size,
+        sink,
+        resources,
+        crate::write_stream::STREAM_MEMBERS_ABOVE,
+    )
+}
+
+/// As [`write_volumes`], packing a compressed member larger than
+/// `stream_above` straight into volumes that can be read back.
+pub(super) fn write_volumes_above<'a>(
+    entries: &'a [ArchiveEntry],
+    plan: EnginePlan<'a>,
+    volume_size: u64,
+    sink: &mut dyn super::VolumeSink,
+    resources: &WriterResources,
+    stream_above: u64,
 ) -> Result<()> {
     if volume_size == 0 {
         return Err(Error::InvalidArgument("RAR 5 volume size is zero"));
@@ -2767,6 +2963,37 @@ pub(super) fn write_volumes<'a>(
         trailing_len: 0,
     };
 
+    // A large member goes into the volumes as it is packed. One coded under a
+    // named filter would be coded differently to go out as it is packed. One
+    // that may be stored over its attempt is cut in the attempt's places, so
+    // its fragment headers have to measure the same either way. Under header
+    // encryption every header measured or written draws an IV, and a member
+    // packed in place measures its headers in another order than a spooled
+    // one, so the set would not be the one the same entropy makes.
+    let explicit = matches!(
+        plan.compress.filter_policy,
+        super::FilterPolicy::Explicit(_)
+    );
+    let info = |method| {
+        super::filter_policy::compression_info(
+            plan.compress.algorithm_version,
+            method,
+            plan.compress.dictionary_size,
+            false,
+        )
+        .map(vint_width)
+    };
+    let measures_alike = info(plan.compress.method)? == info(0)?;
+    let straight = |_: usize, size: u64| {
+        size > stream_above
+            && plan.compress.method != 0
+            && !explicit
+            && !plan.header_encrypted
+            && (plan.compress.solid || measures_alike)
+            && volume_size <= MOST_IN_PLACE_VOLUME
+    };
+    let mut in_place: Option<VolumeInPlace> = None;
+
     // Members go into the volumes in order as their windows finish. A stored
     // member is not read until it is copied, and is hashed then: a fragment's
     // header is patched after its bytes in every volume, so the last one can
@@ -2782,17 +3009,48 @@ pub(super) fn write_volumes<'a>(
         },
         &|index, error| member_error(error, &entries[index].name, "compressing"),
         true,
-        &|_, _| false,
+        &straight,
         &mut |index, handed| {
-            let Handed::Member(member) = handed else {
-                unreachable!("no member goes out straight")
-            };
             check_cancelled(plan.progress)?;
             if !emitting {
                 report_emission(plan.progress, true);
                 emitting = true;
             }
             let entry = &entries[index];
+            let writing = |error| member_error(error, &entry.name, "writing volume member");
+            let member = match handed {
+                Handed::Member(member) => member,
+                Handed::Opening { input_size } => {
+                    let opened = VolumeInPlace::open(
+                        entry,
+                        index,
+                        input_size,
+                        member_ivs[index],
+                        &plan,
+                        &mut write_keys,
+                        resources,
+                    );
+                    in_place = Some(opened.map_err(writing)?);
+                    return Ok(());
+                }
+                Handed::Packed(bytes) => {
+                    let member = in_place.as_mut().expect("packed bytes follow an opening");
+                    return member.take(bytes, &mut writer).map_err(writing);
+                }
+                Handed::Closed(closed) => {
+                    let member = in_place.take().expect("a member closes after it opens");
+                    return member
+                        .close(
+                            entry,
+                            &closed,
+                            member_ivs[index],
+                            &plan,
+                            &mut write_keys,
+                            &mut writer,
+                        )
+                        .map_err(writing);
+                }
+            };
             let size = member.input_size;
             let mut member = prepare_volume_member(
                 entry,
@@ -2860,7 +3118,10 @@ fn prepare_volume_member<'a>(
             reader: None,
         }
     } else {
-        FragmentSource::Packed(member.packed)
+        FragmentSource::Packed {
+            spool: member.packed,
+            base: 0,
+        }
     };
     let mut volume_member = VolumeMember {
         name: &entry.name,
@@ -2896,16 +3157,59 @@ fn prepare_volume_member<'a>(
     Ok(volume_member)
 }
 
+/// A volume's output, as the sink opened it.
+enum VolumeIo {
+    WriteOnly(Box<dyn super::VolumeOutput>),
+    Readable(Box<dyn super::ReadableVolumeOutput>),
+}
+
+impl VolumeIo {
+    fn readable(&mut self) -> Option<&mut dyn super::ReadableVolumeOutput> {
+        match self {
+            Self::WriteOnly(_) => None,
+            Self::Readable(output) => Some(&mut **output),
+        }
+    }
+}
+
+impl Write for VolumeIo {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::WriteOnly(output) => output.write(bytes),
+            Self::Readable(output) => output.write(bytes),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::WriteOnly(output) => output.flush(),
+            Self::Readable(output) => output.flush(),
+        }
+    }
+}
+
+impl Seek for VolumeIo {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Self::WriteOnly(output) => output.seek(to),
+            Self::Readable(output) => output.seek(to),
+        }
+    }
+}
+
 /// Where the body of the volume being filled goes.
 enum VolumeBody {
-    /// Straight into the volume. Without a recovery record the main header's
-    /// length does not depend on the body, so room for it goes out first and
-    /// the header is patched in when the volume closes.
+    /// Straight into the volume, behind room for the main header, which is
+    /// patched in when the volume closes. Without a recovery record the main
+    /// header's length does not depend on the body. With one, the output can
+    /// be read back: the room is what the fullest body needs, the body moves
+    /// if its header comes out another length, and the record is built from
+    /// the volume as written.
     Direct {
-        output: Box<dyn super::VolumeOutput>,
+        output: VolumeIo,
         /// Where the volume starts in `output`.
         start: u64,
-        /// Where the main header goes, and its length.
+        /// Where the main header goes, and the room left for it.
         main_at: u64,
         main_len: u64,
         /// Where the body starts.
@@ -2917,14 +3221,14 @@ enum VolumeBody {
     /// first, and takes the volume whole at the end too.
     Spooled {
         body: Spool,
-        output: Option<Box<dyn super::VolumeOutput>>,
+        output: Option<VolumeIo>,
     },
 }
 
 impl VolumeBody {
     fn io(&mut self) -> &mut dyn super::VolumeOutput {
         match self {
-            Self::Direct { output, .. } => &mut **output,
+            Self::Direct { output, .. } => output,
             Self::Spooled { body, .. } => body,
         }
     }
@@ -2937,6 +3241,23 @@ impl VolumeBody {
             Self::Spooled { body, .. } => Ok(body.len()),
         }
     }
+
+    /// The output a member can be packed straight into: one that seeks, and
+    /// can be read back so a fragment can move once its header's length is known.
+    fn in_place(&mut self) -> Option<&mut dyn super::ReadableVolumeOutput> {
+        match self {
+            Self::Direct { output, .. } => output.readable(),
+            Self::Spooled { .. } => None,
+        }
+    }
+}
+
+/// A volume whose body is complete, waiting to be closed.
+struct FilledVolume {
+    body: VolumeBody,
+    number: u64,
+    /// Its producer record, which goes after its files.
+    producer: Option<PreparedBlock<'static>>,
 }
 
 struct VolumeWriter<'a> {
@@ -2969,9 +3290,18 @@ struct VolumeWriter<'a> {
 impl VolumeWriter<'_> {
     /// Cuts one member across as many volumes as it takes.
     fn write_member(&mut self, member: &mut VolumeMember) -> Result<()> {
+        self.write_member_from(member, 0, false)
+    }
+
+    /// Cuts the rest of a member, from payload offset `start`, across as many
+    /// volumes as it takes.
+    fn write_member_from(
+        &mut self,
+        member: &mut VolumeMember,
+        mut start: u64,
+        mut split_before: bool,
+    ) -> Result<()> {
         check_cancelled(self.progress)?;
-        let mut start = 0u64;
-        let mut split_before = false;
         // Zero-length members still need a header of their own.
         loop {
             if self.body.is_none() {
@@ -2982,60 +3312,27 @@ impl VolumeWriter<'_> {
             // because until then we cannot say whether it is the last one, and
             // its end-of-archive block has to say which.
             let Some(fragment_len) = self.fragment_room(member, split_before, remaining)? else {
-                if self.fragments_in_volume == 0 {
-                    return Err(Error::InvalidArgument(
-                        "RAR 5 volume size is too small to hold a member header",
-                    ));
-                }
-                self.finish_volume(true)?;
+                self.close_full_volume()?;
                 continue;
             };
             let split_after = start + fragment_len < member.payload_len;
-            // A fragment that is not the last one has no whole-member checksum
-            // to report, so the field carries the CRC32 of the bytes this
-            // volume stores. That is what WinRAR puts there, and it lets a
-            // single volume be checked on its own. Those are only known once
-            // the bytes are copied, so the header goes out as a placeholder of
-            // the same length and is patched afterwards.
-            let header_len = self.fragment_header_len(member, fragment_len, split_before)?;
             let body = self.body.as_mut().expect("volume started").io();
-            let header_at = body.stream_position()?;
-            body.write_all(&vec![0; header_len as usize])?;
-            let blake2sp = member.hash.is_some();
-            let emitted = member.source.emit_range(
-                start,
-                fragment_len,
+            write_fragment(
                 &mut CancellableIo {
-                    inner: &mut *body,
+                    inner: body,
                     progress: self.progress,
                 },
+                member,
+                Cut {
+                    start,
+                    len: fragment_len,
+                    split_before,
+                },
                 split_after,
-                blake2sp,
+                self.header_keys,
                 self.resources,
                 self.copy_work,
             )?;
-            // A member hashed on its copy has its checksums only now, for the
-            // header of its last fragment.
-            if let Some(copied) = emitted.member {
-                member.crc32 = copied.crc32;
-                member.hash = copied.hash;
-            }
-            let header = fragment_header(
-                member,
-                fragment_len,
-                split_before,
-                emitted.fragment,
-                self.header_keys,
-                self.resources,
-            )?;
-            patch_header(
-                body,
-                header_at,
-                header_len,
-                &header,
-                Error::WriterFailure("RAR 5 fragment header changed length when patched"),
-            )?;
-
             self.fragments_in_volume += 1;
             start += fragment_len;
             split_before = true;
@@ -3044,6 +3341,23 @@ impl VolumeWriter<'_> {
                 return Ok(());
             }
         }
+    }
+
+    /// Closes a volume the next fragment does not fit in, unless it holds no
+    /// fragment at all, when no volume of this size can hold that one.
+    fn close_full_volume(&mut self) -> Result<()> {
+        if self.fragments_in_volume == 0 {
+            return Err(Error::InvalidArgument(
+                "RAR 5 volume size is too small to hold a member header",
+            ));
+        }
+        self.finish_volume(true)
+    }
+
+    /// How much of the volume's budget is spoken for. A later volume's
+    /// producer record joins the body when it closes.
+    fn used(&mut self) -> Result<u64> {
+        Ok(self.body.as_mut().expect("volume started").len()? + self.trailing_len)
     }
 
     /// The longest next fragment of `member` that still fits in this volume
@@ -3055,8 +3369,7 @@ impl VolumeWriter<'_> {
         split_before: bool,
         remaining: u64,
     ) -> Result<Option<u64>> {
-        // A later volume's producer record joins the body when it closes.
-        let used = self.body.as_mut().expect("volume started").len()? + self.trailing_len;
+        let used = self.used()?;
         // Most of the time the rest of the member fits as it is, and one
         // layout check says so without working out the whole budget.
         let header = self.fragment_header_len(member, remaining, split_before)?;
@@ -3280,17 +3593,30 @@ impl VolumeWriter<'_> {
                 output,
             })
         };
-        if self.recovery_percent.is_some() {
+        check_cancelled(self.progress)?;
+        let readable = self.sink.start_readable_volume(self.volume_index)?;
+        // A recovery record that cannot be read back from the volume is built
+        // from its spooled body, and the volume is opened when it is written.
+        if self.recovery_percent.is_some() && readable.is_none() {
             return spooled(None);
         }
-        check_cancelled(self.progress)?;
-        let mut output = self.sink.start_volume(self.volume_index)?;
+        let mut output = match readable {
+            Some(output) => VolumeIo::Readable(output),
+            None => VolumeIo::WriteOnly(self.sink.start_volume(self.volume_index)?),
+        };
         let Ok(start) = output.stream_position() else {
             return spooled(Some(output));
         };
         let head_crypt = self.head_crypt()?;
-        let layout = resolve_layout(
-            &self.layout_inputs(self.volume_index, head_crypt.len() as u64, 0),
+        // A recovery record's offset in the main header grows with the body,
+        // and most volumes come out about as full as they can be. The guess
+        // stays clear of overflowing the layout.
+        let body_len = match self.recovery_percent {
+            Some(_) => self.volume_size.min(u64::MAX >> 8),
+            None => 0,
+        };
+        let layout = settle_layout(
+            &self.layout_inputs(self.volume_index, head_crypt.len() as u64, body_len),
             self.resources,
         )?;
         let mut io = CancellableIo {
@@ -3312,8 +3638,29 @@ impl VolumeWriter<'_> {
     }
 
     fn finish_volume(&mut self, more_volumes_follow: bool) -> Result<()> {
-        let mut body = self.body.take().expect("volume started");
-        if let Some(marker) = self.trailing_producer.take() {
+        let filled = self.take_volume();
+        self.seal(filled, more_volumes_follow)
+    }
+
+    /// Takes the volume being filled, so the next one can start before it closes.
+    fn take_volume(&mut self) -> FilledVolume {
+        let number = self.volume_index;
+        self.volume_index += 1;
+        FilledVolume {
+            body: self.body.take().expect("volume started"),
+            number,
+            producer: self.trailing_producer.take(),
+        }
+    }
+
+    /// Writes what goes after a volume's body and hands the volume back.
+    fn seal(&mut self, volume: FilledVolume, more_volumes_follow: bool) -> Result<()> {
+        let FilledVolume {
+            mut body,
+            number: volume_number,
+            producer,
+        } = volume;
+        if let Some(marker) = producer {
             let mut io = CancellableIo {
                 inner: body.io(),
                 progress: self.progress,
@@ -3321,8 +3668,6 @@ impl VolumeWriter<'_> {
             io.write_all(&marker.header)?;
             write_payload(marker.payload, &mut io, self.resources, self.progress, None)?;
         }
-        let volume_number = self.volume_index;
-        self.volume_index += 1;
 
         let head_crypt = self.head_crypt()?;
         let layout = resolve_layout(
@@ -3333,24 +3678,64 @@ impl VolumeWriter<'_> {
         check_cancelled(self.progress)?;
         let written = match body {
             VolumeBody::Direct {
-                output,
+                mut output,
                 start,
                 main_at,
                 main_len,
-                ..
+                body_at,
             } => {
+                let body_end = output.stream_position()?;
+                let fitted = layout.main_header_len;
+                if fitted != main_len {
+                    let Some(readable) = output.readable() else {
+                        return Err(Error::WriterFailure(
+                            "RAR 5 volume main header changed length when patched",
+                        ));
+                    };
+                    move_within(
+                        &mut CancellableIo {
+                            inner: readable,
+                            progress: self.progress,
+                        },
+                        body_at,
+                        main_at + fitted,
+                        body_end - body_at,
+                        self.resources,
+                    )?;
+                }
+                let main = self.main_header(volume_number, &layout)?;
+                patch_header(
+                    &mut CancellableIo {
+                        inner: &mut output,
+                        progress: self.progress,
+                    },
+                    main_at,
+                    fitted,
+                    &main,
+                    Error::WriterFailure("RAR 5 volume main header changed length when patched"),
+                )?;
+                if let Some(recovery_percent) = self.recovery_percent {
+                    let prefix_len = layout
+                        .recovery_prefix_len
+                        .expect("a recovery layout knows what its record covers");
+                    debug_assert_eq!(output.stream_position()?, start + prefix_len);
+                    let readable = output
+                        .readable()
+                        .expect("a volume with a recovery record goes straight out only when it can be read back");
+                    write_recovery_read_back(
+                        recovery_percent,
+                        readable,
+                        start,
+                        prefix_len,
+                        self.header_keys,
+                        self.resources,
+                        self.progress,
+                    )?;
+                }
                 let mut output = CancellableIo {
                     inner: output,
                     progress: self.progress,
                 };
-                let main = self.main_header(volume_number, &layout)?;
-                patch_header(
-                    &mut output,
-                    main_at,
-                    main_len,
-                    &main,
-                    Error::WriterFailure("RAR 5 volume main header changed length when patched"),
-                )?;
                 let end = self.end_block(more_volumes_follow)?;
                 output.write_all(&end)?;
                 output.flush()?;
@@ -3415,11 +3800,11 @@ impl VolumeWriter<'_> {
         head_crypt: &[u8],
         layout: &super::layout::ResolvedLayout,
         mut body: Spool,
-        output: Option<Box<dyn super::VolumeOutput>>,
+        output: Option<VolumeIo>,
     ) -> Result<u64> {
         let raw_output = match output {
             Some(output) => output,
-            None => self.sink.start_volume(volume_number)?,
+            None => VolumeIo::WriteOnly(self.sink.start_volume(volume_number)?),
         };
         let mut output = CancellableIo {
             inner: raw_output,
@@ -3466,6 +3851,659 @@ impl VolumeWriter<'_> {
         output.flush()?;
         Ok(written)
     }
+}
+
+/// Volumes a member that may yet be stored over its packed bytes holds open,
+/// at most; past them the rest of its attempt is spooled.
+const MOST_OPEN_VOLUMES: usize = 64;
+
+/// From a body this long a recovery record has all its data shards, and the
+/// overhead around a body only grows with it, so no body past the budget fits.
+const RECOVERY_SHARDS_SETTLE: u64 = 200 * 1024;
+
+/// A member is packed into volumes no larger than this, which are sized to
+/// hold a set whole and keep their layout arithmetic far from overflow.
+const MOST_IN_PLACE_VOLUME: u64 = 1 << 60;
+
+/// A fragment already cut, and where its header went.
+#[derive(Clone, Copy)]
+struct CutFragment {
+    cut: Cut,
+    header_at: u64,
+    header_len: u64,
+}
+
+/// A volume holding a fragment of a member that may yet be stored over its
+/// packed bytes, closed once it is known whether it is.
+struct Pending {
+    volume: FilledVolume,
+    fragment: CutFragment,
+}
+
+/// The fragment being filled as a member is packed.
+struct OpenFragment {
+    header_at: u64,
+    /// The placeholder header's length, for a fragment `direct` bytes long.
+    header_len: u64,
+    /// Bytes certain to be in this fragment, written as they come.
+    direct: u64,
+    /// How many bytes received settle the fragment at `direct` bytes, and
+    /// not the member's last.
+    settled: u64,
+    written: u64,
+    checksums: ChecksumSink,
+    /// Bytes past `direct`, held until the fragment's length is known.
+    held: Bytes,
+}
+
+/// A large member cut into volumes as it is packed.
+///
+/// A fragment's header goes before it and its length depends on the
+/// fragment's. Until the member ends, the fragment being filled holds at least
+/// what has been received and at most what the volume has room for. The bytes
+/// certain to be in it go out behind a header sized for a full volume, and
+/// the few past them are held until the member ends or outgrows the volume.
+/// A member that ends early has its fragment moved to fit a shorter header,
+/// so this needs volumes that can be read back.
+///
+/// Every fragment is cut where it would be if the member's length had been
+/// known from the start, so the set is the one a spooled member makes.
+struct VolumeInPlace<'a> {
+    cipher: Option<OutgoingCipher>,
+    /// MACs the checksums of an encrypted member.
+    keys: Option<Rar50Keys>,
+    /// Neither solid nor too small, so packing that does not pay stores it.
+    may_store: bool,
+    taken: u64,
+    cutter: Cutter<'a>,
+}
+
+struct Cutter<'a> {
+    member: VolumeMember<'a>,
+    may_store: bool,
+    /// Where the fragment being filled starts in the payload.
+    start: u64,
+    split_before: bool,
+    open: Option<OpenFragment>,
+    /// Earlier volumes the member's fragments went into.
+    pending: Records<Pending>,
+    /// The member's fragment in the volume being filled, once cut.
+    current: Option<CutFragment>,
+    /// The rest of the payload, from `start` on, once it cannot go straight
+    /// out.
+    rest: Option<Spool>,
+}
+
+/// Feeds ciphertext to the cutter as it is encrypted.
+struct Feed<'c, 'a, 'w> {
+    cutter: &'c mut Cutter<'a>,
+    writer: &'c mut VolumeWriter<'w>,
+}
+
+impl Write for Feed<'_, '_, '_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.cutter
+            .feed(self.writer, bytes)
+            .map_err(std::io::Error::other)?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> VolumeInPlace<'a> {
+    fn open(
+        entry: &'a ArchiveEntry,
+        index: usize,
+        input_size: u64,
+        iv: Option<[u8; 16]>,
+        plan: &EnginePlan<'_>,
+        write_keys: &mut WriteKeys<'a>,
+        resources: &WriterResources,
+    ) -> Result<Self> {
+        let compress = &plan.compress;
+        let mut member = VolumeMember {
+            name: &entry.name,
+            is_directory: entry.is_directory,
+            mtime: entry.mtime,
+            mtime_nanoseconds: entry.mtime_nanoseconds,
+            file_times: entry.file_times,
+            attributes: entry.attributes,
+            host_os: entry.host_os,
+            unpacked_size: input_size,
+            // Placeholders of the checksums' widths size every header.
+            crc32: 0,
+            hash: compress.blake2sp.then_some([0; 32]),
+            compression_info: super::filter_policy::compression_info(
+                compress.algorithm_version,
+                compress.method,
+                compress.dictionary_size,
+                compress.solid && index > 0,
+            )?,
+            payload_len: 0,
+            source: FragmentSource::Held {
+                bytes: Bytes::new(resources),
+                base: 0,
+            },
+            encryption: None,
+        };
+        let (keys, cipher) = match entry.password.as_deref() {
+            Some(password) => {
+                let (salt, keys) = write_keys.for_password(password)?;
+                let iv = iv.expect("an IV is drawn for every member with a password");
+                member.encryption = Some((salt, iv, keys.checked_password_record()?));
+                let cipher = OutgoingCipher::new(&keys, iv, resources)?;
+                (Some(keys), Some(cipher))
+            }
+            None => (None, None),
+        };
+        let may_store = super::filter_policy::should_store_compressed_payload(
+            input_size,
+            input_size,
+            compress.solid,
+            &compress.filter_policy,
+        );
+        Ok(Self {
+            cipher,
+            keys,
+            may_store,
+            taken: 0,
+            cutter: Cutter {
+                member,
+                may_store,
+                start: 0,
+                split_before: false,
+                open: None,
+                pending: Records::new(if may_store { MOST_OPEN_VOLUMES } else { 0 }, resources)?,
+                current: None,
+                rest: None,
+            },
+        })
+    }
+
+    /// Bytes that reach the size of a member that may be stored are not cut:
+    /// it will be stored over them.
+    fn take(&mut self, bytes: &[u8], writer: &mut VolumeWriter) -> Result<()> {
+        let size = self.cutter.member.unpacked_size;
+        let taken = self.taken + bytes.len() as u64;
+        if self.may_store && taken >= size {
+            self.taken = size;
+            return Ok(());
+        }
+        self.taken = taken;
+        match self.cipher.as_mut() {
+            Some(cipher) => cipher.write(
+                bytes,
+                &mut Feed {
+                    cutter: &mut self.cutter,
+                    writer,
+                },
+            ),
+            None => self.cutter.feed(writer, bytes),
+        }
+    }
+
+    fn close(
+        mut self,
+        entry: &'a ArchiveEntry,
+        closed: &ClosedMember,
+        iv: Option<[u8; 16]>,
+        plan: &EnginePlan<'_>,
+        write_keys: &mut WriteKeys<'a>,
+        writer: &mut VolumeWriter,
+    ) -> Result<()> {
+        if closed.store {
+            let stored = prepare_volume_member(
+                entry,
+                closed.stored(writer.resources)?,
+                iv,
+                plan,
+                write_keys,
+                writer.resources,
+            )?;
+            return self.cutter.store(writer, stored);
+        }
+        if closed.packed_len != self.taken {
+            return Err(Error::InvalidArgument(
+                "RAR 5 member packed in place is not the size written",
+            ));
+        }
+        let payload_len = match self.cipher.take() {
+            Some(cipher) => {
+                cipher.finish(&mut Feed {
+                    cutter: &mut self.cutter,
+                    writer,
+                })?;
+                padded_to_cipher_block(closed.packed_len)?
+            }
+            None => closed.packed_len,
+        };
+        let member = &mut self.cutter.member;
+        member.payload_len = payload_len;
+        (member.crc32, member.hash) = match &self.keys {
+            Some(keys) => (
+                keys.checked_crc_mac(closed.crc32)?,
+                closed
+                    .hash
+                    .map(|hash| keys.checked_hash_mac(hash))
+                    .transpose()?,
+            ),
+            None => (closed.crc32, closed.hash),
+        };
+        self.cutter.finish(writer)
+    }
+}
+
+impl Cutter<'_> {
+    fn output<'w>(
+        writer: &'w mut VolumeWriter,
+    ) -> CancellableIo<'w, &'w mut dyn super::ReadableVolumeOutput> {
+        let progress = writer.progress;
+        CancellableIo {
+            inner: writer
+                .body
+                .as_mut()
+                .and_then(VolumeBody::in_place)
+                .expect("a fragment is filled in place"),
+            progress,
+        }
+    }
+
+    fn feed(&mut self, writer: &mut VolumeWriter, mut bytes: &[u8]) -> Result<()> {
+        while !bytes.is_empty() {
+            if let Some(rest) = self.rest.as_mut() {
+                rest.write_all(bytes)?;
+                return Ok(());
+            }
+            let Some(open) = self.open.as_mut() else {
+                self.begin(writer)?;
+                continue;
+            };
+            if open.written < open.direct {
+                let take = (open.direct - open.written).min(bytes.len() as u64) as usize;
+                Self::output(writer).write_all(&bytes[..take])?;
+                open.checksums.update(&bytes[..take]);
+                open.written += take as u64;
+                bytes = &bytes[take..];
+                continue;
+            }
+            let received = open.written + open.held.len() as u64;
+            let take = (open.settled - received).min(bytes.len() as u64) as usize;
+            open.held.extend_from_slice(&bytes[..take])?;
+            bytes = &bytes[take..];
+            if received + take as u64 >= open.settled {
+                let carry = self.settle(writer)?;
+                self.feed(writer, &carry)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the next fragment where the volume being filled has got to.
+    fn begin(&mut self, writer: &mut VolumeWriter) -> Result<()> {
+        if writer.body.is_none() {
+            writer.start_volume()?;
+        }
+        if writer
+            .body
+            .as_mut()
+            .and_then(VolumeBody::in_place)
+            .is_none()
+        {
+            self.rest = Some(Spool::create(writer.resources)?);
+            return Ok(());
+        }
+        let used = writer.used()?;
+        let budget = writer.body_budget()?;
+        // A member with this much left cannot fit in the volume with its
+        // header, so its fragment is as long as the volume allows.
+        let settled = if writer.recovery_percent.is_none() || budget >= RECOVERY_SHARDS_SETTLE {
+            budget.saturating_sub(used)
+        } else {
+            writer
+                .volume_size
+                .saturating_sub(writer.fixed_len)
+                .saturating_sub(used)
+        } + 1;
+        let most = writer.fragment_room(&self.member, self.split_before, settled)?;
+        let header_at = Self::output(writer).stream_position()?;
+        let (direct, header_len) = match most {
+            // Any longer member gets a fragment at least this long.
+            Some(len) if len > 0 => {
+                let header_len =
+                    writer.fragment_header_len(&self.member, len, self.split_before)?;
+                Self::output(writer).write_all(&vec![0; header_len as usize])?;
+                (len, header_len)
+            }
+            _ => (0, 0),
+        };
+        self.open = Some(OpenFragment {
+            header_at,
+            header_len,
+            direct,
+            settled,
+            written: 0,
+            checksums: ChecksumSink::new(self.member.hash.is_some()),
+            held: Bytes::new(writer.resources),
+        });
+        Ok(())
+    }
+
+    /// The member outgrew the volume, so the fragment is as long as the
+    /// volume allows. Returns the bytes held past it.
+    fn settle(&mut self, writer: &mut VolumeWriter) -> Result<Bytes> {
+        let open = self.open.take().expect("a fragment is open");
+        if open.direct > 0 {
+            let checksums = open.checksums;
+            self.cut(
+                writer,
+                open.header_at,
+                open.header_len,
+                open.direct,
+                Some(checksums.into()),
+            )?;
+        } else {
+            self.next_volume(writer)?;
+        }
+        Ok(open.held)
+    }
+
+    /// Patches the header of the fragment that ends here. A fragment that is
+    /// not the member's last carries its own checksums.
+    fn cut(
+        &mut self,
+        writer: &mut VolumeWriter,
+        header_at: u64,
+        header_len: u64,
+        len: u64,
+        fragment: Option<FragmentChecksums>,
+    ) -> Result<()> {
+        let header = fragment_header(
+            &self.member,
+            len,
+            self.split_before,
+            fragment,
+            writer.header_keys,
+            writer.resources,
+        )?;
+        patch_header(
+            &mut Self::output(writer),
+            header_at,
+            header_len,
+            &header,
+            Error::WriterFailure("RAR 5 fragment header changed length when patched"),
+        )?;
+        writer.fragments_in_volume += 1;
+        let cut = CutFragment {
+            cut: Cut {
+                start: self.start,
+                len,
+                split_before: self.split_before,
+            },
+            header_at,
+            header_len,
+        };
+        self.start += len;
+        self.split_before = true;
+        if self.may_store && fragment.is_some() && self.current.replace(cut).is_some() {
+            return Err(Error::WriterFailure(
+                "RAR 5 member was cut twice into one volume",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Moves on from a volume the member has no more room in. One holding a
+    /// fragment of a member that may yet be stored over it stays open.
+    fn next_volume(&mut self, writer: &mut VolumeWriter) -> Result<()> {
+        let Some(fragment) = self.current.take() else {
+            return writer.close_full_volume();
+        };
+        if self.pending.len() < MOST_OPEN_VOLUMES {
+            let volume = writer.take_volume();
+            return self.pending.push(Pending { volume, fragment });
+        }
+        // The volume stays the one being filled, and is left once the
+        // member's length is known.
+        self.current = Some(fragment);
+        self.rest = Some(Spool::create(writer.resources)?);
+        Ok(())
+    }
+
+    /// Cuts the rest of a member that turned out not to be stored.
+    fn finish(mut self, writer: &mut VolumeWriter) -> Result<()> {
+        let pending = std::mem::replace(&mut self.pending, Records::new(0, writer.resources)?);
+        for pending in pending {
+            writer.seal(pending.volume, true)?;
+        }
+        if let Some(rest) = self.rest.take() {
+            self.member.source = FragmentSource::Packed {
+                spool: rest,
+                base: self.start,
+            };
+            return writer.write_member_from(&mut self.member, self.start, self.split_before);
+        }
+        let Some(open) = self.open.take() else {
+            return Err(Error::WriterFailure(
+                "RAR 5 member packed in place ended between fragments",
+            ));
+        };
+        let remaining = self.member.payload_len - self.start;
+        // The fragment is measured from where it starts.
+        Self::output(writer).seek(SeekFrom::Start(open.header_at))?;
+        let room = writer.fragment_room(&self.member, self.split_before, remaining)?;
+        let len = match room {
+            Some(len) if len >= open.written && len - open.written <= open.held.len() as u64 => len,
+            None if open.written == 0 => {
+                writer.close_full_volume()?;
+                self.member.source = FragmentSource::Held {
+                    bytes: open.held,
+                    base: self.start,
+                };
+                return writer.write_member_from(&mut self.member, self.start, self.split_before);
+            }
+            _ => {
+                return Err(Error::WriterFailure(
+                    "RAR 5 member packed in place outran its fragment",
+                ))
+            }
+        };
+        let header_len = writer.fragment_header_len(&self.member, len, self.split_before)?;
+        let resources = writer.resources;
+        let mut output = Self::output(writer);
+        if open.written == 0 {
+            output.write_all(&vec![0; header_len as usize])?;
+        } else if header_len != open.header_len {
+            move_within(
+                &mut output,
+                open.header_at + open.header_len,
+                open.header_at + header_len,
+                open.written,
+                resources,
+            )?;
+        } else {
+            output.seek(SeekFrom::Start(open.header_at + header_len + open.written))?;
+        }
+        let tail = (len - open.written) as usize;
+        output.write_all(&open.held[..tail])?;
+        let mut checksums = open.checksums;
+        checksums.update(&open.held[..tail]);
+        let last = len == remaining;
+        self.cut(
+            writer,
+            open.header_at,
+            header_len,
+            len,
+            (!last).then(|| checksums.into()),
+        )?;
+        if last {
+            return Ok(());
+        }
+        let mut bytes = Bytes::new(resources);
+        bytes.extend_from_slice(&open.held[tail..])?;
+        self.member.source = FragmentSource::Held {
+            bytes,
+            base: self.start,
+        };
+        writer.write_member_from(&mut self.member, self.start, true)
+    }
+
+    /// Writes a member stored over its attempt, from its first fragment on.
+    /// The attempt stopped short of the member's size, so the stored member
+    /// is cut where the attempt was, and every volume the attempt reached is
+    /// still open.
+    fn store(mut self, writer: &mut VolumeWriter, mut member: VolumeMember) -> Result<()> {
+        for pending in self.pending {
+            let Pending {
+                mut volume,
+                fragment,
+            } = pending;
+            Self::recut(writer, volume.body.io(), &mut member, fragment)?;
+            writer.seal(volume, true)?;
+        }
+        if let Some(fragment) = self.current.take() {
+            let mut body = writer.body.take().expect("volume started");
+            let recut = Self::recut(writer, body.io(), &mut member, fragment);
+            writer.body = Some(body);
+            recut?;
+        }
+        if let Some(open) = self.open.take() {
+            writer
+                .body
+                .as_mut()
+                .expect("volume started")
+                .io()
+                .seek(SeekFrom::Start(open.header_at))?;
+        }
+        writer.write_member_from(&mut member, self.start, self.split_before)
+    }
+
+    fn recut(
+        writer: &VolumeWriter,
+        output: &mut dyn super::VolumeOutput,
+        member: &mut VolumeMember,
+        fragment: CutFragment,
+    ) -> Result<()> {
+        output.seek(SeekFrom::Start(fragment.header_at))?;
+        let header_len = write_fragment(
+            &mut CancellableIo {
+                inner: output,
+                progress: writer.progress,
+            },
+            member,
+            fragment.cut,
+            true,
+            writer.header_keys,
+            writer.resources,
+            writer.copy_work,
+        )?;
+        if header_len != fragment.header_len {
+            return Err(Error::WriterFailure(
+                "RAR 5 member stored over its attempt has a fragment header of another length",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Where one fragment of a member's payload goes.
+#[derive(Clone, Copy)]
+struct Cut {
+    start: u64,
+    len: u64,
+    split_before: bool,
+}
+
+/// Writes one fragment of `member` at the output's position.
+///
+/// A fragment that is not the last one has no whole-member checksum to
+/// report, so the field carries the CRC32 of the bytes this volume stores.
+/// That is what WinRAR puts there, and it lets a single volume be checked on
+/// its own. Those are only known once the bytes are copied, so the header goes
+/// out as a placeholder of the same length and is patched afterwards.
+#[allow(clippy::too_many_arguments)]
+fn write_fragment(
+    output: &mut (impl Write + Seek),
+    member: &mut VolumeMember,
+    cut: Cut,
+    split_after: bool,
+    header_keys: Option<&HeaderEncryptionKeys>,
+    resources: &WriterResources,
+    copy_work: Option<&WorkTracker<'_>>,
+) -> Result<u64> {
+    let header_len = fragment_header(
+        member,
+        cut.len,
+        cut.split_before,
+        None,
+        header_keys,
+        resources,
+    )?
+    .len() as u64;
+    let header_at = output.stream_position()?;
+    output.write_all(&vec![0; header_len as usize])?;
+    let blake2sp = member.hash.is_some();
+    let emitted = member.source.emit_range(
+        cut.start,
+        cut.len,
+        output,
+        split_after,
+        blake2sp,
+        resources,
+        copy_work,
+    )?;
+    // A member hashed on its copy has its checksums only now, for the
+    // header of its last fragment.
+    if let Some(copied) = emitted.member {
+        member.crc32 = copied.crc32;
+        member.hash = copied.hash;
+    }
+    let header = fragment_header(
+        member,
+        cut.len,
+        cut.split_before,
+        emitted.fragment,
+        header_keys,
+        resources,
+    )?;
+    patch_header(
+        output,
+        header_at,
+        header_len,
+        &header,
+        Error::WriterFailure("RAR 5 fragment header changed length when patched"),
+    )?;
+    Ok(header_len)
+}
+
+/// Moves `len` bytes at `from` to `to` within `output`, and leaves it just
+/// past them.
+fn move_within(
+    output: &mut (impl Read + Write + Seek),
+    from: u64,
+    to: u64,
+    len: u64,
+    resources: &WriterResources,
+) -> Result<()> {
+    const CHUNK: u64 = 64 * 1024;
+    let mut buffer = Bytes::zeroed(len.min(CHUNK) as usize, resources)?;
+    let mut moved = 0;
+    while moved < len {
+        let take = (len - moved).min(CHUNK);
+        // Moving down goes front to back and moving up back to front, so no
+        // byte is overwritten before it is read.
+        let at = if to < from { moved } else { len - moved - take };
+        let chunk = &mut buffer[..take as usize];
+        output.seek(SeekFrom::Start(from + at))?;
+        output.read_exact(chunk)?;
+        output.seek(SeekFrom::Start(to + at))?;
+        output.write_all(chunk)?;
+        moved += take;
+    }
+    output.seek(SeekFrom::Start(to + len))?;
+    Ok(())
 }
 
 /// Builds the file header for one fragment of a member.

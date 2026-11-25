@@ -3535,6 +3535,19 @@ impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
     }
 
     fn start_volume(&mut self, index: u64) -> rars::Result<Box<dyn rars::rar50::VolumeOutput>> {
+        Ok(Box::new(self.stage_volume(index)?))
+    }
+
+    fn start_readable_volume(
+        &mut self,
+        index: u64,
+    ) -> rars::Result<Option<Box<dyn rars::rar50::ReadableVolumeOutput>>> {
+        Ok(Some(Box::new(self.stage_volume(index)?)))
+    }
+}
+
+impl CliVolumeSink<'_> {
+    fn stage_volume(&mut self, index: u64) -> rars::Result<fs::File> {
         // Refuse a name that cannot exist before writing a volume that would need it.
         let part = usize::try_from(index).unwrap_or(usize::MAX);
         (self.part_path)(self.first_path, part, part.saturating_add(1))
@@ -3547,7 +3560,7 @@ impl rars::rar50::VolumeSink for CliVolumeSink<'_> {
         let (temporary, file) = create_streaming_archive_temp(&base)
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         self.temporaries.push(temporary);
-        Ok(Box::new(file))
+        Ok(file)
     }
 }
 
@@ -3661,7 +3674,9 @@ fn create_streaming_archive_temp(archive_path: &Path) -> CliResult<(PathBuf, fs:
             std::process::id()
         ));
         let temporary = archive_path.with_file_name(name);
+        // Readable too, so a writer can read back what it wrote.
         match fs::File::options()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&temporary)

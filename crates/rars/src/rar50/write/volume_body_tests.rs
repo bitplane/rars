@@ -518,3 +518,332 @@ fn a_volume_set_does_not_depend_on_the_thread_count() {
         }
     }
 }
+
+/// Members above this are packed straight into the volumes in these tests.
+const ABOVE: u64 = 256 * 1024;
+
+/// Large members of every kind a set packs in place: text that packs small,
+/// noise that is stored over its attempt, and small members around them.
+fn large_members() -> Vec<(Vec<u8>, Vec<u8>)> {
+    vec![
+        (b"head.txt".to_vec(), text(3000, 5)),
+        (b"big.txt".to_vec(), text(600 * 1024, 1)),
+        (b"big.bin".to_vec(), noise(300 * 1024, 9)),
+        (b"mid.txt".to_vec(), text(20 * 1024, 2)),
+        (b"last.txt".to_vec(), text(400 * 1024, 4)),
+    ]
+}
+
+fn large_cases() -> Vec<Case> {
+    let packed = Case {
+        level: 3,
+        solid: false,
+        password: false,
+        header_encryption: false,
+        blake2sp: false,
+        recovery: None,
+    };
+    let mut cases = vec![
+        packed,
+        Case {
+            solid: true,
+            ..packed
+        },
+        Case {
+            level: 1,
+            blake2sp: true,
+            ..packed
+        },
+    ];
+    if cfg!(feature = "encryption") {
+        cases.extend([
+            Case {
+                password: true,
+                ..packed
+            },
+            Case {
+                password: true,
+                header_encryption: true,
+                blake2sp: true,
+                ..packed
+            },
+        ]);
+    }
+    if cfg!(feature = "recovery") {
+        cases.push(Case {
+            recovery: Some(5),
+            ..packed
+        });
+        if cfg!(feature = "encryption") {
+            cases.push(Case {
+                solid: true,
+                password: true,
+                header_encryption: true,
+                recovery: Some(3),
+                ..packed
+            });
+        }
+    }
+    cases
+}
+
+fn large_entries(case: Case) -> Vec<ArchiveEntry> {
+    large_members()
+        .into_iter()
+        .map(|(name, data)| {
+            let entry = ArchiveEntry::new(name, EntrySource::from_bytes(data));
+            if case.password {
+                entry.with_password(b"secret".to_vec())
+            } else {
+                entry
+            }
+        })
+        .collect()
+}
+
+fn write_large(
+    case: Case,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    volume_size: u64,
+    stream_above: u64,
+) -> crate::Result<()> {
+    seeded(|| {
+        super::write_volumes_above(
+            &large_entries(case),
+            case.options(),
+            ArchiveExtras::default().with_recovery_percent(case.recovery),
+            volume_size,
+            sink,
+            resources,
+            None,
+            stream_above,
+        )
+    })
+}
+
+fn extract_large(case: Case, volumes: &[Vec<u8>]) {
+    let password = case.password.then_some(b"secret".as_slice());
+    let archives: Vec<_> = volumes
+        .iter()
+        .map(|volume| {
+            crate::rar50::Archive::parse_owned_with_password(volume.clone(), password).unwrap()
+        })
+        .collect();
+    let options = match password {
+        Some(password) => ArchiveReadOptions::with_password(password),
+        None => ArchiveReadOptions::new(),
+    };
+    let extracted = Arc::new(Mutex::new(Vec::new()));
+    crate::rar50::extract_volumes_to(&archives, options, |meta| {
+        let file = Arc::new(Mutex::new((meta.name.clone(), Vec::new())));
+        extracted.lock().unwrap().push(file.clone());
+        Ok(Box::new(Shared(file)))
+    })
+    .unwrap();
+    let extracted: Vec<_> = extracted
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|file| file.lock().unwrap().clone())
+        .collect();
+    assert!(extracted == large_members(), "{case:?}");
+}
+
+fn unseekable_volumes(sink: &Unseekable) -> Vec<Vec<u8>> {
+    sink.volumes
+        .iter()
+        .map(|volume| volume.lock().unwrap().clone())
+        .collect()
+}
+
+/// A large member packed straight into the volumes makes the set a spooled
+/// one does, whether it ends inside a volume, spans a few, or spans more than
+/// can be held open while it may still be stored over its attempt.
+#[test]
+fn large_members_packed_into_the_volumes_match_spooled_ones() {
+    let scratch = crate::scratch::case("volume-in-place-parity");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    for case in large_cases() {
+        for volume_size in [4096, 48 * 1024, 2 * 1024 * 1024] {
+            let mut spooled = CollectedVolumes::new();
+            write_large(case, &mut spooled, &resources, volume_size, u64::MAX).unwrap();
+            let spooled = spooled.take();
+            let mut packed = CollectedVolumes::new();
+            write_large(case, &mut packed, &resources, volume_size, ABOVE).unwrap();
+            let packed = packed.take();
+            let mut unseekable = Unseekable::default();
+            write_large(case, &mut unseekable, &resources, volume_size, ABOVE).unwrap();
+            let unseekable = unseekable_volumes(&unseekable);
+            assert_eq!(packed.len(), spooled.len(), "{case:?}, {volume_size}");
+            for (index, (packed, spooled)) in packed.iter().zip(&spooled).enumerate() {
+                assert!(
+                    packed == spooled,
+                    "{case:?}, {volume_size}: volume {index} differs"
+                );
+            }
+            assert!(unseekable == spooled, "{case:?}, {volume_size}");
+            extract_large(case, &packed);
+            assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
+        }
+    }
+}
+
+/// Large members go into seekable volumes without passing through scratch
+/// storage, recovery record and all, where volumes that cannot seek spool them.
+#[test]
+fn large_members_packed_into_the_volumes_need_no_spool() {
+    let scratch = crate::scratch::case("volume-in-place-no-spool");
+    let resources = WriterResources::default()
+        .with_temp_dir(&*scratch)
+        .with_max_spool_bytes(0);
+    let in_place = large_cases()
+        .into_iter()
+        .filter(|case| !case.solid && !case.header_encryption);
+    for case in in_place {
+        // Only large members, as smaller ones are spooled once packed.
+        let entries: Vec<_> = large_entries(case)
+            .into_iter()
+            .filter(|entry| entry.source.len().unwrap() > ABOVE)
+            .collect();
+        let write = |sink: &mut dyn VolumeSink| {
+            seeded(|| {
+                super::write_volumes_above(
+                    &entries,
+                    case.options(),
+                    ArchiveExtras::default().with_recovery_percent(case.recovery),
+                    48 * 1024,
+                    sink,
+                    &resources,
+                    None,
+                    ABOVE,
+                )
+            })
+        };
+        let mut packed = CollectedVolumes::new();
+        write(&mut packed).unwrap_or_else(|error| panic!("{case:?}: {error}"));
+        assert!(packed.take().len() > 4, "{case:?}");
+        let refused = write(&mut Unseekable::default()).unwrap_err();
+        assert_eq!(refused.kind(), crate::ErrorKind::ResourceLimit, "{refused}");
+    }
+}
+
+/// With a recovery record, a seekable volume's record is built from what was
+/// written to it, so no volume is spooled.
+#[test]
+fn recovery_volumes_written_straight_out_need_no_spool() {
+    let scratch = crate::scratch::case("volume-recovery-no-spool");
+    let resources = WriterResources::default()
+        .with_temp_dir(&*scratch)
+        .with_max_spool_bytes(0);
+    let stored = cases()
+        .into_iter()
+        .filter(|case| case.level == 0 && case.recovery.is_some());
+    let mut tried = 0;
+    for case in stored {
+        for volume_size in [4096, 64 * 1024] {
+            let mut seekable = CollectedVolumes::new();
+            case.write(&mut seekable, &resources, volume_size).unwrap();
+            read_back(case, &seekable.take());
+        }
+        let refused = case
+            .write(&mut Unseekable::default(), &resources, 4096)
+            .unwrap_err();
+        assert_eq!(refused.kind(), crate::ErrorKind::ResourceLimit, "{refused}");
+        tried += 1;
+    }
+    assert_eq!(tried > 0, cfg!(feature = "recovery"));
+}
+
+#[test]
+fn large_members_packed_into_the_volumes_do_not_depend_on_the_thread_count() {
+    let scratch = crate::scratch::case("volume-in-place-threads");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    for case in large_cases().into_iter().take(2) {
+        let mut first = None;
+        for threads in [1, 2, 8] {
+            let mut sink = CollectedVolumes::new();
+            let write = || write_large(case, &mut sink, &resources, 48 * 1024, ABOVE);
+            #[cfg(feature = "parallel")]
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(write)
+                .unwrap();
+            #[cfg(not(feature = "parallel"))]
+            {
+                let _ = threads;
+                let mut write = write;
+                write().unwrap();
+            }
+            let volumes = sink.take();
+            match &first {
+                None => first = Some(volumes),
+                Some(first) => assert!(*first == volumes, "{case:?}: {threads} threads"),
+            }
+        }
+    }
+}
+
+/// Volume sizes a byte apart move where a large member ends against the
+/// edge of a volume: inside the bytes it holds back, just short of them, and
+/// where its last fragment cannot start in the volume at all. Each lands where
+/// a spooled member does.
+#[test]
+fn large_members_ending_at_a_volume_edge_match_spooled_ones() {
+    let scratch = crate::scratch::case("volume-in-place-edges");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    let entries: Vec<_> = [
+        noise(300 * 1024, 3),
+        text(200, 1),
+        text(280 * 1024, 2),
+        noise(270 * 1024, 8),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, data)| {
+        ArchiveEntry::new(
+            format!("m{index}").into_bytes(),
+            EntrySource::from_bytes(data),
+        )
+    })
+    .collect();
+    let options =
+        WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::default()).with_compression_level(1);
+    let mut recoveries = vec![None];
+    if cfg!(feature = "recovery") {
+        recoveries.push(Some(5));
+    }
+    for recovery in recoveries {
+        for volume_size in 2016..2032 {
+            let write = |sink: &mut dyn VolumeSink, above| {
+                seeded(|| {
+                    super::write_volumes_above(
+                        &entries,
+                        options,
+                        ArchiveExtras::default().with_recovery_percent(recovery),
+                        volume_size,
+                        sink,
+                        &resources,
+                        None,
+                        above,
+                    )
+                })
+            };
+            let mut spooled = CollectedVolumes::new();
+            let mut packed = CollectedVolumes::new();
+            match (write(&mut spooled, u64::MAX), write(&mut packed, ABOVE)) {
+                (Ok(()), Ok(())) => assert!(
+                    spooled.take() == packed.take(),
+                    "{recovery:?}, {volume_size}"
+                ),
+                // A few of these sizes are refused however the member goes in.
+                (Err(spooled), Err(packed)) => {
+                    assert_eq!(spooled.to_string(), packed.to_string(), "{volume_size}")
+                }
+                (spooled, packed) => panic!("{recovery:?}, {volume_size}: {spooled:?} {packed:?}"),
+            }
+        }
+    }
+}
