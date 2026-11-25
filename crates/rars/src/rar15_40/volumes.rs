@@ -1,9 +1,11 @@
 use super::*;
 use crate::extraction_control::{finish_member, finish_split_member, Resume};
-use crate::extraction_links::legacy_meta_is_link;
+use crate::extraction_links::{decode_legacy_output, legacy_meta_is_link};
 use crate::output_limit::OutputBudget;
 use crate::source::{ArchiveSource, RangeReader};
-use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
+use crate::volume_extract::{
+    flush_split, FragmentWalk, LazyChain, SplitFailure, VolumeEnd, VolumeFeed,
+};
 use std::ops::Range;
 
 pub(super) fn extract<F, B: Budget>(
@@ -172,19 +174,6 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
     }
 }
 
-/// A split member that failed, and the volume holding its end when the walk
-/// could still read that far.
-struct SplitFailure {
-    error: Error,
-    last: Option<Box<Archive>>,
-}
-
-impl From<Error> for SplitFailure {
-    fn from(error: Error) -> Self {
-        Self { error, last: None }
-    }
-}
-
 /// Decodes a split member while its later volumes arrive; returns the volume holding its end.
 ///
 /// When it fails with a member error handler set, the rest of its volumes
@@ -199,7 +188,7 @@ fn extract_split<F, B: Budget>(
     budget: &mut OutputBudget,
     open: &mut F,
     links: &mut Option<&mut LegacyLink<'_>>,
-) -> std::result::Result<Archive, SplitFailure>
+) -> std::result::Result<Archive, SplitFailure<Archive>>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
@@ -210,7 +199,12 @@ where
     match extract_split_walk(
         volume, first, &mut walk, salvage, session, budget, open, links,
     ) {
-        Ok(()) => Ok(walk.into_last_volume()?),
+        Ok(writer) => flush_split(
+            walk.into_last_volume()?,
+            writer,
+            &budget.control,
+            &first.name,
+        ),
         Err(error)
             if options.member_errors.is_none()
                 || matches!(
@@ -240,7 +234,7 @@ fn extract_split_walk<F, B: Budget>(
     budget: &mut OutputBudget,
     open: &mut F,
     links: &mut Option<&mut LegacyLink<'_>>,
-) -> Result<()>
+) -> Result<Option<Box<dyn Write>>>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
@@ -286,7 +280,7 @@ where
         .source
         .owned_range_reader(first.packed_range.clone())?;
     let control = budget.control.clone();
-    legacy_output(
+    decode_legacy_output(
         &meta,
         &allowance,
         &control,

@@ -1058,8 +1058,10 @@ impl Archive {
     ///
     /// For verified publication, write to caller-owned staging storage and
     /// publish it only after extraction succeeds. Output quotas do not provide
-    /// staging or rollback. This method does not flush or sync returned writers;
-    /// callers must check any required flush/sync before publishing staged output.
+    /// staging or rollback. Each file writer is flushed once after all data has
+    /// been written and any checksum has passed. A flush error fails the member
+    /// like a write error. The library never syncs the writer. Durability via
+    /// `sync_all` is the caller's responsibility.
     pub fn extract_to<F>(&self, password: Option<&[u8]>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1107,6 +1109,7 @@ impl Archive {
     ///
     /// A split member's writer opens at its first part, so a later volume that
     /// turns out wrong leaves partial output, as with [`Self::extract_to`].
+    /// The writer is flushed after the reassembled member has been verified.
     /// Links are left out, as there.
     pub fn extract_with_volumes<V, F>(
         &self,
@@ -1219,7 +1222,8 @@ impl Archive {
     /// does not consume output quotas and is not verified. Parsing limits and
     /// passwords needed to read encrypted headers still apply before this call.
     ///
-    /// `Extract` uses the same decoding and output accounting as [`Self::extract_to`].
+    /// `Extract` uses the same decoding, output accounting and writer flushing
+    /// as [`Self::extract_to`].
     /// Its writer can already have been opened when admission fails. Callback,
     /// source, decoding, integrity and sink errors stop extraction immediately;
     /// partial output has the failure semantics documented on that method.
@@ -1301,7 +1305,8 @@ impl Archive {
     }
 
     /// Extracts independent non-solid members in parallel, buffering decoded
-    /// file bytes before replaying writes in archive order.
+    /// file bytes before replaying writes in archive order, with the writer
+    /// flushing semantics of [`Self::extract_to`].
     /// Batches are published before decoding the next batch, so a later failure
     /// can leave earlier output published. Legacy RAR 1.5–4.0 batches retain at
     /// most one result per worker; this is not a byte or total-memory ceiling.
@@ -2088,7 +2093,8 @@ fn read_options(password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
 /// Streams a multivolume archive set to caller-provided writers.
 /// Has the link handling, failure and staging semantics of
 /// [`Archive::extract_to`], including partial output from a split member when
-/// a later volume fails.
+/// a later volume fails. The writer is flushed after the reassembled member
+/// has been verified.
 pub fn extract_volumes_to<F>(archives: &[Archive], password: Option<&[u8]>, open: F) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,

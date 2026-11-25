@@ -2,7 +2,9 @@ use super::*;
 use crate::extraction_control::{finish_member, finish_split_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::source::RangeReader;
-use crate::volume_extract::{FragmentWalk, LazyChain, VolumeEnd, VolumeFeed};
+use crate::volume_extract::{
+    flush_split, FragmentWalk, LazyChain, SplitFailure, VolumeEnd, VolumeFeed,
+};
 
 pub(super) fn extract<F, B: Budget>(
     feed: &mut VolumeFeed<'_, '_, Archive>,
@@ -91,9 +93,9 @@ where
             options.check_cancelled()?;
             let result = (|| {
                 budget.check(u64::from(entry.header.unp_size), &meta.name)?;
-                let mut writer = open(&meta)?;
+                let writer = open(&meta)?;
                 options.check_cancelled()?;
-                budget.run(&meta.name, &mut writer, |mut writer| {
+                budget.run_verified(&meta.name, writer, |mut writer| {
                     entry
                         .write_compressed_to(&volume, password, &mut unpack15, solid, &mut writer)
                         .map_err(|error| entry.entry_error("extracting", error))?;
@@ -141,19 +143,6 @@ where
     Ok(())
 }
 
-/// A split member that failed, and the volume holding its end when the walk
-/// could still read that far.
-struct SplitFailure {
-    error: Error,
-    last: Option<Box<Archive>>,
-}
-
-impl From<Error> for SplitFailure {
-    fn from(error: Error) -> Self {
-        Self { error, last: None }
-    }
-}
-
 /// Decodes a split member while its later volumes arrive; returns the volume holding its end.
 ///
 /// When it fails with a member error handler set, the rest of its volumes
@@ -169,7 +158,7 @@ fn extract_split<F, B: Budget>(
     unpack15: &mut Decoder15<B>,
     solid: bool,
     open: &mut F,
-) -> std::result::Result<Archive, SplitFailure>
+) -> std::result::Result<Archive, SplitFailure<Archive>>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
@@ -182,7 +171,12 @@ where
     }
     let mut walk = SplitWalk::new(feed, first, &unpack15.allowance)?;
     match extract_split_walk(volume, first, &mut walk, budget, unpack15, solid, open) {
-        Ok(()) => Ok(walk.into_last_volume()?),
+        Ok(writer) => flush_split(
+            walk.into_last_volume()?,
+            Some(writer),
+            &budget.control,
+            &first.name,
+        ),
         Err(error)
             if options.member_errors.is_none()
                 || matches!(
@@ -210,7 +204,7 @@ fn extract_split_walk<F, B: Budget>(
     unpack15: &mut Decoder15<B>,
     solid: bool,
     open: &mut F,
-) -> Result<()>
+) -> Result<Box<dyn Write>>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
@@ -278,7 +272,8 @@ where
             options.check_cancelled()
         })
         .map_err(|error| first.entry_error("extracting", error))
-        .map_err(|error| walk.failure.take().unwrap_or(error))
+        .map_err(|error| walk.failure.take().unwrap_or(error))?;
+    Ok(writer)
 }
 
 fn packed_reader<R: Read>(

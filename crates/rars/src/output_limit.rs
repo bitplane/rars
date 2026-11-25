@@ -112,6 +112,16 @@ impl OutputBudget {
         self.conclude(name, exceeded, sink_error, result)
     }
 
+    pub(crate) fn run_verified<W: Write>(
+        &mut self,
+        name: &[u8],
+        mut writer: W,
+        work: impl FnOnce(&mut LimitedWriter<'_, &mut W>) -> Result<()>,
+    ) -> Result<()> {
+        self.run(name, &mut writer, work)?;
+        crate::extraction_control::flush_verified(&self.control, name, &mut writer)
+    }
+
     /// Shared with a member written on another thread, so its errors read as [`Self::run`]'s.
     pub(crate) fn conclude<T>(
         &self,

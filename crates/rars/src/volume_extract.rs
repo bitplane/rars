@@ -1,7 +1,38 @@
 use crate::source::RangeReader;
-use std::io::{Read, Result};
+use std::io::{Read, Result, Write};
 
 pub(crate) type Volumes<'p, A> = dyn Iterator<Item = crate::Result<A>> + Send + 'p;
+
+/// A failed split member and the volume holding its end, if available.
+pub(crate) struct SplitFailure<A> {
+    pub(crate) error: crate::Error,
+    pub(crate) last: Option<Box<A>>,
+}
+
+impl<A> From<crate::Error> for SplitFailure<A> {
+    fn from(error: crate::Error) -> Self {
+        Self { error, last: None }
+    }
+}
+
+/// A flush failure leaves the final volume available so extraction can resume.
+pub(crate) fn flush_split<A>(
+    last: A,
+    writer: Option<Box<dyn Write>>,
+    control: &crate::read_control::ReadControl,
+    name: &[u8],
+) -> std::result::Result<A, SplitFailure<A>> {
+    let Some(mut writer) = writer else {
+        return Ok(last);
+    };
+    if let Err(error) = crate::extraction_control::flush_verified(control, name, &mut *writer) {
+        return Err(SplitFailure {
+            error,
+            last: Some(Box::new(last)),
+        });
+    }
+    Ok(last)
+}
 
 /// A volume that may record its place in its set.
 pub(crate) trait PlacedVolume {

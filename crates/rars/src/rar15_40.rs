@@ -2320,7 +2320,7 @@ impl Archive {
                                 entry,
                                 &mut **open,
                                 &publication,
-                                |meta| meta.name.clone(),
+                                |meta| &meta.name,
                                 |meta, data| emit_legacy_link(meta, data, links, &publication),
                             )
                         });
