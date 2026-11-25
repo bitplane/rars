@@ -130,8 +130,8 @@ impl VolumeCollector {
         })
     }
 }
-impl crate::rar50::VolumeSink for VolumeCollector {
-    fn start_volume(&mut self, index: u64) -> Result<Box<dyn crate::volume_sink::VolumeOutput>> {
+impl VolumeCollector {
+    fn open(&mut self, index: u64) -> Result<VolumeOutput> {
         let index =
             usize::try_from(index).map_err(|_| Error::InvalidArgument("volume index overflows"))?;
         let mut outputs = self.shared.outputs.lock().unwrap();
@@ -143,12 +143,35 @@ impl crate::rar50::VolumeSink for VolumeCollector {
             charge.grow_to(std::mem::size_of::<VolumeOutput>() as u64)?;
         }
         outputs.push_growing(WriterOutput::new(&self.resources))?;
-        Ok(Box::new(VolumeOutput {
+        Ok(VolumeOutput {
             shared: self.shared.clone(),
             index,
             position: 0,
             _charge: charge,
-        }))
+        })
+    }
+}
+impl crate::rar50::VolumeSink for VolumeCollector {
+    fn start_volume(&mut self, index: u64) -> Result<Box<dyn crate::volume_sink::VolumeOutput>> {
+        Ok(Box::new(self.open(index)?))
+    }
+
+    fn start_readable_volume(
+        &mut self,
+        index: u64,
+    ) -> Result<Option<Box<dyn crate::volume_sink::ReadableVolumeOutput>>> {
+        Ok(Some(Box::new(self.open(index)?)))
+    }
+}
+impl io::Read for VolumeOutput {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let outputs = self.shared.outputs.lock().unwrap();
+        let output = &outputs[self.index].bytes;
+        let available = &output[self.position.min(output.len())..];
+        let read = available.len().min(buffer.len());
+        buffer[..read].copy_from_slice(&available[..read]);
+        self.position += read;
+        Ok(read)
     }
 }
 impl Write for VolumeOutput {

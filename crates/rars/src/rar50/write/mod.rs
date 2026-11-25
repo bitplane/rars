@@ -4,7 +4,7 @@ use crate::crc32::Crc32;
 use crate::crypto::rar50::Rar50Cipher;
 use crate::crypto::rar50::Rar50Keys;
 pub use crate::filter::{FilterKind, FilterPolicy, FilterSpec};
-pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
+pub use crate::volume_sink::{CollectedVolumes, ReadableVolumeOutput, VolumeOutput, VolumeSink};
 use crate::write_plan::{PlanShape, WriterOption};
 use crate::write_progress::ProgressReporter;
 use crate::{EntrySource, WriteProgress, WriterResources};
@@ -228,6 +228,31 @@ pub fn write_streaming_volumes_with_progress(
     resources: &WriterResources,
     progress: Option<&dyn WriteProgress>,
 ) -> Result<()> {
+    write_volumes_above(
+        entries,
+        options,
+        extras,
+        volume_size,
+        sink,
+        resources,
+        progress,
+        crate::write_stream::STREAM_MEMBERS_ABOVE,
+    )
+}
+
+/// A compressed member larger than `stream_above` is packed straight into
+/// volumes the sink can read back.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_volumes_above(
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    extras: ArchiveExtras<'_>,
+    volume_size: u64,
+    sink: &mut dyn VolumeSink,
+    resources: &WriterResources,
+    progress: Option<&dyn WriteProgress>,
+    stream_above: u64,
+) -> Result<()> {
     let control =
         crate::write_progress::ResourceProgress::new(resources, progress.map(ProgressReporter));
     let progress: Option<&dyn WriteProgress> =
@@ -287,7 +312,7 @@ pub fn write_streaming_volumes_with_progress(
         return Err(Error::NeedPassword);
     }
 
-    engine::write_volumes(
+    engine::write_volumes_above(
         entries,
         engine::EnginePlan {
             compress: compression_plan(
@@ -313,6 +338,7 @@ pub fn write_streaming_volumes_with_progress(
         volume_size,
         sink,
         resources,
+        stream_above,
     )
 }
 

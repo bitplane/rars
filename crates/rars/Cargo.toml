@@ -27,7 +27,11 @@ default = ["write", "parallel", "recovery", "encryption", "cjk-names"]
 experimental-ring-state = ["write"]
 parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
-write = ["dep:getrandom"]
+# `write` also enables libc: the write-only test in `builder.rs` still names
+# an errno constant from it, so without `write` the library takes no direct
+# libc dependency on the platforms it builds for. Extraction's in-place open,
+# which also needs flags and errno constants, uses rustix where it is built.
+write = ["dep:getrandom", "dep:libc"]
 encryption = ["dep:aes", "dep:hmac", "dep:sha1", "dep:sha2", "dep:zeroize"]
 cjk-names = ["dep:chardetng", "dep:encoding_rs"]
 
@@ -57,9 +61,15 @@ rayon = { workspace = true, optional = true }
 [target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 getrandom = { workspace = true, optional = true, features = ["wasm_js"] }
 
-# In-place extraction opens without following links or waiting on FIFOs.
-[target.'cfg(unix)'.dependencies]
+# In-place extraction opens without following links or waiting on FIFOs. On the
+# platforms rustix is built for (`output_tree::AVAILABLE`) it supplies the flags
+# and errno constants. Elsewhere on Unix libc still must, so it is kept there
+# unconditionally; on those platforms `write` turning it on too changes nothing.
+[target.'cfg(all(unix, not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))))'.dependencies]
 libc.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true, optional = true }
 
 # Windows has no zone database for `tzif` to read, so a legacy timestamp's
 # offset comes from the system's own time zone settings through chrono's

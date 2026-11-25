@@ -105,9 +105,11 @@ fn recovery_payload_growth_preserves_spool_error_details() {
     assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
 }
 
+/// A stored member is encrypted as its fragments are written, so a seekable
+/// set needs no scratch storage for its ciphertext.
 #[test]
 #[cfg(feature = "encryption")]
-fn encrypted_volume_preparation_uses_the_shared_spool_quota() {
+fn encrypted_stored_volumes_need_no_spool() {
     use rars::rar50::{
         write_streaming_volumes_to, ArchiveEntry, ArchiveExtras, CollectedVolumes, WriterOptions,
     };
@@ -123,24 +125,6 @@ fn encrypted_volume_preparation_uses_the_shared_spool_quota() {
         .with_max_spool_bytes(0);
     let mut options = WriterOptions::default();
     options.compression_level = Some(0);
-    let error = write_streaming_volumes_to(
-        &entries,
-        options,
-        ArchiveExtras::default(),
-        4096,
-        &mut CollectedVolumes::new(),
-        &limited,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(
-            error.root_cause(),
-            Error::WriterSpoolLimitExceeded { limit: 0, .. }
-        ),
-        "{error:?}"
-    );
-    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 0);
-    let sufficient = limited.with_max_spool_bytes(1 << 20);
     let mut sink = CollectedVolumes::new();
     write_streaming_volumes_to(
         &entries,
@@ -148,7 +132,7 @@ fn encrypted_volume_preparation_uses_the_shared_spool_quota() {
         ArchiveExtras::default(),
         4096,
         &mut sink,
-        &sufficient,
+        &limited,
     )
     .unwrap();
     let archives: Vec<_> = sink
