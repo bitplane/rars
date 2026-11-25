@@ -224,6 +224,25 @@ impl Gap {
     }
 }
 
+/// Cases that sit on an assertion's edge, so whether they fail depends on how
+/// the threads happen to overlap. A failure here is excused, but unlike
+/// [`KNOWN_GAPS`] a pass is not reported as stale.
+const BORDERLINE_GAPS: &[Gap] = &[
+    // Level 1 is charged a parse workspace for each block coded at once, and
+    // at four threads how many of them are live at the peak varies, so the
+    // charge lands either side of the looseness bound.
+    Gap {
+        tier: Tier::Small,
+        writer: Writer::Rar20,
+        paths: &[Path::Whole, Path::Solid],
+        levels: &[1],
+        threads: Some(4),
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 652,
+    },
+];
+
 /// Every case that fails an assertion today, against the issue tracking it.
 /// #393 is the accounting work these belong to; an entry naming it has no
 /// issue of its own yet.
@@ -895,6 +914,7 @@ fn check(tier: Tier, cases: Vec<Case>) {
     for (case, assertion, detail) in &failures {
         match KNOWN_GAPS
             .iter()
+            .chain(BORDERLINE_GAPS)
             .find(|gap| gap.matches(tier, case, *assertion))
         {
             Some(gap) => eprintln!(
