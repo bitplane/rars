@@ -77,6 +77,13 @@ pub fn rars_main() {
     }
 }
 
+/// The `rars` command line as clap describes it, for the generator of its man
+/// pages and shell completions (crates/rars-manpages).
+#[doc(hidden)]
+pub fn command() -> clap::Command {
+    <cli::Cli as clap::CommandFactory>::command()
+}
+
 impl From<rars::Error> for CliError {
     fn from(error: rars::Error) -> Self {
         let message = format!("{error}{}", retry_hint(&error));

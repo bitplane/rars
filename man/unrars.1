@@ -1,0 +1,244 @@
+.\" Written by hand: unrars parses unrar's command line without clap, so
+.\" crates/rars-manpages cannot generate this page. Keep it to the commands
+.\" and switches that parse() in crates/rars-cli/src/unrars.rs accepts.
+.TH unrars 1 "" rars ""
+.SH NAME
+unrars \- extract, test and list RAR archives with unrar's command line
+.SH SYNOPSIS
+.B unrars
+.I command
+.RI [ \-switch ...]
+.I archive
+.RI [ file ...]
+.RI [ @listfile ...]
+.RI [ path_to_extract/ ]
+.SH DESCRIPTION
+.B unrars
+reads RAR archives through the rars library and takes the part of
+.BR unrar 's
+command line that other programs call: the same commands, switches,
+output lines and exit codes.
+It extracts, tests, prints and lists; it does not create or change archives.
+For that, and for options spelt the usual way, see
+.BR rars (1).
+.PP
+Commands and switches are not case sensitive.
+Switches start with
+.B \-
+and may come anywhere on the line, before or after the archive; an argument
+.B \-\-
+ends them, and every word after it is a command, archive, file or path.
+.PP
+The
+.I archive
+may hold the wildcards
+.B *
+and
+.BR ? ,
+which match archives in its directory.
+A multi\-volume set is read from whichever of its volumes is named.
+.PP
+Each
+.I file
+is a mask that selects members.
+A mask without wildcards is a path from the archive root, and selects a
+directory together with what it holds.
+A mask with wildcards and no directory is matched against each member's own
+name, in any directory; with a directory it is matched against the whole path,
+and its
+.B *
+reaches into subdirectories.
+.BI @ listfile
+reads masks from a file, one to a line.
+With no masks, every member is selected.
+.PP
+The last word is where to extract to if it ends in a path separator or, when
+extracting, if it names a directory that already exists.
+Otherwise members are extracted into the current directory.
+.SH COMMANDS
+.TP
+.B x
+Extract with full paths.
+.TP
+.B e
+Extract every file straight into the destination, without its path.
+.TP
+.B t
+Test archive files: decode them and check their checksums, writing nothing.
+.TP
+.B p
+Print files to standard output.
+.TP
+.B l
+List archive contents: attributes, size, date and name.
+.TP
+.B v
+List archive contents with packed size, ratio and checksum as well.
+.TP
+.BR lt ", " vt
+List a block of fields for each member.
+.TP
+.BR lta ", " vta
+As
+.BR lt ,
+with service blocks too.
+.TP
+.BR lb ", " vb
+List bare member names, one to a line.
+.SH SWITCHES
+.TP
+.B \-?
+Print the usage text and exit.
+.TP
+.B \-o+
+Overwrite existing files.
+.TP
+.B \-o\-
+Keep existing files.
+.TP
+.B \-or
+Write beside an existing file as
+.IR name ( N ). ext
+rather than overwrite it.
+.TP
+.B \-y
+Overwrite existing files, unless
+.B \-o\-
+or
+.B \-or
+was given.
+Without any of these, unrars asks before overwriting, and keeps existing files
+when there is no terminal to ask on.
+.TP
+.BI \-p password
+Use this password.
+.TP
+.B \-p
+Ask for the password before starting.
+.TP
+.B \-p\-
+Do not ask for a password.
+.IP
+Without
+.B \-p
+an archive that needs a password asks for one on the terminal.
+.TP
+.B \-kb
+Keep broken extracted files, with what could be read of them, and read past
+damaged headers.
+.TP
+.B \-ver
+Extract older file versions too.
+.TP
+.B \-v
+With
+.B l
+and its kin, list every volume of a set, not only the one named.
+.TP
+.B \-vp
+Ask before each later volume, and wait for the answer on standard input.
+.TP
+.BI \-x mask
+Exclude members matching
+.IR mask .
+.BI \-x@ listfile
+reads the masks from a file.
+May be given more than once.
+.TP
+.BI \-n mask
+Include only members matching
+.IR mask .
+.BI \-n@ listfile
+reads the masks from a file.
+May be given more than once.
+.TP
+.BI \-ap path
+Extract the members under
+.I path
+in the archive without it.
+Members outside it are extracted where they are.
+.TP
+.B \-ad
+Extract into a directory named after the archive, under the destination.
+.TP
+.B \-ep
+Extract without paths, as
+.B e
+does.
+.TP
+.BI \-op path
+Extract into
+.IR path .
+.TP
+.B \-ol\-
+Leave symbolic links out.
+.TP
+.B \-ierr
+Send all messages to standard error.
+.TP
+.B \-inul
+Print no messages.
+.TP
+.B \-id\fR[\fBc\fR][\fBd\fR][\fBp\fR][\fBq\fR]
+Turn messages off:
+.B c
+the banner,
+.B d
+the closing
+.RB \(lq "All OK" \(rq,
+.B p
+the percentage on each member's line;
+.B q
+prints errors only.
+The letters combine, as in
+.BR \-idcdp .
+.SS Refused switches
+Switches that would change which files are written, or where, in ways unrars
+does not support are refused with exit code 7, rather than ignored:
+.TP
+.BR \-ta ", " \-tb ", " \-tn ", " \-to ", " \-sl ", " \-sm ", " \-e "\fIattr\fR, " \-f ", " \-u
+Filters by time, size, attributes or freshness.
+.TP
+.BR \-cl ", " \-cu
+Case changes to the names written.
+.TP
+.BR \-ad1 ", " \-ad2 ", " \-ep1 " to " \-ep4 ", " \-ola
+Absolute paths and links.
+.PP
+Other
+.B unrar
+switches are accepted and ignored.
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Warning, such as an archive that ends early.
+.TP
+.B 2
+Fatal error.
+.TP
+.B 3
+A checksum did not match, headers are damaged, or an encrypted member of a RAR 1.5 to 4.x archive could not be decoded.
+.TP
+.B 6
+A volume of a multi\-volume set is missing.
+.TP
+.B 7
+Invalid command line, or a refused switch.
+.TP
+.B 10
+No files were selected.
+.TP
+.B 11
+Wrong password.
+.TP
+.B 12
+Standard input closed while unrars was asking on it.
+.TP
+.B 141
+Whatever was reading standard output closed it.
+.SH SEE ALSO
+.BR rars (1),
+.BR unrar (1)

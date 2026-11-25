@@ -97,6 +97,19 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # `just manpages` output is committed; a changed option without its
+      # regenerated man page and completions fails here. git status also sees
+      # a page for a new subcommand, which git diff would not.
+      - name: Man pages and completions are up to date
+        run: |
+          cargo run -p rars-manpages --locked
+          if [ -n "$(git status --porcelain -- man completions)" ]; then
+            git status --short -- man completions
+            git diff -- man completions
+            echo "::error::man/ or completions/ is stale; run 'just manpages' and commit the result"
+            exit 1
+          fi
+
       # Unit and integration tests, every binary at once rather than one after
       # another; nextest does not run doctests, so they follow. External-decoder
       # tests skip unavailable tools; the release gate requires them.

@@ -1,0 +1,157 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH rars-add 1 "" rars
+.SH NAME
+rars\-add \- Create a new archive
+.SH SYNOPSIS
+\fBrars add\fR [\fB\-p\fR|\fB\-\-password\fR] [\fB\-\-threads\fR] [\fB\-\-password\-file\fR] [\fB\-\-progress\fR] [\fB\-\-format\fR] [\fB\-\-store\fR] [\fB\-\-level\fR] [\fB\-\-dict\-size\fR] [\fB\-\-memory\-limit\fR] [\fB\-\-max\-memory\fR] [\fB\-\-temp\-dir\fR] [\fB\-\-solid\fR] [\fB\-\-encrypt\-headers\fR] [\fB\-\-quick\-open\fR] [\fB\-\-blake2sp\fR] [\fB\-\-comment\fR] [\fB\-\-archive\-name\fR] [\fB\-\-file\-comment\fR] [\fB\-\-recovery\-percent\fR] [\fB\-\-volume\-size\fR] [\fB\-\-delta\-filter\fR] [\fB\-\-e8\-filter\fR] [\fB\-\-e8e9\-filter\fR] [\fB\-\-itanium\-filter\fR] [\fB\-\-rgb\-filter\fR] [\fB\-\-audio\-filter\fR] [\fB\-\-arm\-filter\fR] [\fB\-\-auto\-filter\fR] [\fB\-\-no\-filter\fR] [\fB\-\-ppmd\fR] [\fB\-C\fR|\fB\-\-base\-dir\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIARCHIVE\fR> <\fIFILE\fR> 
+.SH DESCRIPTION
+Create a new archive
+.SH OPTIONS
+.TP
+\fB\-p\fR, \fB\-\-password\fR \fI<PASSWORD>\fR
+Archive password (visible in process list \[u2014] prefer \-\-password\-file or the TTY prompt)
+.TP
+\fB\-\-threads\fR \fI<N>\fR
+Worker threads for parallel compression and extraction (default: all available cores)
+.TP
+\fB\-\-password\-file\fR \fI<PATH>\fR
+Read password from file ("\-" for stdin); trailing newlines are stripped
+.TP
+\fB\-\-progress\fR \fI<PROGRESS>\fR [default: auto]
+Progress reporting mode for long\-running operations
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto
+.IP \(bu 2
+always
+.IP \(bu 2
+never
+.RE
+.TP
+\fB\-\-format\fR \fI<FORMAT>\fR [default: rar50]
+Target archive format (default: rar50, the modern widely\-compatible format)
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+rar14
+.IP \(bu 2
+rar15
+.IP \(bu 2
+rar20
+.IP \(bu 2
+rar29
+.IP \(bu 2
+rar30
+.IP \(bu 2
+rar40
+.IP \(bu 2
+rar50
+.IP \(bu 2
+rar70
+.RE
+.TP
+\fB\-\-store\fR
+Store files without compression (equivalent to \-\-level 0)
+.TP
+\fB\-\-level\fR \fI<LEVEL>\fR
+Compression level (0..5; 0 implies \-\-store)
+.TP
+\fB\-\-dict\-size\fR \fI<SIZE>\fR
+Dictionary size (e.g. 4m, 128k; RAR 1.5+)
+
+Left unset, the writer fits one to the data: the smallest size that reaches across the largest member, or the whole archive when \-\-solid shares one window. A larger dictionary can pack better and always costs time and memory to search.
+.TP
+\fB\-\-memory\-limit\fR \fI<SIZE>\fR
+Maximum total compression working memory (default: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
+
+At 283m or above, the budget only affects how much work runs at once. Below 283m it can also change the archive by planning smaller jobs.
+
+Left unset rather than defaulted here, so a volume set below RAR 5, which is still built in memory, can tell an explicit request from a default and refuse the one it cannot honour.
+.TP
+\fB\-\-max\-memory\fR \fI<SIZE>\fR
+Hard managed\-allocation ceiling for RAR5/7, separate from estimated workspace
+.TP
+\fB\-\-temp\-dir\fR \fI<PATH>\fR
+Directory for temporary compressed payloads (RAR 5+)
+.TP
+\fB\-\-solid\fR
+Use solid compression (treats inputs as one continuous stream)
+.TP
+\fB\-\-encrypt\-headers\fR
+Encrypt archive headers (RAR 3.x/4.x and RAR 5+) (requires \-\-password)
+.TP
+\fB\-\-quick\-open\fR
+Emit a quick\-open service block (RAR 5+ only)
+.TP
+\fB\-\-blake2sp\fR
+Store a BLAKE2sp hash of each file beside its CRC32 (RAR 5+ only)
+.TP
+\fB\-\-comment\fR \fI<TEXT>\fR
+Archive\-level comment
+.TP
+\fB\-\-archive\-name\fR \fI<NAME>\fR
+Archive name to embed in archive metadata service (RAR 5+)
+.TP
+\fB\-\-file\-comment\fR \fI<TEXT>\fR
+Per\-file comment (not RAR 3.x/4.x)
+.TP
+\fB\-\-recovery\-percent\fR \fI<PERCENT>\fR
+Add a recovery record at the given percentage (1..100; RAR 5+)
+.TP
+\fB\-\-volume\-size\fR \fI<SIZE>\fR
+Split archive into volumes of this size
+.TP
+\fB\-\-delta\-filter\fR \fI<CHANNELS>\fR
+Delta filter with the given channel count (RAR 2.9+)
+.TP
+\fB\-\-e8\-filter\fR
+E8 x86 call filter (RAR 2.9+)
+.TP
+\fB\-\-e8e9\-filter\fR
+E8E9 x86 call/jump filter (RAR 2.9+)
+.TP
+\fB\-\-itanium\-filter\fR
+Itanium filter (RAR 2.9/3.x/4.x only)
+.TP
+\fB\-\-rgb\-filter\fR \fI<WIDTH>\fR
+RGB image filter with the given pixel width (RAR 2.9/3.x/4.x only)
+.TP
+\fB\-\-audio\-filter\fR \fI<CHANNELS>\fR
+Audio filter with the given channel count (RAR 2.9/3.x/4.x only)
+.TP
+\fB\-\-arm\-filter\fR
+ARM filter (RAR 5+ only)
+.TP
+\fB\-\-auto\-filter\fR
+Auto\-detect data filter (RAR 5+ does this by default)
+.TP
+\fB\-\-no\-filter\fR
+Skip filter detection, compressing the data as it is (RAR 2.9+; the older formats never look, so the flag passes without comment there)
+.TP
+\fB\-\-ppmd\fR
+Use the PPMd compression algorithm (RAR 2.9/3.x/4.x only)
+
+Cannot be combined with \-\-auto\-filter: choosing a filter means measuring candidates through LZ, which forcing PPMd leaves nothing to measure.
+.TP
+\fB\-C\fR, \fB\-\-base\-dir\fR \fI<DIR>\fR
+Read inputs from this directory and store names relative to it
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
+<\fIARCHIVE\fR>
+Output archive path
+.TP
+<\fIFILE\fR>
+Files (and directories) to add to the archive

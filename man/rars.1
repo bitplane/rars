@@ -1,0 +1,56 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH rars 1 "" rars
+.SH NAME
+rars \- Pure\-Rust RAR archive toolkit
+.SH SYNOPSIS
+\fBrars\fR [\fB\-\-threads\fR] [\fB\-\-progress\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIsubcommands\fR>
+.SH DESCRIPTION
+rars reads, writes, and repairs RAR archives across the RAR 1.3 through RAR 7.x family.
+.SH OPTIONS
+.TP
+\fB\-\-threads\fR \fI<N>\fR
+Worker threads for parallel compression and extraction (default: all available cores)
+.TP
+\fB\-\-progress\fR \fI<PROGRESS>\fR [default: auto]
+Progress reporting mode for long\-running operations
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto
+.IP \(bu 2
+always
+.IP \(bu 2
+never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help (see a summary with \*(Aq\-h\*(Aq)
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.SH SUBCOMMANDS
+.TP
+rars\-info(1)
+Display archive metadata
+.TP
+rars\-test(1)
+Verify archive integrity by extracting to a sink
+.TP
+rars\-extract(1)
+Extract archive contents
+.TP
+rars\-repair(1)
+Repair a damaged archive using its recovery record
+.TP
+rars\-add(1)
+Create a new archive
+.SH "EXIT STATUS"
+Exit codes:
+  0  success
+  1  operation failed
+  2  invalid command line
+  3  password required, wrong password, or corrupt encrypted data

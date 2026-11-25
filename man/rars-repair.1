@@ -1,0 +1,43 @@
+.ie \n(.g .ds Aq \(aq
+.el .ds Aq '
+.TH rars-repair 1 "" rars
+.SH NAME
+rars\-repair \- Repair a damaged archive using its recovery record
+.SH SYNOPSIS
+\fBrars repair\fR [\fB\-p\fR|\fB\-\-password\fR] [\fB\-\-threads\fR] [\fB\-\-password\-file\fR] [\fB\-\-progress\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIPATH\fR> 
+.SH DESCRIPTION
+Repair a damaged archive using its recovery record
+.SH OPTIONS
+.TP
+\fB\-p\fR, \fB\-\-password\fR \fI<PASSWORD>\fR
+Archive password (visible in process list \[u2014] prefer \-\-password\-file or the TTY prompt)
+.TP
+\fB\-\-threads\fR \fI<N>\fR
+Worker threads for parallel compression and extraction (default: all available cores)
+.TP
+\fB\-\-password\-file\fR \fI<PATH>\fR
+Read password from file ("\-" for stdin); trailing newlines are stripped
+.TP
+\fB\-\-progress\fR \fI<PROGRESS>\fR [default: auto]
+Progress reporting mode for long\-running operations
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+auto
+.IP \(bu 2
+always
+.IP \(bu 2
+never
+.RE
+.TP
+\fB\-h\fR, \fB\-\-help\fR
+Print help
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version
+.TP
+<\fIPATH\fR>
+Either <archive> <repaired\-archive>, or <rar\-parts\-and\-rev\-files...> <outdir>
