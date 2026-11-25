@@ -3506,6 +3506,169 @@ fn add_recurses_directory_inputs_and_preserves_relative_paths() {
 }
 
 #[test]
+fn add_base_dir_stores_relative_names_and_writes_archive_in_current_directory() {
+    let root = scratch("base-dir-relative-names");
+    let tree = root.join("src/dir");
+    fs::create_dir_all(tree.join("sub")).unwrap();
+    fs::write(tree.join("a.txt"), b"first\n").unwrap();
+    fs::write(tree.join("sub/b.txt"), b"second\n").unwrap();
+
+    for format in ["rar50", "rar29"] {
+        for (base_args, input, prefix) in [
+            (&["-C", "src"][..], "dir", "dir"),
+            (&[][..], "src/dir", "src/dir"),
+        ] {
+            let create = rars()
+                .current_dir(&root)
+                .args(["a", "--format", format])
+                .args(base_args)
+                .args(["out.rar", input])
+                .output()
+                .unwrap();
+            assert!(create.status.success(), "{format}: {}", stderr(&create));
+            assert!(!root.join("src/out.rar").exists());
+            let path = root.join("out.rar");
+            let archive = rars::ArchiveReader::read_path(&path).unwrap();
+            let names: Vec<_> = archive
+                .members()
+                .map(|member| {
+                    String::from_utf8(member.meta.name)
+                        .unwrap()
+                        .replace('\\', "/")
+                })
+                .collect();
+            assert_eq!(
+                names,
+                [
+                    prefix.to_owned(),
+                    format!("{prefix}/a.txt"),
+                    format!("{prefix}/sub"),
+                    format!("{prefix}/sub/b.txt"),
+                ],
+                "{format}"
+            );
+            assert_eq!(
+                archive.read_member_at(1, None).unwrap().unwrap(),
+                b"first\n",
+                "{format}"
+            );
+            assert_eq!(
+                archive.read_member_at(3, None).unwrap().unwrap(),
+                b"second\n",
+                "{format}"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+}
+
+#[test]
+fn add_base_dir_rejects_absolute_and_parent_inputs() {
+    let root = scratch("base-dir-unsafe-input");
+    fs::create_dir(root.join("src")).unwrap();
+    let file = root.join("file.txt");
+    fs::write(&file, b"payload").unwrap();
+
+    for (input, error) in [
+        (
+            file.as_path(),
+            "inputs must be relative when --base-dir is given",
+        ),
+        (Path::new("../file.txt"), "unsafe input archive path"),
+    ] {
+        let create = rars()
+            .current_dir(&root)
+            .args(["a", "-C", "src", "out.rar"])
+            .arg(input)
+            .output()
+            .unwrap();
+        assert!(!create.status.success());
+        assert!(stderr(&create).contains(error), "{}", stderr(&create));
+        assert!(!root.join("out.rar").exists());
+    }
+}
+
+#[test]
+fn add_base_dir_requires_an_existing_directory() {
+    let root = scratch("base-dir-invalid-base");
+    fs::write(root.join("regular-file"), b"payload").unwrap();
+
+    for (base, error) in [
+        ("missing", "failed to stat base directory 'missing'"),
+        (
+            "regular-file",
+            "base path 'regular-file' is not a directory",
+        ),
+    ] {
+        let create = rars()
+            .current_dir(&root)
+            .args(["a", "-C", base, "out.rar", "file.txt"])
+            .output()
+            .unwrap();
+        assert!(!create.status.success());
+        assert!(stderr(&create).contains(error), "{}", stderr(&create));
+        assert!(!root.join("out.rar").exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn add_base_dir_rejects_symlink_inputs() {
+    let root = scratch("base-dir-symlink-input");
+    let source = root.join("src");
+    fs::create_dir(&source).unwrap();
+    fs::write(root.join("target"), b"payload").unwrap();
+    std::os::unix::fs::symlink("../target", source.join("link")).unwrap();
+
+    let create = rars()
+        .current_dir(&root)
+        .args(["a", "-C", "src", "out.rar", "link"])
+        .output()
+        .unwrap();
+    assert!(!create.status.success());
+    assert!(stderr(&create).contains("is a symlink; refusing to follow it"));
+    assert!(!root.join("out.rar").exists());
+}
+
+#[test]
+fn add_base_dir_stores_relative_names_in_volume_sets() {
+    let root = scratch("base-dir-volumes");
+    let source = root.join("src");
+    fs::create_dir_all(source.join("dir")).unwrap();
+    let payload = deterministic_noise(1500);
+    fs::write(source.join("dir/file.txt"), &payload).unwrap();
+
+    for (format, first, second) in [
+        ("rar50", "rar50.part01.rar", "rar50.part02.rar"),
+        ("rar29", "rar29.rar", "rar29.r00"),
+    ] {
+        let create = rars()
+            .current_dir(&root)
+            .args(["a", "--format", format, "--store", "--volume-size", "1k"])
+            .arg("--base-dir")
+            .arg(&source)
+            .arg(format!("{format}.rar"))
+            .arg("dir/file.txt")
+            .output()
+            .unwrap();
+        assert!(create.status.success(), "{format}: {}", stderr(&create));
+        let volumes =
+            [first, second].map(|name| rars::ArchiveReader::read_path(root.join(name)).unwrap());
+        let members = rars::volume_members(&volumes).unwrap();
+        assert_eq!(members.len(), 1, "{format}");
+        let name = String::from_utf8_lossy(&members[0].meta.name).replace('\\', "/");
+        assert_eq!(name, "dir/file.txt", "{format}");
+        assert_eq!(
+            rars::read_volume_member_at(&volumes, 0, None)
+                .unwrap()
+                .unwrap(),
+            payload,
+            "{format}"
+        );
+    }
+}
+
+#[test]
 fn add_preserves_empty_directories_across_archive_generations() {
     let dir = scratch("add-empty-directories");
     for with_file in [false, true] {

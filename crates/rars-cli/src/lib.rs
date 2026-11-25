@@ -2632,6 +2632,7 @@ struct AddCommand {
     no_filter: bool,
     ppmd: bool,
     archive_path: PathBuf,
+    base_dir: Option<PathBuf>,
     input_paths: Vec<PathBuf>,
 }
 
@@ -2693,6 +2694,7 @@ fn build_add_command(args: AddArgs) -> CliResult<AddCommand> {
         no_filter: args.no_filter,
         ppmd: args.ppmd,
         archive_path: args.archive,
+        base_dir: args.base_dir,
         input_paths: args.files,
     })
 }
@@ -2726,6 +2728,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         no_filter,
         ppmd,
         archive_path,
+        base_dir,
         input_paths,
     } = build_add_command(args)?;
     if max_memory.is_some() && target.family() != rars::ArchiveFamily::Rar50Plus {
@@ -2734,6 +2737,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         ));
     }
     let input_paths = input_paths.as_slice();
+    let base_dir = base_dir.as_deref();
     let compress = !store;
 
     validate_archive_output_path(&archive_path)?;
@@ -2826,6 +2830,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
         }
         return write_plain_rar50_streaming(
             input_paths,
+            base_dir,
             &archive_path,
             target,
             if store { Some(0) } else { compression_level },
@@ -2865,6 +2870,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
             LegacyVolumeWrite {
                 write_plan,
                 input_paths,
+                base_dir,
                 archive_path: &archive_path,
                 target,
                 compression_level,
@@ -2883,7 +2889,7 @@ fn cmd_add(args: AddArgs, progress: CliProgress) -> CliResult<()> {
     }
 
     progress.spinner("Scanning inputs");
-    let inputs = collect_inputs(input_paths)?;
+    let inputs = collect_inputs(input_paths, base_dir)?;
     let total: u64 = inputs.iter().map(|entry| entry.size).sum();
     progress.finish(format!(
         "Found {} entries ({})",
@@ -3070,6 +3076,7 @@ const RAR13_VOLUME_INPUTS: &str = "RAR 1.3 volume sets hold one regular input fi
 struct LegacyVolumeWrite<'a> {
     write_plan: AddWritePlan,
     input_paths: &'a [PathBuf],
+    base_dir: Option<&'a Path>,
     archive_path: &'a Path,
     target: ArchiveVersion,
     compression_level: Option<u8>,
@@ -3089,7 +3096,7 @@ struct LegacyVolumeWrite<'a> {
 /// their files as they are packed.
 fn write_legacy_volumes(plan: LegacyVolumeWrite<'_>, progress: &CliProgress) -> CliResult<()> {
     progress.spinner("Scanning inputs");
-    let inputs = collect_inputs(plan.input_paths)?;
+    let inputs = collect_inputs(plan.input_paths, plan.base_dir)?;
     if matches!(plan.write_plan, AddWritePlan::Rar15To40) {
         return write_rar15_legacy_volumes(&plan, &inputs, progress);
     }
@@ -3235,6 +3242,7 @@ impl LegacyVolumeWrite<'_> {
 #[allow(clippy::too_many_arguments)]
 fn write_plain_rar50_streaming(
     input_paths: &[PathBuf],
+    base_dir: Option<&Path>,
     archive_path: &Path,
     target: ArchiveVersion,
     compression_level: Option<u8>,
@@ -3256,7 +3264,7 @@ fn write_plain_rar50_streaming(
     progress: &CliProgress,
 ) -> CliResult<()> {
     progress.spinner("Scanning inputs");
-    let inputs = collect_inputs(input_paths)?;
+    let inputs = collect_inputs(input_paths, base_dir)?;
     let total: u64 = inputs.iter().map(|entry| entry.size).sum();
     progress.finish(format!(
         "Found {} entries ({})",

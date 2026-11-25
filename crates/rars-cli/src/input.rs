@@ -48,12 +48,33 @@ impl LazyInput {
     }
 }
 
-pub(crate) fn collect_inputs(paths: &[PathBuf]) -> CliResult<Vec<LazyInput>> {
+pub(crate) fn collect_inputs(
+    paths: &[PathBuf],
+    base_dir: Option<&Path>,
+) -> CliResult<Vec<LazyInput>> {
+    if let Some(base) = base_dir {
+        let meta = fs::metadata(base)
+            .map_err(|err| format!("failed to stat base directory '{}': {err}", base.display()))?;
+        if !meta.is_dir() {
+            return Err(format!("base path '{}' is not a directory", base.display()).into());
+        }
+    }
     let mut pending = Vec::new();
     for path in paths {
-        let path = Path::new(path);
-        let base = input_archive_base(path)?;
-        collect_input(path, &base, &mut pending)?;
+        if base_dir.is_some() && path.is_absolute() {
+            return Err(format!(
+                "inputs must be relative when --base-dir is given: '{}'",
+                path.display()
+            )
+            .into());
+        }
+        let archive_name = input_archive_base(path)?;
+        let source = base_dir.map(|base| base.join(path));
+        collect_input(
+            source.as_deref().unwrap_or(path),
+            &archive_name,
+            &mut pending,
+        )?;
     }
     if pending.is_empty() {
         return Err("no input files or directories found".into());
@@ -180,15 +201,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn collection_refuses_absolute_inputs_with_a_base() {
+        let root = crate::scratch::case("input-absolute-with-base");
+        let input = root.join("file");
+        fs::write(&input, b"payload").unwrap();
+        let error = collect_inputs(&[input], Some(&root)).err().unwrap();
+        assert!(error
+            .to_string()
+            .contains("inputs must be relative when --base-dir is given"));
+    }
+
+    #[test]
+    fn collection_uses_relative_names_with_a_base() {
+        let root = crate::scratch::case("input-relative-with-base");
+        let input = root.join("dir/file");
+        fs::create_dir(root.join("dir")).unwrap();
+        fs::write(&input, b"payload").unwrap();
+        let entries = collect_inputs(&[PathBuf::from("./dir/./file")], Some(&root)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, b"dir/file");
+        assert_eq!(entries[0].path, input);
+    }
+
+    #[test]
     fn collection_rejects_empty_unsafe_missing_and_duplicate_inputs() {
         let root = crate::scratch::case("input-collection-errors");
         assert_eq!(
-            collect_inputs(&[]).err().unwrap().to_string(),
+            collect_inputs(&[], None).err().unwrap().to_string(),
             "no input files or directories found"
         );
         for path in ["", ".", "./"] {
             assert_eq!(
-                collect_inputs(&[PathBuf::from(path)])
+                collect_inputs(&[PathBuf::from(path)], None)
                     .err()
                     .unwrap()
                     .to_string(),
@@ -196,7 +240,7 @@ mod tests {
             );
         }
         for path in ["../file", "dir/../file"] {
-            assert!(collect_inputs(&[PathBuf::from(path)])
+            assert!(collect_inputs(&[PathBuf::from(path)], None)
                 .err()
                 .unwrap()
                 .to_string()
@@ -206,7 +250,7 @@ mod tests {
             input_archive_base(Path::new("./dir/./file")).unwrap(),
             Path::new("dir/file")
         );
-        assert!(collect_inputs(&[root.join("missing")])
+        assert!(collect_inputs(&[root.join("missing")], None)
             .err()
             .unwrap()
             .to_string()
@@ -215,7 +259,7 @@ mod tests {
             fs::create_dir(root.join(parent)).unwrap();
             fs::write(root.join(parent).join("same"), parent).unwrap();
         }
-        let error = collect_inputs(&[root.join("one/same"), root.join("two/same")])
+        let error = collect_inputs(&[root.join("one/same"), root.join("two/same")], None)
             .err()
             .unwrap();
         assert_eq!(
@@ -231,7 +275,7 @@ mod tests {
 
     #[test]
     fn validation_failure_names_what_was_wrong() {
-        let error = collect_inputs(&[]).err().unwrap();
+        let error = collect_inputs(&[], None).err().unwrap();
         assert_eq!(error.to_string(), "no input files or directories found");
         #[cfg(unix)]
         assert_eq!(
@@ -260,7 +304,7 @@ mod tests {
         // Privileged runners may bypass permission bits; restore before returning
         // or asserting so the scratch directory remains removable in either case.
         let permission_bits_enforced = fs::read_dir(&input).is_err();
-        let result = collect_inputs(std::slice::from_ref(&input));
+        let result = collect_inputs(std::slice::from_ref(&input), None);
         fs::set_permissions(&input, original).unwrap();
         if !permission_bits_enforced {
             eprintln!("permission-denial case unavailable on this privileged runner");
@@ -278,7 +322,7 @@ mod tests {
         fs::create_dir_all(input.join("nested")).unwrap();
         fs::write(input.join("a-empty"), []).unwrap();
         fs::write(input.join("nested/z-data"), [7; 17]).unwrap();
-        let inputs = collect_inputs(std::slice::from_ref(&input)).unwrap();
+        let inputs = collect_inputs(std::slice::from_ref(&input), None).unwrap();
         let seen: Vec<_> = inputs
             .iter()
             .map(|entry| (entry.name.as_slice(), entry.size, entry.file_attr))
@@ -303,7 +347,7 @@ mod tests {
         fs::write(&target, b"payload").unwrap();
         let link = root.join("link");
         symlink(&target, &link).unwrap();
-        assert!(collect_inputs(&[link])
+        assert!(collect_inputs(&[link], None)
             .err()
             .unwrap()
             .to_string()
@@ -311,7 +355,7 @@ mod tests {
         let directory = root.join("directory");
         fs::create_dir(&directory).unwrap();
         symlink(&target, directory.join("child")).unwrap();
-        assert!(collect_inputs(&[directory])
+        assert!(collect_inputs(&[directory], None)
             .err()
             .unwrap()
             .to_string()
@@ -322,11 +366,11 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        let error = collect_inputs(&[fifo])
+        let error = collect_inputs(&[fifo], None)
             .err()
             .expect("FIFO must be rejected without opening it");
         assert!(error.to_string().contains("is not a regular file"));
-        let error = collect_inputs(&[PathBuf::from("/dev/null")])
+        let error = collect_inputs(&[PathBuf::from("/dev/null")], None)
             .err()
             .expect("special files must be rejected during collection");
         assert!(error.to_string().contains("is not a regular file"));
@@ -344,11 +388,11 @@ mod tests {
         if !crate::scratch::supports_raw_byte_names(&root) {
             // The filesystem rejects this input before the CLI can collect it.
             assert!(fs::write(input.join(OsStr::from_bytes(b"bad-\xff")), b"payload").is_err());
-            assert_eq!(collect_inputs(&[input]).unwrap().len(), 1);
+            assert_eq!(collect_inputs(&[input], None).unwrap().len(), 1);
             return;
         }
         fs::write(input.join(OsStr::from_bytes(b"bad-\xff")), b"payload").unwrap();
-        let entries = collect_inputs(&[input]).unwrap();
+        let entries = collect_inputs(&[input], None).unwrap();
         assert_eq!(entries[1].name, b"input/bad-\xff");
         assert_eq!(fs::read(&entries[1].path).unwrap(), b"payload");
     }
@@ -363,7 +407,7 @@ mod tests {
             fs::write(input.join("日本語").join(name), name.as_bytes()).unwrap();
         }
         names.sort();
-        let entries = collect_inputs(std::slice::from_ref(&input)).unwrap();
+        let entries = collect_inputs(std::slice::from_ref(&input), None).unwrap();
         assert_eq!(entries.len(), names.len() + 2);
         assert!(entries[0].is_directory);
         assert!(entries[1].is_directory);
