@@ -785,8 +785,13 @@ jobs:
   publish-github-release:
     name: Publish GitHub Release
     needs: [verify-tag, build, publish]
+    # always(): a re-run of a tagged version skips `tag`, and a skip anywhere
+    # upstream skips this job unless its condition says otherwise.
     if: >-
-      needs.verify-tag.outputs.release == 'true'
+      always()
+      && needs.verify-tag.outputs.release == 'true'
+      && needs.build.result == 'success'
+      && needs.publish.result == 'success'
       && (github.event_name == 'push' || inputs.publish == 'all')
     runs-on: ubuntu-latest
     permissions:
