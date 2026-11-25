@@ -2760,7 +2760,11 @@ fn parse_member(
     let start = combined.len() - input.len();
     let reach = options.max_match_distance.min(MAX_HISTORY);
     let long = keys_long(options, input.len() + start.min(reach), false);
-    let mut finder = ChainFinder::for_reach(reach, reach, long);
+    // Links for what is there to insert, never more than the reach: a short
+    // input then never pays for clearing a reach's worth. Neither window wraps
+    // over an input that fits, so the candidates are the same.
+    let window = combined.len().clamp(1, reach.max(1));
+    let mut finder = ChainFinder::for_reach(window, reach, long);
     for history_pos in 0..start {
         finder.insert(&combined, history_pos);
     }
