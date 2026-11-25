@@ -20,7 +20,7 @@ all-features = true
 
 [features]
 # Default builds retain all capabilities; each optional feature is independent.
-default = ["write", "parallel", "recovery", "encryption"]
+default = ["write", "parallel", "recovery", "encryption", "cjk-names"]
 # Deprecated: does nothing beyond enabling `write`. Kept so 0.13.x stays
 # compatible with 0.13.0; removed in 0.14.0 (#536).
 experimental-ring-state = ["write"]
@@ -28,12 +28,14 @@ parallel = ["dep:rayon"]
 recovery = ["dep:getrandom"]
 write = ["dep:getrandom"]
 encryption = ["dep:aes", "dep:hmac", "dep:sha1", "dep:sha2", "dep:zeroize"]
+cjk-names = ["dep:encoding_rs"]
 
 [dependencies]
 aes = { workspace = true, optional = true }
 aho-corasick.workspace = true
 blake2s_simd.workspace = true
 crc32fast.workspace = true
+encoding_rs = { workspace = true, optional = true }
 getrandom = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 memchr.workspace = true

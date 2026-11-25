@@ -21,7 +21,7 @@ def main():
     args = parser.parse_args()
     if args.features is None:
         combinations = [tuple(f for f, enabled in zip(FEATURES, mask) if enabled)
-                        for mask in itertools.product((False, True), repeat=4)]
+                        for mask in itertools.product((False, True), repeat=len(FEATURES))]
     else:
         combination = tuple(f for f in args.features.split(",") if f and f != "none")
         if set(combination) - set(FEATURES):
@@ -63,6 +63,8 @@ def main():
             excluded.update(("aes", "hmac", "sha1", "sha2", "zeroize"))
         if "parallel" not in combination:
             excluded.update(("rayon", "rayon-core", "crossbeam-deque", "crossbeam-epoch"))
+        if "cjk-names" not in combination:
+            excluded.add("encoding_rs")
         if not {"write", "recovery"}.intersection(combination):
             excluded.add("getrandom")
         unexpected = dependencies.intersection(excluded)

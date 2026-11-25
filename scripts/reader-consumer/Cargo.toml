@@ -16,6 +16,7 @@ parallel = ["rars/parallel"]
 recovery = ["rars/recovery"]
 write = ["rars/write"]
 encryption = ["rars/encryption"]
+cjk-names = ["rars/cjk-names"]
 
 [profile.release]
 strip = true

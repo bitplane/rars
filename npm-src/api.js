@@ -35,7 +35,10 @@ export function createApi(runtime) {
     const limits = {};
     if (options.legacyNameEncoding != null) {
       const encoding = options.legacyNameEncoding;
-      if (typeof encoding !== "string" || !["cp437", "cp850", "cp852", "cp866", "cp1251", "cp1252", "windows-1251", "windows-1252", "utf8", "utf-8"].includes(encoding.toLowerCase())) {
+      if (typeof encoding !== "string" || ![
+        "cp437", "cp850", "cp852", "cp866", "cp1251", "cp1252", "windows-1251", "windows-1252", "utf8", "utf-8",
+        "cp932", "shift_jis", "shift-jis", "sjis", "windows-31j", "cp936", "gbk", "cp949", "euc-kr", "uhc", "cp950", "big5",
+      ].includes(encoding.toLowerCase())) {
         throw new RarError("INVALID_OPTION", "unsupported legacyNameEncoding");
       }
       limits.legacyNameEncoding = encoding;
