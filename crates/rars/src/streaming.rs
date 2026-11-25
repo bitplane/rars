@@ -1033,6 +1033,9 @@ impl MemoryBudget {
         if let Ok(permit) = self.admit(used, bytes) {
             return Some(permit);
         }
+        // Counted as waiting so the room reclaimed is not taken back by a
+        // spool growing before it is admitted.
+        let _waiting = Waiting::new(&self.waiting);
         if !self.reclaim(bytes) {
             return None;
         }
@@ -1043,18 +1046,33 @@ impl MemoryBudget {
 
 impl MemoryPermit {
     /// Extends a running wave without waiting while it holds workspace.
+    ///
+    /// Like [`MemoryBudget::try_acquire`], it moves spools held in memory to
+    /// disk when that makes room, and moves none when it would not.
     #[cfg(feature = "write")]
     pub(crate) fn try_grow_to(&mut self, bytes: u64) -> bool {
         if bytes <= self.bytes {
             return true;
         }
+        if self.grow_if_free(bytes) {
+            return true;
+        }
+        // Counted as waiting so the room reclaimed is not taken back by a
+        // spool growing before this permit does.
+        let budget = Arc::clone(&self.budget);
+        let _waiting = Waiting::new(&budget.waiting);
+        budget.reclaim(bytes - self.bytes) && self.grow_if_free(bytes)
+    }
+
+    #[cfg(feature = "write")]
+    fn grow_if_free(&mut self, bytes: u64) -> bool {
         let mut used = self
             .budget
             .used
             .lock()
             .expect("memory budget lock poisoned");
         let extra = bytes - self.bytes;
-        if extra > self.budget.limit - *used {
+        if extra > self.budget.limit.saturating_sub(*used) {
             return false;
         }
         *used += extra;
@@ -2186,6 +2204,43 @@ mod tests {
             assert!(copied[..300 * 1024].iter().all(|&byte| byte == 3));
             assert_eq!(&copied[300 * 1024..], b"tail");
             drop((first, reader, source));
+            assert_eq!(files(&root), 0);
+            assert_eq!(resources.workspace_in_use(), 0);
+        }
+
+        #[cfg(feature = "write")]
+        #[test]
+        fn a_growing_wave_moves_held_spools_to_disk_for_room() {
+            let root = crate::scratch::case("held-spool-wave");
+            let limit = 1 << 20;
+            let resources = WriterResources::new(limit).with_temp_dir(&*root);
+            let mut wave = resources.try_acquire(limit / 2).unwrap();
+            let mut first = Spool::create(&resources).unwrap();
+            first.write_all(&[5; 200 * 1024]).unwrap();
+            let mut second = Spool::create(&resources).unwrap();
+            second.write_all(&[6; 100 * 1024]).unwrap();
+            assert_eq!(files(&root), 0);
+            let held = resources.workspace_in_use() - limit / 2;
+            assert!(held > limit / 4);
+
+            // More than the budget holds, even with every spool moved: none move.
+            assert!(!wave.try_grow_to(limit + 1));
+            assert_eq!(files(&root), 0);
+            assert_eq!(wave.bytes(), limit / 2);
+
+            // Room for the next job once one spool is on disk: only that one moves.
+            let free = limit - resources.workspace_in_use();
+            assert!(wave.try_grow_to(limit / 2 + free + 1));
+            assert_eq!(files(&root), 1);
+            assert_eq!(wave.bytes(), limit / 2 + free + 1);
+            assert!(resources.workspace_peak() <= limit);
+
+            first.write_all(b"tail").unwrap();
+            let mut copied = Vec::new();
+            first.copy_to(&mut copied).unwrap();
+            assert!(copied[..200 * 1024].iter().all(|&byte| byte == 5));
+            assert_eq!(&copied[200 * 1024..], b"tail");
+            drop((first, second, wave));
             assert_eq!(files(&root), 0);
             assert_eq!(resources.workspace_in_use(), 0);
         }
