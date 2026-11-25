@@ -1,7 +1,8 @@
 use rars::rar13::{extract_volumes_to, file_checksum, Archive, Entry};
 use rars::{detect_archive_family, find_archive_start, ArchiveFamily, Error};
 use std::cell::RefCell;
-use std::io::{Result as IoResult, Write};
+use std::io::{ErrorKind, Result as IoResult, Write};
+use std::path::Path;
 use std::rc::Rc;
 
 const EMPTY: &[u8] = include_bytes!("fixtures/rar13/EMPTY.RAR");
@@ -18,7 +19,6 @@ const README_EXPECTED: &[u8] = include_bytes!("fixtures/rar13/README");
 const CMULTI_EXPECTED: &[u8] = include_bytes!("fixtures/rar13/CMULTI.TXT");
 #[cfg(feature = "encryption")]
 const STOREPWD: &[u8] = include_bytes!("fixtures/rar13/STOREPWD.RAR");
-const SFXSRC: &[u8] = include_bytes!("fixtures/rar13/SFXSRC.EXE");
 const SOLID: &[u8] = include_bytes!("fixtures/rar13/SOLID.RAR");
 const SOLID_FLAG_CLEARED: &[u8] = include_bytes!("fixtures/rar13/solid_flag_cleared.rar");
 const MULTIVOL_RAR: &[u8] = include_bytes!("fixtures/rar13/MULTIVOL.RAR");
@@ -565,11 +565,20 @@ fn decodes_real_rar1402_encrypted_stored_file() {
 
 #[test]
 fn detects_and_parses_rar14_sfx_archive() {
-    let sig = find_archive_start(SFXSRC, 128 * 1024).expect("SFX embedded signature");
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rar13/SFXSRC.EXE");
+    let sfx = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            eprintln!("SFXSRC.EXE is not shipped in the published crate; skipping");
+            return;
+        }
+        Err(error) => panic!("read SFXSRC.EXE: {error}"),
+    };
+    let sig = find_archive_start(&sfx, 128 * 1024).expect("SFX embedded signature");
     assert_eq!(sig.family, ArchiveFamily::Rar13);
     assert_eq!(sig.offset, 6491);
 
-    let archive = Archive::parse(SFXSRC).expect("parse RAR 1.402 SFX archive");
+    let archive = Archive::parse(&sfx).expect("parse RAR 1.402 SFX archive");
     assert_eq!(archive.sfx_offset, 6491);
     assert_eq!(archive.entries.len(), 1);
     let entry = &archive.entries[0];

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/rars",
+    "crates/rars-benches",
     "crates/rars-cli",
     "crates/rars-python",
     "crates/rars-wasm",

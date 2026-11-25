@@ -1,6 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+package_files=$(cargo package -p rars --list)
+if grep -E '(^|/)SFXSRC[.]EXE$|^benches/' <<< "$package_files"; then
+    echo 'Unexpected files in the rars crate package' >&2
+    exit 1
+fi
+if [[ ${1:-} == --package-only ]]; then
+    exit 0
+fi
+
 # The write matrix in crates/rars-cli/tests/external_decoders.rs skips when it
 # cannot find a decoder that reads RAR. A release gate that skips it is the
 # blind spot every corruption bug has shipped through, so make absence fatal.

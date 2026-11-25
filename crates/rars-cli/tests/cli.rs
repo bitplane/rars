@@ -16,6 +16,15 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn sfx_fixture() -> Option<PathBuf> {
+    let path = fixture("SFXSRC.EXE");
+    if !path.try_exists().expect("check for SFXSRC.EXE") {
+        eprintln!("SFXSRC.EXE is not shipped in the published crate; skipping");
+        return None;
+    }
+    Some(path)
+}
+
 fn fixture_rar15_40(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../rars/tests/fixtures/rar15_40")
@@ -1488,14 +1497,15 @@ fn add_refuses_header_encryption_without_password_and_stdout_volume_sets() {
 }
 
 #[test]
-fn info_identifies_self_extracting_archives_and_unpacked_legacy_comments() {
-    let sfx = rars()
-        .arg("info")
-        .arg(fixture("SFXSRC.EXE"))
-        .output()
-        .unwrap();
+fn info_identifies_self_extracting_archives() {
+    let Some(path) = sfx_fixture() else { return };
+    let sfx = rars().arg("info").arg(path).output().unwrap();
     assert!(sfx.status.success(), "{}", stderr(&sfx));
     assert!(stdout(&sfx).contains("(SFX, payload at offset "));
+}
+
+#[test]
+fn info_identifies_unpacked_legacy_comments() {
     let root = scratch("info-unpacked-comment");
     let archive = root.join("comment.rar");
     // Current writers pack archive comments. The legacy reader also accepts
@@ -2359,11 +2369,8 @@ fn test_verifies_solid_fixture() {
 
 #[test]
 fn test_verifies_sfx_prefixed_fixture() {
-    let output = rars()
-        .arg("test")
-        .arg(fixture("SFXSRC.EXE"))
-        .output()
-        .unwrap();
+    let Some(path) = sfx_fixture() else { return };
+    let output = rars().arg("test").arg(path).output().unwrap();
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("OK HELLO.TXT"));
 }

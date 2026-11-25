@@ -1,0 +1,75 @@
+[package]
+name = "rars-benches"
+version = "0.13.1"
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = ["write", "parallel", "recovery", "encryption", "cjk-names"]
+write = ["rars/write"]
+parallel = ["rars/parallel"]
+recovery = ["rars/recovery"]
+encryption = ["rars/encryption"]
+cjk-names = ["rars/cjk-names"]
+
+[dependencies]
+rars = { path = "../rars", default-features = false }
+
+# Criterion pulls in alloca, which builds C; the benches only target hosts with
+# 64-bit atomics, so targets without them skip it and need no C cross-compiler.
+[target.'cfg(target_has_atomic = "64")'.dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+rayon.workspace = true
+
+[[bench]]
+name = "chunk_sizes"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "parallel"
+harness = false
+required-features = ["write", "parallel"]
+
+[[bench]]
+name = "member_lookup"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "huffman_tables"
+harness = false
+
+[[bench]]
+name = "streaming_decode"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "rar50_hash"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "huffman_decode"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "rar20_decode"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "delta_filter"
+harness = false
+required-features = ["write"]
+
+[[bench]]
+name = "recovery"
+harness = false
+required-features = ["write", "recovery", "parallel"]
