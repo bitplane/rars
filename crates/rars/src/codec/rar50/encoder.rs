@@ -1964,61 +1964,167 @@ pub(crate) fn run_trees_workspace(options: EncodeOptions) -> u64 {
     match_finder::SeedTree::<Allowance>::bytes_for_reach(options.max_match_distance) as u64
 }
 
+/// The runs a shared tree can seed: those with history, and at least `nice`
+/// long, since a descent compares at most `nice` bytes and a run's own window
+/// ends where the run does, so the seed tree's descents compare as far as the
+/// run's would only if no run ends within that of its history.
+fn seeds_from_shared(run: &Range<usize>, options: EncodeOptions) -> bool {
+    debug_assert!(run.start <= run.end);
+    run.start > 0 && run.end - run.start >= options.nice()
+}
+
+/// How [`run_trees`] seeds `runs`: in chains of consecutive runs, given as
+/// ranges of their indexes, each seeded from one shared tree when it holds
+/// several runs and on its own otherwise. Runs in no chain seed their own.
+///
+/// A shared tree puts each position in once, but in order: a run's tree is
+/// ready only once everything before its history's end is in. Positions of
+/// one hash go in on one thread, and a hash that a large part of the window
+/// has makes that order slow however many threads there are. So a chain is
+/// cut where it would span more than a dictionary, when the extra positions
+/// the runs then put in for themselves cost less than the wait.
+pub(crate) fn seed_chains(
+    window: &[u8],
+    runs: &[Range<usize>],
+    options: EncodeOptions,
+) -> Vec<Range<usize>> {
+    let history = |index: usize| tree_history(runs[index].start, options);
+    let chains = |limit: usize| {
+        let mut chains: Vec<Range<usize>> = Vec::new();
+        for (index, run) in runs.iter().enumerate() {
+            if run.start == 0 {
+                continue;
+            }
+            if let Some(chain) = chains.last_mut() {
+                let joins = chain.end == index
+                    && runs[chain.start..=index]
+                        .iter()
+                        .all(|run| seeds_from_shared(run, options))
+                    && history(index).end - history(chain.start).start <= limit;
+                if joins {
+                    chain.end += 1;
+                    continue;
+                }
+            }
+            chains.push(index..index + 1);
+        }
+        // A run alone is seeded here only when its history splits between
+        // threads; otherwise its job seeds it as well as this could.
+        chains.retain(|chain| {
+            chain.len() > 1 || match_finder::seed_shares(history(chain.start).len()) >= 2
+        });
+        chains
+    };
+    let together = chains(usize::MAX);
+    let apart = chains(options.max_match_distance);
+    if together == apart {
+        return apart;
+    }
+    let span = |chain: &Range<usize>| history(chain.end - 1).end - history(chain.start).start;
+    let threads = crate::parallel::threads().max(1);
+    let (Some(first), Some(last)) = (together.first(), together.last()) else {
+        return apart;
+    };
+    let skew = match_finder::seed_skew(
+        window,
+        history(first.start).start..history(last.end - 1).end,
+        threads,
+    );
+    let time = |chains: &[Range<usize>]| {
+        let longest = chains.iter().map(span).max().unwrap_or(0) as f64;
+        let work = chains.iter().map(span).sum::<usize>() as f64;
+        (longest * skew).max(work / threads as f64)
+    };
+    if time(&apart) <= time(&together) {
+        apart
+    } else {
+        together
+    }
+}
+
 /// The trees runs of one window seed, each run given by where it starts and
-/// ends in `window`, seeded from one tree rather than each from its own:
-/// one for each run with history that a shared tree can seed, in the order of
-/// `runs`, or `None` where sharing saves nothing.
+/// ends in `window`, seeded on every thread this one may fan out to: one for
+/// each run seeded here, in the order of `runs`, or `None` where none is.
+///
+/// The runs are seeded in `chains`, which [`seed_chains`] made for them, side
+/// by side. Each chain is split between threads by hash, so one whose order
+/// is slow leaves threads to the others. A chain of several runs holds a
+/// shared tree beside their trees while it seeds ([`run_trees_workspace`]).
 ///
 /// Every run must search a tree ([`searches_tree`]) in its window trimmed to
 /// a dictionary before its start, as [`streaming_blocks_in_window`] trims it,
 /// and they must come in order. Each tree is the one the run would have
 /// seeded, so the output does not change.
 #[allow(clippy::type_complexity)]
-pub(crate) fn run_trees<B: Budget>(
+pub(crate) fn run_trees<B: Budget + Sync>(
+    window: &[u8],
+    runs: &[Range<usize>],
+    chains: &[Range<usize>],
+    options: EncodeOptions,
+    allowance: &B,
+) -> Result<Option<Buffer<Option<Rar50TreeMatchFinder<B>>, B>>>
+where
+    Rar50TreeMatchFinder<B>: Send,
+{
+    debug_assert!(runs.iter().all(|run| run.end <= window.len()));
+    if chains.is_empty() {
+        return Ok(None);
+    }
+    let mut seeded: Vec<_> = chains
+        .iter()
+        .map(|chain| (chain.clone(), Ok(Vec::new())))
+        .collect();
+    crate::parallel::for_each_mut(&mut seeded, |_, (chain, trees)| {
+        *trees = seed_chain(window, &runs[chain.clone()], options, allowance);
+    });
+    let mut trees = Buffer::with_capacity(runs.len(), allowance)?;
+    for _ in runs {
+        trees.push_admitted(None);
+    }
+    for (chain, seeded) in seeded {
+        for (slot, tree) in trees[chain].iter_mut().zip(seeded?) {
+            *slot = Some(tree);
+        }
+    }
+    Ok(Some(trees))
+}
+
+/// The trees of one of [`seed_chains`]'s chains.
+fn seed_chain<B: Budget>(
     window: &[u8],
     runs: &[Range<usize>],
     options: EncodeOptions,
     allowance: &B,
-) -> Result<Option<Buffer<Option<Rar50TreeMatchFinder<B>>, B>>> {
-    // A descent compares at most `nice` bytes, and a run's own window ends
-    // where the run does, so the seed tree's descents compare as far as the
-    // run's would only if no run ends within that of its history.
-    let seeds = |run: &Range<usize>| {
-        debug_assert!(run.start <= run.end && run.end <= window.len());
-        run.start > 0 && run.end - run.start >= options.nice()
-    };
-    let histories = || {
-        runs.iter()
-            .filter(|run| seeds(run))
-            .map(|run| tree_history(run.start, options))
-    };
-    let (Some(first), Some(last)) = (histories().next(), histories().next_back()) else {
-        return Ok(None);
-    };
-    // Sharing pays only where the histories overlap.
-    let seeded: usize = histories().map(|history| history.len()).sum();
-    if seeded <= last.end - first.start {
-        return Ok(None);
+) -> Result<Vec<Rar50TreeMatchFinder<B>>> {
+    if let [run] = runs {
+        let history = tree_history(run.start, options);
+        // The run's own window, as its collector would seed it.
+        let combined = &window[history.start..run.end];
+        return Ok(vec![Rar50TreeMatchFinder::seeded(
+            finder_window(options, combined.len()),
+            combined,
+            0..history.len(),
+            |pos| tree_len_limit(combined, pos, options),
+            options.max_match_candidates,
+            match_finder::seed_shares(history.len()),
+            allowance,
+        )?]);
     }
     let mut seed = match_finder::SeedTree::with_allowance(options.max_match_distance, allowance)?;
-    let mut trees = Buffer::with_capacity(runs.len(), allowance)?;
-    for run in runs {
-        if !seeds(run) {
-            trees.push_admitted(None);
-            continue;
-        }
-        let history = tree_history(run.start, options);
-        let reach = run.end - history.start;
-        trees.push_admitted(Some(seed.seed(
-            window,
-            history,
-            finder_window(options, reach),
-            |pos| tree_len_limit(window, pos, options),
-            options.max_match_candidates,
-            allowance,
-        )?));
-    }
-    Ok(Some(trees))
+    runs.iter()
+        .map(|run| {
+            let history = tree_history(run.start, options);
+            let reach = run.end - history.start;
+            seed.seed(
+                window,
+                history,
+                finder_window(options, reach),
+                |pos| tree_len_limit(window, pos, options),
+                options.max_match_candidates,
+                allowance,
+            )
+        })
+        .collect()
 }
 
 /// Whether an optimal parse of `window` from `start` searches a binary tree.
@@ -2296,32 +2402,59 @@ fn runs_seeded_together_code_as_runs_seeded_alone() {
         .collect();
     for threads in [1, 2, 8] {
         crate::parallel::private_pool(threads).install(|| {
-            let trees = run_trees(&window, &runs, options, &allowance)
-                .unwrap()
-                .expect("the runs' histories overlap");
-            for ((run, tree), alone) in runs.iter().zip(trees).zip(&alone) {
-                let together = streaming_blocks_with_tree(
-                    &window[..run.end],
-                    run.start,
-                    tree.expect("every run has history"),
-                    &blocks,
-                    None,
-                    0,
-                    options,
-                    None,
-                    &allowance,
-                )
-                .unwrap();
-                assert!(
-                    together
-                        .iter()
-                        .map(|block| &block[..])
-                        .eq(alone.iter().map(|block| &block[..])),
-                    "run {run:?} at {threads} threads differs"
-                );
+            // One shared tree for them all, each run on its own, and the
+            // chains seeding would choose.
+            let layouts = [
+                std::iter::once(0..runs.len()).collect::<Vec<_>>(),
+                (0..runs.len()).map(|run| run..run + 1).collect(),
+                seed_chains(&window, &runs, options),
+            ];
+            for chains in &layouts {
+                let trees = run_trees(&window, &runs, chains, options, &allowance)
+                    .unwrap()
+                    .expect("runs are seeded");
+                for ((run, tree), alone) in runs.iter().zip(trees).zip(&alone) {
+                    // A run left out seeds its own, as `alone` did.
+                    let Some(tree) = tree else {
+                        continue;
+                    };
+                    check_seeded_run(&window, run, tree, &blocks, options, alone, threads);
+                }
             }
         });
     }
+}
+
+/// Codes `run` of `window` on `tree` and checks it codes `alone`'s blocks.
+#[cfg(all(test, feature = "parallel"))]
+fn check_seeded_run(
+    window: &[u8],
+    run: &Range<usize>,
+    tree: Rar50TreeMatchFinder<Allowance>,
+    blocks: &[(usize, bool)],
+    options: EncodeOptions,
+    alone: &[Buffer<u8>],
+    threads: usize,
+) {
+    let together = streaming_blocks_with_tree(
+        &window[..run.end],
+        run.start,
+        tree,
+        blocks,
+        None,
+        0,
+        options,
+        None,
+        &Allowance::default(),
+    )
+    .unwrap();
+    assert!(
+        together
+            .iter()
+            .map(|block| &block[..])
+            .eq(alone.iter().map(|block| &block[..])),
+        "run {run:?} at {threads} threads differs"
+    );
 }
 
 enum CollectorFinder<B: Budget = Allowance> {
@@ -2362,6 +2495,7 @@ impl<B: Budget> OptimalCollector<B> {
                 tree_history(start, options),
                 |pos| tree_len_limit(combined, pos, options),
                 options.max_match_candidates,
+                1,
                 allowance,
             )?;
             return Self::with_tree(combined, start, tree, options, allowance);

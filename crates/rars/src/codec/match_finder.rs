@@ -693,8 +693,10 @@ impl<B: Budget> TreeMatchFinder<B> {
 
     /// Builds a finder for `window` holding `history`, each position put in
     /// with the descent [`Self::matches`] makes at `len_limit(pos)` and `cut`,
-    /// reporting nothing. `history` must fit in the window, and `len_limit`
-    /// must keep to [`Self::matches`]'s rules.
+    /// reporting nothing, split between `shares` threads by hash. `history`
+    /// must fit in the window, counted from the start of `input` when it is
+    /// split ([`Self::insert_range`]), and `len_limit` must keep to
+    /// [`Self::matches`]'s rules. The links are the same for any `shares`.
     #[cfg(feature = "write")]
     pub(crate) fn seeded(
         window: usize,
@@ -702,11 +704,12 @@ impl<B: Budget> TreeMatchFinder<B> {
         history: std::ops::Range<usize>,
         len_limit: impl Fn(usize) -> usize + Sync,
         cut: usize,
+        shares: usize,
         allowance: &B,
     ) -> Result<Self> {
         let finder = Self::with_allowance(window, allowance)?;
         debug_assert!(history.len() <= finder.mask + 1);
-        finder.insert_range(input, history, &len_limit, cut, 1);
+        finder.insert_range(input, history, &len_limit, cut, shares);
         Ok(finder)
     }
 
@@ -921,6 +924,48 @@ impl<B: Budget> TreeMatchFinder<B> {
     }
 }
 
+/// How many threads, by hash, to put `positions` of history into a tree on:
+/// as many as this thread may fan out to, but no more than give each a share
+/// worth its while, since every share reads every position to find its own.
+#[cfg(feature = "write")]
+pub(crate) fn seed_shares(positions: usize) -> usize {
+    const MIN_SHARE: usize = 256 * 1024;
+    if crate::parallel::may_nest() {
+        crate::parallel::threads().min(positions / MIN_SHARE).max(1)
+    } else {
+        1
+    }
+}
+
+/// About how much of putting `positions` of `input` into a tree falls to the
+/// busiest of `shares` hash shares, as a fraction of the whole, from a sample
+/// of the positions. A share's hashes go in on one thread, so this much of
+/// the work is done in sequence however many threads there are: in machine
+/// code, say, where runs of zeroes all have one hash.
+#[cfg(feature = "write")]
+pub(crate) fn seed_skew(input: &[u8], positions: std::ops::Range<usize>, shares: usize) -> f64 {
+    const STEP: usize = 7;
+    let bits = TreeMatchFinder::<Allowance>::HASH_BITS;
+    let shares = shares.max(1);
+    let end = positions.end.min(
+        input
+            .len()
+            .saturating_sub(TreeMatchFinder::<Allowance>::MIN_MATCH - 1),
+    );
+    let mut counts = vec![0usize; shares];
+    for pos in (positions.start..end).step_by(STEP) {
+        let bytes = [input[pos], input[pos + 1], input[pos + 2], input[pos + 3]];
+        counts[(mix(u32::from_le_bytes(bytes), bits) * shares) >> bits] += 1;
+    }
+    let total: usize = counts.iter().sum();
+    let busiest = counts.into_iter().max().unwrap_or(0);
+    if total == 0 {
+        1.0
+    } else {
+        busiest as f64 / total as f64
+    }
+}
+
 /// One tree that seeds the trees of several runs over one window, so history
 /// the runs share goes in once rather than once per run.
 ///
@@ -949,10 +994,6 @@ pub(crate) struct SeedTree<B: Budget = Allowance> {
 
 #[cfg(feature = "write")]
 impl<B: Budget> SeedTree<B> {
-    /// A share of the hashes is only worth a thread when it has this much
-    /// history to insert: every share reads every position to find its own.
-    const MIN_SHARE: usize = 256 * 1024;
-
     /// What [`Self::with_allowance`] allocates for a dictionary of `reach`.
     pub(crate) fn bytes_for_reach(reach: usize) -> usize {
         TreeMatchFinder::<B>::bytes_for_window(reach)
@@ -987,21 +1028,11 @@ impl<B: Budget> SeedTree<B> {
         debug_assert!(history.len() <= self.tree.mask + 1);
         self.tree.oldest = history.start;
         let from = self.next.max(history.start);
-        let shares = Self::shares(history.end - from);
+        let shares = seed_shares(history.end - from);
         self.tree
             .insert_range(input, from..history.end, &len_limit, cut, shares);
         self.next = history.end;
         self.copy(input, history, window, allowance)
-    }
-
-    fn shares(positions: usize) -> usize {
-        if crate::parallel::may_nest() {
-            crate::parallel::threads()
-                .min(positions / Self::MIN_SHARE)
-                .max(1)
-        } else {
-            1
-        }
     }
 
     /// `history`'s part of the tree, in a finder of its own for `window`.
@@ -1035,7 +1066,7 @@ impl<B: Budget> SeedTree<B> {
                 .saturating_sub(TreeMatchFinder::<B>::MIN_MATCH - 1),
         );
         let span = end.saturating_sub(base);
-        let pieces = Self::shares(span);
+        let pieces = seed_shares(span);
         let mut each = vec![(); pieces];
         crate::parallel::for_each_mut(&mut each, |piece, _| {
             let first = base + span * piece / pieces;
@@ -1740,8 +1771,9 @@ mod tests {
         input
     }
 
-    /// Each run's tree out of a shared seed tree is the one it would have
-    /// seeded on its own, link for link, on any number of threads: for runs
+    /// Each run's tree, seeded alone with its history split between threads
+    /// or out of a shared seed tree, is the one it would have seeded on its
+    /// own on one thread, link for link, on any number of threads: for runs
     /// whose history is the start of the input, runs a whole reach in, and
     /// a run whose history starts past everything seeded before it.
     #[test]
@@ -1772,6 +1804,7 @@ mod tests {
                     0..run.start - base,
                     |pos| (own.len() - pos).min(nice),
                     cut,
+                    1,
                     &allowance,
                 )
                 .unwrap()
@@ -1780,6 +1813,24 @@ mod tests {
             .collect();
         for threads in [1, 2, 8] {
             crate::parallel::private_pool(threads).install(|| {
+                for (run, expected) in runs.iter().zip(&expected) {
+                    let base = history(run).start;
+                    let own = &input[base..run.end];
+                    let split = TreeMatchFinder::seeded(
+                        window(run),
+                        own,
+                        0..run.start - base,
+                        |pos| (own.len() - pos).min(nice),
+                        cut,
+                        super::seed_shares(run.start - base),
+                        &allowance,
+                    )
+                    .unwrap();
+                    assert!(
+                        split.links() == *expected,
+                        "run {run:?} seeded alone at {threads} threads differs"
+                    );
+                }
                 let mut seed = super::SeedTree::with_allowance(reach, &allowance).unwrap();
                 for (run, expected) in runs.iter().zip(&expected) {
                     let tree = seed
