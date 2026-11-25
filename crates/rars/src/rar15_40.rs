@@ -115,7 +115,7 @@ pub struct Archive {
     pub sfx_offset: usize,
     pub main: MainHeader,
     pub blocks: Vec<Block>,
-    source: ArchiveSource,
+    pub(super) source: ArchiveSource,
     // Shared with later volumes parsed in the same session, so keys outlive one call.
     pub(crate) key_cache: Arc<KeyCache>,
     truncation: Option<Truncation>,
