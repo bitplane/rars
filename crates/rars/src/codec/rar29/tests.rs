@@ -1574,7 +1574,9 @@ fn matched_member_streams_across_flush_and_history_boundaries() {
     let input = vec![b'Z'; MAX_HISTORY + STREAM_CHUNK + 513];
     let mut encoder = Unpack29Encoder::new();
     let packed = encoder.encode_member(&input).unwrap();
-    assert_eq!(encoder.history.len(), MAX_HISTORY);
+    // The encoder keeps only what its matches reach back; the decoder below
+    // keeps its whole window.
+    assert_eq!(encoder.history.len(), MAX_ENCODER_MATCH_OFFSET);
 
     let mut decoder = Unpack29::new();
     let mut sink = RecordingSink {
@@ -1655,7 +1657,9 @@ fn solid_follower_can_match_the_oldest_retained_history() {
 #[test]
 fn block_encoder_trims_local_history_at_the_dictionary_boundary() {
     let history = vec![b'Z'; MAX_HISTORY];
-    let options = EncodeOptions::new(0).with_block_size(1);
+    let options = EncodeOptions::new(0)
+        .with_block_size(1)
+        .with_max_match_distance(MAX_HISTORY);
     let mut encoder = Unpack29Encoder::with_options(options);
     encoder.history.clone_from(&history);
     let packed = encoder.encode_member(b"AB").unwrap();
@@ -5984,4 +5988,30 @@ fn the_bit_writer_packs_bits_in_the_order_written() {
     assert!(unpacked[expected.len()..].iter().all(|&bit| !bit));
     unpacked.truncate(expected.len());
     assert_eq!(unpacked, expected);
+}
+
+#[test]
+fn chain_history_keeps_one_reach_in_room_for_one_reach() {
+    let reach = 64 * 1024;
+    let options = super::EncodeOptions::default().with_max_match_distance(reach);
+    let mut encoder = super::Unpack29Encoder::with_options(options);
+    let mut read = Vec::new();
+    for (len, seed) in [
+        (1000, 1u8),
+        (reach / 2, 2),
+        (3 * reach, 3),
+        (10, 4),
+        (reach - 1, 5),
+    ] {
+        let member: Vec<u8> = (0..len).map(|at| (at as u8).wrapping_mul(seed)).collect();
+        encoder.remember(&member);
+        read.extend_from_slice(&member);
+        assert_eq!(encoder.history, read[read.len().saturating_sub(reach)..]);
+        assert!(encoder.history.capacity() <= reach);
+    }
+    let len = 5 * reach;
+    assert!(
+        super::chain_member_workspace(len, options, true, false)
+            >= (encoder.history.capacity() + reach + len) as u64
+    );
 }

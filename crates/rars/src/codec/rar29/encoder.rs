@@ -1357,12 +1357,31 @@ impl Unpack29Encoder {
     }
 
     fn remember(&mut self, input: &[u8]) {
-        self.history.extend_from_slice(input);
-        let keep_from = self.history.len().saturating_sub(MAX_HISTORY);
-        if keep_from != 0 {
-            self.history.drain(..keep_from);
-        }
+        keep_history(&mut self.history, input, self.options.max_match_distance);
     }
+
+    /// Takes `history` as the chain's, trimmed to the reach a member can
+    /// match back and to no more room than that.
+    fn keep(&mut self, mut history: Vec<u8>) {
+        let reach = self.options.max_match_distance;
+        history.drain(..history.len().saturating_sub(reach));
+        history.shrink_to(reach);
+        self.history = history;
+    }
+}
+
+/// Appends `bytes` to `history`, keeping its last `reach` bytes in a buffer
+/// that never grows past `reach`: [`chain_member_workspace`] charges a chain's
+/// history at that size.
+fn keep_history(history: &mut Vec<u8>, bytes: &[u8], reach: usize) {
+    let bytes = &bytes[bytes.len().saturating_sub(reach)..];
+    history.drain(..(history.len() + bytes.len()).saturating_sub(reach));
+    let needed = history.len() + bytes.len();
+    if needed > history.capacity() {
+        let room = needed.max(history.capacity().saturating_mul(2)).min(reach);
+        history.reserve_exact(room - history.len());
+    }
+    history.extend_from_slice(bytes);
 }
 
 fn encode_member(input: &[u8], history: &[u8]) -> Result<Vec<u8>> {
@@ -1545,9 +1564,7 @@ impl Unpack29Encoder {
         )?;
         if flow.is_continue() {
             // Every parse reads one reach of history, which the window still holds.
-            let mut history = segments.window;
-            history.drain(..history.len().saturating_sub(reach));
-            self.history = history;
+            self.keep(segments.window);
             self.levels = levels;
         }
         Ok(flow)
@@ -1583,11 +1600,11 @@ impl Unpack29Encoder {
             filter,
             model,
             size,
-            Some(&mut history),
+            Some((&mut history, self.options.max_match_distance)),
             progress,
             out,
         )?;
-        self.history = history;
+        self.keep(history);
         if let Some(model) = model {
             self.ppmd = Some((model, size));
         }
@@ -1595,7 +1612,8 @@ impl Unpack29Encoder {
     }
 }
 
-/// `history`, when given, is left holding the last [`MAX_HISTORY`] bytes read after it.
+/// `history`, when given with a reach, is left holding that many of the last
+/// bytes read after it.
 ///
 /// `filter` is applied a record at a time as the bytes each covers are read,
 /// and each record is declared as the coder reaches it.
@@ -1607,7 +1625,7 @@ fn encode_ppmd_streamed(
     filter: Option<crate::FilterSpec>,
     model: Option<PpmdModel>,
     size: PpmdModelSize,
-    mut history: Option<&mut Vec<u8>>,
+    mut history: Option<(&mut Vec<u8>, usize)>,
     progress: &mut dyn FnMut(usize) -> bool,
     out: PackedOut<'_>,
 ) -> Result<(ControlFlow<()>, Option<PpmdModel>)> {
@@ -1656,9 +1674,8 @@ fn encode_ppmd_streamed(
         if let Some(filters) = &mut filters {
             filters.apply(&mut window, origin)?;
         }
-        if let Some(history) = history.as_deref_mut() {
-            history.extend_from_slice(&window[have..]);
-            history.drain(..history.len().saturating_sub(MAX_HISTORY));
+        if let Some((history, reach)) = history.as_mut() {
+            keep_history(history, &window[have..], *reach);
         }
         let mut declare = |encoder: &mut PpmdEncoder, at: usize, len: usize| match &mut filters {
             Some(filters) => filters.declare(encoder, origin + at, len),
@@ -2941,6 +2958,34 @@ pub(crate) fn member_encode_workspace(len: usize, options: EncodeOptions) -> u64
         .saturating_add(tokens)
         .saturating_add(len)
         .saturating_add(packed.saturating_mul(2))
+}
+
+/// What coding a `len` byte member into a solid chain holds beyond what coding
+/// it on its own does, for an encoder with `options`.
+///
+/// The chain keeps one reach of history between members, which
+/// [`keep_history`] holds to that size. An LZ parse reads that reach and the
+/// member as one run of bytes, so it joins a copy of the two, as
+/// `with_history` and [`InMemory`]'s first segment do. With `searches`, the
+/// member is coded under each filter candidate in turn, and the best so far
+/// keeps its filtered bytes and packed form beside the next candidate's
+/// filtered bytes. A member coded as PPMd only, `lz` false, reads no history.
+pub(crate) fn chain_member_workspace(
+    len: usize,
+    options: EncodeOptions,
+    lz: bool,
+    searches: bool,
+) -> u64 {
+    let reach = options.constrained().max_match_distance as u64;
+    let len = len as u64;
+    let joined = if lz { reach.saturating_add(len) } else { 0 };
+    let candidates = if lz && searches {
+        let packed = len.saturating_add(len / 8);
+        len.saturating_mul(2).saturating_add(packed)
+    } else {
+        0
+    };
+    reach.saturating_add(joined).saturating_add(candidates)
 }
 
 /// One block's tokens, and where in the parsed bytes the block ends.

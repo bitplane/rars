@@ -1,14 +1,14 @@
 #[cfg(feature = "write")]
 mod encoder;
-#[cfg(all(test, feature = "write"))]
-pub(crate) use encoder::{encode_member_with_custom_filters, COUNTDOWN_VM_PROGRAM};
 #[cfg(feature = "write")]
 pub(crate) use encoder::{
-    filtered_members, member_encode_workspace, named_filter_segments, order0_entropy,
-    ppmd_search_workspace, unpack29_encode_literals_with_options_and_progress,
+    chain_member_workspace, filtered_members, member_encode_workspace, named_filter_segments,
+    order0_entropy, ppmd_search_workspace, unpack29_encode_literals_with_options_and_progress,
     unpack29_encode_ppmd_with_progress, PpmdModelSize, MAX_VM_DELTA_FILTER_BLOCK_SIZE,
     OPTIMAL_PARSE_WORKSPACE, PPMD_MODEL_BYTES,
 };
+#[cfg(all(test, feature = "write"))]
+pub(crate) use encoder::{encode_member_with_custom_filters, COUNTDOWN_VM_PROGRAM};
 #[cfg(feature = "write")]
 pub use encoder::{
     unpack29_encode_literals, unpack29_encode_literals_with_options, unpack29_encode_ppmd,

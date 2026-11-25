@@ -2366,12 +2366,43 @@ fn member_charge(
         return Ok(None);
     }
     let ppmd = ppmd_held(member, options, coding, unpacked_size, chain)?;
-    Ok(Some(member_workspace(
-        options,
-        unpacked_size,
-        coding.compresses(),
-        ppmd,
-    )))
+    Ok(Some(
+        member_workspace(options, unpacked_size, coding.compresses(), ppmd)
+            .saturating_add(rar29_chain_workspace(options, coding, unpacked_size)),
+    ))
+}
+
+/// What a member coded into a RAR 2.9 solid chain holds beyond
+/// [`member_workspace`]: the chain's history, and what coding against it
+/// copies. The chain searches filters for the members it codes as
+/// [`MemberCoding::Compressed`] or under [`FilterPolicy::Auto`], unless PPMd
+/// is forced.
+fn rar29_chain_workspace(options: WriterOptions, coding: &MemberCoding, unpacked: u64) -> u64 {
+    let chained = options.features.solid
+        && coding.compresses()
+        && compression_method_for_level(options) != 0x30
+        && matches!(
+            options.target,
+            ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+        );
+    if !chained {
+        return 0;
+    }
+    let Ok(encode) = rar29_encode_options_for_options(options) else {
+        return 0;
+    };
+    let lz = options.method != Rar29Method::Ppmd;
+    let searches = lz
+        && matches!(
+            coding,
+            MemberCoding::Compressed | MemberCoding::Filtered(FilterPolicy::Auto)
+        );
+    crate::codec::rar29::chain_member_workspace(
+        usize::try_from(unpacked).unwrap_or(usize::MAX),
+        encode,
+        lz,
+        searches,
+    )
 }
 
 /// [`encode_member`] once the member is measured and charged for. The charge

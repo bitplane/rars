@@ -269,18 +269,6 @@ const KNOWN_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 393,
     },
-    // A RAR 4 chain is charged as one member at a time, and holds more than
-    // that while it codes.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar4,
-        paths: &[Path::Solid],
-        levels: &[1, 2, 3, 4, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Covered,
-        issue: 393,
-    },
     // The lazy parse's charge is the same at every level, and level 1's
     // short chains hold a fraction of it.
     Gap {
