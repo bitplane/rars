@@ -35,6 +35,12 @@ npm:
     ./scripts/build-npm.sh
     node scripts/test-npm-package.js
 
+# Regenerate the rars man pages in man/ and the shell completions in
+# completions/ from its clap definition, after changing a command or option.
+# Commit what changes: CI fails if they differ. man/unrars.1 is written by hand.
+manpages:
+    cargo run -p rars-manpages --locked
+
 # What CI runs before a release, including the external decoders and the Python
 # bindings. Fails rather than skips when the decoders are missing.
 gate:

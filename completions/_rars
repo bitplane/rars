@@ -1,0 +1,303 @@
+#compdef rars
+
+autoload -U is-at-least
+
+_rars() {
+    typeset -A opt_args
+    typeset -a _arguments_options
+    local ret=1
+
+    if is-at-least 5.2; then
+        _arguments_options=(-s -S -C)
+    else
+        _arguments_options=(-s -C)
+    fi
+
+    local context curcontext="$curcontext" state line
+    _arguments "${_arguments_options[@]}" : \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+":: :_rars_commands" \
+"*::: :->rars" \
+&& ret=0
+    case $state in
+    (rars)
+        words=($line[1] "${words[@]}")
+        (( CURRENT += 1 ))
+        curcontext="${curcontext%:*:*}:rars-command-$line[1]:"
+        case $line[1] in
+            (info)
+_arguments "${_arguments_options[@]}" : \
+'--legacy-name-encoding=[Source encoding for legacy names without Unicode (e.g. cp850 or detect)]:ENCODING:_default' \
+'--rar50-buffered-decode-limit=[Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)]:SIZE:_default' \
+'--rar50-decode-workers=[Threads decoding RAR5/7 blocks ahead of the output; 0 decodes serially (default\: up to 8)]:N:_default' \
+'--rar50-dictionary-size-limit=[Maximum declared RAR5/7 dictionary size (not total memory)]:SIZE:_default' \
+'--max-member-output-bytes=[Maximum decoded output per logical member or archive comment]:SIZE:_default' \
+'--max-total-output-bytes=[Maximum decoded output per extraction/test call, or per archive comment]:SIZE:_default' \
+'--max-reader-workspace-bytes=[Maximum aggregate reader workspace per call (not process RAM)]:SIZE:_default' \
+'--max-header-count=[Maximum top-level headers per physical archive parse]:COUNT:_default' \
+'--max-header-bytes=[Maximum plaintext header bytes per physical archive parse]:SIZE:_default' \
+'--rar50-scratch-dir=[Directory for RAR5 filtered decoding above the buffering threshold]:PATH:_files' \
+'--rar50-scratch-bytes=[Maximum temporary bytes for RAR5 scratch decoding]:SIZE:_default' \
+'--rar50-filter-memory-limit=[Maximum workspace per RAR5 scratch filter]:SIZE:_default' \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'--allow-rar3-vm[Run RAR 3 VM filter programs other than the six standard ones. Off by default\: they are arbitrary bytecode from the archive and can use a lot of CPU time. Enable only for archives you trust]' \
+'-v[Show all raw block/header fields (the developer-style dump)]' \
+'--verbose[Show all raw block/header fields (the developer-style dump)]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'*::paths -- One or more archive paths:_files' \
+&& ret=0
+;;
+(test)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--legacy-name-encoding=[Source encoding for legacy names without Unicode (e.g. cp850 or detect)]:ENCODING:_default' \
+'--rar50-buffered-decode-limit=[Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)]:SIZE:_default' \
+'--rar50-decode-workers=[Threads decoding RAR5/7 blocks ahead of the output; 0 decodes serially (default\: up to 8)]:N:_default' \
+'--rar50-dictionary-size-limit=[Maximum declared RAR5/7 dictionary size (not total memory)]:SIZE:_default' \
+'--max-member-output-bytes=[Maximum decoded output per logical member or archive comment]:SIZE:_default' \
+'--max-total-output-bytes=[Maximum decoded output per extraction/test call, or per archive comment]:SIZE:_default' \
+'--max-reader-workspace-bytes=[Maximum aggregate reader workspace per call (not process RAM)]:SIZE:_default' \
+'--max-header-count=[Maximum top-level headers per physical archive parse]:COUNT:_default' \
+'--max-header-bytes=[Maximum plaintext header bytes per physical archive parse]:SIZE:_default' \
+'--rar50-scratch-dir=[Directory for RAR5 filtered decoding above the buffering threshold]:PATH:_files' \
+'--rar50-scratch-bytes=[Maximum temporary bytes for RAR5 scratch decoding]:SIZE:_default' \
+'--rar50-filter-memory-limit=[Maximum workspace per RAR5 scratch filter]:SIZE:_default' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'--allow-rar3-vm[Run RAR 3 VM filter programs other than the six standard ones. Off by default\: they are arbitrary bytecode from the archive and can use a lot of CPU time. Enable only for archives you trust]' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'*::paths -- Archive path (first volume of a multi-part set), optionally followed by sibling parts:_files' \
+&& ret=0
+;;
+(extract)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--legacy-name-encoding=[Source encoding for legacy names without Unicode (e.g. cp850 or detect)]:ENCODING:_default' \
+'--rar50-buffered-decode-limit=[Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)]:SIZE:_default' \
+'--rar50-decode-workers=[Threads decoding RAR5/7 blocks ahead of the output; 0 decodes serially (default\: up to 8)]:N:_default' \
+'--rar50-dictionary-size-limit=[Maximum declared RAR5/7 dictionary size (not total memory)]:SIZE:_default' \
+'--max-member-output-bytes=[Maximum decoded output per logical member or archive comment]:SIZE:_default' \
+'--max-total-output-bytes=[Maximum decoded output per extraction/test call, or per archive comment]:SIZE:_default' \
+'--max-reader-workspace-bytes=[Maximum aggregate reader workspace per call (not process RAM)]:SIZE:_default' \
+'--max-header-count=[Maximum top-level headers per physical archive parse]:COUNT:_default' \
+'--max-header-bytes=[Maximum plaintext header bytes per physical archive parse]:SIZE:_default' \
+'--rar50-scratch-dir=[Directory for RAR5 filtered decoding above the buffering threshold]:PATH:_files' \
+'--rar50-scratch-bytes=[Maximum temporary bytes for RAR5 scratch decoding]:SIZE:_default' \
+'--rar50-filter-memory-limit=[Maximum workspace per RAR5 scratch filter]:SIZE:_default' \
+'--overwrite=[Behaviour when an extracted file already exists on disk]:OVERWRITE:((never\:""
+always\:""
+rename\:"Write beside an existing file as name(N).ext"))' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'--allow-rar3-vm[Run RAR 3 VM filter programs other than the six standard ones. Off by default\: they are arbitrary bytecode from the archive and can use a lot of CPU time. Enable only for archives you trust]' \
+'--in-place[Write each file at its destination instead of staging it; a failed member leaves a partial file]' \
+'--keep-broken[Keep a damaged member'\''s file with what could be read of it, like unrar -kb; implies --in-place]' \
+'--flatten[Write every file straight into the output directory under its base name, creating no directories]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'*::paths -- Archive (and optional sibling parts) followed by an output directory:_files' \
+&& ret=0
+;;
+(x)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--legacy-name-encoding=[Source encoding for legacy names without Unicode (e.g. cp850 or detect)]:ENCODING:_default' \
+'--rar50-buffered-decode-limit=[Maximum RAR 5 member size to decode in memory; larger ones stream (default 16m)]:SIZE:_default' \
+'--rar50-decode-workers=[Threads decoding RAR5/7 blocks ahead of the output; 0 decodes serially (default\: up to 8)]:N:_default' \
+'--rar50-dictionary-size-limit=[Maximum declared RAR5/7 dictionary size (not total memory)]:SIZE:_default' \
+'--max-member-output-bytes=[Maximum decoded output per logical member or archive comment]:SIZE:_default' \
+'--max-total-output-bytes=[Maximum decoded output per extraction/test call, or per archive comment]:SIZE:_default' \
+'--max-reader-workspace-bytes=[Maximum aggregate reader workspace per call (not process RAM)]:SIZE:_default' \
+'--max-header-count=[Maximum top-level headers per physical archive parse]:COUNT:_default' \
+'--max-header-bytes=[Maximum plaintext header bytes per physical archive parse]:SIZE:_default' \
+'--rar50-scratch-dir=[Directory for RAR5 filtered decoding above the buffering threshold]:PATH:_files' \
+'--rar50-scratch-bytes=[Maximum temporary bytes for RAR5 scratch decoding]:SIZE:_default' \
+'--rar50-filter-memory-limit=[Maximum workspace per RAR5 scratch filter]:SIZE:_default' \
+'--overwrite=[Behaviour when an extracted file already exists on disk]:OVERWRITE:((never\:""
+always\:""
+rename\:"Write beside an existing file as name(N).ext"))' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'--allow-rar3-vm[Run RAR 3 VM filter programs other than the six standard ones. Off by default\: they are arbitrary bytecode from the archive and can use a lot of CPU time. Enable only for archives you trust]' \
+'--in-place[Write each file at its destination instead of staging it; a failed member leaves a partial file]' \
+'--keep-broken[Keep a damaged member'\''s file with what could be read of it, like unrar -kb; implies --in-place]' \
+'--flatten[Write every file straight into the output directory under its base name, creating no directories]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'*::paths -- Archive (and optional sibling parts) followed by an output directory:_files' \
+&& ret=0
+;;
+(repair)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'-h[Print help]' \
+'--help[Print help]' \
+'-V[Print version]' \
+'--version[Print version]' \
+'*::paths -- Either <archive> <repaired-archive>, or <rar-parts-and-rev-files...> <outdir>:_files' \
+&& ret=0
+;;
+(add)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--format=[Target archive format (default\: rar50, the modern widely-compatible format)]:FORMAT:(rar14 rar15 rar20 rar29 rar30 rar40 rar50 rar70)' \
+'--level=[Compression level (0..5; 0 implies --store)]:LEVEL:_default' \
+'--dict-size=[Dictionary size (e.g. 4m, 128k; RAR 1.5+)]:SIZE:_default' \
+'--memory-limit=[Maximum total compression working memory (default\: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)]:SIZE:_default' \
+'--max-memory=[Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace]:SIZE:_default' \
+'--temp-dir=[Directory for temporary compressed payloads (RAR 5+)]:PATH:_files' \
+'--comment=[Archive-level comment]:TEXT:_default' \
+'--archive-name=[Archive name to embed in archive metadata service (RAR 5+)]:NAME:_default' \
+'--file-comment=[Per-file comment (not RAR 3.x/4.x)]:TEXT:_default' \
+'--recovery-percent=[Add a recovery record at the given percentage (1..100; RAR 5+)]:PERCENT:_default' \
+'--volume-size=[Split archive into volumes of this size]:SIZE:_default' \
+'--delta-filter=[Delta filter with the given channel count (RAR 2.9+)]:CHANNELS:_default' \
+'--rgb-filter=[RGB image filter with the given pixel width (RAR 2.9/3.x/4.x only)]:WIDTH:_default' \
+'--audio-filter=[Audio filter with the given channel count (RAR 2.9/3.x/4.x only)]:CHANNELS:_default' \
+'-C+[Read inputs from this directory and store names relative to it]:DIR:_files' \
+'--base-dir=[Read inputs from this directory and store names relative to it]:DIR:_files' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'--store[Store files without compression (equivalent to --level 0)]' \
+'--solid[Use solid compression (treats inputs as one continuous stream)]' \
+'--encrypt-headers[Encrypt archive headers (RAR 3.x/4.x and RAR 5+) (requires --password)]' \
+'--quick-open[Emit a quick-open service block (RAR 5+ only)]' \
+'--blake2sp[Store a BLAKE2sp hash of each file beside its CRC32 (RAR 5+ only)]' \
+'(--e8e9-filter)--e8-filter[E8 x86 call filter (RAR 2.9+)]' \
+'--e8e9-filter[E8E9 x86 call/jump filter (RAR 2.9+)]' \
+'--itanium-filter[Itanium filter (RAR 2.9/3.x/4.x only)]' \
+'--arm-filter[ARM filter (RAR 5+ only)]' \
+'--auto-filter[Auto-detect data filter (RAR 5+ does this by default)]' \
+'(--auto-filter)--no-filter[Skip filter detection, compressing the data as it is (RAR 2.9+; the older formats never look, so the flag passes without comment there)]' \
+'--ppmd[Use the PPMd compression algorithm (RAR 2.9/3.x/4.x only)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+':archive -- Output archive path:_files' \
+'*::files -- Files (and directories) to add to the archive:_files' \
+&& ret=0
+;;
+(a)
+_arguments "${_arguments_options[@]}" : \
+'-p+[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'--password=[Archive password (visible in process list — prefer --password-file or the TTY prompt)]:PASSWORD:_default' \
+'(-p --password)--password-file=[Read password from file ("-" for stdin); trailing newlines are stripped]:PATH:_files' \
+'--format=[Target archive format (default\: rar50, the modern widely-compatible format)]:FORMAT:(rar14 rar15 rar20 rar29 rar30 rar40 rar50 rar70)' \
+'--level=[Compression level (0..5; 0 implies --store)]:LEVEL:_default' \
+'--dict-size=[Dictionary size (e.g. 4m, 128k; RAR 1.5+)]:SIZE:_default' \
+'--memory-limit=[Maximum total compression working memory (default\: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)]:SIZE:_default' \
+'--max-memory=[Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace]:SIZE:_default' \
+'--temp-dir=[Directory for temporary compressed payloads (RAR 5+)]:PATH:_files' \
+'--comment=[Archive-level comment]:TEXT:_default' \
+'--archive-name=[Archive name to embed in archive metadata service (RAR 5+)]:NAME:_default' \
+'--file-comment=[Per-file comment (not RAR 3.x/4.x)]:TEXT:_default' \
+'--recovery-percent=[Add a recovery record at the given percentage (1..100; RAR 5+)]:PERCENT:_default' \
+'--volume-size=[Split archive into volumes of this size]:SIZE:_default' \
+'--delta-filter=[Delta filter with the given channel count (RAR 2.9+)]:CHANNELS:_default' \
+'--rgb-filter=[RGB image filter with the given pixel width (RAR 2.9/3.x/4.x only)]:WIDTH:_default' \
+'--audio-filter=[Audio filter with the given channel count (RAR 2.9/3.x/4.x only)]:CHANNELS:_default' \
+'-C+[Read inputs from this directory and store names relative to it]:DIR:_files' \
+'--base-dir=[Read inputs from this directory and store names relative to it]:DIR:_files' \
+'--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
+'--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
+'--store[Store files without compression (equivalent to --level 0)]' \
+'--solid[Use solid compression (treats inputs as one continuous stream)]' \
+'--encrypt-headers[Encrypt archive headers (RAR 3.x/4.x and RAR 5+) (requires --password)]' \
+'--quick-open[Emit a quick-open service block (RAR 5+ only)]' \
+'--blake2sp[Store a BLAKE2sp hash of each file beside its CRC32 (RAR 5+ only)]' \
+'(--e8e9-filter)--e8-filter[E8 x86 call filter (RAR 2.9+)]' \
+'--e8e9-filter[E8E9 x86 call/jump filter (RAR 2.9+)]' \
+'--itanium-filter[Itanium filter (RAR 2.9/3.x/4.x only)]' \
+'--arm-filter[ARM filter (RAR 5+ only)]' \
+'--auto-filter[Auto-detect data filter (RAR 5+ does this by default)]' \
+'(--auto-filter)--no-filter[Skip filter detection, compressing the data as it is (RAR 2.9+; the older formats never look, so the flag passes without comment there)]' \
+'--ppmd[Use the PPMd compression algorithm (RAR 2.9/3.x/4.x only)]' \
+'-h[Print help (see more with '\''--help'\'')]' \
+'--help[Print help (see more with '\''--help'\'')]' \
+'-V[Print version]' \
+'--version[Print version]' \
+':archive -- Output archive path:_files' \
+'*::files -- Files (and directories) to add to the archive:_files' \
+&& ret=0
+;;
+        esac
+    ;;
+esac
+}
+
+(( $+functions[_rars_commands] )) ||
+_rars_commands() {
+    local commands; commands=(
+'info:Display archive metadata' \
+'test:Verify archive integrity by extracting to a sink' \
+'extract:Extract archive contents' \
+'x:Extract archive contents' \
+'repair:Repair a damaged archive using its recovery record' \
+'add:Create a new archive' \
+'a:Create a new archive' \
+    )
+    _describe -t commands 'rars commands' commands "$@"
+}
+(( $+functions[_rars__subcmd__add_commands] )) ||
+_rars__subcmd__add_commands() {
+    local commands; commands=()
+    _describe -t commands 'rars add commands' commands "$@"
+}
+(( $+functions[_rars__subcmd__extract_commands] )) ||
+_rars__subcmd__extract_commands() {
+    local commands; commands=()
+    _describe -t commands 'rars extract commands' commands "$@"
+}
+(( $+functions[_rars__subcmd__info_commands] )) ||
+_rars__subcmd__info_commands() {
+    local commands; commands=()
+    _describe -t commands 'rars info commands' commands "$@"
+}
+(( $+functions[_rars__subcmd__repair_commands] )) ||
+_rars__subcmd__repair_commands() {
+    local commands; commands=()
+    _describe -t commands 'rars repair commands' commands "$@"
+}
+(( $+functions[_rars__subcmd__test_commands] )) ||
+_rars__subcmd__test_commands() {
+    local commands; commands=()
+    _describe -t commands 'rars test commands' commands "$@"
+}
+
+if [ "$funcstack[1]" = "_rars" ]; then
+    _rars "$@"
+else
+    compdef _rars rars
+fi

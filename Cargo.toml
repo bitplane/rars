@@ -3,6 +3,7 @@ members = [
     "crates/rars",
     "crates/rars-benches",
     "crates/rars-cli",
+    "crates/rars-manpages",
     "crates/rars-python",
     "crates/rars-wasm",
 ]

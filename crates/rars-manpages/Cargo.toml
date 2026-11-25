@@ -1,0 +1,16 @@
+[package]
+name = "rars-manpages"
+version = "0.13.1"
+description = "Generates the man pages and shell completions for the rars CLI."
+publish = false
+edition.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+clap_complete = "4.6"
+clap_mangen = "0.3"
+rars-cli = { path = "../rars-cli" }
