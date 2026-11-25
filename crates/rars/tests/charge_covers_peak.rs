@@ -649,11 +649,15 @@ fn members(case: &Case, tier: Tier) -> Vec<(String, EntrySource)> {
 }
 
 /// Writes one case's archive to a sink under `resources`.
-fn write(case: &Case, tier: Tier, members: &[(String, EntrySource)], resources: &WriterResources) {
+fn write(
+    case: &Case,
+    dictionary: Option<u64>,
+    members: &[(String, EntrySource)],
+    resources: &WriterResources,
+) {
     let mut features = FeatureSet::store_only();
     features.solid = case.path == Path::Solid;
     let version = case.writer.version();
-    let dictionary = case.writer.dictionary(tier, case.level);
     let sink = &mut std::io::sink();
     match case.writer {
         Writer::Rar13 => {
@@ -711,11 +715,14 @@ fn write(case: &Case, tier: Tier, members: &[(String, EntrySource)], resources: 
                 Path::Blocks => FilterPolicy::None,
                 _ => FilterPolicy::Auto,
             };
+            let mut options = rars::rar50::WriterOptions::new(version, features)
+                .with_compression_level(case.level);
+            if let Some(dictionary) = dictionary {
+                options = options.with_dictionary_size(dictionary);
+            }
             rars::rar50::write_streaming_archive_with_progress(
                 &entries,
-                rars::rar50::WriterOptions::new(version, features)
-                    .with_compression_level(case.level)
-                    .with_dictionary_size(dictionary.expect("RAR 5 always names one")),
+                options,
                 ArchiveExtras::default().with_filter_policy(policy),
                 resources,
                 None,
@@ -737,13 +744,14 @@ struct Measured {
 }
 
 fn run_case(case: Case, tier: Tier) -> Measured {
-    let members = members(&case, tier);
     let _one = MEASURING
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let members = members(&case, tier);
+    let dictionary = case.writer.dictionary(tier, case.level);
     let ((charged, default_limit), allocated) = measure(case.threads, || {
         let resources = WriterResources::default().with_memory_limit(LARGE_BUDGET);
-        write(&case, tier, &members, &resources);
+        write(&case, dictionary, &members, &resources);
         (
             resources.workspace_peak(),
             WriterResources::default().memory_limit(),
@@ -751,7 +759,7 @@ fn run_case(case: Case, tier: Tier) -> Measured {
     });
     let allocated_at_default = (charged > default_limit).then(|| {
         measure(case.threads, || {
-            write(&case, tier, &members, &WriterResources::default());
+            write(&case, dictionary, &members, &WriterResources::default());
         })
         .1
     });
@@ -952,6 +960,33 @@ fn check(tier: Tier, cases: Vec<Case>) {
 #[test]
 fn charges_cover_what_writers_allocate_on_a_sample() {
     check(Tier::Small, quick_cases());
+}
+
+#[test]
+fn rar5_level5_fitted_dictionary_charge_covers_three_symbol_noise() {
+    let case = Case {
+        writer: Writer::Rar5,
+        path: Path::FiltersAuto,
+        level: 5,
+        threads: 1,
+        input: Input::ThreeSymbol,
+    };
+    let _one = MEASURING
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let members = members(&case, Tier::Fitted);
+    let (charged, allocated) = measure(case.threads, || {
+        let resources = WriterResources::default();
+        write(&case, None, &members, &resources);
+        resources.workspace_peak()
+    });
+    eprintln!(
+        "allocated {} MiB, charged {} MiB",
+        mib(allocated),
+        mib(charged)
+    );
+    assert_eq!(charged, rars::DEFAULT_WRITER_PLANNING_LIMIT);
+    assert!(allocated <= charged);
 }
 
 /// Every writer, path, level, thread count and input at a 1 MiB dictionary.

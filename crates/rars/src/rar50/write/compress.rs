@@ -584,9 +584,11 @@ impl<B: Budget> BlockJob<B> {
 }
 
 pub(super) fn run_size(plan: &CompressPlan) -> usize {
-    plan.encode_options
-        .max_match_distance
-        .max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE)
+    run_size_for_distance(plan.encode_options.max_match_distance)
+}
+
+pub(super) fn run_size_for_distance(distance: usize) -> usize {
+    distance.max(crate::codec::rar50::MAX_LZ_BLOCK_SIZE)
 }
 
 /// The longest run an independent member is cut into: 4 MiB.

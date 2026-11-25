@@ -680,8 +680,7 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
     Ok((crc.finish(), hash.map(blake2sp::Hasher::finalize)))
 }
 
-/// What one compression job holds, for admitting jobs against the memory limit
-/// and for shrinking a fitted dictionary until it fits.
+/// The coding workspace of one streaming compression job.
 ///
 /// Nearly all of it is the match finder's chain links: four bytes per byte of
 /// window, and the window is a power of two, so a dictionary just over one costs
@@ -2088,11 +2087,7 @@ mod tests {
         // one that admits a 256 KiB window and nothing larger. Spelling the
         // parameters out here instead would make this test pass or fail on
         // whether the ladder had moved since.
-        let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
-        let parse = encode_options_for_level(Some(3), DEFAULT_RAR50_DICTIONARY_SIZE)
-            .unwrap()
-            .optimal_parse;
-        let room_for_256k = streaming_lz_workspace(256 * 1024, block, parse);
+        let room_for_256k = filter_policy::fitted_dictionary_workspace(3, 256 * 1024).unwrap();
 
         // A budget that cannot hold the fitted window takes the largest one it
         // can, rather than failing a write the old 128 KiB default would have
@@ -2100,7 +2095,7 @@ mod tests {
         let fitted = dictionary_size_for_options(options, 8 * 1024 * 1024, room_for_256k).unwrap();
 
         assert_eq!(fitted, 256 * 1024);
-        assert!(streaming_lz_workspace(fitted, block, parse) <= room_for_256k);
+        assert!(filter_policy::fitted_dictionary_workspace(3, fitted).unwrap() <= room_for_256k);
         // A dictionary the caller named is used as asked, so the write fails
         // later saying what it needed instead of quietly writing something else.
         assert_eq!(
@@ -2500,16 +2495,13 @@ mod tests {
         let dictionary_size =
             dictionary_size_for_options(options, dictionary_reach(&entries, false), u64::MAX)
                 .unwrap();
-        // Exactly what the writer charges itself, so the budget below admits one
-        // job and no more. Derived rather than written down, because a charge
-        // larger than the writer's would quietly make this a two-job test.
-        let required = streaming_lz_workspace(
+        // Allow the fitted dictionary at both budgets while the smaller
+        // budget admits only one job.
+        let required = filter_policy::fitted_dictionary_workspace(
+            filter_policy::resolved_level(options.compression_level),
             dictionary_size,
-            1024 * 1024,
-            encode_options_for_level(options.compression_level, dictionary_size)
-                .unwrap()
-                .optimal_parse,
-        );
+        )
+        .unwrap();
         let mut one_job = Vec::new();
         write_streaming_archive_to(
             &entries,

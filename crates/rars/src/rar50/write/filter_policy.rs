@@ -328,16 +328,8 @@ pub(super) fn dictionary_size_for_options(
         None => {
             let level = resolved_level(options.compression_level);
             let mut fitted = fitted_dictionary_size(content, level);
-            // Whether the level parses optimally decides how much a window
-            // costs, and the level owns that answer. The size passed here does
-            // not change it.
-            let optimal_parse = encode_options_for_level(Some(level), fitted)?.optimal_parse;
             while fitted > DEFAULT_RAR50_DICTIONARY_SIZE
-                && super::streaming_lz_workspace(
-                    fitted,
-                    crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-                    optimal_parse,
-                ) > memory_limit
+                && fitted_dictionary_workspace(level, fitted)? > memory_limit
             {
                 fitted /= 2;
             }
@@ -346,6 +338,17 @@ pub(super) fn dictionary_size_for_options(
     };
     validate_dictionary_size(options.target, size)?;
     Ok(size)
+}
+
+/// Reserve for a full block job, including room for per-run filters.
+pub(super) fn fitted_dictionary_workspace(level: u8, dictionary: u64) -> Result<u64> {
+    let options = encode_options_for_level(Some(level), dictionary)?;
+    let code = super::streaming_lz_workspace(
+        dictionary,
+        crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
+        options.optimal_parse,
+    );
+    Ok(super::plan::block_admission(code, options, u64::MAX, true))
 }
 
 pub(super) fn validate_dictionary_size(target: crate::ArchiveVersion, size: u64) -> Result<()> {
