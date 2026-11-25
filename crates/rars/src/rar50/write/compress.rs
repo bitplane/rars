@@ -5487,6 +5487,7 @@ mod tests {
                             .unwrap();
                         let mut packed = Vec::new();
                         members[0].packed.copy_to(&mut packed).unwrap();
+                        drop(members);
                         assert_eq!(resources.workspace_in_use(), 0);
                         packed
                     })

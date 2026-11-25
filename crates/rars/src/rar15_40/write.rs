@@ -6979,28 +6979,40 @@ mod tests {
             }
         }
         let dir = crate::scratch::case("rar15-40-piped");
-        let resources = crate::WriterResources::default().with_temp_dir(dir.to_path_buf());
         let members: Vec<_> = entries.iter().map(super::Member::from_streaming).collect();
-        let mut out = Piped {
-            out: Vec::new(),
-            dir: dir.to_path_buf(),
-            saw_spool: false,
+        let write = |resources: &crate::WriterResources| {
+            let mut out = Piped {
+                out: Vec::new(),
+                dir: dir.to_path_buf(),
+                saw_spool: false,
+            };
+            super::write_archive_to(
+                &members,
+                options,
+                coding.clone(),
+                None,
+                resources,
+                None,
+                super::CallerOutput::stream(&mut out).streaming_above(256 * 1024),
+                None,
+                None,
+            )
+            .unwrap();
+            let left = std::fs::read_dir(&*dir).unwrap().count();
+            assert_eq!(left, 0, "a spool was left behind");
+            (out.out, out.saw_spool)
         };
-        super::write_archive_to(
-            &members,
-            options,
-            coding,
-            None,
-            &resources,
-            None,
-            super::CallerOutput::stream(&mut out).streaming_above(256 * 1024),
-            None,
-            None,
-        )
-        .unwrap();
-        let left = std::fs::read_dir(&*dir).unwrap().count();
-        assert_eq!(left, 0, "a spool was left behind");
-        (out.out, out.saw_spool)
+        let resources = crate::WriterResources::default().with_temp_dir(dir.to_path_buf());
+        let (on_disk, saw_spool) = write(&resources.clone().with_spools_on_disk());
+        // Members this small spool in memory, to the same archive, give or
+        // take the random salts of encrypted ones.
+        let (in_memory, saw_memory_spool) = write(&resources);
+        assert!(!saw_memory_spool, "a spool went to disk");
+        assert_eq!(in_memory.len(), on_disk.len());
+        if entries.iter().all(|entry| entry.password.is_none()) {
+            assert!(in_memory == on_disk);
+        }
+        (on_disk, saw_spool)
     }
 
     #[test]

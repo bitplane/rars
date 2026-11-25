@@ -4364,7 +4364,7 @@ mod emission_ledger_tests {
         let data = vec![7; 131072];
         for estimated_limit in [16384, 8 * 1024 * 1024] {
             let base = WriterResources::new(estimated_limit).with_temp_dir(&*scratch);
-            let mut prefix = Spool::create(&base).unwrap();
+            let mut prefix = Spool::create_on_disk(&base).unwrap();
             prefix.write_all(&data).unwrap();
             let mut expected = Vec::new();
             write_recovery_service(10, &mut prefix, None, &base, None, &mut expected).unwrap();

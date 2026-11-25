@@ -2406,7 +2406,6 @@ mod tests {
             }
         }
         let dir = crate::scratch::case("rars-rar13-spooled");
-        let resources = super::WriterResources::default().with_temp_dir(dir.to_path_buf());
         let files: Vec<_> = entries
             .iter()
             .map(|entry| super::BorrowedFileEntry {
@@ -2421,29 +2420,36 @@ mod tests {
                 source: Some(&entry.source),
             })
             .collect();
-        let mut out = Watching {
-            out: std::io::Cursor::new(Vec::new()),
-            dir: dir.to_path_buf(),
-            saw_spool: false,
+        let write = |resources: &super::WriterResources| {
+            let mut out = Watching {
+                out: std::io::Cursor::new(Vec::new()),
+                dir: dir.to_path_buf(),
+                saw_spool: false,
+            };
+            let output = if seekable {
+                super::CallerOutput::seekable(&mut out)
+            } else {
+                super::CallerOutput::stream(&mut out)
+            };
+            super::write_archive_with_sources(
+                &files,
+                options,
+                super::MemberCoding::Compressed,
+                None,
+                resources,
+                None,
+                output.streaming_above(stream_above),
+            )
+            .unwrap();
+            let left = std::fs::read_dir(&*dir).unwrap().count();
+            assert_eq!(left, 0, "a spool was left behind");
+            (out.out.into_inner(), out.saw_spool)
         };
-        let output = if seekable {
-            super::CallerOutput::seekable(&mut out)
-        } else {
-            super::CallerOutput::stream(&mut out)
-        };
-        super::write_archive_with_sources(
-            &files,
-            options,
-            super::MemberCoding::Compressed,
-            None,
-            &resources,
-            None,
-            output.streaming_above(stream_above),
-        )
-        .unwrap();
-        let left = std::fs::read_dir(&*dir).unwrap().count();
-        assert_eq!(left, 0, "a spool was left behind");
-        (out.out.into_inner(), out.saw_spool)
+        let resources = super::WriterResources::default().with_temp_dir(dir.to_path_buf());
+        let (on_disk, saw_spool) = write(&resources.clone().with_spools_on_disk());
+        // Members this small spool in memory, to the same archive.
+        assert_eq!(write(&resources), (on_disk.clone(), false));
+        (on_disk, saw_spool)
     }
 
     fn spooled_members() -> Vec<(&'static str, Vec<u8>)> {

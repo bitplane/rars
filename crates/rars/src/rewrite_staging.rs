@@ -678,7 +678,7 @@ mod native {
             let resources = WriterResources::new(0).with_temp_dir(&*root);
             let used = Arc::new(AtomicU64::new(0));
             let mut sink = Sink {
-                spool: Rc::new(RefCell::new(Spool::create(&resources).unwrap())),
+                spool: Rc::new(RefCell::new(Spool::create_on_disk(&resources).unwrap())),
                 used: used.clone(),
                 limit: 16,
             };
