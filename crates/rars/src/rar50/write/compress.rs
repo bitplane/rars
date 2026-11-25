@@ -28,9 +28,9 @@ use super::FilterPolicy;
 use crate::codec::packed_chain::SharedPackedIndex;
 use crate::codec::rar50::EncodeOptions;
 use crate::codec::rar50::{
-    filter_streaming_blocks_in_place, run_trees, run_trees_workspace, streaming_blocks_in_window,
-    streaming_blocks_with_finder, streaming_blocks_with_tree, BlockSplitter, EncodeFilter,
-    RunFinder,
+    filter_streaming_blocks_in_place, run_trees, run_trees_workspace, seed_chains,
+    streaming_blocks_in_window, streaming_blocks_with_finder, streaming_blocks_with_tree,
+    BlockSplitter, EncodeFilter, RunFinder,
 };
 use crate::codec::workspace::{Allowance, Budget, Buffer};
 use crate::crc32::Crc32;
@@ -326,6 +326,16 @@ where
             && (crate::codec::rar50::searches_tree(window, start, options)
                 || crate::codec::rar50::packed_index_fits(window, start, options))
     };
+    // A run alone in its group shares nothing, but one that seeds a tree from
+    // history is still worth a group of its own: the group seeds it before
+    // anything codes, on threads its own job would leave idle.
+    let seeds_alone = |job: &BlockJob<B>| {
+        let (window, start) = (own_window(job), job.history.len().min(dictionary));
+        !chain
+            && start != 0
+            && crate::parallel::threads() > 1
+            && crate::codec::rar50::searches_tree(window, start, options)
+    };
     let next_to = |before: &BlockJob<B>, after: &BlockJob<B>| {
         chain || before.offset + before.data.len() == after.offset
     };
@@ -363,7 +373,7 @@ where
                 group.push(index);
                 continue;
             }
-            if group.len() > 1 {
+            if group.len() > 1 || group.first().is_some_and(|&only| seeds_alone(&jobs[only])) {
                 groups.push((std::mem::take(&mut group), window_len));
             }
             group.clear();
@@ -392,51 +402,89 @@ where
     crate::parallel::for_each_mut(&mut builds, |_, (group, window_len, result)| {
         *result = share_group(group, *window_len, options, allowance);
     });
-    // One group at a time, since each seeds on every thread and holds a seed
-    // tree while it does, which the wave is charged for once.
-    for (group, _, result) in builds.iter_mut() {
+    for (_, _, result) in builds.iter_mut() {
         std::mem::replace(result, Ok(()))?;
-        if !chain {
-            seed_group_trees(group, options, allowance)?;
-        }
+    }
+    if chain {
+        return Ok(());
+    }
+    // Nothing codes until the trees are seeded, so the seeding has every
+    // thread. Groups that seed from a shared tree go one at a time, since
+    // each holds one while it does, which the wave is charged for once. The
+    // others hold only their runs' own trees, and split the threads.
+    let (shared, mut alone): (Vec<_>, Vec<_>) = builds
+        .into_iter()
+        .filter_map(|(group, _, _)| Some((TreeRuns::of(&group, options)?, group, Ok(()))))
+        .partition(|(runs, _, _)| runs.chains.iter().any(|chain| chain.len() > 1));
+    let threads = (crate::parallel::threads() / alone.len().max(1)).max(1);
+    crate::parallel::for_each_mut(&mut alone, |_, (runs, group, result)| {
+        let _cap = crate::parallel::ThreadCap::set(Some(threads));
+        *result = runs.seed(group, options, allowance);
+    });
+    alone.into_iter().try_for_each(|(_, _, result)| result)?;
+    for (runs, mut group, _) in shared {
+        runs.seed(&mut group, options, allowance)?;
     }
     Ok(())
 }
 
-/// Seeds the trees of a group's runs that search one from a single tree,
-/// where their histories overlap ([`run_trees`]). Each run gets the tree it
-/// would have seeded itself.
-fn seed_group_trees<B: Budget>(
-    group: &mut [&mut BlockJob<B>],
-    options: EncodeOptions,
-    allowance: &B,
-) -> Result<()> {
-    let trees: Vec<usize> = (0..group.len())
-        .filter(|&index| {
-            group[index]
-                .shared
-                .as_ref()
-                .is_some_and(|shared| shared.finder.is_none())
+/// The runs of a group that search a tree and have none yet, and how they
+/// are to be seeded.
+struct TreeRuns<B: Budget> {
+    window: std::sync::Arc<Buffer<u8, B>>,
+    /// Their indexes in the group.
+    trees: Vec<usize>,
+    /// Where each starts and ends in `window`.
+    runs: Vec<std::ops::Range<usize>>,
+    /// [`seed_chains`] over `runs`.
+    chains: Vec<std::ops::Range<usize>>,
+}
+
+impl<B: Budget + Sync> TreeRuns<B>
+where
+    B::Charge: Send,
+{
+    /// `None` where no run of `group` is seeded before its job starts.
+    fn of(group: &[&mut BlockJob<B>], options: EncodeOptions) -> Option<Self> {
+        let trees: Vec<usize> = (0..group.len())
+            .filter(|&index| {
+                group[index]
+                    .shared
+                    .as_ref()
+                    .is_some_and(|shared| shared.finder.is_none())
+            })
+            .collect();
+        let window = std::sync::Arc::clone(&group[*trees.first()?].shared.as_ref()?.window);
+        let runs: Vec<_> = trees
+            .iter()
+            .map(|&index| {
+                let shared = group[index].shared.as_ref().expect("a shared run");
+                debug_assert!(std::sync::Arc::ptr_eq(&shared.window, &window));
+                shared.start..shared.end
+            })
+            .collect();
+        let chains = seed_chains(&window, &runs, options);
+        (!chains.is_empty()).then_some(Self {
+            window,
+            trees,
+            runs,
+            chains,
         })
-        .collect();
-    let Some(&first) = trees.first() else {
-        return Ok(());
-    };
-    let window = std::sync::Arc::clone(&group[first].shared.as_ref().expect("a shared run").window);
-    let runs: Vec<std::ops::Range<usize>> = trees
-        .iter()
-        .map(|&index| {
-            let shared = group[index].shared.as_ref().expect("a shared run");
-            debug_assert!(std::sync::Arc::ptr_eq(&shared.window, &window));
-            shared.start..shared.end
-        })
-        .collect();
-    if let Some(seeded) = run_trees(&window, &runs, options, allowance)? {
-        for (&index, tree) in trees.iter().zip(seeded) {
+    }
+
+    /// Hands each run the tree it would have seeded itself ([`run_trees`]).
+    fn seed(
+        &self,
+        group: &mut [&mut BlockJob<B>],
+        options: EncodeOptions,
+        allowance: &B,
+    ) -> Result<()> {
+        let seeded = run_trees(&self.window, &self.runs, &self.chains, options, allowance)?;
+        for (&index, tree) in self.trees.iter().zip(seeded.into_iter().flatten()) {
             group[index].shared.as_mut().expect("a shared run").finder = tree.map(RunFinder::Tree);
         }
+        Ok(())
     }
-    Ok(())
 }
 
 fn share_group<B: Budget + Send + Sync>(
@@ -1513,16 +1561,37 @@ fn compress_streaming_members(
     }
 }
 
+/// What one encode of a filter search over up to `len` bytes holds.
+fn filter_search_workspace(options: EncodeOptions, len: u64) -> u64 {
+    use crate::codec::rar50::{lazy_parse_workspace, MAX_LZ_BLOCK_SIZE};
+    let piece = len.min(filter_search_bytes() as u64);
+    let reach = piece.min(options.max_match_distance as u64);
+    let block = piece.min(MAX_LZ_BLOCK_SIZE as u64) as usize;
+    let scratch = if options.optimal_parse {
+        super::streaming_lz_workspace(reach, block, true)
+    } else {
+        lazy_parse_workspace(options, usize::try_from(reach).unwrap_or(usize::MAX), block)
+    };
+    scratch.saturating_add(piece.saturating_mul(2))
+}
+
 /// Assembly, filter selection and coding hold different sets of buffers.
 #[derive(Default, Clone, Copy)]
 struct WaveWorkspace {
     assembly: u64,
     filter_inputs: u64,
+    /// One filter search's scratch for each job, which searches its pieces
+    /// one at a time under an execution ledger.
     filter_search: u64,
+    /// One for each piece, and the most one holds, for the searches of every
+    /// piece in the wave side by side ([`choose_run_filters`]).
+    piece_searches: u64,
+    piece_search: u64,
     coding: u64,
 }
 
 impl WaveWorkspace {
+    #[allow(clippy::too_many_arguments)]
     fn add_job(
         self,
         options: EncodeOptions,
@@ -1530,6 +1599,7 @@ impl WaveWorkspace {
         history: u64,
         block: usize,
         filter_piece: u64,
+        filter_pieces: u64,
         tree_chunk_size: Option<usize>,
     ) -> Self {
         use crate::codec::rar50::{lazy_parse_workspace, MAX_LZ_BLOCK_SIZE};
@@ -1558,12 +1628,7 @@ impl WaveWorkspace {
             .saturating_add(window)
             .saturating_add(history);
         let search = if filter_piece > 0 {
-            let piece = filter_piece.min(filter_search_bytes() as u64);
-            scratch(
-                piece.min(options.max_match_distance as u64),
-                piece.min(MAX_LZ_BLOCK_SIZE as u64) as usize,
-            )
-            .saturating_add(piece.saturating_mul(2))
+            filter_search_workspace(options, filter_piece)
         } else {
             0
         };
@@ -1597,14 +1662,25 @@ impl WaveWorkspace {
             assembly: self.assembly.saturating_add(assembly),
             filter_inputs: self.filter_inputs.saturating_add(cap),
             filter_search: self.filter_search.saturating_add(search),
+            piece_searches: self
+                .piece_searches
+                .saturating_add(search.saturating_mul(filter_pieces)),
+            piece_search: self.piece_search.max(search),
             coding: self.coding.saturating_add(coding),
         }
     }
 
     /// `seed` is held beside the coded jobs' trees while their windows are
-    /// shared out, before any of them codes.
-    fn peak(self, retained: u64, seed: u64) -> u64 {
-        let filters = self.filter_inputs.saturating_add(self.filter_search);
+    /// shared out, before any of them codes. `piece_threads` is how many
+    /// filter searches run at once when the wave's pieces are searched side by
+    /// side, or `None` when each job searches its own in turn.
+    fn peak(self, retained: u64, seed: u64, piece_threads: Option<u64>) -> u64 {
+        let search = piece_threads.map_or(self.filter_search, |threads| {
+            self.piece_searches
+                .min(self.piece_search.saturating_mul(threads))
+                .max(self.filter_search)
+        });
+        let filters = self.filter_inputs.saturating_add(search);
         self.assembly
             .max(filters)
             .max(self.coding.saturating_add(seed))
@@ -1666,10 +1742,15 @@ impl BlockWave {
             history,
             crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
             filter_piece,
+            filter_piece.div_ceil(filter_search_bytes() as u64),
             single_pass_tree_chunk(plan, filter_runs, min_len, history)
                 .filter(|_| resources.execution.is_none()),
         );
-        let charge = workspace.peak(retained, seed);
+        let piece_threads = resources
+            .execution
+            .is_none()
+            .then(|| crate::parallel::threads() as u64);
+        let charge = workspace.peak(retained, seed, piece_threads);
         let scopes = self
             .scopes
             .saturating_add(required.saturating_add(crate::codec::workspace::RESERVATION_BYTES));
@@ -1717,26 +1798,21 @@ impl BlockWave {
                 .max()
                 .unwrap_or(0);
         }
-        let filter_piece = if !filter_runs || plan.filter_policy != FilterPolicy::Auto {
-            0
-        } else if job.segments.is_empty() {
-            job.runs(job.data.len())
-                .map(|run| run.len())
-                .max()
-                .unwrap_or(0)
-        } else {
-            job.segments
-                .iter()
-                .map(|(segment, _)| segment.len())
-                .max()
-                .unwrap_or(0)
-        };
+        let (filter_piece, filter_pieces) =
+            if !filter_runs || plan.filter_policy != FilterPolicy::Auto {
+                (0, 0)
+            } else {
+                filter_pieces(job).fold((0, 0), |(most, count), (piece, _)| {
+                    (most.max(piece.len()), count + 1)
+                })
+            };
         self.workspace = self.workspace.add_job(
             plan.encode_options,
             job.data.len() as u64,
             history,
             block,
             filter_piece as u64,
+            filter_pieces,
             single_pass_tree_chunk(plan, filter_runs, job.data.len() as u64, history)
                 .filter(|_| !B::LIMITED),
         );
@@ -2788,8 +2864,10 @@ fn explicit_run_range(
     (start < end).then(|| start - run.start..end - run.start)
 }
 
-/// Each admitted job searches its own pieces in order. At most one search
-/// holds scratch for that job at a time.
+/// Each admitted job searches its own pieces in order, so at most one search
+/// holds scratch for that job at a time. Without an execution ledger every
+/// piece of the wave is searched side by side instead, as many at once as
+/// there are threads ([`WaveWorkspace::peak`]).
 fn choose_run_filters<B: Budget>(
     jobs: &mut [BlockJob<B>],
     plan: &CompressPlan,
@@ -2797,70 +2875,116 @@ fn choose_run_filters<B: Budget>(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
 ) -> Result<()> {
-    let searches = Records::collect(jobs.iter().map(Ok), resources)?;
-    let found = if resources.execution.is_some() {
-        run_jobs_admitted(
+    if resources.execution.is_some() {
+        let searches = Records::collect(jobs.iter().map(Ok), resources)?;
+        let found = run_jobs_admitted(
             searches,
             resources,
             advance,
             |_| required,
             |job, worker, progress, allowance| {
-                choose_job_filters(job, plan, worker, progress, allowance)
+                let mut filters = Records::new(0, worker)?;
+                for (range, offset) in filter_pieces(job) {
+                    let found =
+                        search_filter_piece(job, range, offset, plan, progress, worker, allowance)?;
+                    for spec in found {
+                        filters.push_growing(spec)?;
+                    }
+                }
+                Ok(filters)
             },
-        )?
-    } else {
-        run_jobs(searches, resources, advance, |job, progress| {
-            choose_job_filters(job, plan, resources, progress, &Allowance::default())
-        })?
-    };
-    for (job, filters) in jobs.iter_mut().zip(found) {
-        job.filters = filters;
+        )?;
+        for (job, filters) in jobs.iter_mut().zip(found) {
+            job.filters = filters;
+        }
+        return Ok(());
+    }
+    let mut pieces = Records::new(0, resources)?;
+    for (index, job) in jobs.iter().enumerate() {
+        for (range, offset) in filter_pieces(job) {
+            pieces.push_growing((index, range, offset))?;
+        }
+    }
+    let owners = Records::collect(pieces.iter().map(|&(index, _, _)| Ok(index)), resources)?;
+    let found = run_jobs(
+        pieces,
+        resources,
+        advance,
+        |(index, range, offset), progress| {
+            search_filter_piece(
+                &jobs[index],
+                range,
+                offset,
+                plan,
+                progress,
+                resources,
+                &Allowance::default(),
+            )
+        },
+    )?;
+    for job in jobs.iter_mut() {
+        job.filters = Records::new(0, resources)?;
+    }
+    for (index, found) in owners.into_iter().zip(found) {
+        for spec in found {
+            jobs[index].filters.push_growing(spec)?;
+        }
     }
     Ok(())
 }
 
-fn choose_job_filters<B: Budget, C: Budget>(
+/// The pieces a job's filters are searched in, each with where it starts in
+/// its file. A joined job searches on the same grid as its runs would alone.
+fn filter_pieces<B: Budget>(
     job: &BlockJob<B>,
-    plan: &CompressPlan,
-    resources: &WriterResources,
-    progress: &dyn CompressionProgress,
-    allowance: &C,
-) -> Result<Records<crate::FilterSpec>> {
-    let runs;
-    let segments = if job.segments.is_empty() {
-        // A joined job searches on the same grid as its runs would alone.
-        runs = job
-            .runs(job.data.len())
+) -> impl Iterator<Item = (std::ops::Range<usize>, usize)> + '_ {
+    let segments: Vec<(std::ops::Range<usize>, usize)> = if job.segments.is_empty() {
+        job.runs(job.data.len())
             .map(|run| {
                 let offset = job.offset + run.start;
                 (run, offset)
             })
-            .collect::<Vec<_>>();
-        &runs[..]
+            .collect()
     } else {
-        &job.segments[..]
+        job.segments.iter().cloned().collect()
     };
-    let mut filters = Records::new(0, resources)?;
     let piece = filter_search_bytes();
-    for (segment, file_offset) in segments {
-        for start in (segment.start..segment.end).step_by(piece) {
-            let end = (start + piece).min(segment.end);
-            let offset = file_offset + (start - segment.start);
-            let specs = super::filter_policy::run_filters_with_allowance(
-                &job.data[start..end],
-                offset,
-                plan.algorithm_version,
-                plan.encode_options,
-                &|| progress.is_cancelled(),
-                allowance,
-            )?;
-            for spec in specs {
-                let span = spec
-                    .range
-                    .map_or(start..end, |r| start + r.start..start + r.end);
-                filters.push_growing(crate::FilterSpec::range(spec.kind, span))?;
-            }
-        }
+    segments
+        .into_iter()
+        .flat_map(move |(segment, file_offset)| {
+            (segment.start..segment.end)
+                .step_by(piece)
+                .map(move |start| {
+                    let end = (start + piece).min(segment.end);
+                    (start..end, file_offset + (start - segment.start))
+                })
+        })
+}
+
+/// The filters found in one piece of `job`'s data, ranged over the data.
+fn search_filter_piece<B: Budget, C: Budget>(
+    job: &BlockJob<B>,
+    range: std::ops::Range<usize>,
+    offset: usize,
+    plan: &CompressPlan,
+    progress: &dyn CompressionProgress,
+    resources: &WriterResources,
+    allowance: &C,
+) -> Result<Records<crate::FilterSpec>> {
+    let specs = super::filter_policy::run_filters_with_allowance(
+        &job.data[range.clone()],
+        offset,
+        plan.algorithm_version,
+        plan.encode_options,
+        &|| progress.is_cancelled(),
+        allowance,
+    )?;
+    let mut filters = Records::new(0, resources)?;
+    for spec in specs {
+        let span = spec.range.map_or(range.clone(), |r| {
+            range.start + r.start..range.start + r.end
+        });
+        filters.push_growing(crate::FilterSpec::range(spec.kind, span))?;
     }
     Ok(filters)
 }
@@ -5736,9 +5860,11 @@ mod tests {
         assert_eq!(member_run_size(&lazy), 16 * MIB as usize);
     }
 
-    /// Runs shorter than the dictionary code the same member at 1, 2 and 8
+    /// Runs shorter than the dictionary code the same member at 1, 2, 4 and 8
     /// threads, which join them four, two and one to a job, and the short
-    /// tail joins the run before it (#546).
+    /// tail joins the run before it (#546). With their filters searched, the
+    /// pieces are searched side by side, and a run whose job follows an
+    /// unshared one has its tree seeded before the jobs start.
     #[cfg(all(
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))
@@ -5749,48 +5875,57 @@ mod tests {
         let options = EncodeOptions::new(8)
             .with_max_match_distance(2 * MIB)
             .with_optimal_parse(true);
-        let plan = CompressPlan {
-            algorithm_version: 0,
-            encode_options: options,
-            dictionary_size: 2 * MIB as u64,
-            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
-            solid: false,
-            method: 1,
-            filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
-            blake2sp: true,
-        };
         let data = joined_runs_input(MIB);
         let sources = [EntrySource::from_bytes(data.clone())];
         let scratch = crate::scratch::case("short-runs-threads");
-        let code = |threads: usize| -> Vec<u8> {
-            rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .build()
-                .unwrap()
-                .install(|| {
-                    super::super::plan::with_filter_search_bytes(MIB, || {
-                        assert_eq!(member_run_size(&plan), MIB);
-                        let resources = WriterResources::default().with_temp_dir(&*scratch);
-                        let mut members =
-                            compress_members_reporting(&sources, plan.clone(), &resources, &|_| {
-                                true
-                            })
+        for filter_policy in [FilterPolicy::None, FilterPolicy::Auto] {
+            let plan = CompressPlan {
+                algorithm_version: 0,
+                encode_options: options,
+                dictionary_size: 2 * MIB as u64,
+                block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+                solid: false,
+                method: 1,
+                filter_policy: filter_policy.clone(),
+                candidates: vec![options].into(),
+                blake2sp: true,
+            };
+            let code = |threads: usize| -> Vec<u8> {
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        super::super::plan::with_filter_search_bytes(MIB, || {
+                            assert_eq!(member_run_size(&plan), MIB);
+                            let resources = WriterResources::default().with_temp_dir(&*scratch);
+                            let mut members = compress_members_reporting(
+                                &sources,
+                                plan.clone(),
+                                &resources,
+                                &|_| true,
+                            )
                             .unwrap();
-                        let mut packed = Vec::new();
-                        members[0].packed.copy_to(&mut packed).unwrap();
-                        drop(members);
-                        assert_eq!(resources.workspace_in_use(), 0);
-                        packed
+                            let mut packed = Vec::new();
+                            members[0].packed.copy_to(&mut packed).unwrap();
+                            drop(members);
+                            assert_eq!(resources.workspace_in_use(), 0);
+                            packed
+                        })
                     })
-                })
-        };
-        let one = code(1);
-        for threads in [2, 8] {
-            assert!(code(threads) == one, "{threads} threads changed the member");
+            };
+            let one = code(1);
+            for threads in [2, 4, 8] {
+                assert!(
+                    code(threads) == one,
+                    "{threads} threads changed the member, {filter_policy:?}"
+                );
+            }
+            if filter_policy == FilterPolicy::None {
+                let decoded = crate::codec::rar50::decode_lz(&one, 0, data.len()).unwrap();
+                assert!(decoded == data, "the member does not round-trip");
+            }
         }
-        let decoded = crate::codec::rar50::decode_lz(&one, 0, data.len()).unwrap();
-        assert!(decoded == data, "the member does not round-trip");
     }
 
     /// A job of several runs parses straight through where each run of its
