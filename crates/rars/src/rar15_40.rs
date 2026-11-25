@@ -2057,6 +2057,9 @@ impl Archive {
         session.read_control = budget.control.clone();
         let archive_solid = self.main.is_solid() || self.files().any(|file| file.is_solid());
         let solid = selector.is_some() && archive_solid;
+        let _read_ahead = self
+            .source
+            .bound_file_read_ahead(selector.is_some() && !archive_solid);
         for file in self.files() {
             let selected = crate::extraction_control::select(
                 &mut selector,

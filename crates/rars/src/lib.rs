@@ -1221,6 +1221,8 @@ impl Archive {
     /// encrypted independent member without reading its payload. Skipped output
     /// does not consume output quotas and is not verified. Parsing limits and
     /// passwords needed to read encrypted headers still apply before this call.
+    /// See [`ArchiveReader::read_reader`] for the source truncation guarantee
+    /// when extracting one member of a non-solid archive.
     ///
     /// `Extract` uses the same decoding, output accounting and writer flushing
     /// as [`Self::extract_to`].
@@ -1927,8 +1929,14 @@ impl ArchiveReader {
     /// Parses an owned seekable source without copying the complete archive.
     ///
     /// Reads from offset zero regardless of the source's initial position. The
-    /// archive and its clones retain the source until they are dropped. Its
-    /// contents and length must remain unchanged throughout that lifetime.
+    /// archive and its clones retain the source until they are dropped.
+    /// For solid archives, the source's contents and length must remain unchanged.
+    /// After parsing a non-solid archive, selecting one member with
+    /// [`Archive::extract_with_control`] and skipping every other member reads no
+    /// bytes at or past the end of the selected member's packed data. This also
+    /// applies to [`Self::read_path`]. A caller extracting in reverse order may
+    /// truncate away members it has already extracted and keep using the parsed
+    /// archive for these selections. The source must otherwise remain unchanged.
     /// Sources borrowed from a shorter-lived owner are not supported; an owned
     /// file, memory-map wrapper, or shared virtual-file handle can be supplied.
     ///
@@ -1950,7 +1958,7 @@ impl ArchiveReader {
     }
 
     /// Parses an owned seekable source with the same policies as [`Self::read_with_options`].
-    /// Ownership, positioning and concurrency follow [`Self::read_reader`].
+    /// Ownership, positioning, concurrency and source truncation follow [`Self::read_reader`].
     pub fn read_reader_with_options<R: Read + std::io::Seek + Send + 'static>(
         reader: R,
         options: ArchiveReadOptions<'_>,

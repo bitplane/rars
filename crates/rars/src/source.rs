@@ -1,6 +1,6 @@
 use crate::error::{Error, Result};
 use crate::io_util::read_exact_at;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
@@ -169,18 +169,32 @@ impl Window {
 thread_local! {
     static PARKED: RefCell<Option<(Weak<FileSource>, Window)>> =
         const { RefCell::new(None) };
+    static BOUNDED_READ_AHEAD: Cell<*const FileSource> = const { Cell::new(std::ptr::null()) };
+}
+
+pub(crate) struct FileReadAheadLimit<'a> {
+    previous: *const FileSource,
+    _source: &'a Arc<FileSource>,
+}
+
+impl Drop for FileReadAheadLimit<'_> {
+    fn drop(&mut self) {
+        BOUNDED_READ_AHEAD.set(self.previous);
+    }
 }
 
 pub(crate) struct FileCursor {
     source: Arc<FileSource>,
     position: u64,
     end: u64,
+    bound_read_ahead: bool,
     window: Option<Window>,
 }
 
 impl FileCursor {
     fn new(source: Arc<FileSource>, range: Range<usize>) -> Self {
         let position = range.start as u64;
+        let bound_read_ahead = std::ptr::eq(BOUNDED_READ_AHEAD.get(), Arc::as_ptr(&source));
         let window = PARKED.with_borrow_mut(|parked| {
             let adopt = parked.as_ref().is_some_and(|(owner, window)| {
                 std::ptr::eq(owner.as_ptr(), Arc::as_ptr(&source)) && window.holds(position)
@@ -195,6 +209,7 @@ impl FileCursor {
             source,
             position,
             end: range.end as u64,
+            bound_read_ahead,
             window,
         }
     }
@@ -235,7 +250,12 @@ impl Read for FileCursor {
                 .take()
                 .map(|window| window.data)
                 .unwrap_or_default();
-            data.resize(READ_AHEAD, 0);
+            let read_ahead = if self.bound_read_ahead {
+                READ_AHEAD.min(self.end.saturating_sub(self.position) as usize)
+            } else {
+                READ_AHEAD
+            };
+            data.resize(read_ahead, 0);
             let count = self.read_disk(&mut data)?;
             data.truncate(count);
             self.window = Some(Window {
@@ -328,6 +348,17 @@ pub(crate) enum ArchiveSource {
 impl ArchiveSource {
     pub(crate) fn file(path: &Path) -> Self {
         Self::File(Arc::new(FileSource::new(path)))
+    }
+
+    /// Keep file read-ahead inside each range opened by the current extractor.
+    pub(crate) fn bound_file_read_ahead(&self, enabled: bool) -> Option<FileReadAheadLimit<'_>> {
+        match self {
+            Self::File(source) if enabled => Some(FileReadAheadLimit {
+                previous: BOUNDED_READ_AHEAD.replace(Arc::as_ptr(source)),
+                _source: source,
+            }),
+            _ => None,
+        }
     }
 
     #[cfg(test)]

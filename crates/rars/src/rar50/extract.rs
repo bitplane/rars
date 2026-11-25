@@ -1166,6 +1166,9 @@ impl Archive {
         let archive_solid =
             self.main.is_solid() || self.files().any(|file| file.compression_info & 0x40 != 0);
         let solid = selector.is_some() && archive_solid;
+        let _read_ahead = self
+            .source
+            .bound_file_read_ahead(selector.is_some() && !archive_solid);
         let mut lane = Lane::start(settling, selector.is_some(), options, &budget);
         let files: Vec<&FileHeader> = self.files().collect();
         for (index, &file) in files.iter().enumerate() {
