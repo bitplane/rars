@@ -65,7 +65,9 @@ mod member;
 mod member_batches;
 pub use member::{ArchiveIndex, ArchiveMemberRef, ArchiveMemberRefs};
 mod member_read;
+mod member_reader;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
+pub use member_reader::{MemberReader, MembersIter};
 mod output_limit;
 #[doc(hidden)]
 pub mod output_links;
@@ -1396,6 +1398,52 @@ impl Archive {
     /// payload and solid predecessors are verified; later payloads are not read.
     pub fn read_member_at(&self, index: usize, password: Option<&[u8]>) -> Result<Option<Vec<u8>>> {
         self.read_member_at_with_options(index, read_options(password))
+    }
+
+    /// Opens a payload by its archive-order index, as reported by [`Self::members`].
+    ///
+    /// Missing indices, directories, redirections and split payloads are rejected.
+    /// Stored, unencrypted payloads read directly from the source and can seek.
+    /// They verify the checksum only when read sequentially to the end without
+    /// any seek. Other payloads stream on native targets and can only seek to
+    /// their current position. On bare WebAssembly they decode at open time and
+    /// are seekable in memory.
+    ///
+    /// Drop the reader to cancel background extraction. Options containing a
+    /// cancellation token or member error handler return [`Error::InvalidArgument`].
+    /// Native streaming failures come back from [`Read::read`] after any bytes
+    /// already produced. A stored checksum failure comes back from the read
+    /// that reaches the end. In either case, the I/O error wraps the archive error.
+    pub fn open_member(
+        &self,
+        index: usize,
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<MemberReader> {
+        member_reader::open_member(self, index, options)
+    }
+
+    /// Reads selected payloads of a single archive in order through one decoder session.
+    ///
+    /// Indices may be unsorted or repeated. Each selected payload is yielded once.
+    /// Missing indices, directories and redirections are ignored. Solid
+    /// predecessors are decoded once and their discarded bytes count toward the
+    /// ordinary output limits.
+    ///
+    /// Each item is a complete verified buffer or a member error. Independent
+    /// members can continue after a member error. A fatal error is yielded last.
+    /// Drop the iterator to cancel background extraction. Options containing a
+    /// cancellation token or member error handler return [`Error::InvalidArgument`].
+    /// Extraction errors come back from [`Iterator::next`].
+    ///
+    /// On bare WebAssembly the selection is decoded into memory at construction,
+    /// using [`Self::read_members_at_with_options`]. A decode failure yields one
+    /// error and no buffers there.
+    pub fn read_members_iter(
+        &self,
+        indices: &[usize],
+        options: ArchiveReadOptions<'_>,
+    ) -> Result<MembersIter> {
+        member_reader::read_members_iter(self, indices, options)
     }
 
     /// Identity-based counterpart to [`read_member_with_options`](Self::read_member_with_options).

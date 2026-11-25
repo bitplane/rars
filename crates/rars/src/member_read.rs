@@ -143,13 +143,18 @@ impl Archive {
             if let Some(writer) = batch.writer(index) {
                 return Ok(ExtractionDecision::Extract(writer));
             }
-            Ok(if solid {
-                ExtractionDecision::Extract(Box::new(std::io::sink()))
-            } else {
-                ExtractionDecision::Skip
-            })
+            Ok(predecessor_decision(solid))
         })?;
         Ok(batch.finish())
+    }
+}
+
+/// Keeps solid history and charges discarded bytes to the ordinary output limits.
+pub(crate) fn predecessor_decision(solid: bool) -> ExtractionDecision {
+    if solid {
+        ExtractionDecision::Extract(Box::new(std::io::sink()))
+    } else {
+        ExtractionDecision::Skip
     }
 }
 

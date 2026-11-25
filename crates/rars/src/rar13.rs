@@ -99,7 +99,7 @@ pub struct Archive {
     pub sfx_offset: usize,
     pub main: MainHeader,
     pub entries: Vec<Entry>,
-    source: ArchiveSource,
+    pub(super) source: ArchiveSource,
     truncation: Option<Truncation>,
 }
 
@@ -1237,20 +1237,20 @@ impl<W: Write + ?Sized> Write for Rar13ChecksumWriter<'_, W> {
     }
 }
 
-struct Rar13Checksum {
+pub(super) struct Rar13Checksum {
     value: u16,
     written: u64,
 }
 
 impl Rar13Checksum {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             value: 0,
             written: 0,
         }
     }
 
-    fn update(&mut self, input: &[u8]) {
+    pub(super) fn update(&mut self, input: &[u8]) {
         self.written = self.written.saturating_add(input.len() as u64);
         for &byte in input {
             self.value = self.value.wrapping_add(byte as u16).rotate_left(1);
@@ -1266,7 +1266,7 @@ impl Rar13Checksum {
         Ok(())
     }
 
-    fn finish(self) -> u16 {
+    pub(super) fn finish(self) -> u16 {
         self.value
     }
 }
