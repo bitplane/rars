@@ -6,7 +6,8 @@ use super::{write_streaming_volumes_to, ArchiveEntry, ArchiveExtras, WriterOptio
 use crate::rar50::{CollectedVolumes, VolumeOutput, VolumeSink};
 use crate::{ArchiveReadOptions, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
 use std::io::{Seek, SeekFrom, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Collects volumes through outputs that refuse to seek.
 #[derive(Default)]
@@ -291,19 +292,229 @@ fn volumes_written_straight_out_match_spooled_ones() {
 }
 
 /// A set of stored members goes from its sources to its volumes without
-/// touching scratch storage, unless a volume has to be spooled.
+/// touching scratch storage, encrypted or not, unless a volume has to be
+/// spooled.
 #[test]
 fn stored_volumes_written_straight_out_need_no_spool() {
     let scratch = crate::scratch::case("volume-body-no-spool");
     let resources = WriterResources::default()
         .with_temp_dir(&*scratch)
         .with_max_spool_bytes(0);
-    let case = cases()[1];
-    let mut seekable = CollectedVolumes::new();
-    case.write(&mut seekable, &resources, 4096).unwrap();
-    read_back(case, &seekable.take());
-    let refused = case
-        .write(&mut Unseekable::default(), &resources, 4096)
-        .unwrap_err();
-    assert_eq!(refused.kind(), crate::ErrorKind::ResourceLimit, "{refused}");
+    let stored = cases()[1];
+    let mut cases = vec![stored];
+    if cfg!(feature = "encryption") {
+        cases.push(Case {
+            password: true,
+            ..stored
+        });
+    }
+    for case in cases {
+        let mut seekable = CollectedVolumes::new();
+        case.write(&mut seekable, &resources, 4096).unwrap();
+        read_back(case, &seekable.take());
+        let refused = case
+            .write(&mut Unseekable::default(), &resources, 4096)
+            .unwrap_err();
+        assert_eq!(refused.kind(), crate::ErrorKind::ResourceLimit, "{refused}");
+    }
+}
+
+/// Counts the bytes that reach the first volume, through an output that seeks.
+struct FirstVolumeWatched {
+    collected: CollectedVolumes,
+    first_volume_bytes: Arc<AtomicUsize>,
+}
+
+struct Watched {
+    inner: Box<dyn VolumeOutput>,
+    seen: Option<Arc<AtomicUsize>>,
+}
+
+impl Write for Watched {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(bytes)?;
+        if let Some(seen) = &self.seen {
+            seen.fetch_add(written, Ordering::SeqCst);
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Seek for Watched {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(to)
+    }
+}
+
+impl VolumeSink for FirstVolumeWatched {
+    fn start_volume(&mut self, index: u64) -> crate::Result<Box<dyn VolumeOutput>> {
+        Ok(Box::new(Watched {
+            inner: self.collected.start_volume(index)?,
+            seen: (index == 0).then(|| self.first_volume_bytes.clone()),
+        }))
+    }
+
+    fn finish_volume(&mut self, index: u64, len: u64) -> crate::Result<()> {
+        self.collected.finish_volume(index, len)
+    }
+}
+
+/// Enough members that two threads and a small dictionary pack them in
+/// several windows. The last one's source records how many bytes the first
+/// volume held when it was opened.
+fn many_members(
+    password: bool,
+    first_volume_bytes: &Arc<AtomicUsize>,
+) -> (Vec<ArchiveEntry>, Arc<OnceLock<usize>>) {
+    let count = 200;
+    let at_last_open = Arc::new(OnceLock::new());
+    let entries = (0..count)
+        .map(|index| {
+            let data = if index % 7 == 0 {
+                noise(4096, index as u32)
+            } else {
+                text(16 * 1024, index)
+            };
+            let source = if index + 1 == count {
+                let (seen, at) = (first_volume_bytes.clone(), at_last_open.clone());
+                EntrySource::from_opener(data.len() as u64, move || {
+                    at.get_or_init(|| seen.load(Ordering::SeqCst));
+                    Ok(Box::new(std::io::Cursor::new(data.clone())))
+                })
+            } else {
+                EntrySource::from_bytes(data)
+            };
+            let entry = ArchiveEntry::new(format!("member{index:04}").into_bytes(), source);
+            if password {
+                entry.with_password(b"secret".to_vec())
+            } else {
+                entry
+            }
+        })
+        .collect();
+    (entries, at_last_open)
+}
+
+fn many_member_options(level: u8, solid: bool, header_encryption: bool) -> WriterOptions {
+    let mut features = if level == 0 {
+        FeatureSet::store_only()
+    } else {
+        FeatureSet::default()
+    };
+    features.solid = solid;
+    features.header_encryption = header_encryption;
+    WriterOptions::new(ArchiveVersion::Rar50, features)
+        .with_compression_level(level)
+        .with_dictionary_size(256 * 1024)
+}
+
+/// (level, solid, encrypted) for the many-member sets.
+fn many_member_cases() -> Vec<(u8, bool, bool)> {
+    let mut cases = vec![(3, false, false), (3, true, false), (0, false, false)];
+    if cfg!(feature = "encryption") {
+        cases.extend([(3, false, true), (0, false, true)]);
+    }
+    cases
+}
+
+fn write_many(
+    threads: usize,
+    entries: &[ArchiveEntry],
+    options: WriterOptions,
+    sink: &mut (dyn VolumeSink + Send),
+    resources: &WriterResources,
+) {
+    let write = || {
+        seeded(|| {
+            write_streaming_volumes_to(
+                entries,
+                options,
+                ArchiveExtras::default(),
+                16 * 1024,
+                sink,
+                resources,
+            )
+        })
+    };
+    #[cfg(feature = "parallel")]
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build()
+        .unwrap()
+        .install(write)
+        .unwrap();
+    #[cfg(not(feature = "parallel"))]
+    {
+        let _ = threads;
+        let mut write = write;
+        write().unwrap();
+    }
+}
+
+#[test]
+fn the_first_volume_is_written_before_the_last_member_is_packed() {
+    let scratch = crate::scratch::case("volume-first-before-last");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    for (level, solid, encrypted) in many_member_cases() {
+        let first_volume_bytes = Arc::new(AtomicUsize::new(0));
+        let (entries, at_last_open) = many_members(encrypted, &first_volume_bytes);
+        let options = many_member_options(level, solid, encrypted);
+        let mut sink = FirstVolumeWatched {
+            collected: CollectedVolumes::new(),
+            first_volume_bytes: first_volume_bytes.clone(),
+        };
+        write_many(2, &entries, options, &mut sink, &resources);
+        let at_last_open = *at_last_open.get().unwrap();
+        assert!(
+            at_last_open > 0,
+            "level {level}, solid {solid}, encrypted {encrypted}: nothing reached the first volume before the last member was opened"
+        );
+        let volumes = sink.collected.take();
+        assert!(volumes.len() > 2);
+        let password = encrypted.then_some(b"secret".as_slice());
+        let archives: Vec<_> = volumes
+            .into_iter()
+            .map(|volume| {
+                crate::rar50::Archive::parse_owned_with_password(volume, password).unwrap()
+            })
+            .collect();
+        let options = match password {
+            Some(password) => ArchiveReadOptions::with_password(password),
+            None => ArchiveReadOptions::new(),
+        };
+        let extracted = Arc::new(AtomicUsize::new(0));
+        crate::rar50::extract_volumes_to(&archives, options, |_| {
+            extracted.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(std::io::sink()))
+        })
+        .unwrap();
+        assert_eq!(extracted.load(Ordering::SeqCst), entries.len());
+    }
+}
+
+#[test]
+fn a_volume_set_does_not_depend_on_the_thread_count() {
+    let scratch = crate::scratch::case("volume-thread-count");
+    let resources = WriterResources::default().with_temp_dir(&*scratch);
+    for (level, solid, encrypted) in many_member_cases() {
+        let mut first = None;
+        for threads in [1, 2, 8] {
+            let (entries, _) = many_members(encrypted, &Arc::new(AtomicUsize::new(0)));
+            let mut sink = CollectedVolumes::new();
+            let options = many_member_options(level, solid, encrypted);
+            write_many(threads, &entries, options, &mut sink, &resources);
+            let volumes = sink.take();
+            match &first {
+                None => first = Some(volumes),
+                Some(first) => assert!(
+                    *first == volumes,
+                    "level {level}, solid {solid}, encrypted {encrypted}: {threads} threads wrote another set"
+                ),
+            }
+        }
+    }
 }
