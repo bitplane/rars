@@ -63,8 +63,8 @@ impl Archive {
     /// sequential decoding, as does RAR5 with a scratch policy. Earlier
     /// callback side effects are retained on failure; ordinary file writers have
     /// the staging requirements of [`Archive::extract_to`]. Metadata retains raw
-    /// archive names, including in errors. Existing byte-oriented APIs continue
-    /// to expose legacy link payloads as data and skip RAR5 redirections.
+    /// archive names, including in errors. The writer-only APIs such as
+    /// [`Archive::extract_to`] leave links out in every format.
     pub fn extract_with_links<F, L>(
         &self,
         options: ArchiveReadOptions<'_>,
@@ -210,6 +210,24 @@ pub(crate) fn legacy_meta_is_link(meta: &crate::rar15_40::ExtractedEntryMeta) ->
         u64::from(meta.attr),
         meta.is_directory,
     )
+}
+
+/// Wraps a byte-oriented `open` so legacy symbolic links never reach it, as
+/// RAR 5 redirections never do. A link's payload is still decoded, into a
+/// sink, so its checksum is verified and a solid stream keeps its history.
+pub(crate) fn skip_legacy_links<F>(
+    mut open: F,
+) -> impl FnMut(&crate::rar15_40::ExtractedEntryMeta) -> Result<Box<dyn Write>>
+where
+    F: FnMut(&crate::rar15_40::ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+{
+    move |meta| {
+        if legacy_meta_is_link(meta) {
+            Ok(Box::new(std::io::sink()))
+        } else {
+            open(meta)
+        }
+    }
 }
 
 pub(crate) fn emit_legacy_link(

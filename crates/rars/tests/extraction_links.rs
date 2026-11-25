@@ -62,7 +62,7 @@ fn raw_link(target: &[u8], split: bool) -> Vec<Archive> {
 }
 
 #[test]
-fn common_link_callbacks_preserve_order_files_and_old_byte_apis() {
+fn common_link_callbacks_preserve_order_and_files() {
     for version in [
         ArchiveVersion::Rar20,
         ArchiveVersion::Rar40,
@@ -119,19 +119,219 @@ fn common_link_callbacks_preserve_order_files_and_old_byte_apis() {
                     }
                 }
             }
-            let mut old_names = Vec::new();
-            archive
-                .extract_to(None, |meta| {
-                    old_names.push(meta.name.clone());
-                    Ok(Box::new(io::sink()))
-                })
-                .unwrap();
-            assert_eq!(
-                old_names.contains(&b"link".to_vec()),
-                version != ArchiveVersion::Rar50
-            );
         }
     }
+}
+
+/// Every writer-only extraction API calls `open` for `before` and `after`
+/// only, with their full contents, and never for `link`.
+fn assert_writer_apis_leave_out_link(archive: &Archive, case: &str) {
+    type Opened = RefCell<Vec<(Vec<u8>, Rc<RefCell<Vec<u8>>>)>>;
+    type Open<'a> = dyn FnMut(&[u8]) -> Box<dyn Write> + 'a;
+    let check = |api: &str, run: &dyn Fn(&mut Open<'_>)| {
+        let opened: Opened = RefCell::new(Vec::new());
+        run(&mut |name| {
+            let data = Rc::new(RefCell::new(Vec::new()));
+            opened.borrow_mut().push((name.to_vec(), data.clone()));
+            Box::new(Capture(data))
+        });
+        let opened = opened.into_inner();
+        let names: Vec<_> = opened.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(
+            names,
+            [b"before".to_vec(), b"after".to_vec()],
+            "{case}: {api}"
+        );
+        for (_, data) in opened {
+            assert_eq!(*data.borrow(), b"hello ".repeat(50), "{case}: {api}");
+        }
+    };
+    let set = std::slice::from_ref(archive);
+    check("extract_to", &|open| {
+        archive
+            .extract_to(None, |meta| Ok(open(&meta.name)))
+            .unwrap()
+    });
+    for options in [
+        ArchiveReadOptions::new(),
+        ArchiveReadOptions::new().with_max_total_output_bytes(1 << 20),
+    ] {
+        check("extract_to_with_options", &|open| {
+            archive
+                .extract_to_with_options(options, |meta| Ok(open(&meta.name)))
+                .unwrap()
+        });
+        check("extract_to_parallel_buffered_with_options", &|open| {
+            archive
+                .extract_to_parallel_buffered_with_options(options, |meta| Ok(open(&meta.name)))
+                .unwrap()
+        });
+        check("extract_with_volumes", &|open| {
+            archive
+                .extract_with_volumes(std::iter::empty(), options, |meta| Ok(open(&meta.name)))
+                .unwrap()
+        });
+        check("extract_volumes_to_with_options", &|open| {
+            rars::extract_volumes_to_with_options(set, options, |meta| Ok(open(&meta.name)))
+                .unwrap()
+        });
+    }
+    check("extract_to_parallel_buffered", &|open| {
+        archive
+            .extract_to_parallel_buffered(None, |meta| Ok(open(&meta.name)))
+            .unwrap()
+    });
+    check("extract_volumes_to", &|open| {
+        rars::extract_volumes_to(set, None, |meta| Ok(open(&meta.name))).unwrap()
+    });
+    match archive {
+        Archive::Rar15To40(legacy) => {
+            let legacy_set = std::slice::from_ref(legacy);
+            check("rar15_40::Archive::extract_to", &|open| {
+                legacy
+                    .extract_to(ArchiveReadOptions::new(), |meta| Ok(open(&meta.name)))
+                    .unwrap()
+            });
+            check("rar15_40::Archive::extract_to_parallel_buffered", &|open| {
+                legacy
+                    .extract_to_parallel_buffered(ArchiveReadOptions::new(), |meta| {
+                        Ok(open(&meta.name))
+                    })
+                    .unwrap()
+            });
+            check("rar15_40::extract_volumes_to", &|open| {
+                rars::rar15_40::extract_volumes_to(legacy_set, ArchiveReadOptions::new(), |meta| {
+                    Ok(open(&meta.name))
+                })
+                .unwrap()
+            });
+        }
+        Archive::Rar50Plus(rar5) => {
+            check("rar50::Archive::extract_to", &|open| {
+                rar5.extract_to(ArchiveReadOptions::new(), |meta| Ok(open(&meta.name)))
+                    .unwrap()
+            });
+        }
+        _ => unreachable!("only RAR 1.5 onwards has links"),
+    }
+}
+
+/// A RAR 5 link written by a Windows host: a symbolic link (type 2) or a
+/// junction (type 3) to the directory `before`, with the reparse-point
+/// attribute set.
+fn windows_link_fixture(redirection_type: u64) -> Archive {
+    let unix = fixture(ArchiveVersion::Rar50, true, false);
+    let Archive::Rar50Plus(mut rar5) = unix.clone() else {
+        unreachable!()
+    };
+    let junction = redirection_type == 3;
+    for block in &mut rar5.blocks {
+        if let rars::rar50::Block::File(file) = block {
+            if let Some(redirection) = file.redirection.as_mut() {
+                redirection.redirection_type = redirection_type;
+                redirection.flags = u64::from(junction);
+                file.host_os = 0;
+                // FILE_ATTRIBUTE_REPARSE_POINT, plus FILE_ATTRIBUTE_DIRECTORY
+                // for a junction.
+                file.attributes = if junction { 0x410 } else { 0x420 };
+                if junction {
+                    file.file_flags |= 1;
+                }
+            }
+        }
+    }
+    let mutated = Archive::Rar50Plus(rar5);
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    for member in mutated.members() {
+        if member.meta.name == b"link" {
+            builder.add_archive_redirection(&member).unwrap();
+        } else {
+            builder
+                .add_bytes(member.meta.name.clone(), b"hello ".repeat(50), None, None)
+                .unwrap();
+        }
+    }
+    let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+    let link = archive
+        .members()
+        .find(|member| member.meta.name == b"link")
+        .unwrap();
+    assert_eq!(link.meta.host_os, Some(0));
+    assert_eq!(link.meta.is_directory, junction);
+    assert_eq!(
+        archive
+            .as_rar50()
+            .unwrap()
+            .files()
+            .find_map(|file| file.redirection.as_ref())
+            .unwrap()
+            .redirection_type,
+        redirection_type
+    );
+    archive
+}
+
+#[test]
+fn writer_apis_leave_out_links_in_every_format() {
+    for version in [
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar40,
+        ArchiveVersion::Rar50,
+    ] {
+        for (store, solid) in [(true, false), (false, false), (false, true)] {
+            let archive = fixture(version, store, solid);
+            assert_writer_apis_leave_out_link(&archive, &format!("{version:?} {store} {solid}"));
+        }
+    }
+    for redirection_type in [2, 3] {
+        let archive = windows_link_fixture(redirection_type);
+        assert_writer_apis_leave_out_link(&archive, &format!("Windows type {redirection_type}"));
+    }
+}
+
+#[test]
+fn legacy_link_payloads_are_still_tested_and_read() {
+    let archive = fixture(ArchiveVersion::Rar40, false, true);
+    let set = std::slice::from_ref(&archive);
+    let mut tested = Vec::new();
+    archive
+        .test_with_options_and_callback(ArchiveReadOptions::new(), |meta| {
+            tested.push(meta.name.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert!(tested.contains(&b"link".to_vec()));
+    let mut tested = Vec::new();
+    rars::test_volumes_with_options_and_callback(set, ArchiveReadOptions::new(), |meta| {
+        tested.push(meta.name.clone());
+        Ok(())
+    })
+    .unwrap();
+    assert!(tested.contains(&b"link".to_vec()));
+    assert_eq!(
+        rars::read_volume_member_at(set, 1, None).unwrap(),
+        Some(b"before".to_vec())
+    );
+    assert_eq!(
+        rars::read_volume_members_at(set, &[1, 2], None).unwrap(),
+        [Some(b"before".to_vec()), Some(b"hello ".repeat(50))]
+    );
+}
+
+#[test]
+fn a_corrupt_legacy_link_still_fails_writer_extraction() {
+    let mut archive = raw_link(b"target", false).pop().unwrap();
+    if let Archive::Rar15To40(a) = &mut archive {
+        for block in &mut a.blocks {
+            if let rars::rar15_40::Block::File(file) = block {
+                file.file_crc ^= 1;
+            }
+        }
+    }
+    assert!(archive
+        .extract_to(None, |_| panic!("link opened as file"))
+        .is_err());
 }
 
 #[test]

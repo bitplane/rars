@@ -38,7 +38,9 @@ mod producer;
 mod vm_work_tests;
 #[cfg(feature = "write")]
 mod write;
-use crate::extraction_links::{check_legacy_size, emit_legacy_link, legacy_output, LegacyLink};
+use crate::extraction_links::{
+    check_legacy_size, emit_legacy_link, legacy_output, skip_legacy_links, LegacyLink,
+};
 #[cfg(feature = "write")]
 pub use crate::streaming::{EntrySource, WriterResources};
 #[cfg(feature = "write")]
@@ -46,7 +48,7 @@ pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
 #[cfg(feature = "write")]
 pub use crate::write_plan::MemberCoding;
 pub use extract::extract_volumes_to;
-pub(crate) use extract::{extract_from_feed, extract_volumes_with_links};
+pub(crate) use extract::{extract_from_feed, extract_volume_payloads, extract_volumes_with_links};
 use extract::{DecoderSession, DecryptingReader, PackedReader};
 #[cfg(feature = "write")]
 pub(crate) use write::write_retained_volumes_to;
@@ -1978,11 +1980,14 @@ impl Archive {
     }
 
     /// Streams extracted entries to caller-provided writers.
-    pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, mut open: F) -> Result<()>
+    ///
+    /// Unix symbolic links are left out: `open` is never called for them.
+    /// [`crate::Archive::extract_with_links`] reports them.
+    pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.extract_impl(options, &mut open, None, None, None)
+        self.extract_impl(options, &mut skip_legacy_links(open), None, None, None)
             .map(|_| ())
     }
 
@@ -2176,7 +2181,8 @@ impl Archive {
     /// Each batch buffers at most 16 MiB of decoded output; larger and split
     /// members stream on the calling thread between batches. Completed members
     /// can have been emitted when a later one fails. Solid archives and a
-    /// configured total output ceiling select sequential extraction.
+    /// configured total output ceiling select sequential extraction. Unix
+    /// symbolic links are left out, as with [`Self::extract_to`].
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
@@ -2185,7 +2191,7 @@ impl Archive {
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.extract_parallel_with_links(options, open, None)
+        self.extract_parallel_with_links(options, skip_legacy_links(open), None)
     }
 
     pub(crate) fn extract_parallel_with_links<F>(
