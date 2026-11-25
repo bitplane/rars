@@ -244,6 +244,59 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     }
 }
 
+pub(crate) trait ChainRule {
+    type Error;
+
+    /// The byte a candidate must match before measuring, if there is one.
+    fn probe(&mut self, distance: usize) -> Option<usize>;
+
+    /// Check the prefix and measure a candidate, returning zero for a rejection.
+    fn measure(&self, candidate: usize, distance: usize) -> usize;
+
+    /// Consider a measured match. Return true to end the search.
+    fn consider(
+        &mut self,
+        length: usize,
+        distance: usize,
+    ) -> std::result::Result<bool, Self::Error>;
+}
+
+/// Walk older candidates in distance order. The starting candidate and links
+/// must be older than `pos`, or be `NO_POSITION`.
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(crate) fn walk_chain<R: ChainRule>(
+    input: &[u8],
+    pos: usize,
+    mut candidate: usize,
+    max_length: usize,
+    max_distance: usize,
+    mut remaining: usize,
+    previous: impl Fn(usize) -> usize,
+    rule: &mut R,
+) -> std::result::Result<(), R::Error> {
+    while candidate != NO_POSITION && remaining != 0 {
+        let distance = pos - candidate;
+        if distance > max_distance {
+            break;
+        }
+        remaining -= 1;
+        if rule.probe(distance).is_none_or(|probe| {
+            probe < max_length && input[candidate + probe] == input[pos + probe]
+        }) {
+            let length = rule.measure(candidate, distance);
+            if length != 0 && rule.consider(length, distance)? {
+                break;
+            }
+        }
+        if remaining == 0 {
+            break;
+        }
+        candidate = previous(candidate);
+    }
+    Ok(())
+}
+
 // Fusing insertion and lookup shares one hash and skips the self link.
 impl<B: Budget> MatchFinder<4, B> {
     /// Insert a readable position and return its first older candidate. Like
@@ -342,7 +395,7 @@ impl<B: Budget> MatchFinder<4, B> {
         &self,
         input: &[u8],
         pos: usize,
-        first: usize,
+        mut first: usize,
         max_length: usize,
         max_distance: usize,
         cut: usize,
@@ -350,42 +403,74 @@ impl<B: Budget> MatchFinder<4, B> {
         out: &mut Buffer<(u32, u32), B>,
     ) -> std::result::Result<(), B::Failure> {
         debug_assert!(max_length >= 4 && pos + max_length <= input.len());
-        if cut == 0 {
+        if cut == 0 || nice == 0 {
             return Ok(());
         }
-        let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
-        let mut longest = 0;
-        let mut checked = 0;
-        let mut candidate = first;
-        while candidate != NO_POSITION && longest < max_length && longest < nice {
-            if candidate >= pos {
-                candidate = self.previous_for_collection::<SHORT>(candidate);
-                continue;
-            }
-            let distance = pos - candidate;
-            if distance > max_distance {
-                break;
-            }
-            checked += 1;
-            if input[candidate + longest] == input[pos + longest] {
-                let difference = prefix
-                    ^ u32::from_le_bytes(input[candidate..candidate + 4].try_into().unwrap());
-                let length = if difference != 0 {
-                    (difference.trailing_zeros() / 8) as usize
-                } else {
-                    4 + super::fast::match_length(input, pos + 4, distance, max_length - 4)
-                };
-                if length > longest {
-                    out.push((length as u32, distance as u32))?;
-                    longest = length;
-                }
-            }
-            if checked >= cut {
-                break;
-            }
-            candidate = self.previous_for_collection::<SHORT>(candidate);
+        let previous = |candidate| self.previous_for_collection::<SHORT>(candidate);
+        while first != NO_POSITION && first >= pos {
+            first = previous(first);
         }
-        Ok(())
+        walk_chain(
+            input,
+            pos,
+            first,
+            max_length,
+            max_distance,
+            cut,
+            previous,
+            &mut ImprovingRuns {
+                input,
+                pos,
+                max_length,
+                stop_length: max_length.min(nice),
+                prefix: u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap()),
+                longest: 0,
+                out,
+            },
+        )
+    }
+}
+
+struct ImprovingRuns<'a, B: Budget> {
+    input: &'a [u8],
+    pos: usize,
+    max_length: usize,
+    stop_length: usize,
+    prefix: u32,
+    longest: usize,
+    out: &'a mut Buffer<(u32, u32), B>,
+}
+
+impl<B: Budget> ChainRule for ImprovingRuns<'_, B> {
+    type Error = B::Failure;
+
+    #[inline]
+    fn probe(&mut self, _distance: usize) -> Option<usize> {
+        Some(self.longest)
+    }
+
+    #[inline]
+    fn measure(&self, candidate: usize, distance: usize) -> usize {
+        let difference = self.prefix
+            ^ u32::from_le_bytes(self.input[candidate..candidate + 4].try_into().unwrap());
+        if difference != 0 {
+            (difference.trailing_zeros() / 8) as usize
+        } else {
+            4 + super::fast::match_length(self.input, self.pos + 4, distance, self.max_length - 4)
+        }
+    }
+
+    #[inline]
+    fn consider(
+        &mut self,
+        length: usize,
+        distance: usize,
+    ) -> std::result::Result<bool, B::Failure> {
+        if length > self.longest {
+            self.out.push((length as u32, distance as u32))?;
+            self.longest = length;
+        }
+        Ok(self.longest >= self.stop_length)
     }
 }
 
