@@ -365,7 +365,7 @@ pub(super) fn split_members_above(
                 }
                 // Copied as a stored member is, so charged as one in a single
                 // archive is: for the buffer it goes through.
-                let held = member_charge(member, options, &MemberCoding::Stored, len)
+                let held = member_charge(member, options, &MemberCoding::Stored, len, None)?
                     .map(|charge| {
                         resources.acquire_serialising_cancellable(charge, &|| work.is_cancelled())
                     })
