@@ -1487,7 +1487,7 @@ impl crate::filter_search::FilterSearch for Rar29Search {
 /// The pieces are searched [`PIECE_SEARCHES_AT_ONCE`] at a time where there are
 /// threads for it, and each piece's search runs its independent encodes side
 /// by side in what `room` grants: asked for the bytes of one more encode at a
-/// time (see [`rar29_search_encode_workspace`]), and `None` keeps it to one.
+/// time (see [`rar29_side_encode_workspace`]), and `None` keeps it to one.
 /// Which filters come back does not depend on how many ran at once, so the
 /// archive is the same at any thread count.
 fn rar29_piece_filters<R: Send>(
@@ -1501,7 +1501,7 @@ fn rar29_piece_filters<R: Send>(
 ) -> Result<Vec<FilterSpec>> {
     let search_options = options.with_optimal_parse_passes(0);
     let piece = piece.max(1);
-    let admit = |len: usize| room(rar29_search_encode_workspace(len, search_options));
+    let admit = |len: usize| room(rar29_side_encode_workspace(len, search_options));
     let search = |start: usize| -> Result<Vec<FilterSpec>> {
         let end = (start + piece).min(data.len());
         let bytes = &data[start..end];
@@ -1526,7 +1526,7 @@ fn rar29_piece_filters<R: Send>(
             .collect())
     };
     let at_once = if crate::parallel::may_nest() {
-        crate::parallel::threads().clamp(1, PIECE_SEARCHES_AT_ONCE)
+        rar29_piece_searches_at_once()
     } else {
         1
     };
@@ -1543,12 +1543,22 @@ fn rar29_piece_filters<R: Send>(
 }
 
 /// What one encode of up to `len` bytes holds in a filter search measuring at
-/// `options`, whether at those settings or the reduced ones its screens use.
+/// `options`, whether at those settings or the reduced ones its screens use,
+/// beside the best encode so far.
 fn rar29_search_encode_workspace(len: usize, options: Rar29EncodeOptions) -> u64 {
     use crate::filter_search::FilterSearch;
     let screen = Rar29Search::MEMBER.screen_options(options);
     crate::codec::rar29::member_encode_workspace(len, options)
         .max(crate::codec::rar29::member_encode_workspace(len, screen))
+}
+
+/// [`rar29_search_encode_workspace`] for an encode a search runs beside the
+/// one that keeps the best so far.
+fn rar29_side_encode_workspace(len: usize, options: Rar29EncodeOptions) -> u64 {
+    use crate::filter_search::FilterSearch;
+    let screen = Rar29Search::MEMBER.screen_options(options);
+    crate::codec::rar29::side_encode_workspace(len, options)
+        .max(crate::codec::rar29::side_encode_workspace(len, screen))
 }
 
 /// How many pieces of one member [`rar29_piece_filters`] searches at once,
@@ -1642,7 +1652,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
                 }),
                 &|len| {
                     resources.and_then(|resources| {
-                        resources.try_acquire(rar29_search_encode_workspace(len, lazy))
+                        resources.try_acquire(rar29_side_encode_workspace(len, lazy))
                     })
                 },
             )?;
@@ -2234,49 +2244,211 @@ fn text_is_cheap_to_read(bytes: &MemberBytes<'_>, unpacked: u64) -> bool {
 /// Working memory one member needs while it is coded.
 ///
 /// This is the admission weight that decides how many members run at once, not
-/// a prediction: the encoder holds the member, its packed output, and a match
-/// finder sized by the block it works in, and the PPMd models `ppmd` says.
+/// a prediction: the encoder holds the member, what coding it as `coding` asks
+/// for, and the PPMd models `ppmd` says.
 fn member_workspace(
     options: WriterOptions,
     unpacked: u64,
-    compressing: bool,
+    coding: &MemberCoding,
     ppmd: PpmdHeld,
 ) -> u64 {
-    if !compressing {
+    if !coding.compresses() {
         // A stored member is never loaded: it is written from the caller's
         // bytes or copied from its source, encrypted as it goes.
         return WRITE_WORKSPACE;
     }
+    if is_rar29(options) {
+        return unpacked.saturating_add(rar29_coding_workspace(
+            options,
+            coding,
+            unpacked,
+            ppmd,
+            Rar29Coded::Member,
+        ));
+    }
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
-    let rar29 = matches!(
-        options.target,
-        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
-    );
-    let ppmd_models = match ppmd {
-        PpmdHeld::None => 0,
-        PpmdHeld::Chain => largest_ppmd_model(options),
-        PpmdHeld::Trial => {
-            // A trial holds two models of one size at a time. A chain keeps
-            // its own beside two copies: a short member's escaped coding is
-            // kept while the same member codes again as literals.
-            let models = if options.features.solid { 3 } else { 2 };
-            (models * largest_ppmd_model(options)).saturating_add(
-                crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
-            )
-        }
-    };
-    let optimal_parse = if rar29 {
-        rar29_optimal_parse_workspace(options, unpacked)
-    } else {
-        0
-    };
     unpacked
         .saturating_mul(held_per_byte(options))
-        .saturating_add(ppmd_models)
-        .saturating_add(optimal_parse)
         .saturating_add(coder_workspace(options, Some(unpacked), dictionary, 12))
-        .saturating_add(2 * 1024 * 1024)
+        .saturating_add(CODER_SCRATCH)
+}
+
+/// What RAR 1.5 and 2.0 hold beside the parts they charge: tables, headers
+/// and small buffers.
+const CODER_SCRATCH: u64 = 2 * 1024 * 1024;
+
+fn is_rar29(options: WriterOptions) -> bool {
+    matches!(
+        options.target,
+        ArchiveVersion::Rar29 | ArchiveVersion::Rar30 | ArchiveVersion::Rar40
+    )
+}
+
+/// What a RAR 2.9 coding is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Rar29Coded {
+    /// A member held whole, alone or in its chain.
+    Member,
+    /// The sample a streamed member's engine trial codes, on its own.
+    Sample,
+}
+
+/// What coding `len` bytes of a RAR 2.9 member holds beside them: an LZ
+/// encode unless PPMd is forced, and the PPMd coding `ppmd` says.
+///
+/// The text trial codes the two engines side by side where there are threads
+/// for it, LZ by the lazy parse. A member that may go either to it or to the
+/// filter search is charged the larger. Otherwise PPMd codes after LZ, while
+/// LZ's packed bytes and the filtered copy they were coded from are kept.
+fn rar29_coding_workspace(
+    options: WriterOptions,
+    coding: &MemberCoding,
+    len: u64,
+    ppmd: PpmdHeld,
+    coded: Rar29Coded,
+) -> u64 {
+    let ppmd_coding = rar29_ppmd_workspace(options, coding, len, ppmd, coded);
+    if options.method == Rar29Method::Ppmd {
+        return ppmd_coding;
+    }
+    let Ok(encode) = rar29_encode_options_for_options(options) else {
+        return ppmd_coding;
+    };
+    let bytes = usize::try_from(len).unwrap_or(usize::MAX);
+    let kept = len.saturating_add(packed_bound(len));
+    let after_lz = |lz: u64| lz.max(kept.saturating_add(ppmd_coding));
+    let lazy = rar29_search_encode_workspace(bytes, encode.with_optimal_parse_passes(0));
+    let text_trial = match crate::parallel::threads() > 1 {
+        true => lazy.saturating_add(ppmd_coding),
+        false => after_lz(lazy),
+    };
+    if coded == Rar29Coded::Sample {
+        return text_trial;
+    }
+    let lz = rar29_lz_workspace(options, coding, len);
+    match ppmd {
+        PpmdHeld::Trial if rar29_text_trial(options, coding) => lz.max(text_trial),
+        PpmdHeld::Trial => after_lz(lz),
+        _ => lz.saturating_add(ppmd_coding),
+    }
+}
+
+/// The most a member's packed bytes come to, a little over the member.
+fn packed_bound(len: u64) -> u64 {
+    len.saturating_add(len / 8)
+}
+
+/// Whether a RAR 2.9 member coded LZ searches for its filters.
+fn rar29_searches_filters(options: WriterOptions, coding: &MemberCoding) -> bool {
+    options.method != Rar29Method::Ppmd
+        && matches!(
+            coding,
+            MemberCoding::Compressed | MemberCoding::Filtered(FilterPolicy::Auto)
+        )
+}
+
+/// Whether a RAR 2.9 member held whole that reads as text goes to
+/// [`text_trial`] rather than coding LZ and then PPMd.
+fn rar29_text_trial(options: WriterOptions, coding: &MemberCoding) -> bool {
+    !options.features.solid
+        && options.method == Rar29Method::Auto
+        && rar29_searches_filters(options, coding)
+}
+
+/// An LZ encode of `len` bytes at the writer's settings, with a shortest-path
+/// parse for each block parsing at once, or the filter search before it when
+/// that holds more: each piece of a member held alone that is searched at once
+/// holds the first of its encodes. The encodes a search runs beside those are
+/// charged as they run. A chain screens its candidates one at a time.
+fn rar29_lz_workspace(options: WriterOptions, coding: &MemberCoding, len: u64) -> u64 {
+    let Ok(encode) = rar29_encode_options_for_options(options) else {
+        return 0;
+    };
+    let bytes = usize::try_from(len).unwrap_or(usize::MAX);
+    let at_settings = crate::codec::rar29::member_encode_workspace(bytes, encode)
+        .saturating_add(rar29_optimal_parse_workspace(options, len));
+    if options.features.solid || !rar29_searches_filters(options, coding) {
+        return at_settings;
+    }
+    let piece = bytes.min(RAR29_FILTER_SEARCH_BYTES);
+    let pieces = bytes
+        .div_ceil(piece.max(1))
+        .min(rar29_piece_searches_at_once());
+    let search = rar29_search_encode_workspace(piece, encode.with_optimal_parse_passes(0))
+        .saturating_mul(pieces.max(1) as u64);
+    at_settings.max(search)
+}
+
+/// How many pieces of one member [`rar29_piece_filters`] may search at once.
+fn rar29_piece_searches_at_once() -> usize {
+    crate::parallel::threads().clamp(1, PIECE_SEARCHES_AT_ONCE)
+}
+
+/// The PPMd coding of `len` bytes that `ppmd` says a RAR 2.9 member holds:
+/// the models live at once, and while it codes them, the escape search, the
+/// packed bytes each model codes, and the filtered copy a named filter makes.
+fn rar29_ppmd_workspace(
+    options: WriterOptions,
+    coding: &MemberCoding,
+    len: u64,
+    ppmd: PpmdHeld,
+    coded: Rar29Coded,
+) -> u64 {
+    let model = largest_ppmd_model(options);
+    let codings = match ppmd {
+        PpmdHeld::None => return 0,
+        PpmdHeld::Chain => return model,
+        PpmdHeld::Trial => rar29_ppmd_codings(options, coding, len, coded),
+    };
+    // A chain keeps its model, or the best its first PPMd member has coded
+    // so far, beside the coding.
+    let kept = match coded == Rar29Coded::Member && options.features.solid {
+        true => model,
+        false => 0,
+    };
+    let dictionary =
+        dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
+    let reach = usize::try_from(len.min(dictionary)).unwrap_or(usize::MAX);
+    let filtered = match coding {
+        MemberCoding::Filtered(FilterPolicy::Explicit(_)) => len,
+        _ => 0,
+    };
+    model
+        .saturating_add(packed_bound(len))
+        .saturating_mul(codings)
+        .saturating_add(kept)
+        .saturating_add(crate::codec::rar29::ppmd_search_workspace(reach))
+        .saturating_add(filtered)
+}
+
+/// How many PPMd codings of a member, each with a model of its own, run at
+/// once beside what a chain keeps.
+///
+/// Forced PPMd codes one model at a time, and so does a member held alone that
+/// codes LZ first. [`text_trial`] codes plain PPMd beside PPMd with escapes
+/// where it tries both and there are threads for it. A chain's trial keeps the escaped coding while it codes
+/// the literals where [`crate::codec::rar29::ppmd_either_way_codings`] says.
+fn rar29_ppmd_codings(
+    options: WriterOptions,
+    coding: &MemberCoding,
+    len: u64,
+    coded: Rar29Coded,
+) -> u64 {
+    if options.method == Rar29Method::Ppmd {
+        return 1;
+    }
+    let bytes = usize::try_from(len).unwrap_or(usize::MAX);
+    if coded == Rar29Coded::Member && options.features.solid {
+        return crate::codec::rar29::ppmd_either_way_codings(bytes);
+    }
+    let text_trial = coded == Rar29Coded::Sample || rar29_text_trial(options, coding);
+    let level = compression_method_for_level(options).saturating_sub(0x30);
+    let both = text_trial_exhaustive(level) || bytes <= PPMD_LITERAL_TRIAL_BYTES;
+    match text_trial && both && crate::parallel::threads() > 1 {
+        true => 2,
+        false => 1,
+    }
 }
 
 /// What the shortest-path parse holds beyond the lazy one: a workspace for
@@ -2293,7 +2465,7 @@ fn rar29_optimal_parse_workspace(options: WriterOptions, unpacked: u64) -> u64 {
     parses.saturating_mul(crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE)
 }
 
-/// The retained dictionary and, for RAR 1.5 and 2.0, the codec's own allocation.
+/// RAR 1.5 and 2.0's retained dictionary and the codec's own allocation.
 fn coder_workspace(
     options: WriterOptions,
     unpacked: Option<u64>,
@@ -2389,7 +2561,7 @@ fn member_charge(
     }
     let ppmd = ppmd_held(member, options, coding, unpacked_size, chain)?;
     Ok(Some(
-        member_workspace(options, unpacked_size, coding.compresses(), ppmd)
+        member_workspace(options, unpacked_size, coding, ppmd)
             .saturating_add(rar29_chain_workspace(options, coding, unpacked_size)),
     ))
 }
@@ -2807,50 +2979,57 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<TextScore> {
     Ok(score_text_windows(windows.iter().map(Vec::as_slice)))
 }
 
-/// A filter search holds a filtered segment and a candidate; a PPMd trial holds the sample and two models.
-///
-/// A chain also holds its history, and its model when `ppmd` says it has or
-/// will have one, which the member codes against.
+/// What streaming a member holds: for RAR 2.9, the engine trial on a sample,
+/// then the coding of whichever engine it may choose, beside a chain's history
+/// and its model when `ppmd` says it has or will have one.
 fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdHeld) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
-    if matches!(
-        options.target,
-        ArchiveVersion::Rar15 | ArchiveVersion::Rar20
-    ) {
+    if !is_rar29(options) {
         // A window, the parse of each block in a batch, and a chain's history.
-        return coder_workspace(options, None, dictionary, 2).saturating_add(2 * 1024 * 1024);
+        return coder_workspace(options, None, dictionary, 2).saturating_add(CODER_SCRATCH);
     }
-    let segment = engine_sample_len(options) as u64;
-    let lz = dictionary
-        .saturating_mul(12 + 6)
-        .saturating_add(rar29_optimal_parse_workspace(options, u64::MAX))
-        .saturating_add(2 * 1024 * 1024);
-    // A named filter is applied in place, with no candidate to hold beside it.
-    let searching = options.method != Rar29Method::Ppmd
-        && matches!(
-            coding,
-            MemberCoding::Compressed | MemberCoding::Filtered(FilterPolicy::Auto)
-        );
-    let search = if searching {
-        segment.saturating_mul(2)
-    } else {
-        0
+    let Ok(encode) = rar29_encode_options_for_options(options) else {
+        return dictionary;
     };
+    let reach = encode.max_match_distance.min(RAR29_MAX_DICTIONARY_SIZE);
     let model = largest_ppmd_model(options);
-    let trial = if ppmd == PpmdHeld::Trial {
-        segment.saturating_add(2 * model).saturating_add(
-            crate::codec::rar29::ppmd_search_workspace(dictionary as usize),
+    let search = match rar29_searches_filters(options, coding) {
+        true => rar29_search_encode_workspace(
+            RAR29_FILTER_SEARCH_BYTES,
+            encode.with_optimal_parse_passes(0),
         )
-    } else {
-        0
+        .saturating_mul(rar29_piece_searches_at_once() as u64),
+        false => 0,
+    };
+    let lz = crate::codec::rar29::streamed_lz_workspace(encode)
+        .saturating_add(rar29_optimal_parse_workspace(options, u64::MAX))
+        .saturating_add(search);
+    let ppmd_coding =
+        crate::codec::rar29::streamed_ppmd_workspace(Some(reach)).saturating_add(model);
+    let coded = match (options.method, ppmd) {
+        (Rar29Method::Ppmd, _) => ppmd_coding,
+        (_, PpmdHeld::Trial) => lz.max(ppmd_coding),
+        _ => lz,
+    };
+    // The trial codes a sample in memory, as a member that long is coded.
+    let sample = engine_sample_len(options) as u64;
+    let trial = match ppmd {
+        PpmdHeld::Trial => sample.saturating_add(rar29_coding_workspace(
+            options,
+            coding,
+            sample,
+            ppmd,
+            Rar29Coded::Sample,
+        )),
+        _ => 0,
     };
     let chain = match (options.features.solid, ppmd) {
         (false, _) => 0,
-        (true, PpmdHeld::None) => dictionary,
-        (true, _) => dictionary.saturating_add(model),
+        (true, PpmdHeld::None) => reach as u64,
+        (true, _) => (reach as u64).saturating_add(model),
     };
-    lz.saturating_add(search.max(trial)).saturating_add(chain)
+    coded.max(trial).saturating_add(chain)
 }
 
 /// Where a streamed member's packed bytes go: one archive, or the fragments of a volume set.
@@ -5541,8 +5720,13 @@ mod tests {
         // with the threads its shortest-path parse spreads over.
         let (charge, room) = pool.install(|| {
             (
-                super::member_workspace(options, data.len() as u64, true, super::PpmdHeld::None),
-                crate::codec::rar29::member_encode_workspace(data.len(), lazy),
+                super::member_workspace(
+                    options,
+                    data.len() as u64,
+                    &crate::MemberCoding::Compressed,
+                    super::PpmdHeld::None,
+                ),
+                super::rar29_side_encode_workspace(data.len(), lazy),
             )
         });
         let encode = |limit: u64| {
@@ -7363,8 +7547,18 @@ mod tests {
     fn rar15_charges_an_index_whatever_the_member_size() {
         for level in [1, 3, 5] {
             let options = rar15(level, false);
-            let small = super::member_workspace(options, 1 << 20, true, super::PpmdHeld::None);
-            let large = super::member_workspace(options, 1 << 30, true, super::PpmdHeld::None);
+            let small = super::member_workspace(
+                options,
+                1 << 20,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            );
+            let large = super::member_workspace(
+                options,
+                1 << 30,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            );
             // Beyond the bytes it holds, a large member costs what a small one does.
             assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
             let streamed = super::streamed_workspace(
@@ -7382,8 +7576,18 @@ mod tests {
         let _cap = crate::parallel::ThreadCap::set(Some(1));
         for level in [3, 5] {
             let options = rar20(level, false);
-            let small = super::member_workspace(options, 1 << 20, true, super::PpmdHeld::None);
-            let large = super::member_workspace(options, 1 << 30, true, super::PpmdHeld::None);
+            let small = super::member_workspace(
+                options,
+                1 << 20,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            );
+            let large = super::member_workspace(
+                options,
+                1 << 30,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            );
             // Beyond the bytes it holds, a large member costs what a small one does.
             assert_eq!(large - small, 2 * ((1 << 30) - (1 << 20)));
             let streamed = super::streamed_workspace(
@@ -8122,8 +8326,16 @@ mod tests {
         for options in [independent, solid] {
             let ppmd = super::PpmdHeld::Trial;
             let charge = super::streamed_workspace(options, &coding, ppmd);
-            assert!(charge < 256 * MIB, "{} MiB", charge / MIB);
-            assert!(charge < super::member_workspace(options, 1 << 30, true, ppmd));
+            assert!(charge < 512 * MIB, "{} MiB", charge / MIB);
+            assert!(
+                charge
+                    < super::member_workspace(
+                        options,
+                        1 << 30,
+                        &crate::MemberCoding::Compressed,
+                        ppmd
+                    )
+            );
         }
     }
 
@@ -8910,7 +9122,12 @@ mod tests {
         let charge = |target, level| {
             let mut options = super::WriterOptions::new(target, FeatureSet::default());
             options.compression_level = Some(level);
-            super::member_workspace(options, size, true, super::PpmdHeld::None)
+            super::member_workspace(
+                options,
+                size,
+                &crate::MemberCoding::Compressed,
+                super::PpmdHeld::None,
+            )
         };
         // RAR 2.0 holds the member and its packed form, and a block's parse for
         // each block it codes at once: one per thread, up to sixteen, and no
@@ -8941,19 +9158,19 @@ mod tests {
             assert!(charge(ArchiveVersion::Rar15, level) >= 2 * size + index);
             assert!(charge(ArchiveVersion::Rar15, level) < 2 * size + index + (16 << 20));
         }
-        // RAR 2.9 holds the member, its packed form and its window, and level 5
+        // RAR 2.9 holds the member, its encode and its window, and level 5
         // one shortest-path parse per block it parses at once: one per thread,
-        // up to sixteen. Pin one thread for the per-byte bound, so it holds on
-        // any machine.
+        // up to sixteen, beside a parse batch that grows with the threads too.
+        // Pin one thread for the per-byte bound, so it holds on any machine.
         let one = {
             let _cap = crate::parallel::ThreadCap::set(Some(1));
             charge(ArchiveVersion::Rar29, 5)
         };
         assert!(one < 50 * size, "{one}");
         let parses = crate::parallel::threads().clamp(1, 16) as u64;
-        assert_eq!(
-            charge(ArchiveVersion::Rar29, 5) - one,
-            (parses - 1) * crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE
+        assert!(
+            charge(ArchiveVersion::Rar29, 5) - one
+                >= (parses - 1) * crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE
         );
     }
 
@@ -9845,6 +10062,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "parallel")]
     fn rar29_levels_are_charged_for_the_models_and_parse_they_hold() {
         const MIB: u64 = 1024 * 1024;
         let at = |level: u8| {
@@ -9854,43 +10072,46 @@ mod tests {
             options
         };
         let trial = super::PpmdHeld::Trial;
-        let charge = |level| super::member_workspace(at(level), 8 * MIB, true, trial);
-        // Two models of the largest size a level tries, and a parse workspace
-        // per block that runs at once.
-        let parse = crate::codec::rar29::OPTIMAL_PARSE_WORKSPACE;
-        assert!(charge(4) >= charge(3) + 2 * (64 - 25) * MIB + parse);
-        assert!(charge(5) >= charge(4) + 2 * (128 - 64) * MIB);
-        // A member of one block parses one block at a time.
-        assert_eq!(
-            super::member_workspace(at(5), 1000, true, trial)
-                - super::member_workspace(at(3), 1000, true, trial),
-            2 * (128 - 25) * MIB + parse
-        );
-        // Streamed, the parse is charged by the block, not by the member.
         let coding = crate::MemberCoding::Compressed;
+        let whole = |options, len| super::member_workspace(options, len, &coding, trial);
         let streamed = |options| super::streamed_workspace(options, &coding, trial);
-        assert!(streamed(at(5)) < super::member_workspace(at(5), 1 << 30, true, trial));
-        // A streamed trial holds two of the level's largest models, and a
-        // chain keeps one between members.
-        assert!(streamed(at(5)) >= streamed(at(3)) + 2 * (128 - 25) * MIB);
-        let solid = |level| {
-            let mut options = at(level);
-            options.features.solid = true;
-            options
-        };
-        assert!(streamed(solid(5)) >= streamed(at(5)) + 128 * MIB);
-        // Forced PPMd holds models at every level, the trial's two at the top.
         let forced = |level| {
             let mut options = at(level);
             options.method = super::Rar29Method::Ppmd;
             options
         };
-        let none = |level| super::member_workspace(at(level), 8 * MIB, true, super::PpmdHeld::None);
-        assert!(super::member_workspace(forced(1), 8 * MIB, true, trial) >= none(1) + 2 * 25 * MIB);
-        assert!(
-            super::member_workspace(forced(5), 8 * MIB, true, trial) >= none(1) + 2 * 128 * MIB
-        );
-        assert!(streamed(forced(5)) >= streamed(forced(3)) + 2 * (128 - 25) * MIB);
+        let solid = |level| {
+            let mut options = at(level);
+            options.features.solid = true;
+            options
+        };
+        // Threads for the text trial to code its engines and models side by side.
+        crate::parallel::private_pool(4).install(|| {
+            // The largest model a level tries, two side by side at level 5,
+            // where the trial codes plain PPMd beside PPMd with escapes.
+            let charge = |level| whole(at(level), 8 * MIB);
+            assert!(charge(4) >= charge(3) + (64 - 25) * MIB);
+            assert!(charge(5) >= charge(4) + (2 * 128 - 64) * MIB);
+            // A short member is coded both ways at every level.
+            assert_eq!(
+                whole(at(5), 1000) - whole(at(3), 1000),
+                2 * (128 - 25) * MIB
+            );
+            // Streamed, the parse is charged by the block, not by the member.
+            assert!(streamed(at(5)) < whole(at(5), 1 << 30));
+            // A streamed trial codes a sample as a member that long is coded,
+            // and a chain keeps its model between members.
+            assert!(streamed(at(5)) >= 2 * 128 * MIB);
+            assert!(streamed(at(3)) < 128 * MIB);
+            assert!(streamed(solid(5)) >= streamed(at(5)) + 128 * MIB);
+            // Forced PPMd codes one model at a time and no LZ at all.
+            assert_eq!(
+                whole(forced(5), 8 * MIB) - whole(forced(1), 8 * MIB),
+                (128 - 25) * MIB
+            );
+            assert!(whole(forced(1), 8 * MIB) < whole(at(3), 8 * MIB));
+            assert_eq!(streamed(forced(5)) - streamed(forced(3)), (128 - 25) * MIB);
+        });
     }
 
     #[test]
@@ -9961,10 +10182,18 @@ mod tests {
         assert_eq!(held(&text, solid, chain.as_ref()), Trial);
         // What the models add, whole and streamed.
         let options = at(5, Auto);
-        let whole = |ppmd| super::member_workspace(options, 8 * MIB, true, ppmd);
-        assert!(whole(Trial) >= whole(Nothing) + 2 * 128 * MIB);
+        let whole = |ppmd| {
+            super::member_workspace(options, 8 * MIB, &crate::MemberCoding::Compressed, ppmd)
+        };
+        // Level 5's trial codes two models side by side where it has the threads.
+        let models = match crate::parallel::threads() > 1 {
+            true => 2,
+            false => 1,
+        };
+        assert!(whole(Trial) >= 8 * MIB + models * 128 * MIB);
+        assert!(whole(Trial) > whole(Nothing));
         let streamed = |options, ppmd| super::streamed_workspace(options, &coding, ppmd);
-        assert!(streamed(options, Trial) >= streamed(options, Nothing) + 2 * 128 * MIB);
+        assert!(streamed(options, Trial) >= models * 128 * MIB);
         assert_eq!(streamed(solid, Chain), streamed(solid, Nothing) + 128 * MIB);
     }
 

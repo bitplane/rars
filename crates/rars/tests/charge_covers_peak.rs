@@ -9,9 +9,10 @@
 //! holds. This measures both sides of one write:
 //!
 //! - **allocated**: the high-water mark of live heap bytes during the write,
-//!   above the level when it began, counted by the global allocator below. The
-//!   members' bytes and the thread pool exist before that point, and the
-//!   archive goes to `io::sink()`, so neither counts.
+//!   above the level when it began, counted by the global allocator below,
+//!   plus the PPMd pools alive at the time. The members' bytes and the thread
+//!   pool exist before that point, and the archive goes to `io::sink()`, so
+//!   neither counts.
 //! - **charged**: the most the write held against its budget at once,
 //!   [`WriterResources::workspace_peak`].
 //!
@@ -39,9 +40,11 @@
 //! level's fitted dictionary, are `#[ignore]`d and run by hand.
 //!
 //! Resident memory (what the allocator keeps after a free, glibc's arenas)
-//! is not counted here, and nor is the PPMd model's pool, which is an
-//! anonymous mapping of its own on Unix and Windows rather than a heap
-//! allocation.
+//! is not counted here. A PPMd model's pool is an anonymous mapping of its own
+//! on Unix and Windows rather than a heap allocation, and commits its pages as
+//! the model reaches them. It is counted at its mapped size, the most it can
+//! commit, since the inputs here reach only part of it and a charge has to
+//! hold for one that reaches all of it.
 
 use rars::rar15_40::{MemberCoding, Rar29Method};
 use rars::rar50::{ArchiveEntry, ArchiveExtras};
@@ -66,9 +69,11 @@ struct Counting;
 static LIVE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
+/// Live heap and PPMd pools. A pool is mapped with heap allocations either
+/// side of it, so sampling it as the heap grows sees it.
 fn grew(bytes: usize) {
     let live = LIVE.fetch_add(bytes, Ordering::Relaxed) + bytes;
-    PEAK.fetch_max(live, Ordering::Relaxed);
+    PEAK.fetch_max(live + rars::codec::pool_mapped_bytes(), Ordering::Relaxed);
 }
 
 fn shrank(bytes: usize) {
@@ -279,108 +284,29 @@ const BORDERLINE_GAPS: &[Gap] = &[
 /// #393 is the accounting work these belong to; an entry naming it has no
 /// issue of its own yet.
 const KNOWN_GAPS: &[Gap] = &[
-    // At a 1 MiB dictionary.
-    //
-    // From level 3, RAR 4 tries PPMd on text, and is charged the trial's
-    // models in full. Their pools are anonymous mappings, not heap
-    // allocations, so the allocator here does not see them.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar4,
-        paths: &[Path::Whole, Path::FiltersAuto, Path::Solid],
-        levels: &[3, 4, 5],
-        threads: None,
-        input: Some(Input::Text),
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    // Level 5's filter search codes its finalists side by side, each in room
-    // charged as it runs, and at four threads that room is more than binary
-    // records hold.
+    // RAR 4's level 2 at four threads charges its filter search a parse batch
+    // of a token per byte, split blocks holding the tokens twice, for the
+    // member's encode and for each encode beside it. None of these inputs
+    // parses to a token per byte.
     Gap {
         tier: Tier::Small,
         writer: Writer::Rar4,
         paths: &[Path::FiltersAuto],
-        levels: &[5],
+        levels: &[2],
         threads: Some(4),
-        input: Some(Input::Binary),
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    // Forced PPMd is charged its models in full. The model's pool is an
-    // anonymous mapping, not a heap allocation, so the allocator here does
-    // not see it either: part of this gap is what the test cannot count.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar4,
-        paths: &[Path::Ppmd],
-        levels: &[1, 2, 3, 4, 5],
-        threads: None,
         input: None,
         assertion: Assertion::Loose,
-        issue: 393,
-    },
-    // At each level's fitted dictionary, for the causes above where an entry
-    // gives none of its own.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::Whole],
-        levels: &[3, 4, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
+        issue: 706,
     },
     Gap {
         tier: Tier::Fitted,
         writer: Writer::Rar4,
         paths: &[Path::FiltersAuto],
-        levels: &[4, 5],
-        threads: None,
+        levels: &[2],
+        threads: Some(4),
         input: None,
         assertion: Assertion::Loose,
-        issue: 393,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::FiltersAuto],
-        levels: &[3],
-        threads: Some(1),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::Solid],
-        levels: &[4, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::Ppmd],
-        levels: &[1, 2, 3, 4, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 393,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::Solid],
-        levels: &[1, 2, 3, 4, 5],
-        threads: None,
-        input: None,
-        assertion: Assertion::Covered,
-        issue: 393,
+        issue: 706,
     },
 ];
 
@@ -575,7 +501,7 @@ fn thread_counts() -> &'static [usize] {
 /// returns with the most live heap it added at once.
 fn measure<T: Send>(threads: usize, run: impl FnOnce() -> T + Send) -> (T, u64) {
     let counted = move || {
-        let before = LIVE.load(Ordering::Relaxed);
+        let before = LIVE.load(Ordering::Relaxed) + rars::codec::pool_mapped_bytes();
         PEAK.store(before, Ordering::Relaxed);
         let result = run();
         let peak = PEAK.load(Ordering::Relaxed);

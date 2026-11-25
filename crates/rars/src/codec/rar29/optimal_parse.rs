@@ -20,12 +20,20 @@ use super::*;
 /// array.
 const OPTIMAL_SPAN: usize = 64 * 1024;
 
-/// What one block's shortest-path parse holds: a node per position, the
-/// matches found at each, and the two-byte table.
+/// What one block's shortest-path parse holds: the matches found at each
+/// position, with room for every position keeping all it may, a node per
+/// position, the two-byte table, and the tokens of the route being priced
+/// beside those of the best so far, which the parse batch already holds.
 ///
-/// Charged per block that may parse at once, with room for one where every
-/// position keeps all its matches.
-pub(crate) const OPTIMAL_PARSE_WORKSPACE: u64 = 8 * 1024 * 1024;
+/// Charged per block that may parse at once.
+pub(crate) const OPTIMAL_PARSE_WORKSPACE: u64 = {
+    let counts = OPTIMAL_SPAN;
+    let runs = OPTIMAL_SPAN * MAX_FOUND * std::mem::size_of::<FoundMatch>();
+    let nodes = (OPTIMAL_SPAN + 1) * std::mem::size_of::<Node>();
+    let pairs = (1 << 16) * std::mem::size_of::<u32>();
+    let route = OPTIMAL_SPAN * std::mem::size_of::<EncodeToken>();
+    (counts + runs + nodes + pairs + route) as u64
+};
 
 /// A run reaching this far is taken without pricing the positions it covers.
 const NICE_LENGTH: usize = MAX_ENCODER_MATCH_LENGTH;
