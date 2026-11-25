@@ -247,7 +247,7 @@ impl<T, B: Budget> Buffer<T, B> {
         Ok(out)
     }
     /// [`Self::filled`] for values that are not `Clone`, each made by `make`.
-    #[cfg(feature = "write")]
+    #[cfg(any(test, feature = "write"))]
     pub(crate) fn filled_with(len: usize, make: impl FnMut() -> T, allowance: &B) -> Result<Self> {
         let bytes = allocation_size::<T>(len)?;
         let mut out = Self::new(allowance);
