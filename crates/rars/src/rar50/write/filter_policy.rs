@@ -125,14 +125,21 @@ use crate::filter_search::search_applies_throughout as auto_size_filter_search_a
 
 /// How many bytes the encoder will walk while packing this member, for progress
 /// to scale by.
+///
+/// A search that judges by statistics (see [`estimated_search`]) encodes next
+/// to nothing on the way, so only the member's own encodes count.
 pub(super) fn filter_policy_walk_bytes(
     data: &[u8],
     policy: &FilterPolicy,
     _algorithm_version: u8,
-    encoder_candidates: usize,
+    candidates: &[EncodeOptions],
 ) -> u64 {
     let member = data.len() as u64;
-    if *policy != FilterPolicy::Auto || !auto_size_filter_search_applies(data) {
+    let encoder_candidates = candidates.len();
+    if *policy != FilterPolicy::Auto
+        || !auto_size_filter_search_applies(data)
+        || candidates.first().is_some_and(|&options| estimated_search(options))
+    {
         return member * encoder_candidates.max(1) as u64;
     }
     crate::filter_search::walk_bytes_for_kinds(
@@ -536,6 +543,7 @@ mod dictionary_encoding_tests {
             file_offset: 0,
             piece: false,
             exhaustive: false,
+            estimates: false,
             allowance: Allowance::limited(0),
         };
         let filter = FilterSpec::whole(FilterKind::Delta { channels: 1 });
@@ -602,6 +610,9 @@ struct Rar50OwnedSearch<B: Budget> {
     piece: bool,
     /// Whether every finalist is encoded in full (see [`exhaustive_search`]).
     exhaustive: bool,
+    /// Whether the samples are priced rather than encoded (see
+    /// [`estimated_search`]).
+    estimates: bool,
     allowance: B,
 }
 impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
@@ -639,6 +650,9 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
     }
     fn exhaustive(&self) -> bool {
         self.exhaustive
+    }
+    fn estimates(&self) -> bool {
+        self.estimates
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, B>> {
         if self.file_offset != 0 {
@@ -736,6 +750,7 @@ fn choose_owned_filter<B: Budget>(
                 file_offset: 0,
                 piece: false,
                 exhaustive: exhaustive_search(options),
+                estimates: estimated_search(options),
                 allowance: allowance.clone(),
             },
             data,
@@ -785,6 +800,14 @@ fn choose_owned_filter<B: Budget>(
 fn exhaustive_search(options: EncodeOptions) -> bool {
     options.max_match_candidates >= match_candidates_for_level(5).expect("level 5 is a level")
 }
+/// Whether the search at these settings judges filters by byte statistics
+/// rather than sample encodes (see [`OwnedSearch::estimates`]): levels 1 and
+/// 2's. There the sample encodes cost about as much as packing the member, and
+/// on the bench classes the statistics pick filters that pack as small.
+fn estimated_search(options: EncodeOptions) -> bool {
+    options.max_match_candidates <= match_candidates_for_level(2).expect("level 2 is a level")
+}
+
 /// The filters for one run of a member too large to search whole, ranged over
 /// the run. The run is searched on its own, without the history it is later
 /// coded against, so the choice never waits on the runs before it. It is
@@ -835,6 +858,7 @@ fn piece_filters<B: Budget>(
             file_offset,
             piece: true,
             exhaustive: exhaustive_search(options),
+            estimates: estimated_search(options),
             allowance: allowance.clone(),
         },
         data,

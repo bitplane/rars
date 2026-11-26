@@ -2270,7 +2270,7 @@ fn compress_whole_member<B: Budget>(
             &data,
             &plan.filter_policy,
             plan.algorithm_version,
-            plan.candidates.len(),
+            &plan.candidates,
         )
         .max(input_size)
         .max(1);
