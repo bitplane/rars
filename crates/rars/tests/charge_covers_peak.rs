@@ -300,19 +300,6 @@ const BORDERLINE_GAPS: &[Gap] = &[
 /// #393 is the accounting work these belong to; an entry naming it has no
 /// issue of its own yet.
 const KNOWN_GAPS: &[Gap] = &[
-    // RAR 4's level 2 at four threads charges the encodes its filter search
-    // runs beside the member's on top of a member charge already sized for
-    // two pieces searched at once.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::FiltersAuto],
-        levels: &[2],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 717,
-    },
     // A solid level 5 text chain holds more than the one-thread default
     // budget, and a member charged past the budget runs alone in it rather
     // than holding less.
@@ -924,6 +911,25 @@ fn rar5_level5_fitted_dictionary_charge_covers_three_symbol_noise() {
     );
     assert_eq!(charged, rars::DEFAULT_WRITER_PLANNING_LIMIT);
     assert!(allocated <= charged);
+}
+
+/// RAR 4's level 2 searches a member longer than a piece a piece at a time,
+/// two pieces at once, each running sample encodes beside its first.
+#[test]
+fn rar4_level2_fitted_piece_search_charge_covers_every_input() {
+    let cases = thread_counts()
+        .iter()
+        .flat_map(|&threads| {
+            INPUTS.map(|input| Case {
+                writer: Writer::Rar4,
+                path: Path::FiltersAuto,
+                level: 2,
+                threads,
+                input,
+            })
+        })
+        .collect();
+    check(Tier::Fitted, cases);
 }
 
 /// Every writer, path, level, thread count and input at a 1 MiB dictionary.
