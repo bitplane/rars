@@ -1045,6 +1045,12 @@ impl MemoryBudget {
 }
 
 impl MemoryPermit {
+    /// What it holds against the budget.
+    #[cfg(any(test, feature = "write"))]
+    pub(crate) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
     /// Extends a running wave without waiting while it holds workspace.
     ///
     /// Like [`MemoryBudget::try_acquire`], it moves spools held in memory to
@@ -1095,11 +1101,6 @@ impl MemoryPermit {
         *used = used.saturating_sub(self.bytes - bytes);
         self.bytes = bytes;
         self.budget.changed.notify_all();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn bytes(&self) -> u64 {
-        self.bytes
     }
 
     /// Grows the charge to `bytes` if that much is free now and no acquirer

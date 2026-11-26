@@ -1494,6 +1494,9 @@ impl crate::filter_search::FilterSearch for Rar29Search {
 /// threads for it, and each piece's search runs its independent encodes side
 /// by side in what `room` grants: asked for the bytes of one more encode at a
 /// time (see [`rar29_side_encode_workspace`]), and `None` keeps it to one.
+/// The encodes beside the searches are no more than the threads the searches
+/// at once leave, so a caller that charges each search at once its first
+/// encode is never asked for room for more encodes than there are threads.
 /// Which filters come back does not depend on how many ran at once, so the
 /// archive is the same at any thread count.
 fn rar29_piece_filters<R: Send>(
@@ -1507,7 +1510,24 @@ fn rar29_piece_filters<R: Send>(
 ) -> Result<Vec<FilterSpec>> {
     let search_options = options.with_optimal_parse_passes(0);
     let piece = piece.max(1);
-    let admit = |len: usize| room(rar29_side_encode_workspace(len, search_options, effort));
+    let at_once = if crate::parallel::may_nest() {
+        rar29_piece_searches_at_once()
+    } else {
+        1
+    };
+    let starts: Vec<usize> = (0..data.len()).step_by(piece).collect();
+    // Each search on its own asks for an encode beside its own per thread.
+    // The searches share what is left once each has one.
+    let beside = crate::parallel::threads().saturating_sub(at_once.min(starts.len()));
+    let running = std::sync::atomic::AtomicUsize::new(0);
+    let admit = |len: usize| {
+        let (slot, taken) = EncodeSlot::enter(&running);
+        if taken > beside {
+            return None;
+        }
+        let room = room(rar29_side_encode_workspace(len, search_options, effort))?;
+        Some((room, slot))
+    };
     let search = |start: usize| -> Result<Vec<FilterSpec>> {
         let end = (start + piece).min(data.len());
         let bytes = &data[start..end];
@@ -1531,12 +1551,6 @@ fn rar29_piece_filters<R: Send>(
             })
             .collect())
     };
-    let at_once = if crate::parallel::may_nest() {
-        rar29_piece_searches_at_once()
-    } else {
-        1
-    };
-    let starts: Vec<usize> = (0..data.len()).step_by(piece).collect();
     let mut specs = Vec::new();
     for wave in starts.chunks(at_once) {
         let (found, failure) = crate::parallel::map_prefix(wave.to_vec(), search);
@@ -1546,6 +1560,24 @@ fn rar29_piece_filters<R: Send>(
         specs.extend(found.into_iter().flatten());
     }
     Ok(specs)
+}
+
+/// One of the encodes [`rar29_piece_filters`] runs beside its searches,
+/// counted until it is dropped.
+struct EncodeSlot<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl<'a> EncodeSlot<'a> {
+    /// The slot, and how many are taken counting it.
+    fn enter(count: &'a std::sync::atomic::AtomicUsize) -> (Self, usize) {
+        let taken = count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        (Self(count), taken)
+    }
+}
+
+impl Drop for EncodeSlot<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// What one encode of up to `len` bytes holds in a filter search measuring at
@@ -3030,9 +3062,8 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<TextScore> {
 
 /// What streaming a member holds: for RAR 2.9, the engine trial on a sample,
 /// then the coding of whichever engine it may choose, beside a chain's history
-/// and its model when `ppmd` says it has or will have one. LZ holds the
-/// filter search of each piece of a segment searched at once beside its
-/// window, priced as a member held whole prices its pieces' searches.
+/// and its model when `ppmd` says it has or will have one. LZ is
+/// [`Rar29StreamedLz::workspace`].
 fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdHeld) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
@@ -3045,14 +3076,7 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdH
     };
     let reach = encode.max_match_distance.min(RAR29_MAX_DICTIONARY_SIZE);
     let model = largest_ppmd_model(options);
-    let search = match rar29_searches_filters(options, coding) {
-        true => rar29_piece_search_workspace(options, encode)
-            .saturating_mul(rar29_piece_searches_at_once() as u64),
-        false => 0,
-    };
-    let lz = crate::codec::rar29::streamed_lz_workspace(encode)
-        .saturating_add(rar29_optimal_parse_workspace(options, u64::MAX))
-        .saturating_add(search);
+    let lz = Rar29StreamedLz::new(options, coding, encode).workspace();
     let ppmd_coding =
         crate::codec::rar29::streamed_ppmd_workspace(Some(reach)).saturating_add(model);
     let coded = match (options.method, ppmd) {
@@ -3078,6 +3102,122 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdH
         (true, _) => (reach as u64).saturating_add(model),
     };
     coded.max(trial).saturating_add(chain)
+}
+
+/// What a RAR 2.9 member streamed through the LZ engine holds beside a chain's
+/// history: its window throughout, and either a segment's coding or the
+/// filter search over it.
+///
+/// A segment's filters are chosen before its parser is built, so the search
+/// and the coding take turns. The search is charged for each of the
+/// segment's pieces searched at once, priced as a member held whole prices
+/// its pieces' searches; a segment no longer than one piece runs one search.
+/// The coding is the match finder, a parse batch, and the shortest-path parse
+/// of each block in a batch that parses at once.
+struct Rar29StreamedLz {
+    window: u64,
+    coding: u64,
+    search: u64,
+}
+
+impl Rar29StreamedLz {
+    fn new(options: WriterOptions, coding: &MemberCoding, encode: Rar29EncodeOptions) -> Self {
+        let streamed = crate::codec::rar29::StreamedLzWorkspace::new(encode);
+        let search = match rar29_searches_filters(options, coding) {
+            true => {
+                let pieces = streamed
+                    .segment
+                    .div_ceil(RAR29_FILTER_SEARCH_BYTES)
+                    .min(rar29_piece_searches_at_once());
+                rar29_piece_search_workspace(options, encode).saturating_mul(pieces as u64)
+            }
+            false => 0,
+        };
+        Self {
+            window: streamed.window,
+            coding: streamed
+                .coding
+                .saturating_add(rar29_optimal_parse_workspace(
+                    options,
+                    streamed.segment as u64,
+                )),
+            search,
+        }
+    }
+
+    fn workspace(&self) -> u64 {
+        self.window.saturating_add(self.coding.max(self.search))
+    }
+
+    /// What it holds while a segment's filters are chosen, before any encode
+    /// a piece search runs beside its own.
+    fn while_searching(&self) -> u64 {
+        self.window.saturating_add(self.search)
+    }
+}
+
+/// What of `held`, the streamed member's permit, nothing holds while a
+/// segment's filters are chosen: past its window, the searches' own encodes
+/// and the most a chain holds. A permit cut down to the budget lends less.
+fn rar29_streamed_idle_while_searching(
+    options: WriterOptions,
+    coding: &MemberCoding,
+    encode: Rar29EncodeOptions,
+    held: u64,
+) -> u64 {
+    let chain = match options.features.solid {
+        true => (encode.max_match_distance.min(RAR29_MAX_DICTIONARY_SIZE) as u64)
+            .saturating_add(largest_ppmd_model(options)),
+        false => 0,
+    };
+    let busy = Rar29StreamedLz::new(options, coding, encode)
+        .while_searching()
+        .saturating_add(chain);
+    held.saturating_sub(busy)
+}
+
+/// Room for an encode a streamed segment's piece search runs beside its own:
+/// lent from what the member's charge holds for the segment's coding, which
+/// is idle while the search runs, and taken from the budget past that.
+struct LentRoom<'a> {
+    idle: &'a std::sync::Mutex<u64>,
+    lent: u64,
+    _permit: Option<MemoryPermit>,
+}
+
+impl<'a> LentRoom<'a> {
+    fn take(
+        idle: &'a std::sync::Mutex<u64>,
+        bytes: u64,
+        resources: &WriterResources,
+    ) -> Option<Self> {
+        let lent = {
+            let mut left = idle.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let lent = bytes.min(*left);
+            *left -= lent;
+            lent
+        };
+        // Dropped without a permit, it hands back what was lent.
+        let mut room = Self {
+            idle,
+            lent,
+            _permit: None,
+        };
+        if lent < bytes {
+            room._permit = Some(resources.try_acquire(bytes - lent)?);
+        }
+        Some(room)
+    }
+}
+
+impl Drop for LentRoom<'_> {
+    fn drop(&mut self) {
+        let mut left = self
+            .idle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *left += self.lent;
+    }
 }
 
 /// Where a streamed member's packed bytes go: one archive, or the fragments of a volume set.
@@ -3253,7 +3393,7 @@ fn stream_member_admitted(
     let unpacked_size = member.unpacked_size()?;
     let len = usize::try_from(unpacked_size)
         .map_err(|_| Error::InvalidArgument("member is larger than this host can hold"))?;
-    let _permit = match admitted {
+    let permit = match admitted {
         Some(permit) => permit,
         None => {
             let chain = solid.as_ref().and_then(|link| link.encoder.as_ref());
@@ -3378,6 +3518,12 @@ fn stream_member_admitted(
             ),
         },
         Some((encode_options, engine)) => {
+            let idle = std::sync::Mutex::new(rar29_streamed_idle_while_searching(
+                options,
+                coding,
+                encode_options,
+                permit.bytes(),
+            ));
             let mut choose =
                 |segment: &[u8], start: usize| -> crate::codec::Result<Vec<FilterSpec>> {
                     if !crate::filter_search::search_applies_throughout(segment) {
@@ -3392,7 +3538,7 @@ fn stream_member_admitted(
                         SearchEffort::for_options(options),
                         RAR29_FILTER_SEARCH_BYTES,
                         &|| progress.is_cancelled(),
-                        &|bytes| resources.try_acquire(bytes),
+                        &|bytes| LentRoom::take(&idle, bytes, resources),
                     )
                     .map_err(|error| crate::codec::Error::Io(Box::new(error)))
                 };
@@ -6413,7 +6559,13 @@ mod tests {
                 for granted in [0, 1, usize::MAX] {
                     let (found, peak) = search(threads, granted);
                     assert_eq!(found, specs, "level {level}, {threads} threads, {granted}");
-                    if granted == usize::MAX {
+                    // Beside the two pieces' searches, encodes never
+                    // outnumber the threads.
+                    assert!(
+                        peak + 2 <= threads,
+                        "level {level}, {threads} threads, {granted}"
+                    );
+                    if granted == usize::MAX && threads > 2 {
                         assert!(peak > 1, "level {level}, {threads} threads ran in turn");
                     }
                 }
@@ -6572,47 +6724,104 @@ mod tests {
         });
     }
 
-    /// A streamed member's piece searches are priced as a held member's are:
-    /// below level 5 by the longest encode the search runs, two pieces at
-    /// once, and at level 5 by two whole pieces.
+    /// A streamed member holds its window throughout, and beside it either a
+    /// segment's coding or the searches over its pieces, never both. A
+    /// segment at a 1 MiB dictionary is one piece, so one search runs; at
+    /// 4 MiB it is four, searched two at once. Each search is priced as a
+    /// held member's are: below level 5 by the longest encode it runs, at
+    /// level 5 by a whole piece.
     #[cfg(all(
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))
     ))]
     #[test]
-    fn a_streamed_piece_search_is_charged_its_longest_encode() {
+    fn a_streamed_segment_is_searched_or_coded_beside_its_window() {
         use crate::filter_search::longest_specs_encode;
         crate::parallel::private_pool(4).install(|| {
-            for level in 1..=5 {
-                let options = rar40()
-                    .with_compression_level(level)
-                    .with_dictionary_size(4 * 1024 * 1024);
-                let encode = super::rar29_encode_options_for_options(options).unwrap();
-                let lazy = encode.with_optimal_parse_passes(0);
-                let effort = super::SearchEffort::for_options(options);
-                let piece = super::RAR29_FILTER_SEARCH_BYTES;
-                let streamed =
-                    |coding| super::streamed_workspace(options, &coding, super::PpmdHeld::None);
-                let search = streamed(crate::MemberCoding::Compressed)
-                    - streamed(crate::MemberCoding::Filtered(crate::FilterPolicy::None));
-                let longest =
-                    longest_specs_encode(&super::Rar29Search::at(0, encode, effort), piece);
-                let whole_pieces = 2 * super::rar29_search_encode_workspace(piece, lazy);
-                assert_eq!(
-                    search,
-                    2 * super::rar29_search_encode_workspace(
+            for (dictionary, pieces) in [(1 << 20, 1), (4 << 20, 2)] {
+                for level in 1..=5 {
+                    let options = rar40()
+                        .with_compression_level(level)
+                        .with_dictionary_size(dictionary);
+                    let encode = super::rar29_encode_options_for_options(options).unwrap();
+                    let lazy = encode.with_optimal_parse_passes(0);
+                    let effort = super::SearchEffort::for_options(options);
+                    let piece = super::RAR29_FILTER_SEARCH_BYTES;
+                    let case = format!("{} MiB, level {level}", dictionary >> 20);
+
+                    let longest =
+                        longest_specs_encode(&super::Rar29Search::at(0, encode, effort), piece);
+                    let one_search = super::rar29_search_encode_workspace(
                         longest,
-                        effort.sample_options(longest, lazy)
-                    ),
-                    "level {level}"
-                );
-                if level < 5 {
-                    assert!(search < whole_pieces, "level {level}");
-                } else {
-                    assert_eq!(search, whole_pieces, "level {level}");
+                        effort.sample_options(longest, lazy),
+                    );
+                    let whole_piece = super::rar29_search_encode_workspace(piece, lazy);
+                    if level < 5 {
+                        assert!(one_search < whole_piece, "{case}");
+                    } else {
+                        assert_eq!(one_search, whole_piece, "{case}");
+                    }
+
+                    let streamed = crate::codec::rar29::StreamedLzWorkspace::new(encode);
+                    let lz = super::Rar29StreamedLz::new(
+                        options,
+                        &crate::MemberCoding::Compressed,
+                        encode,
+                    );
+                    assert_eq!(lz.search, pieces * one_search, "{case}");
+                    assert_eq!(lz.window, streamed.window, "{case}");
+                    assert_eq!(
+                        lz.coding,
+                        streamed.coding
+                            + super::rar29_optimal_parse_workspace(
+                                options,
+                                streamed.segment as u64
+                            ),
+                        "{case}"
+                    );
+                    let charge =
+                        |coding| super::streamed_workspace(options, &coding, super::PpmdHeld::None);
+                    assert_eq!(
+                        charge(crate::MemberCoding::Compressed),
+                        lz.window + lz.coding.max(lz.search),
+                        "{case}"
+                    );
+                    assert_eq!(
+                        charge(crate::MemberCoding::Filtered(crate::FilterPolicy::None)),
+                        lz.window + lz.coding,
+                        "{case}"
+                    );
                 }
             }
         });
+    }
+
+    /// Room for an encode beside a streamed segment's search is lent from
+    /// what the member's charge holds idle while it searches, and only what
+    /// that falls short of is taken from the budget. Both go back on drop.
+    #[test]
+    fn a_streamed_search_borrows_its_idle_coding_before_the_budget() {
+        let resources = crate::WriterResources::default().with_memory_limit(100);
+        let idle = std::sync::Mutex::new(10);
+        let left = || *idle.lock().unwrap();
+        let first = super::LentRoom::take(&idle, 6, &resources).unwrap();
+        assert!(first._permit.is_none());
+        assert_eq!(left(), 4);
+        assert!(super::LentRoom::take(&idle, 200, &resources).is_none());
+        assert_eq!(left(), 4, "a refusal hands back what it would have lent");
+        let second = super::LentRoom::take(&idle, 6, &resources).unwrap();
+        assert_eq!(
+            second._permit.as_ref().map(|permit| permit.bytes()),
+            Some(2)
+        );
+        assert_eq!(left(), 0);
+        drop((first, second));
+        assert_eq!(left(), 10);
+        assert_eq!(resources.workspace_peak(), 2);
+        assert!(
+            resources.try_acquire(100).is_some(),
+            "the budget is whole again"
+        );
     }
 
     /// Sixteen-bit stereo: two tones with noise in the low bits, which as

@@ -3000,37 +3000,53 @@ pub(crate) fn side_encode_workspace(len: usize, options: EncodeOptions) -> u64 {
         .saturating_add(packed)
 }
 
-/// The most [`Unpack29Encoder::encode_lz_streamed`] holds beside the chain's
-/// history, for a member longer than one block: the window it reads segments
-/// of four reaches into after the reach before them, which doubles from one
-/// segment to two, the match finder, and one parse batch's tokens and packed
-/// blocks.
+/// What [`Unpack29Encoder::encode_lz_streamed`] holds beside the chain's
+/// history, for a member longer than one block.
 ///
-/// The shortest-path parse's own workspace is not included, as for
-/// [`member_encode_workspace`].
-pub(crate) fn streamed_lz_workspace(options: EncodeOptions) -> u64 {
-    let options = options.constrained();
-    let reach = options.max_match_distance.min(MAX_HISTORY);
-    let block = options
-        .block_size
-        .filter(|&size| size != 0)
-        .unwrap_or(reach)
-        .max(1);
-    let batch = LzParser::batch_bytes(block);
-    let segment = reach.saturating_mul(4).div_ceil(batch).max(1) * batch;
-    let window = segment.saturating_mul(2) as u64;
-    let finder = Rar29MatchFinder::bytes_for_reach(reach.saturating_add(batch), reach);
-    let token = std::mem::size_of::<EncodeToken>() as u64;
-    let per_byte = match options.split_blocks {
-        true => 2 * token + 2,
-        false => token + 1,
-    };
-    let batch = batch as u64;
-    let packed = batch.saturating_add(batch / 8);
-    window
-        .saturating_add(finder)
-        .saturating_add(batch.saturating_mul(per_byte))
-        .saturating_add(packed)
+/// A segment's filters are chosen before its parser is built, and the parser
+/// is dropped before the next segment is read, so a chooser runs beside
+/// [`Self::window`] alone, never beside [`Self::coding`].
+pub(crate) struct StreamedLzWorkspace {
+    /// The most bytes one segment reads, and so hands its filter chooser:
+    /// four reaches, in whole parse batches.
+    pub(crate) segment: usize,
+    /// The window it reads segments into after the reach before them, which
+    /// doubles from one segment to two.
+    pub(crate) window: u64,
+    /// The match finder, and one parse batch's tokens and packed blocks.
+    ///
+    /// The shortest-path parse's own workspace is not included, as for
+    /// [`member_encode_workspace`].
+    pub(crate) coding: u64,
+}
+
+impl StreamedLzWorkspace {
+    pub(crate) fn new(options: EncodeOptions) -> Self {
+        let options = options.constrained();
+        let reach = options.max_match_distance.min(MAX_HISTORY);
+        let block = options
+            .block_size
+            .filter(|&size| size != 0)
+            .unwrap_or(reach)
+            .max(1);
+        let batch = LzParser::batch_bytes(block);
+        let segment = reach.saturating_mul(4).div_ceil(batch).max(1) * batch;
+        let finder = Rar29MatchFinder::bytes_for_reach(reach.saturating_add(batch), reach);
+        let token = std::mem::size_of::<EncodeToken>() as u64;
+        let per_byte = match options.split_blocks {
+            true => 2 * token + 2,
+            false => token + 1,
+        };
+        let batch = batch as u64;
+        let packed = batch.saturating_add(batch / 8);
+        Self {
+            segment,
+            window: segment.saturating_mul(2) as u64,
+            coding: finder
+                .saturating_add(batch.saturating_mul(per_byte))
+                .saturating_add(packed),
+        }
+    }
 }
 
 /// The most a streamed PPMd member holds beside its model and the chain's

@@ -312,6 +312,12 @@ fn lcg(state: &mut u64) -> u64 {
 }
 
 impl Input {
+    /// RAR 4 holds a member that reads as text whole, however long, so only
+    /// the rest take [`Path::Streamed`].
+    fn streams(self) -> bool {
+        !matches!(self, Self::Text | Self::Literals)
+    }
+
     fn bytes(self, size: usize, seed: u64) -> Vec<u8> {
         let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2545_f491_4f6c_dd1d;
         let mut data = Vec::with_capacity(size);
@@ -442,7 +448,13 @@ impl Writer {
         match self {
             Self::Rar13 | Self::Rar15 => &[Path::Whole],
             Self::Rar20 => &[Path::Whole, Path::Solid],
-            Self::Rar4 => &[Path::Whole, Path::FiltersAuto, Path::Ppmd, Path::Solid],
+            Self::Rar4 => &[
+                Path::Whole,
+                Path::FiltersAuto,
+                Path::Ppmd,
+                Path::Solid,
+                Path::Streamed,
+            ],
             Self::Rar5 => &[Path::FiltersAuto, Path::Blocks, Path::Solid],
             Self::Rar7 => &[Path::Blocks],
         }
@@ -684,6 +696,9 @@ fn all_cases(tier: Tier) -> Vec<Case> {
             for &level in writer.levels() {
                 for &threads in thread_counts() {
                     for input in INPUTS {
+                        if path == Path::Streamed && !input.streams() {
+                            continue;
+                        }
                         cases.push(Case {
                             writer,
                             path,
@@ -907,7 +922,7 @@ fn rar4_level2_fitted_piece_search_charge_covers_every_input() {
 }
 
 /// RAR 4 streams a binary member past [`RAR4_STREAMS_BINARY_ABOVE`] and
-/// searches each segment for filters a piece at a time, two pieces at once.
+/// searches each segment for filters a piece at a time, up to two at once.
 /// Level 1's search isn't exhaustive, so its pieces are charged for its
 /// longest encode, not a whole piece each.
 #[test]
