@@ -26,7 +26,7 @@ mod volume_body_tests;
 use filter_policy::encode_options_for_level;
 use filter_policy::{
     compression_method_for_level, dictionary_size_for_options, encode_option_candidates_for_level,
-    filter_policy_walk_bytes, rar50_algorithm_version,
+    filter_policy_for_level, filter_policy_walk_bytes, rar50_algorithm_version,
 };
 pub(super) use headers::end_header_specific;
 
@@ -601,6 +601,7 @@ fn compression_plan(
     resources: &WriterResources,
 ) -> Result<compress::CompressPlan> {
     let method = compression_method_for_level(options.compression_level)?;
+    let filter_policy = filter_policy_for_level(filter_policy, options.compression_level);
     // A stored member has no window to reach across, and the size still lands in
     // its header, so fitting one to the data would only inflate what the header
     // claims.
@@ -1998,7 +1999,7 @@ mod tests {
         };
 
         assert_eq!(capped(1), 1024 * 1024);
-        assert_eq!(capped(2), 2 * 1024 * 1024);
+        assert_eq!(capped(2), 1024 * 1024);
         assert_eq!(capped(3), 4 * 1024 * 1024);
         assert_eq!(capped(4), 8 * 1024 * 1024);
         assert_eq!(capped(5), 16 * 1024 * 1024);
@@ -2118,7 +2119,7 @@ mod tests {
     #[test]
     fn every_level_keeps_its_dictionary_under_the_default_plan() {
         let limit = crate::WriterResources::default().planning_memory_limit();
-        for (level, megabytes) in [(1, 1), (2, 2), (3, 4), (4, 8), (5, 16)] {
+        for (level, megabytes) in [(1, 1), (2, 1), (3, 4), (4, 8), (5, 16)] {
             let options = WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
                 .with_compression_level(level);
             assert_eq!(
@@ -2883,46 +2884,50 @@ mod tests {
     }
 
     #[test]
-    fn level_one_looks_ahead_before_taking_a_match() {
-        // Level 1 is the only rung that does not parse by shortest path, so
-        // it is the only one where lazy matching does anything.
-        let level_one = encode_options_for_level(Some(1), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
+    fn level_two_looks_ahead_before_taking_a_match() {
+        // Level 2 is the only rung that parses lazily: level 1 parses greedily
+        // and the rest by shortest path.
+        let level_two = encode_options_for_level(Some(2), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
         assert!(
-            level_one.lazy_matching,
-            "level 1 took the first match it found"
+            level_two.lazy_matching,
+            "level 2 took the first match it found"
         );
-        assert_eq!(level_one.lazy_lookahead, 2);
+        assert_eq!(level_two.lazy_lookahead, 2);
 
         // Source code, the kind of input the bench corpus's text and source
         // classes hold. Lazy matching does not win everywhere. Words from a
         // dozen-word vocabulary in a jumbled order pack larger with it, so this
         // checks real text rather than a synthetic one.
         let data = include_bytes!("../../codec/rar50/encoder.rs");
-        let lazy = encode_lz_member_with_options(data, 0, level_one).unwrap();
+        let lazy = encode_lz_member_with_options(data, 0, level_two).unwrap();
         let greedy =
-            encode_lz_member_with_options(data, 0, level_one.with_lazy_matching(false)).unwrap();
+            encode_lz_member_with_options(data, 0, level_two.with_lazy_matching(false)).unwrap();
         assert!(
             lazy.len() < greedy.len(),
-            "level 1 packed {} looking ahead against {} without",
+            "level 2 packed {} looking ahead against {} without",
             lazy.len(),
             greedy.len(),
         );
     }
 
     #[test]
-    fn only_the_bottom_of_the_ladder_settles_for_a_lazy_parse() {
-        // Level 1 is the rung that exists to be quick. Everything above it
-        // parses by shortest path, because nothing else closes the distance to
-        // WinRAR at any rung.
-        for level in 0..=1u8 {
+    fn only_the_bottom_two_rungs_settle_for_a_chain_parse() {
+        // Levels 1 and 2 are the rungs that exist to be quick: greedy, then
+        // lazy. Everything above them parses by shortest path, because nothing
+        // else closes the distance to WinRAR at any rung.
+        for level in 0..=2u8 {
             let options =
                 encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
             assert!(!options.optimal_parse, "level {level} priced every path");
+            assert_eq!(options.parses_greedily(), level == 1, "level {level}");
         }
-        for level in 2..=5u8 {
+        for level in 3..=5u8 {
             let options =
                 encode_options_for_level(Some(level), DEFAULT_RAR50_DICTIONARY_SIZE).unwrap();
             assert!(options.optimal_parse, "level {level} settled for lazy");
+            // The filter search screens with these options minus the optimal
+            // parse, so the lazy flag still shapes what level 3 and up write.
+            assert!(options.lazy_matching, "level {level} screens greedily");
         }
         assert!(
             encode_options_for_level(None, DEFAULT_RAR50_DICTIONARY_SIZE)

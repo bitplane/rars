@@ -253,12 +253,13 @@ const BORDERLINE_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 652,
     },
-    // The four solid coding peaks can coincide (80.9 MiB charged, 34.4/32.4 MiB measured by tier).
+    // The four solid coding peaks of the chain-walking levels can coincide
+    // (80.9 MiB charged, 34.4/32.4 MiB measured by tier).
     Gap {
         tier: Tier::Small,
         writer: Writer::Rar5,
         paths: &[Path::Solid],
-        levels: &[1],
+        levels: &[1, 2],
         threads: Some(4),
         input: None,
         assertion: Assertion::Loose,
@@ -268,7 +269,7 @@ const BORDERLINE_GAPS: &[Gap] = &[
         tier: Tier::Fitted,
         writer: Writer::Rar5,
         paths: &[Path::Solid],
-        levels: &[1],
+        levels: &[1, 2],
         threads: Some(4),
         input: None,
         assertion: Assertion::Loose,
@@ -471,8 +472,7 @@ impl Writer {
             (Self::Rar20 | Self::Rar4, Tier::Fitted) => Some(4 * MIB),
             (Self::Rar5 | Self::Rar7, Tier::Fitted) => Some(
                 match level {
-                    1 => 1,
-                    2 => 2,
+                    1 | 2 => 1,
                     3 => 4,
                     4 => 8,
                     _ => 16,

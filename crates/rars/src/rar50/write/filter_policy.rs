@@ -161,20 +161,31 @@ pub(super) fn should_store_compressed_payload(
 
 /// How hard each level looks for a match, and where the default sits.
 ///
-/// Each rung packs smaller than the one below. Level 3 is the default because
-/// it is the knee. Level 5 searches filters exhaustively, which is most of what
-/// it costs over level 4, and its 16 MiB window is most of what it buys.
+/// Each rung packs smaller than the one below. Level 1 is the greedy parse over
+/// two chain candidates, the quick rung. Level 3 is the default because it is
+/// the knee. Level 5 searches filters exhaustively, which is most of what it
+/// costs over level 4, and its 16 MiB window is most of what it buys.
 fn match_candidates_for_level(level: u8) -> Result<usize> {
     match level {
         0 => Ok(0),
-        1 => Ok(8),
-        2 => Ok(16),
+        1 => Ok(2),
+        2 => Ok(8),
         3 => Ok(32),
         4 => Ok(128),
         5 => Ok(512),
         _ => Err(Error::InvalidArgument(
             "RAR 5 compression level must be in the range 0..5",
         )),
+    }
+}
+
+/// The filter policy a level writes with. Level 1 searches for no filter: the
+/// search's trial encodes cost several times its greedy parse. A filter the
+/// caller asked for is still applied.
+pub(super) fn filter_policy_for_level(policy: FilterPolicy, level: Option<u8>) -> FilterPolicy {
+    match policy {
+        FilterPolicy::Auto if resolved_level(level) == 1 => FilterPolicy::None,
+        policy => policy,
     }
 }
 
@@ -196,25 +207,33 @@ pub(super) fn encode_options_for_level(
         Error::InvalidArgument("RAR 5 dictionary size exceeds this platform's address space")
     })?;
     Ok(EncodeOptions::new(candidates)
+        // Level 1 takes the best match at each position as it comes, over two
+        // chain candidates and the remembered distances, and searches no
+        // filters ([`filter_policy_for_level`]). It is the rung that exists to
+        // be quick.
+        .with_greedy(level == 1)
         // Looking a byte or two further ahead before settling for the match at
-        // hand is what level 1 parses with; the levels above it parse by
+        // hand is what level 2 parses with; the levels above it parse by
         // shortest path and never ask. A lookahead of four is worse than one.
         //
-        // A deeper lazy rung between levels 1 and 2 loses to the shortest-path
+        // A deeper lazy rung between levels 2 and 3 loses to the shortest-path
         // parse at a shallow search: chains over a 4 MiB window cost the lazy
         // parse more than the tree costs the shortest-path one.
-        .with_lazy_matching(level >= 1)
-        .with_lazy_lookahead(2)
-        // Everything above level 1 parses by shortest path. Search depth is
-        // worth far less than the parse, so there is no setting of the other
-        // knobs that makes a greedy rung competitive. What the depth still buys
-        // is the ordering: at 32, 128, 256 and 512 candidates the parse packs
-        // steadily smaller for steadily more time, which is what a level is.
         //
-        // Level 1 keeps the lazy parse. It is the rung that exists to be quick,
-        // and it is the only place left to go when the shortest-path parse is
-        // too slow for the job.
-        .with_optimal_parse(level >= 2)
+        // The levels above keep the flag although their parse ignores it: the
+        // filter search screens with their options minus the optimal parse.
+        .with_lazy_matching(level >= 2)
+        .with_lazy_lookahead(2)
+        // Everything above level 2 parses by shortest path. Search depth is
+        // worth far less than the parse, so no setting of the other knobs
+        // makes a lazy rung competitive there. What the depth still buys is
+        // the ordering: at 32, 128 and 512 candidates the parse packs steadily
+        // smaller for steadily more time, which is what a level is.
+        //
+        // Level 2 keeps the lazy parse. It is the place to go when the
+        // shortest-path parse is too slow for the job and the greedy one packs
+        // too large.
+        .with_optimal_parse(level >= 3)
         .with_nice_match_length(parse_effort_for_level(level).0)
         .with_parse_passes(parse_effort_for_level(level).1)
         .with_max_match_distance(max_match_distance))
@@ -223,12 +242,10 @@ pub(super) fn encode_options_for_level(
 /// The nice match length and parse passes for a level.
 ///
 /// Search depth alone barely separates the parsing levels on a member that
-/// fits one window. These two are what does. A single pass at level 2 parses
-/// each block once, on guessed prices, rather than again on the prices the
-/// pass before produced.
+/// fits one window. These two are what does. The parses below level 3 take
+/// the defaults, and only the lazy one reads the nice length.
 fn parse_effort_for_level(level: u8) -> (usize, usize) {
     match level {
-        2 => (32, 1),
         3 => (64, 2),
         4 => (256, 3),
         5.. => (1024, 6),
@@ -282,11 +299,10 @@ pub(super) fn compression_method_for_level(level: Option<u8>) -> Result<u8> {
 /// keeps paying up to about 8 MiB; binaries stop at 4 and are slightly worse by
 /// 16.
 ///
-/// Level 2 sits between.
+/// The two chain-walking levels below the default keep to 1 MiB.
 fn fitted_dictionary_cap(level: u8) -> u64 {
     let megabytes = match level {
-        0..=1 => 1,
-        2 => 2,
+        0..=2 => 1,
         3 => 4,
         4 => 8,
         _ => 16,
@@ -1352,7 +1368,7 @@ mod run_search_tests {
         }
     }
 
-    /// Level 1 codes a member longer than one filter search in runs, which
+    /// Level 2 codes a member longer than one filter search in runs, which
     /// run on every thread, rather than whole on one (#545). The archive is
     /// the same at any thread count, and its packed member is the one the
     /// whole-member path makes.
@@ -1366,7 +1382,7 @@ mod run_search_tests {
         use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
         let root = crate::scratch::case("rar50-lazy-member-runs");
         let data = scripted_code(2 * SEARCH + 100 * 1024);
-        let options = encode_options_for_level(Some(1), 128 * 1024).unwrap();
+        let options = encode_options_for_level(Some(2), 128 * 1024).unwrap();
         assert!(!options.optimal_parse);
         let whole = super::super::plan::with_filter_search_bytes(SEARCH, || {
             encode_member_with_filter_policy_candidates_and_progress(
@@ -1394,7 +1410,7 @@ mod run_search_tests {
                         crate::rar50::write_streaming_archive_with_progress(
                             &entries,
                             WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
-                                .with_compression_level(1)
+                                .with_compression_level(2)
                                 .with_dictionary_size(128 * 1024),
                             ArchiveExtras::default().with_filter_policy(FilterPolicy::Auto),
                             &resources,
@@ -1422,6 +1438,68 @@ mod run_search_tests {
         let archive = ArchiveReader::read(&one).unwrap();
         archive.test(None).unwrap();
         assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), data);
+    }
+
+    /// Level 1's greedy parse codes its runs on every thread it is given,
+    /// plain and solid, and the archive is the same at any thread count.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn the_greedy_rung_writes_alike_on_any_thread_count() {
+        use crate::rar50::{ArchiveEntry, ArchiveExtras, WriterOptions};
+        use crate::{ArchiveReader, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
+        let root = crate::scratch::case("rar50-greedy-runs");
+        let code = scripted_code(3 * SEARCH + 77 * 1024);
+        let text: Vec<u8> = (0..40_000u32)
+            .flat_map(|line| format!("line {line} of {} words\n", line % 97).into_bytes())
+            .collect();
+        assert!(encode_options_for_level(Some(1), 128 * 1024)
+            .unwrap()
+            .parses_greedily());
+        for solid in [false, true] {
+            let write = |threads: usize| {
+                let entries = [
+                    ArchiveEntry::new("code", EntrySource::from_bytes(code.clone())),
+                    ArchiveEntry::new("text", EntrySource::from_bytes(text.clone())),
+                ];
+                let resources = WriterResources::new(1024 * 1024 * 1024).with_temp_dir(&*root);
+                let mut features = FeatureSet::store_only();
+                features.solid = solid;
+                let mut bytes = Vec::new();
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(threads)
+                    .build()
+                    .unwrap()
+                    .install(|| {
+                        crate::rar50::write_streaming_archive_with_progress(
+                            &entries,
+                            WriterOptions::new(ArchiveVersion::Rar50, features)
+                                .with_compression_level(1)
+                                .with_dictionary_size(128 * 1024),
+                            ArchiveExtras::default().with_filter_policy(FilterPolicy::Auto),
+                            &resources,
+                            None,
+                            &mut bytes,
+                        )
+                    })
+                    .unwrap();
+                bytes
+            };
+            let one = write(1);
+            for threads in [2, 8] {
+                assert!(
+                    one == write(threads),
+                    "{threads} threads changed the archive, solid {solid}"
+                );
+            }
+            assert!(one.len() < (code.len() + text.len()) / 2, "solid {solid}");
+            let archive = ArchiveReader::read(&one).unwrap();
+            archive.test(None).unwrap();
+            assert_eq!(archive.read_member(b"code", None).unwrap().unwrap(), code);
+            assert_eq!(archive.read_member(b"text", None).unwrap().unwrap(), text);
+        }
     }
 
     /// A filtered member is cut into the blocks an unfiltered one would be,
