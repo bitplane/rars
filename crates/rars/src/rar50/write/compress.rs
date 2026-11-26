@@ -1579,7 +1579,7 @@ fn filter_search_workspace(options: EncodeOptions, len: u64) -> u64 {
     let reach = piece.min(options.max_match_distance as u64);
     let block = piece.min(MAX_LZ_BLOCK_SIZE as u64) as usize;
     let scratch = if options.optimal_parse {
-        super::streaming_lz_workspace(reach, block, true)
+        super::block_job_lz_workspace(reach, block, options.parse_passes)
     } else {
         lazy_parse_workspace(options, usize::try_from(reach).unwrap_or(usize::MAX), block)
     };
@@ -1627,7 +1627,7 @@ impl WaveWorkspace {
         let reach = window.min(options.max_match_distance as u64);
         let scratch = |reach: u64, block: usize| {
             if options.optimal_parse {
-                super::streaming_lz_workspace(reach, block, true)
+                super::block_job_lz_workspace(reach, block, options.parse_passes)
             } else {
                 lazy_parse_workspace(options, usize::try_from(reach).unwrap_or(usize::MAX), block)
             }
