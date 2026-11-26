@@ -1587,30 +1587,30 @@ fn filter_search_workspace(options: EncodeOptions, len: u64) -> u64 {
 }
 
 /// Assembly, filter selection and coding hold different sets of buffers.
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone)]
 struct WaveWorkspace {
     assembly: u64,
     filter_inputs: u64,
     /// One filter search's scratch for each job, which searches its pieces
     /// one at a time under an execution ledger.
     filter_search: u64,
-    /// One for each piece, and the most one holds, for the searches of every
-    /// piece in the wave side by side ([`choose_run_filters`]).
-    piece_searches: u64,
-    piece_search: u64,
+    /// Each piece's search, priced by its own length, for the searches of
+    /// every piece in the wave side by side ([`choose_run_filters`]). A job's
+    /// last piece of a run is often far shorter than the others.
+    piece_searches: Vec<u64>,
     coding: u64,
 }
 
 impl WaveWorkspace {
-    #[allow(clippy::too_many_arguments)]
+    /// `filter_pieces` are the lengths of the pieces the job's filters are
+    /// searched in, empty when it searches none.
     fn add_job(
-        self,
+        mut self,
         options: EncodeOptions,
         len: u64,
         history: u64,
         block: usize,
-        filter_piece: u64,
-        filter_pieces: u64,
+        filter_pieces: impl IntoIterator<Item = u64>,
         tree_chunk_size: Option<usize>,
     ) -> Self {
         use crate::codec::rar50::{lazy_parse_workspace, MAX_LZ_BLOCK_SIZE};
@@ -1638,11 +1638,18 @@ impl WaveWorkspace {
             .saturating_mul(2)
             .saturating_add(window)
             .saturating_add(history);
-        let search = if filter_piece > 0 {
-            filter_search_workspace(options, filter_piece)
-        } else {
-            0
-        };
+        let searches = self.piece_searches.len();
+        self.piece_searches.extend(
+            filter_pieces
+                .into_iter()
+                .filter(|&piece| piece > 0)
+                .map(|piece| filter_search_workspace(options, piece)),
+        );
+        let search = self.piece_searches[searches..]
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
         // Optimal coding's window term includes room beside the finder links.
         // Lazy coding explicitly adds the window, which it owns per job.
         let coding = if let Some(chunk) = tree_chunk_size {
@@ -1673,10 +1680,7 @@ impl WaveWorkspace {
             assembly: self.assembly.saturating_add(assembly),
             filter_inputs: self.filter_inputs.saturating_add(cap),
             filter_search: self.filter_search.saturating_add(search),
-            piece_searches: self
-                .piece_searches
-                .saturating_add(search.saturating_mul(filter_pieces)),
-            piece_search: self.piece_search.max(search),
+            piece_searches: self.piece_searches,
             coding: self.coding.saturating_add(coding),
         }
     }
@@ -1685,10 +1689,15 @@ impl WaveWorkspace {
     /// shared out, before any of them codes. `piece_threads` is how many
     /// filter searches run at once when the wave's pieces are searched side by
     /// side, or `None` when each job searches its own in turn.
-    fn peak(self, retained: u64, seed: u64, piece_threads: Option<u64>) -> u64 {
+    fn peak(&self, retained: u64, seed: u64, piece_threads: Option<u64>) -> u64 {
         let search = piece_threads.map_or(self.filter_search, |threads| {
-            self.piece_searches
-                .min(self.piece_search.saturating_mul(threads))
+            // The largest searches, one per thread.
+            let mut searches = self.piece_searches.clone();
+            searches.sort_unstable_by(|a, b| b.cmp(a));
+            searches
+                .iter()
+                .take(usize::try_from(threads).unwrap_or(usize::MAX))
+                .fold(0u64, |sum, &search| sum.saturating_add(search))
                 .max(self.filter_search)
         });
         let filters = self.filter_inputs.saturating_add(search);
@@ -1742,18 +1751,19 @@ impl BlockWave {
         } else {
             0
         };
-        let filter_piece = if filter_runs && plan.filter_policy == FilterPolicy::Auto {
-            len
+        // The job is not read yet, so each of its pieces is priced as long
+        // as the job allows.
+        let filter_pieces = if filter_runs && plan.filter_policy == FilterPolicy::Auto {
+            len.div_ceil(filter_search_bytes() as u64)
         } else {
             0
         };
-        let workspace = self.workspace.add_job(
+        let workspace = self.workspace.clone().add_job(
             plan.encode_options,
             len,
             history,
             crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-            filter_piece,
-            filter_piece.div_ceil(filter_search_bytes() as u64),
+            (0..filter_pieces).map(|_| len.min(filter_search_bytes() as u64)),
             single_pass_tree_chunk(plan, filter_runs, min_len, history)
                 .filter(|_| resources.execution.is_none()),
         );
@@ -1819,13 +1829,12 @@ impl BlockWave {
             len,
             history,
             crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
-            0,
-            0,
+            [],
             single_pass_tree_chunk(plan, filter_runs, len, history),
         );
         let workspace = WaveWorkspace {
             coding: self.workspace.coding.saturating_add(tail.coding),
-            ..self.workspace
+            ..self.workspace.clone()
         };
         let charge = workspace.peak(retained, seed, Some(crate::parallel::threads() as u64));
         if !permit.try_grow_to(charge) {
@@ -1858,21 +1867,15 @@ impl BlockWave {
                 .max()
                 .unwrap_or(0);
         }
-        let (filter_piece, filter_pieces) =
-            if !filter_runs || plan.filter_policy != FilterPolicy::Auto {
-                (0, 0)
-            } else {
-                filter_pieces(job).fold((0, 0), |(most, count), (piece, _)| {
-                    (most.max(piece.len()), count + 1)
-                })
-            };
-        self.workspace = self.workspace.add_job(
+        let searched = filter_runs && plan.filter_policy == FilterPolicy::Auto;
+        self.workspace = std::mem::take(&mut self.workspace).add_job(
             plan.encode_options,
             job.data.len() as u64,
             history,
             block,
-            filter_piece as u64,
-            filter_pieces,
+            filter_pieces(job)
+                .filter(|_| searched)
+                .map(|(piece, _)| piece.len() as u64),
             single_pass_tree_chunk(plan, filter_runs, job.data.len() as u64, history)
                 .filter(|_| !B::LIMITED),
         );

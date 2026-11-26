@@ -785,8 +785,21 @@ fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse
 /// 16 MiB window: the pages behind the untouched slots never become resident.
 /// The charge covers the allocation anyway, since data that does fill the
 /// window will touch them.
+///
+/// Routing prices a whole member with this, and it is part of the encoding
+/// plan, so it stays fixed. What a whole member is admitted for is
+/// [`whole_member_tree_workspace`].
 fn tree_lz_workspace(reach: u64, block_size: usize) -> u64 {
     lz_workspace(reach, block_size, 17, 160)
+}
+
+/// What a whole member's optimal parse is admitted for besides the member
+/// copies: the tree's links per window byte, as [`tree_lz_workspace`], and a
+/// block job's parse per block byte, as [`streaming_lz_workspace`]. The
+/// pipelined parse holds at most a block's worth of collected and priced
+/// blocks at once, as a block job's does.
+fn whole_member_tree_workspace(reach: u64, block_size: usize) -> u64 {
+    lz_workspace(reach, block_size, 17, 104)
 }
 
 fn lz_workspace(window: u64, block_size: usize, per_window_byte: u64, per_block_byte: u64) -> u64 {
