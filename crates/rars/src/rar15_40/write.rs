@@ -2541,15 +2541,26 @@ fn encode_member<'a>(
     progress: &WorkTracker<'_>,
 ) -> Result<EncodedMember<'a>> {
     let unpacked_size = measure_member(member, options, progress)?;
-    let permit = member_charge(
+    let charge = member_charge(
         member,
         options,
         coding,
         unpacked_size,
         solid_encoder.as_ref(),
-    )?
-    .map(|charge| resources.acquire_serialising_cancellable(charge, &|| progress.is_cancelled()))
-    .transpose()?;
+    )?;
+    // A charge past the budget is clamped to it and the member runs alone,
+    // so what the member holds is all that can give: its chain tries the PPMd
+    // sizes one model at a time, which codes the same bytes more slowly.
+    if let Some(SolidEncoder::Rar29(encoder)) = solid_encoder {
+        encoder.set_ppmd_trial_one_model(
+            charge.is_some_and(|charge| charge > resources.memory_limit()),
+        );
+    }
+    let permit = charge
+        .map(|charge| {
+            resources.acquire_serialising_cancellable(charge, &|| progress.is_cancelled())
+        })
+        .transpose()?;
     encode_measured(
         member,
         options,
@@ -7810,6 +7821,63 @@ mod tests {
             (b"after.txt".to_vec(), text[text.len() - 60000..].to_vec()),
         ];
         assert_eq!(extracted(&archive, Some(b"password")), expected);
+    }
+
+    /// A chain member charged past its budget tries the PPMd sizes one model
+    /// at a time, which codes the archive a large budget codes, at any thread
+    /// count.
+    #[test]
+    #[cfg(feature = "parallel")]
+    fn a_solid_chain_charged_past_its_budget_codes_the_same_at_any_thread_count() {
+        let text = word_text(super::CHAIN_PPMD_TRIAL_BYTES as usize + 64 * 1024);
+        let mut options = rar40().with_compression_level(5);
+        options.features.solid = true;
+        let coding = crate::MemberCoding::Compressed;
+        // The first member is too long for the run's own model trial, so it
+        // tries every size the level does itself.
+        let (first, after) = text.split_at(super::CHAIN_PPMD_TRIAL_BYTES as usize);
+        let members = entries(&[("first.txt", first), ("after.txt", after)]);
+        let write = |resources: &crate::WriterResources| {
+            let mut out = Vec::new();
+            super::write_streaming_archive_to(
+                &members,
+                options,
+                coding.clone(),
+                None,
+                resources,
+                None,
+                &mut out,
+            )
+            .unwrap();
+            out
+        };
+        // The least the member is charged, at one thread.
+        let one = crate::parallel::ThreadCap::set(Some(1));
+        let charge = {
+            let member = super::Member::from_streaming(&members[0]);
+            let chain = super::SolidEncoder::for_target(options).unwrap();
+            super::member_charge(&member, options, &coding, first.len() as u64, Some(&chain))
+                .unwrap()
+                .unwrap()
+        };
+        assert!(charge > crate::WriterResources::new(charge / 2).memory_limit());
+        let large = write(&crate::WriterResources::new(charge * 4));
+        drop(one);
+        for threads in [1, 2, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let short = pool.install(|| write(&crate::WriterResources::new(charge / 2)));
+            assert!(short == large, "{threads} threads changed the archive");
+        }
+        assert_eq!(
+            extracted(&large, None),
+            [
+                (b"first.txt".to_vec(), first.to_vec()),
+                (b"after.txt".to_vec(), after.to_vec()),
+            ]
+        );
     }
 
     #[test]

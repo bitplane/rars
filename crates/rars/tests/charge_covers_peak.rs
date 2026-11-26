@@ -299,21 +299,7 @@ const BORDERLINE_GAPS: &[Gap] = &[
 /// Every case that fails an assertion today, against the issue tracking it.
 /// #393 is the accounting work these belong to; an entry naming it has no
 /// issue of its own yet.
-const KNOWN_GAPS: &[Gap] = &[
-    // A solid level 5 text chain holds more than the one-thread default
-    // budget, and a member charged past the budget runs alone in it rather
-    // than holding less.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar4,
-        paths: &[Path::Solid],
-        levels: &[5],
-        threads: Some(1),
-        input: Some(Input::Literals),
-        assertion: Assertion::InsideBudget,
-        issue: 718,
-    },
-];
+const KNOWN_GAPS: &[Gap] = &[];
 
 fn lcg(state: &mut u64) -> u64 {
     *state = state
