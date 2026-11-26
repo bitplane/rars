@@ -165,6 +165,9 @@ enum Input {
     TwoSymbol,
     ThreeSymbol,
     Zeros,
+    /// Characters drawn from 64 symbols: they compress, but so rarely match
+    /// that an LZ parse codes them a literal at a time, a token per byte.
+    Literals,
 }
 
 const WRITERS: [Writer; 6] = [
@@ -176,13 +179,14 @@ const WRITERS: [Writer; 6] = [
     Writer::Rar7,
 ];
 
-const INPUTS: [Input; 6] = [
+const INPUTS: [Input; 7] = [
     Input::Text,
     Input::Binary,
     Input::Random,
     Input::TwoSymbol,
     Input::ThreeSymbol,
     Input::Zeros,
+    Input::Literals,
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,26 +282,27 @@ const BORDERLINE_GAPS: &[Gap] = &[
         assertion: Assertion::Loose,
         issue: 654,
     },
+    // The same three repricing jobs in RAR 5, at the two levels that reprice
+    // two or three times. Six passes at level 5 overlap enough to pass.
+    Gap {
+        tier: Tier::Small,
+        writer: Writer::Rar5,
+        paths: &[Path::Blocks],
+        levels: &[3, 4],
+        threads: Some(4),
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 654,
+    },
 ];
 
 /// Every case that fails an assertion today, against the issue tracking it.
 /// #393 is the accounting work these belong to; an entry naming it has no
 /// issue of its own yet.
 const KNOWN_GAPS: &[Gap] = &[
-    // RAR 4's level 2 at four threads charges its filter search a parse batch
-    // of a token per byte, split blocks holding the tokens twice, for the
-    // member's encode and for each encode beside it. None of these inputs
-    // parses to a token per byte.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar4,
-        paths: &[Path::FiltersAuto],
-        levels: &[2],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 706,
-    },
+    // RAR 4's level 2 at four threads charges the encodes its filter search
+    // runs beside the member's on top of a member charge already sized for
+    // two pieces searched at once.
     Gap {
         tier: Tier::Fitted,
         writer: Writer::Rar4,
@@ -306,7 +311,42 @@ const KNOWN_GAPS: &[Gap] = &[
         threads: Some(4),
         input: None,
         assertion: Assertion::Loose,
-        issue: 706,
+        issue: 717,
+    },
+    // A solid level 5 text chain holds more than the one-thread default
+    // budget, and a member charged past the budget runs alone in it rather
+    // than holding less.
+    Gap {
+        tier: Tier::Fitted,
+        writer: Writer::Rar4,
+        paths: &[Path::Solid],
+        levels: &[5],
+        threads: Some(1),
+        input: Some(Input::Literals),
+        assertion: Assertion::InsideBudget,
+        issue: 718,
+    },
+    // RAR 5 routes a member it codes whole on a fixed estimate whose parse
+    // term, per byte of a block, is well above what any of these inputs hold.
+    Gap {
+        tier: Tier::Fitted,
+        writer: Writer::Rar5,
+        paths: &[Path::FiltersAuto],
+        levels: &[2],
+        threads: None,
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 719,
+    },
+    Gap {
+        tier: Tier::Fitted,
+        writer: Writer::Rar5,
+        paths: &[Path::FiltersAuto],
+        levels: &[3],
+        threads: Some(4),
+        input: None,
+        assertion: Assertion::Loose,
+        issue: 719,
     },
 ];
 
@@ -413,6 +453,11 @@ impl Input {
                 }
             }
             Self::Zeros => data.resize(size, 0),
+            Self::Literals => {
+                while data.len() < size {
+                    data.push(b'0' + ((lcg(&mut state) >> 33) % 64) as u8);
+                }
+            }
         }
         data.truncate(size);
         data
