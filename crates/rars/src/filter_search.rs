@@ -1398,6 +1398,25 @@ const TRIAL_SPAN: usize = 256 * 1024;
 /// A quarter of the member.
 const TRIAL_WINDOW_LEN: usize = 64 * 1024;
 
+const _: () = assert!(SCREEN_SAMPLE_LEN <= TRIAL_SPAN && TRIAL_WINDOW_LEN <= TRIAL_SPAN);
+
+/// The longest encode [`choose_filter_specs`] runs on `len` bytes for
+/// `search`, so a caller can price the search by it.
+///
+/// An exhaustive search encodes every finalist in full. Any other search
+/// hands its winner back unencoded, and nothing it encodes is longer than a
+/// trial span: the screens encode samples of [`SCREEN_SAMPLE_LEN`] at most,
+/// the trial encodes windows of [`TRIAL_WINDOW_LEN`], and only data no longer
+/// than [`TRIAL_SPAN`] is encoded whole, by the screen, the trial or the
+/// comparison of finalists the screen measured.
+pub(crate) fn longest_specs_encode<S: FilterSearch>(search: &S, len: usize) -> usize {
+    if search.exhaustive() {
+        len
+    } else {
+        len.min(TRIAL_SPAN)
+    }
+}
+
 /// Where the trial encodes a member this long: the middle of each
 /// [`TRIAL_SPAN`] of it.
 fn trial_windows(len: usize) -> impl Iterator<Item = Range<usize>> {
