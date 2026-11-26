@@ -1249,16 +1249,8 @@ impl Rar29Search {
         }
     }
 
-    /// The reduced searches price a sample within what it holds. A sample is
-    /// encoded on its own, so no match reaches past it, but a finder sized for
-    /// the member's dictionary clears a head per four bytes of that for every
-    /// sample: 4 MiB for each of the hundreds a tar of executables screens.
     fn sample_options(&self, data: &[u8], options: Rar29EncodeOptions) -> Rar29EncodeOptions {
-        if self.effort == SearchEffort::Full {
-            return options;
-        }
-        let within = options.max_match_distance.min(data.len().max(1));
-        options.with_max_match_distance(within)
+        self.effort.sample_options(data.len(), options)
     }
 }
 
@@ -1293,6 +1285,20 @@ impl SearchEffort {
 
     fn for_options(options: WriterOptions) -> Self {
         Self::for_method(compression_method_for_level(options))
+    }
+
+    /// The options a search at this effort encodes `len` bytes at.
+    ///
+    /// The reduced searches price a sample within what it holds. A sample is
+    /// encoded on its own, so no match reaches past it, but a finder sized for
+    /// the member's dictionary clears a head per four bytes of that for every
+    /// sample: 4 MiB for each of the hundreds a tar of executables screens.
+    fn sample_options(self, len: usize, options: Rar29EncodeOptions) -> Rar29EncodeOptions {
+        if self == Self::Full {
+            return options;
+        }
+        let within = options.max_match_distance.min(len.max(1));
+        options.with_max_match_distance(within)
     }
 
     /// Whether the search skips `data` outright: a reduced search does not
@@ -1501,7 +1507,7 @@ fn rar29_piece_filters<R: Send>(
 ) -> Result<Vec<FilterSpec>> {
     let search_options = options.with_optimal_parse_passes(0);
     let piece = piece.max(1);
-    let admit = |len: usize| room(rar29_side_encode_workspace(len, search_options));
+    let admit = |len: usize| room(rar29_side_encode_workspace(len, search_options, effort));
     let search = |start: usize| -> Result<Vec<FilterSpec>> {
         let end = (start + piece).min(data.len());
         let bytes = &data[start..end];
@@ -1552,10 +1558,16 @@ fn rar29_search_encode_workspace(len: usize, options: Rar29EncodeOptions) -> u64
         .max(crate::codec::rar29::member_encode_workspace(len, screen))
 }
 
-/// [`rar29_search_encode_workspace`] for an encode a search runs beside the
-/// one that keeps the best so far.
-fn rar29_side_encode_workspace(len: usize, options: Rar29EncodeOptions) -> u64 {
+/// [`rar29_search_encode_workspace`] for an encode a search at `effort` runs
+/// beside the one that keeps the best so far, with the finder that effort
+/// sizes for `len` bytes.
+fn rar29_side_encode_workspace(
+    len: usize,
+    options: Rar29EncodeOptions,
+    effort: SearchEffort,
+) -> u64 {
     use crate::filter_search::FilterSearch;
+    let options = effort.sample_options(len, options);
     let screen = Rar29Search::MEMBER.screen_options(options);
     crate::codec::rar29::side_encode_workspace(len, options)
         .max(crate::codec::rar29::side_encode_workspace(len, screen))
@@ -1652,7 +1664,7 @@ fn encode_rar29_auto_filtered_member_with_progress(
                 }),
                 &|len| {
                     resources.and_then(|resources| {
-                        resources.try_acquire(rar29_side_encode_workspace(len, lazy))
+                        resources.try_acquire(rar29_side_encode_workspace(len, lazy, effort))
                     })
                 },
             )?;
@@ -5733,7 +5745,7 @@ mod tests {
                     &crate::MemberCoding::Compressed,
                     super::PpmdHeld::None,
                 ),
-                super::rar29_side_encode_workspace(data.len(), lazy),
+                super::rar29_side_encode_workspace(data.len(), lazy, super::SearchEffort::Full),
             )
         });
         let encode = |limit: u64| {
