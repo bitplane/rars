@@ -243,9 +243,9 @@ pub(crate) trait OwnedSearch {
     /// Whether to measure the E8-only filter wherever the x86 screen keeps
     /// code, rather than only where a sample says the jumps cost more. See
     /// [`x86_screened_regions`].
-    fn prices_calls_alone(&self) -> bool {
-        false
-    }
+    ///
+    /// It has no default, so a wrapper can't drop an inner search's answer.
+    fn prices_calls_alone(&self) -> bool;
     fn max_delta_channels(&self) -> usize;
     /// See [`FilterSearch::table_scan_window`].
     fn table_scan_window(&self) -> usize {
@@ -336,6 +336,9 @@ impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
     }
     fn detects_x86(&self) -> bool {
         self.0.detects_x86()
+    }
+    fn prices_calls_alone(&self) -> bool {
+        false
     }
     fn max_delta_channels(&self) -> usize {
         self.0.max_delta_channels()
@@ -1896,6 +1899,9 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
     fn detects_x86(&self) -> bool {
         self.search.detects_x86()
     }
+    fn prices_calls_alone(&self) -> bool {
+        self.search.prices_calls_alone()
+    }
     fn max_delta_channels(&self) -> usize {
         self.search.max_delta_channels()
     }
@@ -3046,6 +3052,9 @@ mod tests {
             fn detects_x86(&self) -> bool {
                 false
             }
+            fn prices_calls_alone(&self) -> bool {
+                false
+            }
             fn max_delta_channels(&self) -> usize {
                 0
             }
@@ -3120,6 +3129,9 @@ mod tests {
             }
             fn detects_x86(&self) -> bool {
                 true
+            }
+            fn prices_calls_alone(&self) -> bool {
+                false
             }
             fn max_delta_channels(&self) -> usize {
                 0
@@ -3198,6 +3210,9 @@ mod tests {
                 Ok(Buffer::new(&self.0))
             }
             fn detects_x86(&self) -> bool {
+                false
+            }
+            fn prices_calls_alone(&self) -> bool {
                 false
             }
             fn max_delta_channels(&self) -> usize {
@@ -4356,5 +4371,73 @@ mod tests {
             assert_eq!(chosen, Err(crate::Error::Cancelled));
             assert_eq!(search.encodes.load(SeqCst), 0);
         }
+    }
+
+    #[test]
+    fn wrappers_keep_a_search_that_prices_calls_alone() {
+        struct Calls(Allowance);
+        impl OwnedSearch for Calls {
+            type Options = ();
+            type Memory = Allowance;
+
+            fn allowance(&self) -> &Allowance {
+                &self.0
+            }
+            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind>> {
+                unreachable!()
+            }
+            fn detects_x86(&self) -> bool {
+                true
+            }
+            fn prices_calls_alone(&self) -> bool {
+                true
+            }
+            fn max_delta_channels(&self) -> usize {
+                0
+            }
+            fn screen_options(&self, options: ()) {
+                options
+            }
+            fn filtered_bytes(&self, _: &[u8], _: &[FilterSpec]) -> Result<Buffer<u8>> {
+                unreachable!()
+            }
+            fn encode_plain(
+                &self,
+                _: &[u8],
+                _: (),
+                _: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Buffer<u8>> {
+                unreachable!()
+            }
+            fn encode_filtered(
+                &self,
+                _: &[u8],
+                _: &[FilterSpec],
+                _: (),
+                _: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> Result<Buffer<u8>> {
+                unreachable!()
+            }
+        }
+
+        let search = Calls(Allowance::default());
+        let progress = |_: usize| true;
+        let shared = SharedReporting {
+            search: &search,
+            progress: &progress,
+        };
+        assert!(shared.prices_calls_alone());
+        let admit = |_: usize| None::<()>;
+        let side = SideBySideSearch {
+            search: &shared,
+            admit: &admit,
+        };
+        assert!(side.prices_calls_alone());
+        let mut report = |_: EncodeProgress| true;
+        let reporting = ReportingSearch {
+            search: &search,
+            progress: std::cell::RefCell::new(&mut report),
+        };
+        assert!(reporting.prices_calls_alone());
     }
 }
