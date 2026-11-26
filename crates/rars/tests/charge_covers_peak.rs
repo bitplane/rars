@@ -299,30 +299,7 @@ const BORDERLINE_GAPS: &[Gap] = &[
 /// Every case that fails an assertion today, against the issue tracking it.
 /// #393 is the accounting work these belong to; an entry naming it has no
 /// issue of its own yet.
-const KNOWN_GAPS: &[Gap] = &[
-    // RAR 5 routes a member it codes whole on a fixed estimate whose parse
-    // term, per byte of a block, is well above what any of these inputs hold.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto],
-        levels: &[2],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 719,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto],
-        levels: &[3],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 719,
-    },
-];
+const KNOWN_GAPS: &[Gap] = &[];
 
 fn lcg(state: &mut u64) -> u64 {
     *state = state
