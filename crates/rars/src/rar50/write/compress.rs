@@ -1715,6 +1715,10 @@ struct BlockWave {
     // The hard ledger also holds the scopes' control blocks and any existing
     // coordinator allocations, such as retained histories and spool storage.
     scopes: u64,
+    /// What the ledger had free when the wave's first job was admitted, and
+    /// what the wave's jobs take from it outside their scopes.
+    room: u64,
+    incoming: u64,
     /// The member of the last job that seeds a tree from history, and how
     /// many of its jobs in a row do.
     seeding: Option<(usize, usize)>,
@@ -1775,13 +1779,19 @@ impl BlockWave {
         let scopes = self
             .scopes
             .saturating_add(required.saturating_add(crate::codec::workspace::RESERVATION_BYTES));
+        // Outside its scope a job holds its input, which may have grown to
+        // twice its length, a copy of its history, which a filtered run is
+        // only handed after every job is admitted, and the window its worker
+        // grows that history into. Each job's share is summed against the
+        // room the wave started with, since the ledger does not yet show the
+        // copies and windows of the jobs before it.
+        let incoming = self.incoming.saturating_add(
+            len.saturating_mul(4)
+                .saturating_add(history.saturating_mul(3)),
+        );
         if let Some(permit) = &mut self.permit {
-            if resources.execution.as_ref().is_some_and(|ledger| {
-                let incoming = len
-                    .saturating_mul(4)
-                    .saturating_add(history.saturating_mul(2));
-                scopes.saturating_add(incoming) > ledger.available()
-            }) || !permit.try_grow_to(charge)
+            if (resources.execution.is_some() && scopes.saturating_add(incoming) > self.room)
+                || !permit.try_grow_to(charge)
             {
                 return Ok(false);
             }
@@ -1791,8 +1801,13 @@ impl BlockWave {
                 plan.dictionary_size,
                 &|| advance.is_cancelled(),
             )?);
+            self.room = resources
+                .execution
+                .as_ref()
+                .map_or(0, |ledger| ledger.available());
         }
         self.scopes = scopes;
+        self.incoming = incoming;
         self.seeding = seeding;
         self.shared_seed = shared_seed;
         Ok(true)
