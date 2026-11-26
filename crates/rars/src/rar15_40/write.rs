@@ -2387,7 +2387,8 @@ fn rar29_piece_searches_at_once() -> usize {
 
 /// The PPMd coding of `len` bytes that `ppmd` says a RAR 2.9 member holds:
 /// the models live at once, and while it codes them, the escape search, the
-/// packed bytes each model codes, and the filtered copy a named filter makes.
+/// packed bytes each model codes, the smallest coding so far where the level
+/// tries more than one model, and the filtered copy a named filter makes.
 fn rar29_ppmd_workspace(
     options: WriterOptions,
     coding: &MemberCoding,
@@ -2414,10 +2415,16 @@ fn rar29_ppmd_workspace(
         MemberCoding::Filtered(FilterPolicy::Explicit(_)) => len,
         _ => 0,
     };
+    // The models are coded one after another, each beside the best before it.
+    let best = match ppmd_models_for_options(options).len() > 1 {
+        true => packed_bound(len),
+        false => 0,
+    };
     model
         .saturating_add(packed_bound(len))
         .saturating_mul(codings)
         .saturating_add(kept)
+        .saturating_add(best)
         .saturating_add(crate::codec::rar29::ppmd_search_workspace(reach))
         .saturating_add(filtered)
 }
@@ -10092,10 +10099,11 @@ mod tests {
             let charge = |level| whole(at(level), 8 * MIB);
             assert!(charge(4) >= charge(3) + (64 - 25) * MIB);
             assert!(charge(5) >= charge(4) + (2 * 128 - 64) * MIB);
-            // A short member is coded both ways at every level.
+            // A short member is coded both ways at every level, and level 5
+            // keeps the smallest coding beside the next model's.
             assert_eq!(
                 whole(at(5), 1000) - whole(at(3), 1000),
-                2 * (128 - 25) * MIB
+                2 * (128 - 25) * MIB + super::packed_bound(1000)
             );
             // Streamed, the parse is charged by the block, not by the member.
             assert!(streamed(at(5)) < whole(at(5), 1 << 30));
@@ -10107,7 +10115,7 @@ mod tests {
             // Forced PPMd codes one model at a time and no LZ at all.
             assert_eq!(
                 whole(forced(5), 8 * MIB) - whole(forced(1), 8 * MIB),
-                (128 - 25) * MIB
+                (128 - 25) * MIB + super::packed_bound(8 * MIB)
             );
             assert!(whole(forced(1), 8 * MIB) < whole(at(3), 8 * MIB));
             assert_eq!(streamed(forced(5)) - streamed(forced(3)), (128 - 25) * MIB);
