@@ -2373,6 +2373,10 @@ fn rar29_text_trial(options: WriterOptions, coding: &MemberCoding) -> bool {
 /// that holds more: each piece of a member held alone that is searched at once
 /// holds the first of its encodes. The encodes a search runs beside those are
 /// charged as they run. A chain screens its candidates one at a time.
+///
+/// A member searched whole encodes its winner whole. A member searched a
+/// piece at a time encodes nothing longer than
+/// [`crate::filter_search::longest_specs_encode`] of a piece.
 fn rar29_lz_workspace(options: WriterOptions, coding: &MemberCoding, len: u64) -> u64 {
     let Ok(encode) = rar29_encode_options_for_options(options) else {
         return 0;
@@ -2383,12 +2387,20 @@ fn rar29_lz_workspace(options: WriterOptions, coding: &MemberCoding, len: u64) -
     if options.features.solid || !rar29_searches_filters(options, coding) {
         return at_settings;
     }
-    let piece = bytes.min(RAR29_FILTER_SEARCH_BYTES);
+    let lazy = encode.with_optimal_parse_passes(0);
+    if bytes <= RAR29_FILTER_SEARCH_BYTES {
+        return at_settings.max(rar29_search_encode_workspace(bytes, lazy));
+    }
     let pieces = bytes
-        .div_ceil(piece.max(1))
+        .div_ceil(RAR29_FILTER_SEARCH_BYTES)
         .min(rar29_piece_searches_at_once());
-    let search = rar29_search_encode_workspace(piece, encode.with_optimal_parse_passes(0))
-        .saturating_mul(pieces.max(1) as u64);
+    let effort = SearchEffort::for_options(options);
+    let longest = crate::filter_search::longest_specs_encode(
+        &Rar29Search::at(0, encode, effort),
+        RAR29_FILTER_SEARCH_BYTES,
+    );
+    let search = rar29_search_encode_workspace(longest, effort.sample_options(longest, lazy))
+        .saturating_mul(pieces as u64);
     at_settings.max(search)
 }
 
@@ -6390,6 +6402,157 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A piece search below level 5 encodes nothing longer than the bound
+    /// its charge is priced by, whatever the piece holds, and level 5's is
+    /// the piece.
+    #[test]
+    fn a_piece_search_encodes_nothing_longer_than_its_bound() {
+        use crate::filter_search::FilterSearch;
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        struct Longest(super::Rar29Search, AtomicUsize);
+        impl FilterSearch for Longest {
+            type Options = super::Rar29EncodeOptions;
+            fn screened_kinds(&self, data: &[u8]) -> Vec<FilterKind> {
+                self.0.screened_kinds(data)
+            }
+            fn max_delta_channels(&self) -> usize {
+                self.0.max_delta_channels()
+            }
+            fn table_scan_window(&self) -> usize {
+                self.0.table_scan_window()
+            }
+            fn x86_region_sample_span(&self) -> usize {
+                self.0.x86_region_sample_span()
+            }
+            fn screen_options(&self, options: Self::Options) -> Self::Options {
+                self.0.screen_options(options)
+            }
+            fn exhaustive(&self) -> bool {
+                self.0.exhaustive()
+            }
+            fn trusts_x86_scanner(&self) -> bool {
+                self.0.trusts_x86_scanner()
+            }
+            fn filtered_bytes(
+                &self,
+                data: &[u8],
+                filters: &[FilterSpec],
+            ) -> crate::Result<Vec<u8>> {
+                self.0.filtered_bytes(data, filters)
+            }
+            fn filtered_window(
+                &self,
+                data: &[u8],
+                offset: usize,
+                filters: &[FilterSpec],
+            ) -> crate::Result<Vec<u8>> {
+                self.0.filtered_window(data, offset, filters)
+            }
+            fn encode_plain(
+                &self,
+                data: &[u8],
+                options: Self::Options,
+                progress: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> crate::Result<Vec<u8>> {
+                self.1.fetch_max(data.len(), Relaxed);
+                self.0.encode_plain(data, options, progress)
+            }
+            fn encode_filtered(
+                &self,
+                data: &[u8],
+                filters: &[FilterSpec],
+                options: Self::Options,
+                progress: Option<&mut dyn FnMut(usize) -> bool>,
+            ) -> crate::Result<Vec<u8>> {
+                self.1.fetch_max(data.len(), Relaxed);
+                self.0.encode_filtered(data, filters, options, progress)
+            }
+        }
+        // Code with a table in it, samples and zeros, so every screen, the
+        // trial's windows and the finalists all have something to encode.
+        let piece = super::RAR29_FILTER_SEARCH_BYTES;
+        let quarter = piece / 4;
+        let table = relocations(4096);
+        let mut data = x86_calls(quarter - table.len());
+        data.extend_from_slice(&table);
+        data.extend_from_slice(&noisy_stereo(quarter));
+        data.extend_from_slice(&x86_calls(quarter));
+        data.resize(piece, 0);
+        // A piece no longer than a trial span is encoded whole.
+        let short = noisy_stereo(200 * 1024);
+        for level in 1..=4 {
+            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
+            let effort = super::SearchEffort::for_method(0x30 + level);
+            for bytes in [&data[..], &short[..]] {
+                let search = Longest(super::Rar29Search::at(0, options, effort), 0.into());
+                let bound = crate::filter_search::longest_specs_encode(&search, bytes.len());
+                crate::filter_search::choose_filter_specs(
+                    &search,
+                    bytes,
+                    options.with_optimal_parse_passes(0),
+                    None,
+                    &|_| Some(()),
+                )
+                .unwrap();
+                let longest = search.1.into_inner();
+                assert!(longest > 0, "level {level} encoded nothing");
+                assert!(
+                    longest <= bound,
+                    "level {level}: encoded {longest} bytes of {}, bound {bound}",
+                    bytes.len()
+                );
+            }
+            assert!(
+                crate::filter_search::longest_specs_encode(
+                    &super::Rar29Search::at(0, options, effort),
+                    piece
+                ) < piece
+            );
+        }
+        let options = super::rar29_encode_options_for_level(Some(5)).unwrap();
+        let search = super::Rar29Search::at(0, options, super::SearchEffort::Full);
+        assert_eq!(
+            crate::filter_search::longest_specs_encode(&search, piece),
+            piece
+        );
+    }
+
+    /// Below level 5 a member searched a piece at a time is charged for the
+    /// coding after the search, which holds more than the pieces' searches,
+    /// two at once. Level 5 encodes its pieces' finalists whole.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_piece_search_below_level_five_is_charged_under_the_coding() {
+        let len = 10 * 1024 * 1024;
+        crate::parallel::private_pool(4).install(|| {
+            for level in 1..=5 {
+                let options = rar40()
+                    .with_compression_level(level)
+                    .with_dictionary_size(4 * 1024 * 1024);
+                let encode = super::rar29_encode_options_for_options(options).unwrap();
+                let at_settings = crate::codec::rar29::member_encode_workspace(len, encode)
+                    .saturating_add(super::rar29_optimal_parse_workspace(options, len as u64));
+                let charged = super::rar29_lz_workspace(
+                    options,
+                    &crate::MemberCoding::Compressed,
+                    len as u64,
+                );
+                let whole_pieces = 2 * super::rar29_search_encode_workspace(
+                    super::RAR29_FILTER_SEARCH_BYTES,
+                    encode.with_optimal_parse_passes(0),
+                );
+                if level < 5 {
+                    assert_eq!(charged, at_settings, "level {level}");
+                } else {
+                    assert!(charged >= whole_pieces, "level {level}");
+                }
+            }
+        });
     }
 
     /// Sixteen-bit stereo: two tones with noise in the low bits, which as
