@@ -153,6 +153,9 @@ enum Path {
     Ppmd,
     /// Three members in a solid chain.
     Solid,
+    /// RAR 4: one binary member long enough to be coded as it is read,
+    /// filters searched a segment at a time.
+    Streamed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -475,10 +478,17 @@ impl Writer {
     }
 }
 
-fn member_size(writer: Writer, tier: Tier, level: u8) -> usize {
-    match tier {
-        Tier::Small => (5 * MIB / 2) as usize,
-        Tier::Fitted => (writer.dictionary(tier, level).unwrap_or(MIB) * 5 / 2) as usize,
+/// RAR 4 streams a binary member longer than this rather than holding it.
+const RAR4_STREAMS_BINARY_ABOVE: u64 = 16 * MIB;
+
+fn member_size(writer: Writer, path: Path, tier: Tier, level: u8) -> usize {
+    let size = match tier {
+        Tier::Small => 5 * MIB / 2,
+        Tier::Fitted => writer.dictionary(tier, level).unwrap_or(MIB) * 5 / 2,
+    };
+    match path {
+        Path::Streamed => (RAR4_STREAMS_BINARY_ABOVE + size) as usize,
+        _ => size as usize,
     }
 }
 
@@ -527,7 +537,7 @@ fn measure<T: Send>(threads: usize, run: impl FnOnce() -> T + Send) -> (T, u64) 
 /// The members of one case, made before anything is counted.
 fn members(case: &Case, tier: Tier) -> Vec<(String, EntrySource)> {
     let count = if case.path == Path::Solid { 3 } else { 1 };
-    let size = member_size(case.writer, tier, case.level);
+    let size = member_size(case.writer, case.path, tier, case.level);
     (0..count)
         .map(|member| {
             let data = case.input.bytes(size, member + 1);
@@ -894,6 +904,27 @@ fn rar4_level2_fitted_piece_search_charge_covers_every_input() {
         })
         .collect();
     check(Tier::Fitted, cases);
+}
+
+/// RAR 4 streams a binary member past [`RAR4_STREAMS_BINARY_ABOVE`] and
+/// searches each segment for filters a piece at a time, two pieces at once.
+/// Level 1's search isn't exhaustive, so its pieces are charged for its
+/// longest encode, not a whole piece each.
+#[test]
+fn rar4_level1_streamed_piece_search_charge_covers_and_fits() {
+    let cases = thread_counts()
+        .iter()
+        .flat_map(|&threads| {
+            [Input::Binary, Input::TwoSymbol].map(|input| Case {
+                writer: Writer::Rar4,
+                path: Path::Streamed,
+                level: 1,
+                threads,
+                input,
+            })
+        })
+        .collect();
+    check(Tier::Small, cases);
 }
 
 /// Every writer, path, level, thread count and input at a 1 MiB dictionary.
