@@ -49,6 +49,7 @@ not (
     (binary_id(rars::rar50_fixtures) & test(=streaming_writer_handles_solid_encrypted_headers_and_recovery_together)) |
     (binary_id(rars::rar50_large_member_filters) & test(=an_explicit_filter_too_large_to_apply_whole_is_applied_run_by_run)) |
     (binary_id(rars::rar50_large_member_filters) & test(=runs_of_a_large_member_choose_their_own_filters)) |
+    (binary_id(rars::rar50_ledger_auto_threads) & test(=filtered_runs_under_a_ledger_write_alike_at_any_thread_count)) |
     (binary_id(rars::rar50_shared_block_windows) & test(=filtered_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
     (binary_id(rars::rar50_shared_block_windows) & test(=filtered_solid_runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
     (binary_id(rars::rar50_shared_block_windows) & test(=runs_sharing_a_window_write_the_archive_one_run_at_a_time_would)) |
