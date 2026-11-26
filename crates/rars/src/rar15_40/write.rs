@@ -2387,21 +2387,28 @@ fn rar29_lz_workspace(options: WriterOptions, coding: &MemberCoding, len: u64) -
     if options.features.solid || !rar29_searches_filters(options, coding) {
         return at_settings;
     }
-    let lazy = encode.with_optimal_parse_passes(0);
     if bytes <= RAR29_FILTER_SEARCH_BYTES {
+        let lazy = encode.with_optimal_parse_passes(0);
         return at_settings.max(rar29_search_encode_workspace(bytes, lazy));
     }
     let pieces = bytes
         .div_ceil(RAR29_FILTER_SEARCH_BYTES)
         .min(rar29_piece_searches_at_once());
+    let search = rar29_piece_search_workspace(options, encode).saturating_mul(pieces as u64);
+    at_settings.max(search)
+}
+
+/// What one piece's filter search holds for the first of its encodes: no
+/// longer than [`crate::filter_search::longest_specs_encode`] of a piece, at
+/// the settings the search's effort encodes that at.
+fn rar29_piece_search_workspace(options: WriterOptions, encode: Rar29EncodeOptions) -> u64 {
+    let lazy = encode.with_optimal_parse_passes(0);
     let effort = SearchEffort::for_options(options);
     let longest = crate::filter_search::longest_specs_encode(
         &Rar29Search::at(0, encode, effort),
         RAR29_FILTER_SEARCH_BYTES,
     );
-    let search = rar29_search_encode_workspace(longest, effort.sample_options(longest, lazy))
-        .saturating_mul(pieces as u64);
-    at_settings.max(search)
+    rar29_search_encode_workspace(longest, effort.sample_options(longest, lazy))
 }
 
 /// How many pieces of one member [`rar29_piece_filters`] may search at once.
@@ -3023,7 +3030,9 @@ fn sampled_text(bytes: &MemberBytes<'_>, len: u64) -> Result<TextScore> {
 
 /// What streaming a member holds: for RAR 2.9, the engine trial on a sample,
 /// then the coding of whichever engine it may choose, beside a chain's history
-/// and its model when `ppmd` says it has or will have one.
+/// and its model when `ppmd` says it has or will have one. LZ holds the
+/// filter search of each piece of a segment searched at once beside its
+/// window, priced as a member held whole prices its pieces' searches.
 fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdHeld) -> u64 {
     let dictionary =
         dictionary_size_for_options(options).unwrap_or(RAR29_MAX_DICTIONARY_SIZE) as u64;
@@ -3037,11 +3046,8 @@ fn streamed_workspace(options: WriterOptions, coding: &MemberCoding, ppmd: PpmdH
     let reach = encode.max_match_distance.min(RAR29_MAX_DICTIONARY_SIZE);
     let model = largest_ppmd_model(options);
     let search = match rar29_searches_filters(options, coding) {
-        true => rar29_search_encode_workspace(
-            RAR29_FILTER_SEARCH_BYTES,
-            encode.with_optimal_parse_passes(0),
-        )
-        .saturating_mul(rar29_piece_searches_at_once() as u64),
+        true => rar29_piece_search_workspace(options, encode)
+            .saturating_mul(rar29_piece_searches_at_once() as u64),
         false => 0,
     };
     let lz = crate::codec::rar29::streamed_lz_workspace(encode)
@@ -6561,6 +6567,49 @@ mod tests {
                     assert_eq!(charged, at_settings, "level {level}");
                 } else {
                     assert!(charged >= whole_pieces, "level {level}");
+                }
+            }
+        });
+    }
+
+    /// A streamed member's piece searches are priced as a held member's are:
+    /// below level 5 by the longest encode the search runs, two pieces at
+    /// once, and at level 5 by two whole pieces.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn a_streamed_piece_search_is_charged_its_longest_encode() {
+        use crate::filter_search::longest_specs_encode;
+        crate::parallel::private_pool(4).install(|| {
+            for level in 1..=5 {
+                let options = rar40()
+                    .with_compression_level(level)
+                    .with_dictionary_size(4 * 1024 * 1024);
+                let encode = super::rar29_encode_options_for_options(options).unwrap();
+                let lazy = encode.with_optimal_parse_passes(0);
+                let effort = super::SearchEffort::for_options(options);
+                let piece = super::RAR29_FILTER_SEARCH_BYTES;
+                let streamed =
+                    |coding| super::streamed_workspace(options, &coding, super::PpmdHeld::None);
+                let search = streamed(crate::MemberCoding::Compressed)
+                    - streamed(crate::MemberCoding::Filtered(crate::FilterPolicy::None));
+                let longest =
+                    longest_specs_encode(&super::Rar29Search::at(0, encode, effort), piece);
+                let whole_pieces = 2 * super::rar29_search_encode_workspace(piece, lazy);
+                assert_eq!(
+                    search,
+                    2 * super::rar29_search_encode_workspace(
+                        longest,
+                        effort.sample_options(longest, lazy)
+                    ),
+                    "level {level}"
+                );
+                if level < 5 {
+                    assert!(search < whole_pieces, "level {level}");
+                } else {
+                    assert_eq!(search, whole_pieces, "level {level}");
                 }
             }
         });
