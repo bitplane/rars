@@ -150,7 +150,7 @@ impl ExecutionPlan {
             let run_filters = settings.solid
                 && settings.filter_policy == FilterPolicy::Auto
                 && whole_member_routing_workspace(piece, settings) <= limit;
-            let search = whole_member_workspace(piece, settings);
+            let search = run_search_workspace(piece, settings);
             return Ok(Self::Blocks {
                 workspace: if run_filters {
                     workspace.max(search)
@@ -248,7 +248,7 @@ impl MemberPlan {
         // explicit filter is coded the same way, without the search, so it is
         // charged the same.
         let search =
-            whole_member_workspace(size.min(search_piece(settings.encode_options)), settings);
+            run_search_workspace(size.min(search_piece(settings.encode_options)), settings);
         let routing = whole_member_routing_workspace(
             size.min(search_piece(settings.encode_options)),
             settings,
@@ -420,23 +420,47 @@ pub(super) struct CompressPlan {
 
 /// Working memory a member needs to be filtered as a whole: the member, the
 /// filtered copy, and the candidate packed outputs being compared.
+///
+/// This is what a member coded whole is admitted for, not what routes it:
+/// see [`whole_member_routing_workspace`].
 pub(super) fn whole_member_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
     if input_size == 0 {
         return 0;
     }
-    if !plan.encode_options.optimal_parse
-        && plan.candidates.iter().all(|options| !options.optimal_parse)
-    {
-        return plan
-            .candidates
+    lazy_member_workspace(input_size, plan).unwrap_or_else(|| {
+        let (reach, block) = whole_member_parse_extent(input_size, plan);
+        input_size
+            .saturating_mul(4)
+            .saturating_add(super::whole_member_tree_workspace(reach, block))
+    })
+}
+
+/// What a run's filter search is charged as a member of its own. It is also
+/// what each run's job reserves under an execution ledger, beside the run's
+/// coding, so it keeps the routing estimate rather than
+/// [`whole_member_workspace`].
+fn run_search_workspace(piece: u64, plan: &CompressPlan) -> u64 {
+    if piece == 0 {
+        return 0;
+    }
+    lazy_member_workspace(piece, plan)
+        .unwrap_or_else(|| whole_member_routing_workspace(piece, plan))
+}
+
+/// The most a lazy candidate holds coding `input` whole, or `None` when any
+/// candidate parses by shortest path.
+fn lazy_member_workspace(input: u64, plan: &CompressPlan) -> Option<u64> {
+    (!plan.encode_options.optimal_parse
+        && plan.candidates.iter().all(|options| !options.optimal_parse))
+    .then(|| {
+        plan.candidates
             .iter()
             .copied()
             .chain(std::iter::once(plan.encode_options))
-            .map(|options| lazy_whole_member_workspace(input_size, options))
+            .map(|options| lazy_whole_member_workspace(input, options))
             .max()
-            .unwrap_or(0);
-    }
-    whole_member_routing_workspace(input_size, plan)
+            .unwrap_or(0)
+    })
 }
 
 fn lazy_whole_member_workspace(input: u64, options: EncodeOptions) -> u64 {
@@ -449,13 +473,27 @@ fn lazy_whole_member_workspace(input: u64, options: EncodeOptions) -> u64 {
     .saturating_add(input.saturating_mul(4))
 }
 
-/// Routing is part of the archive's encoding plan, so it uses a fixed estimate.
+/// Routing is part of the archive's encoding plan, so it uses a fixed estimate,
+/// kept apart from the [`whole_member_workspace`] a member is admitted for so
+/// that what a member is charged never moves it between paths.
 fn whole_member_routing_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
     if input_size == 0 {
         return 0;
     }
     let optimal = plan.encode_options.optimal_parse
         || plan.candidates.iter().any(|options| options.optimal_parse);
+    let (reach, block) = whole_member_parse_extent(input_size, plan);
+    // Input, transformed input and competing packed outputs stay live alongside
+    // the finder and the per-block token/parse workspace, not instead of them.
+    input_size.saturating_mul(4).saturating_add(if optimal {
+        super::tree_lz_workspace(reach, block)
+    } else {
+        super::streaming_lz_workspace(reach, block, false)
+    })
+}
+
+/// How far back a whole member's parse reaches, and its largest block.
+fn whole_member_parse_extent(input_size: u64, plan: &CompressPlan) -> (u64, usize) {
     let reach = plan
         .candidates
         .iter()
@@ -468,13 +506,7 @@ fn whole_member_routing_workspace(input_size: u64, plan: &CompressPlan) -> u64 {
         .min(input_size)
         .max(crate::codec::rar50::LZ_BLOCK_SIZE as u64);
     let block = input_size.min(crate::codec::rar50::MAX_LZ_BLOCK_SIZE as u64) as usize;
-    // Input, transformed input and competing packed outputs stay live alongside
-    // the finder and the per-block token/parse workspace, not instead of them.
-    input_size.saturating_mul(4).saturating_add(if optimal {
-        super::tree_lz_workspace(reach, block)
-    } else {
-        super::streaming_lz_workspace(reach, block, false)
-    })
+    (reach, block)
 }
 
 #[cfg(test)]
@@ -520,7 +552,7 @@ mod tests {
             whole_member_routing_workspace(search_piece(settings.encode_options), &settings);
         assert_eq!(
             below.members()[0].workspace,
-            whole_member_workspace(search_piece(settings.encode_options), &settings)
+            run_search_workspace(search_piece(settings.encode_options), &settings)
         );
         assert!(search < required);
 
@@ -642,7 +674,7 @@ mod tests {
         let roomy = ExecutionPlan::new(&settings, sizes(), search);
         assert!(matches!(
             roomy,
-            ExecutionPlan::Blocks { workspace, run_filters: true, .. } if workspace == whole_member_workspace(search_piece(settings.encode_options), &settings).max(streaming)
+            ExecutionPlan::Blocks { workspace, run_filters: true, .. } if workspace == run_search_workspace(search_piece(settings.encode_options), &settings).max(streaming)
         ));
         let tight = ExecutionPlan::new(&settings, sizes(), search - 1);
         assert!(matches!(
@@ -715,7 +747,7 @@ mod tests {
                 member.execution,
                 Execution::Blocks {
                     fallback: FallbackReason::AutomaticFilterWorkspace {
-                        required: whole_member_workspace(size, &settings),
+                        required: whole_member_routing_workspace(size, &settings),
                         limit: resources.routing_memory_limit(),
                     },
                     run_filters: true,
@@ -830,7 +862,7 @@ mod tests {
         let resources = WriterResources::with_default_planning(DEFAULT_WRITER_MEMORY_LIMIT);
         let (settings, _) = default_job(3, false, &resources);
         let size = 8 * MIB;
-        let required = whole_member_workspace(size, &settings);
+        let required = whole_member_routing_workspace(size, &settings);
         assert!(required > 256 * MIB && required <= DEFAULT_WRITER_PLANNING_LIMIT);
         let default_with_limit = resources.with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
         for resources in [WriterResources::default(), default_with_limit] {

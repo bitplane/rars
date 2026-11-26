@@ -313,28 +313,6 @@ const KNOWN_GAPS: &[Gap] = &[
         assertion: Assertion::InsideBudget,
         issue: 718,
     },
-    // RAR 5 routes a member it codes whole on a fixed estimate whose parse
-    // term, per byte of a block, is well above what any of these inputs hold.
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto],
-        levels: &[2],
-        threads: None,
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 719,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::FiltersAuto],
-        levels: &[3],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 719,
-    },
 ];
 
 fn lcg(state: &mut u64) -> u64 {
