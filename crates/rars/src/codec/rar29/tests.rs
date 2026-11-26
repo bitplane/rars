@@ -5839,6 +5839,44 @@ fn x86_filters_leave_operands_a_decoder_cannot_restore_unfiltered() {
     }
 }
 
+/// Trying the sizes one model at a time codes the member that starts the
+/// model, and the member that continues it, exactly as keeping the best model
+/// does, whether the winner is the last size tried or an earlier one.
+#[test]
+fn a_chain_trying_ppmd_sizes_one_model_at_a_time_codes_the_same_bytes() {
+    use super::PpmdModelSize;
+    const ORDER_16: PpmdModelSize = PpmdModelSize {
+        order: 16,
+        memory_mb: 64,
+    };
+    static SMALL_FIRST: [PpmdModelSize; 2] = [PpmdModelSize::DEFAULT, ORDER_16];
+    static LARGE_FIRST: [PpmdModelSize; 2] = [ORDER_16, PpmdModelSize::DEFAULT];
+    let members = [related_text_member(2, 3000), related_text_member(3, 3000)];
+    let code = |sizes: &'static [PpmdModelSize], one_model: bool| {
+        let mut chain =
+            Unpack29Encoder::with_options(EncodeOptions::default()).with_ppmd_sizes(sizes);
+        chain.set_ppmd_trial_one_model(one_model);
+        members
+            .iter()
+            .map(|member| {
+                chain
+                    .encode_member_with_engine(member, ChainEngine::Smaller, &[], &mut |_| true)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut first_size_wins = Vec::new();
+    for sizes in [&SMALL_FIRST, &LARGE_FIRST] {
+        let kept = code(sizes, false);
+        assert!(kept == code(sizes, true), "{sizes:?}");
+        // A reset, then the model's memory in megabytes less one.
+        assert_ne!(kept[0][0] & 0x20, 0, "the first member went PPMd");
+        first_size_wins.push(kept[0][1] == sizes[0].memory_mb - 1);
+    }
+    // In one order or the other, the winner is not the last size tried.
+    assert!(first_size_wins.contains(&true));
+}
+
 /// A chain keeps the PPMd model its first PPMd member starts, so the size is
 /// chosen there: whichever codes that member smallest, which every member
 /// after continues.

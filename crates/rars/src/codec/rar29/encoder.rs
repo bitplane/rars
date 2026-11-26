@@ -1058,6 +1058,10 @@ pub struct Unpack29Encoder {
     /// The sizes a member that starts the chain's model tries, in order; the
     /// one that codes it smallest is the one the rest of the chain continues.
     ppmd_sizes: &'static [PpmdModelSize],
+    /// Whether a member that starts the model keeps only the smallest coding
+    /// while it tries the sizes, rather than its model too, and codes the
+    /// winner again for its model if a later size was tried after it.
+    ppmd_trial_one_model: bool,
 }
 
 impl Default for Unpack29Encoder {
@@ -1078,6 +1082,7 @@ impl Unpack29Encoder {
             levels: [0; TABLE_COUNT],
             ppmd: None,
             ppmd_sizes: &[PpmdModelSize::DEFAULT],
+            ppmd_trial_one_model: false,
         }
     }
 
@@ -1090,6 +1095,14 @@ impl Unpack29Encoder {
             self.ppmd_sizes = sizes;
         }
         self
+    }
+
+    /// Has a member that starts the model hold one model at a time while it
+    /// tries the sizes, at the cost of coding the winner twice when it is not
+    /// the last size tried. The packed bytes and the model are the same
+    /// either way.
+    pub(crate) fn set_ppmd_trial_one_model(&mut self, one_model: bool) {
+        self.ppmd_trial_one_model = one_model;
     }
 
     pub fn encode_member(&mut self, input: &[u8]) -> Result<Vec<u8>> {
@@ -1273,19 +1286,29 @@ impl Unpack29Encoder {
             let (packed, model) = code(Some(model), *size, progress)?;
             return Ok((packed, (model, *size)));
         }
-        let mut best: Option<(Vec<u8>, (PpmdModel, PpmdModelSize))> = None;
+        let mut best: Option<(Vec<u8>, PpmdModelSize, Option<PpmdModel>)> = None;
         for (index, &size) in self.ppmd_sizes.iter().enumerate() {
             let mut report =
                 |position: usize| progress(if index == 0 { position } else { input.len() });
+            if self.ppmd_trial_one_model {
+                if let Some((_, _, model)) = &mut best {
+                    *model = None;
+                }
+            }
             let (packed, model) = code(None, size, &mut report)?;
             if best
                 .as_ref()
-                .is_none_or(|(best, _)| packed.len() < best.len())
+                .is_none_or(|(best, _, _)| packed.len() < best.len())
             {
-                best = Some((packed, (model, size)));
+                best = Some((packed, size, Some(model)));
             }
         }
-        Ok(best.expect("a chain always has a PPMd size to try"))
+        let (packed, size, model) = best.expect("a chain always has a PPMd size to try");
+        let model = match model {
+            Some(model) => model,
+            None => code(None, size, &mut |_| progress(input.len()))?.1,
+        };
+        Ok((packed, (model, size)))
     }
 
     /// Whether the chain holds a PPMd model a member would continue.
