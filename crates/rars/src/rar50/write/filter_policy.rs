@@ -138,7 +138,9 @@ pub(super) fn filter_policy_walk_bytes(
     let encoder_candidates = candidates.len();
     if *policy != FilterPolicy::Auto
         || !auto_size_filter_search_applies(data)
-        || candidates.first().is_some_and(|&options| estimated_search(options))
+        || candidates
+            .first()
+            .is_some_and(|&options| estimated_search(options))
     {
         return member * encoder_candidates.max(1) as u64;
     }
