@@ -766,6 +766,17 @@ fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse
     lz_workspace(dictionary_size, block_size, 13, 64)
 }
 
+/// What a block job's optimal parse is admitted for: [`streaming_lz_workspace`]
+/// when it reprices, and less per block byte when it parses each block once,
+/// since a single pass keeps neither the next pass's tokens nor an earlier
+/// winner beside its own. Routing keeps [`streaming_lz_workspace`] for both.
+fn block_job_lz_workspace(reach: u64, block_size: usize, parse_passes: usize) -> u64 {
+    if parse_passes > 1 {
+        return streaming_lz_workspace(reach, block_size, true);
+    }
+    lz_workspace(reach, block_size, 9, 88)
+}
+
 /// What a whole-member optimal parse holds besides the member copies. It
 /// searches a binary tree, two links per window position, and on low-entropy
 /// data the tree reports far more runs per position than the chains do: two-
