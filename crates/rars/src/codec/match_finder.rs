@@ -746,12 +746,9 @@ impl<B: Budget> TreeMatchFinder<B> {
                 }
             }
         };
-        if shares <= 1 {
-            insert(0);
-        } else {
-            let mut each = vec![(); shares];
-            crate::parallel::for_each_mut(&mut each, |share, _| insert(share));
-        }
+        // Share 0 holds the hash of a run of zeroes, which can be most of the
+        // work in machine code, and `spread` keeps it on this thread.
+        crate::parallel::spread(shares.max(1), insert);
     }
 
     fn hash(&self, input: &[u8], pos: usize) -> usize {
@@ -1067,8 +1064,7 @@ impl<B: Budget> SeedTree<B> {
         );
         let span = end.saturating_sub(base);
         let pieces = seed_shares(span);
-        let mut each = vec![(); pieces];
-        crate::parallel::for_each_mut(&mut each, |piece, _| {
+        crate::parallel::spread(pieces, |piece| {
             let first = base + span * piece / pieces;
             let last = base + span * (piece + 1) / pieces;
             for pos in first..last {

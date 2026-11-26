@@ -401,6 +401,33 @@ mod threaded {
         rayon::join(a, b)
     }
 
+    /// Runs `run` for each index below `count`, `0` on this thread and the
+    /// rest on whichever threads are free.
+    ///
+    /// For items that never wait on anything themselves. A thread that waits
+    /// in the pool takes on whatever work it finds, however long, before it
+    /// goes back to what it was waiting in. [`for_each_mut`] splits its items
+    /// in halves, and leaves a thread waiting at every split; here only this
+    /// thread waits, once its own item is done, so giving it the longest keeps
+    /// the wait short.
+    #[cfg(feature = "write")]
+    pub(crate) fn spread<F>(count: usize, run: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        if count <= 1 {
+            (0..count).for_each(run);
+            return;
+        }
+        let run = &run;
+        rayon::scope(|scope| {
+            for index in 1..count {
+                scope.spawn(move |_| run(index));
+            }
+            run(0);
+        });
+    }
+
     /// How many members can be worked on at the same time, within this thread's cap.
     pub(crate) fn threads() -> usize {
         let pool = rayon::current_num_threads().max(1);
@@ -602,6 +629,15 @@ mod sequential {
         RB: Send,
     {
         (a(), b())
+    }
+
+    #[cfg(feature = "write")]
+    #[cfg_attr(all(test, feature = "parallel"), allow(dead_code))]
+    pub(crate) fn spread<F>(count: usize, run: F)
+    where
+        F: Fn(usize) + Sync,
+    {
+        (0..count).for_each(run);
     }
 }
 
