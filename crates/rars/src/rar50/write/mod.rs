@@ -732,25 +732,27 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// rest rather than pretending to predict it.
 ///
 /// The optimal parse in a block job searches a tree seeded with the run's
-/// history, eight bytes of links per byte of dictionary, or the packed hash
-/// chains when the run is shorter than a quarter of its history. Past the links it spends
+/// history, six bytes of links per byte of dictionary up to 16 MiB and eight
+/// past it ([`tree_window_bytes`]), or the packed hash chains when the run is
+/// shorter than a quarter of its history. Past the links it spends
 /// most of its workspace on the match runs it collects for a block: up to
 /// eight per position on two-symbol noise, the worst found, against one on
-/// real data. Counted allocation peaks per job under `--max-memory`, level 3,
-/// over 16 MiB (4 MiB dictionary), 32 MiB (8 MiB) and 64 MiB (16 MiB)
-/// members:
+/// real data. Counted allocation peaks per job under `--max-memory` without
+/// filters, over 16 MiB (4 MiB dictionary, level 3), 32 MiB (8 MiB, level 4)
+/// and 64 MiB (16 MiB, level 3) members, against the charge:
 ///
 /// ```text
 /// input                 4 MiB dict    8 MiB dict   16 MiB dict
-/// text                    37.1 MiB                   139.4 MiB
-/// binary                  38.2 MiB                   138.3 MiB
-/// random                  43.1 MiB                   151.1 MiB
-/// three-symbol noise     133.2 MiB
-/// two-symbol noise       132.9 MiB     165.5 MiB     230.6 MiB
+/// text                    30.0 MiB      55.6 MiB     104.9 MiB
+/// binary                  33.4 MiB      60.1 MiB     109.0 MiB
+/// three-symbol noise     126.3 MiB     150.8 MiB     201.4 MiB
+/// two-symbol noise       126.0 MiB     150.6 MiB     199.8 MiB
+/// charged                135   MiB     163   MiB     219   MiB
 /// ```
 ///
-/// Level 5 peaks the same on noise and random (133.0, 165.5 and 230.6 MiB;
-/// 151.1 MiB), and 174.1 MiB on 64 MiB of shared libraries at 16 MiB.
+/// Level 5 peaks within 0.1 MiB of level 3 on noise at 4 and 16 MiB, and a
+/// member whose last run is a fifth of a dictionary peaks the same. Random
+/// input is stored rather than coded.
 ///
 /// Random data costs the most per window byte: 583 MiB through the tree at a
 /// 64 MiB dictionary, and 654 MiB through chains, whose deltas pack worst on
@@ -762,7 +764,12 @@ fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
 /// [`crate::codec::rar50::MAX_LZ_BLOCK_SIZE`].
 fn streaming_lz_workspace(dictionary_size: u64, block_size: usize, optimal_parse: bool) -> u64 {
     if optimal_parse {
-        return lz_workspace(dictionary_size, block_size, 9, 104);
+        return lz_workspace(
+            dictionary_size,
+            block_size,
+            tree_window_bytes(dictionary_size, 1),
+            104,
+        );
     }
     lz_workspace(dictionary_size, block_size, 13, 64)
 }
@@ -775,7 +782,7 @@ fn block_job_lz_workspace(reach: u64, block_size: usize, parse_passes: usize) ->
     if parse_passes > 1 {
         return streaming_lz_workspace(reach, block_size, true);
     }
-    lz_workspace(reach, block_size, 9, 88)
+    lz_workspace(reach, block_size, tree_window_bytes(reach, 1), 88)
 }
 
 /// What a whole-member optimal parse holds besides the member copies. It
@@ -799,19 +806,27 @@ fn block_job_lz_workspace(reach: u64, block_size: usize, parse_passes: usize) ->
 /// window will touch them.
 ///
 /// Routing prices a whole member with this, and it is part of the encoding
-/// plan, so it stays fixed. What a whole member is admitted for is
+/// plan, so it stays fixed: it charges the eight bytes of links a window past
+/// 16 MiB takes at every window size. What a whole member is admitted for is
 /// [`whole_member_tree_workspace`].
 fn tree_lz_workspace(reach: u64, block_size: usize) -> u64 {
     lz_workspace(reach, block_size, 17, 160)
 }
 
 /// What a whole member's optimal parse is admitted for besides the member
-/// copies: the tree's links per window byte, as [`tree_lz_workspace`], and a
-/// block job's parse per block byte, as [`streaming_lz_workspace`]. The
+/// copies: per window byte, the tree's links at the window's width and the
+/// rest of what [`tree_lz_workspace`] charges, and a block job's parse per
+/// block byte, as [`streaming_lz_workspace`]. The
 /// pipelined parse holds at most a block's worth of collected and priced
 /// blocks at once, as a block job's does.
 fn whole_member_tree_workspace(reach: u64, block_size: usize) -> u64 {
-    lz_workspace(reach, block_size, 17, 104)
+    lz_workspace(reach, block_size, tree_window_bytes(reach, 9), 104)
+}
+
+/// What a parse searching a tree over `window` is charged per window byte: the
+/// tree's links, whose width the window decides, and `rest` more.
+fn tree_window_bytes(window: u64, rest: u64) -> u64 {
+    crate::codec::rar50::tree_link_bytes(usize::try_from(window).unwrap_or(usize::MAX)) + rest
 }
 
 fn lz_workspace(window: u64, block_size: usize, per_window_byte: u64, per_block_byte: u64) -> u64 {
@@ -2083,12 +2098,47 @@ mod tests {
     fn the_block_job_charge_covers_its_counted_peaks() {
         const MIB: f64 = 1024.0 * 1024.0;
         let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
-        for (dictionary, peak) in [(4u64, 133.2), (8, 165.5), (16, 230.6), (64, 654.3)] {
-            // Level 5 measured the same or less: 133.0, 165.5, 230.6 and 583.1
-            // through the tree, and 174.1 MiB on binaries at 16 MiB.
+        for (dictionary, peak) in [(4u64, 126.3), (8, 151.2), (16, 201.4), (64, 654.3)] {
+            // Level 5 measured the same or less: 126.3 and 201.3 MiB at 4 and
+            // 16 MiB, and 583.1 through the tree at 64 MiB.
             let charged = streaming_lz_workspace(dictionary << 20, block, true);
             let peak = (peak * MIB) as u64;
             assert!(charged >= peak, "{dictionary} MiB: {charged} < {peak}");
+        }
+    }
+
+    /// A tree's links take six bytes a window byte up to 16 MiB and eight past
+    /// it, and every tree charge follows the finder across that line, while
+    /// routing's stays at eight.
+    #[test]
+    fn tree_charges_follow_the_tree_link_width() {
+        const MIB: u64 = 1024 * 1024;
+        let block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
+        for (window, links) in [(MIB, 6), (16 * MIB, 6), (16 * MIB + 1, 8), (64 * MIB, 8)] {
+            let slots = window.next_power_of_two();
+            let options = filter_policy::encode_options_for_level(Some(5), window).unwrap();
+            assert_eq!(options.max_match_distance as u64, window);
+            assert_eq!(
+                crate::codec::rar50::run_trees_workspace(options),
+                links * slots + (1 << 17) * 4,
+                "{window}-byte tree allocation"
+            );
+            let charges = [
+                (streaming_lz_workspace(window, block, true), 1, 104),
+                (block_job_lz_workspace(window, block, 1), 1, 88),
+                (whole_member_tree_workspace(window, block), 9, 104),
+            ];
+            for (charged, rest, per_block) in charges {
+                assert_eq!(
+                    charged,
+                    lz_workspace(window, block, links + rest, per_block),
+                    "{window}-byte window"
+                );
+            }
+            assert_eq!(
+                tree_lz_workspace(window, block),
+                lz_workspace(window, block, 17, 160)
+            );
         }
     }
 

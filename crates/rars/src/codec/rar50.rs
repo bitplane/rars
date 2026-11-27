@@ -33,8 +33,9 @@ pub(crate) use encoder::{
     filter_streaming_blocks_in_place, filtered_owned_member, filtered_run_bytes, filtered_run_cuts,
     lazy_parse_workspace, packed_index_fits, packed_most, run_trees_workspace, searches_tree,
     seed_chain, seed_chains, seed_run_tree, single_pass_tree_workspace, streaming_blocks_in_window,
-    streaming_blocks_with_finder, streaming_blocks_with_tree, BlockSplitter, EncodeFilter,
-    FilteredRunBlocks, RunFinder, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS, MAX_LZ_BLOCK_SIZE,
+    streaming_blocks_with_finder, streaming_blocks_with_tree, tree_link_bytes, BlockSplitter,
+    EncodeFilter, FilteredRunBlocks, RunFinder, LZ_BLOCK_SIZE, MAX_DELTA_CHANNELS,
+    MAX_LZ_BLOCK_SIZE,
 };
 #[cfg(all(test, feature = "write"))]
 pub(crate) use encoder::{

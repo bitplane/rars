@@ -417,7 +417,7 @@ struct WriterResources {
     #[pyo3(get)]
     max_memory_bytes: Option<u64>,
     /// How much the members compressing at once may plan to use, for every
-    /// version; the CLI's `--memory-limit`. The default is 283 MiB plus 160 MiB
+    /// version; the CLI's `--memory-limit`. The default is 256 MiB plus 160 MiB
     /// for each thread past the first, up to a quarter of memory on Linux.
     /// Lowering it runs fewer members at once; below 256 MiB it also plans
     /// smaller jobs, which can change the archive written.

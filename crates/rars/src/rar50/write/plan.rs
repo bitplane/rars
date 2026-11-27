@@ -353,21 +353,19 @@ pub(super) fn lazy_streaming_workspace(options: EncodeOptions, input: u64) -> u6
 ///   and the run's bytes while its filters are searched.
 ///
 /// Live allocation peaks in MiB, counted by a global allocator over a whole
-/// write at one thread, where each wave holds one job, on members two and a
-/// half runs long:
+/// write at one thread under the default budget, where each wave holds one
+/// job, on members two and a half runs long with filters searched (the
+/// fitted-dictionary matrix in `tests/charge_covers_peak.rs`):
 ///
 /// ```text
 /// input                level 3, 4 MiB   level 4, 8 MiB   level 5, 16 MiB
-/// text                       55.5                            188.1
-/// shared libraries           57.3                            221.2
-/// random                     54.2                            198.2
-/// all zeros                  68.7                            200.7
-/// eight-symbol noise         57.2                            200.9
-/// four-symbol noise         128.3                            260.3
-/// two-symbol noise          130.9            174.9           263.0
-/// three-symbol noise        133.7            178.4           268.2
-/// filter search alone       133.4            143.3           167.3
-/// charged here           159 (151 unfiltered)  195           283
+/// text                       48.6             81.7             153.6
+/// binary records             43.2             75.3             147.3
+/// all zeros                  65.7             97.8             169.7
+/// 64-symbol literals         54.7             91.2             165.3
+/// two-symbol noise          127.7            176.0             233.3
+/// three-symbol noise        131.4            180.3             237.0
+/// charged here           151 (143 unfiltered)  179           251
 /// ```
 pub(super) fn block_admission(
     code: u64,
@@ -812,10 +810,11 @@ mod tests {
         (settings, admission)
     }
 
-    /// The one-thread default budget is the largest admission a default plan
+    /// The default planning budget is the largest admission a default plan
     /// makes, rounded up to a MiB: level 5's, at its fitted 16 MiB dictionary
     /// with filters searched. If that charge moves, this fails until the
-    /// constant follows it.
+    /// constant follows it. The one-thread default budget is that, or the
+    /// routing threshold when it is less.
     #[test]
     fn the_one_thread_default_is_the_largest_default_admission() {
         const MIB: u64 = 1024 * 1024;
@@ -828,10 +827,13 @@ mod tests {
             }
         }
         assert_eq!(largest.1, 5);
-        assert_eq!(largest.0.next_multiple_of(MIB), DEFAULT_WRITER_MEMORY_LIMIT);
         assert_eq!(
             largest.0.next_multiple_of(MIB),
             DEFAULT_WRITER_PLANNING_LIMIT
+        );
+        assert_eq!(
+            DEFAULT_WRITER_MEMORY_LIMIT,
+            DEFAULT_WRITER_PLANNING_LIMIT.max(resources.routing_memory_limit())
         );
     }
 
@@ -861,8 +863,8 @@ mod tests {
         let (settings, _) = default_job(3, false, &resources);
         let size = 8 * MIB;
         let required = whole_member_routing_workspace(size, &settings);
-        assert!(required > 256 * MIB && required <= DEFAULT_WRITER_PLANNING_LIMIT);
-        let default_with_limit = resources.with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
+        assert!(required > 256 * MIB);
+        let default_with_limit = resources.with_memory_limit(DEFAULT_WRITER_MEMORY_LIMIT);
         for resources in [WriterResources::default(), default_with_limit] {
             let plan =
                 ExecutionPlan::with_resources(&settings, [size].into_iter(), &resources).unwrap();
@@ -877,8 +879,7 @@ mod tests {
                 }
             );
         }
-        let custom =
-            ExecutionPlan::new(&settings, [size].into_iter(), DEFAULT_WRITER_PLANNING_LIMIT);
+        let custom = ExecutionPlan::new(&settings, [size].into_iter(), required);
         assert_eq!(custom.members()[0].execution, Execution::WholeMember);
     }
 

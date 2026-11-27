@@ -70,9 +70,9 @@ Dictionary size (e.g. 4m, 128k; RAR 1.5+)
 Left unset, the writer fits one to the data: the smallest size that reaches across the largest member, or the whole archive when \-\-solid shares one window. A larger dictionary can pack better and always costs time and memory to search.
 .TP
 \fB\-\-memory\-limit\fR \fI<SIZE>\fR
-Maximum total compression working memory (default: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
+Maximum total compression working memory (default: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
 
-At 283m or above, the budget only affects how much work runs at once. Below 283m it can also change the archive by planning smaller jobs.
+At 256m or above, the budget only affects how much work runs at once. Below 256m it can also change the archive by planning smaller jobs.
 
 Left unset rather than defaulted here, so a volume set below RAR 5, which is still built in memory, can tell an explicit request from a default and refuse the one it cannot honour.
 .TP

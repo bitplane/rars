@@ -174,7 +174,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Target archive format (default\: rar50, the modern widely-compatible format)]:FORMAT:(rar14 rar15 rar20 rar29 rar30 rar40 rar50 rar70)' \
 '--level=[Compression level (0..5; 0 implies --store)]:LEVEL:_default' \
 '--dict-size=[Dictionary size (e.g. 4m, 128k; RAR 1.5+)]:SIZE:_default' \
-'--memory-limit=[Maximum total compression working memory (default\: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)]:SIZE:_default' \
+'--memory-limit=[Maximum total compression working memory (default\: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)]:SIZE:_default' \
 '--max-memory=[Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace]:SIZE:_default' \
 '--temp-dir=[Directory for temporary compressed payloads (RAR 5+)]:PATH:_files' \
 '--comment=[Archive-level comment]:TEXT:_default' \
@@ -217,7 +217,7 @@ _arguments "${_arguments_options[@]}" : \
 '--format=[Target archive format (default\: rar50, the modern widely-compatible format)]:FORMAT:(rar14 rar15 rar20 rar29 rar30 rar40 rar50 rar70)' \
 '--level=[Compression level (0..5; 0 implies --store)]:LEVEL:_default' \
 '--dict-size=[Dictionary size (e.g. 4m, 128k; RAR 1.5+)]:SIZE:_default' \
-'--memory-limit=[Maximum total compression working memory (default\: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)]:SIZE:_default' \
+'--memory-limit=[Maximum total compression working memory (default\: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)]:SIZE:_default' \
 '--max-memory=[Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace]:SIZE:_default' \
 '--temp-dir=[Directory for temporary compressed payloads (RAR 5+)]:PATH:_files' \
 '--comment=[Archive-level comment]:TEXT:_default' \

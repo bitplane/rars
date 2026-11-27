@@ -14,21 +14,29 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 
-/// Default aggregate compression workspace budget at one thread (283 MiB).
+/// Default aggregate compression workspace budget at one thread (256 MiB).
 ///
-/// What the largest job a default writer plans is admitted for: a RAR 5 level 5
-/// block job at its fitted 16 MiB dictionary with filters searched, so one
-/// thread can admit that job in full.
-pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 = DEFAULT_WRITER_PLANNING_LIMIT;
+/// The larger of [`DEFAULT_WRITER_PLANNING_LIMIT`], so one thread can admit the
+/// largest job a default writer plans in full, and the 256 MiB threshold for
+/// whole-member coding and filter routing, so one thread routes members as
+/// more threads do.
+pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 =
+    if DEFAULT_WRITER_PLANNING_LIMIT > DEFAULT_WRITER_ROUTING_LIMIT {
+        DEFAULT_WRITER_PLANNING_LIMIT
+    } else {
+        DEFAULT_WRITER_ROUTING_LIMIT
+    };
 
 /// The budget for fitting a RAR 5 or RAR 7 dictionary with default resources
-/// (283 MiB).
+/// (251 MiB): what the largest job a default writer plans is admitted for, a
+/// RAR 5 level 5 block job at its fitted 16 MiB dictionary with filters
+/// searched.
 ///
 /// This covers a full block job's admission charge, including the workspace
 /// held by the coordinator. The budget is the same at every thread count.
 /// Default resources use a separate 256 MiB threshold for whole-member coding
 /// and filter routing to preserve the archive bytes.
-pub const DEFAULT_WRITER_PLANNING_LIMIT: u64 = 283 * 1024 * 1024;
+pub const DEFAULT_WRITER_PLANNING_LIMIT: u64 = 251 * 1024 * 1024;
 
 const DEFAULT_WRITER_ROUTING_LIMIT: u64 = 256 * 1024 * 1024;
 
@@ -373,7 +381,7 @@ impl WriterResources {
     ///
     /// Unlike [`WriterResources::new`], each job is still planned within the
     /// limit it had, or within `limit` when that is lower. On a default writer,
-    /// a budget at or above [`DEFAULT_WRITER_PLANNING_LIMIT`] therefore changes
+    /// a budget at or above [`DEFAULT_WRITER_MEMORY_LIMIT`] therefore changes
     /// only how many jobs run at once, never the archive written; a lower one
     /// also plans smaller jobs.
     /// Configure before execution; clones share the new budget.
@@ -1493,8 +1501,7 @@ mod tests {
             DEFAULT_WRITER_PLANNING_LIMIT
         );
         assert_eq!(raised.routing_memory_limit(), DEFAULT_WRITER_ROUTING_LIMIT);
-        let at_default =
-            WriterResources::default().with_memory_limit(DEFAULT_WRITER_PLANNING_LIMIT);
+        let at_default = WriterResources::default().with_memory_limit(DEFAULT_WRITER_MEMORY_LIMIT);
         assert_eq!(
             at_default.planning_memory_limit(),
             DEFAULT_WRITER_PLANNING_LIMIT
@@ -1509,6 +1516,10 @@ mod tests {
         assert_eq!(
             one_thread.planning_memory_limit(),
             DEFAULT_WRITER_PLANNING_LIMIT
+        );
+        assert_eq!(
+            one_thread.routing_memory_limit(),
+            DEFAULT_WRITER_ROUTING_LIMIT
         );
         let lowered = WriterResources::default().with_memory_limit(64 * MIB);
         assert_eq!(lowered.memory_limit(), 64 * MIB);
