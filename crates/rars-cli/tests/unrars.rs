@@ -2148,3 +2148,83 @@ fn comments_show_as_unrar_shows_them() {
         "{tested:?}"
     );
 }
+
+/// `-o-` and `-o+` over existing files and repeated paths, in a RAR 2.9
+/// archive and volume set, print and leave the same at every thread count.
+#[test]
+fn legacy_overwrite_switches_match_one_thread() {
+    let dir = scratch::case("unrars-legacy-threads");
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    for index in 0..30u32 {
+        let name = format!("d{}/f{}.txt", index % 3, index % 25);
+        builder
+            .add_bytes(
+                name.into_bytes(),
+                format!("member {index} ").repeat(20).into_bytes(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    // `-o-` keeps the directory the member before it made.
+    for (name, data) in [("d2/x/y", "inner"), ("d2/x", "outer")] {
+        builder
+            .add_bytes(name.into(), data.into(), None, None)
+            .unwrap();
+    }
+    builder.write_to_path(&dir.join("plain.rar"), None).unwrap();
+    for (index, bytes) in builder
+        .volume_size(Some(4 * 1024))
+        .build_volumes(None)
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        let name = match index {
+            0 => "set.rar".to_string(),
+            index => format!("set.r{:02}", index - 1),
+        };
+        fs::write(dir.join(name), bytes).unwrap();
+    }
+    for archive in ["plain.rar", "set.rar"] {
+        for switch in ["-o-", "-o+"] {
+            let mut runs = Vec::new();
+            for threads in ["1", "2", "8"] {
+                let out = format!("out-{archive}{switch}{threads}");
+                fs::create_dir_all(dir.join(&out).join("d1")).unwrap();
+                fs::write(dir.join(&out).join("d1/f4.txt"), b"mine").unwrap();
+                let output = Command::new(env!("CARGO_BIN_EXE_unrars"))
+                    .current_dir(&dir)
+                    .env("RAYON_NUM_THREADS", threads)
+                    .args(["x", "-idp", switch, archive, &format!("{out}/")])
+                    .output()
+                    .unwrap();
+                let mut files = Vec::new();
+                let mut pending = vec![dir.join(&out)];
+                while let Some(directory) = pending.pop() {
+                    for entry in fs::read_dir(&directory).unwrap() {
+                        let path = entry.unwrap().path();
+                        let relative = path.strip_prefix(dir.join(&out)).unwrap().to_owned();
+                        if path.is_dir() {
+                            files.push((relative, Vec::new()));
+                            pending.push(path);
+                        } else {
+                            files.push((relative, fs::read(&path).unwrap()));
+                        }
+                    }
+                }
+                files.sort();
+                let shown = stdout(&output).replace(&out, "OUT");
+                runs.push((threads, output.status.code(), shown, stderr(&output), files));
+            }
+            let (_, code, shown, errors, files) = runs.remove(0);
+            for run in &runs {
+                let case = format!("{archive} {switch} threads={}", run.0);
+                assert_eq!(run.1, code, "{case}");
+                assert_eq!(run.2, shown, "{case}");
+                assert_eq!(run.3, errors, "{case}");
+                assert_eq!(run.4, files, "{case}");
+            }
+        }
+    }
+}

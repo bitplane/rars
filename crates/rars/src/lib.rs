@@ -59,6 +59,8 @@ pub use header_damage::{HeaderDamage, HeaderDamageKind};
 mod filter_search;
 #[cfg(feature = "write")]
 mod filter_stats;
+#[doc(hidden)]
+pub mod in_flight;
 #[cfg(feature = "write")]
 mod incompressible;
 mod io_util;

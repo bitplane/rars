@@ -1,4 +1,5 @@
 use crate::output::{self, ExtractedOutput, ExtractionStaging, OverwritePolicy};
+use rars::in_flight::InFlight;
 use rars::output_staging::{refused_output, FileIdentity, RenameCounters};
 use rars::output_tree::OutputTree;
 use rars::publish_queue::{PublishQueue, PublishStep};
@@ -482,8 +483,19 @@ impl PublishStep for PublishState {
 /// opening sees it as the publish under way leaves it.
 pub(crate) struct Publisher {
     queue: PublishQueue<PublishState>,
+    out_dir: PathBuf,
     /// Outputs queued so far.
     queued: usize,
+    /// Where outputs queued and not known to be published go, oldest first,
+    /// kept here so queueing never waits for the publish under way.
+    in_flight: VecDeque<Option<(PathBuf, bool)>>,
+    in_flight_paths: InFlight,
+    /// Outputs queued before `in_flight`.
+    retired: usize,
+    /// Whether opening asks where queued outputs go: see [`Self::queued_changes`].
+    track_paths: bool,
+    /// A link or a discard has needed [`PublishState::link_paths`], so opening notes what it creates.
+    notes_created: bool,
     /// A failure was handed on, and the run has not ended: its handler let it go on.
     failure_given: bool,
 }
@@ -492,7 +504,13 @@ impl Publisher {
     pub(crate) fn new(out_dir: &Path, overwrite: OverwritePolicy, in_place: bool) -> Self {
         Self {
             queue: PublishQueue::new(PublishState::new(out_dir, overwrite, in_place)),
+            out_dir: out_dir.to_path_buf(),
             queued: 0,
+            in_flight: VecDeque::new(),
+            in_flight_paths: InFlight::default(),
+            retired: 0,
+            track_paths: true,
+            notes_created: false,
             failure_given: false,
         }
     }
@@ -516,6 +534,19 @@ impl Publisher {
         self.queue.state()
     }
 
+    /// The state, for [`PublishState::link_paths`] and [`PublishState::forget_created`].
+    pub(crate) fn link_state(&mut self) -> MutexGuard<'_, PublishState> {
+        self.notes_created = true;
+        self.queue.state()
+    }
+
+    /// A newly opened output for `stored` is at `staged`.
+    pub(crate) fn note_created(&mut self, stored: &Path, staged: &Path) {
+        if self.notes_created {
+            self.state().note_created(stored, staged);
+        }
+    }
+
     /// Waits for every output queued so far; only a member the run went on to calls it.
     pub(crate) fn wait(&mut self) {
         self.go_on();
@@ -536,8 +567,34 @@ impl Publisher {
 
     pub(crate) fn queue(&mut self, verified: Unpublished) {
         self.go_on();
+        let output = &verified.output;
+        let path = match output.path.strip_prefix(&self.out_dir) {
+            Ok(relative) if self.track_paths => {
+                self.in_flight_paths.add(relative, output.meta.is_directory);
+                Some((relative.to_path_buf(), output.meta.is_directory))
+            }
+            _ => None,
+        };
+        self.in_flight.push_back(path);
         self.queued += 1;
         self.queue.submit(verified);
+    }
+
+    /// Whether to note where outputs queued from now on go, for [`Self::queued_changes`].
+    pub(crate) fn track_paths(&mut self, track: bool) {
+        self.track_paths = track;
+    }
+
+    /// Whether an output still queued can change what opening finds at `relative`.
+    pub(crate) fn queued_changes(&mut self, relative: &Path, directory: bool) -> bool {
+        let finished = self.queue.finished();
+        while self.retired < finished {
+            if let Some((path, directory)) = self.in_flight.pop_front().flatten() {
+                self.in_flight_paths.remove(&path, directory);
+            }
+            self.retired += 1;
+        }
+        self.in_flight_paths.changes(relative, directory)
     }
 
     /// The first failure of an output queued earlier, naming its member.
