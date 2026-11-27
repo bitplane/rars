@@ -113,3 +113,32 @@ def test_links_find_every_earlier_member_in_place(tmp_path, version, overwrite):
     _outcome, left = alike(tmp_path, path, overwrite=overwrite)
     assert left["d0/link"] == "link -> f0.txt"
     assert (tmp_path / "out-8" / "d1/up").read_bytes() == dict(members)["d2/f2.txt"]
+
+
+@pytest.mark.parametrize(
+    "version, solid, split",
+    [
+        ("rar29", False, False),
+        ("rar29", True, False),
+        ("rar29", False, True),
+        ("rar50", False, False),
+        ("rar50", True, False),
+        ("rar50", False, True),
+        ("rar50", True, True),
+    ],
+)
+def test_empty_members_publish_with_their_times_at_every_thread_count(tmp_path, version, solid, split):
+    builder = rars.RarBuilder(version, level=0 if split else 3, solid=solid, volume_size=4096 if split else None)
+    for index, (name, data) in enumerate(files(40)):
+        builder.add_bytes(b"" if index % 4 == 0 else data, name, mtime=1_600_000_000 + 2 * index)
+    directory = tmp_path / "archive"
+    directory.mkdir()
+    path = builder.write(directory / ("set.part01.rar" if split else "one.rar"))[0]
+    for threads in [1, *THREADS]:
+        out = tmp_path / f"out-{threads}"
+        rars.RarFile(path).extractall(out, options=rars.ReadOptions(threads=threads))
+        for index, (name, data) in enumerate(files(40)):
+            published = out / name
+            context = f"threads={threads} {name}"
+            assert published.read_bytes() == (b"" if index % 4 == 0 else data), context
+            assert published.stat().st_mtime == 1_600_000_000 + 2 * index, context

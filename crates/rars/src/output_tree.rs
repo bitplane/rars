@@ -77,6 +77,54 @@ impl Drop for HeldFile {
     }
 }
 
+/// Created where it is first used, so the thread that names it pays for no system call.
+pub struct DeferredFile {
+    file: Result<std::fs::File, Option<(FileDir, std::ffi::OsString, u32)>>,
+}
+
+impl DeferredFile {
+    pub fn new(dir: FileDir, name: std::ffi::OsString, mode: u32) -> Self {
+        Self {
+            file: Err(Some((dir, name, mode))),
+        }
+    }
+
+    pub fn from_file(file: std::fs::File) -> Self {
+        Self { file: Ok(file) }
+    }
+
+    /// The file, created now if it isn't yet.
+    pub fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        if let Err(pending) = &mut self.file {
+            let (dir, name, mode) = pending.take().ok_or_else(never_created)?;
+            self.file = Ok(dir.create_file(&name, mode)?);
+        }
+        match &mut self.file {
+            Ok(file) => Ok(file),
+            Err(_) => unreachable!("created above"),
+        }
+    }
+}
+
+/// What using, or publishing, a [`DeferredFile`] whose creation failed says.
+pub fn never_created() -> std::io::Error {
+    std::io::Error::other("the staged file could not be created")
+}
+
+impl std::io::Write for DeferredFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file()?.write(buf)
+    }
+
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.file()?.write_all(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file()?.flush()
+    }
+}
+
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 pub use imp::{file_identity, FileDir, OutputTree};
 
