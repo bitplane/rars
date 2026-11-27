@@ -162,8 +162,9 @@ pub(super) fn should_store_compressed_payload(
 /// How hard each level looks for a match, and where the default sits.
 ///
 /// Each rung packs smaller than the one below. Level 3 is the default because
-/// it is the knee. Level 5 searches filters exhaustively, which is most of what
-/// it costs over level 4, and its 16 MiB window is most of what it buys.
+/// it is the knee. Level 5 searches no deeper than level 4: past 128 candidates
+/// the time grows faster than the output shrinks. Its 16 MiB window and longer
+/// parse ([`parse_effort_for_level`]) are what it buys.
 fn match_candidates_for_level(level: u8) -> Result<usize> {
     match level {
         0 => Ok(0),
@@ -171,7 +172,7 @@ fn match_candidates_for_level(level: u8) -> Result<usize> {
         2 => Ok(16),
         3 => Ok(32),
         4 => Ok(128),
-        5 => Ok(512),
+        5 => Ok(128),
         _ => Err(Error::InvalidArgument(
             "RAR 5 compression level must be in the range 0..5",
         )),
@@ -226,12 +227,15 @@ pub(super) fn encode_options_for_level(
 /// fits one window. These two are what does. A single pass at level 2 parses
 /// each block once, on guessed prices, rather than again on the prices the
 /// pass before produced.
+///
+/// Level 5's gains flatten out by a nice length of 512, and on binaries by
+/// three passes; text keeps gaining to about five.
 fn parse_effort_for_level(level: u8) -> (usize, usize) {
     match level {
         2 => (32, 1),
         3 => (64, 2),
         4 => (256, 3),
-        5.. => (1024, 6),
+        5.. => (512, 5),
         _ => (512, 3),
     }
 }
@@ -600,7 +604,8 @@ struct Rar50OwnedSearch<B: Budget> {
     /// Whether this is one piece of a larger member, which measures E8 alone
     /// alongside E8E9 (see `prices_calls_alone`).
     piece: bool,
-    /// Whether every finalist is encoded in full (see [`exhaustive_search`]).
+    /// Whether every finalist is encoded in full. No level asks for it: at
+    /// level 5 it doubled the time on binaries for a tenth of the level's gain.
     exhaustive: bool,
     allowance: B,
 }
@@ -735,7 +740,7 @@ fn choose_owned_filter<B: Budget>(
                 algorithm_version,
                 file_offset: 0,
                 piece: false,
-                exhaustive: exhaustive_search(options),
+                exhaustive: false,
                 allowance: allowance.clone(),
             },
             data,
@@ -779,12 +784,6 @@ fn choose_owned_filter<B: Budget>(
     Ok((specs, packed))
 }
 
-/// Whether the search at these settings encodes every finalist in full
-/// rather than ranking them by a trial: level 5's, which is the level that
-/// spends whatever it takes.
-fn exhaustive_search(options: EncodeOptions) -> bool {
-    options.max_match_candidates >= match_candidates_for_level(5).expect("level 5 is a level")
-}
 /// The filters for one run of a member too large to search whole, ranged over
 /// the run. The run is searched on its own, without the history it is later
 /// coded against, so the choice never waits on the runs before it. It is
@@ -834,7 +833,7 @@ fn piece_filters<B: Budget>(
             algorithm_version,
             file_offset,
             piece: true,
-            exhaustive: exhaustive_search(options),
+            exhaustive: false,
             allowance: allowance.clone(),
         },
         data,
