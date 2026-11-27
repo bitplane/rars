@@ -3,7 +3,7 @@ mod scratch;
 
 use rars::{ArchiveVersion, Builder};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 fn write_archive(path: &Path, version: ArchiveVersion, entries: &[(&[u8], &[u8])]) -> Vec<u8> {
@@ -600,12 +600,17 @@ fn files_written_in_place_keep_their_times_and_modes() {
 #[cfg(unix)]
 #[test]
 fn a_file_landing_on_an_earlier_members_directory_is_refused_alike() {
-    for overwrite in ["--overwrite=never", "--overwrite=always"] {
+    for (version, overwrite) in [ArchiveVersion::Rar29, ArchiveVersion::Rar50]
+        .into_iter()
+        .flat_map(|version| {
+            ["--overwrite=never", "--overwrite=always"].map(|overwrite| (version, overwrite))
+        })
+    {
         let root = scratch::case("extraction-file-over-made-directory");
         let archive = root.join("archive.rar");
         write_archive(
             &archive,
-            ArchiveVersion::Rar50,
+            version,
             &[
                 (b"a/b/c", b"inner"),
                 (b"a/b", b"outer"),
@@ -638,30 +643,32 @@ fn a_file_landing_on_an_earlier_members_directory_is_refused_alike() {
 /// opened or after, so every thread count leaves the same files.
 #[test]
 fn members_on_one_output_path_publish_alike_at_every_thread_count() {
-    let root = scratch::case("extraction-publish-repeats");
-    let archive = root.join("archive.rar");
-    write_archive(
-        &archive,
-        ArchiveVersion::Rar50,
-        &[
-            (b"a/x.txt", b"first"),
-            (b"b/x.txt", b"second"),
-            (b"c/y.txt", b"tail"),
-        ],
-    );
-    for args in [
-        &["--flatten", "--overwrite=always"][..],
-        &["--flatten", "--overwrite=rename"],
-        &["--flatten", "--overwrite=never"],
-        &["--overwrite=rename"],
-    ] {
-        let run = extract_at_thread_counts(&archive, &root, args, |out| {
-            let _ = fs::remove_dir_all(out);
-        });
-        let all = args.contains(&"--overwrite=never");
-        assert_eq!(run.0 == Some(0), !all, "{args:?}: {}", run.2);
-        if args.contains(&"--overwrite=always") {
-            assert!(run.3.contains(&("x.txt".to_string(), b"second".to_vec())));
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let root = scratch::case("extraction-publish-repeats");
+        let archive = root.join("archive.rar");
+        write_archive(
+            &archive,
+            version,
+            &[
+                (b"a/x.txt", b"first"),
+                (b"b/x.txt", b"second"),
+                (b"c/y.txt", b"tail"),
+            ],
+        );
+        for args in [
+            &["--flatten", "--overwrite=always"][..],
+            &["--flatten", "--overwrite=rename"],
+            &["--flatten", "--overwrite=never"],
+            &["--overwrite=rename"],
+        ] {
+            let run = extract_at_thread_counts(&archive, &root, args, |out| {
+                let _ = fs::remove_dir_all(out);
+            });
+            let all = args.contains(&"--overwrite=never");
+            assert_eq!(run.0 == Some(0), !all, "{version:?} {args:?}: {}", run.2);
+            if args.contains(&"--overwrite=always") {
+                assert!(run.3.contains(&("x.txt".to_string(), b"second".to_vec())));
+            }
         }
     }
 }
@@ -671,24 +678,135 @@ fn members_on_one_output_path_publish_alike_at_every_thread_count() {
 #[cfg(unix)]
 #[test]
 fn a_symbolic_link_among_published_members_matches_one_thread() {
-    let root = scratch::case("extraction-publish-symlink");
-    let archive = root.join("archive.rar");
-    let mut builder = Builder::new(ArchiveVersion::Rar50);
-    builder
-        .add_bytes(b"d/real.txt".to_vec(), b"hello".repeat(2000), None, None)
-        .unwrap();
-    builder
-        .add_unix_symlink(b"d/link".to_vec(), b"real.txt".to_vec(), false, None, None)
-        .unwrap();
-    builder
-        .add_bytes(b"d/after.txt".to_vec(), b"tail".repeat(3000), None, None)
-        .unwrap();
-    fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
-    for args in [&["--overwrite=always"][..], &["--overwrite=never"]] {
-        let run = extract_at_thread_counts(&archive, &root, args, |out| {
-            let _ = fs::remove_dir_all(out);
-        });
-        assert_eq!(run.0, Some(0), "{args:?}: {}", run.2);
-        assert!(run.3.iter().any(|(name, _)| name == "d/link"), "{run:?}");
+    for version in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
+        let root = scratch::case("extraction-publish-symlink");
+        let archive = root.join("archive.rar");
+        let mut builder = Builder::new(version);
+        builder
+            .add_bytes(b"d/real.txt".to_vec(), b"hello".repeat(2000), None, None)
+            .unwrap();
+        builder
+            .add_unix_symlink(b"d/link".to_vec(), b"real.txt".to_vec(), false, None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"d/after.txt".to_vec(), b"tail".repeat(3000), None, None)
+            .unwrap();
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        for args in [&["--overwrite=always"][..], &["--overwrite=never"]] {
+            let run = extract_at_thread_counts(&archive, &root, args, |out| {
+                let _ = fs::remove_dir_all(out);
+            });
+            assert_eq!(run.0, Some(0), "{version:?} {args:?}: {}", run.2);
+            assert!(run.3.iter().any(|(name, _)| name == "d/link"), "{run:?}");
+        }
+    }
+}
+
+fn small_legacy_members(root: &Path, volumes: bool) -> (PathBuf, Vec<(String, Vec<u8>)>) {
+    let mut builder = Builder::new(ArchiveVersion::Rar29).store(true);
+    if volumes {
+        builder = builder.volume_size(Some(4 * 1024));
+    }
+    let mut sources = Vec::new();
+    for index in 0..40u32 {
+        let name = format!("dir{}/file{index}.txt", index % 3);
+        let data = format!("small member {index}; ").repeat(10).into_bytes();
+        builder
+            .add_bytes(name.clone().into_bytes(), data.clone(), None, None)
+            .unwrap();
+        sources.push((name, data));
+    }
+    if !volumes {
+        let archive = root.join("archive.rar");
+        fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+        return (archive, sources);
+    }
+    let parts = builder.build_volumes(None).unwrap();
+    assert!(parts.len() >= 3);
+    for (index, bytes) in parts.iter().enumerate() {
+        fs::write(root.join(format!("set.part{}.rar", index + 1)), bytes).unwrap();
+    }
+    (root.join("set.part1.rar"), sources)
+}
+
+/// A legacy member whose output is refused as it is opened, or only as it is
+/// published, ends the run where one thread does: the members before it are
+/// published and none after it.
+#[test]
+fn a_refused_legacy_output_ends_the_run_alike_at_every_thread_count() {
+    for volumes in [false, true] {
+        for at_publish in [false, true] {
+            let root = scratch::case("extraction-legacy-refusal");
+            let (archive, sources) = small_legacy_members(&root, volumes);
+            let overwrite = if at_publish {
+                "--overwrite=always"
+            } else {
+                "--overwrite=never"
+            };
+            let run = extract_at_thread_counts(&archive, &root, &[overwrite], |out| {
+                if at_publish {
+                    // Opened over a file, refused as a directory as it is renamed into place.
+                    fs::create_dir_all(out.join("dir2/file20.txt/inner")).unwrap();
+                } else {
+                    fs::create_dir_all(out.join("dir2")).unwrap();
+                    fs::write(out.join("dir2/file20.txt"), b"keep me").unwrap();
+                }
+            });
+            let case = format!("volumes={volumes} {overwrite}");
+            assert_ne!(run.0, Some(0), "{case}: {}", run.2);
+            let mut expected = expected_files(&sources[..20], &[]);
+            if at_publish {
+                expected.push(("dir2/file20.txt/".to_string(), Vec::new()));
+                expected.push(("dir2/file20.txt/inner/".to_string(), Vec::new()));
+            } else {
+                expected.push(("dir2/file20.txt".to_string(), b"keep me".to_vec()));
+            }
+            expected.sort();
+            assert_eq!(run.3, expected, "{case}: {}", run.2);
+        }
+    }
+}
+
+/// A legacy member under a path an earlier member published as a file is
+/// refused as it is at one thread, however far publishing has got.
+#[test]
+fn a_legacy_member_under_an_earlier_file_is_refused_alike() {
+    for overwrite in ["--overwrite=never", "--overwrite=always"] {
+        let root = scratch::case("extraction-legacy-under-file");
+        let archive = root.join("archive.rar");
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = (0..20)
+            .map(|index| (format!("pad{index}.txt").into_bytes(), b"pad".to_vec()))
+            .collect();
+        entries.push((b"a".to_vec(), b"outer".to_vec()));
+        entries.push((b"a/b".to_vec(), b"inner".to_vec()));
+        entries.push((b"z.txt".to_vec(), b"after".to_vec()));
+        let entries: Vec<(&[u8], &[u8])> = entries
+            .iter()
+            .map(|(name, data)| (name.as_slice(), data.as_slice()))
+            .collect();
+        write_archive(&archive, ArchiveVersion::Rar29, &entries);
+        let run = extract_at_thread_counts(&archive, &root, &[overwrite], |_| {});
+        assert_ne!(run.0, Some(0), "{overwrite}: {}", run.2);
+        assert!(
+            run.3.contains(&("a".to_string(), b"outer".to_vec())),
+            "{overwrite}: {run:?}"
+        );
+        assert!(
+            !run.3.iter().any(|(name, _)| name == "z.txt"),
+            "{overwrite}: {run:?}"
+        );
+    }
+}
+
+/// Many small legacy members, in one archive or a volume set, extract to the
+/// same files at every thread count.
+#[test]
+fn small_legacy_members_extract_alike_at_every_thread_count() {
+    for volumes in [false, true] {
+        let root = scratch::case("extraction-legacy-small");
+        let (archive, sources) = small_legacy_members(&root, volumes);
+        let run = extract_at_thread_counts(&archive, &root, &[], |_| {});
+        assert_eq!(run.0, Some(0), "volumes={volumes}: {}", run.2);
+        assert_eq!(run.3, expected_files(&sources, &[]));
     }
 }

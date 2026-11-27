@@ -3,6 +3,7 @@
 //! Shared with the Python binding; not part of the stable API.
 
 use crate::extract_dir::{ExtractedDir, SkippedLink};
+use crate::in_flight::InFlight;
 use crate::output_links::{create_link_output, link_source_path};
 use crate::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
@@ -88,81 +89,6 @@ struct Publishing {
     created: HashMap<PathBuf, PathBuf>,
     /// Where outputs queued and not yet published go.
     queued: InFlight,
-}
-
-/// Outputs not yet in place, by destination relative to the output directory.
-#[derive(Default)]
-struct InFlight {
-    paths: HashMap<PathBuf, Counts>,
-}
-
-/// Below counts outputs under the path, which a file there would collide with.
-#[derive(Default)]
-struct Counts {
-    files: usize,
-    directories: usize,
-    below: usize,
-}
-
-impl InFlight {
-    fn add(&mut self, relative: &Path, directory: bool) {
-        for above in parents(relative) {
-            self.paths.entry(above.to_path_buf()).or_default().below += 1;
-        }
-        let counts = self.paths.entry(relative.to_path_buf()).or_default();
-        if directory {
-            counts.directories += 1;
-        } else {
-            counts.files += 1;
-        }
-    }
-
-    fn remove(&mut self, relative: &Path, directory: bool) {
-        let mut forget = |path: &Path, count: fn(&mut Counts) -> &mut usize| {
-            if let Some(counts) = self.paths.get_mut(path) {
-                *count(counts) -= 1;
-                if counts.files + counts.directories + counts.below == 0 {
-                    self.paths.remove(path);
-                }
-            }
-        };
-        if directory {
-            forget(relative, |counts| &mut counts.directories);
-        } else {
-            forget(relative, |counts| &mut counts.files);
-        }
-        for above in parents(relative) {
-            forget(above, |counts| &mut counts.below);
-        }
-    }
-
-    /// Whether an output goes to `relative` itself.
-    fn holds(&self, relative: &Path) -> bool {
-        self.paths
-            .get(relative)
-            .is_some_and(|counts| counts.files + counts.directories > 0)
-    }
-
-    /// Whether these outputs can change what opening finds at `relative`.
-    fn changes(&self, relative: &Path, directory: bool) -> bool {
-        if self.paths.is_empty() {
-            return false;
-        }
-        if let Some(counts) = self.paths.get(relative) {
-            if counts.files > 0 || !directory && (counts.directories > 0 || counts.below > 0) {
-                return true;
-            }
-        }
-        parents(relative).any(|above| self.paths.get(above).is_some_and(|counts| counts.files > 0))
-    }
-}
-
-/// The directories above `relative`, not counting the output directory.
-fn parents(relative: &Path) -> impl Iterator<Item = &Path> {
-    relative
-        .ancestors()
-        .skip(1)
-        .take_while(|above| !above.as_os_str().is_empty())
 }
 
 /// Where staged files go in a staging storage walked by descriptor. Links

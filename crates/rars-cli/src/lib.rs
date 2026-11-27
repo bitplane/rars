@@ -1148,7 +1148,8 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
             extract_single_archive(&archives[0], options, &state, &damaged)
         } else {
             extract_volume_archives(archives, options, &state, &damaged)
-        };
+        }
+        .and_then(|()| state.borrow_mut().queued_failure());
         state.borrow_mut().discard_failed(&damaged.take_failed());
         passed_over += damaged.passed_over();
         result
@@ -1252,6 +1253,8 @@ struct ExtractOutputState<'a> {
     unpublished: VecDeque<Unpublished>,
     publisher: Publisher,
     planned_paths: HashSet<PathBuf>,
+    /// Where the staging storage is, once made: publishing never moves it.
+    staging_at: Option<PathBuf>,
     /// The staging storage, walked the same way; present only with `out_tree`.
     /// Files stage there under names of their own in [`STAGED_FILES`], and
     /// links under their own paths in [`STAGED_LINKS`].
@@ -1303,7 +1306,7 @@ impl<'a> ExtractOutputState<'a> {
         flatten: bool,
         family: rars::ArchiveFamily,
     ) -> Self {
-        let state = Self {
+        let mut state = Self {
             out_dir,
             overwrite,
             in_place,
@@ -1314,6 +1317,7 @@ impl<'a> ExtractOutputState<'a> {
             unpublished: VecDeque::new(),
             publisher: Publisher::new(out_dir, overwrite, in_place),
             planned_paths: HashSet::new(),
+            staging_at: None,
             staging_tree: None,
             staging_files: None,
             staged_count: 0,
@@ -1333,7 +1337,14 @@ impl<'a> ExtractOutputState<'a> {
             .publisher
             .state()
             .set_repeats_allowed(state.repeats_allowed());
+        // In place, opening writes the destination; flattened, it claims names publishing keeps.
+        state.publisher.publish_on_thread(!in_place && !flatten);
         state
+    }
+
+    /// For callers whose own output follows each publish as it happens.
+    fn publish_on_calling_thread(&mut self) {
+        self.publisher.publish_on_thread(false);
     }
 
     fn allow_overwrite_repeats(&mut self) {
@@ -1361,8 +1372,8 @@ impl<'a> ExtractOutputState<'a> {
     /// earlier run have verified.
     fn settle_explicitly(&mut self, settling: bool) {
         self.settling = settling;
-        // Settling, opening reads only what a publish still queued leaves for publishing to catch.
-        self.publisher.publish_on_thread(settling);
+        // Settling, a collision with a member still queued is caught as it is published.
+        self.publisher.track_paths(!settling);
         self.settled = self.unpublished.len();
         self.unsettled.clear();
     }
@@ -1428,7 +1439,7 @@ impl<'a> ExtractOutputState<'a> {
         let staged = self.unpublished[index].staged.clone();
         self.publisher.wait();
         self.publisher
-            .state()
+            .link_state()
             .forget_created(&self.unpublished, &staged);
         self.unpublished.remove(index);
         if !self.in_place {
@@ -1476,6 +1487,7 @@ impl<'a> ExtractOutputState<'a> {
             return Ok(Box::new(std::io::sink()));
         }
         let relative = self.output_relative(&stored);
+        self.wait_for_queued(&relative, meta.is_directory)?;
         let (destination, existing) = self
             .checked_destination(&relative)
             .map_err(|error| output::refused_path(error, &meta.name))?;
@@ -1484,9 +1496,9 @@ impl<'a> ExtractOutputState<'a> {
         }
         self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
-        // Settling, members before this one may not be published yet: the
+        // Staged, the members before this one may not be published yet: the
         // time is taken as it is published.
-        if !self.settling {
+        if self.in_place {
             self.publisher
                 .state()
                 .record_directory_time(&destination, meta)?;
@@ -1562,7 +1574,7 @@ impl<'a> ExtractOutputState<'a> {
             Some(path) if self.in_place => path,
             _ => destination,
         };
-        self.publisher.state().note_created(&stored, &staged);
+        self.publisher.note_created(&stored, &staged);
         self.unpublished.push_back(Unpublished {
             output: ExtractedOutput {
                 name,
@@ -1575,7 +1587,7 @@ impl<'a> ExtractOutputState<'a> {
             pending,
             redirection: false,
             hardlink_target: None,
-            time_on_publish: self.settling,
+            time_on_publish: !self.in_place,
         });
         Ok(writer)
     }
@@ -1625,7 +1637,7 @@ impl<'a> ExtractOutputState<'a> {
             staging.push(STAGED_LINKS);
         }
         let policy = self.staged_policy();
-        let mut publisher = self.publisher.state();
+        let mut publisher = self.publisher.link_state();
         let (created_paths, renames) = publisher.link_paths(&self.unpublished);
         let created = create_link_output(
             &staging,
@@ -1695,6 +1707,15 @@ impl<'a> ExtractOutputState<'a> {
         true
     }
 
+    /// Waits for the outputs queued ahead of a member when one could change
+    /// what opening it finds, so it finds what it would at one thread.
+    fn wait_for_queued(&mut self, relative: &Path, directory: bool) -> rars::Result<()> {
+        if !self.publisher.queued_changes(relative, directory) {
+            return Ok(());
+        }
+        self.queued_failure()
+    }
+
     fn output_relative<'p>(&self, stored: &'p Path) -> std::borrow::Cow<'p, Path> {
         if self.flatten {
             rars::output_staging::flat_relative(stored).into()
@@ -1705,8 +1726,8 @@ impl<'a> ExtractOutputState<'a> {
 
     /// Where outputs stage: the extraction storage, or in place the output directory.
     fn staging_root(&self) -> PathBuf {
-        match self.publisher.state().staging() {
-            Some(staging) if !self.in_place => staging.root.clone(),
+        match &self.staging_at {
+            Some(root) if !self.in_place => root.clone(),
             _ => self.out_dir.to_path_buf(),
         }
     }
@@ -1848,8 +1869,9 @@ impl<'a> ExtractOutputState<'a> {
             }
             return Ok(());
         }
-        if self.publisher.state().staging().is_none() {
+        if self.staging_at.is_none() {
             let staging = ExtractionStaging::new(self.out_dir)?;
+            self.staging_at = Some(staging.root.clone());
             if let Some(out_tree) = self.publisher.state().tree()? {
                 self.staging_tree = OutputTree::open(&staging.root)?;
                 if let Some(staging_tree) = &self.staging_tree {
@@ -1859,13 +1881,13 @@ impl<'a> ExtractOutputState<'a> {
             let by_descriptor = self.staging_tree.is_some();
             self.publisher.state().start_staging(staging, by_descriptor);
         }
-        let publisher = self.publisher.state();
-        let staging = publisher.staging().expect("staging exists");
-        let root = &staging.root;
         // The output tree refused the storage on its walk to the destination.
         if existing.is_none() {
+            let publisher = self.publisher.state();
+            let staging = publisher.staging().expect("staging exists");
             staging.reject_alias(destination)?;
         }
+        let root = self.staging_at.as_deref().expect("staging exists");
         let relative = destination
             .strip_prefix(self.out_dir)
             .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
@@ -2084,6 +2106,13 @@ impl<'a> ExtractOutputState<'a> {
         let queued = self.publish_verified();
         self.publisher.wait_to_failure();
         queued?;
+        self.publisher.publish_failure()
+    }
+
+    /// A run that ended well still fails on a member published since its last
+    /// open, as it would have at that open had it published there.
+    fn queued_failure(&mut self) -> rars::Result<()> {
+        self.publisher.wait_to_failure();
         self.publisher.publish_failure()
     }
 
@@ -4328,6 +4357,7 @@ mod tests {
                     writer.write_all(name.as_bytes()).unwrap();
                 }
                 // `one` is in place and `two` is staged when the directory is swapped.
+                state.publisher.wait();
                 let moved = root.join("moved");
                 std::fs::rename(root.join(planted), &moved).unwrap();
                 std::os::unix::fs::symlink(&outside, root.join(planted)).unwrap();
@@ -4543,6 +4573,7 @@ mod tests {
                 // Opening `other` publishes `one`, which makes `d`.
                 write(&mut state, "d/one").unwrap();
                 write(&mut state, "d/other").unwrap();
+                state.publisher.wait();
                 assert_eq!(std::fs::read(root.join("d/one")).unwrap(), b"d/one");
                 let planted = root.join("d/two");
                 if plant == "symlink" {

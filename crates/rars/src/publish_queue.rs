@@ -16,6 +16,8 @@ pub trait PublishStep: Send + 'static {
 struct Progress<J> {
     /// Jobs sent and not yet published.
     outstanding: usize,
+    /// Jobs whose publish has run, whether or not it failed.
+    finished: usize,
     /// Failures not yet taken, in archive order.
     failures: VecDeque<Error>,
     /// A publish failed: no later one runs until [`PublishQueue::resume`].
@@ -64,6 +66,7 @@ impl<P: PublishStep> Shared<P> {
                 progress.panicked.get_or_insert(payload);
             }
         }
+        progress.finished += 1;
         progress.outstanding -= 1;
         self.idle.notify_all();
     }
@@ -102,6 +105,7 @@ impl<P: PublishStep> PublishQueue<P> {
                 state: Mutex::new(state),
                 progress: Mutex::new(Progress {
                     outstanding: 0,
+                    finished: 0,
                     failures: VecDeque::new(),
                     paused: false,
                     closing: false,
@@ -181,6 +185,11 @@ impl<P: PublishStep> PublishQueue<P> {
             jobs: Some(jobs),
             thread: Some(thread),
         })
+    }
+
+    /// How many of the jobs submitted, oldest first, have run, without waiting for any.
+    pub fn finished(&self) -> usize {
+        lock(&self.shared.progress).finished
     }
 
     /// The first failure of a publish not yet taken, without waiting for any.
@@ -321,6 +330,7 @@ mod tests {
                 }
                 queue.wait();
                 assert_eq!(queue.state().published, vec![0, 1]);
+                assert_eq!(queue.finished(), 2);
                 assert_eq!(queue.take_failure(), Some(Error::InvalidHeader("refused")));
                 queue.resume();
                 queue.wait();
