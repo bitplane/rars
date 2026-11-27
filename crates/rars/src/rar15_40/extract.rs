@@ -4,7 +4,13 @@ mod volumes;
 use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::rar29::Reader29State;
-use crate::codec::workspace::{Allowance, Boxed, Buffer};
+#[cfg(any(
+    feature = "encryption",
+    all(test, feature = "write"),
+    feature = "recovery"
+))]
+use crate::codec::workspace::Buffer;
+use crate::codec::workspace::{Allowance, Boxed};
 use crate::extraction_links::{check_legacy_size, legacy_output, skip_legacy_links, LegacyLink};
 use crate::volume_extract::{LazyChain, VolumeFeed};
 use std::io::{Read, Write};
@@ -1146,7 +1152,10 @@ mod tests {
     ) -> Result<()> {
         let volumes = [archive_with(vec![Block::File(first)])];
         volumes::with_walk(&volumes, password, |_, _, walk| {
-            walk.validate_continuation(continuation)
+            <volumes::Rar15To40 as crate::volume_extract::SplitFormat>::validate_continuation(
+                walk,
+                continuation,
+            )
         })
     }
 

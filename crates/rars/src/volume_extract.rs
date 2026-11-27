@@ -314,6 +314,165 @@ impl Read for LazyChain<'_> {
     }
 }
 
+/// What a format supplies to [`SplitWalk`]: how its volumes' first headers
+/// are read, what each fragment records, and what ties a continuation to the
+/// member it continues.
+pub(crate) trait SplitFormat: Sized {
+    type Archive: PlacedVolume + Send;
+    type Header: Clone + Send;
+    /// What the walk keeps of each fragment, to explain a member that fails.
+    type Fragment: Send;
+    /// What the format keeps across a member's fragments beyond the walk's own.
+    type State: Default + Send;
+    const INCOMPLETE: &'static str;
+    const INTERRUPTED: &'static str;
+    fn first_header(volume: &Self::Archive) -> Option<&Self::Header>;
+    fn header_count(volume: &Self::Archive) -> usize;
+    fn known_size(file: &Self::Header) -> Option<u64>;
+    fn is_split_after(file: &Self::Header) -> bool;
+    fn reader(volume: &Self::Archive, file: &Self::Header) -> crate::Result<RangeReader<'static>>;
+    fn fragment(index: usize, volume: &Self::Archive, file: &Self::Header) -> Self::Fragment;
+    /// An error when `file` cannot be a later fragment of the member `walk` follows.
+    fn validate_continuation(
+        walk: &SplitWalk<'_, '_, '_, Self>,
+        file: &Self::Header,
+    ) -> crate::Result<()>;
+    /// Takes note of a fragment the walk has accepted, the first included.
+    fn record(_state: &mut Self::State, _file: &Self::Header) -> crate::Result<()> {
+        Ok(())
+    }
+}
+
+/// Fetches a split member's later volumes as its reader reaches each fragment's end.
+pub(crate) struct SplitWalk<'f, 'p, 'o, F: SplitFormat> {
+    feed: &'f mut VolumeFeed<'p, 'o, F::Archive>,
+    pub(crate) options: crate::ArchiveReadOptions<'o>,
+    pub(crate) first: F::Header,
+    /// The member's size, once a fragment states it.
+    pub(crate) size: Option<u64>,
+    pub(crate) split_after: bool,
+    last: Option<F::Archive>,
+    prefetched: std::collections::VecDeque<RangeReader<'static>>,
+    /// Each fragment read so far, charged to the reader workspace.
+    pub(crate) fragments: crate::codec::workspace::Buffer<F::Fragment>,
+    /// A refused or missing volume, reported as itself rather than as a decode failure.
+    pub(crate) failure: Option<crate::Error>,
+    pub(crate) state: F::State,
+}
+
+impl<'f, 'p, 'o, F: SplitFormat> SplitWalk<'f, 'p, 'o, F> {
+    pub(crate) fn new(
+        feed: &'f mut VolumeFeed<'p, 'o, F::Archive>,
+        volume: &F::Archive,
+        first: &F::Header,
+        allowance: &crate::codec::workspace::Allowance,
+    ) -> crate::Result<Self> {
+        let mut fragments = crate::codec::workspace::Buffer::new(allowance);
+        fragments.try_push(F::fragment(feed.current_index(), volume, first))?;
+        let mut state = F::State::default();
+        F::record(&mut state, first)?;
+        Ok(Self {
+            options: feed.options(),
+            feed,
+            first: first.clone(),
+            size: F::known_size(first),
+            split_after: true,
+            last: None,
+            prefetched: Default::default(),
+            fragments,
+            failure: None,
+            state,
+        })
+    }
+
+    /// Reads past any fragments the decoder did not need and returns the member's last header.
+    pub(crate) fn finish(&mut self) -> crate::Result<&F::Header> {
+        while self.next_fragment()?.is_some() {}
+        // Salvaging, a failure ends the fragments rather than failing.
+        if let Some(error) = &self.failure {
+            return Err(error.clone());
+        }
+        self.last_header()
+    }
+
+    pub(crate) fn last_header(&self) -> crate::Result<&F::Header> {
+        self.last
+            .as_ref()
+            .and_then(F::first_header)
+            .ok_or(crate::Error::InvalidHeader(F::INCOMPLETE))
+    }
+
+    /// Fetches every remaining volume of the member before any of its data is read.
+    pub(crate) fn prefetch(&mut self) -> crate::Result<&F::Header> {
+        while let Some(reader) = self
+            .advance()
+            .inspect_err(|error| self.failure = Some(error.clone()))?
+        {
+            self.prefetched.push_back(reader);
+        }
+        self.last_header()
+    }
+
+    pub(crate) fn into_last_volume(mut self) -> crate::Result<F::Archive> {
+        self.finish()?;
+        Ok(self.last.expect("finish found the last fragment"))
+    }
+
+    fn advance(&mut self) -> crate::Result<Option<RangeReader<'static>>> {
+        if !self.split_after {
+            return Ok(None);
+        }
+        loop {
+            let missing = self.feed.missing_next();
+            let Some(volume) = self.feed.next_part()? else {
+                // The volumes given ran out while the member continues.
+                return Err(missing);
+            };
+            let Some(file) = F::first_header(&volume) else {
+                continue;
+            };
+            F::validate_continuation(self, file)?;
+            if F::is_split_after(file) && F::header_count(&volume) != 1 {
+                return Err(crate::Error::InvalidHeader(F::INTERRUPTED));
+            }
+            self.size = self.size.or(F::known_size(file));
+            let reader = F::reader(&volume, file)?;
+            self.fragments
+                .try_push(F::fragment(self.feed.current_index(), &volume, file))?;
+            F::record(&mut self.state, file)?;
+            self.split_after = F::is_split_after(file);
+            self.last = Some(volume);
+            return Ok(Some(reader));
+        }
+    }
+}
+
+impl<F: SplitFormat> FragmentWalk for SplitWalk<'_, '_, '_, F> {
+    fn next_fragment(&mut self) -> crate::Result<Option<RangeReader<'static>>> {
+        // Fragments fetched before a failure are still read, when salvaging.
+        if let Some(reader) = self.prefetched.pop_front() {
+            return Ok(Some(reader));
+        }
+        let error = match &self.failure {
+            Some(error) => error.clone(),
+            None => match self.advance() {
+                Ok(reader) => return Ok(reader),
+                Err(error) => {
+                    self.failure = Some(error.clone());
+                    error
+                }
+            },
+        };
+        // Salvaging, the member's data ends where its volumes give out, so
+        // the decoder delivers what it decoded first. The failure is still
+        // the member's, once it is decoded.
+        if self.options.salvage {
+            return Ok(None);
+        }
+        Err(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

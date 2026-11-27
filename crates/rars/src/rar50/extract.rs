@@ -4160,7 +4160,10 @@ mod tests {
         let check = |continuation: &FileHeader, password: Option<&[u8]>| {
             let options = crate::ArchiveReadOptions::with_optional_password(password);
             volumes::with_walk(&volumes, options, &Allowance::default(), |_, _, walk| {
-                walk.validate_continuation(continuation)
+                <volumes::Rar50 as crate::volume_extract::SplitFormat>::validate_continuation(
+                    walk,
+                    continuation,
+                )
             })
         };
 
