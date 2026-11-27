@@ -9,7 +9,7 @@ use crate::output_staging::{
 };
 use crate::output_tree::{FileDir, HeldFile, OutputTree, TreeEntry};
 use crate::ExtractedLink;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -46,6 +46,10 @@ pub struct DirOutputs<'a> {
     staging: Option<ExtractionStaging>,
     staged: usize,
     pending: Option<PendingOutput>,
+    /// Members opened by [`Self::open_settled`] and not yet settled, oldest first.
+    unsettled: VecDeque<Unsettled>,
+    /// How many unsettled members go to each destination.
+    unsettled_destinations: HashMap<PathBuf, usize>,
     published: Vec<PathBuf>,
     /// Where each output went, by its stored path, for hard links and copies.
     created: HashMap<PathBuf, PathBuf>,
@@ -76,6 +80,20 @@ struct PendingOutput {
     meta: crate::ExtractedEntryMeta,
     /// A legacy symlink's target, buffered until verified.
     link_target: Option<Arc<Mutex<Vec<u8>>>>,
+}
+
+enum Unsettled {
+    Refused,
+    /// Made once it settles, so a file before it in the archive is published first.
+    Directory {
+        meta: crate::ExtractedEntryMeta,
+        destination: PathBuf,
+    },
+    Output {
+        pending: PendingOutput,
+        /// `Never` asks again at publishing: a member before it goes to the same destination.
+        recheck: bool,
+    },
 }
 
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -122,6 +140,8 @@ impl<'a> DirOutputs<'a> {
             staging: None,
             staged: 0,
             pending: None,
+            unsettled: VecDeque::new(),
+            unsettled_destinations: HashMap::new(),
             published: Vec::new(),
             created: HashMap::new(),
             skipped_links: Vec::new(),
@@ -201,7 +221,10 @@ impl<'a> DirOutputs<'a> {
                 "multiple archive entries map to the same output path",
             ));
         }
-        if self.encoding.is_some() && self.published.iter().any(|path| path == destination) {
+        if self.encoding.is_some()
+            && (self.published.iter().any(|path| path == destination)
+                || self.unsettled_destinations.contains_key(destination))
+        {
             return Err(crate::Error::InvalidArgument(
                 "multiple entries map to the same decoded output path",
             ));
@@ -235,17 +258,118 @@ impl<'a> DirOutputs<'a> {
             self.record_published(stored, destination, meta, true);
             return Ok(Box::new(io::sink()));
         }
-        let exists = match &existing {
-            Some(entry) => *entry != TreeEntry::Missing,
-            None => fs::symlink_metadata(&destination).is_ok(),
-        };
-        if self.overwrite == OverwritePolicy::Never && exists {
+        if self.overwrite == OverwritePolicy::Never && self.exists(&destination, existing.as_ref())
+        {
             return Err(self.already_exists(&destination).into());
         }
         if self.in_place {
             return self.open_in_place(stored, destination, meta);
         }
-        self.open_staged(stored, destination, meta)
+        Ok(self.open_staged(stored, destination, meta)?)
+    }
+
+    /// For [`Self::settle`]: opening can't read what members still unsettled will publish, so writing in place or flattened can't use it.
+    pub fn open_settled(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write + Send>> {
+        debug_assert!(!self.in_place && !self.flatten);
+        let (writer, unsettled) = match self.open_unsettled(meta) {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.unsettled.push_back(Unsettled::Refused);
+                return Err(error);
+            }
+        };
+        let destination = match &unsettled {
+            Unsettled::Output { pending, .. } => Some(&pending.destination),
+            Unsettled::Directory { destination, .. } => Some(destination),
+            Unsettled::Refused => None,
+        };
+        if let Some(destination) = destination {
+            *self
+                .unsettled_destinations
+                .entry(destination.clone())
+                .or_default() += 1;
+        }
+        self.unsettled.push_back(unsettled);
+        Ok(writer)
+    }
+
+    fn open_unsettled(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<(Box<dyn Write + Send>, Unsettled)> {
+        let (stored, destination, existing) = self.destination(meta)?;
+        self.claim(&destination, meta)?;
+        if meta.is_directory {
+            let unsettled = Unsettled::Directory {
+                meta: meta.clone(),
+                destination,
+            };
+            return Ok((Box::new(io::sink()), unsettled));
+        }
+        if self.overwrite == OverwritePolicy::Never && self.exists(&destination, existing.as_ref())
+        {
+            return Err(self.already_exists(&destination).into());
+        }
+        let recheck = self.unsettled_destinations.contains_key(&destination);
+        let writer = self.open_staged(stored, destination, meta)?;
+        let pending = self.pending.take().expect("staged above");
+        Ok((writer, Unsettled::Output { pending, recheck }))
+    }
+
+    /// Publishes or drops the oldest member from [`Self::open_settled`]; an error is that member's own.
+    pub fn settle(&mut self, verified: bool) -> crate::Result<()> {
+        let unsettled = self
+            .unsettled
+            .pop_front()
+            .expect("only members opened are settled");
+        match unsettled {
+            Unsettled::Refused => Ok(()),
+            Unsettled::Directory { meta, destination } => {
+                self.forget_unsettled(&destination);
+                if !verified {
+                    return Ok(());
+                }
+                // A symlink may have been linked into the way since it opened.
+                let (stored, destination, existing) = self.destination(&meta)?;
+                self.create_directory(&destination, existing.as_ref(), &meta.name)?;
+                self.record_published(stored, destination, &meta, true);
+                Ok(())
+            }
+            Unsettled::Output { pending, recheck } => {
+                self.forget_unsettled(&pending.destination);
+                if !verified {
+                    drop_staged(&pending);
+                    return Ok(());
+                }
+                if recheck && self.overwrite == OverwritePolicy::Never {
+                    let (_, destination, existing) = self.destination(&pending.meta)?;
+                    if self.exists(&destination, existing.as_ref()) {
+                        drop_staged(&pending);
+                        return Err(self.already_exists(&destination).into());
+                    }
+                }
+                self.publish(pending)
+            }
+        }
+    }
+
+    fn forget_unsettled(&mut self, destination: &Path) {
+        match self.unsettled_destinations.get_mut(destination) {
+            Some(count) if *count > 1 => *count -= 1,
+            _ => {
+                self.unsettled_destinations.remove(destination);
+            }
+        }
+    }
+
+    fn exists(&self, destination: &Path, existing: Option<&TreeEntry>) -> bool {
+        match existing {
+            Some(entry) => *entry != TreeEntry::Missing,
+            None => fs::symlink_metadata(destination).is_ok(),
+        }
     }
 
     /// Makes a directory member, and any missing parents.
@@ -361,7 +485,7 @@ impl<'a> DirOutputs<'a> {
         stored: PathBuf,
         destination: PathBuf,
         meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write>> {
+    ) -> crate::Result<Box<dyn Write + Send>> {
         self.staging()?;
         let staging = self.staging.as_ref().expect("made above");
         if self.staged_files.is_none() {
@@ -417,11 +541,13 @@ impl<'a> DirOutputs<'a> {
             gone_past
         });
         if failed {
-            if let Some(staged) = &pending.staged {
-                let _ = fs::remove_file(staged);
-            }
+            drop_staged(&pending);
             return Ok(());
         }
+        self.publish(pending)
+    }
+
+    fn publish(&mut self, pending: PendingOutput) -> crate::Result<()> {
         if let Some(target) = pending.link_target {
             let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
             crate::output_links::check_legacy_symlink_target(
@@ -649,6 +775,12 @@ impl<'a> DirOutputs<'a> {
 
     /// A member still in flight when extraction failed never reaches its destination.
     pub fn finish(mut self, result: crate::Result<()>) -> crate::Result<ExtractedDir> {
+        // Members not settled when extraction failed never verified.
+        for unsettled in std::mem::take(&mut self.unsettled) {
+            if let Unsettled::Output { pending, .. } = unsettled {
+                drop_staged(&pending);
+            }
+        }
         let published = match result {
             Ok(()) => self.publish_pending(),
             Err(error) => {
@@ -681,6 +813,12 @@ impl<'a> DirOutputs<'a> {
             paths,
             skipped_links: std::mem::take(&mut self.skipped_links),
         })
+    }
+}
+
+fn drop_staged(pending: &PendingOutput) {
+    if let Some(staged) = &pending.staged {
+        let _ = fs::remove_file(staged);
     }
 }
 
@@ -777,3 +915,7 @@ fn like_create_dir_all(error: crate::Error, directory: &Path) -> crate::Error {
     let _ = directory;
     error
 }
+
+#[cfg(test)]
+#[path = "output_dir_tests.rs"]
+mod tests;
