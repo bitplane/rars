@@ -2007,7 +2007,9 @@ fn seeds_from_shared(run: &Range<usize>, options: EncodeOptions) -> bool {
 /// one hash go in on one thread, and a hash that a large part of the window
 /// has makes that order slow however many threads there are. So a chain is
 /// cut where it would span more than a dictionary, when the extra positions
-/// the runs then put in for themselves cost less than the wait.
+/// the runs then put in for themselves cost less than the wait. Those
+/// positions go in on the threads that code the runs, so they are weighed
+/// with the coding, not against idle threads.
 pub(crate) fn seed_chains(
     window: &[u8],
     runs: &[Range<usize>],
@@ -2055,12 +2057,20 @@ pub(crate) fn seed_chains(
         history(first.start).start..history(last.end - 1).end,
         threads,
     );
+    // Parsing a byte at levels 4 and 5 costs two and a half to five times
+    // what putting it in a tree does, on machine code, text and compressed
+    // data. Taking less keeps chains cut wherever the wait could dominate.
+    const CODING_PER_SEEDED_BYTE: f64 = 2.0;
+    let coding = runs.iter().map(|run| run.len()).sum::<usize>() as f64 * CODING_PER_SEEDED_BYTE;
+    let work = |chains: &[Range<usize>]| chains.iter().map(span).sum::<usize>();
     let time = |chains: &[Range<usize>]| {
         let longest = chains.iter().map(span).max().unwrap_or(0) as f64;
-        let work = chains.iter().map(span).sum::<usize>() as f64;
-        (longest * skew).max(work / threads as f64)
+        (longest * skew).max((work(chains) as f64 + coding) / threads as f64)
     };
-    if time(&apart) <= time(&together) {
+    // Where the times tie, the plan that puts fewer positions in wins, and
+    // where those tie too, the chains seeded side by side.
+    let cost = |chains: &[Range<usize>]| (time(chains), work(chains));
+    if cost(&apart) <= cost(&together) {
         apart
     } else {
         together
@@ -2388,6 +2398,48 @@ fn a_seeded_tree_collects_what_a_tree_that_parsed_the_history_does() {
         found += actual.runs.len();
     }
     assert!(found > 0);
+}
+
+/// Runs whose histories overlap share one seed tree when the hash of a run
+/// of zeroes holds a fifth of the window, as in machine code, since the
+/// positions they would put in again cost more than waiting on that hash.
+/// Where it holds most of the window they are seeded apart.
+#[test]
+#[cfg(feature = "parallel")]
+fn runs_share_a_seed_tree_unless_one_hash_holds_most_of_the_window() {
+    const KIB: usize = 1024;
+    let window = |zeroes: usize| {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut window: Vec<u8> = (0..3 * 1024 * KIB)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 64) as u8 + 1
+            })
+            .collect();
+        for chunk in window.as_chunks_mut::<40>().0 {
+            chunk[..zeroes].fill(0);
+        }
+        window
+    };
+    let options = EncodeOptions {
+        max_match_distance: 1024 * KIB,
+        max_match_candidates: 16,
+        optimal_parse: true,
+        ..EncodeOptions::default()
+    }
+    .with_nice_match_length(64);
+    let runs: Vec<Range<usize>> = (4..12)
+        .map(|run| run * 256 * KIB..(run + 1) * 256 * KIB)
+        .collect();
+    crate::parallel::private_pool(16).install(|| {
+        let together = seed_chains(&window(11), &runs, options);
+        assert_eq!(together.len(), 1);
+        assert_eq!(together[0], 0..runs.len());
+        let apart = seed_chains(&window(28), &runs, options);
+        assert_eq!(apart.len(), runs.len());
+    });
 }
 
 /// Runs of one window seeded from a shared tree code the bytes each codes
