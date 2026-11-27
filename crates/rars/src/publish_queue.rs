@@ -67,6 +67,17 @@ impl<P: PublishStep> Shared<P> {
         progress.outstanding -= 1;
         self.idle.notify_all();
     }
+
+    fn wait(&self) -> MutexGuard<'_, Progress<P::Job>> {
+        let mut progress = lock(&self.progress);
+        while progress.outstanding > progress.held.len() && !progress.paused {
+            progress = self
+                .idle
+                .wait(progress)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        progress
+    }
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -179,17 +190,20 @@ impl<P: PublishStep> PublishQueue<P> {
 
     /// Waits until every job submitted so far is published, or the first failure held the rest.
     pub fn wait(&self) {
-        let mut progress = lock(&self.shared.progress);
-        while progress.outstanding > progress.held.len() && !progress.paused {
-            progress = self
-                .shared
-                .idle
-                .wait(progress)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
+        let mut progress = self.shared.wait();
         if let Some(payload) = progress.panicked.take() {
             drop(progress);
             std::panic::resume_unwind(payload);
+        }
+    }
+
+    /// [`Self::wait`] for another thread; a panic is left for the queue to report.
+    pub fn waiter(&self) -> impl Fn() + Send + Sync + 'static {
+        let shared = std::sync::Arc::downgrade(&self.shared);
+        move || {
+            if let Some(shared) = shared.upgrade() {
+                drop(shared.wait());
+            }
         }
     }
 
@@ -200,7 +214,7 @@ impl<P: PublishStep> PublishQueue<P> {
         // Joins the thread, which holds the other reference.
         drop(worker);
         let Ok(shared) = std::sync::Arc::try_unwrap(shared) else {
-            unreachable!("the thread has been joined");
+            unreachable!("the thread has been joined, and a waiter waits only during the run");
         };
         let failures = lock(&shared.progress).failures.drain(..).collect();
         (
@@ -377,6 +391,24 @@ mod tests {
             queue.submit(0);
             queue.submit(1);
             queue.wait();
+            assert_eq!(queue.state().published, vec![0, 1]);
+        });
+    }
+
+    #[test]
+    fn another_thread_can_wait_for_what_is_queued() {
+        capped(4, || {
+            let mut queue = queue(
+                Log {
+                    delay_first: true,
+                    ..Log::default()
+                },
+                4,
+            );
+            queue.submit(0);
+            queue.submit(1);
+            let waiter = queue.waiter();
+            std::thread::scope(|scope| scope.spawn(waiter).join().unwrap());
             assert_eq!(queue.state().published, vec![0, 1]);
         });
     }

@@ -2517,7 +2517,6 @@ impl RarFile {
             self.begin_set(py, volumes, options, progress, &chosen);
         }
         self.extract_prepared_set(py, volumes, prepared, options, |volumes| {
-            let mut volumes = tracked(progress.map(Arc::as_ref), volumes, &chosen);
             let outputs = std::cell::RefCell::new(ExtractOutputs::new(
                 out_dir,
                 first.family(),
@@ -2526,6 +2525,13 @@ impl RarFile {
                 progress.cloned(),
                 failed,
             ));
+            // A `volumes` iterator can look at the output directory: it finds every earlier member there.
+            let published = outputs.borrow().outputs.publish_waiter();
+            let mut tracked = tracked(progress.map(Arc::as_ref), volumes, &chosen);
+            let mut volumes = std::iter::from_fn(|| {
+                published();
+                tracked.next()
+            });
             let open = |meta: &rars_rs::ExtractedEntryMeta| outputs.borrow_mut().open(meta);
             let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
                 outputs.borrow_mut().link(meta, link)
@@ -2533,7 +2539,7 @@ impl RarFile {
             let result = match selected {
                 Some(selected) => extract_arriving_selected(
                     first,
-                    &mut *volumes,
+                    &mut volumes,
                     options,
                     selected,
                     self.selection_end(selected),
@@ -2543,7 +2549,11 @@ impl RarFile {
                 None => match self.salvaged_run() {
                     Some(run) => rars_rs::extract_volumes_with_links(&run, options, open, link),
                     None => rars_rs::output_links::extract_arriving_with_links(
-                        first, volumes, options, open, link,
+                        first,
+                        &mut volumes,
+                        options,
+                        open,
+                        link,
                     ),
                 },
             };
