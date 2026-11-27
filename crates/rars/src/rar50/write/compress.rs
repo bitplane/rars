@@ -175,55 +175,6 @@ fn complete_jobs_dispatched<T: Send, O: Send>(
     Ok(output)
 }
 
-/// Admit fixed worker scopes only after coordinator slots have capacity. Keep
-/// every reservation until all callbacks join, then retire unused capacity;
-/// output owners remain charged after return. No worker can extend its scope.
-fn run_jobs_admitted<T: Send, O: Send>(
-    jobs: Records<T>,
-    resources: &WriterResources,
-    progress: &dyn CompressionProgress,
-    required: impl Fn(&T) -> u64,
-    map: impl Fn(
-            T,
-            &WriterResources,
-            &dyn CompressionProgress,
-            &crate::codec::workspace::Limited,
-        ) -> Result<O>
-        + Sync
-        + Send,
-) -> Result<Records<O>> {
-    let ledger = resources
-        .execution
-        .as_ref()
-        .expect("admitted execution ledger");
-    let output = Records::new(jobs.len(), resources)?;
-    let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
-    let mut reservations = Records::new(slots.len(), resources)?;
-    for (job, _) in slots.iter() {
-        if progress.is_cancelled() || resources.is_cancelled() {
-            return Err(Error::Cancelled);
-        }
-        reservations.push(ledger.reserve(required(job.as_ref().unwrap()))?)?;
-    }
-    let result = complete_jobs(
-        slots,
-        output,
-        resources,
-        progress,
-        |index, job, progress| {
-            let allowance = reservations[index].allowance();
-            let worker = resources
-                .clone()
-                .with_execution_allowance(allowance.clone());
-            map(job, &worker, progress, &allowance)
-        },
-    );
-    for reservation in reservations {
-        reservation.retire();
-    }
-    result
-}
-
 /// A member's size, CRC32 and, when the archive asks for one, BLAKE2sp hash.
 pub(super) type Integrity = (u64, u32, Option<[u8; 32]>);
 
@@ -1180,10 +1131,7 @@ fn probe_members(
                     if cancelled() {
                         return Err(Error::Cancelled);
                     }
-                    match &resources.execution {
-                        Some(allowance) => probe_packed_len(sample, plan, &cancelled, allowance),
-                        None => probe_packed_len(sample, plan, &cancelled, &Allowance::default()),
-                    }
+                    probe_packed_len(sample, plan, &cancelled, &resources.allowance())
                 })
             };
             probe().map_err(|error| error_context(index, error))
@@ -1492,77 +1440,43 @@ fn compress_streaming_members(
             plan,
             integrity.iter().map(|&(size, ..)| size).max().unwrap_or(0),
             admission,
-            resources
-                .execution
-                .as_ref()
-                .map_or(resources.memory_limit(), |ledger| {
-                    resources.memory_limit().min(ledger.available())
-                }),
+            resources.memory_limit(),
             batch_capacity,
         )
     };
 
     // One dictionary runs through solid members, so none can be stored
     // instead once its packed bytes have gone out.
-    match (&resources.execution, plan.solid) {
-        (Some(allowance), true) => compress_solid_chain(
+    let allowance = resources.allowance();
+    if plan.solid {
+        compress_solid_chain(
             sources,
             integrity,
             plan,
             run_filters,
             batch_capacity,
-            required,
             resources,
             advance,
             error_context,
-            allowance,
+            &allowance,
             straight,
             consume,
-        ),
-        (Some(allowance), false) => compress_independent_members(
-            sources,
-            integrity,
-            plan,
-            run_filters,
-            runs_per_job,
-            batch_capacity,
-            required,
-            resources,
-            advance,
-            error_context,
-            allowance,
-            straight,
-            consume,
-        ),
-        (None, true) => compress_solid_chain(
-            sources,
-            integrity,
-            plan,
-            run_filters,
-            batch_capacity,
-            required,
-            resources,
-            advance,
-            error_context,
-            &Allowance::default(),
-            straight,
-            consume,
-        ),
-        (None, false) => compress_independent_members(
+        )
+    } else {
+        compress_independent_members(
             sources,
             integrity,
             plan,
             run_filters,
             runs_per_job,
             batch_capacity,
-            required,
             resources,
             advance,
             error_context,
-            &Allowance::default(),
+            &allowance,
             straight,
             consume,
-        ),
+        )
     }
 }
 
@@ -1585,8 +1499,7 @@ fn filter_search_workspace(options: EncodeOptions, len: u64) -> u64 {
 struct WaveWorkspace {
     assembly: u64,
     filter_inputs: u64,
-    /// One filter search's scratch for each job, which searches its pieces
-    /// one at a time under an execution ledger.
+    /// The largest one filter search's scratch, the least the searches hold.
     filter_search: u64,
     /// Each piece's search, priced by its own length, for the searches of
     /// every piece in the wave side by side ([`choose_run_filters`]). A job's
@@ -1683,17 +1596,15 @@ impl WaveWorkspace {
     /// shared out, before any of them codes. `piece_threads` is how many
     /// filter searches run at once when the wave's pieces are searched side by
     /// side, or `None` when each job searches its own in turn.
-    fn peak(&self, retained: u64, seed: u64, piece_threads: Option<u64>) -> u64 {
-        let search = piece_threads.map_or(self.filter_search, |threads| {
-            // The largest searches, one per thread.
-            let mut searches = self.piece_searches.clone();
-            searches.sort_unstable_by(|a, b| b.cmp(a));
-            searches
-                .iter()
-                .take(usize::try_from(threads).unwrap_or(usize::MAX))
-                .fold(0u64, |sum, &search| sum.saturating_add(search))
-                .max(self.filter_search)
-        });
+    fn peak(&self, retained: u64, seed: u64, piece_threads: u64) -> u64 {
+        // The largest searches, one per thread.
+        let mut searches = self.piece_searches.clone();
+        searches.sort_unstable_by(|a, b| b.cmp(a));
+        let search = searches
+            .iter()
+            .take(usize::try_from(piece_threads).unwrap_or(usize::MAX))
+            .fold(0u64, |sum, &search| sum.saturating_add(search))
+            .max(self.filter_search);
         let filters = self.filter_inputs.saturating_add(search);
         self.assembly
             .max(filters)
@@ -1706,13 +1617,6 @@ impl WaveWorkspace {
 struct BlockWave {
     workspace: WaveWorkspace,
     permit: Option<crate::streaming::MemoryPermit>,
-    // The hard ledger also holds the scopes' control blocks and any existing
-    // coordinator allocations, such as retained histories and spool storage.
-    scopes: u64,
-    /// What the ledger had free when the wave's first job was admitted, and
-    /// what the wave's jobs take from it outside their scopes.
-    room: u64,
-    incoming: u64,
     /// The member of the last job that seeds a tree from history, and how
     /// many of its jobs in a row do.
     seeding: Option<(usize, usize)>,
@@ -1731,7 +1635,6 @@ impl BlockWave {
         min_len: u64,
         history: u64,
         retained: u64,
-        required: u64,
         resources: &WriterResources,
         advance: &dyn CompressionProgress,
         seeding: Option<usize>,
@@ -1762,29 +1665,11 @@ impl BlockWave {
             history,
             crate::codec::rar50::MAX_LZ_BLOCK_SIZE,
             (0..filter_pieces).map(|_| len.min(filter_search_bytes() as u64)),
-            single_pass_tree_chunk(plan, filter_runs, min_len, history)
-                .filter(|_| resources.execution.is_none()),
+            single_pass_tree_chunk(plan, filter_runs, min_len, history),
         );
-        let piece_threads = resources
-            .execution
-            .is_none()
-            .then(|| crate::parallel::threads() as u64);
-        let charge = workspace.peak(retained, seed, piece_threads);
-        let scopes = self.scopes.saturating_add(required);
-        // Outside its scope a job holds its input, which may have grown to
-        // twice its length, a copy of its history, which a filtered run is
-        // only handed after every job is admitted, and the window its worker
-        // grows that history into. Each job's share is summed against the
-        // room the wave started with, since the ledger does not yet show the
-        // copies and windows of the jobs before it.
-        let incoming = self.incoming.saturating_add(
-            len.saturating_mul(4)
-                .saturating_add(history.saturating_mul(3)),
-        );
+        let charge = workspace.peak(retained, seed, crate::parallel::threads() as u64);
         if let Some(permit) = &mut self.permit {
-            if (resources.execution.is_some() && scopes.saturating_add(incoming) > self.room)
-                || !permit.try_grow_to(charge)
-            {
+            if !permit.try_grow_to(charge) {
                 return Ok(false);
             }
         } else {
@@ -1793,13 +1678,7 @@ impl BlockWave {
                 plan.dictionary_size,
                 &|| advance.is_cancelled(),
             )?);
-            self.room = resources
-                .execution
-                .as_ref()
-                .map_or(0, |ledger| ledger.available());
         }
-        self.scopes = scopes;
-        self.incoming = incoming;
         self.seeding = seeding;
         self.shared_seed = shared_seed;
         Ok(true)
@@ -1807,8 +1686,7 @@ impl BlockWave {
 
     /// Grows the charge for the tail of the job just recorded, `len` bytes
     /// behind `history`, to be coded as a job of its own ([`split_tail`]):
-    /// its coding beside the job's, which stays charged for the whole. Only a
-    /// wave without an execution ledger cuts tails off.
+    /// its coding beside the job's, which stays charged for the whole.
     fn admit_tail(
         &mut self,
         plan: &CompressPlan,
@@ -1843,7 +1721,7 @@ impl BlockWave {
             coding: self.workspace.coding.saturating_add(tail.coding),
             ..self.workspace.clone()
         };
-        let charge = workspace.peak(retained, seed, Some(crate::parallel::threads() as u64));
+        let charge = workspace.peak(retained, seed, crate::parallel::threads() as u64);
         if !permit.try_grow_to(charge) {
             return false;
         }
@@ -1877,8 +1755,7 @@ impl BlockWave {
             filter_pieces(job)
                 .filter(|_| searched)
                 .map(|(piece, _)| piece.len() as u64),
-            single_pass_tree_chunk(plan, filter_runs, job.data.len() as u64, history)
-                .filter(|_| !job.data.is_limited()),
+            single_pass_tree_chunk(plan, filter_runs, job.data.len() as u64, history),
         );
     }
 }
@@ -2008,64 +1885,25 @@ fn compress_members_whole(
             crate::parallel::threads(),
             resources.memory_limit(),
         );
-        let (end, reserved) = if let Some(ledger) = &resources.execution {
-            let slot_bytes = std::mem::size_of::<usize>()
-                + std::mem::size_of::<CompressedMember>()
-                + std::mem::size_of::<JobSlot<usize, CompressedMember>>()
-                + std::mem::size_of::<crate::codec::workspace::Reservation>();
-            whole_member_wave_with_slots(
-                members,
-                start,
-                crate::parallel::threads(),
-                resources.memory_limit(),
-                slot_bytes as u64,
-                ledger.available(),
-            )
-        } else {
-            (end, reserved)
-        };
         // Acquire the entire wave on the coordinator. No dispatched worker
         // waits for workspace held by another worker in the same pool.
         let permit = resources
             .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())
             .map_err(|error| error_context(start, error))?;
         let jobs = Records::collect((start..end).map(Ok), resources)?;
-        let unlimited = |jobs| {
-            run_jobs(jobs, resources, advance, |index, progress| {
-                compress_whole_member(
-                    index,
-                    &sources[index],
-                    integrity[index],
-                    plan,
-                    resources,
-                    progress,
-                    &Allowance::default(),
-                )
-                .map_err(|error| error_context(index, error))
-            })
-        };
-        let completed = if resources.execution.is_some() {
-            run_jobs_admitted(
-                jobs,
+        let allowance = resources.allowance();
+        let completed = run_jobs(jobs, resources, advance, |index, progress| {
+            compress_whole_member(
+                index,
+                &sources[index],
+                integrity[index],
+                plan,
                 resources,
-                advance,
-                |index| members[*index].workspace,
-                |index, worker, progress, allowance| {
-                    compress_whole_member(
-                        index,
-                        &sources[index],
-                        integrity[index],
-                        plan,
-                        worker,
-                        progress,
-                        allowance,
-                    )
-                    .map_err(|error| error_context(index, error))
-                },
-            )?
-        } else {
-            unlimited(jobs)?
-        };
+                progress,
+                &allowance,
+            )
+            .map_err(|error| error_context(index, error))
+        })?;
         // The writer may need workspace of its own for what it is handed.
         drop(permit);
         for (index, member) in (start..end).zip(completed) {
@@ -2179,19 +2017,8 @@ fn runs_kind(member: &MemberPlan) -> Option<bool> {
 fn whole_member_wave(
     members: &[MemberPlan],
     start: usize,
-    threads: usize,
-    limit: u64,
-) -> (usize, u64) {
-    whole_member_wave_with_slots(members, start, threads, limit, 0, u64::MAX)
-}
-
-fn whole_member_wave_with_slots(
-    members: &[MemberPlan],
-    start: usize,
     max_jobs: usize,
     limit: u64,
-    slot_bytes: u64,
-    capacity: u64,
 ) -> (usize, u64) {
     let mut reserved = members[start].workspace;
     let mut end = start + 1;
@@ -2202,9 +2029,7 @@ fn whole_member_wave_with_slots(
         let Some(total) = reserved.checked_add(members[end].workspace) else {
             break;
         };
-        if total > limit
-            || total.saturating_add(slot_bytes.saturating_mul((end - start + 1) as u64)) > capacity
-        {
+        if total > limit {
             break;
         }
         reserved = total;
@@ -2407,7 +2232,6 @@ fn compress_independent_members(
     filter_runs: bool,
     runs_per_job: usize,
     batch_capacity: usize,
-    required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
@@ -2487,12 +2311,10 @@ fn compress_independent_members(
                     stream.unread().min(member_run_size(plan) as u64),
                     history,
                     plan.encode_options.max_match_distance as u64,
-                    required,
                     resources,
                     advance,
-                    // Only a run with history seeds a tree, and only a wave
-                    // whose windows are shared seeds them together.
-                    (history > 0 && resources.execution.is_none()).then_some(member),
+                    // Only a run with history seeds a tree.
+                    (history > 0).then_some(member),
                 )? {
                     break;
                 }
@@ -2549,8 +2371,7 @@ fn compress_independent_members(
                 // on a tree seeded from its own history rather than after the
                 // run it joined ([`split_tail`]).
                 let tail = tail.filter(|&at| {
-                    resources.execution.is_none()
-                        && crate::parallel::threads() > 1
+                    crate::parallel::threads() > 1
                         && jobs.len() + tails + 2 <= batch_capacity
                         && job.data.len() - at >= member_run_size(plan) / 4
                 });
@@ -2589,7 +2410,7 @@ fn compress_independent_members(
                         explicit_run_filter(job, spec)?;
                     }
                 } else {
-                    choose_run_filters(&mut jobs, plan, required, resources, advance)?;
+                    choose_run_filters(&mut jobs, plan, resources, advance)?;
                 }
             }
             if tails > 0 {
@@ -2614,16 +2435,11 @@ fn compress_independent_members(
                 }
             }
 
-            let seeding = if resources.execution.is_none() {
-                share_member_windows(&mut jobs, plan, false, allowance)?
-            } else {
-                Vec::new()
-            };
+            let seeding = share_member_windows(&mut jobs, plan, false, allowance)?;
             compress_wave(
                 jobs,
                 seeding,
                 plan,
-                required,
                 &mut streams,
                 resources,
                 advance,
@@ -2647,7 +2463,6 @@ fn compress_solid_chain(
     plan: &CompressPlan,
     filter_runs: bool,
     batch_capacity: usize,
-    required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
@@ -2708,7 +2523,6 @@ fn compress_solid_chain(
                 0,
                 placed.min(dictionary),
                 dictionary,
-                required,
                 resources,
                 advance,
                 None,
@@ -2776,7 +2590,7 @@ fn compress_solid_chain(
 
         if filter_runs && !jobs.is_empty() {
             // A solid run can hold many members, each searched on its own.
-            choose_run_filters(&mut jobs, plan, required, resources, advance)?;
+            choose_run_filters(&mut jobs, plan, resources, advance)?;
             for job in jobs.iter_mut() {
                 job.history = Buffer::copied(&history, allowance)?;
                 if !job.filters.is_empty() {
@@ -2800,14 +2614,11 @@ fn compress_solid_chain(
         }
 
         if !jobs.is_empty() {
-            if resources.execution.is_none() {
-                share_member_windows(&mut jobs, plan, true, allowance)?;
-            }
+            share_member_windows(&mut jobs, plan, true, allowance)?;
             compress_wave(
                 jobs,
                 Vec::new(),
                 plan,
-                required,
                 &mut streams,
                 resources,
                 advance,
@@ -3087,41 +2898,15 @@ fn explicit_run_range(
     (start < end).then(|| start - run.start..end - run.start)
 }
 
-/// Each admitted job searches its own pieces in order, so at most one search
-/// holds scratch for that job at a time. Without an execution ledger every
-/// piece of the wave is searched side by side instead, as many at once as
-/// there are threads ([`WaveWorkspace::peak`]).
+/// Every piece of the wave is searched side by side, as many at once as there
+/// are threads ([`WaveWorkspace::peak`]).
 fn choose_run_filters(
     jobs: &mut [BlockJob],
     plan: &CompressPlan,
-    required: u64,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
 ) -> Result<()> {
-    if resources.execution.is_some() {
-        let searches = Records::collect(jobs.iter().map(Ok), resources)?;
-        let found = run_jobs_admitted(
-            searches,
-            resources,
-            advance,
-            |_| required,
-            |job, worker, progress, allowance| {
-                let mut filters = Records::new(0, worker)?;
-                for (range, offset) in filter_pieces(job) {
-                    let found =
-                        search_filter_piece(job, range, offset, plan, progress, worker, allowance)?;
-                    for spec in found {
-                        filters.push_growing(spec)?;
-                    }
-                }
-                Ok(filters)
-            },
-        )?;
-        for (job, filters) in jobs.iter_mut().zip(found) {
-            job.filters = filters;
-        }
-        return Ok(());
-    }
+    let allowance = resources.allowance();
     let mut pieces = Records::new(0, resources)?;
     for (index, job) in jobs.iter().enumerate() {
         for (range, offset) in filter_pieces(job) {
@@ -3141,7 +2926,7 @@ fn choose_run_filters(
                 plan,
                 progress,
                 resources,
-                &Allowance::default(),
+                &allowance,
             )
         },
     )?;
@@ -3217,24 +3002,12 @@ fn compress_wave(
     jobs: Records<BlockJob>,
     seeding: Vec<TreeRuns>,
     plan: &CompressPlan,
-    _required: u64,
     streams: &mut [MemberStream],
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()> {
-    if resources.execution.is_some() {
-        let jobs = prepare_block_jobs(jobs, resources)?;
-        let packed_runs = run_jobs_admitted(
-            jobs,
-            resources,
-            advance,
-            |_| _required,
-            |job, _, progress, allowance| encode_block_job(job, plan, progress, allowance),
-        )?;
-        return append_packed_runs(packed_runs, plan, streams, advance, error_context, consume);
-    }
     let jobs = prepare_block_jobs(jobs, resources)?;
     let output = Records::new(jobs.len(), resources)?;
     let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
@@ -3739,7 +3512,6 @@ mod tests {
         plan: &CompressPlan,
         filter_runs: bool,
         batch_capacity: usize,
-        required: u64,
         resources: &WriterResources,
         advance: &dyn CompressionProgress,
         error_context: &(dyn Fn(usize, Error) -> Error + Sync),
@@ -3753,7 +3525,6 @@ mod tests {
             filter_runs,
             1,
             batch_capacity,
-            required,
             resources,
             advance,
             error_context,
@@ -3770,7 +3541,6 @@ mod tests {
         plan: &CompressPlan,
         filter_runs: bool,
         batch_capacity: usize,
-        required: u64,
         resources: &WriterResources,
         advance: &dyn CompressionProgress,
         error_context: &(dyn Fn(usize, Error) -> Error + Sync),
@@ -3783,7 +3553,6 @@ mod tests {
             plan,
             filter_runs,
             batch_capacity,
-            required,
             resources,
             advance,
             error_context,
@@ -4221,43 +3990,6 @@ mod tests {
             Error::Cancelled
         );
 
-        let ledger = crate::codec::workspace::Allowance::limited(1024 * 1024);
-        let admitted = resources.with_execution_allowance(ledger.clone());
-        let jobs = Records::collect([1u8].into_iter().map(Ok), &admitted).unwrap();
-        assert_eq!(
-            run_jobs_admitted(
-                jobs,
-                &admitted,
-                &Cancelled,
-                |_| 1,
-                |_, _, _, _| -> Result<u8> { panic!("cancelled job was admitted") },
-            )
-            .err()
-            .unwrap(),
-            Error::Cancelled
-        );
-        assert_eq!(ledger.used(), 0);
-
-        let cancellation = crate::WriteCancellation::new();
-        let admitted = WriterResources::default()
-            .with_cancellation(cancellation.clone())
-            .with_execution_allowance(ledger.clone());
-        let jobs = Records::collect([1u8].into_iter().map(Ok), &admitted).unwrap();
-        cancellation.cancel();
-        assert_eq!(
-            run_jobs_admitted(
-                jobs,
-                &admitted,
-                &|_| true,
-                |_| 1,
-                |_, _, _, _| -> Result<u8> { panic!("cancelled resource dispatched a job") },
-            )
-            .err()
-            .unwrap(),
-            Error::Cancelled
-        );
-        assert_eq!(ledger.used(), 0);
-
         let source = EntrySource::from_opener(0, || panic!("empty source was opened"));
         assert_eq!(
             MemberStream::new(
@@ -4530,7 +4262,6 @@ mod tests {
                     &plan,
                     false,
                     2,
-                    1,
                     &resources,
                     &|_| true,
                     &|_, error| error,
@@ -4563,7 +4294,6 @@ mod tests {
                         &plan,
                         false,
                         2,
-                        1,
                         &resources,
                         &|_| {
                             assert!(allowance.used() > 0);
@@ -4601,7 +4331,6 @@ mod tests {
                     &plan,
                     false,
                     2,
-                    1,
                     &resources,
                     &|_| false,
                     &|_, error| error,
@@ -4649,7 +4378,6 @@ mod tests {
                     &plan,
                     false,
                     1,
-                    1,
                     &resources,
                     &|_| true,
                     &|_, error| error,
@@ -4667,7 +4395,6 @@ mod tests {
                     &plan,
                     false,
                     2,
-                    1,
                     &resources,
                     &|_| true,
                     &|_, error| error,
@@ -4775,7 +4502,7 @@ mod tests {
                         )
                     })
                     .unwrap();
-                assert!(peak.load(Ordering::Relaxed) >= required * workers);
+                assert!(peak.load(Ordering::Relaxed) > 0);
                 // Native spools retain their path storage alongside result descriptors.
                 assert!(
                     ledger.used()
@@ -4942,68 +4669,7 @@ mod tests {
         not(all(target_arch = "wasm32", target_os = "unknown"))
     ))]
     #[test]
-    fn admitted_workers_share_one_ledger_without_racing_for_spare_capacity() {
-        use crate::atomic64::AtomicU64;
-        use crate::streaming::preparation::Bytes;
-        use std::sync::Barrier;
-        let ledger = Allowance::limited(65536);
-        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(2)
-            .build()
-            .unwrap();
-        for fail in [false, true] {
-            let barrier = Barrier::new(2);
-            let admitted = AtomicU64::new(0);
-            let jobs = Records::collect((0..2).map(Ok), &resources).unwrap();
-            let result = pool.install(|| {
-                run_jobs_admitted(
-                    jobs,
-                    &resources,
-                    &|_| true,
-                    |_| 128,
-                    |index, worker, _, allowance| {
-                        if index == 0 {
-                            admitted.store(ledger.used(), Ordering::Relaxed);
-                        }
-                        barrier.wait();
-                        let prepared = Bytes::zeroed(32, worker)?;
-                        let bytes = Buffer::filled(64, index as u8, allowance)?;
-                        assert_eq!(ledger.used(), admitted.load(Ordering::Relaxed));
-                        barrier.wait();
-                        if fail && index == 0 {
-                            Buffer::filled(33, 0u8, allowance)?;
-                        }
-                        Ok((prepared, bytes))
-                    },
-                )
-            });
-            if fail {
-                assert_eq!(
-                    result.err().unwrap().kind(),
-                    crate::ErrorKind::ResourceLimit
-                );
-                assert_eq!(ledger.used(), 0);
-            } else {
-                let mut output = result.unwrap();
-                let first = output.pop().unwrap();
-                let second = output.pop().unwrap();
-                drop(output);
-                assert_eq!(ledger.used(), 192);
-                drop(first);
-                assert_eq!(ledger.used(), 96);
-                drop(second);
-                assert_eq!(ledger.used(), 0);
-            }
-        }
-    }
-
-    #[cfg(all(
-        feature = "parallel",
-        not(all(target_arch = "wasm32", target_os = "unknown"))
-    ))]
-    #[test]
-    fn whole_member_ledger_selects_fitting_waves_before_opening_sources() {
+    fn whole_member_waves_fit_under_the_ceiling_and_write_alike() {
         use std::sync::{atomic::AtomicUsize, Arc, Barrier};
         let scratch = crate::scratch::case("whole-member-ledger");
         let options = EncodeOptions::new(8)
@@ -5052,7 +4718,7 @@ mod tests {
                     let opens = opens.clone();
                     let barrier = barrier.clone();
                     EntrySource::from_opener(data.len() as u64, move || {
-                        assert!(ledger.used() >= required * workers);
+                        assert!(ledger.used() <= ledger.limit());
                         opens.fetch_add(1, Ordering::Relaxed);
                         barrier.wait();
                         Ok(Box::new(std::io::Cursor::new(data.clone())))
@@ -6418,7 +6084,6 @@ mod tests {
                                 filter_runs,
                                 1,
                                 threads,
-                                1,
                                 &resources,
                                 &|_| true,
                                 &|_, error| error,
@@ -6486,7 +6151,6 @@ mod tests {
                             filter_runs,
                             runs_per_job,
                             batch_capacity,
-                            1,
                             &resources,
                             &|_| true,
                             &|_, error| error,

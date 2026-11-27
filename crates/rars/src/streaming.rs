@@ -385,24 +385,44 @@ impl WriterResources {
     /// also plans smaller jobs.
     /// Configure before execution; clones share the new budget.
     pub fn with_memory_limit(mut self, limit: u64) -> Self {
-        self.memory_limit = limit;
         self.planning_limit = self.planning_limit.min(limit);
         self.routing_limit = self.routing_limit.min(limit);
-        self.budget = Arc::new(MemoryBudget::new(limit));
+        self.set_workspace_budget(limit);
         self
+    }
+
+    /// Budgets the jobs run at once within `limit`, and within the hard
+    /// ceiling when there is one, so that jobs admitted side by side by their
+    /// estimates fit under it together. Planning is left as it was, so the
+    /// archive written does not change.
+    fn set_workspace_budget(&mut self, limit: u64) {
+        self.memory_limit = self
+            .execution
+            .as_ref()
+            .map_or(limit, |ceiling| limit.min(ceiling.limit()));
+        self.budget = Arc::new(MemoryBudget::new(self.memory_limit));
     }
 
     /// Set a hard ceiling on managed writer allocation capacity for RAR5/7.
     /// Includes active work, retained spools/headers, conversion and owned output.
     /// Caller-owned inputs and external sinks, allocator/runtime overhead, stacks
     /// and OS memory are excluded. This is not a process-RAM limit.
-    /// Legacy writers refuse this policy. The estimated workspace policy remains
-    /// independent. Spools start in temporary files under this ceiling rather
+    /// Legacy writers refuse this policy. Jobs run side by side only while their
+    /// estimated workspace fits under this as well as the workspace budget, so
+    /// [`Self::memory_limit`] reports the lower of the two; the archive written
+    /// does not change. Spools start in temporary files under this ceiling rather
     /// than borrowing workspace memory. Configure before execution; clones share
     /// the new ledger.
     pub fn with_max_memory_bytes(mut self, limit: u64) -> Self {
         self.execution = Some(crate::codec::workspace::Allowance::limited(limit));
+        self.set_workspace_budget(self.memory_limit);
         self
+    }
+
+    /// What every writer allocation is charged to: the hard ceiling when one
+    /// is set, otherwise a budget that only counts.
+    pub(crate) fn allowance(&self) -> crate::codec::workspace::Allowance {
+        self.execution.clone().unwrap_or_default()
     }
 
     pub fn max_memory_bytes(&self) -> Option<u64> {
@@ -568,7 +588,8 @@ impl WriterResources {
         CapacityCharge::new(self, &self.spool_memory_budget)
     }
 
-    // A coordinator supplies a child scope to its admitted workers.
+    /// Charges this writer's allocations to `allowance`.
+    #[cfg(test)]
     pub(crate) fn with_execution_allowance(
         mut self,
         allowance: crate::codec::workspace::Limited,

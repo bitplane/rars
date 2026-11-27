@@ -288,8 +288,9 @@ fn codec_refusal_and_spool_refusal_preserve_destination_and_release_capacity() {
                 None,
             )
             .unwrap();
-        // 1 MiB admits descriptors/headers but cannot admit the codec's worker.
-        // A zero-byte spool limit instead refuses packed output after encoding.
+        // 1 MiB is below the codec's estimated workspace, so the job is refused
+        // before it starts. A zero-byte spool limit instead refuses packed
+        // output after encoding.
         for (limit, spool_limit) in [(MIB, None), (SMALL_LIMIT, Some(0))] {
             let mut resources = resources(&root, limit);
             if let Some(spool_limit) = spool_limit {
@@ -312,10 +313,7 @@ fn codec_refusal_and_spool_refusal_preserve_destination_and_release_capacity() {
                     );
                 } else {
                     assert!(
-                        matches!(
-                            error.root_cause(),
-                            rars::Error::Codec(rars::codec::Error::WorkspaceLimitExceeded(_))
-                        ),
+                        matches!(error.root_cause(), rars::Error::MemoryLimitExceeded { .. }),
                         "{error}"
                     );
                 }
