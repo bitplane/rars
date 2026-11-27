@@ -735,7 +735,10 @@ impl<B: Budget> TreeMatchFinder<B> {
     }
 
     /// Inserts the positions of `range` that have four bytes left, as
-    /// [`Self::seeded`] does, split between `shares` threads by hash.
+    /// [`Self::seeded`] does, split between `shares` threads by hash. Noise
+    /// is left out ([`super::noise::NoiseScan::skips`]), judged in cells
+    /// counted from the end of `range`, where the run it is history for
+    /// starts.
     ///
     /// Each hash's positions still go in in order, so the links come out the
     /// same on any number of threads, provided no position of `range` shares
@@ -755,9 +758,14 @@ impl<B: Budget> TreeMatchFinder<B> {
             .end
             .min(input.len().saturating_sub(Self::MIN_MATCH - 1));
         let insert = |share: usize| {
+            // The tree collector leaves the same positions out, in cells
+            // counted from the run the history is for.
+            let mut noise = super::noise::NoiseScan::with_cells(range.end);
             for pos in range.start..end {
                 let hash = self.hash(input, pos);
-                if shares == 1 || (hash * shares) >> Self::HASH_BITS == share {
+                if (shares == 1 || (hash * shares) >> Self::HASH_BITS == share)
+                    && !noise.skips(input, pos)
+                {
                     let inserted =
                         self.descend::<true>(input, pos, hash, len_limit(pos), 0, cut, None);
                     debug_assert!(

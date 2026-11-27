@@ -767,6 +767,7 @@ impl<B: Budget> PackedMatchFinder<B> {
         runs: &mut Buffer<(u32, u32), B>,
         starts: &mut Buffer<u32, B>,
         commits: &mut Buffer<super::match_finder::CommittedMatch, B>,
+        noise: &mut super::noise::NoiseScan,
     ) -> std::result::Result<(), B::Failure> {
         debug_assert!(block.start <= block.end && block.end <= input.len());
         let mut committed_through = block.start;
@@ -782,7 +783,12 @@ impl<B: Budget> PackedMatchFinder<B> {
             let max_length = remaining.min(max_match_length);
             let max_distance = pos.min(distance_limit);
             let before = runs.len();
-            if pos >= committed_through && cut != 0 && max_distance != 0 && max_length >= 4 {
+            if pos >= committed_through
+                && cut != 0
+                && max_distance != 0
+                && max_length >= 4
+                && !noise.skips(input, pos)
+            {
                 self.collect_improving(
                     input,
                     pos,
@@ -1185,6 +1191,7 @@ mod tests {
                         &mut found,
                         &mut starts,
                         &mut Buffer::new(&allowance),
+                        &mut crate::codec::noise::NoiseScan::new(),
                     )
                     .unwrap();
                 collected.push((found.into_vec(), starts.into_vec()));
@@ -1482,6 +1489,7 @@ mod tests {
                 &mut runs,
                 &mut starts,
                 &mut Buffer::new(&allowance),
+                &mut crate::codec::noise::NoiseScan::new(),
             )
             .unwrap();
         assert_eq!(allowance.used(), index_bytes + output_bytes);
@@ -1498,6 +1506,7 @@ mod tests {
                 &mut runs,
                 &mut starts,
                 &mut Buffer::new(&allowance),
+                &mut crate::codec::noise::NoiseScan::new(),
             )
             .unwrap();
         assert!(finder.packed.is_empty() && finder.cursor.is_empty());

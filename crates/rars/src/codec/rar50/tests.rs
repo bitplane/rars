@@ -1,3 +1,4 @@
+use crate::codec::noise::NoiseScan;
 use crate::codec::workspace::RefusingBudget;
 
 fn repeated_byte_runs_ladder(algorithm_version: u8) {
@@ -1746,6 +1747,7 @@ fn should_lazy_emit_literal(
         state,
         distance_size,
         current,
+        &mut NoiseScan::new(),
     )
     .0
 }
@@ -2678,6 +2680,7 @@ fn lazy_match_lookahead_stops_at_the_member_boundary() {
             &EncoderMatchState::default(),
             DISTANCE_TABLE_SIZE_50,
             current,
+            &mut NoiseScan::new(),
         ),
         (false, None)
     );
