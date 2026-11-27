@@ -205,9 +205,6 @@ fn run_jobs_admitted<T: Send, O: Send>(
         }
         reservations.push(ledger.reserve(required(job.as_ref().unwrap()))?)?;
     }
-    for reservation in reservations.iter_mut() {
-        reservation.start();
-    }
     let result = complete_jobs(
         slots,
         output,
@@ -1776,9 +1773,7 @@ impl BlockWave {
             .is_none()
             .then(|| crate::parallel::threads() as u64);
         let charge = workspace.peak(retained, seed, piece_threads);
-        let scopes = self
-            .scopes
-            .saturating_add(required.saturating_add(crate::codec::workspace::RESERVATION_BYTES));
+        let scopes = self.scopes.saturating_add(required);
         // Outside its scope a job holds its input, which may have grown to
         // twice its length, a copy of its history, which a filtered run is
         // only handed after every job is admitted, and the window its worker
@@ -2032,7 +2027,7 @@ fn compress_members_whole(
                 start,
                 crate::parallel::threads(),
                 resources.memory_limit(),
-                slot_bytes as u64 + crate::codec::workspace::RESERVATION_BYTES,
+                slot_bytes as u64,
                 ledger.available(),
             )
         } else {
@@ -5046,15 +5041,9 @@ mod tests {
                 let first = output.pop().unwrap();
                 let second = output.pop().unwrap();
                 drop(output);
-                assert_eq!(
-                    ledger.used(),
-                    192 + 2 * crate::codec::workspace::RESERVATION_BYTES
-                );
+                assert_eq!(ledger.used(), 192);
                 drop(first);
-                assert_eq!(
-                    ledger.used(),
-                    96 + crate::codec::workspace::RESERVATION_BYTES
-                );
+                assert_eq!(ledger.used(), 96);
                 drop(second);
                 assert_eq!(ledger.used(), 0);
             }

@@ -53,26 +53,24 @@ fn reader_vm_workspace_refusals_release_program_operands_memory_and_results() {
 
 #[test]
 fn reader_vm_workspace_results_remain_charged_after_worker_retirement() {
-    use crate::codec::workspace::RESERVATION_BYTES;
-    let ledger = Allowance::limited(1024 * 1024 + RESERVATION_BYTES);
-    let mut reservation = ledger.reserve(1024 * 1024).unwrap();
+    let ledger = Allowance::limited(1024 * 1024);
+    let reservation = ledger.reserve(1024 * 1024).unwrap();
     let budget = reservation.allowance();
-    reservation.start();
     let program = OwnedProgram::parse(&reader_vm_blob(), &budget).unwrap();
     let mut vm = Vm::with_allowance(&program, reader_vm_invocation(), &budget).unwrap();
     let result = vm
         .run(&program, &crate::read_control::ReadControl::default())
         .unwrap();
     reservation.retire();
-    assert!(ledger.used() >= MEMORY_SIZE as u64 + RESERVATION_BYTES);
+    assert!(ledger.used() >= MEMORY_SIZE as u64);
     drop(vm);
     drop(program);
     assert_eq!(
         ledger.used(),
-        (result.output.capacity() + result.globals.capacity()) as u64 + RESERVATION_BYTES
+        (result.output.capacity() + result.globals.capacity()) as u64
     );
     drop(result);
-    assert_eq!(ledger.used(), RESERVATION_BYTES);
+    assert_eq!(ledger.used(), 0);
     drop(budget);
     assert_eq!(ledger.used(), 0);
 }

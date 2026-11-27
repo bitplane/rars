@@ -154,8 +154,7 @@ fn reader_rar29_refusals_release_standard_filter_scratch_and_output() {
 fn reader_rar29_returned_output_keeps_reservation_after_decoder_drop() {
     use crate::codec::workspace::Allowance;
     let ledger = Allowance::limited(128 * 1024);
-    let mut reservation = ledger.reserve(120 * 1024).unwrap();
-    reservation.start();
+    let reservation = ledger.reserve(120 * 1024).unwrap();
     let budget = reservation.allowance();
     let mut state = super::Reader29State::with_allowance(&budget);
     let out = state.decode_member_owned(COMPRESSED_TEXT, 2400).unwrap();

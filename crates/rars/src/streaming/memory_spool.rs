@@ -233,56 +233,54 @@ mod tests {
 
     #[test]
     fn admitted_spool_retains_its_capacity_after_worker_retirement() {
-        use crate::codec::workspace::{Allowance, Buffer, RESERVATION_BYTES};
+        use crate::codec::workspace::{Allowance, Buffer};
         use crate::streaming::preparation::Bytes;
         let ledger = Allowance::limited(20000);
         let resources = WriterResources::default().with_execution_allowance(ledger.clone());
         let prepared = Bytes::zeroed(32, &resources).unwrap();
-        let mut reservation = ledger.reserve(capacity(2)).unwrap();
+        let reservation = ledger.reserve(capacity(2)).unwrap();
         let allowance = reservation.allowance();
         let worker = resources
             .clone()
             .with_execution_allowance(allowance.clone());
-        reservation.start();
         let scratch = Buffer::filled(64, 0u8, &allowance).unwrap();
         let mut spool = MemorySpool::new(&worker);
         spool.write_all(b"payload").unwrap();
-        assert_eq!(ledger.used(), 32 + capacity(2) + RESERVATION_BYTES);
+        assert_eq!(ledger.used(), 32 + capacity(2));
         reservation.retire();
-        assert_eq!(ledger.used(), 32 + 64 + capacity(1) + RESERVATION_BYTES);
+        assert_eq!(ledger.used(), 32 + 64 + capacity(1));
         drop(scratch);
         drop(prepared);
-        assert_eq!(ledger.used(), capacity(1) + RESERVATION_BYTES);
+        assert_eq!(ledger.used(), capacity(1));
         spool.seek(SeekFrom::Start(BLOCK_BYTES as u64)).unwrap();
         let error = spool.write_all(b"growth after retirement").unwrap_err();
         assert_eq!(
             error.downcast::<Error>().unwrap().kind(),
             ErrorKind::ResourceLimit
         );
-        assert_eq!(ledger.used(), capacity(1) + RESERVATION_BYTES);
+        assert_eq!(ledger.used(), capacity(1));
         spool.seek(SeekFrom::Start(0)).unwrap();
         let mut bytes = [0; 7];
         spool.read_exact(&mut bytes).unwrap();
         assert_eq!(&bytes, b"payload");
         drop(spool);
-        assert_eq!(ledger.used(), RESERVATION_BYTES);
+        assert_eq!(ledger.used(), 0);
         drop((worker, allowance));
         assert_eq!(ledger.used(), 0);
     }
 
     #[test]
     fn copying_retired_worker_output_counts_source_and_spool_together() {
-        use crate::codec::workspace::{Allowance, Buffer, RESERVATION_BYTES};
+        use crate::codec::workspace::{Allowance, Buffer};
         let payload = 32;
-        let ledger = Allowance::limited(capacity(1) + payload + RESERVATION_BYTES);
+        let ledger = Allowance::limited(capacity(1) + payload);
         let resources = WriterResources::default().with_execution_allowance(ledger.clone());
-        let mut reservation = ledger.reserve(payload).unwrap();
-        reservation.start();
+        let reservation = ledger.reserve(payload).unwrap();
         let bytes = Buffer::filled(payload as usize, 7u8, &reservation.allowance()).unwrap();
         reservation.retire();
         let mut spool = MemorySpool::new(&resources);
         spool.write_all(&bytes).unwrap();
-        assert_eq!(ledger.used(), capacity(1) + payload + RESERVATION_BYTES);
+        assert_eq!(ledger.used(), capacity(1) + payload);
         // A second destination must not borrow the still-live source charge.
         assert!(MemorySpool::new(&resources).write_all(&bytes).is_err());
         drop(bytes);
