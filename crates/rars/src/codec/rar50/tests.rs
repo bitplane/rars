@@ -1263,7 +1263,7 @@ fn parser_refusal_and_cancellation_release_finders_matches_and_parse_arrays() {
         if optimal {
             // Admit the finder, then refuse later match/parse allocations.
             // Exercise the real budget error as well as injected failures.
-            let allowance = Allowance::limited(1_200_000);
+            let allowance = Allowance::limited(1_100_000);
             assert!(matches!(
                 encode_tokens_with_allowance(
                     &data,
@@ -1275,7 +1275,7 @@ fn parser_refusal_and_cancellation_release_finders_matches_and_parse_arrays() {
                     None,
                     &allowance,
                 ),
-                Err(Error::WorkspaceLimitExceeded(details)) if details.used > 1_000_000
+                Err(Error::WorkspaceLimitExceeded(details)) if details.used > 900_000
             ));
             assert_eq!(allowance.used(), 0);
             assert_each_allocation_refusal(|budget| {

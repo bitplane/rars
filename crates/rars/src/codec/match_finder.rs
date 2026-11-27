@@ -16,8 +16,8 @@
 //! bytes it has already matched. That is what a deep chain walk cannot avoid,
 //! and why the tree serves the optimal parse, which searches at every position
 //! anyway. The price is that inserting *is* a descent, so history cannot be
-//! seeded cheaply, and the tree costs eight bytes per byte of window against
-//! the chain's four.
+//! seeded cheaply, and the tree costs six bytes per byte of window up to
+//! 16 MiB, and eight past it, against the chain's four.
 //!
 //! `prev` holds one link per position in a window rather than one per position
 //! in the input, indexed by position modulo the window. A link is only followed
@@ -34,7 +34,7 @@
 
 use super::workspace::{Allowance, Budget, Buffer};
 use super::Result;
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
 
 /// Sentinel for "no position" in `head`/`prev` chains.
 pub(crate) const NO_POSITION: usize = usize::MAX;
@@ -641,8 +641,14 @@ impl CommittedMatch {
 /// tree ordered by the bytes at them, newest position at the root. The two
 /// children of each position live in `son`, one window slot per position as
 /// with the chain finder's `prev`, and the same rules keep slot reuse and the
-/// window from ever overlapping. Truncated links are read back with the
-/// position being searched for as the reference, which is always the newest.
+/// window from ever overlapping.
+///
+/// A window of up to 16 MiB stores each child as its distance back from the
+/// node holding the link, in 24 bits ([`NarrowLinks`]): six bytes a slot
+/// rather than eight. A child that far back has fallen out of the window, so
+/// it is stored as no child, which a descent treats the same way. A larger
+/// window stores truncated positions, read back with the position being
+/// searched for as the reference, which is always the newest.
 ///
 /// Positions with different hashes never link to each other, so each hash's
 /// tree is built by its own insertions alone. That is what lets a
@@ -654,8 +660,11 @@ pub(crate) struct TreeMatchFinder<B: Budget = Allowance> {
     head: Buffer<AtomicU32, B>,
     /// Two links per window slot: the child whose bytes compare lesser first,
     /// then the greater-or-equal one, in LZMA's layout.
-    son: Buffer<AtomicU32, B>,
+    son: Links<B>,
     mask: usize,
+    /// Position `pos` keeps its links in slot `(pos + shift) & mask`. Only a
+    /// tree a [`SeedTree`] hands on whole has slots offset from its positions.
+    shift: usize,
     /// Positions before this count as fallen out of the window. Only a
     /// [`SeedTree`] raises it from zero.
     oldest: usize,
@@ -665,6 +674,21 @@ impl TreeMatchFinder {
     #[cfg(test)]
     pub(crate) fn new(window: usize) -> Self {
         Self::with_allowance(window, &Allowance::default()).expect("unlimited finder allocation")
+    }
+
+    /// A finder storing truncated positions, as a window past 16 MiB does.
+    #[cfg(all(test, feature = "write", feature = "parallel"))]
+    fn with_wide_links(window: usize) -> Self {
+        let mut finder = Self::new(window);
+        finder.son = Links::Wide(
+            Buffer::filled_with(
+                2 * (finder.mask + 1),
+                || AtomicU32::new(0),
+                &Allowance::default(),
+            )
+            .expect("unlimited finder allocation"),
+        );
+        finder
     }
 }
 
@@ -685,11 +709,17 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// What the tree's heads and two links per window slot allocate.
     #[cfg(feature = "write")]
     pub(crate) fn bytes_for_window(window: usize) -> usize {
-        ((1 << Self::HASH_BITS) + 2 * window.max(1).next_power_of_two()) * size_of::<u32>()
+        let slots = window.max(1).next_power_of_two();
+        let links = if slots <= NarrowLinks::<B>::MAX_WINDOW {
+            6 * slots
+        } else {
+            2 * slots * size_of::<u32>()
+        };
+        (1 << Self::HASH_BITS) * size_of::<u32>() + links
     }
 
-    /// Builds a finder that remembers the last `window` positions, at eight
-    /// bytes of links per byte of window.
+    /// Builds a finder that remembers the last `window` positions, at six
+    /// bytes of links per byte of window up to 16 MiB and eight past it.
     pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
         let window = window
             .max(1)
@@ -700,14 +730,23 @@ impl<B: Budget> TreeMatchFinder<B> {
             // Zero rather than the sentinel for the same reason as the chain
             // finder's `prev`: a slot is always written during its position's
             // own insertion before any link can lead to it.
-            son: Buffer::filled_with(
-                window
-                    .checked_mul(2)
-                    .ok_or(super::Error::InvalidData("finder window overflows"))?,
-                || AtomicU32::new(0),
-                allowance,
-            )?,
+            son: if window <= NarrowLinks::<B>::MAX_WINDOW {
+                Links::Narrow(NarrowLinks(Buffer::filled_with(
+                    6 * window,
+                    || AtomicU8::new(0),
+                    allowance,
+                )?))
+            } else {
+                Links::Wide(Buffer::filled_with(
+                    window
+                        .checked_mul(2)
+                        .ok_or(super::Error::InvalidData("finder window overflows"))?,
+                    || AtomicU32::new(0),
+                    allowance,
+                )?)
+            },
             mask: window - 1,
+            shift: 0,
             oldest: 0,
         })
     }
@@ -798,18 +837,51 @@ impl<B: Budget> TreeMatchFinder<B> {
         }
         let newest = resolve(pos, self.head[self.hash(input, pos)].load(Relaxed));
         if newest < pos {
-            crate::simd::prefetch(&self.son, (newest & self.mask) << 1);
+            let pair = self.slot(newest) << 1;
+            match &self.son {
+                Links::Wide(son) => crate::simd::prefetch(son, pair),
+                Links::Narrow(son) => crate::simd::prefetch(&son.0, 3 * pair),
+            }
             crate::simd::prefetch(input, newest);
         }
     }
 
-    /// Each hash's head and the two child links of each window slot, for
-    /// tests to compare whole trees.
+    /// Where `pos` keeps its two links.
+    #[inline(always)]
+    fn slot(&self, pos: usize) -> usize {
+        (pos.wrapping_add(self.shift)) & self.mask
+    }
+
+    /// The child `owner` links to at `index`, as [`Son::child`] reads it.
+    #[cfg(feature = "write")]
+    fn child(&self, reference: usize, owner: usize, index: usize) -> usize {
+        match &self.son {
+            Links::Wide(son) => son.child(reference, owner, index),
+            Links::Narrow(son) => son.child(reference, owner, index),
+        }
+    }
+
+    /// Links `owner` to `child` at `index`, as [`Son::hang`] does.
+    #[cfg(feature = "write")]
+    fn hang(&self, owner: usize, index: usize, child: usize) {
+        match &self.son {
+            Links::Wide(son) => son.hang(owner, index, child),
+            Links::Narrow(son) => son.hang(owner, index, child),
+        }
+    }
+
+    /// Each hash's head and the two child links of each window slot, as
+    /// stored, for tests to compare whole trees.
     #[cfg(test)]
     fn links(&self) -> (Vec<u32>, Vec<u32>) {
-        let read =
-            |links: &Buffer<AtomicU32, B>| links.iter().map(|link| link.load(Relaxed)).collect();
-        (read(&self.head), read(&self.son))
+        let head = self.head.iter().map(|link| link.load(Relaxed)).collect();
+        let son = match &self.son {
+            Links::Wide(son) => son.iter().map(|link| link.load(Relaxed)).collect(),
+            Links::Narrow(son) => (0..2 * (self.mask + 1))
+                .map(|index| son.stored(index) as u32)
+                .collect(),
+        };
+        (head, son)
     }
 
     #[cfg(feature = "write")]
@@ -871,24 +943,47 @@ impl<B: Budget> TreeMatchFinder<B> {
         len_limit: usize,
         max_distance: usize,
         cut: usize,
+        out: Option<&mut Buffer<(u32, u32), B>>,
+    ) -> std::result::Result<(), B::Failure> {
+        match &self.son {
+            Links::Wide(son) => {
+                self.descend_in::<FAST, _>(son, input, pos, hash, len_limit, max_distance, cut, out)
+            }
+            Links::Narrow(son) => {
+                self.descend_in::<FAST, _>(son, input, pos, hash, len_limit, max_distance, cut, out)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
+    fn descend_in<const FAST: bool, S: Son>(
+        &self,
+        son: &S,
+        input: &[u8],
+        pos: usize,
+        hash: usize,
+        len_limit: usize,
+        max_distance: usize,
+        cut: usize,
         mut out: Option<&mut Buffer<(u32, u32), B>>,
     ) -> std::result::Result<(), B::Failure> {
         // The tree collector calls this only when at least four bytes remain.
         // Unlike the chain finder, it skips near-end positions before calling.
         debug_assert!(len_limit >= Self::MIN_MATCH && pos + len_limit <= input.len());
-        let link = |slot: usize| self.son[slot].load(Relaxed);
-        let set = |slot: usize, value: u32| self.son[slot].store(value, Relaxed);
         // A load and a store rather than a swap, which would be a locked
         // instruction: no other thread touches this hash.
         let head = &self.head[hash];
         let mut current = resolve(pos, head.load(Relaxed));
         head.store(pos as u32, Relaxed);
         // The two attachment points still waiting for a subtree, starting as
-        // the new position's own child slots. Each step down hangs the node
-        // just compared on one of them and moves that side into the node's
-        // matching child slot.
-        let mut ptr0 = ((pos & self.mask) << 1) + 1;
-        let mut ptr1 = (pos & self.mask) << 1;
+        // the new position's own child slots, and the nodes they belong to.
+        // Each step down hangs the node just compared on one of them and
+        // moves that side into the node's matching child slot.
+        let mut ptr0 = (self.slot(pos) << 1) + 1;
+        let mut ptr1 = self.slot(pos) << 1;
+        let mut owner0 = pos;
+        let mut owner1 = pos;
         // How much of the prefix is proven to match on each side of the
         // descent. Everything below a node compares the same way the node
         // did up to its recorded length, so bytes before the smaller of the
@@ -907,13 +1002,13 @@ impl<B: Budget> TreeMatchFinder<B> {
             // stale link survives below them. A spent budget ends it the same
             // way, dropping whatever subtree the budget could not reach.
             if current >= floor || current < lowest || budget == 0 {
-                set(ptr0, NO_LINK);
-                set(ptr1, NO_LINK);
+                son.hang(owner0, ptr0, NO_POSITION);
+                son.hang(owner1, ptr1, NO_POSITION);
                 return Ok(());
             }
             budget -= 1;
             floor = current;
-            let pair = (current & self.mask) << 1;
+            let pair = self.slot(current) << 1;
             let mut len = len0.min(len1);
             if input[current + len] == input[pos + len] {
                 len += 1;
@@ -945,24 +1040,146 @@ impl<B: Budget> TreeMatchFinder<B> {
                         // position's prefix, so the new position adopts its
                         // children and the node drops out as the farther of
                         // two interchangeable candidates.
-                        set(ptr1, link(pair));
-                        set(ptr0, link(pair + 1));
+                        son.hang(owner1, ptr1, son.child(pos, current, pair));
+                        son.hang(owner0, ptr0, son.child(pos, current, pair + 1));
                         return Ok(());
                     }
                 }
             }
             if input[current + len] < input[pos + len] {
-                set(ptr1, current as u32);
+                son.hang_near(owner1, ptr1, current);
                 ptr1 = pair + 1;
+                owner1 = current;
                 len1 = len;
-                current = resolve(pos, link(ptr1));
+                current = son.next(pos, current, ptr1);
             } else {
-                set(ptr0, current as u32);
+                son.hang_near(owner0, ptr0, current);
                 ptr0 = pair;
+                owner0 = current;
                 len0 = len;
-                current = resolve(pos, link(ptr0));
+                current = son.next(pos, current, ptr0);
             }
         }
+    }
+}
+
+/// A tree's child links, by the widest window they can serve.
+#[derive(Debug)]
+enum Links<B: Budget> {
+    /// Each child's position, truncated to 32 bits.
+    Wide(Buffer<AtomicU32, B>),
+    Narrow(NarrowLinks<B>),
+}
+
+/// How a tree's descent reads and writes its child links. `index` is a
+/// slot's first link, or its second one past it.
+trait Son {
+    /// The child linked at `index` of `owner`'s slot, or [`NO_POSITION`].
+    /// `reference` is the newest position the tree holds.
+    fn child(&self, reference: usize, owner: usize, index: usize) -> usize;
+    /// [`Self::child`] for a descent, which stops at any candidate not older
+    /// than `owner`: where there is no child this can return one of those
+    /// rather than [`NO_POSITION`].
+    fn next(&self, reference: usize, owner: usize, index: usize) -> usize;
+    /// Links `child`, older than `owner`, or [`NO_POSITION`], at `index` of
+    /// `owner`'s slot.
+    fn hang(&self, owner: usize, index: usize, child: usize);
+    /// [`Self::hang`] for a child less than a window older than `owner`.
+    fn hang_near(&self, owner: usize, index: usize, child: usize);
+}
+
+impl<B: Budget> Son for Buffer<AtomicU32, B> {
+    #[inline(always)]
+    fn child(&self, reference: usize, _owner: usize, index: usize) -> usize {
+        resolve(reference, self[index].load(Relaxed))
+    }
+
+    #[inline(always)]
+    fn next(&self, reference: usize, owner: usize, index: usize) -> usize {
+        self.child(reference, owner, index)
+    }
+
+    #[inline(always)]
+    fn hang(&self, _owner: usize, index: usize, child: usize) {
+        let link = if child == NO_POSITION {
+            NO_LINK
+        } else {
+            child as u32
+        };
+        self[index].store(link, Relaxed);
+    }
+
+    #[inline(always)]
+    fn hang_near(&self, owner: usize, index: usize, child: usize) {
+        self.hang(owner, index, child);
+    }
+}
+
+/// Child links as 24-bit distances back from the node holding them, zero for
+/// none, three bytes each, low byte first. Bytes rather than a word holding
+/// parts of both of a slot's links: a descent then writes a link with three
+/// stores and no read.
+#[derive(Debug)]
+struct NarrowLinks<B: Budget>(Buffer<AtomicU8, B>);
+
+impl<B: Budget> NarrowLinks<B> {
+    /// Distances below this fit; it is also the largest window, since a
+    /// child no closer than that has fallen out of it.
+    const MAX_WINDOW: usize = 1 << 24;
+
+    #[inline(always)]
+    fn stored(&self, index: usize) -> usize {
+        let bytes = &self.0[3 * index..3 * index + 3];
+        usize::from(bytes[0].load(Relaxed))
+            | usize::from(bytes[1].load(Relaxed)) << 8
+            | usize::from(bytes[2].load(Relaxed)) << 16
+    }
+
+    #[inline(always)]
+    fn store(&self, index: usize, distance: usize) {
+        let bytes = &self.0[3 * index..3 * index + 3];
+        bytes[0].store(distance as u8, Relaxed);
+        bytes[1].store((distance >> 8) as u8, Relaxed);
+        bytes[2].store((distance >> 16) as u8, Relaxed);
+    }
+}
+
+impl<B: Budget> Son for NarrowLinks<B> {
+    #[inline(always)]
+    fn child(&self, _reference: usize, owner: usize, index: usize) -> usize {
+        match self.stored(index) {
+            0 => NO_POSITION,
+            // A handed-on tree's slots can still hold distances from before
+            // its history, which reach back past its first position.
+            distance => owner.checked_sub(distance).unwrap_or(NO_POSITION),
+        }
+    }
+
+    /// No child reads back as `owner` itself, and a distance past the first
+    /// position wraps to above it.
+    #[inline(always)]
+    fn next(&self, _reference: usize, owner: usize, index: usize) -> usize {
+        owner.wrapping_sub(self.stored(index))
+    }
+
+    #[inline(always)]
+    fn hang(&self, owner: usize, index: usize, child: usize) {
+        let distance = match child {
+            NO_POSITION => 0,
+            child => {
+                debug_assert!(child < owner);
+                Some(owner - child)
+                    .filter(|&distance| distance < Self::MAX_WINDOW)
+                    .unwrap_or(0)
+            }
+        };
+        self.store(index, distance);
+    }
+
+    #[inline(always)]
+    fn hang_near(&self, owner: usize, index: usize, child: usize) {
+        debug_assert!(child < owner && owner - child < Self::MAX_WINDOW);
+        self.store(index, owner - child);
     }
 }
 
@@ -1066,6 +1283,53 @@ impl<B: Budget> SeedTree<B> {
         cut: usize,
         allowance: &B,
     ) -> Result<TreeMatchFinder<B>> {
+        self.insert(input, history.clone(), len_limit, cut);
+        self.copy(input, history, window, allowance)
+    }
+
+    /// [`Self::seed`] for the last history, handing on the seed tree itself
+    /// where it can stand for the copy: where its window is the run's and its
+    /// links are distances, which need no rebasing. Its slots are left where
+    /// they are, offset from the run's positions.
+    pub(crate) fn finish(
+        mut self,
+        input: &[u8],
+        history: std::ops::Range<usize>,
+        window: usize,
+        len_limit: impl Fn(usize) -> usize + Sync,
+        cut: usize,
+        allowance: &B,
+    ) -> Result<TreeMatchFinder<B>> {
+        self.insert(input, history.clone(), len_limit, cut);
+        let Some(newest) = history.end.checked_sub(1) else {
+            return self.copy(input, history, window, allowance);
+        };
+        if window.max(1).next_power_of_two() != self.tree.mask + 1
+            || !matches!(self.tree.son, Links::Narrow(_))
+        {
+            return self.copy(input, history, window, allowance);
+        }
+        let base = history.start;
+        for head in self.tree.head.iter() {
+            let link = match resolve(newest, head.load(Relaxed)) {
+                NO_POSITION => NO_LINK,
+                pos if pos < base => NO_LINK,
+                pos => (pos - base) as u32,
+            };
+            head.store(link, Relaxed);
+        }
+        self.tree.shift = base & self.tree.mask;
+        self.tree.oldest = 0;
+        Ok(self.tree)
+    }
+
+    fn insert(
+        &mut self,
+        input: &[u8],
+        history: std::ops::Range<usize>,
+        len_limit: impl Fn(usize) -> usize + Sync,
+        cut: usize,
+    ) {
         debug_assert!(history.start >= self.tree.oldest && history.end >= self.next);
         debug_assert!(history.len() <= self.tree.mask + 1);
         self.tree.oldest = history.start;
@@ -1074,7 +1338,6 @@ impl<B: Budget> SeedTree<B> {
         self.tree
             .insert_range(input, from..history.end, &len_limit, cut, shares);
         self.next = history.end;
-        self.copy(input, history, window, allowance)
     }
 
     /// `history`'s part of the tree, in a finder of its own for `window`.
@@ -1101,6 +1364,12 @@ impl<B: Budget> SeedTree<B> {
         for (to, from) in copy.head.iter().zip(self.tree.head.iter()) {
             to.store(rebase(from.load(Relaxed)), Relaxed);
         }
+        // A child before the history is no child in the run's tree.
+        let rebase = |pos: usize| match pos {
+            NO_POSITION => NO_POSITION,
+            pos if pos < base => NO_POSITION,
+            pos => pos - base,
+        };
         // Only positions that were inserted have links of their own.
         let end = history.end.min(
             input
@@ -1113,11 +1382,11 @@ impl<B: Budget> SeedTree<B> {
             let first = base + span * piece / pieces;
             let last = base + span * (piece + 1) / pieces;
             for pos in first..last {
-                let from = (pos & self.tree.mask) << 1;
-                let to = ((pos - base) & copy.mask) << 1;
+                let from = self.tree.slot(pos) << 1;
+                let to = copy.slot(pos - base) << 1;
                 for side in 0..2 {
-                    copy.son[to + side]
-                        .store(rebase(self.tree.son[from + side].load(Relaxed)), Relaxed);
+                    let child = self.tree.child(newest, pos, from + side);
+                    copy.hang(pos - base, to + side, rebase(child));
                 }
             }
         });
@@ -1889,6 +2158,110 @@ mod tests {
                         "run {run:?} at {threads} threads differs"
                     );
                 }
+            });
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "write", feature = "parallel"))]
+    fn narrow_links_find_what_wide_links_find() {
+        let input = busy_input(256 * 1024);
+        let allowance = super::Allowance::default();
+        for (window, cut, nice) in [(64, 4, 16), (4096, 16, 48), (64 * 1024, 128, 273)] {
+            let mut narrow = TreeMatchFinder::new(window);
+            let mut wide = TreeMatchFinder::with_wide_links(window);
+            assert!(matches!(narrow.son, super::Links::Narrow(_)));
+            let mut expected = super::Buffer::new(&allowance);
+            let mut actual = super::Buffer::new(&allowance);
+            for pos in 0..input.len() - 3 {
+                expected.clear();
+                actual.clear();
+                let limit = nice.min(input.len() - pos);
+                let distance = pos.min(window - 1);
+                wide.matches(&input, pos, limit, distance, cut, &mut expected)
+                    .unwrap();
+                narrow
+                    .matches(&input, pos, limit, distance, cut, &mut actual)
+                    .unwrap();
+                assert_eq!(
+                    &actual[..],
+                    &expected[..],
+                    "position {pos}, window {window}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "write", feature = "parallel"))]
+    fn a_seed_tree_handed_on_finds_what_the_last_runs_own_tree_finds() {
+        const KIB: usize = 1024;
+        let input = busy_input(1024 * KIB);
+        let reach = 128 * KIB;
+        let (nice, cut) = (48, 12);
+        let allowance = super::Allowance::default();
+        let runs = [
+            64 * KIB..128 * KIB,
+            128 * KIB..256 * KIB,
+            352 * KIB..416 * KIB,
+        ];
+        let history = |run: &std::ops::Range<usize>| run.start.saturating_sub(reach)..run.start;
+        let last = runs.last().unwrap();
+        let base = history(last).start;
+        let own = &input[base..last.end];
+        let collect = |tree: &mut TreeMatchFinder| {
+            let mut found = Vec::new();
+            let mut out = super::Buffer::new(&allowance);
+            for pos in last.start - base..own.len() - 3 {
+                out.clear();
+                let limit = (own.len() - pos).min(nice);
+                tree.matches(own, pos, limit, reach, cut, &mut out).unwrap();
+                found.push(out.to_vec());
+            }
+            found
+        };
+        let mut alone = TreeMatchFinder::seeded(
+            reach,
+            own,
+            0..last.start - base,
+            |pos| (own.len() - pos).min(nice),
+            cut,
+            1,
+            &allowance,
+        )
+        .unwrap();
+        let expected = collect(&mut alone);
+        for threads in [1, 2, 8] {
+            crate::parallel::private_pool(threads).install(|| {
+                let mut seed = super::SeedTree::with_allowance(reach, &allowance).unwrap();
+                for run in &runs[..runs.len() - 1] {
+                    let window = reach.min(run.end - history(run).start);
+                    seed.seed(
+                        &input,
+                        history(run),
+                        window,
+                        |pos| (input.len() - pos).min(nice),
+                        cut,
+                        &allowance,
+                    )
+                    .unwrap();
+                }
+                let mut handed = seed
+                    .finish(
+                        &input,
+                        history(last),
+                        reach,
+                        |pos| (input.len() - pos).min(nice),
+                        cut,
+                        &allowance,
+                    )
+                    .unwrap();
+                // Handed on whole, its slots stay offset from the run's positions.
+                assert_ne!(handed.shift, 0);
+                assert!(
+                    collect(&mut handed) == expected,
+                    "the handed-on tree differs at {threads} threads"
+                );
             });
         }
     }

@@ -908,8 +908,9 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
 /// [`streaming_blocks_in_window`] for a run whose window is one job's part of
 /// a group's, with a finder handed out by the group's shared index.
 ///
-/// `window` must end where the run does and start where the group's window
-/// does, and the finder must stand at the run's start; nothing is trimmed.
+/// `window` must end where the run does and start where the group's index
+/// does, no later than the run's dictionary reaches back, and the finder must
+/// stand at the run's start.
 /// The match finder then collects what the job's own would, which is what
 /// keeps the output unchanged (#276). Only a run whose own window would use a
 /// packed index ([`packed_index_fits`]) shares one, so never a run that starts
@@ -1991,7 +1992,7 @@ pub(crate) enum RunFinder<B: Budget> {
     Tree(Rar50TreeMatchFinder<B>),
 }
 
-/// What [`seed_chain`] holds besides the trees it returns.
+/// The most [`seed_chain`] holds besides the trees it returns.
 pub(crate) fn run_trees_workspace(options: EncodeOptions) -> u64 {
     if !options.optimal_parse {
         return 0;
@@ -2115,20 +2116,35 @@ pub(crate) fn seed_chain<B: Budget>(
     allowance: &B,
 ) -> Result<Vec<Rar50TreeMatchFinder<B>>> {
     let mut seed = match_finder::SeedTree::with_allowance(options.max_match_distance, allowance)?;
-    runs.iter()
-        .map(|run| {
-            let history = tree_history(run.start, options);
-            let reach = run.end - history.start;
-            seed.seed(
-                window,
-                history,
-                finder_window(options, reach),
-                |pos| tree_len_limit(window, pos, options),
-                options.max_match_candidates,
-                allowance,
-            )
-        })
-        .collect()
+    let Some((last, before)) = runs.split_last() else {
+        return Ok(Vec::new());
+    };
+    let mut trees = Vec::with_capacity(runs.len());
+    for run in before {
+        let history = tree_history(run.start, options);
+        let reach = run.end - history.start;
+        trees.push(seed.seed(
+            window,
+            history,
+            finder_window(options, reach),
+            |pos| tree_len_limit(window, pos, options),
+            options.max_match_candidates,
+            allowance,
+        )?);
+    }
+    // The last run takes the seed tree itself where it can, rather than a
+    // copy beside it.
+    let history = tree_history(last.start, options);
+    let reach = last.end - history.start;
+    trees.push(seed.finish(
+        window,
+        history,
+        finder_window(options, reach),
+        |pos| tree_len_limit(window, pos, options),
+        options.max_match_candidates,
+        allowance,
+    )?);
+    Ok(trees)
 }
 
 /// The trees [`seed_run_tree`] and [`seed_chain`] seed for `runs` of `window`

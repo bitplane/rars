@@ -294,6 +294,9 @@ struct SharedRun<B: Budget> {
     end: usize,
     /// None for a run that seeds its own tree.
     finder: Option<RunFinder<B>>,
+    /// Where the group's packed index starts in `window`. It covers no more
+    /// than the runs that walk chains reach back over.
+    index_start: usize,
     /// For a filtered run, the blocks it is coded in and their records. Its
     /// part of `window` already holds the filtered bytes.
     filtered: Option<crate::codec::rar50::FilteredRunBlocks<B>>,
@@ -577,10 +580,18 @@ where
         .zip(&chains)
         .filter_map(|(&at, &chain)| chain.then_some(at))
         .collect();
+    // Nothing before the earliest such run's dictionary is within reach of
+    // its parse, or of any later one's.
+    let index_start = bounds
+        .iter()
+        .zip(&chains)
+        .find(|(_, &chain)| chain)
+        .map_or(0, |(&(start, _), _)| start.saturating_sub(dictionary));
     let mut finders = if chain_at.is_empty() {
         Buffer::new(allowance)
     } else {
-        SharedPackedIndex::finders_over(&window, &chain_at, allowance)?
+        let chain_at: Vec<usize> = chain_at.iter().map(|&at| at - index_start).collect();
+        SharedPackedIndex::finders_over(&window[index_start..], &chain_at, allowance)?
     }
     .into_iter()
     .map(RunFinder::Packed);
@@ -593,6 +604,7 @@ where
             start,
             end,
             finder,
+            index_start,
             filtered,
         });
     }
@@ -3567,6 +3579,7 @@ fn encode_shared_block_job<B: Budget>(
         start,
         end,
         finder,
+        index_start,
         filtered,
     } = shared.expect("dispatched as a shared run");
     let finder = match finder {
@@ -3585,8 +3598,8 @@ fn encode_shared_block_job<B: Budget>(
     };
     let packed = match finder {
         Some(RunFinder::Packed(finder)) => streaming_blocks_with_finder(
-            &window[..end],
-            start,
+            &window[index_start..end],
+            start - index_start,
             finder,
             cuts,
             records,
