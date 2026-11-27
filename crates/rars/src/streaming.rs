@@ -28,9 +28,8 @@ pub const DEFAULT_WRITER_MEMORY_LIMIT: u64 =
     };
 
 /// The budget for fitting a RAR 5 or RAR 7 dictionary with default resources
-/// (251 MiB): what the largest job a default writer plans is admitted for, a
-/// RAR 5 level 5 block job at its fitted 16 MiB dictionary with filters
-/// searched.
+/// (251 MiB): enough to admit the largest job a default writer plans, a RAR 5
+/// level 5 block job at its fitted 16 MiB dictionary with filters searched.
 ///
 /// This covers a full block job's admission charge, including the workspace
 /// held by the coordinator. The budget is the same at every thread count.

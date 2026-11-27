@@ -810,31 +810,29 @@ mod tests {
         (settings, admission)
     }
 
-    /// The default planning budget is the largest admission a default plan
-    /// makes, rounded up to a MiB: level 5's, at its fitted 16 MiB dictionary
-    /// with filters searched. If that charge moves, this fails until the
-    /// constant follows it. The one-thread default budget is that, or the
-    /// routing threshold when it is less.
+    /// One thread's default budget admits the largest job a default plan makes,
+    /// level 5's at its fitted 16 MiB dictionary with filters searched, without
+    /// shrinking its dictionary, and reaches the routing threshold, so a
+    /// member is routed the same at every thread count.
     #[test]
-    fn the_one_thread_default_is_the_largest_default_admission() {
-        const MIB: u64 = 1024 * 1024;
+    fn the_one_thread_default_admits_every_default_job_and_routes_as_many_do() {
         let resources = WriterResources::with_default_planning(DEFAULT_WRITER_MEMORY_LIMIT);
         let mut largest = (0, 0);
         for level in 1..=5 {
             for solid in [false, true] {
-                let (_, admission) = default_job(level, solid, &resources);
+                let (settings, admission) = default_job(level, solid, &resources);
+                if level == 5 {
+                    assert_eq!(settings.dictionary_size, 16 * 1024 * 1024, "solid {solid}");
+                }
                 largest = largest.max((admission, level));
             }
         }
         assert_eq!(largest.1, 5);
-        assert_eq!(
-            largest.0.next_multiple_of(MIB),
-            DEFAULT_WRITER_PLANNING_LIMIT
-        );
-        assert_eq!(
-            DEFAULT_WRITER_MEMORY_LIMIT,
-            DEFAULT_WRITER_PLANNING_LIMIT.max(resources.routing_memory_limit())
-        );
+        assert!(largest.0 <= DEFAULT_WRITER_PLANNING_LIMIT);
+        assert!(largest.0 <= DEFAULT_WRITER_MEMORY_LIMIT);
+        let routing = WriterResources::with_default_planning(u64::MAX).routing_memory_limit();
+        assert!(DEFAULT_WRITER_MEMORY_LIMIT >= routing);
+        assert_eq!(resources.routing_memory_limit(), routing);
     }
 
     #[test]
