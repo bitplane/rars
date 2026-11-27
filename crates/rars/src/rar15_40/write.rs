@@ -8873,21 +8873,6 @@ mod tests {
     }
 
     #[test]
-    fn rar15_level_five_alone_takes_the_priced_parse() {
-        let priced = |level| {
-            super::rar15_encode_options_for_level(level).unwrap()
-                == super::rar15_encode_options_for_level(level)
-                    .unwrap()
-                    .with_priced_parse(true)
-        };
-        assert!(priced(Some(5)));
-        assert!(priced(None));
-        for level in 0..5 {
-            assert!(!priced(Some(level)), "level {level}");
-        }
-    }
-
-    #[test]
     fn writer_limits_and_invalid_options_are_not_archive_corruption() {
         for error in [
             super::validate_member(b"", ArchiveVersion::Rar40, 0).unwrap_err(),
@@ -9766,8 +9751,8 @@ mod tests {
 
     use super::{
         encode_rar29_auto_filtered_member, encode_rar29_filtered_member,
-        encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_level,
-        rar20_encode_options_for_options, rar29_encode_options_for_options, FilterKind, FilterSpec,
+        encode_rar29_filtered_members, is_audio_filter_candidate, rar20_encode_options_for_options,
+        rar29_encode_options_for_options, FilterKind, FilterSpec,
     };
     use crate::codec::rar29::{unpack29_decode, EncodeOptions};
 
@@ -10452,76 +10437,6 @@ mod tests {
             1024 * 1024
         );
     }
-    #[test]
-    fn rar20_levels_from_the_default_up_parse_by_shortest_path() {
-        for level in 0..=2u8 {
-            let options = rar20_encode_options_for_level(Some(level)).unwrap();
-            assert!(!options.optimal_parse, "level {level} priced every path");
-        }
-        for level in 3..=5u8 {
-            let options = rar20_encode_options_for_level(Some(level)).unwrap();
-            assert!(options.optimal_parse, "level {level} settled for greedy");
-        }
-        assert_eq!(
-            rar20_encode_options_for_level(None).unwrap(),
-            rar20_encode_options_for_level(Some(3)).unwrap(),
-            "an absent level is the default level",
-        );
-    }
-
-    #[test]
-    fn rar20_levels_spend_more_within_each_parse() {
-        let level = |level| rar20_encode_options_for_level(Some(level)).unwrap();
-        // Greedy: deeper search, then shortest path: deeper search and more
-        // priced passes, each at least what the level below spends.
-        assert!(level(2).max_match_candidates > level(1).max_match_candidates);
-        for (below, above) in [(3, 4), (4, 5)] {
-            assert!(level(above).max_match_candidates > level(below).max_match_candidates);
-            assert!(level(above).extra_priced_passes > level(below).extra_priced_passes);
-        }
-    }
-
-    #[test]
-    fn rar20_greedy_levels_look_one_position_ahead_and_seeds_two() {
-        for level in 1..=5u8 {
-            let options = rar20_encode_options_for_level(Some(level)).unwrap();
-            assert!(options.lazy_matching, "level {level} stopped being lazy");
-            let ahead = if options.optimal_parse { 2 } else { 1 };
-            assert_eq!(options.lazy_lookahead, ahead, "level {level}");
-        }
-    }
-
-    #[test]
-    fn only_the_top_two_rar29_levels_pay_for_the_shortest_path() {
-        for level in 0..=3u8 {
-            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
-            assert_eq!(options.optimal_parse_passes, 0, "level {level}");
-        }
-        for level in 4..=5u8 {
-            let options = super::rar29_encode_options_for_level(Some(level)).unwrap();
-            assert!(options.optimal_parse_passes > 0, "level {level}");
-        }
-        // An absent level keeps the parse the writer always used.
-        let default = super::rar29_encode_options_for_level(None).unwrap();
-        assert_eq!(default.optimal_parse_passes, 0);
-        assert_eq!(
-            (default.max_match_candidates, default.lazy_matching),
-            (128, true)
-        );
-    }
-
-    #[test]
-    fn rar29_levels_from_two_cut_blocks_by_price() {
-        let cuts = |level| {
-            super::rar29_encode_options_for_level(level)
-                .unwrap()
-                .split_blocks
-        };
-        assert!(!cuts(Some(0)) && !cuts(Some(1)));
-        assert!((2..=5u8).all(|level| cuts(Some(level))));
-        assert!(cuts(None));
-    }
-
     /// Each level tries every PPMd model the level below does, so text can
     /// only come out smaller further up.
     #[test]

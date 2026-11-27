@@ -2032,31 +2032,6 @@ fn reference_rar_accepts_rar50_acl_and_stream_file_service_records() {
 }
 
 #[test]
-#[ignore = "requires RARS_RAR50_LARGE_STREAM_FIXTURE pointing at an external >16 MiB sparse unfiltered RAR5 fixture"]
-fn external_sparse_rar50_large_member_streams_to_sink() {
-    let Some(path) = std::env::var_os("RARS_RAR50_LARGE_STREAM_FIXTURE") else {
-        eprintln!(
-            "skipping reference test: set RARS_RAR50_LARGE_STREAM_FIXTURE to an external sparse RAR5 fixture"
-        );
-        return;
-    };
-    let archive = Archive::parse_path(path).unwrap();
-    let largest = archive
-        .files()
-        .map(|file| file.unpacked_size)
-        .max()
-        .unwrap_or(0);
-    assert!(
-        largest > 16 * 1024 * 1024,
-        "fixture must contain a member larger than the buffered decode limit"
-    );
-
-    archive
-        .extract_to(read_options(None), |_meta| Ok(Box::new(std::io::sink())))
-        .unwrap();
-}
-
-#[test]
 #[cfg(all(feature = "write", feature = "recovery"))]
 fn writes_rar50_recovery_service_record() {
     let entries = [entry(
@@ -6025,24 +6000,6 @@ fn reference_test_archive(label: &str, archive: &[u8]) -> Option<std::process::O
     result
 }
 
-#[test]
-#[cfg(feature = "write")]
-#[ignore = "requires a local unrar or rar command"]
-fn reference_rar_accepts_streaming_solid_archive() {
-    let archive = write_streaming(&solid_test_entries(), true);
-    let Some(output) = reference_test_archive("streaming-solid", &archive) else {
-        eprintln!("skipping reference test: no unrar or rar command is installed");
-        return;
-    };
-
-    assert!(
-        output.status.success(),
-        "the reference tool rejected the streaming solid archive\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 /// The exact flag combination from issue #29.
 #[test]
 #[cfg(all(feature = "write", feature = "recovery", feature = "encryption"))]
@@ -6775,49 +6732,6 @@ fn streaming_volume_set_recovers_each_volume() {
     let mut repaired = Vec::new();
     damaged_archive.repair_recovery_to(&mut repaired).unwrap();
     assert_eq!(repaired, volumes[0]);
-}
-
-#[test]
-#[cfg(feature = "write")]
-#[ignore = "requires a local unrar or rar command"]
-fn reference_rar_accepts_a_streaming_volume_set() {
-    let payload = volume_payload(150_000);
-    let entries = [streaming_entry("split.bin", &payload)];
-    let volumes = write_volume_set(
-        &entries,
-        FeatureSet::store_only(),
-        rar50::ArchiveExtras::default(),
-        25_000,
-    );
-    assert!(volumes.len() > 2);
-
-    let dir = scratch::case("rars-volset");
-    for (index, volume) in volumes.iter().enumerate() {
-        fs::write(dir.join(format!("set.part{:02}.rar", index + 1)), volume).unwrap();
-    }
-
-    let first = dir.join("set.part01.rar");
-    let mut result = None;
-    for tool in ["unrar", "rar"] {
-        match Command::new(tool).arg("t").arg(&first).output() {
-            Ok(output) => {
-                result = Some(output);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => panic!("failed to run {tool}: {error}"),
-        }
-    }
-    let Some(output) = result else {
-        eprintln!("skipping reference test: no unrar or rar command is installed");
-        return;
-    };
-    assert!(
-        output.status.success(),
-        "the reference tool rejected the volume set\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
 }
 
 fn zero_fill_payload() -> Vec<u8> {

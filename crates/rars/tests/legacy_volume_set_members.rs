@@ -74,20 +74,23 @@ fn extract(volumes: &[Vec<u8>], password: Option<&[u8]>) -> Vec<Extracted> {
         .iter()
         .map(|volume| Archive::parse_with_password(volume, password).unwrap())
         .collect();
+    extract_archives(&archives, password).unwrap()
+}
+
+fn extract_archives(archives: &[Archive], password: Option<&[u8]>) -> rars::Result<Vec<Extracted>> {
     let options = match password {
         Some(password) => ArchiveReadOptions::with_password(password),
         None => ArchiveReadOptions::default(),
     };
     let found = RefCell::new(Vec::new());
-    extract_volumes_to(&archives, options, |meta| {
+    extract_volumes_to(archives, options, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         found
             .borrow_mut()
             .push((meta.name.clone(), meta.is_directory, Rc::clone(&data)));
         Ok(Box::new(Capture(data)))
-    })
-    .unwrap();
-    found
+    })?;
+    Ok(found
         .into_inner()
         .into_iter()
         .map(|(name, is_directory, data)| Extracted {
@@ -95,7 +98,7 @@ fn extract(volumes: &[Vec<u8>], password: Option<&[u8]>) -> Vec<Extracted> {
             is_directory,
             data: data.borrow().clone(),
         })
-        .collect()
+        .collect())
 }
 
 fn expected(entries: &[(&str, Option<Vec<u8>>)]) -> Vec<Extracted> {
@@ -340,6 +343,117 @@ fn the_builder_writes_the_set_the_streaming_writer_does() {
             .unwrap();
             assert!(built == streamed, "{case}");
             assert_eq!(extract(&built, None), expected(&wanted), "{case}");
+        }
+    }
+}
+
+/// One member split across a set carries the flags a reader needs to follow
+/// it, and a password-protected one refuses to extract without the password.
+#[test]
+fn a_split_member_keeps_its_flags_and_needs_its_password() {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Protection {
+        None,
+        Password,
+        Headers,
+    }
+    let data = bytes(9_000, 8);
+    for target in [
+        ArchiveVersion::Rar15,
+        ArchiveVersion::Rar20,
+        ArchiveVersion::Rar29,
+        ArchiveVersion::Rar30,
+        ArchiveVersion::Rar40,
+    ] {
+        for coding in [MemberCoding::Stored, MemberCoding::Compressed] {
+            for protection in [Protection::None, Protection::Password, Protection::Headers] {
+                if protection != Protection::None && !cfg!(feature = "encryption") {
+                    continue;
+                }
+                let rar3 = matches!(target, ArchiveVersion::Rar30 | ArchiveVersion::Rar40);
+                if protection == Protection::Headers && !rar3 {
+                    continue;
+                }
+                let case = format!("{target:?} {coding:?} {protection:?}");
+                let password = (protection != Protection::None).then_some(&b"secret"[..]);
+                let mut features = FeatureSet::store_only();
+                features.header_encryption = protection == Protection::Headers;
+                let mut entry = file("split.bin", data.clone());
+                if let Some(password) = password {
+                    entry = entry.with_password(password.to_vec());
+                }
+                let volumes = write(
+                    &[entry],
+                    WriterOptions::new(target, features),
+                    coding.clone(),
+                    2000,
+                )
+                .unwrap();
+                assert!(volumes.len() > 1, "{case}");
+
+                if protection == Protection::Headers {
+                    assert!(
+                        matches!(Archive::parse(&volumes[0]), Err(rars::Error::NeedPassword)),
+                        "{case}"
+                    );
+                }
+                let archives: Vec<_> = volumes
+                    .iter()
+                    .map(|volume| Archive::parse_with_password(volume, password).unwrap())
+                    .collect();
+                assert!(archives[0].main.is_volume(), "{case}");
+                assert!(archives[0].main.is_first_volume(), "{case}");
+                assert_eq!(
+                    archives[0].main.has_encrypted_headers(),
+                    protection == Protection::Headers,
+                    "{case}"
+                );
+                let first = archives[0].files().next().unwrap();
+                assert!(first.is_split_after(), "{case}");
+                match target {
+                    ArchiveVersion::Rar20 => assert_eq!(first.unp_ver, 20, "{case}"),
+                    ArchiveVersion::Rar29 => assert_eq!(first.unp_ver, 29, "{case}"),
+                    _ => {}
+                }
+                assert_eq!(first.is_encrypted(), password.is_some(), "{case}");
+
+                if protection == Protection::Password {
+                    assert!(
+                        matches!(
+                            extract_archives(&archives, None),
+                            Err(rars::Error::NeedPassword)
+                        ),
+                        "{case}"
+                    );
+                    if target != ArchiveVersion::Rar15 && target != ArchiveVersion::Rar20 {
+                        // Every volume repeats the member's salt.
+                        assert!(first.salt.is_some(), "{case}");
+                        for archive in &archives[1..] {
+                            let part = archive.files().next().unwrap();
+                            assert_eq!(part.salt, first.salt, "{case}");
+                        }
+                    }
+                    if rar3 {
+                        // A part's CRC covers its encrypted bytes.
+                        let packed = first.packed_data(&archives[0]).unwrap();
+                        assert_eq!(first.file_crc, rars::crc32::crc32(&packed), "{case}");
+                    }
+                }
+                if password.is_some() {
+                    assert!(
+                        matches!(
+                            extract_archives(&archives, Some(b"wrong")),
+                            Err(rars::Error::WrongPasswordOrCorruptData)
+                        ),
+                        "{case}"
+                    );
+                }
+                assert_eq!(
+                    extract_archives(&archives, password).unwrap(),
+                    expected(&[("split.bin", Some(data.clone()))]),
+                    "{case}"
+                );
+            }
         }
     }
 }
