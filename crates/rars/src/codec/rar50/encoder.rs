@@ -100,8 +100,8 @@ impl BlockSplitter {
 
     /// Folds a chunk into the open block.
     pub(crate) fn accept(&mut self, chunk: &[u8]) {
-        for &byte in chunk {
-            self.counts[usize::from(byte)] += 1;
+        for (ours, theirs) in self.counts.iter_mut().zip(byte_counts(chunk)) {
+            *ours += theirs;
         }
         self.total += chunk.len() as u64;
     }
@@ -144,10 +144,7 @@ impl BlockSplitter {
         if open + chunk.len() as u64 > MAX_LZ_BLOCK_SIZE as u64 {
             return None;
         }
-        let mut counts = [0u32; 256];
-        for &byte in chunk {
-            counts[usize::from(byte)] += 1;
-        }
+        let counts = byte_counts(chunk);
         let chunk_len = chunk.len() as u64;
         // How many of the chunk's bytes the open block's distribution places
         // wrongly. Both sides are scaled by `open` so neither divides early.
@@ -157,6 +154,22 @@ impl BlockSplitter {
         }
         (misplaced / open <= chunk_len / BLOCK_DRIFT_DIVISOR).then_some(counts)
     }
+}
+
+/// How many times each byte value occurs in `bytes`, counted four ways so
+/// that a run of one byte value does not wait on its own count.
+fn byte_counts(bytes: &[u8]) -> [u32; 256] {
+    let mut counts = [[0u32; 256]; 4];
+    let (quads, rest) = bytes.as_chunks::<4>();
+    for quad in quads {
+        for (lane, &byte) in quad.iter().enumerate() {
+            counts[lane][usize::from(byte)] += 1;
+        }
+    }
+    for (lane, &byte) in rest.iter().enumerate() {
+        counts[lane][usize::from(byte)] += 1;
+    }
+    std::array::from_fn(|byte| counts.iter().map(|lane| lane[byte]).sum())
 }
 
 #[cfg(test)]
