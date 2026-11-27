@@ -93,6 +93,8 @@ mod producer;
 mod progress;
 #[doc(hidden)]
 pub mod publish;
+#[doc(hidden)]
+pub mod publish_queue;
 mod read_control;
 #[doc(hidden)]
 pub mod read_session;
