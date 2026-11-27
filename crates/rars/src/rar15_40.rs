@@ -43,6 +43,7 @@ use crate::extraction_links::{
 };
 #[cfg(feature = "write")]
 pub use crate::streaming::{EntrySource, WriterResources};
+use crate::volume_extract::LazyChain;
 #[cfg(feature = "write")]
 pub use crate::volume_sink::{CollectedVolumes, VolumeOutput, VolumeSink};
 #[cfg(feature = "write")]
@@ -430,7 +431,7 @@ impl FileHeader {
         archive: &'a Archive,
         password: Option<&[u8]>,
         allowance: &B,
-    ) -> Result<PackedReader<crate::source::RangeReader<'a>, B>> {
+    ) -> Result<PackedReader<'a, B>> {
         let mut range = self.packed_range.clone();
         if self.is_encrypted() && self.is_cut_short() {
             // Whole cipher blocks only.
@@ -438,7 +439,7 @@ impl FileHeader {
         }
         let reader = archive.range_reader(range.clone())?;
         if !self.is_encrypted() {
-            return Ok(PackedReader::Plain(reader));
+            return Ok(PackedReader::Plain(LazyChain::single(reader)));
         }
         crate::crypto::require_encryption()?;
         let Some(password) = password else {
@@ -455,7 +456,7 @@ impl FileHeader {
             crate::codec::workspace::Boxed::try_new(
                 || {
                     DecryptingReader::with_allowance(
-                        reader,
+                        LazyChain::single(reader),
                         self.unp_ver,
                         password,
                         self.salt,
@@ -806,7 +807,8 @@ impl CommentHeader {
                     allowance,
                 )?;
                 decoder.read_control = control;
-                decoder.decode_member_from_reader(&mut &packed[..], target, writer)?;
+                let mut reader = PackedReader::<B>::Plain(LazyChain::bytes(packed));
+                decoder.decode_member_from_reader(&mut reader, target, writer)?;
             } else {
                 return Err(Error::UnsupportedCompression {
                     family: "RAR 1.5 comment",

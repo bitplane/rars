@@ -467,14 +467,14 @@ fn write_unsized_stored<B: Budget>(
         .map_err(|error| last.entry_error("extracting", error))
 }
 
-pub(super) fn packed_reader<R: Read, B: Budget>(
-    chain: R,
+pub(super) fn packed_reader<'a, B: Budget>(
+    chain: LazyChain<'a>,
     first: &FileHeader,
     password: Option<&[u8]>,
     key_cache: &KeyCache,
     allowance: &B,
     salvage: bool,
-) -> Result<PackedReader<R, B>> {
+) -> Result<PackedReader<'a, B>> {
     if !first.is_encrypted() {
         return Ok(PackedReader::Plain(chain));
     }

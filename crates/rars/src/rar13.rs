@@ -31,7 +31,7 @@ use crate::io_util::{read_exact_at, read_u16, read_u32};
 pub(crate) use crate::source::ArchiveSource;
 use crate::truncation::{TruncatedBlock, Truncation};
 use crate::version::ArchiveFamily;
-use crate::volume_extract::VolumeFeed;
+use crate::volume_extract::{LazyChain, VolumeFeed};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::ops::Range;
@@ -313,7 +313,7 @@ impl<B: Budget> Decoder15<B> {
     }
     fn decode_member_from_reader(
         &mut self,
-        input: &mut impl Read,
+        input: &mut PackedReader<'_>,
         output_size: usize,
         solid: bool,
         input_cut: bool,
@@ -849,10 +849,10 @@ impl Archive {
             }
 
             budget.check(unpacked_len as u64, b"CMT")?;
-            let mut packed = Rar13DecryptReader::new(
-                &self.main.extra[packed_start..packed_end],
+            let mut packed = PackedReader::Encrypted(Rar13DecryptReader::new(
+                LazyChain::bytes(&self.main.extra[packed_start..packed_end]),
                 Rar13Cipher::new_comment(),
-            );
+            ));
             let mut decoder = Decoder15::with_allowance(allowance);
             decoder.read_control = budget.control.clone();
             let mut data = Vec::new();
@@ -1035,7 +1035,7 @@ impl Entry {
         if self.is_empty_without_key(password) {
             return Ok(());
         }
-        let source = archive.range_reader(self.packed_range.clone())?;
+        let source = LazyChain::single(archive.range_reader(self.packed_range.clone())?);
         let mut reader = if self.is_encrypted() {
             crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
@@ -1083,28 +1083,26 @@ impl Entry {
             inner: out,
             checksum: &mut checksum,
         };
-        if self.is_encrypted() {
+        let mut packed = if self.is_encrypted() {
             crate::crypto::require_encryption()?;
             let password = password.ok_or(Error::NeedPassword)?;
-            let packed = archive.range_reader(self.packed_range.clone())?;
-            let mut packed = Rar13DecryptReader::new(packed, Rar13Cipher::for_password(password)?);
-            unpack15.decode_member_from_reader(
-                &mut packed,
-                self.header.unp_size as usize,
-                solid,
-                self.cut_short,
-                &mut checksum_writer,
-            )?;
+            let source = LazyChain::single(archive.range_reader(self.packed_range.clone())?);
+            PackedReader::Encrypted(Rar13DecryptReader::new(
+                source,
+                Rar13Cipher::for_password(password)?,
+            ))
         } else {
-            let mut packed = archive.range_reader(self.packed_range.clone())?;
-            unpack15.decode_member_from_reader(
-                &mut packed,
-                self.header.unp_size as usize,
-                solid,
-                self.cut_short,
-                &mut checksum_writer,
-            )?;
-        }
+            PackedReader::Plain(LazyChain::single(
+                archive.range_reader(self.packed_range.clone())?,
+            ))
+        };
+        unpack15.decode_member_from_reader(
+            &mut packed,
+            self.header.unp_size as usize,
+            solid,
+            self.cut_short,
+            &mut checksum_writer,
+        )?;
         let actual = checksum.finish();
         if actual == self.header.file_crc {
             Ok(())
@@ -1274,11 +1272,11 @@ impl Rar13Checksum {
     }
 }
 
-enum PackedReader<R> {
-    Plain(R),
-    Encrypted(Rar13DecryptReader<R>),
+enum PackedReader<'a> {
+    Plain(LazyChain<'a>),
+    Encrypted(Rar13DecryptReader<LazyChain<'a>>),
 }
-impl<R: Read> Read for PackedReader<R> {
+impl Read for PackedReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(out),

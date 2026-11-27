@@ -603,34 +603,34 @@ fn large_text() -> Vec<u8> {
         .collect()
 }
 
-struct ThreadRecordingReader<R> {
-    inner: R,
-    threads: Vec<std::thread::ThreadId>,
-}
-
-impl<R: Read> Read for ThreadRecordingReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.threads.push(std::thread::current().id());
-        self.inner.read(buf)
-    }
-}
-
 #[test]
 fn large_compressed_members_decode_off_the_caller() {
+    use crate::source::RangeReader;
+    use crate::volume_extract::FragmentWalk;
+
+    struct Fragment {
+        reader: Option<RangeReader<'static>>,
+        thread: Option<std::thread::ThreadId>,
+    }
+    impl FragmentWalk for Fragment {
+        fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
+            self.thread = Some(std::thread::current().id());
+            Ok(self.reader.take())
+        }
+    }
+
     let data = large_text();
     let (archive, file) = fixture(&data, false, false);
-    let (packed, _) = file
-        .packed_reader_with_allowance(
-            &archive,
-            None,
-            &crate::key_cache::KeyCache::default(),
-            &Allowance::default(),
-        )
+    let range = file.block.data_range.clone();
+    let first = archive
+        .source
+        .owned_range_reader(range.start..range.start)
         .unwrap();
-    let mut packed = ThreadRecordingReader {
-        inner: packed,
-        threads: Vec::new(),
+    let mut fragment = Fragment {
+        reader: Some(archive.source.owned_range_reader(range).unwrap()),
+        thread: None,
     };
+    let mut packed = PackedReader::Plain(LazyChain::new(&mut fragment, first));
     let mut decoder = ReaderState::new(&Allowance::default());
     let mut output = Vec::new();
     file.stream_packed_with_decoder(&mut packed, None, &mut decoder, 0, None, &mut output)
@@ -638,7 +638,7 @@ fn large_compressed_members_decode_off_the_caller() {
     assert_eq!(output, data);
     let caller = std::thread::current().id();
     assert_eq!(
-        packed.threads.iter().any(|thread| *thread != caller),
+        fragment.thread.unwrap() != caller,
         crate::parallel::may_spawn(),
     );
 }

@@ -82,7 +82,7 @@ use crate::error::{Error, Result};
 use crate::extraction_control::{finish_independent, holds_for_handler};
 use crate::member_batches::{self, Plan};
 use crate::output_pipeline::{self, PipeError};
-use crate::volume_extract::VolumeFeed;
+use crate::volume_extract::{LazyChain, VolumeFeed};
 use std::io::{Read, Write};
 use write_lane::Lane;
 
@@ -235,10 +235,7 @@ impl FileHeader {
         password: Option<&[u8]>,
         key_cache: &crate::key_cache::KeyCache,
         allowance: &B,
-    ) -> Result<(
-        PackedReader<crate::source::RangeReader<'a>, B>,
-        Option<Rar50Keys>,
-    )> {
+    ) -> Result<(PackedReader<'a, B>, Option<Rar50Keys>)> {
         let mut range = self.block.data_range.clone();
         if self.encrypted && self.is_cut_short() {
             // Whole cipher blocks only.
@@ -246,7 +243,7 @@ impl FileHeader {
         }
         let reader = archive.range_reader(range)?;
         if !self.encrypted {
-            return Ok((PackedReader::Plain(reader), None));
+            return Ok((PackedReader::Plain(LazyChain::single(reader)), None));
         }
         if !self.packed_size().is_multiple_of(16) {
             return Err(Error::InvalidHeader(
@@ -256,7 +253,7 @@ impl FileHeader {
         let keys = self.encryption_keys_cached(password, key_cache)?;
         let iv = self.encryption_iv()?;
         let reader = Boxed::try_new(
-            || Rar50DecryptingReader::with_keys(reader, keys.key, iv),
+            || Rar50DecryptingReader::with_keys(LazyChain::single(reader), keys.key, iv),
             allowance,
         )?;
         Ok((PackedReader::Encrypted(reader), Some(keys)))
@@ -267,10 +264,7 @@ impl FileHeader {
         &self,
         archive: &'a Archive,
         password: Option<&[u8]>,
-    ) -> Result<(
-        PackedReader<crate::source::RangeReader<'a>>,
-        Option<Rar50Keys>,
-    )> {
+    ) -> Result<(PackedReader<'a>, Option<Rar50Keys>)> {
         self.packed_reader_with_allowance(
             archive,
             password,
@@ -707,9 +701,9 @@ impl FileHeader {
     }
 
     #[cfg(all(test, feature = "write"))]
-    fn stream_packed_with_decoder<R: Read + Send, B: Budget>(
+    fn stream_packed_with_decoder<B: Budget>(
         &self,
-        packed: &mut R,
+        packed: &mut PackedReader<'_, B>,
         keys: Option<&Rar50Keys>,
         decoder: &mut ReaderState<B>,
         buffered_decode_limit: u64,
@@ -718,7 +712,7 @@ impl FileHeader {
     ) -> Result<()> {
         // Split members retain their existing checksum work. Only ordinary
         // members select the optional policy, independently of scratch decoding.
-        self.stream_packed_with_crc_policy::<false, _, _>(
+        self.stream_packed_with_crc_policy::<false, _>(
             packed,
             keys,
             decoder,
@@ -731,13 +725,9 @@ impl FileHeader {
 
     /// `outer_check` sees every output byte, on the checksum thread when there is one.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn stream_packed_with_crc_policy<
-        const OPTIONAL_CRC: bool,
-        R: Read + Send,
-        B: Budget,
-    >(
+    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, B: Budget>(
         &self,
-        packed: &mut R,
+        packed: &mut PackedReader<'_, B>,
         keys: Option<&Rar50Keys>,
         decoder: &mut ReaderState<B>,
         buffered_decode_limit: u64,
@@ -2160,7 +2150,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
                 &self.allowance,
             )
             .map_err(|error| file.entry_error("reading", error))?;
-        let result = file.stream_packed_with_crc_policy::<true, _, _>(
+        let result = file.stream_packed_with_crc_policy::<true, _>(
             &mut packed,
             keys.as_ref(),
             &mut streaming_decoder,
@@ -2414,11 +2404,15 @@ impl<F: FnMut(&[u8])> Write for UpdateSink<F> {
     }
 }
 
-enum PackedReader<R, B: Budget = Allowance> {
-    Plain(R),
-    Encrypted(Boxed<Rar50DecryptingReader<R>, B>),
+pub(crate) fn packed_bytes<B: Budget>(bytes: &[u8]) -> impl Read + '_ {
+    PackedReader::<B>::Plain(LazyChain::bytes(bytes))
 }
-impl<R: Read, B: Budget> Read for PackedReader<R, B> {
+
+enum PackedReader<'a, B: Budget = Allowance> {
+    Plain(LazyChain<'a>),
+    Encrypted(Boxed<Rar50DecryptingReader<LazyChain<'a>>, B>),
+}
+impl<B: Budget> Read for PackedReader<'_, B> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(out),
@@ -2601,7 +2595,7 @@ mod tests {
                         .source
                         .owned_range_reader(first.block.data_range.clone())?;
                     let _reader = volumes::packed_reader(
-                        crate::volume_extract::LazyChain::new(walk, reader),
+                        LazyChain::new(&mut *walk, reader),
                         Some(&decryptor),
                         budget,
                         false,
@@ -3587,8 +3581,8 @@ mod tests {
     #[test]
     fn unrepresentable_dictionary_is_refused_by_buffered_streaming_and_split_decoders() {
         struct NeverRead;
-        impl Read for NeverRead {
-            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+        impl crate::volume_extract::FragmentWalk for NeverRead {
+            fn next_fragment(&mut self) -> Result<Option<crate::source::RangeReader<'static>>> {
                 panic!("an unrepresentable dictionary must be rejected before reading")
             }
         }
@@ -3607,7 +3601,10 @@ mod tests {
         );
         assert_eq!(
             file.stream_packed_with_decoder(
-                &mut NeverRead,
+                &mut PackedReader::Plain(LazyChain::new(
+                    &mut NeverRead,
+                    crate::source::RangeReader::Memory(std::io::Cursor::new(&[]))
+                )),
                 None,
                 &mut decoder,
                 u64::MAX,
