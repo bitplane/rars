@@ -3846,6 +3846,7 @@ impl OptimalMatchPrices {
         }
     }
 
+    #[inline(always)]
     fn run(
         &self,
         state: &EncoderMatchState,
