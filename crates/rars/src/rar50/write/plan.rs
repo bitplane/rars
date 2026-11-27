@@ -793,17 +793,15 @@ mod tests {
                 run_filters,
                 ..
             } => {
-                assert!(run_filters, "level {level}, solid {solid}");
+                // Level 1 searches no filters.
+                assert_eq!(run_filters, level > 1, "level {level}, solid {solid}");
                 admission
             }
             ExecutionPlan::IndependentMembers(members) => {
                 assert!(
                     matches!(
                         members[0].execution,
-                        Execution::Blocks {
-                            run_filters: true,
-                            ..
-                        }
+                        Execution::Blocks { run_filters, .. } if run_filters == (level > 1)
                     ),
                     "level {level}, solid {solid}"
                 );

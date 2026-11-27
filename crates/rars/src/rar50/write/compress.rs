@@ -1203,15 +1203,15 @@ fn probe_members(
     Ok(any.then_some(stored))
 }
 
-/// What a probe sample packs to coded on its own at level 1, unfiltered: the
-/// cheapest coding there is, and about the least any level saves.
+/// What a probe sample packs to coded on its own by the lazy parse of level 2,
+/// unfiltered: about the least any level above the greedy one saves.
 fn probe_packed_len<B: Budget>(
     sample: &[u8],
     plan: &CompressPlan,
     cancelled: &dyn Fn() -> bool,
     allowance: &B,
 ) -> Result<usize> {
-    let options = super::filter_policy::encode_options_for_level(Some(1), sample.len() as u64)?;
+    let options = super::filter_policy::encode_options_for_level(Some(2), sample.len() as u64)?;
     let packed = crate::codec::rar50::encode_owned_member(
         sample,
         plan.algorithm_version,

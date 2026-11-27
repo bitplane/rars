@@ -518,6 +518,11 @@ pub struct EncodeOptions {
     pub nice_match_length: usize,
     /// How many times the optimal parse prices each block, at least once.
     pub parse_passes: usize,
+    /// Parse greedily: take the best match at each position, searching only
+    /// the remembered distances and `max_match_candidates` chain positions,
+    /// without looking ahead. The fastest parse there is. Lazy matching and
+    /// the optimal parse each take precedence over it.
+    pub greedy: bool,
 }
 
 impl EncodeOptions {
@@ -530,7 +535,13 @@ impl EncodeOptions {
             optimal_parse: false,
             nice_match_length: NICE_MATCH_LENGTH,
             parse_passes: OPTIMAL_PARSE_PASSES,
+            greedy: false,
         }
+    }
+
+    pub const fn with_greedy(mut self, enabled: bool) -> Self {
+        self.greedy = enabled;
+        self
     }
 
     pub const fn with_nice_match_length(mut self, length: usize) -> Self {
@@ -541,6 +552,10 @@ impl EncodeOptions {
     pub const fn with_parse_passes(mut self, passes: usize) -> Self {
         self.parse_passes = passes;
         self
+    }
+
+    pub(crate) const fn parses_greedily(&self) -> bool {
+        self.greedy && !self.lazy_matching && !self.optimal_parse
     }
 
     fn nice(&self) -> usize {
@@ -1905,9 +1920,7 @@ fn member_finder_with_allowance<B: Budget>(
 ) -> Result<Rar50MatchFinder<B>> {
     let mut finder =
         Rar50MatchFinder::with_allowance(finder_window(options, combined.len()), allowance)?;
-    for pos in 0..start {
-        finder.insert(combined, pos);
-    }
+    finder.insert_run(combined, 0..start.min(combined.len().saturating_sub(3)));
     Ok(finder)
 }
 
@@ -3028,7 +3041,8 @@ fn encode_token_payload<B: Budget>(
     distance_size: usize,
     allowance: &B,
 ) -> Result<BitWriter<B>> {
-    let lengths = table_lengths_for_stream(tokens.clone(), filters, distance_size, allowance)?;
+    let (lengths, stream_bits) =
+        stream_lengths_and_bits(tokens.clone(), filters, distance_size, allowance)?;
 
     let main_table = EncoderCodeTable::from_lengths(&lengths.main, allowance)?;
     let distance_table = EncoderCodeTable::from_lengths(&lengths.distance, allowance)?;
@@ -3036,13 +3050,7 @@ fn encode_token_payload<B: Budget>(
     let length_table = EncoderCodeTable::from_lengths(&lengths.length, allowance)?;
     let (table_data, table_bits) =
         encode_table_slices(lengths.slices(), algorithm_version, allowance)?;
-    let payload_bits = token_stream_bits_after_tables(
-        tokens.clone(),
-        filters,
-        &lengths,
-        distance_size,
-        table_bits,
-    )?;
+    let payload_bits = table_bits + stream_bits;
     let mut writer = BitWriter {
         bytes: table_data,
         bit_pos: table_bits,
@@ -3051,6 +3059,7 @@ fn encode_token_payload<B: Budget>(
         .bytes
         .reserve_total_capacity(payload_bits.div_ceil(8))?;
     let mut state = EncoderMatchState::default();
+    let mut bits = PendingBits::default();
     for token in filters
         .iter()
         .copied()
@@ -3060,20 +3069,21 @@ fn encode_token_payload<B: Budget>(
         match token {
             EncodeToken::Filter(filter) => {
                 let (code, len) = main_table.code_for_present_symbol(256);
-                writer.write_admitted_bits(usize::from(code), usize::from(len));
-                // token_stream_bits_after_tables validated this same record
-                // before its exact payload allocation was admitted.
+                bits.put(&mut writer, usize::from(code), usize::from(len));
+                bits.flush(&mut writer);
+                // stream_lengths_and_bits validated this same record before
+                // its exact payload allocation was admitted.
                 write_valid_filter(&mut writer, filter);
             }
             EncodeToken::Literal(byte) => {
                 let (code, len) = main_table.code_for_present_symbol(byte as usize);
-                writer.write_admitted_bits(usize::from(code), usize::from(len));
+                bits.put(&mut writer, usize::from(code), usize::from(len));
             }
             EncodeToken::Match { length, distance } => {
                 match state.encode_valid_match(length, distance, distance_size) {
                     EncodedMatch::LastLengthRepeat => {
                         let (code, len) = main_table.code_for_present_symbol(257);
-                        writer.write_admitted_bits(usize::from(code), usize::from(len));
+                        bits.put(&mut writer, usize::from(code), usize::from(len));
                     }
                     EncodedMatch::RepeatDistance {
                         index,
@@ -3081,13 +3091,12 @@ fn encode_token_payload<B: Budget>(
                         length_extra,
                     } => {
                         let (code, len) = main_table.code_for_present_symbol(258 + index);
-                        writer.write_admitted_bits(usize::from(code), usize::from(len));
+                        bits.put(&mut writer, usize::from(code), usize::from(len));
                         let (code, len) = length_table.code_for_present_symbol(length_slot);
-                        writer.write_admitted_bits(usize::from(code), usize::from(len));
+                        bits.put(&mut writer, usize::from(code), usize::from(len));
                         let length_extra_bits = length_slot_extra_bits(length_slot);
                         if length_extra_bits != 0 {
-                            writer
-                                .write_admitted_bits(length_extra, usize::from(length_extra_bits));
+                            bits.put(&mut writer, length_extra, usize::from(length_extra_bits));
                         }
                     }
                     EncodedMatch::New {
@@ -3098,26 +3107,22 @@ fn encode_token_payload<B: Budget>(
                         distance_bit_count,
                     } => {
                         let (code, len) = main_table.code_for_present_symbol(262 + length_slot);
-                        writer.write_admitted_bits(usize::from(code), usize::from(len));
+                        bits.put(&mut writer, usize::from(code), usize::from(len));
                         let length_extra_bits = length_slot_extra_bits(length_slot);
                         if length_extra_bits != 0 {
-                            writer
-                                .write_admitted_bits(length_extra, usize::from(length_extra_bits));
+                            bits.put(&mut writer, length_extra, usize::from(length_extra_bits));
                         }
                         let (code, len) = distance_table.code_for_present_symbol(distance_slot);
-                        writer.write_admitted_bits(usize::from(code), usize::from(len));
+                        bits.put(&mut writer, usize::from(code), usize::from(len));
                         if distance_bit_count >= 4 {
                             if distance_bit_count > 4 {
-                                writer.write_admitted_bits(
-                                    distance_extra >> 4,
-                                    distance_bit_count - 4,
-                                );
+                                bits.put(&mut writer, distance_extra >> 4, distance_bit_count - 4);
                             }
                             let (code, len) =
                                 align_table.code_for_present_symbol(distance_extra & 0x0f);
-                            writer.write_admitted_bits(usize::from(code), usize::from(len));
+                            bits.put(&mut writer, usize::from(code), usize::from(len));
                         } else if distance_bit_count != 0 {
-                            writer.write_admitted_bits(distance_extra, distance_bit_count);
+                            bits.put(&mut writer, distance_extra, distance_bit_count);
                         }
                     }
                 }
@@ -3125,9 +3130,42 @@ fn encode_token_payload<B: Budget>(
             }
         }
     }
+    bits.flush(&mut writer);
 
     debug_assert_eq!(writer.bit_pos, payload_bits);
     Ok(writer)
+}
+
+/// Codes waiting to be written, most significant first, so that a token's
+/// several codes and the short tokens after it reach the writer in one call.
+#[derive(Default)]
+struct PendingBits {
+    value: u64,
+    count: usize,
+}
+
+impl PendingBits {
+    #[inline]
+    fn put<B: Budget>(&mut self, writer: &mut BitWriter<B>, value: usize, count: usize) {
+        debug_assert!(count < 64);
+        if self.count + count > 64 {
+            self.flush(writer);
+        }
+        let value = value as u64 & ((1u64 << count) - 1);
+        self.value = (self.value << count) | value;
+        self.count += count;
+    }
+
+    #[inline]
+    fn flush<B: Budget>(&mut self, writer: &mut BitWriter<B>) {
+        if self.count != 0 {
+            writer
+                .bytes
+                .write_msb_bits_admitted(&mut writer.bit_pos, self.value, self.count);
+            self.value = 0;
+            self.count = 0;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3415,16 +3453,16 @@ impl EncoderMatchState {
         if distance == self.reps[0] && length == self.last_length {
             return;
         }
-        if let Some(index) = self
-            .reps
-            .iter()
-            .position(|&repeat_distance| repeat_distance == distance)
-        {
-            self.reps[..=index].rotate_right(1);
+        let [first, second, third, _] = self.reps;
+        self.reps = if distance == first {
+            self.reps
+        } else if distance == second {
+            [distance, first, third, self.reps[3]]
+        } else if distance == third {
+            [distance, first, second, self.reps[3]]
         } else {
-            self.reps.rotate_right(1);
-        }
-        self.reps[0] = distance;
+            [distance, first, second, third]
+        };
         self.last_length = length;
     }
 }
@@ -3461,15 +3499,42 @@ fn table_lengths_for_stream<B: Budget>(
     distance_size: usize,
     allowance: &B,
 ) -> Result<OwnedLengths<B>> {
+    stream_lengths_and_bits(tokens, filters, distance_size, allowance).map(|(lengths, _)| lengths)
+}
+
+/// The Huffman code lengths of a stream of tokens, and how many bits the
+/// stream codes to under them, tables not included.
+///
+/// The count falls out of the symbol frequencies: every code is its length
+/// once per use, and the extra bits and filter records do not depend on the
+/// tables at all.
+fn stream_lengths_and_bits<B: Budget>(
+    tokens: impl Iterator<Item = EncodeToken>,
+    filters: &[EncodeFilter],
+    distance_size: usize,
+    allowance: &B,
+) -> Result<(OwnedLengths<B>, usize)> {
     let mut main_frequencies = Buffer::filled(MAIN_TABLE_SIZE, 0usize, allowance)?;
     main_frequencies[256] = filters.len();
     let mut distance_frequencies = Buffer::filled(distance_size, 0usize, allowance)?;
     let mut align_frequencies = Buffer::filled(ALIGN_TABLE_SIZE, 0usize, allowance)?;
     let mut length_frequencies = Buffer::filled(LENGTH_TABLE_SIZE, 0usize, allowance)?;
+    let mut extra_bits = 0usize;
+    let filter_record_bits = |filter: EncodeFilter| -> Result<usize> {
+        let mut writer = BitWriter::with_allowance(allowance);
+        try_write_filter(&mut writer, filter)?;
+        Ok(writer.bit_pos)
+    };
+    for &filter in filters {
+        extra_bits += filter_record_bits(filter)?;
+    }
     let mut state = EncoderMatchState::default();
     for token in tokens {
         match token {
-            EncodeToken::Filter(_) => main_frequencies[256] += 1,
+            EncodeToken::Filter(filter) => {
+                main_frequencies[256] += 1;
+                extra_bits += filter_record_bits(filter)?;
+            }
             EncodeToken::Literal(byte) => main_frequencies[byte as usize] += 1,
             EncodeToken::Match { length, distance } => {
                 match state.encode_match(length, distance, distance_size)? {
@@ -3479,6 +3544,7 @@ fn table_lengths_for_stream<B: Budget>(
                     } => {
                         main_frequencies[258 + index] += 1;
                         length_frequencies[length_slot] += 1;
+                        extra_bits += usize::from(length_slot_extra_bits(length_slot));
                     }
                     EncodedMatch::New {
                         length_slot,
@@ -3489,8 +3555,12 @@ fn table_lengths_for_stream<B: Budget>(
                     } => {
                         main_frequencies[262 + length_slot] += 1;
                         distance_frequencies[distance_slot] += 1;
+                        extra_bits += usize::from(length_slot_extra_bits(length_slot));
                         if distance_bit_count >= 4 {
                             align_frequencies[distance_extra & 0x0f] += 1;
+                            extra_bits += distance_bit_count - 4;
+                        } else {
+                            extra_bits += distance_bit_count;
                         }
                     }
                 }
@@ -3499,12 +3569,25 @@ fn table_lengths_for_stream<B: Budget>(
         }
     }
 
-    Ok(OwnedLengths {
+    let lengths = OwnedLengths {
         main: huffman::complete_lengths_with_allowance(&main_frequencies, 15, allowance)?,
         distance: huffman::complete_lengths_with_allowance(&distance_frequencies, 15, allowance)?,
         align: huffman::complete_lengths_with_allowance(&align_frequencies, 15, allowance)?,
         length: huffman::complete_lengths_with_allowance(&length_frequencies, 15, allowance)?,
-    })
+    };
+    let coded = |frequencies: &[usize], lengths: &[u8]| -> usize {
+        frequencies
+            .iter()
+            .zip(lengths)
+            .map(|(&count, &length)| count * usize::from(length))
+            .sum()
+    };
+    let bits = extra_bits
+        + coded(&main_frequencies, &lengths.main)
+        + coded(&distance_frequencies, &lengths.distance)
+        + coded(&align_frequencies, &lengths.align)
+        + coded(&length_frequencies, &lengths.length);
+    Ok((lengths, bits))
 }
 
 /// Actual payload size, including the transmitted tables and filter records.
@@ -4493,6 +4576,17 @@ fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
             &mut own
         }
     };
+    if options.parses_greedily() {
+        return greedy_tokens(
+            combined,
+            block,
+            finder,
+            options,
+            distance_size,
+            progress,
+            allowance,
+        );
+    }
     let mut tokens = Buffer::new(allowance);
     let mut pos = start;
     let mut state = EncoderMatchState::default();
@@ -4539,6 +4633,124 @@ fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
                 .map_err(Into::into)?;
             finder.insert(combined, pos);
             pos += 1;
+        }
+        let consumed = pos - start;
+        if consumed >= next_report {
+            if progress
+                .as_deref_mut()
+                .is_some_and(|report| !report(consumed))
+            {
+                return Err(Error::Cancelled);
+            }
+            next_report = consumed.saturating_add(1024 * 1024);
+        }
+    }
+    if progress.is_some_and(|report| !report(end - start)) {
+        return Err(Error::Cancelled);
+    }
+    Ok(tokens)
+}
+
+/// How many positions after a match's first the greedy parse puts into the
+/// finder. The rest of a long match is stepped over unhashed, which costs
+/// about a quarter of a percent on binaries and buys a tenth of the time.
+const GREEDY_INSERTED_PER_MATCH: usize = 16;
+
+/// The least score a greedy match must beat to be taken over a literal. A four
+/// byte match whose estimated cost is 16 bits or more goes out as literals,
+/// which leaves the next position free to start a longer one.
+const GREEDY_MIN_SCORE: isize = 48;
+
+/// Each run of this many positions without a match adds one more literal the
+/// greedy parse steps over unsearched, so data that does not compress is
+/// crossed in a fraction of the searches.
+const GREEDY_MISS_SHIFT: u32 = 7;
+
+/// The greedy parse: at each position the best of the remembered distances and
+/// the first `max_match_candidates` positions in the hash chain, taken without
+/// looking ahead. Matches enter the finder only partly; see
+/// [`GREEDY_INSERTED_PER_MATCH`].
+fn greedy_tokens<B: Budget, T: From<EncodeToken>>(
+    combined: &[u8],
+    block: Range<usize>,
+    finder: &mut Rar50MatchFinder<B>,
+    options: EncodeOptions,
+    distance_size: usize,
+    mut progress: Option<&mut dyn FnMut(usize) -> bool>,
+    allowance: &B,
+) -> Result<Buffer<T, B>> {
+    let start = block.start;
+    let end = block.end;
+    let mut tokens = Buffer::new(allowance);
+    let mut pos = start;
+    let mut state = EncoderMatchState::default();
+    let mut next_report = 0usize;
+    let mut misses = 0usize;
+    // The last position with four bytes after it to hash.
+    let searchable_end = end.min(combined.len().saturating_sub(3));
+    let word = |at: usize| u32::from_le_bytes(combined[at..at + 4].try_into().unwrap());
+    while pos < end {
+        if pos >= searchable_end || end - pos < 4 {
+            tokens
+                .push(T::from(EncodeToken::Literal(combined[pos])))
+                .map_err(Into::into)?;
+            finder.insert(combined, pos);
+            pos += 1;
+            continue;
+        }
+        let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
+        let max_distance = pos.min(options.max_match_distance);
+        let here = word(pos);
+        let mut candidate = finder.insert_and_first(combined, pos);
+        let mut best = None;
+        for &distance in &state.reps {
+            if distance != 0 && distance <= max_distance && word(pos - distance) == here {
+                let length = match_length(combined, pos, distance, max_length);
+                consider_match_candidate(&mut best, &state, distance_size, length, distance);
+            }
+        }
+        let mut checked = 0;
+        while candidate != match_finder::NO_POSITION && checked < options.max_match_candidates {
+            let distance = pos - candidate;
+            if distance > max_distance {
+                break;
+            }
+            checked += 1;
+            if distance != state.reps[0] && word(candidate) == here {
+                let length = match_length(combined, pos, distance, max_length);
+                consider_match_candidate(&mut best, &state, distance_size, length, distance);
+            }
+            if checked < options.max_match_candidates {
+                candidate = finder.previous(candidate);
+            }
+        }
+        match best {
+            Some(MatchCandidate {
+                length,
+                distance,
+                score,
+            }) if score > GREEDY_MIN_SCORE => {
+                tokens
+                    .push(T::from(EncodeToken::Match { length, distance }))
+                    .map_err(Into::into)?;
+                state.remember(length, distance);
+                let inserted_end = (pos + length)
+                    .min(pos + 1 + GREEDY_INSERTED_PER_MATCH)
+                    .min(searchable_end);
+                finder.insert_run(combined, pos + 1..inserted_end);
+                pos += length;
+                misses = 0;
+            }
+            _ => {
+                misses += 1;
+                let skipped = 1 + (misses >> GREEDY_MISS_SHIFT).min(end - pos - 1);
+                for &byte in &combined[pos..pos + skipped] {
+                    tokens
+                        .push(T::from(EncodeToken::Literal(byte)))
+                        .map_err(Into::into)?;
+                }
+                pos += skipped;
+            }
         }
         let consumed = pos - start;
         if consumed >= next_report {
@@ -4757,6 +4969,7 @@ fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) ->
     super::super::fast::match_length(input, pos, distance, max_length)
 }
 
+#[inline]
 fn consider_match_candidate(
     best: &mut Option<MatchCandidate>,
     state: &EncoderMatchState,
