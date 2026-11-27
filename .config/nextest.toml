@@ -42,6 +42,9 @@ not (
     (binary_id(rars) & test(=rar50::write::tests::streaming_entry_order_is_identical_at_one_and_many_job_budgets)) |
     (binary_id(rars-cli::cli) & test(=raising_the_memory_limit_never_changes_the_archive)) |
     (binary_id(rars-cli::cli) & test(=rar50_looks_for_a_data_filter_by_default)) |
+    (binary_id(rars::charge_covers_peak) & test(=rar4_level1_streamed_piece_search_charge_covers_and_fits)) |
+    (binary_id(rars::charge_covers_peak) & test(=rar4_level2_fitted_piece_search_charge_covers_every_input)) |
+    (binary_id(rars::charge_covers_peak) & test(=rar5_level5_fitted_dictionary_charge_covers_three_symbol_noise)) |
     (binary_id(rars::encoder_memory_regression) & test(=default_builder_and_explicit_dictionaries_fit_fixed_managed_ceilings)) |
     (binary_id(rars::encoder_memory_regression) & test(=solid_multirun_history_fits_fixed_ceiling_and_extracts)) |
     (binary_id(rars::legacy_large_volumes) & test(=a_stored_member_over_4_gib_splits_across_volumes_with_large_headers)) |

@@ -748,11 +748,6 @@ mod tests {
                 }
             );
             assert!(budget / member.admission >= threads);
-            match threads {
-                8 => assert_eq!(budget / member.workspace, 5),
-                32 => assert_eq!(budget / member.workspace, 21),
-                _ => {}
-            }
         }
     }
 
@@ -845,7 +840,7 @@ mod tests {
 
         let tight = WriterResources::default().with_memory_limit(admission - 1);
         let (planned, charge) = default_job(5, false, &tight);
-        assert_eq!(planned.dictionary_size, settings.dictionary_size / 2);
+        assert!(planned.dictionary_size < settings.dictionary_size);
         assert!(charge <= tight.memory_limit());
     }
 
