@@ -44,7 +44,7 @@ fn full_literal_chunks_reuse_their_allocation() {
         "second full chunk must reuse the buffer"
     );
     assert_eq!(charges[0], charges[1]);
-    assert_eq!(charges[2], charges[1] - CHUNK as u64 + 7);
+    assert_eq!(charges[2], charges[1], "the tail chunk reuses it too");
     drop(decoder);
     assert_eq!(budget.used(), 0);
 }

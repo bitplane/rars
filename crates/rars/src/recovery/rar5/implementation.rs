@@ -320,11 +320,10 @@ pub(crate) fn choose_recovery_capacity_mode(
     allowance: &crate::codec::workspace::Limited,
 ) -> Result<(RecoveryMemoryMode, u64)> {
     use crate::codec::workspace::Limited;
-    let field = ((FIELD_SIZE * 4 + 1) * 2 + (FIELD_SIZE + 1) * 4) as u64;
     let rows = plan.recovery_shards;
     let descriptor = std::mem::size_of::<Buffer<u8, Limited>>() as u64;
-    let fixed = field
-        .saturating_add(rows.saturating_mul(descriptor))
+    let fixed = rows
+        .saturating_mul(descriptor)
         .saturating_add(rows.saturating_mul(plan.data_shards).saturating_mul(2))
         .saturating_add(plan.data_shards.saturating_mul(8));
     let io = plan.group_count.max(1).min(RECOVERY_IO_BLOCK as u64);
@@ -530,7 +529,7 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     };
 
     check_recovery_cancelled(progress)?;
-    let field = RecoveryField::new(allowance)?;
+    let field = shared_gf16();
     let gf = field.view();
     let matrix = encoder_matrix_with_allowance(data_shards, recovery_shards, &gf, allowance)?;
     let mut shard_states = Buffer::filled(data_shards, 0u64, allowance)?;
@@ -676,31 +675,6 @@ fn rows_with_allowance<B: Budget>(
         out.push_admitted(Buffer::filled(width, 0u8, allowance)?);
     }
     Ok(out)
-}
-
-enum RecoveryField<B: Budget> {
-    Shared(&'static Gf16),
-    Owned {
-        exp: Buffer<u16, B>,
-        log: Buffer<u32, B>,
-    },
-}
-impl<B: Budget> RecoveryField<B> {
-    fn new(allowance: &B) -> Result<Self> {
-        if !B::LIMITED {
-            return Ok(Self::Shared(shared_gf16()));
-        }
-        let mut exp = Buffer::filled(FIELD_SIZE * 4 + 1, 0u16, allowance)?;
-        let mut log = Buffer::filled(FIELD_SIZE + 1, 0u32, allowance)?;
-        initialize_field(&mut exp, &mut log);
-        Ok(Self::Owned { exp, log })
-    }
-    fn view(&self) -> GfView<'_> {
-        match self {
-            Self::Shared(gf) => gf.view(),
-            Self::Owned { exp, log } => GfView { exp, log },
-        }
-    }
 }
 
 fn encoder_matrix_with_allowance<B: Budget>(
@@ -2420,7 +2394,7 @@ mod tests {
     fn aggregate_recovery_planning_selects_stripes_beside_retained_capacity() {
         let data = vec![7; 131072];
         let plan = super::plan_inline_recovery(data.len() as u64, 100).unwrap();
-        let ledger = super::Allowance::limited(900000);
+        let ledger = super::Allowance::limited(113_562);
         let retained = super::Buffer::filled(4096, 0u8, &ledger).unwrap();
         let (mode, required) =
             super::choose_recovery_capacity_mode(plan, 8 * 1024 * 1024, &ledger).unwrap();
@@ -2466,28 +2440,20 @@ mod tests {
     }
 
     #[test]
-    fn recovery_allowance_covers_tables_parity_and_framing_in_both_modes() {
+    fn recovery_allowance_covers_parity_and_framing_in_both_modes() {
         use super::{streamed_recovery_with_allowance, Allowance, RecoveryMemoryMode};
         use std::io::Cursor;
         let data = recovery_test_bytes(200_003, 17);
         let plan = plan_inline_recovery(data.len() as u64, 10).unwrap();
         let expected =
             super::legacy_reference::build_structural_inline_recovery_data(&data, 10).unwrap();
-        let field_bytes = ((super::FIELD_SIZE * 4 + 1) * 2 + (super::FIELD_SIZE + 1) * 4) as u64;
         for mode in [
             RecoveryMemoryMode::Resident,
             RecoveryMemoryMode::Striped { stripe_len: 64 },
         ] {
             let mut successes = 0;
             let mut refusals = 0;
-            for limit in [
-                0,
-                field_bytes - 1,
-                field_bytes,
-                field_bytes + 2048,
-                field_bytes + 16384,
-                field_bytes + 131072,
-            ] {
+            for limit in [0, 1, 2048, 16384, 131072, 8 << 20] {
                 let allowance = Allowance::limited(limit);
                 let mut body = Cursor::new(&data);
                 let mut scratch = Cursor::new(Vec::new());
@@ -2516,7 +2482,7 @@ mod tests {
                             crate::Error::from(error).kind(),
                             crate::ErrorKind::ResourceLimit
                         );
-                        if limit <= field_bytes {
+                        if limit <= 1 {
                             assert_eq!(body.position(), 0);
                             assert!(output.is_empty());
                         }

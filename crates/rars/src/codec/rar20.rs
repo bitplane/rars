@@ -169,12 +169,8 @@ impl<B: Budget> Reader20State<B> {
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
         // A future match needs only the last window. Do not copy deferred
-        // bytes into a checkpoint; bounded copies keep their charge sequence.
-        let drain = if B::LIMITED {
-            0
-        } else {
-            self.output.len().saturating_sub(MAX_HISTORY)
-        };
+        // bytes into a checkpoint.
+        let drain = self.output.len().saturating_sub(MAX_HISTORY);
         Ok(Self {
             read_control: self.read_control.clone(),
             bits: self.bits.try_clone()?,
@@ -645,8 +641,7 @@ impl<B: Budget> Reader20State<B> {
         output_size: usize,
         before_window: bool,
     ) -> Result<()> {
-        if B::LIMITED || length <= SHORT_MATCH {
-            // Keep short copies cheap and preserve growth/failure prefixes under a quota.
+        if length <= SHORT_MATCH {
             for index in 0..length {
                 if self.current_pos() >= output_size {
                     self.pending_match = Some((length - index, offset, before_window));
@@ -757,9 +752,8 @@ impl<B: Budget> Reader20State<B> {
     }
 
     fn prepare_history(&mut self, output_size: usize) {
-        // Reclaim deferred bytes before they could cause an allocation. Keep
-        // bounded readers' growth and failure prefixes exactly as before.
-        if !B::LIMITED && output_size > self.output.capacity() - self.output.len() {
+        // Reclaim deferred bytes before they could cause an allocation.
+        if output_size > self.output.capacity() - self.output.len() {
             let current = self.current_pos();
             self.trim_history(current, current);
         }
@@ -767,7 +761,7 @@ impl<B: Budget> Reader20State<B> {
 
     fn finish_history(&mut self) {
         // Amortize window moves across small members using existing capacity.
-        if B::LIMITED || self.output.len().saturating_sub(MAX_HISTORY) >= HISTORY_TRIM_BATCH {
+        if self.output.len().saturating_sub(MAX_HISTORY) >= HISTORY_TRIM_BATCH {
             let current = self.current_pos();
             self.trim_history(current, current);
         }

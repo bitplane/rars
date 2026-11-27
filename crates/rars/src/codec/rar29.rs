@@ -838,7 +838,7 @@ impl<B: Budget> Reader29State<B> {
                     self.output.try_push(symbol as u8)?;
                     // Setting up the burst costs more than a match-heavy
                     // stream gains from it when no literal follows.
-                    if B::LIMITED || !self.main.literal_follows(&self.bits) {
+                    if !self.main.literal_follows(&self.bits) {
                         continue;
                     }
                     // Past `top_up` at least the packed window's low-water
