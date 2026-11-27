@@ -13,6 +13,7 @@ use std::{
 mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+#[cfg(feature = "encryption")]
 use data::xorshift;
 
 const FORMATS: [ArchiveVersion; 8] = [

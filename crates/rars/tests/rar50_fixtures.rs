@@ -5,12 +5,14 @@ mod fixtures;
 mod scratch;
 #[path = "support/sinks.rs"]
 mod sinks;
+#[cfg(feature = "write")]
 #[path = "support/vint.rs"]
 mod vint;
 #[path = "support/volume_size.rs"]
 mod volume_size;
 use fixtures::fixture;
 use sinks::Capture;
+#[cfg(feature = "write")]
 use vint::read_vint;
 
 use rars::codec::rar50::{decode_lz, parse_compressed_block, read_table_lengths, DecodeTables};
@@ -36,7 +38,9 @@ use std::cell::RefCell;
 use std::fs;
 #[cfg(feature = "write")]
 use std::io::Read;
-use std::io::{Result as IoResult, Write};
+#[cfg(any(feature = "write", feature = "encryption"))]
+use std::io::Result as IoResult;
+use std::io::Write;
 use std::path::Path;
 #[cfg(feature = "write")]
 use std::process::Command;
@@ -3696,6 +3700,7 @@ fn writes_rar50_volume_sets_that_reader_reassembles() {
             member(two, second.repeat(repeats.1), times.1),
         ]
     };
+    #[cfg_attr(not(feature = "encryption"), allow(unused_mut))]
     let mut cases = vec![
         case(
             "solid",
