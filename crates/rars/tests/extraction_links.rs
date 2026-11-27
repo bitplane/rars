@@ -1,4 +1,8 @@
 #![cfg(feature = "write")]
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::Capture;
+
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ExtractedLink};
 use std::{
     cell::RefCell,
@@ -6,16 +10,6 @@ use std::{
     rc::Rc,
 };
 
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(data);
-        Ok(data.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 fn fixture(version: ArchiveVersion, store: bool, solid: bool) -> Archive {
     let mut builder = Builder::new(version).store(store).solid(solid);
     builder

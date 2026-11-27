@@ -3,17 +3,6 @@
 use rars::{ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 use std::{cell::RefCell, io::Write, rc::Rc};
 
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 #[test]
 fn workspace_policy_covers_every_codec_and_parallel_publication() {
     for version in [
@@ -266,6 +255,9 @@ fn solid_rar5_streaming_and_selected_reads_share_the_operation_quota() {
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::Capture;
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[test]

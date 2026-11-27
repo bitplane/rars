@@ -1,5 +1,12 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/sinks.rs"]
+mod sinks;
+use data::xorshift;
+use sinks::Capture;
+
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error,
     ExtractionDecision as Decision, ExtractionOutcome as Outcome,
@@ -18,16 +25,6 @@ const VERSIONS: [ArchiveVersion; 8] = [
     ArchiveVersion::Rar70,
 ];
 
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 fn archive(version: ArchiveVersion, solid: bool, encrypted: bool) -> Archive {
     let mut builder = Builder::new(version)
         .solid(solid)
@@ -1081,15 +1078,7 @@ fn controlled_directory_extraction_selects_a_writer_without_spending_output_quot
 
 #[test]
 fn a_solid_skip_budget_decodes_a_skipped_member_and_delivers_the_ones_after_it() {
-    let mut state = 0x9e37_79b9u32;
-    let middle: Vec<u8> = (0..8192)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let middle = xorshift(8192, 0x9e37_79b9);
     let first = b"before the large member".to_vec();
     // Only the skipped member's history can produce this one.
     let last = middle[1000..1300].to_vec();

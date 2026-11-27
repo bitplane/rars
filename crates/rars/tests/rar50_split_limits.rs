@@ -11,17 +11,9 @@ use std::rc::Rc;
 
 #[path = "support/scratch.rs"]
 mod scratch;
-
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::Capture;
 
 fn options(limit: u64, password: Option<&[u8]>) -> ArchiveReadOptions<'_> {
     password

@@ -14,6 +14,9 @@ use std::time::SystemTime;
 
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/vint.rs"]
+mod vint;
+use vint::read_vint;
 
 const DIR_TIME: i64 = 1_600_000_000;
 const FILE_TIME: i64 = 1_650_000_000;
@@ -59,20 +62,6 @@ fn paths(names: &[&str]) -> BTreeSet<PathBuf> {
     names.iter().map(PathBuf::from).collect()
 }
 
-fn read_vint(data: &[u8], mut at: usize) -> (u64, usize) {
-    let mut value = 0;
-    let mut shift = 0;
-    loop {
-        let byte = data[at];
-        at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return (value, at);
-        }
-        shift += 7;
-    }
-}
-
 /// Swaps a RAR 5 member name for one of the same length and repairs the
 /// header CRC, giving a well-formed archive the builder would refuse to make.
 fn rewrite_rar5_name(archive: &[u8], placeholder: &[u8], replacement: &[u8]) -> Vec<u8> {
@@ -81,15 +70,16 @@ fn rewrite_rar5_name(archive: &[u8], placeholder: &[u8], replacement: &[u8]) -> 
     let mut at = 8;
     while at + 4 < archive.len() {
         let body_at = at + 4;
-        let (size, after_size) = read_vint(archive, body_at);
-        let body_end = after_size + size as usize;
-        let (kind, cursor) = read_vint(archive, after_size);
-        let (flags, mut cursor) = read_vint(archive, cursor);
+        let mut cursor = body_at;
+        let size = read_vint(archive, &mut cursor);
+        let body_end = cursor + size as usize;
+        let kind = read_vint(archive, &mut cursor);
+        let flags = read_vint(archive, &mut cursor);
         if flags & 1 != 0 {
-            cursor = read_vint(archive, cursor).1;
+            read_vint(archive, &mut cursor);
         }
         let data_size = if flags & 2 != 0 {
-            read_vint(archive, cursor).0 as usize
+            read_vint(archive, &mut cursor) as usize
         } else {
             0
         };

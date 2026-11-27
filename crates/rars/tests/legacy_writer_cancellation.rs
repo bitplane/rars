@@ -9,8 +9,11 @@ use std::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::xorshift;
 
 const FORMATS: [ArchiveVersion; 7] = [
     ArchiveVersion::Rar13,
@@ -371,15 +374,7 @@ fn rar13_compressed_volume_preserves_cancellation_from_codec() {
 fn rar29_filter_search_preserves_cancellation() {
     use rars::{rar15_40, FeatureSet, FilterPolicy};
 
-    let mut state = 0x1357_9bdfu32;
-    let data: Vec<u8> = (0..16_384)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let data = xorshift(16_384, 0x1357_9bdf);
     let entry = rar15_40::FileEntry {
         name: b"binary",
         data: &data,

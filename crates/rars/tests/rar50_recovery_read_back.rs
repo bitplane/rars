@@ -4,8 +4,11 @@ use rars::rar50::{self, ArchiveEntry, ArchiveExtras, WriterOptions};
 use rars::{ArchiveVersion, Builder, EntrySource, Error, FeatureSet, WriterResources};
 use std::io::{Cursor, Seek, SeekFrom, Write};
 
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::xorshift;
 
 struct WriteOnly(Cursor<Vec<u8>>);
 
@@ -22,18 +25,6 @@ impl Seek for WriteOnly {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         self.0.seek(to)
     }
-}
-
-fn noise(len: usize, seed: u32) -> Vec<u8> {
-    let mut state = seed | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
 }
 
 fn text(len: usize, seed: u32) -> Vec<u8> {
@@ -129,7 +120,9 @@ fn on_two_threads<T: Send>(work: impl FnOnce() -> T + Send) -> T {
 fn a_readable_output_needs_no_mirror_of_the_archive() {
     // Too large to mirror under the cap, but the members in flight and the
     // record fit.
-    let members: Vec<_> = (0..48).map(|index| noise(64 * 1024, index)).collect();
+    let members: Vec<_> = (0..48)
+        .map(|index| xorshift(64 * 1024, index | 1))
+        .collect();
     let entries = entries(&members, None);
     // Stored members hashed on their copy are held as sources, so at level 0
     // only a mirror can exceed the cap.
@@ -250,7 +243,7 @@ fn a_builder_writing_to_a_path_reads_its_record_back() {
         builder
             .add_bytes(
                 format!("member{index:02}.bin").into_bytes(),
-                noise(64 * 1024, index),
+                xorshift(64 * 1024, index | 1),
                 None,
                 None,
             )

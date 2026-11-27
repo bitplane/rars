@@ -3,6 +3,9 @@
 use rars::{ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder};
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::SyncCapture;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -45,16 +48,6 @@ fn tracked(bytes: Vec<u8>) -> Tracked {
         reads: Arc::default(),
         dropped: Arc::default(),
         fail: Arc::default(),
-    }
-}
-struct Capture(Arc<Mutex<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
     }
 }
 
@@ -119,7 +112,7 @@ fn seekable_sources_cover_families_encryption_sfx_and_parallel_extraction() {
             for parallel in [false, true] {
                 let output = Arc::new(Mutex::new(Vec::new()));
                 let open = |_: &rars::ExtractedEntryMeta| {
-                    Ok(Box::new(Capture(output.clone())) as Box<dyn Write>)
+                    Ok(Box::new(SyncCapture(output.clone())) as Box<dyn Write>)
                 };
                 if parallel {
                     clone.extract_to_parallel_buffered(password, open).unwrap();
@@ -184,7 +177,7 @@ fn unencrypted_rar5_behind_a_prefix_reads_as_the_byte_parser_does() {
                 let extracted = |archive: &rars::Archive| {
                     let output = Arc::new(Mutex::new(Vec::new()));
                     archive
-                        .extract_to(None, |_| Ok(Box::new(Capture(output.clone()))))
+                        .extract_to(None, |_| Ok(Box::new(SyncCapture(output.clone()))))
                         .unwrap();
                     let output = output.lock().unwrap().clone();
                     output
@@ -285,8 +278,10 @@ fn split_members_can_read_from_multiple_caller_owned_sources() {
             .collect();
         assert!(volumes.len() > 1);
         let output = Arc::new(Mutex::new(Vec::new()));
-        rars::extract_volumes_to(&volumes, None, |_| Ok(Box::new(Capture(output.clone()))))
-            .unwrap();
+        rars::extract_volumes_to(&volumes, None, |_| {
+            Ok(Box::new(SyncCapture(output.clone())))
+        })
+        .unwrap();
         assert_eq!(*output.lock().unwrap(), data);
     }
 }

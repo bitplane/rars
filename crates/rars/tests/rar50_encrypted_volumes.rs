@@ -1,20 +1,12 @@
 #![cfg(all(feature = "write", feature = "encryption", feature = "recovery"))]
 //! What RAR 7.12 checks in a password-protected RAR 5 set that rars writes.
 
+#[path = "support/data.rs"]
+mod data;
+use data::xorshift;
+
 use rars::rar50::{Archive, Block};
 use rars::{ArchiveVersion, Builder};
-
-fn noise(len: usize) -> Vec<u8> {
-    let mut state = 0x2545_f491u32;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
 
 fn build(header_encryption: bool, volume_size: Option<usize>) -> Vec<Vec<u8>> {
     let mut builder = Builder::new(ArchiveVersion::Rar50)
@@ -24,7 +16,12 @@ fn build(header_encryption: bool, volume_size: Option<usize>) -> Vec<Vec<u8>> {
         .recovery_percent(Some(5))
         .volume_size(volume_size);
     builder
-        .add_bytes(b"data.bin".to_vec(), noise(150_000), None, None)
+        .add_bytes(
+            b"data.bin".to_vec(),
+            xorshift(150_000, 0x2545_f491),
+            None,
+            None,
+        )
         .unwrap();
     match volume_size {
         Some(_) => builder.build_volumes(None).unwrap(),

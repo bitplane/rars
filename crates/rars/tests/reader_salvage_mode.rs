@@ -6,6 +6,9 @@
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/vint.rs"]
+mod vint;
+use vint::{read_vint, vint};
 
 use rars::rar15_40::{write_compressed_archive, FileEntry, Rar29Method, WriterOptions};
 use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions as Rar50WriterOptions};
@@ -93,32 +96,6 @@ fn member_ranges(bytes: &[u8], index: usize) -> (Range<usize>, Range<usize>) {
             )
         }
         _ => unreachable!("a RAR 1.3-5 archive"),
-    }
-}
-
-fn read_vint(bytes: &[u8], at: &mut usize) -> u64 {
-    let mut value = 0;
-    for shift in (0..).step_by(7) {
-        let byte = bytes[*at];
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-    }
-    value
-}
-
-fn vint(mut value: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return out;
-        }
-        out.push(byte | 0x80);
     }
 }
 

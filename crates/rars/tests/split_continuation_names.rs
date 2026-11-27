@@ -1,5 +1,12 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/vint.rs"]
+mod vint;
+use data::noise;
+use vint::{read_vint, vint};
+
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder, ExtractedEntryMeta};
 use std::io::Write;
 use std::sync::{Arc, Mutex};
@@ -12,18 +19,6 @@ const VERSIONS: [ArchiveVersion; 4] = [
     ArchiveVersion::Rar29,
     ArchiveVersion::Rar50,
 ];
-
-fn noise(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(2654435761) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
 
 fn build_set(version: ArchiveVersion, stored: bool, name: &[u8], data: &[u8]) -> Vec<Vec<u8>> {
     let mut builder = Builder::new(version).store(stored).volume_size(Some(4096));
@@ -71,32 +66,6 @@ fn rename_rar15_header(volume: &mut Vec<u8>, file: &rars::rar15_40::FileHeader, 
     volume[name_size_at..name_size_at + 2].copy_from_slice(&(name.len() as u16).to_le_bytes());
     let crc = rars::crc32::crc32(&volume[start + 2..start + head_size]) as u16;
     volume[start..start + 2].copy_from_slice(&crc.to_le_bytes());
-}
-
-fn read_vint(bytes: &[u8], at: &mut usize) -> u64 {
-    let mut value = 0;
-    for shift in (0..).step_by(7) {
-        let byte = bytes[*at];
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-    }
-    value
-}
-
-fn vint(mut value: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return out;
-        }
-        out.push(byte | 0x80);
-    }
 }
 
 const HFL_EXTRA: u64 = 0x01;

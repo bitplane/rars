@@ -1,8 +1,14 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/sinks.rs"]
+mod sinks;
 #[path = "support/volume_size.rs"]
 mod volume_size;
+use data::xorshift;
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
+use sinks::SyncCapture;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
@@ -117,16 +123,6 @@ fn every_seekable_parser_source_failure_is_reported_without_a_partial_archive() 
     }
 }
 
-struct Capture(Arc<Mutex<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 #[test]
 fn source_failures_abort_member_publication_and_the_archive_can_be_retried() {
     let expected = b"repeatable member payload\n".repeat(16);
@@ -143,7 +139,7 @@ fn source_failures_abort_member_publication_and_the_archive_can_be_retried() {
             let output = Arc::new(Mutex::new(Vec::new()));
             fault.lock().unwrap().arm(None);
             archive
-                .extract_to_with_options(options, |_| Ok(Box::new(Capture(output.clone()))))
+                .extract_to_with_options(options, |_| Ok(Box::new(SyncCapture(output.clone()))))
                 .unwrap();
             assert_eq!(*output.lock().unwrap(), expected);
             let operations = fault.lock().unwrap().operations;
@@ -151,7 +147,7 @@ fn source_failures_abort_member_publication_and_the_archive_can_be_retried() {
                 output.lock().unwrap().clear();
                 fault.lock().unwrap().arm(Some(fail_at));
                 let error = archive
-                    .extract_to_with_options(options, |_| Ok(Box::new(Capture(output.clone()))))
+                    .extract_to_with_options(options, |_| Ok(Box::new(SyncCapture(output.clone()))))
                     .unwrap_err();
                 assert!(
                     matches!(error.kind(), ErrorKind::Io),
@@ -172,7 +168,7 @@ fn source_failures_abort_member_publication_and_the_archive_can_be_retried() {
             output.lock().unwrap().clear();
             fault.lock().unwrap().arm(None);
             archive
-                .extract_to_with_options(options, |_| Ok(Box::new(Capture(output.clone()))))
+                .extract_to_with_options(options, |_| Ok(Box::new(SyncCapture(output.clone()))))
                 .unwrap();
             assert_eq!(*output.lock().unwrap(), expected);
         }
@@ -235,15 +231,7 @@ fn split_and_parallel_sink_failures_keep_member_context() {
                 .volume_size(Some(512));
             // Store mode uses noise; compressed mode uses repeated bytes and
             // very small fragments so the writer cannot choose a stored fallback.
-            let mut state = 0x12345678u32;
-            let payload: Vec<u8> = (0..16384)
-                .map(|_| {
-                    state ^= state << 13;
-                    state ^= state >> 17;
-                    state ^= state << 5;
-                    state as u8
-                })
-                .collect();
+            let payload = xorshift(16384, 0x12345678);
             let payload = if stored {
                 payload
             } else {

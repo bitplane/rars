@@ -1,35 +1,19 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
+#[path = "support/sinks.rs"]
+mod sinks;
+use fixtures::fixture;
+use sinks::Capture;
+
 use rars::crc32::crc32;
 use rars::rar15_40::Archive;
 use rars::{ArchiveReadOptions, Error, ErrorKind, Result};
 use std::cell::RefCell;
-use std::io::{Result as IoResult, Write};
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
-
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/rar15_40/rarvm")
-        .join(name)
-}
-
-struct CollectWriter {
-    data: Rc<RefCell<Vec<u8>>>,
-}
 
 struct CollectedEntry {
     name: Vec<u8>,
     data: Vec<u8>,
-}
-
-impl Write for CollectWriter {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.data.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        Ok(())
-    }
 }
 
 fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>> {
@@ -44,7 +28,7 @@ fn collect_extract_with(
     archive.extract_to(options, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
-        Ok(Box::new(CollectWriter { data }))
+        Ok(Box::new(Capture(data)))
     })?;
     Ok(entries
         .into_inner()
@@ -58,9 +42,11 @@ fn collect_extract_with(
 
 #[test]
 fn solid_e8_filters_use_member_relative_offsets() {
-    let expected_lead = std::fs::read(fixture("solid_e8_filter_lead.txt")).unwrap();
-    let expected_exe = std::fs::read(fixture("solid_e8_filter_payload.exe")).unwrap();
-    let archive = Archive::parse_path(fixture("solid_e8_filter_member_offset.rar")).unwrap();
+    let expected_lead = std::fs::read(fixture("rar15_40/rarvm/solid_e8_filter_lead.txt")).unwrap();
+    let expected_exe =
+        std::fs::read(fixture("rar15_40/rarvm/solid_e8_filter_payload.exe")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/solid_e8_filter_member_offset.rar")).unwrap();
     let files: Vec<_> = archive.files().collect();
 
     assert!(archive.main.is_solid());
@@ -81,7 +67,8 @@ fn solid_e8_filters_use_member_relative_offsets() {
 
 #[test]
 fn non_standard_vm_filter_uses_generic_executor() {
-    let archive = Archive::parse_path(fixture("generic_delta_padding_mutation.rar")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/generic_delta_padding_mutation.rar")).unwrap();
     let files: Vec<_> = archive.files().collect();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].name, b"itanium_synthetic_bundles.bin");
@@ -97,7 +84,8 @@ fn non_standard_vm_filter_uses_generic_executor() {
 
 #[test]
 fn non_standard_vm_filter_is_refused_by_default() {
-    let archive = Archive::parse_path(fixture("generic_delta_padding_mutation.rar")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/generic_delta_padding_mutation.rar")).unwrap();
 
     let error = match collect_extract(&archive) {
         Err(error) => error,
@@ -115,7 +103,8 @@ fn non_standard_vm_filter_is_refused_by_default() {
 fn standard_filters_run_without_allowing_vm_programs() {
     // Every other fixture here uses only the six standard programs, which run
     // as native code whatever the option says.
-    let archive = Archive::parse_path(fixture("ppmd_embedded_vm_filter.rar")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/ppmd_embedded_vm_filter.rar")).unwrap();
     let extracted = collect_extract(&archive).unwrap();
     assert_eq!(crc32(&extracted[0].data), 0xa0fa_ad59);
 }
@@ -125,7 +114,8 @@ fn ppmd_embedded_vm_filter_is_applied() {
     // Generated with RAR 3.00 using `-m5 -mc10:16t+ -mce+`: text/PPMd is
     // forced for the member while the x86 executable filter is also forced,
     // so the filter record is carried by PPMd escape 3 instead of LZ symbols.
-    let archive = Archive::parse_path(fixture("ppmd_embedded_vm_filter.rar")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/ppmd_embedded_vm_filter.rar")).unwrap();
     let files: Vec<_> = archive.files().collect();
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].name, b"ppmd_branch_mix.bin");
@@ -144,7 +134,8 @@ fn wide_e8e9_filter_blocks_use_32_bit_encoded_sizes() {
     // WinRAR 6.02 (`-ma4 -m5 -mcE+`) cuts 64 KiB E8E9 blocks over a synthetic
     // executable image. A block size of 0x10000 does not fit the 16-bit
     // integer form, so the filter control stream carries 32-bit integers.
-    let archive = Archive::parse_path(fixture("x86_e8e9_64k_blocks_rar602.rar")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/x86_e8e9_64k_blocks_rar602.rar")).unwrap();
     let extracted = collect_extract(&archive).unwrap();
 
     assert_eq!(extracted.len(), 1);
@@ -161,7 +152,7 @@ fn vm_delta_filter_accepts_more_than_thirty_two_channels() {
             expected.push((channel * 7 + row * 3) as u8);
         }
     }
-    let archive = Archive::parse_path(fixture("delta_64_channels.rar")).unwrap();
+    let archive = Archive::parse_path(fixture("rar15_40/rarvm/delta_64_channels.rar")).unwrap();
 
     let extracted = collect_extract(&archive).unwrap();
 
@@ -181,7 +172,8 @@ fn generic_program_reads_static_data_through_a_called_subroutine() {
         .enumerate()
         .map(|(index, byte)| byte ^ table[index & 3])
         .collect();
-    let archive = Archive::parse_path(fixture("generic_static_data_call_ret.rar")).unwrap();
+    let archive =
+        Archive::parse_path(fixture("rar15_40/rarvm/generic_static_data_call_ret.rar")).unwrap();
 
     let options = ArchiveReadOptions::new().with_rar3_vm_programs(true);
     let extracted = collect_extract_with(&archive, options).unwrap();

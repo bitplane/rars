@@ -2,23 +2,16 @@
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/sinks.rs"]
+mod sinks;
 use rars::rar50::{ArchiveEntry, Rar50Writer, WriterOptions};
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, EntrySource, Error, FeatureSet,
     FilterKind, FilterPolicy, Rar50Scratch,
 };
+use sinks::Capture;
 use std::{cell::RefCell, io, io::Write, rc::Rc, sync::Arc};
 
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 fn payload() -> Vec<u8> {
     (0..196_608)
         .map(|i| [0xe8, 1, 0, 0, 0, 0xe9, 3, 0, 0, 0, 0xeb, 0x14][i % 12])

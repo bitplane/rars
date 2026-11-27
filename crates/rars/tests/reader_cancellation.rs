@@ -9,8 +9,11 @@ use std::{
     rc::Rc,
 };
 
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::xorshift;
 
 const FORMATS: [ArchiveVersion; 8] = [
     ArchiveVersion::Rar14,
@@ -49,15 +52,7 @@ fn cancellation_from_the_last_directory_callback_is_not_success() {
 #[test]
 #[cfg(feature = "encryption")]
 fn compressed_encrypted_splits_keep_cancellation_ahead_of_checksum_diagnostics() {
-    let mut state = 0x1234_5678u32;
-    let noise: Vec<u8> = (0..4096)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let noise = xorshift(4096, 0x1234_5678);
     let data = noise.repeat(3);
     for format in [ArchiveVersion::Rar29, ArchiveVersion::Rar50] {
         let mut builder = Builder::new(format)

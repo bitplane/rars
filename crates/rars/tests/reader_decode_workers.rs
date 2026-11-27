@@ -1,19 +1,12 @@
 #![cfg(feature = "write")]
 #![cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 
-use rars::{ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder};
-use std::{cell::RefCell, io, io::Write, rc::Rc};
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::Capture;
 
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
+use rars::{ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder};
+use std::{cell::RefCell, rc::Rc};
 
 fn member(len: usize, seed: u32) -> Vec<u8> {
     let mut state = seed;
