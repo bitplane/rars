@@ -1887,7 +1887,7 @@ impl BlockWave {
                 .filter(|_| searched)
                 .map(|(piece, _)| piece.len() as u64),
             single_pass_tree_chunk(plan, filter_runs, job.data.len() as u64, history)
-                .filter(|_| !B::LIMITED),
+                .filter(|_| !job.data.is_limited()),
         );
     }
 }

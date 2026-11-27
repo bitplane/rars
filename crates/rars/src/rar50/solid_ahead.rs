@@ -84,7 +84,7 @@ impl<B: Budget> DecoderSession<'_, B> {
         let control = &self.decoder.read_control;
         let solid =
             archive.main.is_solid() || files.iter().any(|file| file.compression_info & 0x40 != 0);
-        if B::LIMITED
+        if self.decoder.is_limited()
             || !solid
             || self.scratch.is_some()
             || control.salvage()

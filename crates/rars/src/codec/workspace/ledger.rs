@@ -19,9 +19,11 @@ impl Drop for Usage {
         debug_assert!(self.retired && self.used == 0);
     }
 }
-#[derive(Clone, Debug)]
+/// A workspace budget. Without a ledger it is unlimited, and charging it
+/// only records the bytes.
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Limited {
-    ledger: Arc<Ledger>,
+    ledger: Option<Arc<Ledger>>,
     scope: Option<Arc<Mutex<Usage>>>,
 }
 #[derive(Debug)]
@@ -41,32 +43,38 @@ fn refusal(limit: u64, required: u64, used: u64) -> Error {
     }))
 }
 impl Limited {
-    pub(super) fn new(limit: u64) -> Self {
+    /// A budget that refuses growth past `limit` bytes.
+    pub(crate) fn limited(limit: u64) -> Self {
         Self {
-            ledger: Arc::new(Ledger {
+            ledger: Some(Arc::new(Ledger {
                 limit,
                 used: Mutex::new(0),
-            }),
+            })),
             scope: None,
         }
     }
+    pub(crate) fn is_limited(&self) -> bool {
+        self.ledger.is_some()
+    }
     #[cfg(any(test, feature = "write"))]
     pub(crate) fn limit(&self) -> u64 {
-        self.ledger.limit
+        self.ledger.as_ref().map_or(u64::MAX, |ledger| ledger.limit)
     }
     pub(crate) fn used(&self) -> u64 {
-        match &self.scope {
-            Some(scope) => scope.lock().unwrap().used,
-            None => *self.ledger.used.lock().unwrap(),
+        match (&self.scope, &self.ledger) {
+            (Some(scope), _) => scope.lock().unwrap().used,
+            (None, Some(ledger)) => *ledger.used.lock().unwrap(),
+            (None, None) => 0,
         }
     }
     pub(crate) fn available(&self) -> u64 {
-        match &self.scope {
-            Some(scope) => {
+        match (&self.scope, &self.ledger) {
+            (Some(scope), _) => {
                 let usage = scope.lock().unwrap();
                 usage.capacity - usage.used
             }
-            None => self.ledger.limit - self.used(),
+            (None, Some(ledger)) => ledger.limit - self.used(),
+            (None, None) => u64::MAX,
         }
     }
     pub(crate) fn check_capacity(&self, required: u64) -> Result<()> {
@@ -75,30 +83,40 @@ impl Limited {
             if required > usage.capacity - usage.used {
                 return Err(refusal(usage.capacity, required, usage.used));
             }
-        } else {
-            let used = *self.ledger.used.lock().unwrap();
-            if required > self.ledger.limit - used {
-                return Err(refusal(self.ledger.limit, required, used));
+        } else if let Some(ledger) = &self.ledger {
+            let used = *ledger.used.lock().unwrap();
+            if required > ledger.limit - used {
+                return Err(refusal(ledger.limit, required, used));
             }
         }
         Ok(())
     }
     fn reserve_global(&self, bytes: u64, required: u64) -> Result<()> {
-        let mut used = self.ledger.used.lock().unwrap();
-        if bytes > self.ledger.limit - *used {
-            return Err(refusal(self.ledger.limit, required, *used));
+        let Some(ledger) = &self.ledger else {
+            return Ok(());
+        };
+        let mut used = ledger.used.lock().unwrap();
+        if bytes > ledger.limit - *used {
+            return Err(refusal(ledger.limit, required, *used));
         }
         *used += bytes;
         Ok(())
     }
     fn release_global(&self, bytes: u64) {
-        *self.ledger.used.lock().unwrap() -= bytes;
+        if let Some(ledger) = &self.ledger {
+            *ledger.used.lock().unwrap() -= bytes;
+        }
     }
     pub(crate) fn reserve(&self, capacity: u64) -> Result<Reservation> {
         if self.scope.is_some() {
             return Err(Error::InvalidData(
                 "workers cannot reserve global workspace",
             ));
+        }
+        if self.ledger.is_none() {
+            return Ok(Reservation {
+                allowance: self.clone(),
+            });
         }
         self.reserve_global(capacity, capacity)?;
         Ok(Reservation {
@@ -119,6 +137,10 @@ impl Charge {
         self.bytes
     }
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        if self.allowance.ledger.is_none() {
+            self.bytes = bytes;
+            return Ok(());
+        }
         if let Some(scope) = &self.allowance.scope {
             let mut usage = scope.lock().unwrap();
             if bytes > self.bytes {
@@ -159,7 +181,10 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        let mut usage = self.allowance.scope.as_ref().unwrap().lock().unwrap();
+        let Some(scope) = &self.allowance.scope else {
+            return;
+        };
+        let mut usage = scope.lock().unwrap();
         let unused = usage.capacity - usage.used;
         usage.capacity = usage.used;
         usage.retired = true;
@@ -174,7 +199,7 @@ mod tests {
 
     #[test]
     fn scoped_capacity_never_borrows_global_spare_space_and_stays_retired() {
-        let ledger = Limited::new(128);
+        let ledger = Limited::limited(128);
         let reservation = ledger.reserve(16).unwrap();
         let local = reservation.allowance();
         assert_eq!(local.available(), 16);
@@ -204,7 +229,7 @@ mod tests {
 
     #[test]
     fn retirement_releases_only_unused_reservations_and_keeps_escaped_outputs() {
-        let ledger = Limited::new(128);
+        let ledger = Limited::limited(128);
         let first = ledger.reserve(80).unwrap();
         let second = ledger.reserve(32).unwrap();
         assert_eq!(ledger.used(), 112);
@@ -233,7 +258,7 @@ mod tests {
 
     #[test]
     fn unwind_releases_the_admitted_scope() {
-        let ledger = Limited::new(64);
+        let ledger = Limited::limited(64);
         let result = std::panic::catch_unwind(|| {
             let reservation = ledger.reserve(48).unwrap();
             assert_eq!(ledger.used(), 48);

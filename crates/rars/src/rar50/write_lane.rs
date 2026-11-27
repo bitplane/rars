@@ -61,13 +61,14 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         selecting: bool,
         options: crate::ArchiveReadOptions<'_>,
         budget: &OutputBudget,
+        workspace_limited: bool,
     ) -> Option<Self> {
         let settling = settling.filter(|_| {
             !selecting
                 && !options.salvage
                 && options.rar50_scratch.is_none()
                 && !budget.is_limited()
-                && !B::LIMITED
+                && !workspace_limited
                 && crate::parallel::may_spawn()
         })?;
         let control = budget.control.clone();

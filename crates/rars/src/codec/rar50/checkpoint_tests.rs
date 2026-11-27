@@ -126,7 +126,7 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
         let fresh = original.take_for_stream(false);
         assert!(fresh.tables.is_none());
         assert!(fresh.history.is_empty());
-        if B::LIMITED {
+        if budget.is_limited() {
             assert_eq!(fresh.history.capacity(), 0);
             assert_eq!(original.history.as_ptr(), address);
             assert_eq!(original.reachable_history(), data);
