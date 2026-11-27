@@ -11,6 +11,7 @@ pub(crate) mod blake2s;
 /// Asks the cache for the line holding `data[index]`, ahead of a load the
 /// caller expects to miss. Only a hint: an index past the end is ignored, and
 /// targets without a prefetch instruction here do nothing.
+#[cfg(feature = "write")]
 #[inline(always)]
 pub(crate) fn prefetch<T>(data: &[T], index: usize) {
     #[cfg(target_arch = "x86_64")]

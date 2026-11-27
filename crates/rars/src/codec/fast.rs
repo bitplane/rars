@@ -56,9 +56,10 @@ pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length
     let current = &current[..max_length];
     let previous = &input[pos - distance..][..max_length];
     let mut length = 0;
-    for (current, previous) in current.chunks_exact(8).zip(previous.chunks_exact(8)) {
-        let difference = u64::from_le_bytes(current.try_into().unwrap())
-            ^ u64::from_le_bytes(previous.try_into().unwrap());
+    let (current_words, _) = current.as_chunks::<8>();
+    let (previous_words, _) = previous.as_chunks::<8>();
+    for (current, previous) in current_words.iter().zip(previous_words) {
+        let difference = u64::from_le_bytes(*current) ^ u64::from_le_bytes(*previous);
         if difference != 0 {
             return length + (difference.trailing_zeros() / 8) as usize;
         }
