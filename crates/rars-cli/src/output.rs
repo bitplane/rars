@@ -1,8 +1,11 @@
 use crate::CliResult;
-use rars::{Archive as DetectedArchive, AttrSource, Error, ExtractedEntryMeta};
+use rars::{Archive as DetectedArchive, Error, ExtractedEntryMeta};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub(crate) use rars::output_modes::{
+    applied_mode, create_mode, has_mode, set_file_mode, set_path_mode, waits_for_end, CreatedModes,
+};
 pub(crate) use rars::output_staging::{ExtractionStaging, OverwritePolicy};
 
 pub(crate) struct ExtractedOutput {
@@ -84,22 +87,12 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
         .into_iter()
         .partition(|output| output.meta.is_directory);
     for output in files {
-        set_extracted_permissions(
-            &output.path,
-            output.meta.file_attr,
-            output.meta.attr_source,
-            false,
-        )?;
+        set_path_mode(&output.path, &output.meta)?;
     }
     // Finish descendants before a parent's mode can deny access to them.
     directories.sort_by_cached_key(|output| std::cmp::Reverse(output.path.components().count()));
     for output in directories {
-        set_extracted_permissions(
-            &output.path,
-            output.meta.file_attr,
-            output.meta.attr_source,
-            true,
-        )?;
+        set_path_mode(&output.path, &output.meta)?;
     }
     Ok(())
 }
@@ -118,96 +111,14 @@ pub(crate) fn early_file_metadata(output: &ExtractedOutput) -> Option<EarlyMetad
 pub(crate) type EarlyMetadata = (Option<std::time::SystemTime>, Option<u32>);
 
 fn early_metadata(meta: &ExtractedEntryMeta) -> Option<EarlyMetadata> {
-    let mode = extracted_mode(meta.file_attr, meta.attr_source, false);
-    if mode.is_some_and(|mode| mode & 0o400 == 0) {
+    let mode = applied_mode(meta);
+    if mode.is_some_and(waits_for_end) {
         return None;
     }
     let modified = meta
         .modified
         .and_then(|time| std::time::SystemTime::try_from(time).ok());
     Some((modified, mode))
-}
-
-/// The permission bits a member's file is created with: its own, when they
-/// can be set before it is published, else 0666.
-pub(crate) fn create_mode(meta: &ExtractedEntryMeta) -> u32 {
-    create_mode_for(early_metadata(meta))
-}
-
-fn create_mode_for(early: Option<EarlyMetadata>) -> u32 {
-    early.and_then(|(_, mode)| mode).unwrap_or(0o666)
-}
-
-/// Whether `file` has exactly the permission bits `mode`.
-#[cfg(unix)]
-pub(crate) fn has_mode(file: &fs::File, mode: u32) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    file.metadata()
-        .is_ok_and(|metadata| metadata.permissions().mode() & 0o7777 == mode)
-}
-
-#[cfg(not(unix))]
-pub(crate) fn has_mode(_file: &fs::File, _mode: u32) -> bool {
-    false
-}
-
-/// Whether creating a file in one directory with given permission bits
-/// gives it exactly those bits, for each set of bits a file there was created
-/// with: the umask or a default ACL may clear some. Learnt from the first file
-/// created with each, so the others need no change when they are kept. The
-/// CLI never changes its umask.
-#[derive(Clone)]
-pub(crate) struct CreatedModes {
-    #[cfg(unix)]
-    known: std::sync::Arc<[std::sync::atomic::AtomicU8]>,
-}
-
-impl Default for CreatedModes {
-    fn default() -> Self {
-        Self {
-            #[cfg(unix)]
-            known: (0..=0o7777).map(|_| Default::default()).collect(),
-        }
-    }
-}
-
-impl CreatedModes {
-    // Not known yet is 0, as each starts.
-    #[cfg(unix)]
-    const KEPT: u8 = 1;
-    #[cfg(unix)]
-    const CHANGED: u8 = 2;
-
-    /// Whether `file`, created here with the permission bits `mode` and not
-    /// changed since, has them.
-    #[cfg(unix)]
-    fn kept(&self, file: &fs::File, mode: u32) -> bool {
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::atomic::Ordering;
-        let Some(known) = self.known.get(mode as usize) else {
-            return false;
-        };
-        match known.load(Ordering::Relaxed) {
-            Self::KEPT => true,
-            Self::CHANGED => false,
-            _ => {
-                let Ok(metadata) = file.metadata() else {
-                    return false;
-                };
-                let kept = metadata.permissions().mode() & 0o7777 == mode;
-                known.store(
-                    if kept { Self::KEPT } else { Self::CHANGED },
-                    Ordering::Relaxed,
-                );
-                kept
-            }
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn kept(&self, _file: &fs::File, _mode: u32) -> bool {
-        false
-    }
 }
 
 /// A staged file, created and finished on whichever thread writes it. It is
@@ -246,7 +157,7 @@ impl StagedFile {
     ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let set = std::sync::Arc::default();
         let early = early_metadata(meta);
-        let create_mode = create_mode_for(early);
+        let create_mode = create_mode(meta);
         let staged = Self {
             file: rars::output_tree::DeferredFile::new(dir, name, create_mode),
             early,
@@ -298,69 +209,6 @@ impl Drop for StagedFile {
         self.set
             .store(set.is_ok(), std::sync::atomic::Ordering::Release);
     }
-}
-
-#[cfg(unix)]
-pub(crate) fn set_file_mode(file: &fs::File, mode: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(mode))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn set_file_mode(_file: &fs::File, _mode: u32) -> std::io::Result<()> {
-    Err(std::io::ErrorKind::Unsupported.into())
-}
-
-#[cfg(unix)]
-fn set_extracted_permissions(
-    path: &Path,
-    file_attr: u64,
-    attr_source: AttrSource,
-    is_directory: bool,
-) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    if let Some(mode) = extracted_mode(file_attr, attr_source, is_directory) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn extracted_mode(file_attr: u64, attr_source: AttrSource, is_directory: bool) -> Option<u32> {
-    const FILE_ATTRIBUTE_READONLY: u64 = 0x01;
-
-    match attr_source {
-        // A DOS attribute word says nothing about permissions except whether
-        // the entry is read-only. Everything else is already right: the file
-        // was created 0666 & ~umask and the directory 0777 & ~umask, which is
-        // what the reference leaves behind, so only read-only needs acting on
-        // and only on files.
-        AttrSource::Dos => {
-            (!is_directory && file_attr & FILE_ATTRIBUTE_READONLY != 0).then_some(0o444)
-        }
-        // A st_mode is applied verbatim, but only when it carries file-type
-        // bits. Without them the value is not a mode, and stripping a file to
-        // whatever the low bits happen to say is worse than leaving it.
-        AttrSource::Unix if file_attr & 0o170000 != 0 => Some((file_attr & 0o777) as u32),
-        // Missing type bits and unknown (including future) hosts leave modes unchanged.
-        _ => None,
-    }
-}
-
-#[cfg(not(unix))]
-fn set_extracted_permissions(
-    _path: &Path,
-    _file_attr: u64,
-    _attr_source: AttrSource,
-    _is_directory: bool,
-) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn extracted_mode(_file_attr: u64, _attr_source: AttrSource, _is_directory: bool) -> Option<u32> {
-    None
 }
 
 pub(crate) fn checked_output_path(out_dir: &Path, rel: &Path) -> rars::Result<PathBuf> {
@@ -920,7 +768,7 @@ mod tests {
                         if directory { 0o040700 } else { 0o100600 },
                         directory,
                     )
-                    .with_attr_source(AttrSource::Unix),
+                    .with_attr_source(rars::AttrSource::Unix),
                     restore_metadata: false,
                 };
                 restore_output_metadata(std::slice::from_ref(&output)).unwrap();
@@ -933,44 +781,6 @@ mod tests {
                     assert!(restore_output_metadata(&[output]).is_err());
                 }
             }
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn permissions_respect_attribute_source_and_type_bits() {
-        use super::*;
-        use std::os::unix::fs::PermissionsExt;
-        let dir = scratch("permission-policy");
-        for (source, attr, directory, expected) in [
-            (AttrSource::Dos, 0, false, 0o640),
-            (AttrSource::Dos, 1, false, 0o444),
-            (AttrSource::Dos, 1, true, 0o640),
-            (AttrSource::Unix, 0o777, false, 0o640),
-            (AttrSource::Unix, 0o100754, false, 0o754),
-            (AttrSource::Unix, u64::MAX, false, 0o777),
-            (AttrSource::Unknown, u64::MAX, false, 0o640),
-        ] {
-            let path = dir.join("entry");
-            if path.exists() {
-                if path.is_dir() {
-                    fs::remove_dir(&path).unwrap();
-                } else {
-                    fs::remove_file(&path).unwrap();
-                }
-            }
-            if directory {
-                fs::create_dir(&path).unwrap();
-            } else {
-                fs::write(&path, b"payload").unwrap();
-            }
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-            set_extracted_permissions(&path, attr, source, directory).unwrap();
-            assert_eq!(
-                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-                expected
-            );
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
     }
 

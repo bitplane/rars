@@ -78,6 +78,8 @@ mod output_limit;
 #[doc(hidden)]
 pub mod output_links;
 #[doc(hidden)]
+pub mod output_modes;
+#[doc(hidden)]
 pub mod output_staging;
 #[doc(hidden)]
 pub mod output_times;
