@@ -37,6 +37,7 @@ mod write_lane {
             _: bool,
             _: crate::ArchiveReadOptions<'_>,
             _: &OutputBudget,
+            _: bool,
         ) -> Option<Self> {
             None
         }
@@ -1159,7 +1160,13 @@ impl Archive {
         let _read_ahead = self
             .source
             .bound_file_read_ahead(selector.is_some() && !archive_solid);
-        let mut lane = Lane::start(settling, selector.is_some(), options, &budget);
+        let mut lane = Lane::start(
+            settling,
+            selector.is_some(),
+            options,
+            &budget,
+            session.decoder.is_limited(),
+        );
         let files: Vec<&FileHeader> = self.files().collect();
         for (index, &file) in files.iter().enumerate() {
             let selected = crate::extraction_control::select(
@@ -1506,7 +1513,9 @@ impl Archive {
         // Outputs opened as members start and written on the workers. A
         // limited workspace keeps writing each member as it is published.
         let on_workers = settling.filter(|_| {
-            !B::LIMITED && crate::parallel::default_window() > 1 && crate::parallel::may_spawn()
+            !allowance.is_limited()
+                && crate::parallel::default_window() > 1
+                && crate::parallel::may_spawn()
         });
         let plan = |file: &FileHeader| {
             if file.is_split_before() || file.is_split_after() {
@@ -1794,7 +1803,7 @@ fn write_opened_entry<B: Budget>(
     session.decoder.read_control = budget.control.clone();
     // As for a buffered worker in `decode_parallel_entry`: the output is
     // written from the decoded copy, so the dictionary need not keep it.
-    let history = if !B::LIMITED
+    let history = if !allowance.is_limited()
         && !archive.main.is_solid()
         && !file.is_stored()
         && !file.should_stream_decode(buffered_decode_limit)
@@ -1932,7 +1941,7 @@ fn decode_parallel_entry<B: Budget>(
     // Only a disposable buffered worker can omit the final dictionary copy.
     // Compression metadata is still validated at its original decode boundary;
     // ReaderState also forces retention for solid and limited decoding.
-    let history = if !B::LIMITED
+    let history = if !allowance.is_limited()
         && !archive.main.is_solid()
         && !file.is_split_before()
         && !file.is_split_after()

@@ -244,9 +244,10 @@ impl<B: Budget> MembersAhead<B> {
 impl<B: Budget> ReaderState<B> {
     /// The member's blocks from the pool, unless they must be decoded here.
     pub(super) fn take_claimed(&mut self, mode: DecodeMode) -> Option<Claimed<B>> {
+        let limited = self.is_limited();
         self.claimed
             .take()
-            .filter(|_| mode == DecodeMode::Lz && !B::LIMITED)
+            .filter(|_| mode == DecodeMode::Lz && !limited)
     }
 
     /// Drops a claim a failure left unused; true when the claim replayed to its final block.

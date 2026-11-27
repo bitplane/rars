@@ -373,7 +373,12 @@ struct AllocationTrace(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
 impl Budget for AllocationTrace {
     type Charge = Self;
     type Failure = std::convert::Infallible;
-    const LIMITED: bool = false;
+    fn is_limited(&self) -> bool {
+        false
+    }
+    fn charge_is_limited(_: &Self) -> bool {
+        false
+    }
     fn grow<T>(
         values: &mut Vec<T>,
         _: &mut Self,

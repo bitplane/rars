@@ -7,7 +7,7 @@
 //! archive, and inline members leave the worker pool idle for any parallelism
 //! inside their own decode.
 
-use crate::codec::workspace::{coordinator, Allowance, Budget, Buffer, Limited};
+use crate::codec::workspace::{coordinator, Budget, Buffer, Limited};
 use crate::read_control::ReadControl;
 use crate::{Error, Result};
 use std::io::Write;
@@ -147,12 +147,14 @@ fn scaled_running_workspace(physical: Option<u64>) -> u64 {
     physical.map_or(CEILING, |total| CEILING.min(total / 4))
 }
 
-/// At most one member per worker. Members start as soon as there is room, not
+/// A limited workspace admits each member by `hint` against its ledger.
+///
+/// Unlimited: at most one member per worker. Members start as soon as there is room, not
 /// a batch at a time, so a slow member holds back only the publication of
 /// those after it. The results not yet published hold at most `capacity`
 /// bytes of cost, and the running members [`running_workspace`] by their
 /// hints; a member over either waits until that one is empty.
-impl Workers for Allowance {
+impl Workers for Limited {
     fn batches<T: Copy + Send, O: Send, C: ?Sized>(
         &self,
         members: &[(T, u64)],
@@ -164,6 +166,18 @@ impl Workers for Allowance {
         decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
         mut publish: impl FnMut(&mut C, O) -> Result<()>,
     ) -> Result<usize> {
+        if self.is_limited() {
+            return coordinator::extract_windowed(
+                members.iter().map(|&(member, _)| member),
+                self,
+                hint,
+                |member, local| {
+                    check()?;
+                    decode(member, local)
+                },
+                |output| publish(ctx, output),
+            );
+        }
         let window = crate::parallel::default_window().max(1);
         if window > 1 && members.len() > 1 && crate::parallel::may_spawn() {
             check()?;
@@ -224,31 +238,6 @@ impl Workers for Allowance {
     }
 }
 
-impl Workers for Limited {
-    fn batches<T: Copy + Send, O: Send, C: ?Sized>(
-        &self,
-        members: &[(T, u64)],
-        _: u64,
-        _: bool,
-        ctx: &mut C,
-        hint: impl Fn(T) -> u64,
-        check: impl Fn() -> Result<()> + Sync,
-        decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
-        mut publish: impl FnMut(&mut C, O) -> Result<()>,
-    ) -> Result<usize> {
-        coordinator::extract_windowed(
-            members.iter().map(|&(member, _)| member),
-            self,
-            hint,
-            |member, local| {
-                check()?;
-                decode(member, local)
-            },
-            |output| publish(ctx, output),
-        )
-    }
-}
-
 /// How many of `members` the next batch takes: at least one, at most `window`,
 /// and no more than `capacity` bytes of cost unless one member alone exceeds it.
 fn batch_len<T>(members: &[(T, u64)], window: usize, capacity: u64) -> usize {
@@ -268,6 +257,7 @@ fn batch_len<T>(members: &[(T, u64)], window: usize, capacity: u64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::workspace::Allowance;
     use crate::Error;
 
     #[test]

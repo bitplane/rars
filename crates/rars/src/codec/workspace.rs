@@ -14,17 +14,10 @@ pub(crate) fn is_refusal(error: &crate::Error) -> bool {
     )
 }
 
-/// A zero-sized policy: its buffers have exactly Vec's layout and no ledger
-/// branch in their hot operations. Limited buffers are a separate instantiation.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct Allowance {
-    _unlimited: (),
-}
-impl Allowance {
-    pub(crate) fn limited(limit: u64) -> Limited {
-        Limited::new(limit)
-    }
-}
+/// The one workspace budget type. `Allowance::default()` is unlimited and
+/// [`Limited::limited`] refuses growth past a ceiling, so every codec is
+/// compiled once.
+pub(crate) type Allowance = Limited;
 
 pub(crate) trait Budget: Clone + std::fmt::Debug + Send + Sync + 'static {
     type Charge: std::fmt::Debug + Send + Sync;
@@ -34,7 +27,8 @@ pub(crate) trait Budget: Clone + std::fmt::Debug + Send + Sync + 'static {
         charge: &mut Self::Charge,
         additional: usize,
     ) -> std::result::Result<(), Self::Failure>;
-    const LIMITED: bool;
+    fn is_limited(&self) -> bool;
+    fn charge_is_limited(charge: &Self::Charge) -> bool;
     fn charge(&self) -> Self::Charge;
     fn allowance(charge: &Self::Charge) -> Self;
     fn resize(charge: &mut Self::Charge, bytes: u64) -> Result<()>;
@@ -72,27 +66,6 @@ impl<T, B: Budget> std::ops::DerefMut for Boxed<T, B> {
         &mut self.value
     }
 }
-impl Budget for Allowance {
-    type Charge = ();
-    type Failure = std::convert::Infallible;
-    fn grow<T>(
-        values: &mut Vec<T>,
-        _: &mut (),
-        additional: usize,
-    ) -> std::result::Result<(), Self::Failure> {
-        values.reserve(additional);
-        Ok(())
-    }
-    const LIMITED: bool = false;
-    fn charge(&self) {}
-    fn allowance(_: &()) -> Self {
-        Self::default()
-    }
-    fn resize(_: &mut (), _: u64) -> Result<()> {
-        Ok(())
-    }
-}
-
 impl Budget for Limited {
     type Charge = Charge;
     type Failure = Error;
@@ -114,7 +87,12 @@ impl Budget for Limited {
         Self::resize(charge, bytes)?;
         Ok(())
     }
-    const LIMITED: bool = true;
+    fn is_limited(&self) -> bool {
+        Limited::is_limited(self)
+    }
+    fn charge_is_limited(charge: &Charge) -> bool {
+        charge.allowance.is_limited()
+    }
     fn charge(&self) -> Charge {
         Charge {
             allowance: self.clone(),
@@ -153,7 +131,7 @@ pub(crate) struct RefusingCharge {
 impl RefusingBudget {
     pub(crate) fn new(fail_at: usize) -> Self {
         Self {
-            inner: Allowance::limited(64 * 1024 * 1024),
+            inner: Limited::limited(64 * 1024 * 1024),
             attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             fail_at,
         }
@@ -181,7 +159,12 @@ fn refuse_once(attempts: &std::sync::atomic::AtomicUsize, fail_at: usize) -> Res
 impl Budget for RefusingBudget {
     type Charge = RefusingCharge;
     type Failure = Error;
-    const LIMITED: bool = true;
+    fn is_limited(&self) -> bool {
+        true
+    }
+    fn charge_is_limited(_: &Self::Charge) -> bool {
+        true
+    }
 
     fn grow<T>(values: &mut Vec<T>, charge: &mut Self::Charge, additional: usize) -> Result<()> {
         refuse_once(&charge.attempts, charge.fail_at)?;
@@ -282,14 +265,16 @@ impl<T, B: Budget> Buffer<T, B> {
     where
         T: Copy,
     {
-        if B::LIMITED {
-            self.reserve(range.len())?;
-        }
+        self.reserve(range.len())?;
         self.values.extend_from_within(range);
         Ok(())
     }
     pub(crate) fn allowance(&self) -> B {
         B::allowance(&self.charge)
+    }
+    /// Whether this buffer's budget has a ceiling.
+    pub(crate) fn is_limited(&self) -> bool {
+        B::charge_is_limited(&self.charge)
     }
     fn reserve(&mut self, additional: usize) -> Result<()> {
         B::grow(&mut self.values, &mut self.charge, additional).map_err(Into::into)
@@ -318,7 +303,7 @@ impl<T, B: Budget> Buffer<T, B> {
     }
     #[inline]
     pub(crate) fn push(&mut self, value: T) -> std::result::Result<(), B::Failure> {
-        if B::LIMITED && self.values.len() == self.values.capacity() {
+        if self.values.len() == self.values.capacity() {
             B::grow(&mut self.values, &mut self.charge, 1)?;
         }
         self.values.push(value);
@@ -367,7 +352,7 @@ impl<T, B: Budget> Buffer<T, B> {
     /// Lets the allocator move the values without a second copy alive, for
     /// a budget that need not count both at once.
     pub(crate) fn grow_in_place(&mut self, capacity: usize) -> Result<()> {
-        debug_assert!(!B::LIMITED);
+        debug_assert!(!self.is_limited());
         if capacity <= self.values.capacity() {
             return Ok(());
         }
@@ -389,7 +374,7 @@ impl<T, B: Budget> Buffer<T, B> {
     where
         T: Clone,
     {
-        if B::LIMITED && len > self.values.capacity() {
+        if len > self.values.capacity() {
             self.reserve(len - self.values.len())?;
         }
         self.values.resize(len, value);
@@ -397,7 +382,7 @@ impl<T, B: Budget> Buffer<T, B> {
     }
     #[cfg(all(test, feature = "write"))]
     pub(crate) fn resize_with(&mut self, len: usize, make: impl FnMut() -> T) -> Result<()> {
-        if B::LIMITED && len > self.values.capacity() {
+        if len > self.values.capacity() {
             self.reserve(len - self.values.len())?;
         }
         self.values.resize_with(len, make);
@@ -447,7 +432,7 @@ impl<T, B: Budget> Buffer<T, B> {
     where
         T: Copy,
     {
-        if B::LIMITED && values.len() > self.values.capacity() - self.values.len() {
+        if values.len() > self.values.capacity() - self.values.len() {
             B::grow(&mut self.values, &mut self.charge, values.len())?;
         }
         self.values.extend_from_slice(values);
@@ -512,11 +497,14 @@ impl<T> From<Vec<T>> for Buffer<T> {
 impl<T> Buffer<T> {
     #[cfg(any(test, feature = "write"))]
     pub(crate) fn from_vec(values: Vec<T>) -> Self {
-        Self { values, charge: () }
+        Self {
+            values,
+            charge: Allowance::default().charge(),
+        }
     }
-    /// Only unlimited buffers can cross an existing unaccounted Vec boundary.
-    pub(crate) fn into_vec(self) -> Vec<T> {
-        self.values
+    /// The values leave the budget: their charge is released.
+    pub(crate) fn into_vec(mut self) -> Vec<T> {
+        std::mem::take(&mut self.values)
     }
 }
 impl<B: Budget> Buffer<u8, B> {
@@ -541,7 +529,7 @@ impl<B: Budget> Buffer<u8, B> {
     ) -> std::result::Result<(), B::Failure> {
         let used = *bit_pos % 8;
         let additional = (used + count).div_ceil(8) - usize::from(used != 0);
-        if B::LIMITED && additional > self.values.capacity() - self.values.len() {
+        if additional > self.values.capacity() - self.values.len() {
             B::grow(&mut self.values, &mut self.charge, additional)?;
         }
         super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
@@ -732,11 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn unlimited_buffers_and_success_results_keep_the_existing_layout() {
-        assert_eq!(
-            std::mem::size_of::<Buffer<u8>>(),
-            std::mem::size_of::<Vec<u8>>()
-        );
+    fn success_results_stay_narrow() {
         assert!(
             std::mem::size_of::<Result<usize>>() <= std::mem::size_of::<(&str, usize)>(),
             "large diagnostics must not widen hot codec results"

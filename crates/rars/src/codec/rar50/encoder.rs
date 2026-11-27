@@ -1017,7 +1017,7 @@ fn streaming_blocks_from<B: Budget>(
     if blocks.is_empty() {
         return Ok(output);
     }
-    if pipelines::<B>(options) {
+    if pipelines(options, allowance) {
         let mut block_start = at;
         pipelined_optimal_blocks(
             combined,
@@ -1269,7 +1269,7 @@ fn filtered_lz_blocks<B: Budget>(
     let start = history.len();
     let mut combined = Buffer::from_slices(&[history, data], allowance)?;
     let blocks = filter_blocks_in_place(&mut combined[start..], filters, file_offset, allowance)?;
-    if pipelines::<B>(options) {
+    if pipelines(options, allowance) {
         let mut out = Buffer::new(allowance);
         let end = combined.len();
         pipelined_optimal_blocks(
@@ -1558,7 +1558,7 @@ fn encode_member_with_allowance<B: Budget>(
         // rehashes a window of history every 64 KiB, half the encode of a
         // 16 MiB member. The optimal parse's collector searches each block
         // once and lets the passes replay the answers.
-        if pipelines::<B>(options) {
+        if pipelines(options, allowance) {
             let mut out = Buffer::new(allowance);
             pipelined_optimal_blocks(
                 combined,
@@ -1724,7 +1724,7 @@ fn pipelined_optimal_blocks<B: Budget, R: std::ops::Deref<Target = [EncodeFilter
     };
     let price =
         |(block, records, is_last, matches): (std::ops::Range<usize>, R, bool, BlockMatches<B>)| {
-            if !B::LIMITED && options.parse_passes == 1 && records.is_empty() {
+            if !allowance.is_limited() && options.parse_passes == 1 && records.is_empty() {
                 let packed = encode_single_pass_block(
                     combined,
                     block.clone(),
@@ -1807,8 +1807,8 @@ fn report_through(
 /// Whether a member's optimal parse may price its blocks on other threads.
 /// A limited allowance is admitted for one block's workspace at a time, and
 /// keeps that.
-fn pipelines<B: Budget>(options: EncodeOptions) -> bool {
-    options.optimal_parse && !B::LIMITED && crate::parallel::may_nest()
+fn pipelines<B: Budget>(options: EncodeOptions, allowance: &B) -> bool {
+    options.optimal_parse && !allowance.is_limited() && crate::parallel::may_nest()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3008,7 +3008,7 @@ fn encode_lz_block_with_allowance<B: Budget>(
         );
     }
 
-    if !B::LIMITED && options.parse_passes == 1 && initial_filters.is_empty() {
+    if !allowance.is_limited() && options.parse_passes == 1 && initial_filters.is_empty() {
         let matches = collect_optimal_matches(combined, block.clone(), search, options, allowance)?;
         return encode_single_pass_block(
             combined,
@@ -4390,7 +4390,7 @@ fn price_optimal_tokens<B: Budget, T: From<EncodeToken>, const BOUNDED: bool>(
 
     let allowance = workspace.price.allowance();
     let found = matches.borrow();
-    if !B::LIMITED && found.runs.is_empty() {
+    if !allowance.is_limited() && found.runs.is_empty() {
         // Every parse starts with empty distance memory. Without a collected
         // match, literals cannot introduce a remembered distance, so they are
         // the only path through this block under any set of table prices.
@@ -4909,7 +4909,7 @@ fn optimal_tokens_for_matches<B: Budget>(
     // distance and can only produce the same literals. Keep the first
     // tables and stream validation before skipping the equal reparse.
     // Limited callers retain every original admission and refusal point.
-    let passes = if !B::LIMITED && matches.runs.is_empty() {
+    let passes = if !allowance.is_limited() && matches.runs.is_empty() {
         1
     } else {
         options.parse_passes.max(1)

@@ -655,6 +655,10 @@ impl<B: Budget> ReaderState<B> {
     pub(crate) fn allowance(&self) -> B {
         self.history.allowance()
     }
+    /// Whether this decoder's workspace has a ceiling.
+    pub(crate) fn is_limited(&self) -> bool {
+        self.history.is_limited()
+    }
     pub(crate) fn new(allowance: &B) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
@@ -686,7 +690,7 @@ impl<B: Budget> ReaderState<B> {
             feature = "parallel",
             not(all(target_arch = "wasm32", target_os = "unknown"))
         ))]
-        return self.claimed.is_some() && !B::LIMITED;
+        return self.claimed.is_some() && !self.is_limited();
         #[cfg(not(all(
             feature = "parallel",
             not(all(target_arch = "wasm32", target_os = "unknown"))
@@ -727,8 +731,9 @@ impl<B: Budget> ReaderState<B> {
         if let Some(history) = self.streamed_history.take() {
             self.history = history.into_buffer()?;
             // Bounded readers give back the ring's flush slack.
-            let limit = reader_history_limit::<B>(dictionary_size).max(self.history.len());
-            if B::LIMITED && self.history.capacity() > limit {
+            let limited = self.is_limited();
+            let limit = reader_history_limit(limited, dictionary_size).max(self.history.len());
+            if limited && self.history.capacity() > limit {
                 self.history.shrink_to(limit)?;
             }
         }
@@ -811,7 +816,7 @@ impl<B: Budget> ReaderState<B> {
         // An independent member needs no old bytes. Reusing the allocation
         // keeps allocators from retaining a freed window per member. Under a
         // limit it would carry one member's charge into the next.
-        if !B::LIMITED {
+        if !self.is_limited() {
             let mut history = match self.streamed_history.take() {
                 Some(ring) => ring.bytes,
                 None => std::mem::replace(&mut self.history, Buffer::new(&decoder.allowance())),
@@ -1159,7 +1164,7 @@ impl<B: Budget> ReaderState<B> {
             }
             self.ended_early = Some(output.len());
         }
-        let retain_history = B::LIMITED || solid || history == HistoryRetention::Retain;
+        let retain_history = self.is_limited() || solid || history == HistoryRetention::Retain;
         let history_output = if retain_history && mode.applies_filters() && !filters.is_empty() {
             Some(Buffer::copied(
                 &output[output.len().saturating_sub(dictionary_size)..],
@@ -1328,7 +1333,7 @@ impl<B: Budget> ReaderState<B> {
             not(all(target_arch = "wasm32", target_os = "unknown"))
         ))]
         // A bounded reader's peak charge must not depend on thread timing.
-        if !B::LIMITED && output_size != 0 {
+        if !self.is_limited() && output_size != 0 {
             let workers = crate::parallel::block_decode_workers(self.read_control.decode_workers());
             if workers != 0 {
                 self.decode_blocks_ahead(
@@ -1567,12 +1572,13 @@ impl<B: Budget> ReaderState<B> {
         let incoming = &output[output.len().saturating_sub(dictionary_size)..];
         let keep = self.history_window.min(dictionary_size - incoming.len());
         let required = keep + incoming.len();
-        let limit = reader_history_limit::<B>(dictionary_size);
+        let limited = self.is_limited();
+        let limit = reader_history_limit(limited, dictionary_size);
         let capacity = self.history.capacity();
 
         // Unlimited readers amortize moves across small members. Bounded
         // readers retain the original exact-window growth and peak charge.
-        if !B::LIMITED
+        if !limited
             && incoming.len() < dictionary_size
             && capacity <= limit
             && self.history.len() + incoming.len() <= capacity
@@ -1582,7 +1588,7 @@ impl<B: Budget> ReaderState<B> {
                 .map_err(Into::into)?;
         } else if capacity <= limit
             && capacity >= required
-            && (B::LIMITED || capacity == limit || incoming.len() == dictionary_size)
+            && (limited || capacity == limit || incoming.len() == dictionary_size)
         {
             // Compact a full slack buffer in place. A full incoming dictionary
             // replaces every old byte, including any discontinuous prefix.
@@ -1590,13 +1596,13 @@ impl<B: Budget> ReaderState<B> {
             self.history
                 .extend_from_slice(incoming)
                 .map_err(Into::into)?;
-        } else if !B::LIMITED
-            && reader_history_capacity::<B>(capacity, required, dictionary_size)
+        } else if !limited
+            && reader_history_capacity(limited, capacity, required, dictionary_size)
                 >= (self.history.len() + incoming.len()).max(capacity + 1)
         {
             // Grown where it lies, so the allocator can remap rather than
             // hold the old window and its copy at once.
-            let capacity = reader_history_capacity::<B>(capacity, required, dictionary_size);
+            let capacity = reader_history_capacity(limited, capacity, required, dictionary_size);
             self.history.grow_in_place(capacity)?;
             self.history.discard_prefix(self.history.len() - keep);
             self.history
@@ -1605,7 +1611,7 @@ impl<B: Budget> ReaderState<B> {
         } else {
             // Admit the replacement before touching the old window. Growing
             // toward the slack limit avoids moving a full dictionary per file.
-            let capacity = reader_history_capacity::<B>(capacity, required, dictionary_size);
+            let capacity = reader_history_capacity(limited, capacity, required, dictionary_size);
             let mut history = Buffer::with_capacity(capacity, &self.history.allowance())?;
             history
                 .extend_from_slice(&self.history[self.history.len() - keep..])
@@ -1739,22 +1745,23 @@ impl<B: Budget> ReaderState<B> {
 
 // Bounded readers keep the original allocation and refusal policy. Unlimited
 // readers keep a quarter dictionary of spare storage across both decode paths.
-fn reader_history_limit<B: Budget>(dictionary_size: usize) -> usize {
-    if B::LIMITED {
+fn reader_history_limit(limited: bool, dictionary_size: usize) -> usize {
+    if limited {
         dictionary_size
     } else {
         dictionary_size.saturating_add(dictionary_size / 4)
     }
 }
 
-fn reader_history_capacity<B: Budget>(
+fn reader_history_capacity(
+    limited: bool,
     current: usize,
     required: usize,
     dictionary_size: usize,
 ) -> usize {
-    let limit = reader_history_limit::<B>(dictionary_size);
+    let limit = reader_history_limit(limited, dictionary_size);
     let capacity = if current > limit {
-        if B::LIMITED {
+        if limited {
             required
         } else {
             // A reset can leave a large allocation with little live history.
@@ -1764,7 +1771,7 @@ fn reader_history_capacity<B: Budget>(
     } else {
         required.max(current.saturating_mul(2)).max(8).min(limit)
     };
-    if !B::LIMITED && capacity >= dictionary_size {
+    if !limited && capacity >= dictionary_size {
         limit
     } else {
         capacity
@@ -1947,7 +1954,9 @@ impl<B: Budget> StreamingOutput<B> {
         ring.keep_newest(history_limit);
         let max_capacity = history_limit.saturating_add(STREAM_SLACK);
         // A reset can leave a large ring under a smaller dictionary.
-        if ring.allocated() > reader_history_limit::<B>(history_limit).saturating_add(STREAM_SLACK)
+        if ring.allocated()
+            > reader_history_limit(ring.bytes.is_limited(), history_limit)
+                .saturating_add(STREAM_SLACK)
         {
             ring.relocate(ring.len + STREAM_SLACK)?;
         }
