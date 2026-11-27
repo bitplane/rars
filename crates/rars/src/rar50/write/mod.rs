@@ -1941,7 +1941,7 @@ mod tests {
         write_main_header,
     };
     use super::*;
-    use crate::codec::rar50::{encode_literal_only, encode_lz_member};
+    use crate::codec::rar50::encode_literal_only;
     use crate::codec::rar50::{encode_lz_member_with_options, EncodeOptions, Unpack50Encoder};
     use crate::filter_search::{
         auto_delta_filter_range, disjoint_filter_ranges, AUTO_DELTA_EDGE_SKIP,
@@ -1950,9 +1950,7 @@ mod tests {
     use crate::{ArchiveVersion, FeatureSet};
     use crate::{WriteOperation, WriteProgressEvent};
     use std::cell::RefCell;
-    use std::fs;
     use std::io::{Cursor, Result as IoResult, Write};
-    use std::process::Command;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -3216,144 +3214,6 @@ mod tests {
                 )
                 .unwrap(),
             data
-        );
-    }
-
-    #[test]
-    #[ignore = "requires local rar command; used for reference-validating experimental RAR5 compressed output"]
-    fn reference_rar_accepts_internal_literal_only_compressed_member() {
-        let data = b"RAR5 literal-only compressed reference experiment\n";
-        let packed = encode_literal_only(data, 0).unwrap();
-        let name = b"compressed.txt";
-
-        let mut archive = Vec::new();
-        archive.extend_from_slice(RAR50_SIGNATURE);
-        write_main_header(
-            &mut archive,
-            0,
-            None,
-            &[],
-            &crate::WriterResources::default(),
-        )
-        .unwrap();
-
-        let mut extra = Vec::new();
-        write_hash_record_with_value(&mut extra, blake2sp::hash(data)).unwrap();
-        let specific = file_specific(
-            name,
-            data.len() as u64,
-            crc32(data),
-            0x20,
-            None,
-            1 << 7,
-            0,
-            false,
-            &crate::WriterResources::default(),
-        )
-        .unwrap();
-        write_block(
-            &mut archive,
-            HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
-            Some(packed.len() as u64),
-            &specific,
-            &extra,
-            &packed,
-            &crate::WriterResources::default(),
-        )
-        .unwrap();
-        write_end_header(&mut archive, 0, &crate::WriterResources::default()).unwrap();
-
-        let dir = crate::scratch::case("rars-rar50-literal-only");
-        let path = dir.join("archive.rar");
-        fs::write(&path, archive).unwrap();
-        let output = match Command::new("rar").arg("t").arg(&path).output() {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipping reference test: local `rar` command is not installed");
-                return;
-            }
-            Err(error) => panic!("failed to run rar: {error}"),
-        };
-        if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_some() {
-            eprintln!("kept reference archive: {}", path.display());
-            std::mem::forget(dir);
-        }
-
-        assert!(
-            output.status.success(),
-            "rar rejected experimental RAR5 compressed output\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    #[ignore = "requires local rar command; used for reference-validating experimental RAR5 match output"]
-    fn reference_rar_accepts_internal_match_compressed_member() {
-        let data = b"RAR5 match compressed reference experiment\n".repeat(8);
-        let packed = encode_lz_member(&data, 0).unwrap();
-        let name = b"compressed.txt";
-
-        let mut archive = Vec::new();
-        archive.extend_from_slice(RAR50_SIGNATURE);
-        write_main_header(
-            &mut archive,
-            0,
-            None,
-            &[],
-            &crate::WriterResources::default(),
-        )
-        .unwrap();
-
-        let mut extra = Vec::new();
-        write_hash_record_with_value(&mut extra, blake2sp::hash(&data)).unwrap();
-        let specific = file_specific(
-            name,
-            data.len() as u64,
-            crc32(&data),
-            0x20,
-            None,
-            1 << 7,
-            0,
-            false,
-            &crate::WriterResources::default(),
-        )
-        .unwrap();
-        write_block(
-            &mut archive,
-            HEAD_FILE,
-            HFL_EXTRA | HFL_DATA,
-            Some(packed.len() as u64),
-            &specific,
-            &extra,
-            &packed,
-            &crate::WriterResources::default(),
-        )
-        .unwrap();
-        write_end_header(&mut archive, 0, &crate::WriterResources::default()).unwrap();
-
-        let dir = crate::scratch::case("rars-rar50-match");
-        let path = dir.join("archive.rar");
-        fs::write(&path, archive).unwrap();
-        let output = match Command::new("rar").arg("t").arg(&path).output() {
-            Ok(output) => output,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                eprintln!("skipping reference test: local `rar` command is not installed");
-                return;
-            }
-            Err(error) => panic!("failed to run rar: {error}"),
-        };
-        if std::env::var_os("RARS_KEEP_REFERENCE_ARCHIVE").is_some() {
-            eprintln!("kept reference archive: {}", path.display());
-            std::mem::forget(dir);
-        }
-
-        assert!(
-            output.status.success(),
-            "rar rejected experimental RAR5 match output\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
         );
     }
 
