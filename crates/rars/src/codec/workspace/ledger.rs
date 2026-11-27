@@ -43,7 +43,9 @@ fn refusal(limit: u64, required: u64, used: u64) -> Error {
     }))
 }
 impl Limited {
-    /// A budget that refuses growth past `limit` bytes.
+    /// A budget that refuses growth past `limit` bytes. Callers spell it
+    /// `Allowance::limited`.
+    #[allow(clippy::self_named_constructors)]
     pub(crate) fn limited(limit: u64) -> Self {
         Self {
             ledger: Some(Arc::new(Ledger {

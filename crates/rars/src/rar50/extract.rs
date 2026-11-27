@@ -37,6 +37,7 @@ mod write_lane {
             _: bool,
             _: crate::ArchiveReadOptions<'_>,
             _: &OutputBudget,
+            _: bool,
         ) -> Option<Self> {
             None
         }
