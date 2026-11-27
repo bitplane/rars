@@ -6,11 +6,11 @@ use crate::volume_extract::{
     flush_split, FragmentWalk, LazyChain, SplitFailure, VolumeEnd, VolumeFeed,
 };
 
-pub(super) fn extract<F, B: Budget>(
+pub(super) fn extract<F>(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
     mut open: F,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -154,12 +154,12 @@ where
 /// RAR 1.5 and later, a fragment's header gives no checksum of its own
 /// packed data (RAR 1.402 writes a running checksum of the input there), so
 /// the damaged volume isn't named.
-fn extract_split<F, B: Budget>(
+fn extract_split<F>(
     volume: &Archive,
     first: &Entry,
     feed: &mut VolumeFeed<'_, '_, Archive>,
     budget: &mut OutputBudget,
-    unpack15: &mut Decoder15<B>,
+    unpack15: &mut Decoder15,
     solid: bool,
     open: &mut F,
 ) -> std::result::Result<Archive, SplitFailure<Archive>>
@@ -200,12 +200,12 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_split_walk<F, B: Budget>(
+fn extract_split_walk<F>(
     volume: &Archive,
     first: &Entry,
-    walk: &mut SplitWalk<'_, '_, '_, B>,
+    walk: &mut SplitWalk<'_, '_, '_>,
     budget: &mut OutputBudget,
-    unpack15: &mut Decoder15<B>,
+    unpack15: &mut Decoder15,
     solid: bool,
     open: &mut F,
 ) -> Result<Box<dyn Write>>
@@ -299,23 +299,23 @@ fn packed_reader<'a>(
 }
 
 /// Fetches a split member's later volumes as its reader reaches each fragment's end.
-struct SplitWalk<'f, 'p, 'o, B: Budget> {
+struct SplitWalk<'f, 'p, 'o> {
     feed: &'f mut VolumeFeed<'p, 'o, Archive>,
     options: crate::ArchiveReadOptions<'o>,
     first: Entry,
     split_after: bool,
     last: Option<Archive>,
     /// The volume of each fragment, charged to the reader workspace.
-    fragments: Buffer<usize, B>,
+    fragments: Buffer<usize>,
     /// A refused or missing volume, reported as itself rather than as a decode failure.
     failure: Option<Error>,
 }
 
-impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
+impl<'f, 'p, 'o> SplitWalk<'f, 'p, 'o> {
     fn new(
         feed: &'f mut VolumeFeed<'p, 'o, Archive>,
         first: &Entry,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         Ok(Self {
             fragments: Buffer::copied(&[feed.current_index()], allowance)?,
@@ -403,7 +403,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     }
 }
 
-impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
+impl FragmentWalk for SplitWalk<'_, '_, '_> {
     fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
         let error = match &self.failure {
             Some(error) => error.clone(),

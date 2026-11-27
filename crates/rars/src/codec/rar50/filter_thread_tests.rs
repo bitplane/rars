@@ -18,7 +18,7 @@ struct Run {
     ended_early: Option<usize>,
 }
 
-fn decoder(workers: Option<usize>) -> ReaderState<Allowance> {
+fn decoder(workers: Option<usize>) -> ReaderState {
     let mut state = ReaderState::new(&Allowance::default());
     if let Some(workers) = workers {
         state.read_control =
@@ -28,7 +28,7 @@ fn decoder(workers: Option<usize>) -> ReaderState<Allowance> {
 }
 
 fn run(
-    state: &mut ReaderState<Allowance>,
+    state: &mut ReaderState,
     stream: &[u8],
     output_size: usize,
     solid: bool,

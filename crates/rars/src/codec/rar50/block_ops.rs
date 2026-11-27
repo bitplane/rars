@@ -2,9 +2,9 @@
 //! as operations; replaying them in order resolves what earlier blocks decide.
 use super::{
     distance_from_slot_parts, distance_slot_bit_count, length_bonus, length_from_slot_parts,
-    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Budget, Buffer,
-    DecodedChunk, Error, Overrun, PendingFilter, ReaderState, ReaderTables, Result,
-    StreamDecodeError, StreamingOutput, LITERAL_BURST, SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
+    length_slot_extra_bits, read_filter, read_filter_record, BitReader, Buffer, DecodedChunk,
+    Error, Overrun, PendingFilter, ReaderState, ReaderTables, Result, StreamDecodeError,
+    StreamingOutput, LITERAL_BURST, SHORT_MATCH, STREAM_FLUSH_THRESHOLD,
 };
 use crate::read_control::Poller;
 use std::hint::select_unpredictable;
@@ -124,9 +124,9 @@ impl BlockOps {
     }
 
     /// Appends a block's operations from `bit_pos` on.
-    pub(super) fn decode<B: Budget>(
+    pub(super) fn decode(
         &mut self,
-        tables: &ReaderTables<B>,
+        tables: &ReaderTables,
         payload: &[u8],
         bit_pos: usize,
         payload_bits: usize,
@@ -157,9 +157,9 @@ impl BlockOps {
         *run_start = self.literals.len();
     }
 
-    fn decode_symbols<B: Budget>(
+    fn decode_symbols(
         &mut self,
-        tables: &ReaderTables<B>,
+        tables: &ReaderTables,
         payload: &[u8],
         bit_pos: usize,
         payload_bits: usize,
@@ -214,10 +214,10 @@ impl BlockOps {
     }
 
     /// Replays the list up to where the serial decoder would stop, counting what it reaches.
-    pub(super) fn apply<B: Budget, E>(
+    pub(super) fn apply<E>(
         &self,
         repeats: &mut Repeats<'_>,
-        output: &mut StreamingOutput<B>,
+        output: &mut StreamingOutput,
         poller: &mut Poller,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
         filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
@@ -327,9 +327,9 @@ impl BlockOps {
 }
 
 /// Where the buffered decoder writes a member: flat, with its filters kept for the end.
-pub(super) struct Flat<'a, B: Budget> {
-    pub(super) output: &'a mut Buffer<u8, B>,
-    pub(super) filters: &'a mut Buffer<PendingFilter, B>,
+pub(super) struct Flat<'a> {
+    pub(super) output: &'a mut Buffer<u8>,
+    pub(super) filters: &'a mut Buffer<PendingFilter>,
     pub(super) output_size: usize,
     pub(super) dictionary_size: usize,
     pub(super) overrun: &'a mut Option<Overrun>,
@@ -342,16 +342,16 @@ const FIRST_ROOM: usize = 16 << 20;
 const FIRST_ROOM: usize = 4 << 10;
 
 /// Writes a [`Flat`] output into zeroed room so most copies skip capacity and length checks.
-pub(super) struct Replay<'f, 'a, B: Budget> {
-    flat: &'f mut Flat<'a, B>,
+pub(super) struct Replay<'f, 'a> {
+    flat: &'f mut Flat<'a>,
     // Bytes from here on are scratch that fixed-width copies may overwrite;
     // at least SHORT_MATCH of them always follow.
     pub(super) written: usize,
 }
 
-impl<'f, 'a, B: Budget> Replay<'f, 'a, B> {
+impl<'f, 'a> Replay<'f, 'a> {
     /// Replaces the empty flat output with zeroed room.
-    pub(super) fn begin(flat: &'f mut Flat<'a, B>) -> Result<Self> {
+    pub(super) fn begin(flat: &'f mut Flat<'a>) -> Result<Self> {
         debug_assert!(flat.output.is_empty());
         let room = flat.output_size.min(FIRST_ROOM) + SHORT_MATCH;
         *flat.output = Buffer::filled(room, 0, &flat.output.allowance())?;
@@ -410,7 +410,7 @@ impl<'f, 'a, B: Budget> Replay<'f, 'a, B> {
 
     /// As `ReaderState::copy_match`, a match reaching past the window writes zeroes.
     #[inline(always)]
-    fn zero_fills(&self, state: &ReaderState<B>, distance: usize) -> bool {
+    fn zero_fills(&self, state: &ReaderState, distance: usize) -> bool {
         distance == 0
             || distance > self.flat.dictionary_size
             || distance > state.history_window + self.written
@@ -420,7 +420,7 @@ impl<'f, 'a, B: Budget> Replay<'f, 'a, B> {
     #[inline(always)]
     fn copy_in_room(
         &mut self,
-        state: &ReaderState<B>,
+        state: &ReaderState,
         distance: usize,
         length: usize,
         zero_fill: bool,
@@ -454,7 +454,7 @@ impl<'f, 'a, B: Budget> Replay<'f, 'a, B> {
     /// Reports the part past the declared size, as the serial decoder does.
     fn copy_match(
         &mut self,
-        state: &ReaderState<B>,
+        state: &ReaderState,
         distance: usize,
         length: usize,
     ) -> Result<Option<Overrun>> {
@@ -513,10 +513,10 @@ pub(super) enum Walked {
 
 impl BlockOps {
     /// [`Self::apply`] for the buffered decoder, which owns the repeat state and history.
-    pub(super) fn apply_buffered<B: Budget>(
+    pub(super) fn apply_buffered(
         &self,
-        state: &mut ReaderState<B>,
-        out: &mut Replay<'_, '_, B>,
+        state: &mut ReaderState,
+        out: &mut Replay<'_, '_>,
         poller: &mut Poller,
         reached: &mut Reached,
     ) -> Result<Walked> {
@@ -626,7 +626,7 @@ impl BlockOps {
 }
 
 /// The replay's unchecked copies, which only replay can keep within a budget.
-impl<B: Budget> StreamingOutput<B> {
+impl StreamingOutput {
     /// Bytes that can be written before a flush, a growth, the output limit
     /// or a zero-filled window needs the checked path, with room left past
     /// the newest byte for one fixed-width over-copy.
@@ -707,8 +707,8 @@ impl<B: Budget> StreamingOutput<B> {
 }
 
 /// Finds where the serial decoder stopped, which replayed operations do not record.
-pub(super) fn skip_symbols<'a, B: Budget>(
-    tables: &ReaderTables<B>,
+pub(super) fn skip_symbols<'a>(
+    tables: &ReaderTables,
     payload: &'a [u8],
     bit_pos: usize,
     count: usize,
@@ -729,8 +729,8 @@ pub(super) fn skip_symbols<'a, B: Budget>(
 
 /// Shared by decoding and skipping so both read a match's bits alike.
 #[inline(always)]
-fn new_match<B: Budget>(
-    tables: &ReaderTables<B>,
+fn new_match(
+    tables: &ReaderTables,
     bits: &mut BitReader<'_>,
     symbol: usize,
 ) -> Result<(usize, usize)> {
@@ -750,7 +750,7 @@ fn new_match<B: Budget>(
     Ok((length + length_bonus(distance), distance))
 }
 
-fn repeat_length<B: Budget>(tables: &ReaderTables<B>, bits: &mut BitReader<'_>) -> Result<usize> {
+fn repeat_length(tables: &ReaderTables, bits: &mut BitReader<'_>) -> Result<usize> {
     let length_slot = tables.length.decode(bits)?;
     let length_extra = bits.read_bits(length_slot_extra_bits(length_slot))?;
     Ok(length_from_slot_parts(length_slot, length_extra))

@@ -1,14 +1,14 @@
 use super::*;
-use crate::codec::workspace::RefusingBudget;
+use crate::codec::workspace::Allowance;
 
 // The eager policy, independent of the batching helpers.
-fn eager<B: Budget>(state: &mut Reader20State<B>) {
+fn eager(state: &mut Reader20State) {
     let drain = state.output.len().saturating_sub(MAX_HISTORY);
     state.output.discard_prefix(drain);
     state.base_offset += drain;
 }
 
-fn assert_window<B: Budget>(actual: &Reader20State<B>, expected: &Reader20State<B>) {
+fn assert_window(actual: &Reader20State, expected: &Reader20State) {
     let end = expected.current_pos();
     let start = end.saturating_sub(MAX_HISTORY);
     assert_eq!(actual.current_pos(), end);
@@ -17,14 +17,10 @@ fn assert_window<B: Budget>(actual: &Reader20State<B>, expected: &Reader20State<
     assert!(actual.output.len() - (end - start) < HISTORY_TRIM_BATCH);
 }
 
-fn seeded<B: Budget>(budget: &B) -> Reader20State<B> {
+fn seeded(budget: &Allowance) -> Reader20State {
     let mut state = Reader20State::with_allowance(budget);
     let seed: Vec<_> = (0..MAX_HISTORY).map(|i| ((i >> 8) ^ i) as u8).collect();
-    state
-        .output
-        .extend_from_slice(&seed)
-        .map_err(Into::<Error>::into)
-        .unwrap();
+    state.output.extend_from_slice(&seed).unwrap();
     state
 }
 
@@ -82,7 +78,7 @@ fn trim_and_spare_capacity_boundaries_preserve_absolute_positions() {
 
 #[test]
 fn pending_matches_and_irregular_members_agree_with_eager_history() {
-    fn check<B: Budget>(budget: &B) {
+    fn check(budget: &Allowance) {
         let mut actual = seeded(budget);
         let mut expected = actual.try_clone().unwrap();
         for size in [
@@ -99,11 +95,7 @@ fn pending_matches_and_irregular_members_agree_with_eager_history() {
                 .map(|i| ((i >> 7) ^ i) as u8)
                 .collect();
             for state in [&mut actual, &mut expected] {
-                state
-                    .output
-                    .extend_from_slice(&data)
-                    .map_err(Into::<Error>::into)
-                    .unwrap();
+                state.output.extend_from_slice(&data).unwrap();
             }
             actual.finish_history();
             eager(&mut expected);
@@ -183,7 +175,7 @@ fn checkpoints_drop_obsolete_bytes_before_restoration_and_growth() {
     }
 }
 
-fn bounded_run<B: Budget>(budget: &B) -> Result<()> {
+fn bounded_run(budget: &Allowance) -> Result<()> {
     let mut state = Reader20State::with_allowance(budget);
     state.output.resize(MAX_HISTORY, 1)?;
     for size in [1024, HISTORY_TRIM_BATCH - 1, HISTORY_TRIM_BATCH + 1] {
@@ -214,10 +206,10 @@ fn bounded_growth_refusals_release_everything() {
         assert_eq!(budget.used(), 0, "limit={limit}");
     }
     assert!(bounded_run(&Allowance::limited(6 * MAX_HISTORY as u64)).is_ok());
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     assert!(bounded_run(&baseline).is_ok());
     for failure in 0..=baseline.attempts() {
-        let budget = RefusingBudget::new(failure);
+        let budget = Allowance::refusing(failure);
         let _ = bounded_run(&budget);
         assert_eq!(budget.used(), 0, "failure={failure}");
     }
@@ -253,7 +245,7 @@ fn solid_members_survive_deferred_history_checkpoints_until_a_sink_failure() {
         (data, packed)
     })
     .collect();
-    fn check<B: Budget>(frames: &[(Vec<u8>, Vec<u8>)], budget: &B) {
+    fn check(frames: &[(Vec<u8>, Vec<u8>)], budget: &Allowance) {
         for streaming in [false, true] {
             let mut actual = Reader20State::with_allowance(budget);
             let mut expected = Reader20State::with_allowance(budget);

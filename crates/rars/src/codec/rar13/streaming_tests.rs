@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::workspace::RefusingBudget;
+use crate::codec::workspace::Allowance;
 
 const CHUNK: usize = 64 * 1024;
 
@@ -17,7 +17,7 @@ impl<F: FnMut(&[u8]) -> std::io::Result<usize>> Write for Sink<F> {
 fn full_literal_chunks_reuse_their_allocation() {
     let data: Vec<_> = (0..2 * CHUNK + 7).map(|i| (i * 73) as u8).collect();
     let packed = Unpack15Encoder::new().encode_literals_only(&data).unwrap();
-    let budget = RefusingBudget::new(usize::MAX);
+    let budget = Allowance::refusing(usize::MAX);
     let mut decoder = Reader15State::with_allowance(&budget).unwrap();
     let mut output = Vec::new();
     let mut attempts = Vec::new();
@@ -50,8 +50,8 @@ fn full_literal_chunks_reuse_their_allocation() {
 }
 
 // The original loop is an oracle for chunk boundaries and bounded workspace.
-fn old_stream<B: Budget>(
-    decoder: &mut Reader15State<B>,
+fn old_stream(
+    decoder: &mut Reader15State,
     input: &mut impl Read,
     target: usize,
     solid: bool,
@@ -76,9 +76,9 @@ fn old_stream<B: Budget>(
     Ok(())
 }
 
-fn stream<B: Budget>(
+fn stream(
     old: bool,
-    decoder: &mut Reader15State<B>,
+    decoder: &mut Reader15State,
     input: &mut impl Read,
     target: usize,
     solid: bool,
@@ -107,7 +107,7 @@ fn matches_fixture() -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
 
 #[test]
 fn reused_chunks_preserve_match_overshoot_and_solid_continuations() {
-    fn check<B: Budget>(budget: &B, members: &[(&[u8], &[u8])]) {
+    fn check(budget: &Allowance, members: &[(&[u8], &[u8])]) {
         let mut reference = Reader15State::with_allowance(budget).unwrap();
         let mut decoder = Reader15State::with_allowance(budget).unwrap();
         for (index, &(data, packed)) in members.iter().enumerate() {
@@ -209,7 +209,7 @@ fn reused_chunks_preserve_minimum_workspace_and_release_before_resizing() {
                 written += bytes.len();
                 if written < data.len() && data.len() - written < CHUNK / 2 {
                     held = Some(
-                        Buffer::<u8, _>::with_capacity(
+                        Buffer::<u8>::with_capacity(
                             (1024 * 1024 - budget.used()) as usize,
                             &budget,
                         )
@@ -237,7 +237,7 @@ fn reused_chunks_preserve_minimum_workspace_and_release_before_resizing() {
 fn reused_chunks_release_on_each_allocation_refusal_and_sink_failure() {
     let data: Vec<_> = (0..2 * CHUNK + 7).map(|i| (i * 73) as u8).collect();
     let packed = Unpack15Encoder::new().encode_literals_only(&data).unwrap();
-    let run = |budget: &RefusingBudget| -> Result<()> {
+    let run = |budget: &Allowance| -> Result<()> {
         let mut decoder = Reader15State::with_allowance(budget)?;
         decoder.decode_member_from_reader(
             &mut packed.as_slice(),
@@ -246,11 +246,11 @@ fn reused_chunks_release_on_each_allocation_refusal_and_sink_failure() {
             &mut std::io::sink(),
         )
     };
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     run(&baseline).unwrap();
     assert_eq!(baseline.used(), 0);
     for failure in 0..baseline.attempts() {
-        let budget = RefusingBudget::new(failure);
+        let budget = Allowance::refusing(failure);
         assert!(
             matches!(run(&budget), Err(Error::Cancelled)),
             "allocation {failure}"
@@ -304,7 +304,7 @@ fn empty_target_keeps_input_errors_and_emits_nothing() {
             Err(std::io::Error::other("packed input failed"))
         }
     }
-    let budget = RefusingBudget::new(usize::MAX);
+    let budget = Allowance::refusing(usize::MAX);
     let mut decoder = Reader15State::with_allowance(&budget).unwrap();
     let mut sink =
         Sink(|_: &[u8]| -> std::io::Result<usize> { panic!("empty member emitted output") });

@@ -188,11 +188,11 @@ fn decode_filter(
     })
 }
 
-pub(super) fn decode<B: Budget>(
+pub(super) fn decode(
     file: &FileHeader,
-    packed: &mut PackedReader<'_, B>,
+    packed: &mut PackedReader<'_>,
     keys: Option<&Rar50Keys>,
-    decoder: &mut ReaderState<B>,
+    decoder: &mut ReaderState,
     policy: &crate::Rar50Scratch,
     writer: &mut dyn Write,
 ) -> Result<()> {

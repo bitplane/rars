@@ -114,7 +114,7 @@ fn independent_stream_preparation_preserves_control_and_exhausted_budget() {
 #[cfg(feature = "write")]
 #[test]
 fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
-    fn check<B: Budget>(budget: &B) {
+    fn check(budget: &Allowance) {
         let data = b"old dictionary and Huffman tables";
         let packed = encode_literal_only(data, 0).unwrap();
         let mut original = ReaderState::new(budget);
@@ -141,7 +141,7 @@ fn independent_stream_preparation_does_not_copy_populated_tables_or_history() {
     check(&Allowance::default());
     check(&Allowance::limited(1024 * 1024));
 
-    let budget = super::super::workspace::RefusingBudget::new(usize::MAX);
+    let budget = super::super::workspace::Allowance::refusing(usize::MAX);
     let packed = encode_literal_only(b"old history", 0).unwrap();
     let mut original = ReaderState::new(&budget);
     original

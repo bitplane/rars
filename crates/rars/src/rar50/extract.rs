@@ -20,18 +20,17 @@ mod write_lane;
 )))]
 mod write_lane {
     use super::{Archive, DecoderSession, FileHeader, Redirections, Settling};
-    use crate::codec::workspace::Budget;
     use crate::error::Result;
     use crate::output_limit::OutputBudget;
     use std::convert::Infallible;
     use std::marker::PhantomData;
 
-    pub(super) struct Decoded<'f, B>(Infallible, PhantomData<&'f B>);
+    pub(super) struct Decoded<'f>(Infallible, PhantomData<&'f ()>);
 
     /// Never started without threads to write on.
-    pub(super) struct Lane<'s, 'a, 'f, B>(Infallible, PhantomData<(&'s Settling<'a>, &'f B)>);
+    pub(super) struct Lane<'s, 'a, 'f>(Infallible, PhantomData<(&'s Settling<'a>, &'f ())>);
 
-    impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
+    impl<'s, 'a, 'f> Lane<'s, 'a, 'f> {
         pub(super) fn start(
             _: Option<&'s Settling<'a>>,
             _: bool,
@@ -51,14 +50,14 @@ mod write_lane {
             _: Redirections,
             _: u64,
             _: &OutputBudget,
-            _: &mut DecoderSession<'_, B>,
-        ) -> Option<Decoded<'f, B>> {
+            _: &mut DecoderSession<'_>,
+        ) -> Option<Decoded<'f>> {
             match self.0 {}
         }
 
         pub(super) fn write(
             &mut self,
-            _: Decoded<'f, B>,
+            _: Decoded<'f>,
             _: crate::ArchiveReadOptions<'_>,
             _: &OutputBudget,
         ) -> Option<Result<()>> {
@@ -74,7 +73,7 @@ use super::{blake2sp, Archive, ExtractedEntryMeta, FileHeader, FileRedirection};
 use crate::codec::rar50::{
     DecodeMode, DecodedChunk, HistoryRetention, ReaderState, StreamDecodeError, FILTER_THREAD_BYTES,
 };
-use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Boxed, Buffer};
 use crate::crc32::{crc32, Crc32};
 #[cfg(feature = "encryption")]
 use crate::crypto::rar50::Rar50Cipher;
@@ -213,14 +212,14 @@ impl FileHeader {
             ))
     }
 
-    fn packed_data_with_allowance<B: Budget>(
+    fn packed_data_with_allowance(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         key_cache: &crate::key_cache::KeyCache,
         control: &crate::read_control::ReadControl,
-        allowance: &B,
-    ) -> Result<(Buffer<u8, B>, Option<Rar50Keys>)> {
+        allowance: &Allowance,
+    ) -> Result<(Buffer<u8>, Option<Rar50Keys>)> {
         control.check()?;
         let (reader, keys) =
             self.packed_reader_with_allowance(archive, password, key_cache, allowance)?;
@@ -230,13 +229,13 @@ impl FileHeader {
         Ok((packed, keys))
     }
 
-    fn packed_reader_with_allowance<'a, B: Budget>(
+    fn packed_reader_with_allowance<'a>(
         &self,
         archive: &'a Archive,
         password: Option<&[u8]>,
         key_cache: &crate::key_cache::KeyCache,
-        allowance: &B,
-    ) -> Result<(PackedReader<'a, B>, Option<Rar50Keys>)> {
+        allowance: &Allowance,
+    ) -> Result<(PackedReader<'a>, Option<Rar50Keys>)> {
         let mut range = self.block.data_range.clone();
         if self.encrypted && self.is_cut_short() {
             // Whole cipher blocks only.
@@ -299,11 +298,7 @@ impl FileHeader {
     /// since the whole file is there and the declared size is what is wrong.
     /// Without a checksum to say so (#44), or if it fails, the member is
     /// truncated.
-    fn ended_early_result<B: Budget>(
-        &self,
-        decoder: &ReaderState<B>,
-        verified: Result<()>,
-    ) -> Result<()> {
+    fn ended_early_result(&self, decoder: &ReaderState, verified: Result<()>) -> Result<()> {
         let Some(decoded) = decoder.ended_early() else {
             return verified;
         };
@@ -340,11 +335,7 @@ impl FileHeader {
 
     /// Under salvage, a member whose stream went on past its declared size
     /// delivered only those bytes, whatever its checksum says.
-    fn salvaged_result<B: Budget>(
-        &self,
-        decoder: &ReaderState<B>,
-        result: Result<()>,
-    ) -> Result<()> {
+    fn salvaged_result(&self, decoder: &ReaderState, result: Result<()>) -> Result<()> {
         if decoder.ran_past() {
             return Err(Error::MemberRanPastDeclaredSize {
                 declared: self.unpacked_size,
@@ -527,12 +518,12 @@ impl FileHeader {
         self.decoded_comment_with_allowance(archive, options, checksum, &Allowance::default())
     }
 
-    fn decoded_comment_with_allowance<B: Budget>(
+    fn decoded_comment_with_allowance(
         &self,
         archive: &Archive,
         options: crate::ArchiveReadOptions<'_>,
         checksum: CommentChecksum,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Vec<u8>> {
         let verify = checksum == CommentChecksum::Verify;
         let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -605,12 +596,12 @@ impl FileHeader {
         Ok(data)
     }
 
-    fn decoded_data_with_decoder<B: Budget>(
+    fn decoded_data_with_decoder(
         &self,
         archive: &Archive,
-        decoder: &mut ReaderState<B>,
+        decoder: &mut ReaderState,
         password: Option<&[u8]>,
-    ) -> Result<DecodedData<B>> {
+    ) -> Result<DecodedData> {
         self.decoded_data_with_decoder_and_history(
             archive,
             decoder,
@@ -620,14 +611,14 @@ impl FileHeader {
         )
     }
 
-    fn decoded_data_with_decoder_and_history<B: Budget>(
+    fn decoded_data_with_decoder_and_history(
         &self,
         archive: &Archive,
-        decoder: &mut ReaderState<B>,
+        decoder: &mut ReaderState,
         password: Option<&[u8]>,
         key_cache: &crate::key_cache::KeyCache,
         history: HistoryRetention,
-    ) -> Result<DecodedData<B>> {
+    ) -> Result<DecodedData> {
         // A member decoded ahead was read when it was offered.
         let (packed, keys) = if decoder.has_claimed() {
             let keys = self
@@ -648,12 +639,12 @@ impl FileHeader {
         Ok(DecodedData { data, keys })
     }
 
-    fn decode_packed_owned<B: Budget>(
+    fn decode_packed_owned(
         &self,
         packed: &[u8],
-        decoder: &mut ReaderState<B>,
+        decoder: &mut ReaderState,
         history: HistoryRetention,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         if self.is_stored() {
             if self.encrypted {
                 let unpacked_size = usize::try_from(self.unpacked_size).map_err(|_| {
@@ -702,18 +693,18 @@ impl FileHeader {
     }
 
     #[cfg(all(test, feature = "write"))]
-    fn stream_packed_with_decoder<B: Budget>(
+    fn stream_packed_with_decoder(
         &self,
-        packed: &mut PackedReader<'_, B>,
+        packed: &mut PackedReader<'_>,
         keys: Option<&Rar50Keys>,
-        decoder: &mut ReaderState<B>,
+        decoder: &mut ReaderState,
         buffered_decode_limit: u64,
         scratch_policy: Option<&crate::Rar50Scratch>,
         writer: &mut dyn Write,
     ) -> Result<()> {
         // Split members retain their existing checksum work. Only ordinary
         // members select the optional policy, independently of scratch decoding.
-        self.stream_packed_with_crc_policy::<false, _>(
+        self.stream_packed_with_crc_policy::<false>(
             packed,
             keys,
             decoder,
@@ -726,11 +717,11 @@ impl FileHeader {
 
     /// `outer_check` sees every output byte, on the checksum thread when there is one.
     #[allow(clippy::too_many_arguments)]
-    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool, B: Budget>(
+    fn stream_packed_with_crc_policy<const OPTIONAL_CRC: bool>(
         &self,
-        packed: &mut PackedReader<'_, B>,
+        packed: &mut PackedReader<'_>,
         keys: Option<&Rar50Keys>,
-        decoder: &mut ReaderState<B>,
+        decoder: &mut ReaderState,
         buffered_decode_limit: u64,
         scratch_policy: Option<&crate::Rar50Scratch>,
         mut outer_check: Option<OuterCheck<'_>>,
@@ -744,7 +735,7 @@ impl FileHeader {
             .then(|| {
                 output_pipeline::admit_with(self.unpacked_size, |bytes| {
                     let mut charge = allowance.charge();
-                    B::resize(&mut charge, bytes.checked_add(FILTER_THREAD_BYTES)?).ok()?;
+                    Allowance::resize(&mut charge, bytes.checked_add(FILTER_THREAD_BYTES)?).ok()?;
                     Some(charge)
                 })
             })
@@ -866,13 +857,13 @@ impl FileHeader {
         self.verify_streaming_integrity(crc, hash, keys)
     }
 
-    fn write_stored_with_allowance<B: Budget>(
+    fn write_stored_with_allowance(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         key_cache: &crate::key_cache::KeyCache,
         writer: &mut dyn Write,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<()> {
         if !self.encrypted && self.packed_size() != self.unpacked_size {
             return Err(self.entry_error(
@@ -929,7 +920,7 @@ impl FileHeader {
     fn decode_packed_with_decoder(
         &self,
         packed: &[u8],
-        decoder: &mut ReaderState<Allowance>,
+        decoder: &mut ReaderState,
     ) -> Result<Vec<u8>> {
         self.decode_packed_owned(packed, decoder, HistoryRetention::Retain)
             .map(Buffer::into_vec)
@@ -1128,7 +1119,7 @@ impl Archive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn extract_with_allowance<F, R, B: Budget>(
+    fn extract_with_allowance<F, R>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
@@ -1137,7 +1128,7 @@ impl Archive {
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         settling: Option<&Settling<'_>>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1284,12 +1275,12 @@ impl Archive {
     }
 
     /// Decodes one non-redirection member straight to the writer `open` returns.
-    fn stream_member<B: Budget>(
+    fn stream_member(
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
         budget: &mut crate::output_limit::OutputBudget,
-        session: &mut DecoderSession<'_, B>,
+        session: &mut DecoderSession<'_>,
         open: impl FnOnce(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     ) -> Result<()> {
         if file.is_split_before() || file.is_split_after() {
@@ -1312,12 +1303,12 @@ impl Archive {
 
     /// Streams one independent member on the calling thread, between batches.
     #[allow(clippy::too_many_arguments)]
-    fn extract_inline<F, B: Budget>(
+    fn extract_inline<F>(
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
         buffered_decode_limit: u64,
-        allowance: &B,
+        allowance: &Allowance,
         open: &mut F,
         redirect: Option<&mut Redirect<'_>>,
     ) -> Result<()>
@@ -1491,14 +1482,14 @@ impl Archive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn parallel_with<F, B: member_batches::Workers>(
+    fn parallel_with<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
         settling: Option<&Settling<'_>>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -1640,12 +1631,12 @@ impl Archive {
     /// are verified and before any member after it is opened, as in
     /// sequential extraction.
     #[allow(clippy::too_many_arguments)]
-    fn write_on_workers<B: member_batches::Workers>(
+    fn write_on_workers(
         &self,
         members: &[(&FileHeader, u64)],
         options: crate::ArchiveReadOptions<'_>,
         buffered_decode_limit: u64,
-        allowance: &B,
+        allowance: &Allowance,
         hint: &impl Fn(&FileHeader) -> u64,
         settling: &Settling<'_>,
         mut redirect: Option<&mut Redirect<'_>>,
@@ -1784,14 +1775,14 @@ enum Written {
 }
 
 /// Writes one member to the output opened for it and closes it, on a worker.
-fn write_opened_entry<B: Budget>(
+fn write_opened_entry(
     archive: &Archive,
     file: &FileHeader,
     meta: &ExtractedEntryMeta,
     writer: Box<dyn Write + Send>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()> {
     options.check_cancelled()?;
     if meta.is_directory {
@@ -1854,14 +1845,14 @@ impl Settling<'_> {
 }
 
 /// Hands a failed member to the error handler and carries the session on as it chose.
-fn finish_solid_member<'a, B: Budget>(
+fn finish_solid_member<'a>(
     on_error: &mut Option<&mut crate::extraction_control::ErrorHandler<'_>>,
     options: crate::ArchiveReadOptions<'_>,
     file: &FileHeader,
     archive_solid: bool,
     result: Result<()>,
-    session: &mut DecoderSession<'a, B>,
-    fresh: impl FnOnce() -> DecoderSession<'a, B>,
+    session: &mut DecoderSession<'a>,
+    fresh: impl FnOnce() -> DecoderSession<'a>,
 ) -> Result<()> {
     let resume = crate::extraction_control::finish_member(
         on_error,
@@ -1905,16 +1896,16 @@ fn publish_redirection(
     options.check_cancelled()
 }
 
-type ParallelExtractedEntry<B> = member_batches::Decoded<ExtractedEntryMeta, B>;
+type ParallelExtractedEntry = member_batches::Decoded<ExtractedEntryMeta>;
 
-fn decode_parallel_entry<B: Budget>(
+fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
     verification: bool,
-    allowance: &B,
-) -> Result<ParallelExtractedEntry<B>> {
+    allowance: &Allowance,
+) -> Result<ParallelExtractedEntry> {
     options.check_cancelled()?;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
@@ -1973,14 +1964,14 @@ pub(crate) enum CommentChecksum {
     Verify,
 }
 
-struct DecodedData<B: Budget = Allowance> {
-    data: Buffer<u8, B>,
+struct DecodedData {
+    data: Buffer<u8>,
     keys: Option<Rar50Keys>,
 }
 
-struct DecoderSession<'a, B: Budget = Allowance> {
-    decoder: ReaderState<B>,
-    allowance: B,
+struct DecoderSession<'a> {
+    decoder: ReaderState,
+    allowance: Allowance,
     password: Option<&'a [u8]>,
     buffered_decode_limit: u64,
     scratch: Option<&'a crate::Rar50Scratch>,
@@ -1990,14 +1981,14 @@ struct DecoderSession<'a, B: Budget = Allowance> {
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))
     ))]
-    ahead: solid_ahead::SolidAhead<B>,
+    ahead: solid_ahead::SolidAhead,
 }
 
-impl<'a, B: Budget> DecoderSession<'a, B> {
+impl<'a> DecoderSession<'a> {
     fn with_allowance(
         password: Option<&'a [u8]>,
         buffered_decode_limit: u64,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Self {
         Self {
             decoder: ReaderState::new(allowance),
@@ -2104,7 +2095,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file: &FileHeader,
         history: HistoryRetention,
         salvaged: &mut dyn Write,
-    ) -> Result<(Buffer<u8, B>, Result<()>)> {
+    ) -> Result<(Buffer<u8>, Result<()>)> {
         let decoded = match self.decoded_file_data(archive, file, history) {
             Ok(decoded) => decoded,
             Err(error) => {
@@ -2159,7 +2150,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
                 &self.allowance,
             )
             .map_err(|error| file.entry_error("reading", error))?;
-        let result = file.stream_packed_with_crc_policy::<true, _>(
+        let result = file.stream_packed_with_crc_policy::<true>(
             &mut packed,
             keys.as_ref(),
             &mut streaming_decoder,
@@ -2182,7 +2173,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         archive: &Archive,
         file: &FileHeader,
         history: HistoryRetention,
-    ) -> Result<DecodedData<B>> {
+    ) -> Result<DecodedData> {
         file.decoded_data_with_decoder_and_history(
             archive,
             &mut self.decoder,
@@ -2197,14 +2188,14 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     feature = "parallel",
     not(all(target_arch = "wasm32", target_os = "unknown"))
 )))]
-impl<B: Budget> DecoderSession<'_, B> {
+impl DecoderSession<'_> {
     fn read_ahead(&mut self, _archive: &Archive, _files: &[&FileHeader], _index: usize) {}
     fn claim_ahead(&mut self, _file: &FileHeader) {}
     fn settle_ahead(&mut self, _file: &FileHeader, _decoded: bool) {}
     fn end_volume(&mut self) {}
 }
 
-impl<'a> DecoderSession<'a, Allowance> {
+impl<'a> DecoderSession<'a> {
     fn new_with_password(password: Option<&'a [u8]>, buffered_decode_limit: u64) -> Self {
         Self::with_allowance(password, buffered_decode_limit, &Allowance::default())
     }
@@ -2413,15 +2404,15 @@ impl<F: FnMut(&[u8])> Write for UpdateSink<F> {
     }
 }
 
-pub(crate) fn packed_bytes<B: Budget>(bytes: &[u8]) -> impl Read + '_ {
-    PackedReader::<B>::Plain(LazyChain::bytes(bytes))
+pub(crate) fn packed_bytes(bytes: &[u8]) -> impl Read + '_ {
+    PackedReader::Plain(LazyChain::bytes(bytes))
 }
 
-enum PackedReader<'a, B: Budget = Allowance> {
+enum PackedReader<'a> {
     Plain(LazyChain<'a>),
-    Encrypted(Boxed<Rar50DecryptingReader<LazyChain<'a>>, B>),
+    Encrypted(Boxed<Rar50DecryptingReader<LazyChain<'a>>>),
 }
-impl<B: Budget> Read for PackedReader<'_, B> {
+impl Read for PackedReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(out),
@@ -2656,15 +2647,15 @@ mod tests {
     }
 
     fn refuse_each_reader_session_allocation(
-        mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
+        mut run: impl FnMut(&crate::codec::workspace::Allowance) -> Result<()>,
     ) {
-        use crate::codec::workspace::RefusingBudget;
-        let baseline = RefusingBudget::new(usize::MAX);
+        use crate::codec::workspace::Allowance;
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         assert_eq!(baseline.used(), 0);
         assert!(baseline.attempts() > 0);
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             let error = run(&budget).unwrap_err();
             assert_eq!(
                 error.kind(),
@@ -2743,7 +2734,7 @@ mod tests {
 
     #[test]
     fn independent_streaming_allocations_do_not_depend_on_previous_history() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
 
         let data = b"independent streaming member".repeat(100);
         let mut builder = crate::Builder::new(ArchiveVersion::Rar50)
@@ -2770,7 +2761,7 @@ mod tests {
         for split in [false, true] {
             let mut counts = Vec::new();
             for seeded in [false, true] {
-                let budget = RefusingBudget::new(usize::MAX);
+                let budget = Allowance::refusing(usize::MAX);
                 let mut session = DecoderSession::with_allowance(None, 0, &budget);
                 if seeded {
                     session

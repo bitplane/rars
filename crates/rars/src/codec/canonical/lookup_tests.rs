@@ -19,7 +19,7 @@ fn lookup_matches_bitwise_decoding_for_every_prefix_and_input_boundary() {
     assert_eq!(budget.used(), 0);
 }
 
-fn compare_with_bitwise<B: Budget>(budget: &B) {
+fn compare_with_bitwise(budget: &Allowance) {
     let tables = [
         (1..=15).chain([15]).collect::<Vec<_>>(),
         vec![0, 2, 2, 10, 11, 15],

@@ -3,9 +3,10 @@
 use super::block_ops::{skip_symbols, BlockOps, Reached, Repeats, Replay, Stop, Walked};
 use super::{
     read_compressed_block_salvaging, read_table_lengths_with_allowance,
-    refuse_stream_past_declared, Budget, DecodedChunk, Error, OwnedCompressedBlock, PendingFilter,
+    refuse_stream_past_declared, DecodedChunk, Error, OwnedCompressedBlock, PendingFilter,
     ReaderState, ReaderTables, Result, StreamDecodeError, StreamingOutput,
 };
+use crate::codec::workspace::Allowance;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,14 +20,14 @@ pub(super) const BATCH_BYTES: usize = 256 * 1024;
 #[cfg(any(test, fuzzing))]
 pub(super) const BATCH_BYTES: usize = 256;
 
-pub(super) type Tables<B> = Arc<ReaderTables<B>>;
+pub(super) type Tables = Arc<ReaderTables>;
 
 /// A block's own tables, or the ones before it, and where its symbols start.
-pub(super) fn enter<B: Budget>(
-    block: &OwnedCompressedBlock<B>,
+pub(super) fn enter(
+    block: &OwnedCompressedBlock,
     algorithm_version: u8,
-    previous: Option<&Tables<B>>,
-) -> Result<(Tables<B>, usize)> {
+    previous: Option<&Tables>,
+) -> Result<(Tables, usize)> {
     if !block.header.has_tables {
         return previous
             .map(|tables| (Arc::clone(tables), 0))
@@ -40,35 +41,35 @@ pub(super) fn enter<B: Budget>(
 }
 
 /// Operations for a batch's blocks up to `stop`, which ended block `index`.
-pub(super) struct Decoded<B: Budget> {
+pub(super) struct Decoded {
     pub(super) ops: BlockOps,
     pub(super) index: usize,
     pub(super) stop: Stop,
     // The tables of each block begun, in order.
-    pub(super) tables: Vec<Tables<B>>,
+    pub(super) tables: Vec<Tables>,
 }
 
-enum Turn<B: Budget> {
+enum Turn {
     Queued,
     Running,
-    Done(Decoded<B>),
+    Done(Decoded),
 }
 
 /// Consecutive blocks decoded as one task.
-pub(super) struct Batch<B: Budget> {
-    pub(super) blocks: Vec<OwnedCompressedBlock<B>>,
+pub(super) struct Batch {
+    pub(super) blocks: Vec<OwnedCompressedBlock>,
     pub(super) algorithm_version: u8,
     // The tables in effect before the first block, if it needs them.
-    inherited: Option<Tables<B>>,
-    turn: Mutex<Turn<B>>,
+    inherited: Option<Tables>,
+    turn: Mutex<Turn>,
     ready: Condvar,
 }
 
-impl<B: Budget> Batch<B> {
+impl Batch {
     pub(super) fn new(
-        blocks: Vec<OwnedCompressedBlock<B>>,
+        blocks: Vec<OwnedCompressedBlock>,
         algorithm_version: u8,
-        inherited: Option<Tables<B>>,
+        inherited: Option<Tables>,
     ) -> Self {
         Self {
             blocks,
@@ -84,7 +85,7 @@ impl<B: Budget> Batch<B> {
         &self,
         index: usize,
         ops: &mut BlockOps,
-        tables: &mut Vec<Tables<B>>,
+        tables: &mut Vec<Tables>,
     ) -> (usize, Stop) {
         for index in index..self.blocks.len() {
             let block = &self.blocks[index];
@@ -103,7 +104,7 @@ impl<B: Budget> Batch<B> {
         (self.blocks.len() - 1, Stop::BlockEnd)
     }
 
-    fn decode(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded<B> {
+    fn decode(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded {
         let mut ops = spare.lock().unwrap().pop().unwrap_or_default();
         ops.clear();
         let mut tables = Vec::with_capacity(self.blocks.len());
@@ -131,7 +132,7 @@ impl<B: Budget> Batch<B> {
     }
 
     /// Decodes here if no worker has started, so this never waits on idle work.
-    pub(super) fn take(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded<B> {
+    pub(super) fn take(&self, spare: &Mutex<Vec<BlockOps>>) -> Decoded {
         let mut turn = self.turn.lock().unwrap();
         loop {
             match std::mem::replace(&mut *turn, Turn::Running) {
@@ -146,9 +147,9 @@ impl<B: Budget> Batch<B> {
     }
 }
 
-struct Finish<'a, B: Budget>(&'a Batch<B>, Turn<B>);
+struct Finish<'a>(&'a Batch, Turn);
 
-impl<B: Budget> Drop for Finish<'_, B> {
+impl Drop for Finish<'_> {
     fn drop(&mut self) {
         let turn = std::mem::replace(&mut self.1, Turn::Queued);
         if let Ok(mut slot) = self.0.turn.lock() {
@@ -159,20 +160,20 @@ impl<B: Budget> Drop for Finish<'_, B> {
 }
 
 /// Reads blocks into batches, leaving their tables to whoever decodes them.
-struct Scan<'a, R, B: Budget> {
+struct Scan<'a, R> {
     input: &'a mut R,
     algorithm_version: u8,
-    allowance: B,
+    allowance: Allowance,
     // The tables before the next batch, unless `unparsed` supersedes them.
-    inherited: Option<Tables<B>>,
+    inherited: Option<Tables>,
     // The newest block with tables, which only its batch's decoder has parsed.
-    unparsed: Option<(Arc<Batch<B>>, usize)>,
+    unparsed: Option<(Arc<Batch>, usize)>,
     done: bool,
 }
 
-impl<R: Read, B: Budget> Scan<'_, R, B> {
+impl<R: Read> Scan<'_, R> {
     /// The next batch, then the failure that ended the scan, if any.
-    fn next(&mut self) -> (Option<Arc<Batch<B>>>, Option<Error>) {
+    fn next(&mut self) -> (Option<Arc<Batch>>, Option<Error>) {
         let mut blocks = Vec::new();
         let mut bytes = 0;
         let mut failure = None;
@@ -265,18 +266,18 @@ fn in_place_scope<'scope, R>(
 }
 
 // Counting the block itself bounds a run of empty blocks too.
-pub(super) fn held_bytes<B: Budget>(block: &OwnedCompressedBlock<B>) -> usize {
-    block.payload.len() + std::mem::size_of::<OwnedCompressedBlock<B>>()
+pub(super) fn held_bytes(block: &OwnedCompressedBlock) -> usize {
+    block.payload.len() + std::mem::size_of::<OwnedCompressedBlock>()
 }
 
-fn batch_bytes<B: Budget>(batch: &Batch<B>) -> usize {
+fn batch_bytes(batch: &Batch) -> usize {
     batch.blocks.iter().map(held_bytes).sum()
 }
 
 /// The serial decoder's check, from where it would have stopped in the newest block.
-pub(super) fn refuse_past_declared_in_batch<B: Budget>(
-    batch: &Batch<B>,
-    tables: &[Tables<B>],
+pub(super) fn refuse_past_declared_in_batch(
+    batch: &Batch,
+    tables: &[Tables],
     reached: &Reached,
 ) -> Result<()> {
     let Some(index) = reached.blocks.checked_sub(1) else {
@@ -293,14 +294,14 @@ pub(super) fn refuse_past_declared_in_batch<B: Budget>(
     refuse_stream_past_declared(&tables[index], bits, block.header.payload_bits)
 }
 
-impl<B: Budget> ReaderState<B> {
+impl ReaderState {
     /// Leaves `reached_tables` as the serial decoder would; true when every block was reached.
     pub(super) fn replay_batch(
         &mut self,
-        batch: &Batch<B>,
+        batch: &Batch,
         spare: &Mutex<Vec<BlockOps>>,
-        out: &mut Replay<'_, '_, B>,
-        reached_tables: &mut Option<Tables<B>>,
+        out: &mut Replay<'_, '_>,
+        reached_tables: &mut Option<Tables>,
     ) -> (Result<()>, bool) {
         let mut poller = self.read_control.poller();
         let Decoded {
@@ -367,7 +368,7 @@ impl<B: Budget> ReaderState<B> {
         workers: usize,
         input: &mut impl Read,
         algorithm_version: u8,
-        output: &mut StreamingOutput<B>,
+        output: &mut StreamingOutput,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
         filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
@@ -392,7 +393,7 @@ impl<B: Budget> ReaderState<B> {
         let pool = decode_pool(workers);
         let result = in_place_scope(pool.as_deref(), |scope| {
             // A read failure waits in line behind the blocks before it.
-            let mut queue: VecDeque<Result<Arc<Batch<B>>>> = VecDeque::new();
+            let mut queue: VecDeque<Result<Arc<Batch>>> = VecDeque::new();
             let mut ahead_bytes = 0;
             let mut replay = || loop {
                 while !scan.done && queue.len() <= workers && ahead_bytes < MAX_AHEAD_BYTES {

@@ -2,9 +2,7 @@
 //! only hands bytes on. The thread starts at the member's first filter; it
 //! takes the bytes and filter records in the order the decoder's own filter
 //! stage would, so output and errors match it.
-use super::{
-    Budget, DecodedChunk, Error, FilterStage, PendingFilter, ReaderState, StreamDecodeError,
-};
+use super::{DecodedChunk, Error, FilterStage, PendingFilter, ReaderState, StreamDecodeError};
 use std::cell::RefCell;
 use std::io::Read;
 use std::sync::mpsc;
@@ -103,8 +101,8 @@ impl Pieces {
 }
 
 /// The filter thread: the decoder's filter stage, fed through a channel.
-fn run_filters<B: Budget, E>(
-    stage: &mut FilterStage<B>,
+fn run_filters<E>(
+    stage: &mut FilterStage,
     pieces: mpsc::Receiver<Piece>,
     spare: mpsc::SyncSender<Vec<u8>>,
     sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
@@ -149,7 +147,7 @@ enum Route<'scope, S, E> {
     Starting,
 }
 
-impl<B: Budget> ReaderState<B> {
+impl ReaderState {
     /// As [`Self::decode_member_from_reader_with_dictionary_to_sink`], except
     /// that from the member's first filter on, the filters are applied and
     /// `sink` called on a thread of their own.

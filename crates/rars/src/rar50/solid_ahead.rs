@@ -1,6 +1,5 @@
 use super::{Archive, DecoderSession, FileHeader};
 use crate::codec::rar50::{MembersAhead, Offered};
-use crate::codec::workspace::Budget;
 
 #[cfg(all(test, feature = "write"))]
 thread_local! {
@@ -12,17 +11,17 @@ pub(super) fn claims() -> usize {
     CLAIMS.get()
 }
 
-pub(super) enum SolidAhead<B: Budget> {
+pub(super) enum SolidAhead {
     Undecided,
     Off,
     On {
-        stage: MembersAhead<B>,
+        stage: MembersAhead,
         // The first member not yet offered.
         next: usize,
     },
 }
 
-impl<B: Budget> DecoderSession<'_, B> {
+impl DecoderSession<'_> {
     /// Offers the members from `index` on in `files`, the archive's in order, to be decoded ahead.
     pub(super) fn read_ahead(&mut self, archive: &Archive, files: &[&FileHeader], index: usize) {
         if let SolidAhead::Undecided = self.ahead {
@@ -80,7 +79,7 @@ impl<B: Budget> DecoderSession<'_, B> {
         }
     }
 
-    fn start_ahead(&self, archive: &Archive, files: &[&FileHeader]) -> SolidAhead<B> {
+    fn start_ahead(&self, archive: &Archive, files: &[&FileHeader]) -> SolidAhead {
         let control = &self.decoder.read_control;
         let solid =
             archive.main.is_solid() || files.iter().any(|file| file.compression_info & 0x40 != 0);

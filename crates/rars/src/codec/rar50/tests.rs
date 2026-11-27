@@ -1,5 +1,5 @@
 use crate::codec::noise::NoiseScan;
-use crate::codec::workspace::RefusingBudget;
+use crate::codec::workspace::Allowance;
 
 fn repeated_byte_runs_ladder(algorithm_version: u8) {
     let mut state = 1u32;
@@ -51,16 +51,16 @@ fn rar70_repeated_byte_runs_ladder() {
 }
 
 fn assert_each_allocation_refusal<T>(
-    mut work: impl FnMut(&RefusingBudget) -> crate::codec::Result<T>,
+    mut work: impl FnMut(&Allowance) -> crate::codec::Result<T>,
 ) -> usize {
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     drop(work(&baseline).unwrap());
     let attempts = baseline.attempts();
     assert!(attempts > 0);
     assert_eq!(baseline.used(), 0);
 
     for fail_at in 0..attempts {
-        let budget = RefusingBudget::new(fail_at);
+        let budget = Allowance::refusing(fail_at);
         assert!(
             matches!(work(&budget), Err(Error::Cancelled)),
             "failure at allocation {fail_at}"
@@ -715,7 +715,7 @@ fn token_block_budget_refusals_release_all_encoder_owners() {
         );
         assert!(refusals > 1);
 
-        let baseline_budget = RefusingBudget::new(usize::MAX);
+        let baseline_budget = Allowance::refusing(usize::MAX);
         let baseline = encode_token_block_with_allowance(
             &tokens,
             0,
@@ -731,7 +731,7 @@ fn token_block_budget_refusals_release_all_encoder_owners() {
         assert!(attempts > 1);
 
         for fail_at in 0..attempts {
-            let budget = RefusingBudget::new(fail_at);
+            let budget = Allowance::refusing(fail_at);
             assert_eq!(
                 encode_token_block_with_allowance(
                     &tokens,
@@ -1096,7 +1096,7 @@ fn filter_writer_allocation_refusals_cover_filter_type_bits() {
             try_write_filter(&mut expected, filter).unwrap();
             let expected = expected.finish();
 
-            let baseline = RefusingBudget::new(usize::MAX);
+            let baseline = Allowance::refusing(usize::MAX);
             let mut writer = BitWriter::with_allowance(&baseline);
             writer.try_write_bits(0, prefix_bits).unwrap();
             try_write_filter(&mut writer, filter).unwrap();
@@ -1136,7 +1136,7 @@ fn table_level_writer_refusals_release_bit_storage() {
             try_write_level_lengths(&mut expected, &lengths).unwrap();
             let expected = expected.finish();
 
-            let baseline = RefusingBudget::new(usize::MAX);
+            let baseline = Allowance::refusing(usize::MAX);
             let mut writer = BitWriter::with_allowance(&baseline);
             writer.try_write_bits(0, prefix_bits).unwrap();
             try_write_level_lengths(&mut writer, &lengths).unwrap();
@@ -1224,10 +1224,7 @@ fn parser_allowance_preserves_tokens_and_retains_the_returned_owner() {
             assert!(retained >= (tokens.len() * std::mem::size_of::<EncodeToken>()) as u64);
             assert!(retained > 0);
             assert!(matches!(
-                Buffer::<u8, _>::with_capacity(
-                    (16 * 1024 * 1024 - retained + 1) as usize,
-                    &allowance
-                ),
+                Buffer::<u8>::with_capacity((16 * 1024 * 1024 - retained + 1) as usize, &allowance),
                 Err(Error::WorkspaceLimitExceeded(_))
             ));
             drop(tokens);
@@ -4783,7 +4780,7 @@ fn optimal_match_collection_grows_beyond_one_run_per_position() {
         })
         .collect();
     let options = EncodeOptions::new(64).with_optimal_parse(true);
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     let mut collector = OptimalCollector::with_allowance(&data, 0, options, &baseline).unwrap();
     let matches = collector.collect(&data, 0..data.len(), options).unwrap();
     assert!(matches.runs.len() > data.len());
@@ -4797,7 +4794,7 @@ fn optimal_match_collection_grows_beyond_one_run_per_position() {
     });
 
     let start = data.len() / 2;
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     let mut collector = OptimalCollector::with_allowance(&data, start, options, &baseline).unwrap();
     let matches = collector
         .collect(&data, start..data.len(), options)
@@ -5986,7 +5983,7 @@ fn virtual_zero_history_does_not_overallocate_a_tiny_dictionary() {
 
 #[test]
 fn ring_growth_refusal_releases_streaming_charge() {
-    let budget = RefusingBudget::new(0);
+    let budget = Allowance::refusing(0);
     {
         let mut output = StreamingOutput::new(Buffer::new(&budget), 3, 1, 1).unwrap();
         let mut emitted = 0;

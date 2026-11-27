@@ -25,6 +25,16 @@ impl Drop for Usage {
 pub(crate) struct Limited {
     ledger: Option<Arc<Ledger>>,
     scope: Option<Arc<Mutex<Usage>>>,
+    #[cfg(test)]
+    refusal: Option<Arc<Refusal>>,
+}
+/// Fault injection for tests: the `fail_at`th time anything charged to this
+/// budget grows, the growth fails with [`Error::Cancelled`].
+#[cfg(test)]
+#[derive(Debug)]
+struct Refusal {
+    attempts: std::sync::atomic::AtomicUsize,
+    fail_at: usize,
 }
 #[derive(Debug)]
 pub(crate) struct Charge {
@@ -53,6 +63,42 @@ impl Limited {
                 used: Mutex::new(0),
             })),
             scope: None,
+            #[cfg(test)]
+            refusal: None,
+        }
+    }
+    /// A generous limited budget whose `fail_at`th growth is refused, so a
+    /// test can walk every refusal point by counting [`Self::attempts`] on a
+    /// run that refuses nothing.
+    #[cfg(test)]
+    pub(crate) fn refusing(fail_at: usize) -> Self {
+        Self {
+            refusal: Some(Arc::new(Refusal {
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+                fail_at,
+            })),
+            ..Self::limited(64 * 1024 * 1024)
+        }
+    }
+    /// How many growths a [`Self::refusing`] budget has been asked for.
+    #[cfg(test)]
+    pub(crate) fn attempts(&self) -> usize {
+        self.refusal.as_ref().map_or(0, |refusal| {
+            refusal.attempts.load(std::sync::atomic::Ordering::Relaxed)
+        })
+    }
+    #[cfg(test)]
+    fn attempt(&self) -> Result<()> {
+        match &self.refusal {
+            Some(refusal)
+                if refusal
+                    .attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    == refusal.fail_at =>
+            {
+                Err(Error::Cancelled)
+            }
+            _ => Ok(()),
         }
     }
     pub(crate) fn is_limited(&self) -> bool {
@@ -129,16 +175,22 @@ impl Limited {
                     used: 0,
                     retired: false,
                 }))),
+                #[cfg(test)]
+                refusal: self.refusal.clone(),
             },
         })
     }
 }
 impl Charge {
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(feature = "write")]
     pub(crate) fn bytes(&self) -> u64 {
         self.bytes
     }
     pub(super) fn resize(&mut self, bytes: u64) -> Result<()> {
+        #[cfg(test)]
+        if bytes > self.bytes {
+            self.allowance.attempt()?;
+        }
         if self.allowance.ledger.is_none() {
             self.bytes = bytes;
             return Ok(());

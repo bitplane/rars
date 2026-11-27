@@ -9,9 +9,9 @@ use std::io::Write;
 
 /// Matches shorter than 4 bytes are never emitted, so candidate positions are
 /// chained by a hash of their first 4 bytes.
-type Rar50MatchFinder<B = Allowance> = match_finder::MatchFinder<4, B>;
+type Rar50MatchFinder = match_finder::MatchFinder<4>;
 
-type Rar50TreeMatchFinder<B> = match_finder::TreeMatchFinder<B>;
+type Rar50TreeMatchFinder = match_finder::TreeMatchFinder;
 
 #[cfg(test)]
 fn test_match_finder(window: usize) -> Rar50MatchFinder {
@@ -304,7 +304,7 @@ struct LengthSlices<'a> {
     length: &'a [u8],
 }
 
-impl<B: Budget> OwnedLengths<B> {
+impl OwnedLengths {
     fn slices(&self) -> LengthSlices<'_> {
         LengthSlices {
             main: &self.main,
@@ -336,11 +336,11 @@ pub fn encode_table_lengths_with_bit_count(
     .map(|(bytes, bits)| (bytes.into_vec(), bits))
 }
 
-fn encode_table_slices<B: Budget>(
+fn encode_table_slices(
     lengths: LengthSlices<'_>,
     algorithm_version: u8,
-    allowance: &B,
-) -> Result<(Buffer<u8, B>, usize)> {
+    allowance: &Allowance,
+) -> Result<(Buffer<u8>, usize)> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
         1 => DISTANCE_TABLE_SIZE_70,
@@ -382,16 +382,12 @@ fn encode_table_slices<B: Budget>(
     try_write_level_lengths(&mut writer, &level_lengths)?;
     for token in level_tokens.iter() {
         let (code, len) = level_table.code_for_present_symbol(token.symbol);
-        writer
-            .try_write_bits(usize::from(code), usize::from(len))
-            .map_err(Into::into)?;
+        writer.try_write_bits(usize::from(code), usize::from(len))?;
         if token.extra_bits != 0 {
-            writer
-                .try_write_bits(
-                    usize::from(token.extra_value),
-                    usize::from(token.extra_bits),
-                )
-                .map_err(Into::into)?;
+            writer.try_write_bits(
+                usize::from(token.extra_value),
+                usize::from(token.extra_bits),
+            )?;
         }
     }
     let bit_count = writer.bit_pos;
@@ -414,13 +410,13 @@ pub fn encode_compressed_block(
     .map(Buffer::into_vec)
 }
 
-fn encode_compressed_block_with_allowance<B: Budget>(
+fn encode_compressed_block_with_allowance(
     payload: &[u8],
     payload_bits: usize,
     has_tables: bool,
     is_last: bool,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     if payload_bits > payload.len() * 8 {
         return Err(Error::InvalidData("RAR 5 block bit count exceeds payload"));
     }
@@ -661,7 +657,7 @@ pub(crate) fn encode_lz_reader_to(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn reader_to_with_allowance<B: Budget>(
+fn reader_to_with_allowance(
     reader: &mut dyn Read,
     input_size: u64,
     output: &mut dyn Write,
@@ -669,7 +665,7 @@ fn reader_to_with_allowance<B: Budget>(
     options: EncodeOptions,
     block_size: usize,
     mut progress: Option<&mut dyn FnMut(u64) -> bool>,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> crate::Result<()> {
     if block_size == 0 {
         return Err(crate::Error::InvalidHeader(
@@ -682,7 +678,7 @@ fn reader_to_with_allowance<B: Budget>(
     let mut block = Buffer::new(allowance);
     let mut remaining = input_size;
     let mut completed = 0u64;
-    let mut held: Option<Buffer<u8, B>> = None;
+    let mut held: Option<Buffer<u8>> = None;
     while remaining != 0 || held.is_some() {
         // One chunk, then further chunks while the data is not moving, which is
         // the cut [`BlockSplitter`] makes for the other two writers. Deciding
@@ -690,17 +686,13 @@ fn reader_to_with_allowance<B: Budget>(
         let mut splitter = BlockSplitter::new();
         block.clear();
         match held.take() {
-            Some(first) => block
-                .extend_from_slice(&first)
-                .map_err(Into::<Error>::into)?,
+            Some(first) => block.extend_from_slice(&first)?,
             None => {
                 let wanted = usize::try_from(remaining.min(block_size as u64))
                     .map_err(|_| crate::Error::InvalidHeader("RAR 5 block size overflows usize"))?;
                 reader.read_exact(&mut chunk[..wanted])?;
                 remaining -= wanted as u64;
-                block
-                    .extend_from_slice(&chunk[..wanted])
-                    .map_err(Into::<Error>::into)?;
+                block.extend_from_slice(&chunk[..wanted])?;
             }
         }
         splitter.accept(&block);
@@ -713,9 +705,7 @@ fn reader_to_with_allowance<B: Budget>(
                 held = Some(Buffer::copied(&chunk[..wanted], allowance)?);
                 break;
             }
-            block
-                .extend_from_slice(&chunk[..wanted])
-                .map_err(Into::<Error>::into)?;
+            block.extend_from_slice(&chunk[..wanted])?;
         }
         let (window, start) = member_window_with_allowance(&block, &history, options, allowance)?;
         let packed = encode_lz_block_with_allowance(
@@ -792,15 +782,15 @@ pub(crate) fn encode_lz_streaming_blocks(
 }
 
 #[cfg(test)]
-pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
+pub(crate) fn streaming_blocks_with_allowance(
     data: &[u8],
     history: &[u8],
     blocks: &[(usize, bool)],
     algorithm_version: u8,
     options: EncodeOptions,
     block_done: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     streaming_blocks_with_records(
         data,
         history,
@@ -819,16 +809,16 @@ pub(crate) fn streaming_blocks_with_allowance<B: Budget>(
 /// a block. `history` is the window the decoder will hold, so it is filtered
 /// wherever the runs before were.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn streaming_blocks_with_records<B: Budget>(
+pub(crate) fn streaming_blocks_with_records(
     data: &[u8],
     history: &[u8],
     blocks: &[(usize, bool)],
-    records: Option<&[Buffer<EncodeFilter, B>]>,
+    records: Option<&[Buffer<EncodeFilter>]>,
     algorithm_version: u8,
     options: EncodeOptions,
     block_done: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     // Refuse bad ranges before the window is allocated, as a caller's budget
     // would otherwise report the allocation instead.
     check_streaming_blocks(data.len(), blocks, records)?;
@@ -845,10 +835,10 @@ pub(crate) fn streaming_blocks_with_records<B: Budget>(
     )
 }
 
-fn check_streaming_blocks<B: Budget>(
+fn check_streaming_blocks(
     len: usize,
     blocks: &[(usize, bool)],
-    records: Option<&[Buffer<EncodeFilter, B>]>,
+    records: Option<&[Buffer<EncodeFilter>]>,
 ) -> Result<()> {
     if records.is_some_and(|records| records.len() != blocks.len()) {
         return Err(Error::InvalidData(
@@ -876,16 +866,16 @@ fn check_streaming_blocks<B: Budget>(
 /// the run, as there. History further back than the match distance is ignored,
 /// as it is when the window is built from separate parts.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn streaming_blocks_in_window<B: Budget>(
+pub(crate) fn streaming_blocks_in_window(
     window: &[u8],
     start: usize,
     blocks: &[(usize, bool)],
-    records: Option<&[Buffer<EncodeFilter, B>]>,
+    records: Option<&[Buffer<EncodeFilter>]>,
     algorithm_version: u8,
     options: EncodeOptions,
     block_done: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     if start > window.len() {
         return Err(Error::InvalidData(
             "RAR 5 streaming run starts past its window",
@@ -920,17 +910,17 @@ pub(crate) fn streaming_blocks_in_window<B: Budget>(
 /// it, over a window already holding its filtered bytes. Its own encode,
 /// [`encode_filtered_run`], parses those blocks with the same collector.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn streaming_blocks_with_finder<B: Budget>(
+pub(crate) fn streaming_blocks_with_finder(
     window: &[u8],
     start: usize,
-    finder: crate::codec::packed_chain::PackedMatchFinder<B>,
+    finder: crate::codec::packed_chain::PackedMatchFinder,
     blocks: &[(usize, bool)],
-    records: Option<&[Buffer<EncodeFilter, B>]>,
+    records: Option<&[Buffer<EncodeFilter>]>,
     algorithm_version: u8,
     options: EncodeOptions,
     block_done: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     if start > window.len() || !options.optimal_parse {
         return Err(Error::InvalidData(
             "RAR 5 shared finder needs an optimal parse within its window",
@@ -952,17 +942,17 @@ pub(crate) fn streaming_blocks_with_finder<B: Budget>(
 /// [`streaming_blocks_in_window`] for a run whose tree its group seeded,
 /// [`seed_run_tree`] or [`seed_chain`] given the same window, run and options.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn streaming_blocks_with_tree<B: Budget>(
+pub(crate) fn streaming_blocks_with_tree(
     window: &[u8],
     start: usize,
-    tree: Rar50TreeMatchFinder<B>,
+    tree: Rar50TreeMatchFinder,
     blocks: &[(usize, bool)],
-    records: Option<&[Buffer<EncodeFilter, B>]>,
+    records: Option<&[Buffer<EncodeFilter>]>,
     algorithm_version: u8,
     options: EncodeOptions,
     block_done: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     if start > window.len() || !options.optimal_parse {
         return Err(Error::InvalidData(
             "RAR 5 shared tree needs an optimal parse within its window",
@@ -983,17 +973,17 @@ pub(crate) fn streaming_blocks_with_tree<B: Budget>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn streaming_blocks_from<B: Budget>(
+fn streaming_blocks_from(
     combined: &[u8],
     start: usize,
-    mut finder: Option<RunFinder<B>>,
+    mut finder: Option<RunFinder>,
     blocks: &[(usize, bool)],
-    records: Option<&[Buffer<EncodeFilter, B>]>,
+    records: Option<&[Buffer<EncodeFilter>]>,
     algorithm_version: u8,
     options: EncodeOptions,
     mut block_done: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     let data = &combined[start..];
     check_streaming_blocks(data.len(), blocks, records)?;
     let records_of =
@@ -1103,12 +1093,12 @@ pub(crate) fn filtered_lz_member(
 
 /// The bytes a decoder's window holds after [`encode_filtered_run`] codes
 /// `data`, which starts `file_offset` bytes into its member, with `filters`.
-pub(crate) fn filtered_run_bytes<B: Budget>(
+pub(crate) fn filtered_run_bytes(
     data: &[u8],
     filters: &[crate::FilterSpec],
     file_offset: usize,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let mut filtered = Buffer::copied(data, allowance)?;
     filter_cells_in_place(&mut filtered, filters, file_offset, allowance)?;
     Ok(filtered)
@@ -1116,21 +1106,20 @@ pub(crate) fn filtered_run_bytes<B: Budget>(
 
 /// Each block a filtered run is coded in, by its end in the run and whether
 /// it is the member's last, and the filter records it opens with.
-pub(crate) type FilteredRunBlocks<B> =
-    (Buffer<(usize, bool), B>, Buffer<Buffer<EncodeFilter, B>, B>);
+pub(crate) type FilteredRunBlocks = (Buffer<(usize, bool)>, Buffer<Buffer<EncodeFilter>>);
 
 /// Transforms a run in place into the bytes [`encode_filtered_run`] codes,
 /// and returns the blocks it codes them in, in the form
 /// [`streaming_blocks_with_finder`] takes. A run in a window shared with its
 /// neighbours is filtered where it lies, so the window holds what the
 /// decoder's will.
-pub(crate) fn filter_run_in_place<B: Budget>(
+pub(crate) fn filter_run_in_place(
     data: &mut [u8],
     filters: &[crate::FilterSpec],
     file_offset: usize,
     is_last: bool,
-    allowance: &B,
-) -> Result<FilteredRunBlocks<B>> {
+    allowance: &Allowance,
+) -> Result<FilteredRunBlocks> {
     let len = data.len();
     let blocks = filter_blocks_in_place(data, filters, file_offset, allowance)?;
     let mut ends = Buffer::with_capacity(blocks.len(), allowance)?;
@@ -1152,7 +1141,7 @@ pub(crate) fn filtered_run_cuts(data: &[u8]) -> impl Iterator<Item = usize> + '_
 /// run. `history` is what the window already holds, so it is filtered bytes
 /// wherever earlier runs were filtered.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn encode_filtered_run<B: Budget>(
+pub(crate) fn encode_filtered_run(
     data: &[u8],
     filters: &[crate::FilterSpec],
     history: &[u8],
@@ -1161,8 +1150,8 @@ pub(crate) fn encode_filtered_run<B: Budget>(
     algorithm_version: u8,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     filtered_lz_blocks(
         data,
         filters,
@@ -1176,11 +1165,11 @@ pub(crate) fn encode_filtered_run<B: Budget>(
     )
 }
 
-fn filtered_member_with_allowance<B: Budget>(
+fn filtered_member_with_allowance(
     data: &[u8],
     filters: &[crate::FilterSpec],
-    allowance: &B,
-) -> Result<(Buffer<u8, B>, Buffer<EncodeFilter, B>)> {
+    allowance: &Allowance,
+) -> Result<(Buffer<u8>, Buffer<EncodeFilter>)> {
     let mut filtered = Buffer::copied(data, allowance)?;
     let mut records = Buffer::with_capacity(filters.len(), allowance)?;
     for filter in filters {
@@ -1205,11 +1194,11 @@ fn filtered_member_with_allowance<B: Budget>(
     Ok((filtered, records))
 }
 
-fn encode_filter_data<B: Budget>(
+fn encode_filter_data(
     kind: Rar50Filter,
     data: &mut [u8],
     file_offset: usize,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<(FilterType, usize)> {
     if file_offset > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
@@ -1254,7 +1243,7 @@ fn encode_filter_data<B: Budget>(
 /// Compressing each block against a fresh copy of its history would re-copy
 /// and re-insert 126 MiB for a 4 MiB member at 64 KiB a block.
 #[allow(clippy::too_many_arguments)]
-fn filtered_lz_blocks<B: Budget>(
+fn filtered_lz_blocks(
     data: &[u8],
     filters: &[crate::FilterSpec],
     history: &[u8],
@@ -1263,8 +1252,8 @@ fn filtered_lz_blocks<B: Budget>(
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     let start = history.len();
     let mut combined = Buffer::from_slices(&[history, data], allowance)?;
@@ -1283,7 +1272,7 @@ fn filtered_lz_blocks<B: Budget>(
             algorithm_version,
             options,
             &mut |block, packed| {
-                out.extend_from_slice(&packed).map_err(Into::into)?;
+                out.extend_from_slice(&packed)?;
                 report_through(&mut progress, block.end - start)
             },
             allowance,
@@ -1320,12 +1309,12 @@ fn filtered_lz_blocks<B: Budget>(
             Some(&mut chunk_progress),
             allowance,
         )?;
-        out.extend_from_slice(&packed).map_err(Into::into)?;
+        out.extend_from_slice(&packed)?;
     }
     Ok(out)
 }
 
-type FilteredBlocks<B> = Buffer<(Range<usize>, Buffer<EncodeFilter, B>), B>;
+type FilteredBlocks = Buffer<(Range<usize>, Buffer<EncodeFilter>)>;
 
 /// Transforms `data`, which starts `file_offset` bytes into its member, and
 /// cuts it into the blocks it is coded in. Returns each block's range and
@@ -1337,12 +1326,12 @@ type FilteredBlocks<B> = Buffer<(Range<usize>, Buffer<EncodeFilter, B>), B>;
 /// transform is [`filter_cells_in_place`]'s, which does not depend on where
 /// the blocks fall, so a filter costs its member no blocks of its own, only
 /// a few bytes of record for each [`FILTER_CELL`] it covers.
-fn filter_blocks_in_place<B: Budget>(
+fn filter_blocks_in_place(
     data: &mut [u8],
     filters: &[crate::FilterSpec],
     file_offset: usize,
-    allowance: &B,
-) -> Result<FilteredBlocks<B>> {
+    allowance: &Allowance,
+) -> Result<FilteredBlocks> {
     // Every cut is decided before any byte is transformed.
     let cuts = Buffer::collect(MemberBlocks::new(data, 0), allowance)?;
     let mut records = filter_cells_in_place(data, filters, file_offset, allowance)?
@@ -1357,8 +1346,7 @@ fn filter_blocks_in_place<B: Budget>(
             own.push(EncodeFilter {
                 offset: record.offset - block.start,
                 ..record
-            })
-            .map_err(Into::into)?;
+            })?;
         }
         blocks.push_admitted((block, own));
     }
@@ -1372,12 +1360,12 @@ fn filter_blocks_in_place<B: Budget>(
 /// delta plane that straddles a cut converts on each side separately.
 /// Returns the records, with offsets into `data`, in the order the decoder
 /// meets them.
-fn filter_cells_in_place<B: Budget>(
+fn filter_cells_in_place(
     data: &mut [u8],
     filters: &[crate::FilterSpec],
     file_offset: usize,
-    allowance: &B,
-) -> Result<Buffer<EncodeFilter, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<EncodeFilter>> {
     let filters = normalized_filter_specs(data.len(), filters, allowance)?;
     let mut records = Buffer::new(allowance);
     for cell_start in (0..data.len()).step_by(FILTER_CELL) {
@@ -1394,14 +1382,12 @@ fn filter_cells_in_place<B: Budget>(
                 file_offset + start,
                 allowance,
             )?;
-            records
-                .push(EncodeFilter {
-                    offset: start,
-                    length: end - start,
-                    filter_type,
-                    channels,
-                })
-                .map_err(Into::into)?;
+            records.push(EncodeFilter {
+                offset: start,
+                length: end - start,
+                filter_type,
+                channels,
+            })?;
         }
     }
     Ok(records)
@@ -1423,13 +1409,13 @@ struct NormalizedFilterSpec {
 ///
 /// A record covers bytes of one block and no more than a record can describe,
 /// so a filter is cut at both, as [`filter_blocks_in_place`] cuts it.
-pub(crate) fn filter_streaming_blocks_in_place<B: Budget>(
+pub(crate) fn filter_streaming_blocks_in_place(
     data: &mut [u8],
     blocks: &[(usize, bool)],
     filters: &[crate::FilterSpec],
     segments: &[(Range<usize>, usize)],
-    allowance: &B,
-) -> Result<Buffer<Buffer<EncodeFilter, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<EncodeFilter>>> {
     let mut filters = normalized_filter_specs(data.len(), filters, allowance)?;
     filters.sort_unstable_by_key(|filter| filter.range.start);
     // `packed_most` counts on no more records in a block than it has bytes.
@@ -1465,14 +1451,12 @@ pub(crate) fn filter_streaming_blocks_in_place<B: Budget>(
                     file_offset + (start - filter.range.start),
                     allowance,
                 )?;
-                block_records
-                    .push(EncodeFilter {
-                        offset: start - block_start,
-                        length: piece_end - start,
-                        filter_type,
-                        channels,
-                    })
-                    .map_err(Into::into)?;
+                block_records.push(EncodeFilter {
+                    offset: start - block_start,
+                    length: piece_end - start,
+                    filter_type,
+                    channels,
+                })?;
                 start = piece_end;
             }
         }
@@ -1482,11 +1466,11 @@ pub(crate) fn filter_streaming_blocks_in_place<B: Budget>(
     Ok(records)
 }
 
-fn normalized_filter_specs<B: Budget>(
+fn normalized_filter_specs(
     data_len: usize,
     filters: &[crate::FilterSpec],
-    allowance: &B,
-) -> Result<Buffer<NormalizedFilterSpec, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<NormalizedFilterSpec>> {
     let mut normalized = Buffer::with_capacity(filters.len(), allowance)?;
     for filter in filters {
         let range = filter.range.clone().unwrap_or(0..data_len);
@@ -1519,14 +1503,14 @@ fn encode_lz_member_inner(
     .map(Buffer::into_vec)
 }
 
-pub(crate) fn encode_owned_member<B: Budget>(
+pub(crate) fn encode_owned_member(
     data: &[u8],
     version: u8,
     options: EncodeOptions,
     filters: Option<&[crate::FilterSpec]>,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     match filters {
         None => encode_member_with_allowance(data, &[], version, options, progress, allowance),
         Some(filters) => {
@@ -1535,22 +1519,22 @@ pub(crate) fn encode_owned_member<B: Budget>(
     }
 }
 
-pub(crate) fn filtered_owned_member<B: Budget>(
+pub(crate) fn filtered_owned_member(
     data: &[u8],
     filters: &[crate::FilterSpec],
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     filtered_member_with_allowance(data, filters, allowance).map(|(bytes, _)| bytes)
 }
 
-fn encode_member_with_allowance<B: Budget>(
+fn encode_member_with_allowance(
     data: &[u8],
     history: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let (window, start) = member_window_with_allowance(data, history, options, allowance)?;
     let combined = &*window;
     if data.len() > LZ_BLOCK_SIZE {
@@ -1568,7 +1552,7 @@ fn encode_member_with_allowance<B: Budget>(
                 algorithm_version,
                 options,
                 &mut |block, packed| {
-                    out.extend_from_slice(&packed).map_err(Into::into)?;
+                    out.extend_from_slice(&packed)?;
                     report_through(&mut progress, block.end - start)
                 },
                 allowance,
@@ -1606,7 +1590,7 @@ fn encode_member_with_allowance<B: Budget>(
                 Some(&mut chunk_progress),
                 allowance,
             )?;
-            out.extend_from_slice(&packed).map_err(Into::into)?;
+            out.extend_from_slice(&packed)?;
             completed = completed.saturating_add(len);
         }
         return Ok(out);
@@ -1682,14 +1666,14 @@ const PIPELINED_BLOCK_BYTES: usize = MAX_LZ_BLOCK_SIZE;
 ///
 /// `blocks` gives each block with the filter records it opens with and whether
 /// it is the last. `emit` takes each block's packed bytes in order.
-fn pipelined_optimal_blocks<B: Budget, R: std::ops::Deref<Target = [EncodeFilter]> + Send>(
+fn pipelined_optimal_blocks<R: std::ops::Deref<Target = [EncodeFilter]> + Send>(
     combined: &[u8],
     blocks: impl Iterator<Item = (std::ops::Range<usize>, R, bool)> + Send,
-    mut collector: OptimalCollector<B>,
+    mut collector: OptimalCollector,
     algorithm_version: u8,
     options: EncodeOptions,
-    emit: &mut dyn FnMut(std::ops::Range<usize>, Buffer<u8, B>) -> Result<()>,
-    allowance: &B,
+    emit: &mut dyn FnMut(std::ops::Range<usize>, Buffer<u8>) -> Result<()>,
+    allowance: &Allowance,
 ) -> Result<()> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
@@ -1700,14 +1684,14 @@ fn pipelined_optimal_blocks<B: Budget, R: std::ops::Deref<Target = [EncodeFilter
             ))
         }
     };
-    type Collected<B, R> = Vec<(std::ops::Range<usize>, R, bool, BlockMatches<B>)>;
+    type Collected<R> = Vec<(std::ops::Range<usize>, R, bool, BlockMatches)>;
     let mut blocks = blocks.peekable();
     // Takes blocks while they fit `room`, and one anyway when `at_least_one`,
     // so a lone block larger than the room still makes progress.
-    let mut collect = |collector: &mut OptimalCollector<B>,
+    let mut collect = |collector: &mut OptimalCollector,
                        room: usize,
                        at_least_one: bool|
-     -> Result<Collected<B, R>> {
+     -> Result<Collected<R>> {
         let mut batch = Vec::new();
         let mut bytes = 0usize;
         while let Some((block, _, _)) = blocks.peek() {
@@ -1723,7 +1707,7 @@ fn pipelined_optimal_blocks<B: Budget, R: std::ops::Deref<Target = [EncodeFilter
         Ok(batch)
     };
     let price =
-        |(block, records, is_last, matches): (std::ops::Range<usize>, R, bool, BlockMatches<B>)| {
+        |(block, records, is_last, matches): (std::ops::Range<usize>, R, bool, BlockMatches)| {
             if !allowance.is_limited() && options.parse_passes == 1 && records.is_empty() {
                 let packed = encode_single_pass_block(
                     combined,
@@ -1807,20 +1791,20 @@ fn report_through(
 /// Whether a member's optimal parse may price its blocks on other threads.
 /// A limited allowance is admitted for one block's workspace at a time, and
 /// keeps that.
-fn pipelines<B: Budget>(options: EncodeOptions, allowance: &B) -> bool {
+fn pipelines(options: EncodeOptions, allowance: &Allowance) -> bool {
     options.optimal_parse && !allowance.is_limited() && crate::parallel::may_nest()
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_filtered_member_with_allowance<B: Budget>(
+fn encode_filtered_member_with_allowance(
     data: &[u8],
     history: &[u8],
     algorithm_version: u8,
     filters: &[EncodeFilter],
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let (window, start) = member_window_with_allowance(data, history, options, allowance)?;
     let end = window.len();
     encode_lz_block_with_allowance(
@@ -1919,7 +1903,7 @@ pub(crate) fn single_pass_tree_workspace(
     debug_assert!(huffman_workspace() + 4 * MAX_BLOCK_TABLE_BYTES <= per_block as u64);
     let retained = unfiltered_payload_bytes(options, run as u64)
         + (run.div_ceil(block_size) as u64) * (MAX_BLOCK_TABLE_BYTES + MAX_BLOCK_HEADER_BYTES + 1);
-    Rar50TreeMatchFinder::<Allowance>::bytes_for_window(finder_window(options, window)) as u64
+    Rar50TreeMatchFinder::bytes_for_window(finder_window(options, window)) as u64
         + matches
         + bytes * per_byte as u64
         + pricing_blocks * per_block as u64
@@ -1929,12 +1913,12 @@ pub(crate) fn single_pass_tree_workspace(
 /// A finder for the whole member, seeded with the history it carries in. It
 /// keeps growing as the blocks are parsed, so it is sized to the widest window
 /// the member could ever want rather than to any one block.
-fn member_finder_with_allowance<B: Budget>(
+fn member_finder_with_allowance(
     combined: &[u8],
     start: usize,
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<Rar50MatchFinder<B>> {
+    allowance: &Allowance,
+) -> Result<Rar50MatchFinder> {
     let mut finder =
         Rar50MatchFinder::with_allowance(finder_window(options, combined.len()), allowance)?;
     finder.insert_run(combined, 0..start.min(combined.len().saturating_sub(3)));
@@ -1943,12 +1927,12 @@ fn member_finder_with_allowance<B: Budget>(
 
 /// A finder holding everything a parse of `block` may reach back to, and
 /// nothing older.
-fn seeded_finder<B: Budget>(
+fn seeded_finder(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<Rar50MatchFinder<B>> {
+    allowance: &Allowance,
+) -> Result<Rar50MatchFinder> {
     // Sized to what this block can actually reach, not to the maximum distance,
     // so the first blocks of a member do not clear a window the data is not yet
     // long enough to fill.
@@ -1962,14 +1946,14 @@ fn seeded_finder<B: Budget>(
 }
 
 /// The search state a member shares across its blocks, when it has any.
-enum MemberSearch<'a, B: Budget = Allowance> {
+enum MemberSearch<'a> {
     /// Nothing shared: the block builds what it needs and drops it.
     Fresh,
     /// The member's chain finder, which the lazy path feeds block by block.
-    Lazy(&'a mut Rar50MatchFinder<B>),
+    Lazy(&'a mut Rar50MatchFinder),
     /// The member's match collector, which the optimal parse feeds block by
     /// block.
-    Optimal(&'a mut OptimalCollector<B>),
+    Optimal(&'a mut OptimalCollector),
 }
 
 /// The history a tree seeded for a parse from `start` holds.
@@ -1985,17 +1969,17 @@ fn tree_len_limit(combined: &[u8], pos: usize, options: EncodeOptions) -> usize 
 
 /// A finder handed to a run that shares its window with the runs around it,
 /// standing where the run's own would.
-pub(crate) enum RunFinder<B: Budget> {
+pub(crate) enum RunFinder {
     /// Over the group's packed index, for a run that walks chains.
-    Packed(crate::codec::packed_chain::PackedMatchFinder<B>),
+    Packed(crate::codec::packed_chain::PackedMatchFinder),
     /// The tree a run that searches one would have seeded.
-    Tree(Rar50TreeMatchFinder<B>),
+    Tree(Rar50TreeMatchFinder),
 }
 
 /// What the links of one window slot take in a tree over a window of
 /// `window` positions.
 pub(crate) fn tree_link_bytes(window: usize) -> u64 {
-    Rar50TreeMatchFinder::<Allowance>::link_bytes_per_slot(window) as u64
+    Rar50TreeMatchFinder::link_bytes_per_slot(window) as u64
 }
 
 /// The most [`seed_chain`] holds besides the trees it returns.
@@ -2003,7 +1987,7 @@ pub(crate) fn run_trees_workspace(options: EncodeOptions) -> u64 {
     if !options.optimal_parse {
         return 0;
     }
-    match_finder::SeedTree::<Allowance>::bytes_for_reach(options.max_match_distance) as u64
+    match_finder::SeedTree::bytes_for_reach(options.max_match_distance) as u64
 }
 
 /// The runs a shared tree can seed: those with history, and at least `nice`
@@ -2091,12 +2075,12 @@ pub(crate) fn seed_chains(
 /// The run need not search a tree in a window of its own
 /// ([`searches_tree`]): the tail of a run that does is coded on the tree
 /// that run's parse has built, which holds what this one does.
-pub(crate) fn seed_run_tree<B: Budget>(
+pub(crate) fn seed_run_tree(
     window: &[u8],
     run: Range<usize>,
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<Rar50TreeMatchFinder<B>> {
+    allowance: &Allowance,
+) -> Result<Rar50TreeMatchFinder> {
     let history = tree_history(run.start, options);
     // The run's own window, as its collector would seed it.
     let combined = &window[history.start..run.end];
@@ -2115,12 +2099,12 @@ pub(crate) fn seed_run_tree<B: Budget>(
 /// in their order, seeded from one shared tree ([`run_trees_workspace`]).
 /// Each is the one [`seed_run_tree`] would seed for its run, so the output
 /// does not change.
-pub(crate) fn seed_chain<B: Budget>(
+pub(crate) fn seed_chain(
     window: &[u8],
     runs: &[Range<usize>],
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<Vec<Rar50TreeMatchFinder<B>>> {
+    allowance: &Allowance,
+) -> Result<Vec<Rar50TreeMatchFinder>> {
     let mut seed = match_finder::SeedTree::with_allowance(options.max_match_distance, allowance)?;
     let Some((last, before)) = runs.split_last() else {
         return Ok(Vec::new());
@@ -2162,7 +2146,7 @@ pub(crate) fn run_trees(
     chains: &[Range<usize>],
     options: EncodeOptions,
     allowance: &Allowance,
-) -> Result<Vec<Option<Rar50TreeMatchFinder<Allowance>>>> {
+) -> Result<Vec<Option<Rar50TreeMatchFinder>>> {
     let mut trees: Vec<Option<_>> = runs.iter().map(|_| None).collect();
     for chain in chains {
         let seeded = match &runs[chain.clone()] {
@@ -2203,13 +2187,13 @@ pub(crate) fn packed_index_fits(window: usize, start: usize, options: EncodeOpti
 
 /// The collector a run's blocks share from `at`: over a finder handed out by
 /// the run's group when there is one, built for the window otherwise.
-fn collector_at<B: Budget>(
+fn collector_at(
     combined: &[u8],
     at: usize,
-    finder: Option<RunFinder<B>>,
+    finder: Option<RunFinder>,
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<OptimalCollector<B>> {
+    allowance: &Allowance,
+) -> Result<OptimalCollector> {
     match finder {
         Some(RunFinder::Packed(finder)) => {
             debug_assert_eq!(finder.position(), at.min(combined.len().saturating_sub(3)));
@@ -2228,13 +2212,13 @@ fn collector_at<B: Budget>(
 // One per member or run being coded, so the collector's noise histogram is
 // not worth a box.
 #[allow(clippy::large_enum_variant)]
-enum SharedMemberSearch<B: Budget> {
-    Lazy(Rar50MatchFinder<B>),
-    Optimal(OptimalCollector<B>),
+enum SharedMemberSearch {
+    Lazy(Rar50MatchFinder),
+    Optimal(OptimalCollector),
 }
 
-impl<B: Budget> SharedMemberSearch<B> {
-    fn borrow(&mut self) -> MemberSearch<'_, B> {
+impl SharedMemberSearch {
+    fn borrow(&mut self) -> MemberSearch<'_> {
         match self {
             Self::Lazy(finder) => MemberSearch::Lazy(finder),
             Self::Optimal(collector) => MemberSearch::Optimal(collector),
@@ -2252,15 +2236,15 @@ impl<B: Budget> SharedMemberSearch<B> {
 /// approaches that: the worst measured is about six runs per position, on a
 /// mebibyte of two-symbol noise, where every position has many candidates whose
 /// lengths creep up one byte at a time.
-struct BlockMatches<B: Budget = Allowance> {
+struct BlockMatches {
     /// Every position's runs, one position after another.
-    runs: Buffer<(u32, u32), B>,
+    runs: Buffer<(u32, u32)>,
     /// Where each position's runs start in `runs`, with one extra entry to
     /// close the last position.
-    starts: Buffer<u32, B>,
+    starts: Buffer<u32>,
     /// The matches the collector committed to, in order, whose interiors it
     /// left unsearched.
-    commits: Buffer<match_finder::CommittedMatch, B>,
+    commits: Buffer<match_finder::CommittedMatch>,
 }
 
 /// One match finder for a member's whole optimal parse, and the walk that asks
@@ -2274,8 +2258,8 @@ struct BlockMatches<B: Budget = Allowance> {
 /// is where the speed is: pricing every position means searching at every
 /// position, which is the load a chain walk carries worst and a tree carries
 /// best. See [`searches_tree`] for which parses get one.
-struct OptimalCollector<B: Budget = Allowance> {
-    finder: CollectorFinder<B>,
+struct OptimalCollector {
+    finder: CollectorFinder,
     /// Which positions the finder leaves out ([`NoiseScan::skips`]), in
     /// cells counted from where the run starts, so that the run's blocks
     /// collect the same whether its window ends with it or runs on into the
@@ -2486,7 +2470,7 @@ fn runs_seeded_together_code_as_runs_seeded_alone() {
 fn check_seeded_run(
     window: &[u8],
     run: &Range<usize>,
-    tree: Rar50TreeMatchFinder<Allowance>,
+    tree: Rar50TreeMatchFinder,
     blocks: &[(usize, bool)],
     options: EncodeOptions,
     alone: &[Buffer<u8>],
@@ -2513,17 +2497,14 @@ fn check_seeded_run(
     );
 }
 
-enum CollectorFinder<B: Budget = Allowance> {
-    Packed(super::super::packed_chain::PackedMatchFinder<B>),
+enum CollectorFinder {
+    Packed(super::super::packed_chain::PackedMatchFinder),
 
     /// The tree, and where each stretch as long as the longest match last
     /// began, for the matches the tree stops short of. See
     /// [`measure_past_nice`] for which parses keep the stretches.
-    Tree(
-        Rar50TreeMatchFinder<B>,
-        Option<match_finder::WindowIndex<B>>,
-    ),
-    Chains(Rar50MatchFinder<B>),
+    Tree(Rar50TreeMatchFinder, Option<match_finder::WindowIndex>),
+    Chains(Rar50MatchFinder),
 }
 
 impl OptimalCollector {
@@ -2534,12 +2515,12 @@ impl OptimalCollector {
     }
 }
 
-impl<B: Budget> OptimalCollector<B> {
+impl OptimalCollector {
     fn with_allowance(
         combined: &[u8],
         start: usize,
         options: EncodeOptions,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         if searches_tree(combined.len(), start, options) {
             // The history goes in as the collector would have put it there had
@@ -2584,9 +2565,9 @@ impl<B: Budget> OptimalCollector<B> {
     fn with_tree(
         combined: &[u8],
         start: usize,
-        tree: Rar50TreeMatchFinder<B>,
+        tree: Rar50TreeMatchFinder,
         options: EncodeOptions,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         let stretches = if options.parse_passes > 1 {
             let mut stretches = match_finder::WindowIndex::with_allowance(
@@ -2620,7 +2601,7 @@ impl<B: Budget> OptimalCollector<B> {
         combined: &[u8],
         block: std::ops::Range<usize>,
         options: EncodeOptions,
-    ) -> Result<BlockMatches<B>> {
+    ) -> Result<BlockMatches> {
         let allowance = match &self.finder {
             CollectorFinder::Packed(finder) => finder.allowance(),
             CollectorFinder::Tree(finder, _) => finder.allowance(),
@@ -2635,20 +2616,18 @@ impl<B: Budget> OptimalCollector<B> {
             commits: Buffer::new(&allowance),
         };
         if let CollectorFinder::Packed(finder) = &mut self.finder {
-            finder
-                .collect_block(
-                    combined,
-                    block,
-                    options.max_match_distance,
-                    options.max_match_candidates,
-                    options.nice(),
-                    MAX_ENCODER_MATCH_LENGTH,
-                    &mut matches.runs,
-                    &mut matches.starts,
-                    &mut matches.commits,
-                    &mut self.noise,
-                )
-                .map_err(Into::into)?;
+            finder.collect_block(
+                combined,
+                block,
+                options.max_match_distance,
+                options.max_match_candidates,
+                options.nice(),
+                MAX_ENCODER_MATCH_LENGTH,
+                &mut matches.runs,
+                &mut matches.starts,
+                &mut matches.commits,
+                &mut self.noise,
+            )?;
             return Ok(matches);
         }
         // The first position past a match the parse will commit to. The parse
@@ -2693,8 +2672,7 @@ impl<B: Budget> OptimalCollector<B> {
                             0,
                             options.max_match_candidates,
                             &mut matches.runs,
-                        )
-                        .map_err(Into::into)?;
+                        )?;
                         continue;
                     }
                     tree.matches(
@@ -2704,8 +2682,7 @@ impl<B: Budget> OptimalCollector<B> {
                         max_distance,
                         options.max_match_candidates,
                         &mut matches.runs,
-                    )
-                    .map_err(Into::into)?;
+                    )?;
                     measure_past_nice(
                         combined,
                         pos,
@@ -2717,8 +2694,7 @@ impl<B: Budget> OptimalCollector<B> {
                         stretch,
                         &mut matches.runs,
                         before,
-                    )
-                    .map_err(Into::into)?;
+                    )?;
                 }
                 CollectorFinder::Chains(finder) => {
                     // Inserting into a chain is one store, so every position
@@ -2739,18 +2715,16 @@ impl<B: Budget> OptimalCollector<B> {
                         continue;
                     }
 
-                    finder
-                        .collect_improving(
-                            combined,
-                            pos,
-                            first_candidate,
-                            max_length,
-                            max_distance,
-                            options.max_match_candidates,
-                            options.nice(),
-                            &mut matches.runs,
-                        )
-                        .map_err(Into::into)?;
+                    finder.collect_improving(
+                        combined,
+                        pos,
+                        first_candidate,
+                        max_length,
+                        max_distance,
+                        options.max_match_candidates,
+                        options.nice(),
+                        &mut matches.runs,
+                    )?;
                 }
             }
             // The parse can only take a match the block still has room for, so
@@ -2763,8 +2737,7 @@ impl<B: Budget> OptimalCollector<B> {
                     committed_through = pos + reach;
                     matches
                         .commits
-                        .push(match_finder::CommittedMatch::at(pos, reach, run))
-                        .map_err(Into::into)?;
+                        .push(match_finder::CommittedMatch::at(pos, reach, run))?;
                 }
             }
         }
@@ -2791,18 +2764,18 @@ const STRETCHES_AHEAD: usize = 8;
 /// A parse that prices once keeps no stretches. It commits to the longest
 /// match at its nice length of 32 without pricing it.
 #[allow(clippy::too_many_arguments)]
-fn measure_past_nice<B: Budget>(
+fn measure_past_nice(
     combined: &[u8],
     pos: usize,
     len_limit: usize,
     limit: usize,
     block_end: usize,
     max_distance: usize,
-    stretches: Option<&match_finder::WindowIndex<B>>,
+    stretches: Option<&match_finder::WindowIndex>,
     stretch: usize,
-    runs: &mut Buffer<(u32, u32), B>,
+    runs: &mut Buffer<(u32, u32)>,
     before: usize,
-) -> std::result::Result<(), B::Failure> {
+) -> std::result::Result<(), crate::codec::Error> {
     let Some(last) = runs[before..].last_mut() else {
         return Ok(());
     };
@@ -2875,12 +2848,12 @@ fn measure_past_nice<B: Budget>(
 ///
 /// A member with no history to carry borrows its own data rather than copying
 /// it, which is every member of a non-solid archive.
-enum MemberWindow<'a, B: Budget> {
+enum MemberWindow<'a> {
     Borrowed(&'a [u8]),
-    Owned(Buffer<u8, B>),
+    Owned(Buffer<u8>),
 }
 
-impl<B: Budget> std::ops::Deref for MemberWindow<'_, B> {
+impl std::ops::Deref for MemberWindow<'_> {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
@@ -2890,12 +2863,12 @@ impl<B: Budget> std::ops::Deref for MemberWindow<'_, B> {
     }
 }
 
-fn member_window_with_allowance<'a, B: Budget>(
+fn member_window_with_allowance<'a>(
     data: &'a [u8],
     history: &[u8],
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<(MemberWindow<'a, B>, usize)> {
+    allowance: &Allowance,
+) -> Result<(MemberWindow<'a>, usize)> {
     let history = &history[history.len().saturating_sub(options.max_match_distance)..];
     if history.is_empty() {
         return Ok((MemberWindow::Borrowed(data), 0));
@@ -2967,17 +2940,17 @@ fn encode_lz_block_in_window(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_lz_block_with_allowance<B: Budget>(
+fn encode_lz_block_with_allowance(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     algorithm_version: u8,
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
     is_last: bool,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
         1 => DISTANCE_TABLE_SIZE_70,
@@ -2988,7 +2961,7 @@ fn encode_lz_block_with_allowance<B: Budget>(
         }
     };
     if !options.optimal_parse {
-        let tokens = lazy_tokens::<B, PackedToken>(
+        let tokens = lazy_tokens::<PackedToken>(
             combined,
             block,
             search,
@@ -3068,13 +3041,13 @@ fn encode_token_block(
     .map(Buffer::into_vec)
 }
 
-fn encode_token_block_with_allowance<B: Budget>(
+fn encode_token_block_with_allowance(
     tokens: &[EncodeToken],
     algorithm_version: u8,
     distance_size: usize,
     is_last: bool,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let payload = encode_token_payload(
         tokens.iter().copied(),
         &[],
@@ -3091,13 +3064,13 @@ fn encode_token_block_with_allowance<B: Budget>(
     )
 }
 
-fn encode_token_payload<B: Budget>(
+fn encode_token_payload(
     tokens: impl Iterator<Item = EncodeToken> + Clone,
     filters: &[EncodeFilter],
     algorithm_version: u8,
     distance_size: usize,
-    allowance: &B,
-) -> Result<BitWriter<B>> {
+    allowance: &Allowance,
+) -> Result<BitWriter> {
     let (lengths, stream_bits) =
         stream_lengths_and_bits(tokens.clone(), filters, distance_size, allowance)?;
 
@@ -3203,7 +3176,7 @@ struct PendingBits {
 
 impl PendingBits {
     #[inline]
-    fn put<B: Budget>(&mut self, writer: &mut BitWriter<B>, value: usize, count: usize) {
+    fn put(&mut self, writer: &mut BitWriter, value: usize, count: usize) {
         debug_assert!(count < 64);
         if self.count + count > 64 {
             self.flush(writer);
@@ -3214,7 +3187,7 @@ impl PendingBits {
     }
 
     #[inline]
-    fn flush<B: Budget>(&mut self, writer: &mut BitWriter<B>) {
+    fn flush(&mut self, writer: &mut BitWriter) {
         if self.count != 0 {
             writer
                 .bytes
@@ -3226,13 +3199,13 @@ impl PendingBits {
 }
 
 #[derive(Debug)]
-struct EncoderState<B: Budget> {
-    history: Buffer<u8, B>,
+struct EncoderState {
+    history: Buffer<u8>,
     options: EncodeOptions,
 }
 
-impl<B: Budget> EncoderState<B> {
-    fn new(options: EncodeOptions, allowance: &B) -> Self {
+impl EncoderState {
+    fn new(options: EncodeOptions, allowance: &Allowance) -> Self {
         Self {
             history: Buffer::new(allowance),
             options,
@@ -3244,7 +3217,7 @@ impl<B: Budget> EncoderState<B> {
         version: u8,
         filters: Option<&[crate::FilterSpec]>,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         let allowance = self.history.allowance();
         let packed = match filters {
             None => encode_member_with_allowance(
@@ -3290,7 +3263,7 @@ impl<B: Budget> EncoderState<B> {
 
 #[derive(Debug)]
 pub struct Unpack50Encoder {
-    state: EncoderState<Allowance>,
+    state: EncoderState,
 }
 
 impl Clone for Unpack50Encoder {
@@ -3541,21 +3514,21 @@ fn table_lengths_with_filters(
     table_lengths_with_allowance(tokens, filters, distance_size, &Allowance::default())
 }
 
-fn table_lengths_with_allowance<B: Budget>(
+fn table_lengths_with_allowance(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
     distance_size: usize,
-    allowance: &B,
-) -> Result<OwnedLengths<B>> {
+    allowance: &Allowance,
+) -> Result<OwnedLengths> {
     table_lengths_for_stream(tokens.iter().copied(), filters, distance_size, allowance)
 }
 
-fn table_lengths_for_stream<B: Budget>(
+fn table_lengths_for_stream(
     tokens: impl Iterator<Item = EncodeToken>,
     filters: &[EncodeFilter],
     distance_size: usize,
-    allowance: &B,
-) -> Result<OwnedLengths<B>> {
+    allowance: &Allowance,
+) -> Result<OwnedLengths> {
     stream_lengths_and_bits(tokens, filters, distance_size, allowance).map(|(lengths, _)| lengths)
 }
 
@@ -3565,12 +3538,12 @@ fn table_lengths_for_stream<B: Budget>(
 /// The count falls out of the symbol frequencies: every code is its length
 /// once per use, and the extra bits and filter records do not depend on the
 /// tables at all.
-fn stream_lengths_and_bits<B: Budget>(
+fn stream_lengths_and_bits(
     tokens: impl Iterator<Item = EncodeToken>,
     filters: &[EncodeFilter],
     distance_size: usize,
-    allowance: &B,
-) -> Result<(OwnedLengths<B>, usize)> {
+    allowance: &Allowance,
+) -> Result<(OwnedLengths, usize)> {
     let mut main_frequencies = Buffer::filled(MAIN_TABLE_SIZE, 0usize, allowance)?;
     main_frequencies[256] = filters.len();
     let mut distance_frequencies = Buffer::filled(distance_size, 0usize, allowance)?;
@@ -3649,10 +3622,10 @@ fn stream_lengths_and_bits<B: Budget>(
 
 /// Actual payload size, including the transmitted tables and filter records.
 /// Padding and block-header size are monotonic in this bit count.
-fn token_stream_bits<B: Budget>(
+fn token_stream_bits(
     tokens: &[EncodeToken],
     filters: &[EncodeFilter],
-    lengths: &OwnedLengths<B>,
+    lengths: &OwnedLengths,
     distance_size: usize,
 ) -> Result<usize> {
     let version = if distance_size == DISTANCE_TABLE_SIZE_70 {
@@ -3671,10 +3644,10 @@ fn token_stream_bits<B: Budget>(
     )
 }
 
-fn token_stream_bits_after_tables<B: Budget>(
+fn token_stream_bits_after_tables(
     tokens: impl Iterator<Item = EncodeToken>,
     filters: &[EncodeFilter],
-    lengths: &OwnedLengths<B>,
+    lengths: &OwnedLengths,
     distance_size: usize,
     mut bits: usize,
 ) -> Result<usize> {
@@ -3705,20 +3678,20 @@ fn token_stream_bits_after_tables<B: Budget>(
     Ok(bits)
 }
 
-struct OptimalWorkspace<B: Budget = Allowance> {
-    price: Buffer<u32, B>,
-    arrive_length: Buffer<u32, B>,
-    arrive_distance: Buffer<u32, B>,
-    arrive_reps: Buffer<[u32; 4], B>,
-    arrive_last_length: Buffer<u32, B>,
+struct OptimalWorkspace {
+    price: Buffer<u32>,
+    arrive_length: Buffer<u32>,
+    arrive_distance: Buffer<u32>,
+    arrive_reps: Buffer<[u32; 4]>,
+    arrive_last_length: Buffer<u32>,
 }
 
 const OPTIMAL_STATE_RING_SIZE: usize = 8192;
 const _: () = assert!(OPTIMAL_STATE_RING_SIZE.is_power_of_two());
 const _: () = assert!(OPTIMAL_STATE_RING_SIZE > MAX_ENCODER_MATCH_LENGTH);
 
-impl<B: Budget> OptimalWorkspace<B> {
-    fn new(allowance: &B) -> Self {
+impl OptimalWorkspace {
+    fn new(allowance: &Allowance) -> Self {
         Self {
             price: Buffer::new(allowance),
             arrive_length: Buffer::new(allowance),
@@ -4359,16 +4332,16 @@ fn committed_tail(
 /// Does no searching of its own: `matches` holds what an [`OptimalCollector`]
 /// found at each position of this block, and prices never change what a
 /// search would find, so every pass prices the same collection.
-fn optimal_tokens_in_workspace<B: Budget>(
+fn optimal_tokens_in_workspace(
     combined: &[u8],
     block: Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
-    matches: &BlockMatches<B>,
-    workspace: &mut OptimalWorkspace<B>,
-) -> Result<Buffer<EncodeToken, B>> {
-    price_optimal_tokens::<B, EncodeToken, false>(
+    matches: &BlockMatches,
+    workspace: &mut OptimalWorkspace,
+) -> Result<Buffer<EncodeToken>> {
+    price_optimal_tokens::<EncodeToken, false>(
         combined,
         block,
         options,
@@ -4379,15 +4352,15 @@ fn optimal_tokens_in_workspace<B: Budget>(
     )
 }
 
-fn price_optimal_tokens<B: Budget, T: From<EncodeToken>, const BOUNDED: bool>(
+fn price_optimal_tokens<T: From<EncodeToken>, const BOUNDED: bool>(
     combined: &[u8],
     block: Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
-    matches: impl std::borrow::Borrow<BlockMatches<B>>,
-    workspace: &mut OptimalWorkspace<B>,
-) -> Result<Buffer<T, B>> {
+    matches: impl std::borrow::Borrow<BlockMatches>,
+    workspace: &mut OptimalWorkspace,
+) -> Result<Buffer<T>> {
     #[cfg(test)]
     convergence_tests::record_pricing_pass();
     let start = block.start;
@@ -4479,17 +4452,13 @@ fn price_optimal_tokens<B: Budget, T: From<EncodeToken>, const BOUNDED: bool>(
         }
         let length = arrive_length[index] as usize;
         if length == 0 {
-            reversed
-                .push(T::from(EncodeToken::Literal(combined[start + index - 1])))
-                .map_err(Into::into)?;
+            reversed.push(T::from(EncodeToken::Literal(combined[start + index - 1])))?;
             index -= 1;
         } else {
-            reversed
-                .push(T::from(EncodeToken::Match {
-                    length,
-                    distance: arrive_distance[index] as usize,
-                }))
-                .map_err(Into::into)?;
+            reversed.push(T::from(EncodeToken::Match {
+                length,
+                distance: arrive_distance[index] as usize,
+            }))?;
             index -= length;
         }
     }
@@ -4530,16 +4499,16 @@ fn encode_tokens_with_progress(
 
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
-fn encode_tokens_with_allowance<B: Budget>(
+fn encode_tokens_with_allowance(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     options: EncodeOptions,
     distance_size: usize,
     initial_filters: &[EncodeFilter],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<EncodeToken, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<EncodeToken>> {
     if options.optimal_parse {
         encode_optimal_tokens(
             combined,
@@ -4552,7 +4521,7 @@ fn encode_tokens_with_allowance<B: Budget>(
             allowance,
         )
     } else {
-        lazy_tokens::<B, EncodeToken>(
+        lazy_tokens::<EncodeToken>(
             combined,
             block,
             search,
@@ -4565,16 +4534,16 @@ fn encode_tokens_with_allowance<B: Budget>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_optimal_tokens<B: Budget>(
+fn encode_optimal_tokens(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     options: EncodeOptions,
     distance_size: usize,
     initial_filters: &[EncodeFilter],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<EncodeToken, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<EncodeToken>> {
     let block_len = block.len();
     let matches = collect_optimal_matches(combined, block.clone(), search, options, allowance)?;
     let tokens = optimal_tokens_for_matches(
@@ -4592,13 +4561,13 @@ fn encode_optimal_tokens<B: Budget>(
     Ok(tokens)
 }
 
-fn collect_optimal_matches<B: Budget>(
+fn collect_optimal_matches(
     combined: &[u8],
     block: Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<BlockMatches<B>> {
+    allowance: &Allowance,
+) -> Result<BlockMatches> {
     match search {
         MemberSearch::Optimal(collector) => collector.collect(combined, block, options),
         _ => {
@@ -4612,19 +4581,19 @@ fn collect_optimal_matches<B: Budget>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encode_single_pass_block<B: Budget>(
+fn encode_single_pass_block(
     combined: &[u8],
     block: Range<usize>,
     options: EncodeOptions,
     algorithm_version: u8,
     distance_size: usize,
     is_last: bool,
-    matches: BlockMatches<B>,
+    matches: BlockMatches,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let span = block.len();
-    let tokens = price_optimal_tokens::<B, PackedToken, true>(
+    let tokens = price_optimal_tokens::<PackedToken, true>(
         combined,
         block,
         options,
@@ -4653,15 +4622,15 @@ fn encode_single_pass_block<B: Budget>(
     )
 }
 
-fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
+fn lazy_tokens<T: From<EncodeToken>>(
     combined: &[u8],
     block: Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     options: EncodeOptions,
     distance_size: usize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<T, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<T>> {
     let start = block.start;
     let end = block.end;
 
@@ -4719,9 +4688,7 @@ fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
                 &mut noise,
             );
             if emit_literal {
-                tokens
-                    .push(T::from(EncodeToken::Literal(combined[pos])))
-                    .map_err(Into::into)?;
+                tokens.push(T::from(EncodeToken::Literal(combined[pos])))?;
                 finder.insert(combined, pos);
                 pos += 1;
                 pending_match = cached_next;
@@ -4730,18 +4697,14 @@ fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
             let MatchCandidate {
                 length, distance, ..
             } = candidate;
-            tokens
-                .push(T::from(EncodeToken::Match { length, distance }))
-                .map_err(Into::into)?;
+            tokens.push(T::from(EncodeToken::Match { length, distance }))?;
             state.remember(length, distance);
             for history_pos in pos..pos + length {
                 finder.insert(combined, history_pos);
             }
             pos += length;
         } else {
-            tokens
-                .push(T::from(EncodeToken::Literal(combined[pos])))
-                .map_err(Into::into)?;
+            tokens.push(T::from(EncodeToken::Literal(combined[pos])))?;
             finder.insert(combined, pos);
             pos += 1;
         }
@@ -4781,15 +4744,15 @@ const GREEDY_MISS_SHIFT: u32 = 7;
 /// the first `max_match_candidates` positions in the hash chain, taken without
 /// looking ahead. Matches enter the finder only partly; see
 /// [`GREEDY_INSERTED_PER_MATCH`].
-fn greedy_tokens<B: Budget, T: From<EncodeToken>>(
+fn greedy_tokens<T: From<EncodeToken>>(
     combined: &[u8],
     block: Range<usize>,
-    finder: &mut Rar50MatchFinder<B>,
+    finder: &mut Rar50MatchFinder,
     options: EncodeOptions,
     distance_size: usize,
     mut progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<T, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<T>> {
     let start = block.start;
     let end = block.end;
     let mut tokens = Buffer::new(allowance);
@@ -4802,9 +4765,7 @@ fn greedy_tokens<B: Budget, T: From<EncodeToken>>(
     let word = |at: usize| u32::from_le_bytes(combined[at..at + 4].try_into().unwrap());
     while pos < end {
         if pos >= searchable_end || end - pos < 4 {
-            tokens
-                .push(T::from(EncodeToken::Literal(combined[pos])))
-                .map_err(Into::into)?;
+            tokens.push(T::from(EncodeToken::Literal(combined[pos])))?;
             finder.insert(combined, pos);
             pos += 1;
             continue;
@@ -4841,9 +4802,7 @@ fn greedy_tokens<B: Budget, T: From<EncodeToken>>(
                 distance,
                 score,
             }) if score > GREEDY_MIN_SCORE => {
-                tokens
-                    .push(T::from(EncodeToken::Match { length, distance }))
-                    .map_err(Into::into)?;
+                tokens.push(T::from(EncodeToken::Match { length, distance }))?;
                 state.remember(length, distance);
                 let inserted_end = (pos + length)
                     .min(pos + 1 + GREEDY_INSERTED_PER_MATCH)
@@ -4856,9 +4815,7 @@ fn greedy_tokens<B: Budget, T: From<EncodeToken>>(
                 misses += 1;
                 let skipped = 1 + (misses >> GREEDY_MISS_SHIFT).min(end - pos - 1);
                 for &byte in &combined[pos..pos + skipped] {
-                    tokens
-                        .push(T::from(EncodeToken::Literal(byte)))
-                        .map_err(Into::into)?;
+                    tokens.push(T::from(EncodeToken::Literal(byte)))?;
                 }
                 pos += skipped;
             }
@@ -4886,15 +4843,15 @@ fn greedy_tokens<B: Budget, T: From<EncodeToken>>(
 /// distance memory, and its prices come from its own passes. That is what lets
 /// a member's blocks be priced on several threads once the collector, which is
 /// sequential, has been through them.
-fn optimal_tokens_for_matches<B: Budget>(
+fn optimal_tokens_for_matches(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     initial_filters: &[EncodeFilter],
-    matches: &BlockMatches<B>,
-    allowance: &B,
-) -> Result<Buffer<EncodeToken, B>> {
+    matches: &BlockMatches,
+    allowance: &Allowance,
+) -> Result<Buffer<EncodeToken>> {
     // The prices come from the Huffman tables, and the tables come from
     // the parse, so the first pass has to guess. Each pass after it prices
     // against what the pass before actually produced.
@@ -4969,11 +4926,11 @@ mod convergence_tests;
 /// match found one byte ahead (when computed) so the caller can reuse it for
 /// the next position instead of searching again.
 #[allow(clippy::too_many_arguments)]
-fn lazy_match_decision<B: Budget>(
+fn lazy_match_decision(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder<B>,
+    finder: &Rar50MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -5018,11 +4975,11 @@ struct MatchCandidate {
 }
 
 #[cfg(test)]
-fn best_match<B: Budget>(
+fn best_match(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder<B>,
+    finder: &Rar50MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -5033,11 +4990,11 @@ fn best_match<B: Budget>(
 /// The best match at `pos`, from the remembered distances and, when `chain`
 /// is set, the hash chain.
 #[allow(clippy::too_many_arguments)]
-fn best_match_with<B: Budget>(
+fn best_match_with(
     input: &[u8],
     pos: usize,
     end: usize,
-    finder: &Rar50MatchFinder<B>,
+    finder: &Rar50MatchFinder,
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
@@ -5218,7 +5175,7 @@ fn literal_presence(data: &[u8]) -> [bool; 256] {
     present
 }
 
-fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) -> Result<()> {
+fn try_write_filter(writer: &mut BitWriter, filter: EncodeFilter) -> Result<()> {
     if filter.offset > u32::MAX as usize {
         return Err(Error::InvalidData("RAR 5 filter offset is too large"));
     }
@@ -5234,19 +5191,17 @@ fn try_write_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) 
                     "RAR 5 DELTA filter channel count is invalid",
                 ));
             }
-            writer.try_write_bits(0, 3).map_err(Into::into)?;
-            writer
-                .try_write_bits(filter.channels - 1, 5)
-                .map_err(Into::into)?;
+            writer.try_write_bits(0, 3)?;
+            writer.try_write_bits(filter.channels - 1, 5)?;
         }
-        FilterType::E8 => writer.try_write_bits(1, 3).map_err(Into::into)?,
-        FilterType::E8E9 => writer.try_write_bits(2, 3).map_err(Into::into)?,
-        FilterType::Arm => writer.try_write_bits(3, 3).map_err(Into::into)?,
+        FilterType::E8 => writer.try_write_bits(1, 3)?,
+        FilterType::E8E9 => writer.try_write_bits(2, 3)?,
+        FilterType::Arm => writer.try_write_bits(3, 3)?,
     }
     Ok(())
 }
 
-fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter) {
+fn write_valid_filter(writer: &mut BitWriter, filter: EncodeFilter) {
     debug_assert!(u32::try_from(filter.offset).is_ok());
     debug_assert!(u32::try_from(filter.length).is_ok());
     write_filter_data_admitted(writer, filter.offset as u32);
@@ -5263,20 +5218,16 @@ fn write_valid_filter<B: Budget>(writer: &mut BitWriter<B>, filter: EncodeFilter
     }
 }
 
-fn try_write_filter_data<B: Budget>(writer: &mut BitWriter<B>, value: u32) -> Result<()> {
+fn try_write_filter_data(writer: &mut BitWriter, value: u32) -> Result<()> {
     let byte_count = filter_data_byte_count(value);
-    writer
-        .try_write_bits(byte_count - 1, 2)
-        .map_err(Into::into)?;
+    writer.try_write_bits(byte_count - 1, 2)?;
     for index in 0..byte_count {
-        writer
-            .try_write_bits(((value >> (index * 8)) & 0xff) as usize, 8)
-            .map_err(Into::into)?;
+        writer.try_write_bits(((value >> (index * 8)) & 0xff) as usize, 8)?;
     }
     Ok(())
 }
 
-fn write_filter_data_admitted<B: Budget>(writer: &mut BitWriter<B>, value: u32) {
+fn write_filter_data_admitted(writer: &mut BitWriter, value: u32) {
     let byte_count = filter_data_byte_count(value);
     writer.write_admitted_bits(byte_count - 1, 2);
     for index in 0..byte_count {
@@ -5337,12 +5288,12 @@ fn arm_encode(data: &mut [u8], file_offset: u32) {
     }
 }
 
-struct EncoderCodeTable<B: Budget> {
-    symbols: Buffer<(u16, u8), B>,
+struct EncoderCodeTable {
+    symbols: Buffer<(u16, u8)>,
 }
 
-impl<B: Budget> EncoderCodeTable<B> {
-    fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
+impl EncoderCodeTable {
+    fn from_lengths(lengths: &[u8], allowance: &Allowance) -> Result<Self> {
         let mut counts = [0u16; 16];
         // Both callers use the encoder's length generators, capped at 15 bits.
         for &length in lengths {
@@ -5376,8 +5327,8 @@ impl<B: Budget> EncoderCodeTable<B> {
     }
 }
 
-struct BitWriter<B: Budget = Allowance> {
-    bytes: Buffer<u8, B>,
+struct BitWriter {
+    bytes: Buffer<u8>,
     bit_pos: usize,
 }
 
@@ -5394,8 +5345,8 @@ impl BitWriter {
     }
 }
 
-impl<B: Budget> BitWriter<B> {
-    fn with_allowance(allowance: &B) -> Self {
+impl BitWriter {
+    fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             bytes: Buffer::new(allowance),
             bit_pos: 0,
@@ -5406,7 +5357,7 @@ impl<B: Budget> BitWriter<B> {
         &mut self,
         value: usize,
         count: usize,
-    ) -> std::result::Result<(), B::Failure> {
+    ) -> std::result::Result<(), crate::codec::Error> {
         self.bytes
             .write_msb_bits(&mut self.bit_pos, value as u64, count)
     }
@@ -5472,10 +5423,10 @@ fn encode_table_level_tokens(lengths: &[u8]) -> Vec<LevelToken> {
         .into_vec()
 }
 
-fn encode_table_level_tokens_with_allowance<B: Budget>(
+fn encode_table_level_tokens_with_allowance(
     lengths: &[u8],
-    allowance: &B,
-) -> Result<Buffer<LevelToken, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<LevelToken>> {
     let mut tokens = Buffer::new(allowance);
     let mut pos = 0usize;
     let mut previous = None;
@@ -5499,34 +5450,25 @@ fn encode_table_level_tokens_with_allowance<B: Budget>(
             continue;
         }
 
-        tokens
-            .push(LevelToken::plain(value as usize))
-            .map_err(Into::into)?;
+        tokens.push(LevelToken::plain(value as usize))?;
         previous = Some(value);
         pos += 1;
     }
     Ok(tokens)
 }
 
-fn emit_repeat_level_run<B: Budget>(
-    tokens: &mut Buffer<LevelToken, B>,
-    mut run: usize,
-) -> Result<()> {
+fn emit_repeat_level_run(tokens: &mut Buffer<LevelToken>, mut run: usize) -> Result<()> {
     while run >= 3 {
         if run >= 11 {
             let mut chunk = run.min(138);
             if matches!(run - chunk, 1 | 2) {
                 chunk -= 3;
             }
-            tokens
-                .push(LevelToken::repeat_previous_long(chunk))
-                .map_err(Into::into)?;
+            tokens.push(LevelToken::repeat_previous_long(chunk))?;
             run -= chunk;
         } else {
             let chunk = run.min(10);
-            tokens
-                .push(LevelToken::repeat_previous_short(chunk))
-                .map_err(Into::into)?;
+            tokens.push(LevelToken::repeat_previous_short(chunk))?;
             run -= chunk;
         }
     }
@@ -5534,29 +5476,22 @@ fn emit_repeat_level_run<B: Budget>(
     Ok(())
 }
 
-fn emit_zero_level_run<B: Budget>(
-    tokens: &mut Buffer<LevelToken, B>,
-    mut run: usize,
-) -> Result<()> {
+fn emit_zero_level_run(tokens: &mut Buffer<LevelToken>, mut run: usize) -> Result<()> {
     while run != 0 {
         if run >= 11 {
             let mut chunk = run.min(138);
             if matches!(run - chunk, 1 | 2) {
                 chunk -= 3;
             }
-            tokens
-                .push(LevelToken::zero_run_long(chunk))
-                .map_err(Into::into)?;
+            tokens.push(LevelToken::zero_run_long(chunk))?;
             run -= chunk;
         } else if run >= 3 {
             let chunk = run.min(10);
-            tokens
-                .push(LevelToken::zero_run_short(chunk))
-                .map_err(Into::into)?;
+            tokens.push(LevelToken::zero_run_short(chunk))?;
             run -= chunk;
         } else {
             for _ in 0..run {
-                tokens.push(LevelToken::plain(0)).map_err(Into::into)?;
+                tokens.push(LevelToken::plain(0))?;
             }
             break;
         }
@@ -5583,9 +5518,9 @@ fn level_code_lengths_for_tokens(tokens: &[LevelToken]) -> [u8; LEVEL_TABLE_SIZE
     level_code_lengths_with_allowance(tokens, &Allowance::default()).unwrap()
 }
 
-fn level_code_lengths_with_allowance<B: Budget>(
+fn level_code_lengths_with_allowance(
     tokens: &[LevelToken],
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<[u8; LEVEL_TABLE_SIZE]> {
     let mut frequencies = [0usize; LEVEL_TABLE_SIZE];
     for token in tokens {
@@ -5651,10 +5586,7 @@ fn write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE])
     try_write_level_lengths(writer, lengths).unwrap();
 }
 
-fn try_write_level_lengths<B: Budget>(
-    writer: &mut BitWriter<B>,
-    lengths: &[u8; LEVEL_TABLE_SIZE],
-) -> Result<()> {
+fn try_write_level_lengths(writer: &mut BitWriter, lengths: &[u8; LEVEL_TABLE_SIZE]) -> Result<()> {
     let mut pos = 0usize;
     while pos < LEVEL_TABLE_SIZE {
         let length = lengths[pos];
@@ -5665,21 +5597,19 @@ fn try_write_level_lengths<B: Budget>(
             }
             while count >= 3 {
                 let chunk = count.min(17);
-                writer.try_write_bits(15, 4).map_err(Into::into)?;
-                writer.try_write_bits(chunk - 2, 4).map_err(Into::into)?;
+                writer.try_write_bits(15, 4)?;
+                writer.try_write_bits(chunk - 2, 4)?;
                 pos += chunk;
                 count -= chunk;
             }
             for _ in 0..count {
-                writer.try_write_bits(0, 4).map_err(Into::into)?;
+                writer.try_write_bits(0, 4)?;
                 pos += 1;
             }
         } else {
-            writer
-                .try_write_bits(usize::from(length), 4)
-                .map_err(Into::into)?;
+            writer.try_write_bits(usize::from(length), 4)?;
             if length == 15 {
-                writer.try_write_bits(0, 4).map_err(Into::into)?;
+                writer.try_write_bits(0, 4)?;
             }
             pos += 1;
         }
