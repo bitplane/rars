@@ -427,13 +427,24 @@ pub(crate) fn encode_pass<T>(
     }
 }
 
-/// Observe every encode in a search, including sample screens. The codec
-/// adapter and search decisions remain unchanged.
-struct ReportingSearch<'a, S> {
+/// Reports every encode of a search, sample screens included, to `progress`
+/// as a pass of its own. Without one it is the search itself.
+struct Reporting<'a, 'p, S> {
     search: &'a S,
-    progress: std::cell::RefCell<&'a mut dyn FnMut(EncodeProgress) -> bool>,
+    progress: Option<std::cell::RefCell<&'p mut dyn FnMut(EncodeProgress) -> bool>>,
 }
-impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
+impl<S: OwnedSearch> Reporting<'_, '_, S> {
+    fn pass<T>(
+        &self,
+        encode: impl FnOnce(Option<&mut dyn FnMut(usize) -> bool>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.progress {
+            Some(progress) => encode_pass(Some(&mut **progress.borrow_mut()), encode),
+            None => encode(None),
+        }
+    }
+}
+impl<S: OwnedSearch> OwnedSearch for Reporting<'_, '_, S> {
     type Options = S::Options;
     type Memory = S::Memory;
     fn allowance(&self) -> &Self::Memory {
@@ -486,9 +497,7 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Buffer<u8, S::Memory>> {
-        encode_pass(Some(&mut **self.progress.borrow_mut()), |progress| {
-            self.search.encode_plain(data, options, progress)
-        })
+        self.pass(|progress| self.search.encode_plain(data, options, progress))
     }
     fn encode_filtered(
         &self,
@@ -497,7 +506,7 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
     ) -> Result<Buffer<u8, S::Memory>> {
-        encode_pass(Some(&mut **self.progress.borrow_mut()), |progress| {
+        self.pass(|progress| {
             self.search
                 .encode_filtered(data, filters, options, progress)
         })
@@ -1765,13 +1774,17 @@ fn ranked_finalists<S: OwnedSearch>(
 /// A solid chain is that caller. Its members code against everything before
 /// them, so a candidate encoded on its own has not been measured at all, and
 /// the bytes [`choose_owned`] returns are bytes the chain would never write.
-pub(crate) fn filter_candidates<S: FilterSearch>(
+pub(crate) fn filter_candidates<S: FilterSearch + Sync>(
     search: &S,
     data: &[u8],
     options: S::Options,
 ) -> Result<Vec<Vec<FilterSpec>>> {
     Ok(finalists(
-        &UnlimitedSearch(search, Allowance::default()),
+        &SideBySideSearch {
+            search: &UnlimitedSearch(search, Allowance::default()),
+            progress: None,
+            admit: &|_| None,
+        },
         data,
         options,
     )?
@@ -1810,38 +1823,27 @@ pub(crate) fn choose_filter<S: FilterSearch>(
 /// [`SideBySideSearch`] runs them, in room `admit` grants, and `progress` is
 /// told what each encode walked as [`choose_filter_side_by_side`] tells it.
 /// The choice is the one made with the encodes in turn.
-pub(crate) fn choose_filter_specs<S, R>(
+pub(crate) fn choose_filter_specs<'r, S, R>(
     search: &S,
     data: &[u8],
     options: S::Options,
     progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
-    admit: &(dyn Fn(usize) -> Option<R> + Sync),
+    admit: &'r (dyn Fn(usize) -> Option<R> + Sync),
 ) -> Result<Vec<FilterSpec>>
 where
     S: FilterSearch + Sync,
+    R: Send + 'r,
 {
-    let search = UnlimitedSearch(search, Allowance::default());
-    match progress {
-        Some(progress) => specs_only(
-            &SideBySideSearch {
-                search: &SharedReporting {
-                    search: &search,
-                    progress,
-                },
-                admit,
-            },
-            data,
-            options,
-        ),
-        None => specs_only(
-            &SideBySideSearch {
-                search: &search,
-                admit,
-            },
-            data,
-            options,
-        ),
-    }
+    let admit = |len| admit(len).map(|room| Box::new(room) as Room<'r>);
+    specs_only(
+        &SideBySideSearch {
+            search: &UnlimitedSearch(search, Allowance::default()),
+            progress,
+            admit: &admit,
+        },
+        data,
+        options,
+    )
     .map(|specs| specs.into_vec())
 }
 
@@ -1872,43 +1874,34 @@ where
 /// `progress` is told how many bytes an encode walked since it last reported,
 /// zero as each encode starts, from whichever thread runs it. False stops the
 /// search with [`crate::Error::Cancelled`].
-pub(crate) fn choose_filter_side_by_side<S, R>(
+pub(crate) fn choose_filter_side_by_side<'r, S, R>(
     search: &S,
     data: &[u8],
     options: S::Options,
     progress: Option<&(dyn Fn(usize) -> bool + Sync)>,
-    admit: &(dyn Fn(usize) -> Option<R> + Sync),
+    admit: &'r (dyn Fn(usize) -> Option<R> + Sync),
 ) -> Result<(Vec<FilterSpec>, Vec<u8>)>
 where
     S: FilterSearch + Sync,
-    R: Send,
+    R: Send + 'r,
 {
-    let search = UnlimitedSearch(search, Allowance::default());
-    match progress {
-        Some(progress) => side_by_side(
-            &SideBySideSearch {
-                search: &SharedReporting {
-                    search: &search,
-                    progress,
-                },
-                admit,
-            },
-            data,
-            options,
-            admit,
-        ),
-        None => side_by_side(
-            &SideBySideSearch {
-                search: &search,
-                admit,
-            },
-            data,
-            options,
-            admit,
-        ),
-    }
+    let admit = |len| admit(len).map(|room| Box::new(room) as Room<'r>);
+    side_by_side(
+        &SideBySideSearch {
+            search: &UnlimitedSearch(search, Allowance::default()),
+            progress,
+            admit: &admit,
+        },
+        data,
+        options,
+        &admit,
+    )
     .map(|(specs, bytes)| (specs.into_vec(), bytes.into_vec()))
 }
+
+/// Room an admission grants, held until the encode it was asked for is done.
+/// Boxed, so the search compiles once whatever the caller's room is.
+type Room<'r> = Box<dyn Send + 'r>;
 
 /// Runs the independent encodes a search hands to [`OwnedSearch::each`] side
 /// by side, as many at once as there are threads to nest on.
@@ -1919,145 +1912,37 @@ where
 /// batch is cut there and the rest wait for the next. With no room at all
 /// they run one at a time. The results come back in order, whichever finished
 /// first, so a search makes the same decisions from them as in turn.
-struct SideBySideSearch<'a, S, R> {
-    search: &'a S,
-    admit: &'a (dyn Fn(usize) -> Option<R> + Sync),
-}
-
-impl<S: OwnedSearch + Sync, R> OwnedSearch for SideBySideSearch<'_, S, R> {
-    type Options = S::Options;
-    type Memory = S::Memory;
-    fn allowance(&self) -> &Self::Memory {
-        self.search.allowance()
-    }
-    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, S::Memory>> {
-        self.search.screened_kinds(data)
-    }
-    fn detects_x86(&self) -> bool {
-        self.search.detects_x86()
-    }
-    fn prices_calls_alone(&self) -> bool {
-        self.search.prices_calls_alone()
-    }
-    fn max_delta_channels(&self) -> usize {
-        self.search.max_delta_channels()
-    }
-    fn table_scan_window(&self) -> usize {
-        self.search.table_scan_window()
-    }
-    fn x86_region_sample_span(&self) -> usize {
-        self.search.x86_region_sample_span()
-    }
-    fn screen_options(&self, options: Self::Options) -> Self::Options {
-        self.search.screen_options(options)
-    }
-    fn exhaustive(&self) -> bool {
-        self.search.exhaustive()
-    }
-    fn trusts_x86_scanner(&self) -> bool {
-        self.search.trusts_x86_scanner()
-    }
-    fn estimates(&self) -> bool {
-        self.search.estimates()
-    }
-    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
-        self.search.filtered_bytes(data, filters)
-    }
-    fn filtered_window(
-        &self,
-        data: &[u8],
-        offset: usize,
-        filters: &[FilterSpec],
-    ) -> Result<Buffer<u8, S::Memory>> {
-        self.search.filtered_window(data, offset, filters)
-    }
-    fn encode_plain(
-        &self,
-        data: &[u8],
-        options: Self::Options,
-        progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, S::Memory>> {
-        self.search.encode_plain(data, options, progress)
-    }
-    fn encode_filtered(
-        &self,
-        data: &[u8],
-        filters: &[FilterSpec],
-        options: Self::Options,
-        progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, S::Memory>> {
-        self.search
-            .encode_filtered(data, filters, options, progress)
-    }
-    fn each<T: Send>(
-        &self,
-        count: usize,
-        longest: usize,
-        job: &(dyn Fn(&Self, usize) -> Result<T> + Sync),
-    ) -> Result<Vec<T>> {
-        let at_once = if count > 1 && crate::parallel::may_nest() {
-            crate::parallel::threads()
-        } else {
-            1
-        };
-        let mut done = Vec::with_capacity(count);
-        let mut start = 0;
-        while start < count {
-            let mut end = start + 1;
-            let mut rooms = Vec::new();
-            while end < count && end - start < at_once {
-                match (self.admit)(longest) {
-                    Some(room) => rooms.push(room),
-                    None => break,
-                }
-                end += 1;
-            }
-            let (packed, failure) = if end - start > 1 {
-                crate::parallel::map_prefix((start..end).collect(), |index| job(self, index))
-            } else {
-                match job(self, start) {
-                    Ok(packed) => (vec![packed], None),
-                    Err(error) => (Vec::new(), Some(error)),
-                }
-            };
-            drop(rooms);
-            if let Some(error) = failure {
-                return Err(error);
-            }
-            done.extend(packed);
-            start = end;
-        }
-        Ok(done)
-    }
-}
-
-/// Reports every encode of a search to one sink, from whichever thread runs it.
 ///
-/// Each encode keeps its own place, so encodes running side by side report
-/// what each of them walked rather than one another's positions.
-struct SharedReporting<'a, S> {
+/// Every encode is reported to `progress`, from whichever thread runs it,
+/// each keeping its own place so encodes side by side report what each of
+/// them walked rather than one another's positions.
+struct SideBySideSearch<'a, 'r, S> {
     search: &'a S,
-    progress: &'a (dyn Fn(usize) -> bool + Sync),
+    progress: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
+    admit: &'a (dyn Fn(usize) -> Option<Room<'r>> + Sync),
 }
 
-impl<S: OwnedSearch> SharedReporting<'_, S> {
+impl<S> SideBySideSearch<'_, '_, S> {
     fn pass<T>(
         &self,
         encode: impl FnOnce(Option<&mut dyn FnMut(usize) -> bool>) -> Result<T>,
     ) -> Result<T> {
-        if !(self.progress)(0) {
+        let Some(progress) = self.progress else {
+            return encode(None);
+        };
+        if !progress(0) {
             return Err(crate::Error::Cancelled);
         }
         let mut last = 0usize;
         encode(Some(&mut |position| {
             let walked = position.saturating_sub(last);
             last = position;
-            (self.progress)(walked)
+            progress(walked)
         }))
     }
 }
 
-impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
+impl<S: OwnedSearch + Sync> OwnedSearch for SideBySideSearch<'_, '_, S> {
     type Options = S::Options;
     type Memory = S::Memory;
     fn allowance(&self) -> &Self::Memory {
@@ -2124,17 +2009,56 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
                 .encode_filtered(data, filters, options, progress)
         })
     }
+    fn each<T: Send>(
+        &self,
+        count: usize,
+        longest: usize,
+        job: &(dyn Fn(&Self, usize) -> Result<T> + Sync),
+    ) -> Result<Vec<T>> {
+        let at_once = if count > 1 && crate::parallel::may_nest() {
+            crate::parallel::threads()
+        } else {
+            1
+        };
+        let mut done = Vec::with_capacity(count);
+        let mut start = 0;
+        while start < count {
+            let mut end = start + 1;
+            let mut rooms = Vec::new();
+            while end < count && end - start < at_once {
+                match (self.admit)(longest) {
+                    Some(room) => rooms.push(room),
+                    None => break,
+                }
+                end += 1;
+            }
+            let (packed, failure) = if end - start > 1 {
+                crate::parallel::map_prefix((start..end).collect(), |index| job(self, index))
+            } else {
+                match job(self, start) {
+                    Ok(packed) => (vec![packed], None),
+                    Err(error) => (Vec::new(), Some(error)),
+                }
+            };
+            drop(rooms);
+            if let Some(error) = failure {
+                return Err(error);
+            }
+            done.extend(packed);
+            start = end;
+        }
+        Ok(done)
+    }
 }
 
-fn side_by_side<S, R>(
+fn side_by_side<'r, S>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    admit: &(dyn Fn(usize) -> Option<R> + Sync),
+    admit: &(dyn Fn(usize) -> Option<Room<'r>> + Sync),
 ) -> Result<FilterChoice<S::Memory>>
 where
     S: OwnedSearch + Sync,
-    R: Send,
 {
     let at_once = if crate::parallel::may_nest() {
         crate::parallel::threads()
@@ -2186,13 +2110,13 @@ where
 /// every encode beside that one runs in room `admit` grants, held until its
 /// bytes have been compared and the larger dropped. A failure is the earliest
 /// failing finalist's, and nothing after it is compared.
-fn smallest<S, R>(
+fn smallest<'r, S>(
     search: &S,
     data: &[u8],
     options: S::Options,
     finalists: impl Iterator<Item = Finalist<S::Memory>>,
     at_once: usize,
-    admit: &(dyn Fn(usize) -> Option<R> + Sync),
+    admit: &(dyn Fn(usize) -> Option<Room<'r>> + Sync),
 ) -> Result<Option<FilterChoice<S::Memory>>>
 where
     S: OwnedSearch + Sync,
@@ -2267,17 +2191,14 @@ pub(crate) fn choose_owned_specs<S: OwnedSearch>(
     options: S::Options,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<Buffer<FilterSpec, S::Memory>> {
-    match progress {
-        Some(progress) => specs_only(
-            &ReportingSearch {
-                search,
-                progress: std::cell::RefCell::new(progress),
-            },
-            data,
-            options,
-        ),
-        None => specs_only(search, data, options),
-    }
+    specs_only(
+        &Reporting {
+            search,
+            progress: progress.map(std::cell::RefCell::new),
+        },
+        data,
+        options,
+    )
 }
 
 fn specs_only<S: OwnedSearch>(
@@ -2320,17 +2241,14 @@ pub(crate) fn choose_owned<S: OwnedSearch>(
     options: S::Options,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
 ) -> Result<FilterChoice<S::Memory>> {
-    match progress {
-        Some(progress) => choose_filter_inner(
-            &ReportingSearch {
-                search,
-                progress: std::cell::RefCell::new(progress),
-            },
-            data,
-            options,
-        ),
-        None => choose_filter_inner(search, data, options),
-    }
+    choose_filter_inner(
+        &Reporting {
+            search,
+            progress: progress.map(std::cell::RefCell::new),
+        },
+        data,
+        options,
+    )
 }
 
 fn choose_filter_inner<S: OwnedSearch>(
@@ -4595,21 +4513,16 @@ mod tests {
 
         let search = Calls(Allowance::default());
         let progress = |_: usize| true;
-        let shared = SharedReporting {
-            search: &search,
-            progress: &progress,
-        };
-        assert!(shared.prices_calls_alone());
-        let admit = |_: usize| None::<()>;
         let side = SideBySideSearch {
-            search: &shared,
-            admit: &admit,
+            search: &search,
+            progress: Some(&progress),
+            admit: &|_| None,
         };
         assert!(side.prices_calls_alone());
         let mut report = |_: EncodeProgress| true;
-        let reporting = ReportingSearch {
+        let reporting = Reporting {
             search: &search,
-            progress: std::cell::RefCell::new(&mut report),
+            progress: Some(std::cell::RefCell::new(&mut report)),
         };
         assert!(reporting.prices_calls_alone());
     }
