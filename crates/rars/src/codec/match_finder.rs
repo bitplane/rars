@@ -409,6 +409,7 @@ impl<B: Budget> MatchFinder<4, B> {
 
     /// Inserts each of `positions` in order, every one with four bytes
     /// readable at it: the stretch a parse steps over inside a match.
+    #[cfg(feature = "write")]
     #[inline]
     pub(crate) fn insert_run(&mut self, input: &[u8], positions: std::ops::Range<usize>) {
         if positions.is_empty() {
