@@ -2634,6 +2634,7 @@ impl<B: Budget> OptimalCollector<B> {
                         .map_or(match_finder::NO_POSITION, |stretches| {
                             stretches.insert(combined, pos)
                         });
+                    tree.prefetch(combined, pos + 1);
                     let avail = combined.len() - pos;
                     if avail < 4 || self.noise.skips(combined, pos) {
                         continue;
