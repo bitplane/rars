@@ -611,7 +611,7 @@ mod tests {
                 false,
             ))
             .unwrap();
-        let storage = state.publisher.staging().unwrap().root.clone();
+        let storage = state.publisher.state().staging().unwrap().root.clone();
         let alias = storage
             .file_name()
             .unwrap()

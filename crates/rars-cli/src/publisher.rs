@@ -1,11 +1,12 @@
 use crate::output::{self, ExtractedOutput, ExtractionStaging, OverwritePolicy};
 use rars::output_staging::{refused_output, FileIdentity, RenameCounters};
 use rars::output_tree::OutputTree;
+use rars::publish_queue::{PublishQueue, PublishStep};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 /// A file staged under a name of its own in a directory held open.
 pub(crate) struct Staged {
@@ -52,11 +53,11 @@ pub(crate) struct Unpublished {
     pub(crate) time_on_publish: bool,
 }
 
-pub(crate) type PublishReport<'a> = dyn FnMut(&ExtractedOutput) + 'a;
+pub(crate) type PublishReport = dyn FnMut(&ExtractedOutput) + Send;
 
-/// Moves verified outputs into place in archive order, owning what that changes.
-pub(crate) struct Publisher<'a> {
-    out_dir: &'a Path,
+/// What publishing changes, and opening reads: see [`Publisher::state`].
+pub(crate) struct PublishState {
+    out_dir: PathBuf,
     overwrite: OverwritePolicy,
     in_place: bool,
     repeats_allowed: bool,
@@ -66,10 +67,7 @@ pub(crate) struct Publisher<'a> {
     /// Files staged in the storage are published by descriptor.
     by_descriptor: bool,
     renames: RenameCounters,
-    queue: VecDeque<Unpublished>,
     outputs: Vec<ExtractedOutput>,
-    /// An output failed to publish: nothing after it is, as when it stopped the run.
-    failed: bool,
     identities: HashSet<FileIdentity>,
     /// Where staged outputs were published, once a hard link may need to find one.
     published_paths: Option<HashMap<PathBuf, PathBuf>>,
@@ -82,13 +80,13 @@ pub(crate) struct Publisher<'a> {
     in_place_modes: HashMap<(FileIdentity, u32), bool>,
     directory_times: Vec<(PathBuf, std::time::SystemTime)>,
     /// Told about each output once it is verified and in place.
-    on_published: Option<Box<PublishReport<'a>>>,
+    on_published: Option<Box<PublishReport>>,
 }
 
-impl<'a> Publisher<'a> {
-    pub(crate) fn new(out_dir: &'a Path, overwrite: OverwritePolicy, in_place: bool) -> Self {
+impl PublishState {
+    fn new(out_dir: &Path, overwrite: OverwritePolicy, in_place: bool) -> Self {
         Self {
-            out_dir,
+            out_dir: out_dir.to_path_buf(),
             overwrite,
             in_place,
             repeats_allowed: false,
@@ -96,9 +94,7 @@ impl<'a> Publisher<'a> {
             staging: None,
             by_descriptor: false,
             renames: Default::default(),
-            queue: VecDeque::new(),
             outputs: Vec::new(),
-            failed: false,
             identities: HashSet::new(),
             published_paths: None,
             created_paths: None,
@@ -112,18 +108,10 @@ impl<'a> Publisher<'a> {
         self.repeats_allowed = allowed;
     }
 
-    pub(crate) fn report_to(&mut self, report: Box<PublishReport<'a>>) {
-        self.on_published = Some(report);
-    }
-
-    pub(crate) fn len(&self) -> usize {
-        self.outputs.len() + self.queue.len()
-    }
-
     /// The output tree, opened on first use: a queued publish adds to it.
     pub(crate) fn tree(&mut self) -> rars::Result<Option<&mut OutputTree>> {
         if self.out_tree.is_none() {
-            self.out_tree = OutputTree::open(self.out_dir)?;
+            self.out_tree = OutputTree::open(&self.out_dir)?;
         }
         Ok(self.out_tree.as_mut())
     }
@@ -132,8 +120,8 @@ impl<'a> Publisher<'a> {
     /// creating the output directory and opening it if need be.
     pub(crate) fn in_place_tree(&mut self) -> rars::Result<bool> {
         if self.out_tree.is_none() && rars::output_tree::AVAILABLE {
-            fs::create_dir_all(self.out_dir)?;
-            self.out_tree = OutputTree::open(self.out_dir)?;
+            fs::create_dir_all(&self.out_dir)?;
+            self.out_tree = OutputTree::open(&self.out_dir)?;
         }
         Ok(self.out_tree.is_some())
     }
@@ -196,7 +184,8 @@ impl<'a> Publisher<'a> {
         self.published_paths.get_or_insert_with(HashMap::new);
     }
 
-    /// Builds [`Self::created_paths`] if nothing has needed it yet, from what is published, queued and `opened`.
+    /// Builds [`Self::created_paths`] if nothing has needed it yet, from what is
+    /// published and `opened`: the caller has waited for what is queued.
     pub(crate) fn link_paths(
         &mut self,
         opened: &VecDeque<Unpublished>,
@@ -206,7 +195,7 @@ impl<'a> Publisher<'a> {
             for output in &self.outputs {
                 created.insert(output.stored.clone(), output.path.clone());
             }
-            for unpublished in self.queue.iter().chain(opened) {
+            for unpublished in opened {
                 created.insert(
                     unpublished.output.stored.clone(),
                     unpublished.staged.clone(),
@@ -230,39 +219,8 @@ impl<'a> Publisher<'a> {
         created.retain(|_, path| path != staged);
     }
 
-    pub(crate) fn queue(&mut self, verified: Unpublished) {
-        self.queue.push_back(verified);
-    }
-
-    pub(crate) fn publish_queued(&mut self) -> rars::Result<()> {
-        if self.failed && !self.queue.is_empty() {
-            return Err(rars::Error::InvalidArgument(
-                "an earlier output could not be published",
-            ));
-        }
-        while let Some(mut next) = self.queue.pop_front() {
-            if let Err(error) = self.publish(&mut next) {
-                self.failed = true;
-                return Err(error);
-            }
-            if let Some(report) = &mut self.on_published {
-                report(&next.output);
-            }
-            self.outputs.push(next.output);
-        }
-        Ok(())
-    }
-
-    pub(crate) fn finish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
-        self.publish_queued()?;
-        for (path, modified) in &self.directory_times {
-            rars::output_times::set_modified_time(path, *modified)?;
-        }
-        Ok(std::mem::take(&mut self.outputs))
-    }
-
     // Publish new inodes rather than truncating any existing hard-link target.
-    fn publish(&mut self, next: &mut Unpublished) -> rars::Result<()> {
+    fn publish_one(&mut self, next: &mut Unpublished) -> rars::Result<()> {
         if next.time_on_publish {
             self.record_directory_time(&next.output.path, &next.output.meta)?;
             next.time_on_publish = false;
@@ -350,7 +308,7 @@ impl<'a> Publisher<'a> {
         let output = &mut next.output;
         let destination = &output.path;
         let relative = destination
-            .strip_prefix(self.out_dir)
+            .strip_prefix(&self.out_dir)
             .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
         let name = &output.meta.name;
         let refuse = |error| output::refused_path(error, name);
@@ -443,9 +401,9 @@ impl<'a> Publisher<'a> {
         let name = &output.meta.name;
         let relative = output
             .path
-            .strip_prefix(self.out_dir)
+            .strip_prefix(&self.out_dir)
             .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-        let destination = output::checked_output_path(self.out_dir, relative)
+        let destination = output::checked_output_path(&self.out_dir, relative)
             .map_err(|error| refused_output(error, name))?;
         // The alias check resolves the destination already when it exists.
         let existing = match &self.staging {
@@ -465,7 +423,7 @@ impl<'a> Publisher<'a> {
             fs::create_dir_all(&destination)?;
         } else {
             fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
-            output::checked_output_path(self.out_dir, relative)
+            output::checked_output_path(&self.out_dir, relative)
                 .map_err(|error| refused_output(error, name))?;
             if self.overwrite == OverwritePolicy::Always && next.redirection {
                 match fs::symlink_metadata(&destination) {
@@ -503,6 +461,106 @@ impl<'a> Publisher<'a> {
             }
         }
         Ok(())
+    }
+}
+
+impl PublishStep for PublishState {
+    type Job = Unpublished;
+
+    fn publish(&mut self, mut next: Unpublished) -> rars::Result<()> {
+        self.publish_one(&mut next)?;
+        if let Some(report) = &mut self.on_published {
+            report(&next.output);
+        }
+        self.outputs.push(next.output);
+        Ok(())
+    }
+}
+
+/// Moves verified outputs into place in archive order, on a thread of its own
+/// where it may. What publishing changes is read through [`Self::state`], so
+/// opening sees it as the publish under way leaves it.
+pub(crate) struct Publisher {
+    queue: PublishQueue<PublishState>,
+    /// Outputs queued so far.
+    queued: usize,
+    /// A failure was handed on, and the run has not ended: its handler let it go on.
+    failure_given: bool,
+}
+
+impl Publisher {
+    pub(crate) fn new(out_dir: &Path, overwrite: OverwritePolicy, in_place: bool) -> Self {
+        Self {
+            queue: PublishQueue::new(PublishState::new(out_dir, overwrite, in_place)),
+            queued: 0,
+            failure_given: false,
+        }
+    }
+
+    pub(crate) fn report_to(&mut self, report: Box<PublishReport>) {
+        self.state().on_published = Some(report);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.queued
+    }
+
+    /// Whether outputs publish on a thread of their own: only where nothing
+    /// opening does depends on the publishes before it.
+    pub(crate) fn publish_on_thread(&mut self, allowed: bool) {
+        self.queue.publish_on_thread(allowed);
+    }
+
+    /// Locks the state; a publish under way holds it, so keep this brief.
+    pub(crate) fn state(&self) -> MutexGuard<'_, PublishState> {
+        self.queue.state()
+    }
+
+    /// Waits for every output queued so far; only a member the run went on to calls it.
+    pub(crate) fn wait(&mut self) {
+        self.go_on();
+        self.queue.wait();
+    }
+
+    /// Waits as far as publishing goes, without going past a failure.
+    pub(crate) fn wait_to_failure(&self) {
+        self.queue.wait();
+    }
+
+    /// The run went on past the failure handed on: outputs held behind it publish.
+    fn go_on(&mut self) {
+        if std::mem::take(&mut self.failure_given) {
+            self.queue.resume();
+        }
+    }
+
+    pub(crate) fn queue(&mut self, verified: Unpublished) {
+        self.go_on();
+        self.queued += 1;
+        self.queue.submit(verified);
+    }
+
+    /// The first failure of an output queued earlier, naming its member.
+    pub(crate) fn publish_failure(&mut self) -> rars::Result<()> {
+        match self.queue.take_failure() {
+            Some(failure) => {
+                self.failure_given = true;
+                Err(failure)
+            }
+            None => Ok(()),
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
+        self.go_on();
+        let (mut state, failures) = self.queue.finish();
+        if let Some(failure) = failures.into_iter().next() {
+            return Err(failure);
+        }
+        for (path, modified) in &state.directory_times {
+            rars::output_times::set_modified_time(path, *modified)?;
+        }
+        Ok(std::mem::take(&mut state.outputs))
     }
 }
 

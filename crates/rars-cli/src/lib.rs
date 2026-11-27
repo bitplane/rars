@@ -791,9 +791,11 @@ impl<'p> DamagedMembers<'p> {
             self.count.fetch_add(1, Ordering::Relaxed);
             return Ok(rars::ExtractionErrorAction::Continue);
         }
+        // A publish that failed after its member settled is told of at a later one.
+        let name = failed_entry_name(error).unwrap_or(&member.meta.name);
         eprintln!(
             "{}",
-            damaged_member_warning(self.path, &member.meta.name, error, &retry_hint(error))
+            damaged_member_warning(self.path, name, error, &retry_hint(error))
         );
         let count = if password_class {
             &self.locked
@@ -1152,7 +1154,9 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
         result
             .inspect_err(|err| {
                 // Keep verified predecessors; retain the extraction error if publication fails.
-                let _ = state.borrow_mut().publish_before_failure(err);
+                if let Err(failure) = state.borrow_mut().publish_before_failure(err) {
+                    eprintln!("warning: {failure}");
+                }
             })
             .map_err(|err| {
                 classify_rars_error(err, |err| {
@@ -1246,7 +1250,7 @@ struct ExtractOutputState<'a> {
     family: rars::ArchiveFamily,
     legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
     unpublished: VecDeque<Unpublished>,
-    publisher: Publisher<'a>,
+    publisher: Publisher,
     planned_paths: HashSet<PathBuf>,
     /// The staging storage, walked the same way; present only with `out_tree`.
     /// Files stage there under names of their own in [`STAGED_FILES`], and
@@ -1299,7 +1303,7 @@ impl<'a> ExtractOutputState<'a> {
         flatten: bool,
         family: rars::ArchiveFamily,
     ) -> Self {
-        let mut state = Self {
+        let state = Self {
             out_dir,
             overwrite,
             in_place,
@@ -1325,16 +1329,21 @@ impl<'a> ExtractOutputState<'a> {
             settled: 0,
             unsettled: VecDeque::new(),
         };
-        state.publisher.set_repeats_allowed(state.repeats_allowed());
+        state
+            .publisher
+            .state()
+            .set_repeats_allowed(state.repeats_allowed());
         state
     }
 
     fn allow_overwrite_repeats(&mut self) {
         self.overwrite_repeats = true;
-        self.publisher.set_repeats_allowed(self.repeats_allowed());
+        self.publisher
+            .state()
+            .set_repeats_allowed(self.repeats_allowed());
     }
 
-    fn report_to(&mut self, report: Box<PublishReport<'a>>) {
+    fn report_to(&mut self, report: Box<PublishReport>) {
         self.publisher.report_to(report);
     }
 
@@ -1352,6 +1361,8 @@ impl<'a> ExtractOutputState<'a> {
     /// earlier run have verified.
     fn settle_explicitly(&mut self, settling: bool) {
         self.settling = settling;
+        // Settling, opening reads only what a publish still queued leaves for publishing to catch.
+        self.publisher.publish_on_thread(settling);
         self.settled = self.unpublished.len();
         self.unsettled.clear();
     }
@@ -1415,7 +1426,10 @@ impl<'a> ExtractOutputState<'a> {
     /// Drops an output that is not to be published, and what it staged.
     fn discard_output(&mut self, index: usize) {
         let staged = self.unpublished[index].staged.clone();
-        self.publisher.forget_created(&self.unpublished, &staged);
+        self.publisher.wait();
+        self.publisher
+            .state()
+            .forget_created(&self.unpublished, &staged);
         self.unpublished.remove(index);
         if !self.in_place {
             let _ = fs::remove_file(&staged);
@@ -1453,6 +1467,7 @@ impl<'a> ExtractOutputState<'a> {
         if self.verified_end() == self.unpublished.len() {
             self.publish_verified()?;
         }
+        self.publisher.publish_failure()?;
         if self.unnamed(meta) {
             return Ok(Box::new(std::io::sink()));
         }
@@ -1472,10 +1487,12 @@ impl<'a> ExtractOutputState<'a> {
         // Settling, members before this one may not be published yet: the
         // time is taken as it is published.
         if !self.settling {
-            self.publisher.record_directory_time(&destination, meta)?;
+            self.publisher
+                .state()
+                .record_directory_time(&destination, meta)?;
         }
         self.prepare_staged_path(&destination, meta.is_directory, existing.as_ref())?;
-        let by_descriptor = self.in_place && self.publisher.in_place_tree()?;
+        let by_descriptor = self.in_place && self.publisher.state().in_place_tree()?;
         let (path, staged, pending, writer) = match &mut self.staging_tree {
             Some(tree) => {
                 // Each member stages under a name of its own, so only
@@ -1485,8 +1502,8 @@ impl<'a> ExtractOutputState<'a> {
                 let name = std::ffi::OsString::from(index.to_string());
                 if self.staging_files.is_none() {
                     let dir = tree.file_dir(Path::new(STAGED_FILES))?;
-                    let staging = self.publisher.staging().expect("staging exists");
-                    self.staging_files = Some((dir, staging.root.join(STAGED_FILES)));
+                    let root = self.staging_root();
+                    self.staging_files = Some((dir, root.join(STAGED_FILES)));
                 }
                 let (dir, root) = self.staging_files.as_ref().expect("made above");
                 let path = root.join(&name);
@@ -1528,16 +1545,13 @@ impl<'a> ExtractOutputState<'a> {
             }
             None => {
                 let policy = self.staged_policy();
-                let root = match self.publisher.staging() {
-                    Some(staging) if !self.in_place => staging.root.clone(),
-                    _ => self.out_dir.to_path_buf(),
-                };
+                let root = self.staging_root();
                 let (path, writer) = open_output_writer(
                     &root,
                     &relative,
                     meta.is_directory,
                     policy,
-                    self.publisher.renames(),
+                    self.publisher.state().renames(),
                 )?;
                 self.record_staged_path(&path, meta.is_directory)?;
                 (Some(path.clone()), path, None, writer)
@@ -1548,7 +1562,7 @@ impl<'a> ExtractOutputState<'a> {
             Some(path) if self.in_place => path,
             _ => destination,
         };
-        self.publisher.note_created(&stored, &staged);
+        self.publisher.state().note_created(&stored, &staged);
         self.unpublished.push_back(Unpublished {
             output: ExtractedOutput {
                 name,
@@ -1577,6 +1591,9 @@ impl<'a> ExtractOutputState<'a> {
             ));
         }
         self.publish_verified()?;
+        // The link finds its target where it was published.
+        self.publisher.wait();
+        self.publisher.publish_failure()?;
         if self.unnamed(meta) {
             return Ok(());
         }
@@ -1603,12 +1620,13 @@ impl<'a> ExtractOutputState<'a> {
         self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
         self.prepare_staged_path(&destination, false, None)?;
-        let mut staging = self.staging_root().to_path_buf();
+        let mut staging = self.staging_root();
         if self.staging_tree.is_some() {
             staging.push(STAGED_LINKS);
         }
         let policy = self.staged_policy();
-        let (created_paths, renames) = self.publisher.link_paths(&self.unpublished);
+        let mut publisher = self.publisher.state();
+        let (created_paths, renames) = publisher.link_paths(&self.unpublished);
         let created = create_link_output(
             &staging,
             &relative,
@@ -1620,10 +1638,10 @@ impl<'a> ExtractOutputState<'a> {
         );
         if self.in_place {
             // Made by path, which can remove a directory the walks hold.
-            self.publisher.forget_walks();
+            publisher.forget_walks();
         }
         let (path, restore_metadata) = created?;
-        let (created_paths, _) = self.publisher.link_paths(&self.unpublished);
+        let (created_paths, _) = publisher.link_paths(&self.unpublished);
         let hardlink_target = match link {
             rars::ExtractedLink::HardLink { .. } => {
                 Some(output::link_source_path(&target, created_paths)?.to_path_buf())
@@ -1632,8 +1650,9 @@ impl<'a> ExtractOutputState<'a> {
         };
         created_paths.insert(stored.clone(), path.clone());
         if hardlink_target.is_some() {
-            self.publisher.track_hard_links();
+            publisher.track_hard_links();
         }
+        drop(publisher);
         self.record_staged_path(&path, false)?;
         self.unpublished.push_back(Unpublished {
             output: ExtractedOutput {
@@ -1685,10 +1704,10 @@ impl<'a> ExtractOutputState<'a> {
     }
 
     /// Where outputs stage: the extraction storage, or in place the output directory.
-    fn staging_root(&self) -> &Path {
-        match self.publisher.staging() {
-            Some(staging) if !self.in_place => &staging.root,
-            _ => self.out_dir,
+    fn staging_root(&self) -> PathBuf {
+        match self.publisher.state().staging() {
+            Some(staging) if !self.in_place => staging.root.clone(),
+            _ => self.out_dir.to_path_buf(),
         }
     }
 
@@ -1718,7 +1737,8 @@ impl<'a> ExtractOutputState<'a> {
         &mut self,
         relative: &Path,
     ) -> rars::Result<(PathBuf, Option<TreeEntry>)> {
-        let Some(tree) = self.publisher.tree()? else {
+        let mut publisher = self.publisher.state();
+        let Some(tree) = publisher.tree()? else {
             return Ok((
                 rars::filename::checked_output_path(self.out_dir, relative)?,
                 None,
@@ -1795,7 +1815,7 @@ impl<'a> ExtractOutputState<'a> {
             // As publishing it would find, if it opened before the
             // directory there was made.
             if let Some(TreeEntry::Directory(identity)) = existing {
-                if self.publisher.made_here(identity) {
+                if self.publisher.state().made_here(identity) {
                     return Err(rars::Error::InvalidHeader(
                         "multiple archive entries map to the same output path",
                     ));
@@ -1811,9 +1831,9 @@ impl<'a> ExtractOutputState<'a> {
                 // A directory a walk made for an earlier member's path is
                 // the run's own, but a directory member may land on it.
                 if directory {
-                    self.publisher.published(identity)
+                    self.publisher.state().published(identity)
                 } else {
-                    self.publisher.made_here(identity)
+                    self.publisher.state().made_here(identity)
                 }
             };
             let ours = match existing {
@@ -1828,18 +1848,19 @@ impl<'a> ExtractOutputState<'a> {
             }
             return Ok(());
         }
-        if self.publisher.staging().is_none() {
+        if self.publisher.state().staging().is_none() {
             let staging = ExtractionStaging::new(self.out_dir)?;
-            if let Some(out_tree) = self.publisher.tree()? {
+            if let Some(out_tree) = self.publisher.state().tree()? {
                 self.staging_tree = OutputTree::open(&staging.root)?;
                 if let Some(staging_tree) = &self.staging_tree {
                     out_tree.forbid(staging_tree.identity());
                 }
             }
             let by_descriptor = self.staging_tree.is_some();
-            self.publisher.start_staging(staging, by_descriptor);
+            self.publisher.state().start_staging(staging, by_descriptor);
         }
-        let staging = self.publisher.staging().expect("staging exists");
+        let publisher = self.publisher.state();
+        let staging = publisher.staging().expect("staging exists");
         let root = &staging.root;
         // The output tree refused the storage on its walk to the destination.
         if existing.is_none() {
@@ -1888,10 +1909,8 @@ impl<'a> ExtractOutputState<'a> {
         meta: &rars::ExtractedEntryMeta,
         existing: Option<&TreeEntry>,
     ) -> rars::Result<(PathBuf, Pending, Box<dyn Write + Send>)> {
-        let tree = self
-            .publisher
-            .opened_tree()
-            .expect("opened by in_place_tree");
+        let mut publisher = self.publisher.state();
+        let tree = publisher.opened_tree().expect("opened by in_place_tree");
         let refuse = |error| output::refused_path(error, &meta.name);
         if meta.is_directory {
             let identity = tree.create_dirs(relative).map_err(refuse)?;
@@ -1905,6 +1924,8 @@ impl<'a> ExtractOutputState<'a> {
         // Nothing was in a directory this run made before it began: a name
         // taken there was taken by this run, or by something racing it.
         let fresh = tree.created(&dir_identity);
+        // Later checks take the state again.
+        drop(publisher);
         let name = relative.file_name().expect("output path has a name");
         let mode = output::create_mode(meta);
         let repeated =
@@ -1927,7 +1948,9 @@ impl<'a> ExtractOutputState<'a> {
                         TreeEntry::Symlink => refuse(rars::Error::UnsafePath(
                             "unsafe archive path crosses symlink",
                         )),
-                        TreeEntry::Directory(identity) if self.publisher.made_here(&identity) => {
+                        TreeEntry::Directory(identity)
+                            if self.publisher.state().made_here(&identity) =>
+                        {
                             repeated()
                         }
                         _ => error.into(),
@@ -1937,7 +1960,7 @@ impl<'a> ExtractOutputState<'a> {
             },
             OverwritePolicy::Rename => {
                 let (path, file) =
-                    dir.create_numbered(&destination, mode, self.publisher.renames())?;
+                    dir.create_numbered(&destination, mode, self.publisher.state().renames())?;
                 (path, file, Some(mode), None)
             }
             OverwritePolicy::Always => {
@@ -1963,7 +1986,7 @@ impl<'a> ExtractOutputState<'a> {
                     }
                     None => {
                         let opened = dir.open_in_place(name, mode)?;
-                        if tracked && self.publisher.made_here(&opened.identity) {
+                        if tracked && self.publisher.state().made_here(&opened.identity) {
                             return Err(repeated());
                         }
                         if opened.len > 0 {
@@ -2013,7 +2036,7 @@ impl<'a> ExtractOutputState<'a> {
         if self.settling {
             self.settled = 0;
         }
-        self.publisher.publish_queued()
+        self.publisher.publish_failure()
     }
 
     /// Drops the output of members the library failed on and went past. It
@@ -2040,7 +2063,7 @@ impl<'a> ExtractOutputState<'a> {
             while self.unpublished.len() > self.settled {
                 self.discard_output(self.unpublished.len() - 1);
             }
-            return self.publish_verified();
+            return self.publish_verified_and_wait();
         }
         let last_verified = matches!(
             (
@@ -2052,7 +2075,16 @@ impl<'a> ExtractOutputState<'a> {
         if !last_verified {
             self.unpublished.pop_back();
         }
-        self.publish_verified()
+        self.publish_verified_and_wait()
+    }
+
+    /// As [`Self::publish_verified`], once everything queued is in place:
+    /// a run that ends early still publishes what verified, and says why it could not.
+    fn publish_verified_and_wait(&mut self) -> rars::Result<()> {
+        let queued = self.publish_verified();
+        self.publisher.wait_to_failure();
+        queued?;
+        self.publisher.publish_failure()
     }
 
     /// Publish the final member once the whole extraction call has succeeded.
