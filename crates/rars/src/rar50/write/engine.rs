@@ -2282,17 +2282,6 @@ fn recovery_payload<W: Write>(
     }
     #[cfg(feature = "recovery")]
     {
-        if let Some(allowance) = &resources.execution {
-            return recovery_payload_with_allowance(
-                recovery_percent,
-                prefix,
-                prefix_len,
-                payload,
-                resources,
-                progress,
-                allowance,
-            );
-        }
         recovery_payload_with_allowance(
             recovery_percent,
             prefix,
@@ -2300,7 +2289,7 @@ fn recovery_payload<W: Write>(
             payload,
             resources,
             progress,
-            &crate::codec::workspace::Allowance::default(),
+            &resources.allowance(),
         )
     }
 }

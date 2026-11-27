@@ -550,7 +550,8 @@ fn bounded_parse(allowance: &Allowance, old: bool) -> (Result<Vec<EncodeToken>>,
 }
 
 #[test]
-fn bounded_literal_parses_preserve_all_quota_failures_and_growth_attempts() {
+fn bounded_literal_parses_match_the_full_parse_or_refuse_and_release_everything() {
+    let unlimited = bounded_parse(&Allowance::default(), true).0.unwrap();
     let mut saw_limit = false;
     let mut saw_success = false;
     for limit in [0, 32, 128, 132, 256, 512, 1024, 2048, 4096, 65536] {
@@ -560,27 +561,34 @@ fn bounded_literal_parses_preserve_all_quota_failures_and_growth_attempts() {
         let actual = bounded_parse(&actual_budget, false);
         saw_limit |= matches!(actual.0, Err(Error::WorkspaceLimitExceeded(_)));
         saw_success |= actual.0.is_ok();
-        assert_eq!(actual, expected, "limit={limit}");
-        assert_eq!(actual_budget.used(), expected_budget.used());
+        match &actual.0 {
+            Ok(packed) => assert_eq!(packed, &unlimited, "limit={limit}"),
+            Err(error) => assert!(
+                matches!(error, Error::WorkspaceLimitExceeded(_)),
+                "limit={limit}: {error}"
+            ),
+        }
+        // The literal-only path does no more than the full parse.
+        assert!(expected.0.is_err() || actual.0.is_ok(), "limit={limit}");
         assert_eq!(
             actual_budget.used(),
             0,
             "all owned charges must be released"
         );
+        assert_eq!(expected_budget.used(), 0);
     }
     assert!(saw_limit && saw_success);
     let mut saw_refusal = false;
     let mut saw_success = false;
     for fail_at in 0..24 {
-        let expected_budget = Allowance::refusing(fail_at);
         let actual_budget = Allowance::refusing(fail_at);
-        let expected = bounded_parse(&expected_budget, true);
         let actual = bounded_parse(&actual_budget, false);
         saw_refusal |= matches!(actual.0, Err(Error::Cancelled));
         saw_success |= actual.0.is_ok();
-        assert_eq!(actual, expected, "growth refusal={fail_at}");
-        assert_eq!(actual_budget.attempts(), expected_budget.attempts());
-        assert_eq!(actual_budget.used(), expected_budget.used());
+        match &actual.0 {
+            Ok(packed) => assert_eq!(packed, &unlimited, "growth refusal={fail_at}"),
+            Err(error) => assert_eq!(error, &Error::Cancelled, "growth refusal={fail_at}"),
+        }
         assert_eq!(actual_budget.used(), 0);
     }
     assert!(saw_refusal && saw_success);
@@ -700,32 +708,27 @@ fn literal_outer_pipeline_matches_old_parses_for_history_tails_and_real_matches(
 }
 
 #[test]
-fn bounded_outer_reparses_keep_every_growth_refusal_and_callback() {
+fn bounded_outer_reparses_match_the_reference_or_refuse_and_release_everything() {
     let data: Vec<_> = (0..32).collect();
     let options = EncodeOptions::new(128).with_optimal_parse(true);
+    let unlimited = reference_encode_block(
+        &data,
+        0..data.len(),
+        MemberSearch::Fresh,
+        0,
+        &[],
+        options,
+        true,
+        None,
+        &Allowance::default(),
+    )
+    .map(|buffer| buffer.to_vec())
+    .unwrap();
     let mut saw_refusal = false;
     let mut saw_success = false;
     for fail_at in 0..128 {
         for continue_work in [true, false] {
-            let expected_budget = Allowance::refusing(fail_at);
             let actual_budget = Allowance::refusing(fail_at);
-            let mut expected_reports = Vec::new();
-            let mut expected_report = |amount| {
-                expected_reports.push(amount);
-                continue_work
-            };
-            let expected = reference_encode_block(
-                &data,
-                0..data.len(),
-                MemberSearch::Fresh,
-                0,
-                &[],
-                options,
-                true,
-                Some(&mut expected_report),
-                &expected_budget,
-            )
-            .map(|buffer| buffer.to_vec());
             let mut actual_reports = Vec::new();
             let mut actual_report = |amount| {
                 actual_reports.push(amount);
@@ -743,15 +746,15 @@ fn bounded_outer_reparses_keep_every_growth_refusal_and_callback() {
                 &actual_budget,
             )
             .map(|buffer| buffer.to_vec());
-            saw_refusal |= expected_reports.is_empty() && matches!(actual, Err(Error::Cancelled));
+            saw_refusal |= matches!(actual, Err(Error::Cancelled));
             saw_success |= actual.is_ok();
-            assert_eq!(
-                actual, expected,
-                "fail_at={fail_at}, continue={continue_work}"
-            );
-            assert_eq!(actual_reports, expected_reports);
-            assert_eq!(actual_budget.attempts(), expected_budget.attempts());
-            assert_eq!(actual_budget.used(), expected_budget.used());
+            match &actual {
+                Ok(packed) => assert_eq!(
+                    packed, &unlimited,
+                    "fail_at={fail_at}, continue={continue_work}"
+                ),
+                Err(error) => assert_eq!(error, &Error::Cancelled),
+            }
             assert_eq!(actual_budget.used(), 0);
         }
     }

@@ -645,23 +645,13 @@ fn source_integrity(
     resources: &WriterResources,
 ) -> Result<(u32, Option<[u8; 32]>)> {
     let block_size = stored_block_len(expected_size);
-    if let Some(allowance) = &resources.execution {
-        return source_integrity_with_allowance(
-            source,
-            expected_size,
-            block_size,
-            blake2sp,
-            progress,
-            allowance,
-        );
-    }
     source_integrity_with_allowance(
         source,
         expected_size,
         block_size,
         blake2sp,
         progress,
-        &crate::codec::workspace::Allowance::default(),
+        &resources.allowance(),
     )
 }
 
@@ -852,13 +842,8 @@ fn encrypt_reader_to(
     iv: [u8; 16],
     block_size: usize,
     progress: Option<ProgressReporter<'_>>,
-    _resources: &WriterResources,
+    resources: &WriterResources,
 ) -> Result<()> {
-    if let Some(allowance) = &_resources.execution {
-        return encrypt_reader_with_allowance(
-            reader, input_size, output, keys, iv, block_size, progress, allowance,
-        );
-    }
     encrypt_reader_with_allowance(
         reader,
         input_size,
@@ -867,7 +852,7 @@ fn encrypt_reader_to(
         iv,
         block_size,
         progress,
-        &crate::codec::workspace::Allowance::default(),
+        &resources.allowance(),
     )
 }
 
