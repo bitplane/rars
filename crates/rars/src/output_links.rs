@@ -319,7 +319,27 @@ fn stays_inside(
     Ok(true)
 }
 
-/// Returns the created path, and whether it is a file whose metadata should be restored.
+/// What a link member made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MadeLink {
+    /// Keeps its own metadata: setting it would follow the link.
+    Symlink,
+    /// Shares its source's mode.
+    HardLink,
+    /// Whether the mode it was asked for went on through its own handle.
+    Copy { mode_set: bool },
+}
+
+impl MadeLink {
+    /// Whether it is a file whose metadata should be restored.
+    pub fn is_file(self) -> bool {
+        self != Self::Symlink
+    }
+}
+
+/// Returns the created path and what it is. A file copy is given
+/// `copy_mode` through its own handle.
+#[allow(clippy::too_many_arguments)]
 pub fn create_link_output(
     out_dir: &Path,
     relative: &Path,
@@ -328,7 +348,8 @@ pub fn create_link_output(
     overwrite: OverwritePolicy,
     created_paths: &HashMap<PathBuf, PathBuf>,
     renames: &mut RenameCounters,
-) -> Result<(PathBuf, bool)> {
+    copy_mode: Option<u32>,
+) -> Result<(PathBuf, MadeLink)> {
     // Resolve hard-link/copy sources before touching an existing destination.
     let source = match link {
         ExtractedLink::HardLink { .. } | ExtractedLink::FileCopy { .. } => {
@@ -353,11 +374,14 @@ pub fn create_link_output(
     // Each refuses an existing destination, so `Rename` can claim a free name.
     let create = |out_path: &Path| match link {
         ExtractedLink::Symlink { directory, .. } => {
-            create_symlink(target, out_path, directory).map(|()| false)
+            create_symlink(target, out_path, directory).map(|()| MadeLink::Symlink)
         }
-        ExtractedLink::Junction { .. } => create_symlink(target, out_path, true).map(|()| false),
+        ExtractedLink::Junction { .. } => {
+            create_symlink(target, out_path, true).map(|()| MadeLink::Symlink)
+        }
         ExtractedLink::HardLink { .. } => {
-            fs::hard_link(source.expect("source checked above"), out_path).map(|()| true)
+            fs::hard_link(source.expect("source checked above"), out_path)
+                .map(|()| MadeLink::HardLink)
         }
         ExtractedLink::FileCopy { .. } => {
             // Open the source first, so a vanished one leaves no empty destination.
@@ -367,14 +391,16 @@ pub fn create_link_output(
                 .create_new(true)
                 .open(out_path)?;
             std::io::copy(&mut input, &mut output)?;
-            Ok(true)
+            let mode_set = copy_mode
+                .is_some_and(|mode| crate::output_modes::set_file_mode(&output, mode).is_ok());
+            Ok(MadeLink::Copy { mode_set })
         }
     };
     if overwrite == OverwritePolicy::Rename {
         return renames.claim(&out_path, create);
     }
-    let file = create(&out_path)?;
-    Ok((out_path, file))
+    let made = create(&out_path)?;
+    Ok((out_path, made))
 }
 
 pub fn link_source_path<'a>(

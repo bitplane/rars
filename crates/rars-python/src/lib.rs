@@ -4558,6 +4558,7 @@ impl<'a> ExtractOutputs<'a> {
             overwrite: mode.overwrite,
             in_place: mode.in_place,
             restore_times: mode.restore_times,
+            restore_modes: false,
             flatten: mode.flatten,
             exists_hint: "; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
         };

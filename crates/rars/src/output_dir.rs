@@ -4,7 +4,8 @@
 
 use crate::extract_dir::{ExtractedDir, SkippedLink};
 use crate::in_flight::InFlight;
-use crate::output_links::{create_link_output, link_source_path};
+use crate::output_links::{create_link_output, link_source_path, MadeLink};
+use crate::output_modes::{early_mode, set_file_mode, CreatedModes, PathModes};
 use crate::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
@@ -26,6 +27,7 @@ pub struct DirMode {
     /// Writes each destination itself instead of staging it.
     pub in_place: bool,
     pub restore_times: bool,
+    pub restore_modes: bool,
     /// Writes every file straight into the directory under its base name.
     pub flatten: bool,
     /// Follows "`<path>` already exists" when `overwrite` is `Never` refuses a file.
@@ -41,6 +43,9 @@ pub struct DirOutputs<'a> {
     in_place: bool,
     flatten: bool,
     restore_times: bool,
+    restore_modes: bool,
+    /// Whether files created with a mode keep it, learnt once per mode.
+    created_modes: CreatedModes,
     exists_hint: &'static str,
     flat_names: crate::output_staging::FlatNames,
     /// Destinations taken under `Rename`, so a repeated stored path fails as in the CLI.
@@ -77,6 +82,8 @@ struct Publishing {
     flatten: bool,
     renames: crate::output_staging::RenameCounters,
     times: Option<crate::output_times::OutputTimes>,
+    /// Modes no descriptor could set, set by path at the end.
+    modes: Option<PathModes>,
     staging: Option<ExtractionStaging>,
     /// Where files stage, once [`Self::staging`] is made.
     storage: Option<Storage>,
@@ -158,10 +165,13 @@ impl Write for SharedBuffer {
     }
 }
 
-/// Takes its member's time as it closes, so the publish needs no call by name.
+/// Takes its member's time and mode as it closes, so the publish needs no call by name.
 struct StagedFile {
     file: DeferredFile,
     modified: Option<SystemTime>,
+    /// The mode it was created with, which it must end with.
+    mode: Option<u32>,
+    created_modes: CreatedModes,
     closed: Arc<CloseOutcome>,
 }
 
@@ -170,6 +180,7 @@ struct CloseOutcome {
     /// An empty member nothing wrote is created as it closes, which can fail unheard.
     created: AtomicBool,
     time_set: AtomicBool,
+    mode_set: AtomicBool,
 }
 
 impl Write for StagedFile {
@@ -197,6 +208,11 @@ impl Drop for StagedFile {
                 self.closed.time_set.store(true, Ordering::Release);
             }
         }
+        if let Some(mode) = self.mode {
+            if self.created_modes.apply(file, mode).is_ok() {
+                self.closed.mode_set.store(true, Ordering::Release);
+            }
+        }
     }
 }
 
@@ -221,6 +237,7 @@ impl<'a> DirOutputs<'a> {
             times: mode
                 .restore_times
                 .then(crate::output_times::OutputTimes::new),
+            modes: mode.restore_modes.then(PathModes::default),
             staging: None,
             storage: None,
             out_tree: None,
@@ -237,6 +254,8 @@ impl<'a> DirOutputs<'a> {
             in_place: mode.in_place,
             flatten: mode.flatten,
             restore_times: mode.restore_times,
+            restore_modes: mode.restore_modes,
+            created_modes: CreatedModes::default(),
             exists_hint: mode.exists_hint,
             flat_names: Default::default(),
             rename_claims: HashSet::new(),
@@ -582,18 +601,21 @@ impl<'a> DirOutputs<'a> {
             ));
         }
         let index = self.staged.to_string();
+        let mode = restored_early_mode(self.restore_modes, meta);
+        let create_mode = mode.unwrap_or(0o666);
         let (staged, staged_at, file) = match &storage.files {
             Some((dir, root)) => {
                 let name = std::ffi::OsString::from(index);
-                let file = DeferredFile::new(dir.clone(), name.clone(), 0o666);
+                let file = DeferredFile::new(dir.clone(), name.clone(), create_mode);
                 (root.join(&name), Some((dir.clone(), name)), file)
             }
             None => {
                 let staged = storage.root.join(index);
-                let file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staged)?;
+                let mut options = fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                std::os::unix::fs::OpenOptionsExt::mode(&mut options, create_mode);
+                let file = options.open(&staged)?;
                 (staged, None, DeferredFile::from_file(file))
             }
         };
@@ -613,6 +635,8 @@ impl<'a> DirOutputs<'a> {
         Ok(Box::new(StagedFile {
             file,
             modified,
+            mode,
+            created_modes: self.created_modes.clone(),
             closed,
         }))
     }
@@ -733,6 +757,14 @@ impl<'a> DirOutputs<'a> {
             .make_link(meta, link, stored, &relative, &target, staged.as_deref())
     }
 
+    #[cfg(all(test, unix))]
+    fn modes_by_path(&mut self) -> Vec<PathBuf> {
+        self.queue.wait();
+        let state = self.queue.state();
+        let modes = state.modes.as_ref().expect("restoring modes");
+        modes.paths().map(Path::to_path_buf).collect()
+    }
+
     /// A member still in flight when extraction failed never reaches its destination.
     pub fn finish(mut self, result: crate::Result<()>) -> crate::Result<ExtractedDir> {
         // Members not settled when extraction failed never verified.
@@ -763,11 +795,15 @@ impl<'a> DirOutputs<'a> {
             ..
         } = self;
         // A run that ended on a failure handed on drops the outputs held behind it.
-        let (state, failures) = queue.finish();
-        let restored = match &state.times {
+        let (mut state, failures) = queue.finish();
+        let mut restored = match &state.times {
             Some(times) => times.restore(),
             None => Ok(()),
         };
+        // After the times: setting a time by path opens the file to read.
+        if let (Ok(()), Some(modes)) = (&restored, state.modes.take()) {
+            restored = modes.restore();
+        }
         result?;
         published?;
         if let Some(failure) = failures.into_iter().next() {
@@ -905,21 +941,28 @@ impl Publishing {
             }
             None => fs::create_dir_all(&destination)?,
         }
-        self.record_published(stored, destination, meta, true);
+        self.record_published(stored, destination, meta, SetByPath::BOTH);
         Ok(())
     }
 
     fn publish_output(&mut self, pending: PendingOutput) -> crate::Result<()> {
         let Some(staged) = &pending.staged else {
-            // Written in place: by descriptor, its time goes on through its own.
-            let modified = self.modified_time(&pending.meta);
-            let later = match (&pending.held, modified) {
-                (Some(held), Some(modified)) => !held
-                    .get()
-                    .is_some_and(|file| file.set_modified(modified).is_ok()),
-                _ => true,
+            // Written in place: by descriptor, its time and mode go on through its own.
+            let file = pending.held.as_ref().and_then(|held| held.get());
+            let by_path = SetByPath {
+                time: match (file, self.modified_time(&pending.meta)) {
+                    (Some(file), Some(modified)) => file.set_modified(modified).is_err(),
+                    _ => true,
+                },
+                mode: match (
+                    file,
+                    restored_early_mode(self.modes.is_some(), &pending.meta),
+                ) {
+                    (Some(file), Some(mode)) => set_file_mode(file, mode).is_err(),
+                    _ => true,
+                },
             };
-            self.record_published(pending.stored, pending.destination, &pending.meta, later);
+            self.record_published(pending.stored, pending.destination, &pending.meta, by_path);
             return Ok(());
         };
         let closed = pending.closed.as_ref().expect("a staged file closes");
@@ -927,11 +970,12 @@ impl Publishing {
             return Err(crate::output_tree::never_created().into());
         }
         let time_set = closed.time_set.load(Ordering::Acquire);
+        let mode_set = closed.mode_set.load(Ordering::Acquire);
         if let Some((dir, name)) = &pending.staged_at {
-            if let Some((published, later)) =
-                self.publish_by_descriptor(&pending, dir, name, time_set)?
+            if let Some((published, by_path)) =
+                self.publish_by_descriptor(&pending, dir, name, time_set, mode_set)?
             {
-                self.record_published(pending.stored, published, &pending.meta, later);
+                self.record_published(pending.stored, published, &pending.meta, by_path);
                 return Ok(());
             }
             // The filesystem can't rename it into place: publish it by path.
@@ -952,7 +996,11 @@ impl Publishing {
             None,
             &mut self.renames,
         )?;
-        self.record_published(pending.stored, destination, &pending.meta, !time_set);
+        let by_path = SetByPath {
+            time: !time_set,
+            mode: !mode_set,
+        };
+        self.record_published(pending.stored, destination, &pending.meta, by_path);
         Ok(())
     }
 
@@ -963,20 +1011,26 @@ impl Publishing {
     }
 
     /// Publishes a file staged by descriptor, renaming it from the storage
-    /// into the output directory's walked descriptors after giving it its
-    /// time. Returns where it landed and whether its time still needs
-    /// setting, or `None` when the filesystem can't rename it into place.
+    /// into the output directory's walked descriptors after giving it the
+    /// time and mode it didn't take as it closed. Returns where it landed and
+    /// what still needs setting, or `None` when the filesystem can't rename
+    /// it into place.
     fn publish_by_descriptor(
         &mut self,
         pending: &PendingOutput,
         dir: &FileDir,
         name: &std::ffi::OsStr,
         time_set: bool,
-    ) -> crate::Result<Option<(PathBuf, bool)>> {
-        let later = match self.modified_time(&pending.meta) {
-            Some(_) if time_set => false,
-            Some(modified) => dir.set_metadata(name, Some(modified), None).is_err(),
-            None => true,
+        mode_set: bool,
+    ) -> crate::Result<Option<(PathBuf, SetByPath)>> {
+        let modified = self.modified_time(&pending.meta).filter(|_| !time_set);
+        let early = restored_early_mode(self.modes.is_some(), &pending.meta);
+        let mode = early.filter(|_| !mode_set);
+        let set = (modified.is_none() && mode.is_none())
+            || dir.set_metadata(name, modified, mode).is_ok();
+        let by_path = SetByPath {
+            time: !time_set && !set,
+            mode: early.is_none() || (!mode_set && !set),
         };
         let relative = self.relative(&pending.destination).to_path_buf();
         let parent = pending
@@ -999,7 +1053,7 @@ impl Publishing {
             .map_err(|error| {
                 like_create_dir_all(refused_walk(error, &pending.meta.name), parent)
             })?;
-        Ok(published.map(|published| (published, later)))
+        Ok(published.map(|published| (published, by_path)))
     }
 
     /// Makes a link at `relative`, in place, or staged as `staged` and then published.
@@ -1012,6 +1066,7 @@ impl Publishing {
         target: &Path,
         staged: Option<&str>,
     ) -> crate::Result<()> {
+        let copy_mode = restored_early_mode(self.modes.is_some(), meta);
         let Some(staged) = staged else {
             let created = create_link_output(
                 &self.out_dir,
@@ -1021,15 +1076,16 @@ impl Publishing {
                 self.overwrite,
                 &self.created,
                 &mut self.renames,
+                copy_mode,
             );
             // Made by path, which can remove a directory the walks hold.
             self.forget_walks();
-            let (path, file) = created?;
-            self.record_published(stored, path, meta, file);
+            let (path, made) = created?;
+            self.record_published(stored, path, meta, SetByPath::link(made));
             return Ok(());
         };
         let root = self.storage()?.root;
-        let (staged, file) = create_link_output(
+        let (staged, made) = create_link_output(
             &root,
             Path::new(staged),
             target,
@@ -1037,6 +1093,7 @@ impl Publishing {
             OverwritePolicy::Never,
             &self.created,
             &mut self.renames,
+            copy_mode,
         )?;
         let source = match link {
             ExtractedLink::HardLink { .. } => {
@@ -1068,21 +1125,24 @@ impl Publishing {
         );
         // Replacing a directory removes it, wherever the walks hold it.
         self.forget_walks();
-        self.record_published(stored, published?, meta, file);
+        self.record_published(stored, published?, meta, SetByPath::link(made));
         Ok(())
     }
 
-    /// Symlinks keep their own times: setting them would follow the link.
+    /// Symlinks keep their own times and modes: setting them would follow the link.
     fn record_published(
         &mut self,
         stored: PathBuf,
         path: PathBuf,
         meta: &crate::ExtractedEntryMeta,
-        restore_times: bool,
+        by_path: SetByPath,
     ) {
-        if let (Some(times), true) = (&mut self.times, restore_times) {
+        if let (Some(times), true) = (&mut self.times, by_path.time) {
             times.opened(path.clone(), meta);
             times.finish();
+        }
+        if let (Some(modes), true) = (&mut self.modes, by_path.mode) {
+            modes.record(path.clone(), meta);
         }
         self.created.insert(stored, path.clone());
         self.published.push(path);
@@ -1102,6 +1162,31 @@ impl PublishStep for Publishing {
         self.note_published(&destination, directory);
         published
     }
+}
+
+/// What no descriptor set, so is set by path once extraction ends.
+#[derive(Clone, Copy)]
+struct SetByPath {
+    time: bool,
+    mode: bool,
+}
+
+impl SetByPath {
+    const BOTH: Self = Self {
+        time: true,
+        mode: true,
+    };
+
+    fn link(made: MadeLink) -> Self {
+        Self {
+            time: made.is_file(),
+            mode: matches!(made, MadeLink::Copy { mode_set: false }),
+        }
+    }
+}
+
+fn restored_early_mode(restore_modes: bool, meta: &crate::ExtractedEntryMeta) -> Option<u32> {
+    restore_modes.then(|| early_mode(meta)).flatten()
 }
 
 fn exists(destination: &Path, existing: Option<&TreeEntry>) -> bool {

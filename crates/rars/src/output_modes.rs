@@ -1,6 +1,6 @@
 use crate::{AttrSource, ExtractedEntryMeta};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Platform-free so a wasm caller, which sets modes itself, can use it.
 pub fn restored_mode(meta: &ExtractedEntryMeta) -> Option<u32> {
@@ -39,27 +39,62 @@ pub fn waits_for_end(mode: u32) -> bool {
     mode & 0o400 == 0
 }
 
-/// The permission bits a member's file is created with: its own, when they
-/// can be set before it is published, else 0666.
-pub fn create_mode(meta: &ExtractedEntryMeta) -> u32 {
-    applied_mode(meta)
-        .filter(|&mode| !waits_for_end(mode))
-        .unwrap_or(0o666)
+/// The mode a member's file takes through its own handle, before it is published.
+pub fn early_mode(meta: &ExtractedEntryMeta) -> Option<u32> {
+    applied_mode(meta).filter(|&mode| !waits_for_end(mode))
 }
 
-/// For directories and modes that wait for the end, which have no open handle to set through.
-#[cfg(unix)]
-pub fn set_path_mode(path: &Path, meta: &ExtractedEntryMeta) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+/// The permission bits a member's file is created with: its [`early_mode`], else 0666.
+pub fn create_mode(meta: &ExtractedEntryMeta) -> u32 {
+    early_mode(meta).unwrap_or(0o666)
+}
 
-    if let Some(mode) = applied_mode(meta) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+/// Modes set by path once extraction ends: files first, then directories
+/// deepest first, so a parent's mode can't deny access to what is under it.
+#[derive(Debug, Default)]
+pub struct PathModes {
+    files: Vec<(PathBuf, u32)>,
+    directories: Vec<(PathBuf, u32)>,
+}
+
+impl PathModes {
+    pub fn record(&mut self, path: PathBuf, meta: &ExtractedEntryMeta) {
+        let Some(mode) = applied_mode(meta) else {
+            return;
+        };
+        if meta.is_directory {
+            self.directories.push((path, mode));
+        } else {
+            self.files.push((path, mode));
+        }
     }
-    Ok(())
+
+    #[cfg(all(test, unix))]
+    pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.files
+            .iter()
+            .chain(&self.directories)
+            .map(|(path, _)| path.as_path())
+    }
+
+    pub fn restore(mut self) -> std::io::Result<()> {
+        self.directories
+            .sort_by_cached_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+        for (path, mode) in self.files.iter().chain(&self.directories) {
+            set_mode(path, *mode)?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
 }
 
 #[cfg(not(unix))]
-pub fn set_path_mode(_path: &Path, _meta: &ExtractedEntryMeta) -> std::io::Result<()> {
+fn set_mode(_path: &Path, _mode: u32) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -141,6 +176,13 @@ impl CreatedModes {
     pub fn kept(&self, _file: &fs::File, _mode: u32) -> bool {
         false
     }
+    /// Gives `file`, created here with the permission bits `mode`, exactly those bits.
+    pub fn apply(&self, file: &fs::File, mode: u32) -> std::io::Result<()> {
+        if self.kept(file, mode) {
+            return Ok(());
+        }
+        set_file_mode(file, mode)
+    }
 }
 
 #[cfg(test)]
@@ -178,6 +220,9 @@ mod tests {
         assert_eq!(create_mode(&unix(0o100750)), 0o750);
         assert_eq!(create_mode(&unix(0o100200)), 0o666);
         assert_eq!(create_mode(&meta(AttrSource::Unknown, 0, false)), 0o666);
+        assert_eq!(early_mode(&unix(0o100750)), Some(0o750));
+        assert_eq!(early_mode(&unix(0o100200)), None);
+        assert_eq!(early_mode(&meta(AttrSource::Dos, 1, false)), Some(0o444));
         assert!(waits_for_end(0o200));
         assert!(!waits_for_end(0o400));
     }
@@ -209,7 +254,9 @@ mod tests {
                 fs::write(&path, b"payload").unwrap();
             }
             fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
-            set_path_mode(&path, &meta(source, attr, directory)).unwrap();
+            let mut modes = PathModes::default();
+            modes.record(path.clone(), &meta(source, attr, directory));
+            modes.restore().unwrap();
             assert_eq!(
                 fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 expected
@@ -236,5 +283,28 @@ mod tests {
             file.metadata().unwrap().permissions().mode() & 0o7777,
             0o600
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_files_end_with_exactly_their_mode() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = crate::scratch::case("output-modes-apply");
+        let modes = CreatedModes::default();
+        // 0777 loses bits to any umask but 0; 0600 to none but the strictest.
+        for (index, mode) in [0o777, 0o600, 0o777, 0o600].into_iter().enumerate() {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(dir.join(index.to_string()))
+                .unwrap();
+            modes.apply(&file, mode).unwrap();
+            assert_eq!(
+                file.metadata().unwrap().permissions().mode() & 0o7777,
+                mode,
+                "{index}"
+            );
+        }
     }
 }
