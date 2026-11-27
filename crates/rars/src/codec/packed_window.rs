@@ -2,7 +2,7 @@
 //! memory does not grow with the member. Shared by the reader-based legacy
 //! decoders.
 
-use super::workspace::{Budget, Buffer};
+use super::workspace::Buffer;
 use super::{Error, Result};
 use std::io::Read;
 
@@ -20,8 +20,8 @@ pub(crate) const DRAINED: usize = usize::MAX;
 /// window. Returns the bit position to refill at next, or [`DRAINED`] once
 /// `src` is exhausted.
 #[cold]
-pub(crate) fn refill<B: Budget>(
-    input: &mut Buffer<u8, B>,
+pub(crate) fn refill(
+    input: &mut Buffer<u8>,
     bit_pos: &mut usize,
     src: &mut dyn Read,
 ) -> Result<usize> {
@@ -37,7 +37,7 @@ pub(crate) fn refill<B: Budget>(
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) => return Err(Error::from(error)),
         };
-        input.extend_from_slice(&chunk[..len]).map_err(Into::into)?;
+        input.extend_from_slice(&chunk[..len])?;
     }
     Ok((PACKED_WINDOW - PACKED_LOW_WATER) * 8)
 }

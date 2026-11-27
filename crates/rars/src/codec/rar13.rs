@@ -12,7 +12,7 @@ pub(crate) use encoder::{unpack15_encode_with_options_and_progress, ENCODER_WORK
 mod streaming_tests;
 
 use super::packed_window::DRAINED;
-use super::workspace::{Allowance, Boxed, Budget, Buffer};
+use super::workspace::{Allowance, Boxed, Buffer};
 use super::{Error, Result, RAR15_ENDED_EARLY};
 use std::io::{Read, Write};
 
@@ -58,9 +58,9 @@ pub fn unpack15_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
 #[derive(Clone)]
 pub struct Unpack15 {
     pub(crate) read_control: crate::read_control::ReadControl,
-    state: Reader15State<Allowance>,
+    state: Reader15State,
 }
-impl Clone for Reader15State<Allowance> {
+impl Clone for Reader15State {
     fn clone(&self) -> Self {
         self.try_clone().expect("unlimited legacy decoder copy")
     }
@@ -102,14 +102,14 @@ impl Unpack15 {
     }
 }
 #[cfg(all(test, feature = "write"))]
-impl Reader15State<Allowance> {
+impl Reader15State {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default()).unwrap()
     }
 }
-pub(crate) struct Reader15State<B: Budget> {
+pub(crate) struct Reader15State {
     pub(crate) read_control: crate::read_control::ReadControl,
-    bits: ReaderBits<B>,
+    bits: ReaderBits,
     target: usize,
     output_written: usize,
     // Where the last step began, to drop a step that ran past the end of a
@@ -117,7 +117,7 @@ pub(crate) struct Reader15State<B: Budget> {
     step_start: usize,
     /// Set for a member the file ends partway through, under salvage.
     pub(crate) input_cut: bool,
-    window: Buffer<u8, B>,
+    window: Buffer<u8>,
     unp_ptr: usize,
     prev_ptr: usize,
     first_win_done: bool,
@@ -150,7 +150,7 @@ pub(crate) struct Reader15State<B: Budget> {
     last_length: u32,
     /// The state from where only the zero bits padding the packed data's
     /// last byte were left, to go back to if the member runs out there.
-    tail: Option<Boxed<Reader15State<B>, B>>,
+    tail: Option<Boxed<Reader15State>>,
     #[cfg(all(test, feature = "write"))]
     token_stats: DecodeTokenStats,
     #[cfg(all(test, feature = "write"))]
@@ -189,7 +189,7 @@ struct OldDistanceEvent {
     max_dist3: u32,
 }
 
-impl<B: Budget> Reader15State<B> {
+impl Reader15State {
     /// A decoder ready to read either a fresh member or a solid continuation.
     ///
     /// The starting state comes from `reset_non_solid` rather than being
@@ -198,7 +198,7 @@ impl<B: Budget> Reader15State<B> {
     /// non-solid member, since that member resets them before the first symbol
     /// is read. A first member carrying the solid flag skips the reset and
     /// decoded against zeroes.
-    pub(crate) fn with_allowance(allowance: &B) -> Result<Self> {
+    pub(crate) fn with_allowance(allowance: &Allowance) -> Result<Self> {
         let mut decoder = Self {
             read_control: crate::read_control::ReadControl::default(),
             bits: ReaderBits::with_allowance(&[], allowance)?,
@@ -294,7 +294,7 @@ impl<B: Budget> Reader15State<B> {
         input: &[u8],
         target: usize,
         solid: bool,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.read_control.check_codec()?;
         let mut output = Buffer::with_capacity(target, &self.window.allowance())?;
         self.decode_member_to(input, target, solid, &mut output)?;
@@ -374,7 +374,7 @@ impl<B: Budget> Reader15State<B> {
     /// whose packed data ran out before its declared size: the steps after it
     /// decoded the padding, and the zeros read past the end, as if they were
     /// data. Unless the bytes they wrote have already been flushed.
-    fn roll_back_to_tail(&mut self, chunk: &mut Buffer<u8, B>, chunk_start: usize) {
+    fn roll_back_to_tail(&mut self, chunk: &mut Buffer<u8>, chunk_start: usize) {
         let Some(mut tail) = self.tail.take() else {
             return;
         };
@@ -388,7 +388,7 @@ impl<B: Budget> Reader15State<B> {
 
     /// A copy of the state without its packed input, or none if the
     /// workspace refuses it.
-    fn checkpoint(&mut self) -> Option<Boxed<Self, B>> {
+    fn checkpoint(&mut self) -> Option<Boxed<Self>> {
         let allowance = self.window.allowance();
         let bits = std::mem::replace(&mut self.bits, ReaderBits::streaming(&allowance));
         let saved = Boxed::try_new(|| self.try_clone(), &allowance).ok();
@@ -1018,15 +1018,15 @@ fn corr_huff(char_set: &mut [u16; 256], num_to_place: &mut [u8; 256]) {
     }
 }
 
-struct ReaderBits<B: Budget> {
-    input: Buffer<u8, B>,
+struct ReaderBits {
+    input: Buffer<u8>,
     bit_pos: usize,
     // Bit position to refill the window at; `DRAINED` once the source is.
     refill_at: usize,
 }
 
-impl<B: Budget> ReaderBits<B> {
-    fn with_allowance(input: &[u8], allowance: &B) -> Result<Self> {
+impl ReaderBits {
+    fn with_allowance(input: &[u8], allowance: &Allowance) -> Result<Self> {
         Ok(Self {
             input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
@@ -1034,7 +1034,7 @@ impl<B: Budget> ReaderBits<B> {
         })
     }
 
-    fn streaming(allowance: &B) -> Self {
+    fn streaming(allowance: &Allowance) -> Self {
         Self {
             input: Buffer::new(allowance),
             bit_pos: 0,
@@ -1091,7 +1091,7 @@ impl<B: Budget> ReaderBits<B> {
 }
 
 #[cfg(all(test, feature = "write"))]
-impl ReaderBits<Allowance> {
+impl ReaderBits {
     fn new(input: &[u8]) -> Self {
         Self::with_allowance(input, &Allowance::default()).unwrap()
     }

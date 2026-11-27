@@ -1,6 +1,6 @@
 use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
-use crate::codec::workspace::{Allowance, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Buffer};
 use crate::crc32::{crc32, Crc32};
 #[cfg(feature = "encryption")]
 use crate::crypto::rar15::Rar15Cipher;
@@ -426,12 +426,12 @@ impl FileHeader {
         archive.copy_range_to(self.packed_range.clone(), out)
     }
 
-    fn packed_reader_with_allowance<'a, B: crate::codec::workspace::Budget>(
+    fn packed_reader_with_allowance<'a>(
         &self,
         archive: &'a Archive,
         password: Option<&[u8]>,
-        allowance: &B,
-    ) -> Result<PackedReader<'a, B>> {
+        allowance: &Allowance,
+    ) -> Result<PackedReader<'a>> {
         let mut range = self.packed_range.clone();
         if self.is_encrypted() && self.is_cut_short() {
             // Whole cipher blocks only.
@@ -549,12 +549,12 @@ impl FileHeader {
         session.write_file_to(archive, self, out)
     }
 
-    fn write_stored_with_allowance<B: crate::codec::workspace::Budget>(
+    fn write_stored_with_allowance(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         out: &mut impl Write,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<()> {
         let result = self.write_whole_stored_with_allowance(archive, password, out, allowance);
         self.cut_short_result(result)
@@ -580,12 +580,12 @@ impl FileHeader {
         }
     }
 
-    fn write_whole_stored_with_allowance<B: crate::codec::workspace::Budget>(
+    fn write_whole_stored_with_allowance(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         out: &mut impl Write,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<()> {
         if !self.is_encrypted() && self.pack_size != self.unp_size {
             return Err(Error::InvalidHeader(
@@ -776,11 +776,11 @@ impl CommentHeader {
         self.decode_with_allowance(packed, budget, &Allowance::default())
     }
 
-    fn decode_with_allowance<B: Budget>(
+    fn decode_with_allowance(
         &self,
         packed: &[u8],
         budget: &mut crate::output_limit::OutputBudget,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Vec<u8>> {
         let target = usize::from(self.unp_size);
         budget.check(target as u64, b"CMT")?;
@@ -807,7 +807,7 @@ impl CommentHeader {
                     allowance,
                 )?;
                 decoder.read_control = control;
-                let mut reader = PackedReader::<B>::Plain(LazyChain::bytes(packed));
+                let mut reader = PackedReader::Plain(LazyChain::bytes(packed));
                 decoder.decode_member_from_reader(&mut reader, target, writer)?;
             } else {
                 return Err(Error::UnsupportedCompression {
@@ -2039,14 +2039,14 @@ impl Archive {
         )
     }
 
-    fn extract_with_allowance<F, B: crate::codec::workspace::Budget>(
+    fn extract_with_allowance<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         mut links: Option<&mut LegacyLink<'_>>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2113,13 +2113,13 @@ impl Archive {
     /// Decodes one member straight to the writer `open` returns, or to the
     /// link callback for a legacy symbolic link.
     #[allow(clippy::too_many_arguments)]
-    fn stream_member<B: crate::codec::workspace::Budget>(
+    fn stream_member(
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
         budget: &mut crate::output_limit::OutputBudget,
-        session: &mut DecoderSession<'_, B>,
-        allowance: &B,
+        session: &mut DecoderSession<'_>,
+        allowance: &Allowance,
         links: &mut Option<&mut LegacyLink<'_>>,
         open: impl FnOnce(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     ) -> Result<()> {
@@ -2155,12 +2155,12 @@ impl Archive {
     }
 
     /// Streams one independent member on the calling thread, between batches.
-    fn extract_inline<F, B: crate::codec::workspace::Budget>(
+    fn extract_inline<F>(
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
         shared: &crate::read_control::ReadControl,
-        allowance: &B,
+        allowance: &Allowance,
         open: &mut F,
         links: &mut Option<&mut LegacyLink<'_>>,
     ) -> Result<()>
@@ -2266,13 +2266,13 @@ impl Archive {
         options.check_cancelled()
     }
 
-    fn parallel_with<F, B: member_batches::Workers>(
+    fn parallel_with<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         mut links: Option<&mut LegacyLink<'_>>,
         verification: bool,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -2365,10 +2365,10 @@ impl Archive {
         self.archive_comment_with_allowance(options, &Allowance::default())
     }
 
-    fn archive_comment_with_allowance<B: Budget>(
+    fn archive_comment_with_allowance(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -2433,17 +2433,17 @@ fn parallel_hint(file: &FileHeader, verification: bool) -> u64 {
         .saturating_add(8192)
 }
 
-type ParallelExtractedEntry<B> = member_batches::Decoded<ExtractedEntryMeta, B>;
+type ParallelExtractedEntry = member_batches::Decoded<ExtractedEntryMeta>;
 
-fn decode_parallel_entry<B: Budget>(
+fn decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     options: crate::ArchiveReadOptions<'_>,
     shared: &crate::read_control::ReadControl,
-    allowance: &B,
+    allowance: &Allowance,
     links: bool,
     verification: bool,
-) -> Result<ParallelExtractedEntry<B>> {
+) -> Result<ParallelExtractedEntry> {
     options.check_cancelled()?;
     let password = options.password;
     let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -2475,12 +2475,12 @@ fn decode_parallel_entry<B: Budget>(
 }
 
 /// Decodes one member's payload, stored or compressed, into `writer`.
-fn decode_member_into<B: Budget>(
+fn decode_member_into(
     archive: &Archive,
     file: &FileHeader,
     password: Option<&[u8]>,
-    session: &mut DecoderSession<'_, B>,
-    allowance: &B,
+    session: &mut DecoderSession<'_>,
+    allowance: &Allowance,
     writer: &mut impl Write,
 ) -> Result<()> {
     if file.is_stored() {

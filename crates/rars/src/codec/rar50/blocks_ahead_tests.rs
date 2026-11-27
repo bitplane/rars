@@ -25,7 +25,7 @@ impl Run {
     }
 }
 
-fn decoder(workers: Option<usize>) -> ReaderState<Allowance> {
+fn decoder(workers: Option<usize>) -> ReaderState {
     let mut state = ReaderState::new(&Allowance::default());
     if let Some(workers) = workers {
         state.read_control =
@@ -34,17 +34,12 @@ fn decoder(workers: Option<usize>) -> ReaderState<Allowance> {
     state
 }
 
-fn decode(
-    state: &mut ReaderState<Allowance>,
-    stream: &[u8],
-    output_size: usize,
-    solid: bool,
-) -> Run {
+fn decode(state: &mut ReaderState, stream: &[u8], output_size: usize, solid: bool) -> Run {
     decode_with(state, stream, output_size, solid, |_| Ok(()))
 }
 
 fn decode_with(
-    state: &mut ReaderState<Allowance>,
+    state: &mut ReaderState,
     stream: &[u8],
     output_size: usize,
     solid: bool,
@@ -54,7 +49,7 @@ fn decode_with(
 }
 
 fn decode_in(
-    state: &mut ReaderState<Allowance>,
+    state: &mut ReaderState,
     stream: &[u8],
     output_size: usize,
     dictionary: usize,

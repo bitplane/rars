@@ -823,7 +823,7 @@ impl CapacityCharge {
         if let Some(allowance) = &_resources.execution {
             return Some(Self::Execution {
                 storage,
-                charge: crate::codec::workspace::Budget::charge(allowance),
+                charge: allowance.charge(),
             });
         }
         storage.map(Self::Storage)
@@ -841,7 +841,7 @@ impl CapacityCharge {
         match self {
             Self::Storage(storage) => storage.grow_to(bytes),
             Self::Execution { storage, charge } => {
-                use crate::codec::workspace::{Budget, Limited};
+                use crate::codec::workspace::Limited;
                 let old = charge.bytes();
                 Limited::resize(charge, bytes)?;
                 if let Some(storage) = storage {
@@ -858,7 +858,7 @@ impl CapacityCharge {
         match self {
             Self::Storage(storage) => storage.shrink_to(bytes),
             Self::Execution { storage, charge } => {
-                use crate::codec::workspace::{Budget, Limited};
+                use crate::codec::workspace::Limited;
                 if let Some(storage) = storage {
                     storage.shrink_to(bytes);
                 }

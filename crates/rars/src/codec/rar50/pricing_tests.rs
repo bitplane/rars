@@ -294,10 +294,10 @@ fn ring_state_preserves_full_backtrace_endpoint_and_three_pricing_passes() {
 
 #[test]
 fn ring_state_allocation_refusal_and_cancellation_release_every_owner() {
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
     let data = vec![0; 2 * OPTIMAL_STATE_RING_SIZE + 128];
     let options = EncodeOptions::new(16).with_optimal_parse(true);
-    let run = |budget: &RefusingBudget| {
+    let run = |budget: &Allowance| {
         encode_tokens_with_allowance(
             &data,
             0..data.len(),
@@ -309,13 +309,13 @@ fn ring_state_allocation_refusal_and_cancellation_release_every_owner() {
             budget,
         )
     };
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     drop(run(&baseline).unwrap());
     let attempts = baseline.attempts();
     assert!(attempts > 0);
     assert_eq!(baseline.used(), 0);
     for fail_at in 0..attempts {
-        let budget = RefusingBudget::new(fail_at);
+        let budget = Allowance::refusing(fail_at);
         assert!(
             matches!(run(&budget), Err(Error::Cancelled)),
             "allocation{fail_at}"

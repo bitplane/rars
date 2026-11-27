@@ -580,11 +580,11 @@ fn public_decoder_clone_keeps_independent_solid_history_and_tables() {
 
 #[test]
 fn reader15_workspace_refusals_release_window_input_output_and_checkpoint() {
-    use crate::codec::workspace::{Allowance, RefusingBudget};
+    use crate::codec::workspace::Allowance;
     let data = b"legacy reader owned capacity\n".repeat(32);
     let packed = unpack15_encode(&data).unwrap();
     for streaming in [false, true] {
-        let run = |budget: &RefusingBudget| -> super::Result<()> {
+        let run = |budget: &Allowance| -> super::Result<()> {
             let mut decoder = super::Reader15State::with_allowance(budget)?;
             if streaming {
                 let mut output = super::Buffer::new(budget);
@@ -603,13 +603,13 @@ fn reader15_workspace_refusals_release_window_input_output_and_checkpoint() {
             assert_eq!(checkpoint.window, decoder.window);
             Ok(())
         };
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         let attempts = baseline.attempts();
         assert!(attempts >= 5);
         assert_eq!(baseline.used(), 0);
         for index in 0..attempts {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert!(
                 matches!(run(&budget), Err(Error::Cancelled)),
                 "allocation {index}, streaming={streaming}"

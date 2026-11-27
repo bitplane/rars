@@ -1,6 +1,6 @@
 #[cfg(any(test, feature = "write"))]
 use super::workspace::Allowance;
-use super::workspace::{Budget, Buffer};
+use super::workspace::Buffer;
 use super::Result;
 
 /// Like [`lengths_for_frequencies`], but guarantees the returned code lengths
@@ -79,11 +79,11 @@ pub(crate) fn lengths_for_frequencies(frequencies: &[usize], max_bits: u8) -> Ve
         .into_vec()
 }
 
-pub(crate) fn complete_lengths_with_allowance<B: Budget>(
+pub(crate) fn complete_lengths_with_allowance(
     frequencies: &[usize],
     max_bits: u8,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let mut lengths = lengths_with_allowance(frequencies, max_bits, allowance)?;
     if !is_complete_code(&lengths) {
         assign_flat_complete_code(&mut lengths);
@@ -91,11 +91,11 @@ pub(crate) fn complete_lengths_with_allowance<B: Budget>(
     Ok(lengths)
 }
 
-pub(crate) fn lengths_with_allowance<B: Budget>(
+pub(crate) fn lengths_with_allowance(
     frequencies: &[usize],
     max_bits: u8,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let used_count = frequencies
         .iter()
         .filter(|&&frequency| frequency != 0)
@@ -117,7 +117,7 @@ pub(crate) fn lengths_with_allowance<B: Budget>(
     let mut order = 0;
     for (symbol, &frequency) in frequencies.iter().enumerate() {
         if frequency != 0 {
-            heap.push((frequency, order, symbol)).map_err(Into::into)?;
+            heap.push((frequency, order, symbol))?;
             order += 1;
         }
     }
@@ -129,8 +129,7 @@ pub(crate) fn lengths_with_allowance<B: Budget>(
         let (right_frequency, _, right) = pop_min(&mut heap);
         parents[left] = next;
         parents[right] = next;
-        heap.push((left_frequency.saturating_add(right_frequency), order, next))
-            .map_err(Into::into)?;
+        heap.push((left_frequency.saturating_add(right_frequency), order, next))?;
         let mut child = heap.len() - 1;
         while child != 0 {
             let parent = (child - 1) / 2;
@@ -160,7 +159,7 @@ pub(crate) fn lengths_with_allowance<B: Budget>(
     Ok(lengths)
 }
 
-fn pop_min<B: Budget>(heap: &mut Buffer<(usize, usize, usize), B>) -> (usize, usize, usize) {
+fn pop_min(heap: &mut Buffer<(usize, usize, usize)>) -> (usize, usize, usize) {
     let last = heap.pop().expect("frequency heap has a node");
     if heap.is_empty() {
         return last;

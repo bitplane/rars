@@ -32,7 +32,7 @@
 //! gigabytes keep only their low half; `resolve` measures back from the newest
 //! position inserted to recover the rest.
 
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::Result;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering::Relaxed};
 
@@ -67,9 +67,9 @@ fn mix(value: u32, bits: u32) -> usize {
 }
 
 #[derive(Debug)]
-pub(crate) struct MatchFinder<const MIN_MATCH: usize, B: Budget = Allowance> {
-    head: Buffer<u32, B>,
-    prev: Buffer<u32, B>,
+pub(crate) struct MatchFinder<const MIN_MATCH: usize> {
+    head: Buffer<u32>,
+    prev: Buffer<u32>,
     mask: usize,
     hash_bits: u32,
     /// The highest position inserted so far, and so at least as high as any
@@ -140,7 +140,7 @@ impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     }
 }
 
-impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
+impl<const MIN_MATCH: usize> MatchFinder<MIN_MATCH> {
     const HASH_BITS: u32 = match MIN_MATCH {
         3 => 16,
         4 | 6 | 32 => 17,
@@ -154,11 +154,11 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     /// position that has fallen out of the window is still readable, and still
     /// names the position it named, so that check rejects it the same way it
     /// rejects a match that is merely too far away.
-    pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
+    pub(crate) fn with_allowance(window: usize, allowance: &Allowance) -> Result<Self> {
         Self::build(window, Self::HASH_BITS, allowance)
     }
 
-    fn build(window: usize, hash_bits: u32, allowance: &B) -> Result<Self> {
+    fn build(window: usize, hash_bits: u32, allowance: &Allowance) -> Result<Self> {
         let window = window
             .max(1)
             .checked_next_power_of_two()
@@ -178,7 +178,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
     }
 
     #[cfg(feature = "write")]
-    pub(crate) fn allowance(&self) -> B {
+    pub(crate) fn allowance(&self) -> Allowance {
         self.head.allowance()
     }
 
@@ -398,7 +398,7 @@ impl ChainWalk {
 }
 
 // Fusing insertion and lookup shares one hash and skips the self link.
-impl<B: Budget> MatchFinder<4, B> {
+impl MatchFinder<4> {
     /// Insert a readable position and return its first older candidate. Like
     /// the encoder's ordinary insertion schedule, positions arrive in order.
     #[inline]
@@ -464,8 +464,8 @@ impl<B: Budget> MatchFinder<4, B> {
         max_distance: usize,
         cut: usize,
         nice: usize,
-        out: &mut Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         if self.newest <= u32::MAX as usize {
             self.collect_improving_with_positions::<true>(
                 input,
@@ -519,8 +519,8 @@ impl<B: Budget> MatchFinder<4, B> {
         max_distance: usize,
         cut: usize,
         nice: usize,
-        out: &mut Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         debug_assert!(max_length >= 4 && pos + max_length <= input.len());
         if cut == 0 || nice == 0 {
             return Ok(());
@@ -550,18 +550,18 @@ impl<B: Budget> MatchFinder<4, B> {
     }
 }
 
-struct ImprovingRuns<'a, B: Budget> {
+struct ImprovingRuns<'a> {
     input: &'a [u8],
     pos: usize,
     max_length: usize,
     stop_length: usize,
     prefix: u32,
     longest: usize,
-    out: &'a mut Buffer<(u32, u32), B>,
+    out: &'a mut Buffer<(u32, u32)>,
 }
 
-impl<B: Budget> ChainRule for ImprovingRuns<'_, B> {
-    type Error = B::Failure;
+impl ChainRule for ImprovingRuns<'_> {
+    type Error = crate::codec::Error;
 
     #[inline]
     fn probe(&mut self, _distance: usize) -> Option<usize> {
@@ -584,7 +584,7 @@ impl<B: Budget> ChainRule for ImprovingRuns<'_, B> {
         &mut self,
         length: usize,
         distance: usize,
-    ) -> std::result::Result<bool, B::Failure> {
+    ) -> std::result::Result<bool, crate::codec::Error> {
         if length > self.longest {
             self.out.push((length as u32, distance as u32))?;
             self.longest = length;
@@ -656,11 +656,11 @@ impl CommittedMatch {
 /// share of the hashes. The links are atomics for that only: every access is
 /// relaxed, and no link is touched by two threads at once.
 #[derive(Debug)]
-pub(crate) struct TreeMatchFinder<B: Budget = Allowance> {
-    head: Buffer<AtomicU32, B>,
+pub(crate) struct TreeMatchFinder {
+    head: Buffer<AtomicU32>,
     /// Two links per window slot: the child whose bytes compare lesser first,
     /// then the greater-or-equal one, in LZMA's layout.
-    son: Links<B>,
+    son: Links,
     mask: usize,
     /// Position `pos` keeps its links in slot `(pos + shift) & mask`. Only a
     /// tree a [`SeedTree`] hands on whole has slots offset from its positions.
@@ -692,7 +692,7 @@ impl TreeMatchFinder {
     }
 }
 
-impl<B: Budget> TreeMatchFinder<B> {
+impl TreeMatchFinder {
     const HASH_BITS: u32 = 17;
     const MIN_MATCH: usize = 4;
     /// The most runs one position reports: the longest found.
@@ -717,7 +717,7 @@ impl<B: Budget> TreeMatchFinder<B> {
     /// positions.
     #[cfg(feature = "write")]
     pub(crate) fn link_bytes_per_slot(window: usize) -> usize {
-        if window.max(1).next_power_of_two() <= NarrowLinks::<B>::MAX_WINDOW {
+        if window.max(1).next_power_of_two() <= NarrowLinks::MAX_WINDOW {
             6
         } else {
             2 * size_of::<u32>()
@@ -726,7 +726,7 @@ impl<B: Budget> TreeMatchFinder<B> {
 
     /// Builds a finder that remembers the last `window` positions, at six
     /// bytes of links per byte of window up to 16 MiB and eight past it.
-    pub(crate) fn with_allowance(window: usize, allowance: &B) -> Result<Self> {
+    pub(crate) fn with_allowance(window: usize, allowance: &Allowance) -> Result<Self> {
         let window = window
             .max(1)
             .checked_next_power_of_two()
@@ -736,7 +736,7 @@ impl<B: Budget> TreeMatchFinder<B> {
             // Zero rather than the sentinel for the same reason as the chain
             // finder's `prev`: a slot is always written during its position's
             // own insertion before any link can lead to it.
-            son: if window <= NarrowLinks::<B>::MAX_WINDOW {
+            son: if window <= NarrowLinks::MAX_WINDOW {
                 Links::Narrow(NarrowLinks(Buffer::filled_with(
                     6 * window,
                     || AtomicU8::new(0),
@@ -771,7 +771,7 @@ impl<B: Budget> TreeMatchFinder<B> {
         len_limit: impl Fn(usize) -> usize + Sync,
         cut: usize,
         shares: usize,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         let finder = Self::with_allowance(window, allowance)?;
         debug_assert!(history.len() <= finder.mask + 1);
@@ -891,7 +891,7 @@ impl<B: Budget> TreeMatchFinder<B> {
     }
 
     #[cfg(feature = "write")]
-    pub(crate) fn allowance(&self) -> B {
+    pub(crate) fn allowance(&self) -> Allowance {
         self.head.allowance()
     }
 
@@ -917,8 +917,8 @@ impl<B: Budget> TreeMatchFinder<B> {
         len_limit: usize,
         max_distance: usize,
         cut: usize,
-        out: &mut Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         self.matches_with_extension::<true>(input, pos, len_limit, max_distance, cut, out)
     }
 
@@ -930,8 +930,8 @@ impl<B: Budget> TreeMatchFinder<B> {
         len_limit: usize,
         max_distance: usize,
         cut: usize,
-        out: &mut Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         let hash = self.hash(input, pos);
         self.descend::<FAST>(input, pos, hash, len_limit, max_distance, cut, Some(out))
     }
@@ -949,8 +949,8 @@ impl<B: Budget> TreeMatchFinder<B> {
         len_limit: usize,
         max_distance: usize,
         cut: usize,
-        out: Option<&mut Buffer<(u32, u32), B>>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: Option<&mut Buffer<(u32, u32)>>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         match &self.son {
             Links::Wide(son) => {
                 self.descend_in::<FAST, _>(son, input, pos, hash, len_limit, max_distance, cut, out)
@@ -972,8 +972,8 @@ impl<B: Budget> TreeMatchFinder<B> {
         len_limit: usize,
         max_distance: usize,
         cut: usize,
-        mut out: Option<&mut Buffer<(u32, u32), B>>,
-    ) -> std::result::Result<(), B::Failure> {
+        mut out: Option<&mut Buffer<(u32, u32)>>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         // The tree collector calls this only when at least four bytes remain.
         // Unlike the chain finder, it skips near-end positions before calling.
         debug_assert!(len_limit >= Self::MIN_MATCH && pos + len_limit <= input.len());
@@ -1071,10 +1071,10 @@ impl<B: Budget> TreeMatchFinder<B> {
 
 /// A tree's child links, by the widest window they can serve.
 #[derive(Debug)]
-enum Links<B: Budget> {
+enum Links {
     /// Each child's position, truncated to 32 bits.
-    Wide(Buffer<AtomicU32, B>),
-    Narrow(NarrowLinks<B>),
+    Wide(Buffer<AtomicU32>),
+    Narrow(NarrowLinks),
 }
 
 /// How a tree's descent reads and writes its child links. `index` is a
@@ -1094,7 +1094,7 @@ trait Son {
     fn hang_near(&self, owner: usize, index: usize, child: usize);
 }
 
-impl<B: Budget> Son for Buffer<AtomicU32, B> {
+impl Son for Buffer<AtomicU32> {
     #[inline(always)]
     fn child(&self, reference: usize, _owner: usize, index: usize) -> usize {
         resolve(reference, self[index].load(Relaxed))
@@ -1126,9 +1126,9 @@ impl<B: Budget> Son for Buffer<AtomicU32, B> {
 /// parts of both of a slot's links: a descent then writes a link with three
 /// stores and no read.
 #[derive(Debug)]
-struct NarrowLinks<B: Budget>(Buffer<AtomicU8, B>);
+struct NarrowLinks(Buffer<AtomicU8>);
 
-impl<B: Budget> NarrowLinks<B> {
+impl NarrowLinks {
     /// Distances below this fit; it is also the largest window, since a
     /// child no closer than that has fallen out of it.
     const MAX_WINDOW: usize = 1 << 24;
@@ -1150,7 +1150,7 @@ impl<B: Budget> NarrowLinks<B> {
     }
 }
 
-impl<B: Budget> Son for NarrowLinks<B> {
+impl Son for NarrowLinks {
     #[inline(always)]
     fn child(&self, _reference: usize, owner: usize, index: usize) -> usize {
         match self.stored(index) {
@@ -1210,13 +1210,11 @@ pub(crate) fn seed_shares(positions: usize) -> usize {
 #[cfg(feature = "write")]
 pub(crate) fn seed_skew(input: &[u8], positions: std::ops::Range<usize>, shares: usize) -> f64 {
     const STEP: usize = 7;
-    let bits = TreeMatchFinder::<Allowance>::HASH_BITS;
+    let bits = TreeMatchFinder::HASH_BITS;
     let shares = shares.max(1);
-    let end = positions.end.min(
-        input
-            .len()
-            .saturating_sub(TreeMatchFinder::<Allowance>::MIN_MATCH - 1),
-    );
+    let end = positions
+        .end
+        .min(input.len().saturating_sub(TreeMatchFinder::MIN_MATCH - 1));
     let mut counts = vec![0usize; shares];
     for pos in (positions.start..end).step_by(STEP) {
         let bytes = [input[pos], input[pos + 1], input[pos + 2], input[pos + 3]];
@@ -1251,21 +1249,21 @@ pub(crate) fn seed_skew(input: &[u8], positions: std::ops::Range<usize>, shares:
 /// descent.
 #[cfg(feature = "write")]
 #[derive(Debug)]
-pub(crate) struct SeedTree<B: Budget = Allowance> {
-    tree: TreeMatchFinder<B>,
+pub(crate) struct SeedTree {
+    tree: TreeMatchFinder,
     /// The first position not yet inserted.
     next: usize,
 }
 
 #[cfg(feature = "write")]
-impl<B: Budget> SeedTree<B> {
+impl SeedTree {
     /// What [`Self::with_allowance`] allocates for a dictionary of `reach`.
     pub(crate) fn bytes_for_reach(reach: usize) -> usize {
-        TreeMatchFinder::<B>::bytes_for_window(reach)
+        TreeMatchFinder::bytes_for_window(reach)
     }
 
     /// A seed tree for histories up to `reach` long.
-    pub(crate) fn with_allowance(reach: usize, allowance: &B) -> Result<Self> {
+    pub(crate) fn with_allowance(reach: usize, allowance: &Allowance) -> Result<Self> {
         Ok(Self {
             tree: TreeMatchFinder::with_allowance(reach, allowance)?,
             next: 0,
@@ -1287,8 +1285,8 @@ impl<B: Budget> SeedTree<B> {
         window: usize,
         len_limit: impl Fn(usize) -> usize + Sync,
         cut: usize,
-        allowance: &B,
-    ) -> Result<TreeMatchFinder<B>> {
+        allowance: &Allowance,
+    ) -> Result<TreeMatchFinder> {
         self.insert(input, history.clone(), len_limit, cut);
         self.copy(input, history, window, allowance)
     }
@@ -1304,8 +1302,8 @@ impl<B: Budget> SeedTree<B> {
         window: usize,
         len_limit: impl Fn(usize) -> usize + Sync,
         cut: usize,
-        allowance: &B,
-    ) -> Result<TreeMatchFinder<B>> {
+        allowance: &Allowance,
+    ) -> Result<TreeMatchFinder> {
         self.insert(input, history.clone(), len_limit, cut);
         let Some(newest) = history.end.checked_sub(1) else {
             return self.copy(input, history, window, allowance);
@@ -1352,8 +1350,8 @@ impl<B: Budget> SeedTree<B> {
         input: &[u8],
         history: std::ops::Range<usize>,
         window: usize,
-        allowance: &B,
-    ) -> Result<TreeMatchFinder<B>> {
+        allowance: &Allowance,
+    ) -> Result<TreeMatchFinder> {
         let copy = TreeMatchFinder::with_allowance(window, allowance)?;
         debug_assert!(history.len() <= copy.mask + 1);
         let Some(newest) = history.end.checked_sub(1) else {
@@ -1377,11 +1375,9 @@ impl<B: Budget> SeedTree<B> {
             pos => pos - base,
         };
         // Only positions that were inserted have links of their own.
-        let end = history.end.min(
-            input
-                .len()
-                .saturating_sub(TreeMatchFinder::<B>::MIN_MATCH - 1),
-        );
+        let end = history
+            .end
+            .min(input.len().saturating_sub(TreeMatchFinder::MIN_MATCH - 1));
         let span = end.saturating_sub(base);
         let pieces = seed_shares(span);
         crate::parallel::spread(pieces, |piece| {
@@ -1418,8 +1414,8 @@ impl<B: Budget> SeedTree<B> {
 /// window that searched different positions see the same candidates.
 #[cfg(feature = "write")]
 #[derive(Debug)]
-pub(crate) struct WindowIndex<B: Budget = Allowance> {
-    table: Buffer<u32, B>,
+pub(crate) struct WindowIndex {
+    table: Buffer<u32>,
     shift: u32,
     span: usize,
     /// The weight of a window's first byte, for rolling it out.
@@ -1430,7 +1426,7 @@ pub(crate) struct WindowIndex<B: Budget = Allowance> {
 }
 
 #[cfg(feature = "write")]
-impl<B: Budget> WindowIndex<B> {
+impl WindowIndex {
     const MULTIPLIER: u64 = 0x9E37_79B9_7F4A_7C15;
 
     /// An index of `span`-byte stretches for a window this long, a slot for
@@ -1439,7 +1435,11 @@ impl<B: Budget> WindowIndex<B> {
     /// so a stretch further back than a few times the slot count has usually
     /// been overwritten. A stretch that repeats is found at its nearest copy,
     /// which is the one worth finding.
-    pub(crate) fn with_allowance(window: usize, span: usize, allowance: &B) -> Result<Self> {
+    pub(crate) fn with_allowance(
+        window: usize,
+        span: usize,
+        allowance: &Allowance,
+    ) -> Result<Self> {
         let slots = (window / 16).clamp(1 << 12, 1 << 18).next_power_of_two();
         let first_weight = (1..span).fold(1u64, |weight, _| weight.wrapping_mul(Self::MULTIPLIER));
         Ok(Self {
@@ -1569,16 +1569,16 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn ordinary_chain_frontier<B: super::Budget>(
-        finder: &MatchFinder<4, B>,
+    fn ordinary_chain_frontier(
+        finder: &MatchFinder<4>,
         input: &[u8],
         pos: usize,
         max_length: usize,
         max_distance: usize,
         cut: usize,
         nice: usize,
-        out: &mut super::Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut super::Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         if cut == 0 {
             return Ok(());
         }
@@ -1788,10 +1788,10 @@ mod tests {
 
     #[test]
     fn raw_fused_subfour_runs_preserve_allocation_refusal_and_cleanup() {
-        use super::super::workspace::RefusingBudget;
+        use super::super::workspace::Allowance;
         let input = raw_collision_fixture();
-        let probe = RefusingBudget::new(usize::MAX);
-        let mut finder = MatchFinder::<4, _>::with_allowance(64, &probe).unwrap();
+        let probe = Allowance::refusing(usize::MAX);
+        let mut finder = MatchFinder::<4>::with_allowance(64, &probe).unwrap();
         finder.insert(&input, 0);
         finder.insert(&input, 16);
         let first = finder.insert_and_first(&input, 32);
@@ -1805,10 +1805,10 @@ mod tests {
         drop((runs, finder));
         assert_eq!(probe.used(), 0);
         for fail_at in 0..attempts {
-            let fused_budget = RefusingBudget::new(fail_at);
-            let ordinary_budget = RefusingBudget::new(fail_at);
-            let run = |budget: &RefusingBudget, fused: bool| {
-                let mut finder = MatchFinder::<4, _>::with_allowance(64, budget)?;
+            let fused_budget = Allowance::refusing(fail_at);
+            let ordinary_budget = Allowance::refusing(fail_at);
+            let run = |budget: &Allowance, fused: bool| {
+                let mut finder = MatchFinder::<4>::with_allowance(64, budget)?;
                 finder.insert(&input, 0);
                 finder.insert(&input, 16);
                 let first = if fused {
@@ -1886,9 +1886,9 @@ mod tests {
         let all = tree_matches_at_every_position(&input, usize::MAX);
         let mut capped = 0;
         for (pos, runs) in all.iter().enumerate() {
-            assert!(runs.len() <= TreeMatchFinder::<super::Allowance>::MAX_RUNS);
+            assert!(runs.len() <= TreeMatchFinder::MAX_RUNS);
             assert!(runs.windows(2).all(|pair| pair[0].0 < pair[1].0));
-            capped += usize::from(runs.len() == TreeMatchFinder::<super::Allowance>::MAX_RUNS);
+            capped += usize::from(runs.len() == TreeMatchFinder::MAX_RUNS);
             let longest = (1..=pos)
                 .map(|distance| {
                     (0..input.len() - pos)

@@ -4,19 +4,19 @@ mod volumes;
 use crate::codec::rar13::Reader15State;
 use crate::codec::rar20::Reader20State;
 use crate::codec::rar29::Reader29State;
-use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Boxed, Buffer};
 use crate::extraction_links::{check_legacy_size, legacy_output, skip_legacy_links, LegacyLink};
 use crate::volume_extract::{LazyChain, VolumeFeed};
 use std::io::{Read, Write};
 
-enum CodecState<B: Budget = Allowance> {
-    Unpack15(Boxed<Reader15State<B>, B>),
-    Unpack20(Boxed<Reader20State<B>, B>),
-    Unpack29(Boxed<Reader29State<B>, B>),
+enum CodecState {
+    Unpack15(Boxed<Reader15State>),
+    Unpack20(Boxed<Reader20State>),
+    Unpack29(Boxed<Reader29State>),
 }
 
-impl<B: Budget> CodecState<B> {
-    fn with_allowance(file: &FileHeader, allowance: &B) -> Result<Self> {
+impl CodecState {
+    fn with_allowance(file: &FileHeader, allowance: &Allowance) -> Result<Self> {
         if file.unp_ver >= 29 {
             return Ok(Self::Unpack29(Boxed::try_new(
                 || Ok::<_, crate::codec::Error>(Reader29State::with_allowance(allowance)),
@@ -56,7 +56,7 @@ impl<B: Budget> CodecState<B> {
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
-        allowance: &B,
+        allowance: &Allowance,
         out: &mut impl Write,
     ) -> Result<()> {
         let mut packed = file
@@ -97,7 +97,7 @@ impl<B: Budget> CodecState<B> {
     /// only, keeping it if it ends cleanly, and returns whether it did and
     /// went past the declared size. RAR 2.9 does this itself, up to its
     /// end-of-file marker.
-    fn run_on(&mut self, input: &mut PackedReader<'_, B>) -> bool {
+    fn run_on(&mut self, input: &mut PackedReader<'_>) -> bool {
         match self {
             Self::Unpack15(decoder) => decoder.run_on(input),
             Self::Unpack20(decoder) => decoder.run_on(input),
@@ -109,7 +109,7 @@ impl<B: Budget> CodecState<B> {
     /// the error that says so, for the caller to weigh against the CRC.
     fn decode_to(
         &mut self,
-        input: &mut PackedReader<'_, B>,
+        input: &mut PackedReader<'_>,
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
@@ -152,7 +152,7 @@ impl<B: Budget> CodecState<B> {
     /// Returns the output's CRC; a split member's last header holds the one to check it against.
     fn decode_split_to(
         &mut self,
-        input: &mut PackedReader<'_, B>,
+        input: &mut PackedReader<'_>,
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
@@ -236,23 +236,27 @@ impl FileHeader {
 }
 
 #[cfg(all(test, feature = "write"))]
-impl CodecState<Allowance> {
+impl CodecState {
     fn new_for(file: &FileHeader) -> Result<Self> {
         Self::with_allowance(file, &Allowance::default())
     }
 }
 
-pub(super) struct DecoderSession<'a, B: Budget = Allowance> {
+pub(super) struct DecoderSession<'a> {
     pub(super) read_control: crate::read_control::ReadControl,
-    codec: Option<CodecState<B>>,
+    codec: Option<CodecState>,
     solid: bool,
     decoded_files: usize,
     password: Option<&'a [u8]>,
-    allowance: B,
+    allowance: Allowance,
 }
 
-impl<'a, B: Budget> DecoderSession<'a, B> {
-    pub(super) fn with_allowance(solid: bool, password: Option<&'a [u8]>, allowance: &B) -> Self {
+impl<'a> DecoderSession<'a> {
+    pub(super) fn with_allowance(
+        solid: bool,
+        password: Option<&'a [u8]>,
+        allowance: &Allowance,
+    ) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
             codec: None,
@@ -296,7 +300,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
 
     fn decode_split_to(
         &mut self,
-        input: &mut PackedReader<'_, B>,
+        input: &mut PackedReader<'_>,
         first: &FileHeader,
         out: &mut impl Write,
     ) -> Result<Decoded> {
@@ -315,7 +319,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         &mut self,
         archive: &Archive,
         file: &FileHeader,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         debug_assert!(!file.is_stored());
         let mut out = Buffer::new(&self.allowance);
         if file.is_empty_compressed_payload() || file.is_empty_without_key(self.password) {
@@ -343,7 +347,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
         file.unp_ver < 20 || file.is_solid()
     }
 
-    fn codec_for(&mut self, file: &FileHeader) -> Result<&mut CodecState<B>> {
+    fn codec_for(&mut self, file: &FileHeader) -> Result<&mut CodecState> {
         self.read_control.check()?;
         let reset = !self.file_is_solid(file)
             || self
@@ -365,7 +369,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
     }
 }
 
-impl<'a> DecoderSession<'a, Allowance> {
+impl<'a> DecoderSession<'a> {
     #[cfg(any(all(test, feature = "write"), feature = "recovery"))]
     pub(super) fn new(solid: bool) -> Self {
         Self::new_with_password(solid, None)
@@ -436,12 +440,12 @@ where
     extract_volumes_with_allowance(volumes, options, open, links, &Allowance::default())
 }
 
-fn extract_volumes_with_allowance<F, B: Budget>(
+fn extract_volumes_with_allowance<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
     open: F,
     links: Option<&mut LegacyLink<'_>>,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -467,20 +471,20 @@ where
 }
 
 #[cfg(feature = "encryption")]
-enum SplitCipher<B: Budget = Allowance> {
+enum SplitCipher {
     Rar15(Rar15Cipher),
-    Rar20(Boxed<Rar20Cipher, B>),
-    Rar30(Boxed<Rar30Cipher, B>),
+    Rar20(Boxed<Rar20Cipher>),
+    Rar30(Boxed<Rar30Cipher>),
 }
 
 #[cfg(feature = "encryption")]
-impl<B: Budget> SplitCipher<B> {
+impl SplitCipher {
     fn with_allowance(
         unp_ver: u8,
         password: &[u8],
         salt: Option<[u8; 8]>,
         key_cache: &KeyCache,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         if unp_ver == 15 {
             return Ok(Self::Rar15(Rar15Cipher::new(password)));
@@ -504,11 +508,11 @@ impl<B: Budget> SplitCipher<B> {
     }
 }
 
-pub(super) enum PackedReader<'a, B: Budget = Allowance> {
+pub(super) enum PackedReader<'a> {
     Plain(LazyChain<'a>),
-    Encrypted(Boxed<DecryptingReader<LazyChain<'a>, B>, B>),
+    Encrypted(Boxed<DecryptingReader<LazyChain<'a>>>),
 }
-impl<B: Budget> Read for PackedReader<'_, B> {
+impl Read for PackedReader<'_> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(out),
@@ -517,15 +521,15 @@ impl<B: Budget> Read for PackedReader<'_, B> {
     }
 }
 #[cfg(not(feature = "encryption"))]
-pub(super) type DecryptingReader<R, B = Allowance> = crate::crypto::unavailable::Reader<R, B>;
+pub(super) type DecryptingReader<R> = crate::crypto::unavailable::Reader<R>;
 
 #[cfg(feature = "encryption")]
-pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
+pub(super) struct DecryptingReader<R> {
     inner: R,
-    cipher: SplitCipher<B>,
-    encrypted_block: Buffer<u8, B>,
-    decrypted: Buffer<u8, B>,
-    read_buffer: Option<Buffer<u8, B>>,
+    cipher: SplitCipher,
+    encrypted_block: Buffer<u8>,
+    decrypted: Buffer<u8>,
+    read_buffer: Option<Buffer<u8>>,
     decrypted_pos: usize,
     eof: bool,
     /// Salvaging a member whose volumes gave out: the cipher block cut at
@@ -534,14 +538,14 @@ pub(super) struct DecryptingReader<R, B: Budget = Allowance> {
 }
 
 #[cfg(feature = "encryption")]
-impl<R: Read, B: Budget> DecryptingReader<R, B> {
+impl<R: Read> DecryptingReader<R> {
     pub(super) fn with_allowance(
         inner: R,
         unp_ver: u8,
         password: &[u8],
         salt: Option<[u8; 8]>,
         key_cache: &KeyCache,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         let cipher = SplitCipher::with_allowance(unp_ver, password, salt, key_cache, allowance)?;
         let read_buffer = matches!(cipher, SplitCipher::Rar15(_))
@@ -588,7 +592,6 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
                 }
                 self.decrypted
                     .extend_from_slice(&read_buffer[..count])
-                    .map_err(Into::<crate::codec::Error>::into)
                     .map_err(Error::from)
                     .map_err(std::io::Error::other)?;
                 cipher.crypt_in_place(&mut self.decrypted);
@@ -615,8 +618,8 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
 
     fn fill_block_decrypted<E: std::fmt::Debug>(
         inner: &mut R,
-        encrypted_block: &mut Buffer<u8, B>,
-        decrypted: &mut Buffer<u8, B>,
+        encrypted_block: &mut Buffer<u8>,
+        decrypted: &mut Buffer<u8>,
         eof: &mut bool,
         drop_cut_block: bool,
         mut decrypt: impl FnMut(&mut [u8]) -> std::result::Result<(), E>,
@@ -632,7 +635,6 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
             }
             encrypted_block
                 .extend_from_slice(&buf[..count])
-                .map_err(Into::<crate::codec::Error>::into)
                 .map_err(Error::from)
                 .map_err(std::io::Error::other)?;
         }
@@ -662,7 +664,7 @@ impl<R: Read, B: Budget> DecryptingReader<R, B> {
 }
 
 #[cfg(feature = "encryption")]
-impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
+impl<R: Read> Read for DecryptingReader<R> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -681,7 +683,7 @@ impl<R: Read, B: Budget> Read for DecryptingReader<R, B> {
 
 #[cfg(all(test, feature = "write"))]
 #[cfg(feature = "encryption")]
-impl SplitCipher<Allowance> {
+impl SplitCipher {
     fn new(unp_ver: u8, password: &[u8], salt: Option<[u8; 8]>) -> Result<Self> {
         Self::with_allowance(
             unp_ver,
@@ -694,7 +696,7 @@ impl SplitCipher<Allowance> {
 }
 #[cfg(all(test, feature = "write"))]
 #[cfg(feature = "encryption")]
-impl<R: Read> DecryptingReader<R, Allowance> {
+impl<R: Read> DecryptingReader<R> {
     pub(super) fn new(
         inner: R,
         unp_ver: u8,
@@ -716,7 +718,7 @@ mod tests {
 
     #[test]
     fn reader_session_workspace_refusals_charge_every_legacy_decoder_and_encrypted_payload() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
         let plain = b"abcabcabc";
         for version in [15, 20, 29] {
             let packed = match version {
@@ -757,7 +759,7 @@ mod tests {
                 entry.packed_range = 0..payload.len();
                 entry.file_crc = crate::crc32::crc32(plain);
                 let archive = archive_with_source(vec![Block::File(entry.clone())], payload);
-                let run = |budget: &RefusingBudget| -> Result<()> {
+                let run = |budget: &Allowance| -> Result<()> {
                     let mut session = DecoderSession::with_allowance(false, Some(b"pw"), budget);
                     let mut out = Buffer::new(budget);
                     session.write_file_to(&archive, &entry, &mut out)?;
@@ -766,11 +768,11 @@ mod tests {
                     assert_eq!(&decoded[..], plain);
                     Ok(())
                 };
-                let baseline = RefusingBudget::new(usize::MAX);
+                let baseline = Allowance::refusing(usize::MAX);
                 run(&baseline).unwrap();
                 assert_eq!(baseline.used(), 0);
                 for index in 0..baseline.attempts() {
-                    let budget = RefusingBudget::new(index);
+                    let budget = Allowance::refusing(index);
                     let error = run(&budget).unwrap_err();
                     assert_eq!(
                         error.kind(),
@@ -814,7 +816,7 @@ mod tests {
     #[test]
     #[cfg(feature = "encryption")]
     fn reader_workspace_refusals_release_legacy_cipher_and_decryption_buffers() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
         for version in [15, 20, 29] {
             let plain = *b"0123456789abcdefRAR AES CBC data";
             let mut encrypted = plain;
@@ -828,7 +830,7 @@ mod tests {
                     .encrypt_in_place(&mut encrypted)
                     .unwrap(),
             }
-            let run = |budget: &RefusingBudget| -> Result<()> {
+            let run = |budget: &Allowance| -> Result<()> {
                 let input = ChunkedReader::new(Cursor::new(&encrypted), 7);
                 let mut reader = DecryptingReader::with_allowance(
                     input,
@@ -843,11 +845,11 @@ mod tests {
                 assert_eq!(&out[..], &plain);
                 Ok(())
             };
-            let baseline = RefusingBudget::new(usize::MAX);
+            let baseline = Allowance::refusing(usize::MAX);
             run(&baseline).unwrap();
             assert_eq!(baseline.used(), 0);
             for index in 0..baseline.attempts() {
-                let budget = RefusingBudget::new(index);
+                let budget = Allowance::refusing(index);
                 let error = run(&budget).unwrap_err();
                 assert_eq!(
                     error.kind(),

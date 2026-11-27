@@ -19,35 +19,20 @@ pub(crate) fn is_refusal(error: &crate::Error) -> bool {
 /// compiled once.
 pub(crate) type Allowance = Limited;
 
-pub(crate) trait Budget: Clone + std::fmt::Debug + Send + Sync + 'static {
-    type Charge: std::fmt::Debug + Send + Sync;
-    type Failure: Into<Error>;
-    fn grow<T>(
-        values: &mut Vec<T>,
-        charge: &mut Self::Charge,
-        additional: usize,
-    ) -> std::result::Result<(), Self::Failure>;
-    fn is_limited(&self) -> bool;
-    fn charge_is_limited(charge: &Self::Charge) -> bool;
-    fn charge(&self) -> Self::Charge;
-    fn allowance(charge: &Self::Charge) -> Self;
-    fn resize(charge: &mut Self::Charge, bytes: u64) -> Result<()>;
-}
-
 /// Admit a boxed value before constructing it. Its storage is freed before
 /// the charge, including when construction fails or a decoder is replaced.
 #[derive(Debug)]
-pub(crate) struct Boxed<T, B: Budget = Allowance> {
+pub(crate) struct Boxed<T> {
     value: Box<T>,
-    _charge: B::Charge,
+    _charge: Charge,
 }
-impl<T, B: Budget> Boxed<T, B> {
+impl<T> Boxed<T> {
     pub(crate) fn try_new<E: From<Error>>(
         make: impl FnOnce() -> std::result::Result<T, E>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> std::result::Result<Self, E> {
         let mut charge = allowance.charge();
-        B::resize(&mut charge, allocation_size::<T>(1)?)?;
+        Allowance::resize(&mut charge, allocation_size::<T>(1)?)?;
         let value = make()?;
         Ok(Self {
             value: Box::new(value),
@@ -55,21 +40,23 @@ impl<T, B: Budget> Boxed<T, B> {
         })
     }
 }
-impl<T, B: Budget> std::ops::Deref for Boxed<T, B> {
+impl<T> std::ops::Deref for Boxed<T> {
     type Target = T;
     fn deref(&self) -> &T {
         &self.value
     }
 }
-impl<T, B: Budget> std::ops::DerefMut for Boxed<T, B> {
+impl<T> std::ops::DerefMut for Boxed<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.value
     }
 }
-impl Budget for Limited {
-    type Charge = Charge;
-    type Failure = Error;
-    fn grow<T>(values: &mut Vec<T>, charge: &mut Charge, additional: usize) -> Result<()> {
+impl Limited {
+    pub(crate) fn grow<T>(
+        values: &mut Vec<T>,
+        charge: &mut Charge,
+        additional: usize,
+    ) -> Result<()> {
         let end = values
             .len()
             .checked_add(additional)
@@ -87,152 +74,65 @@ impl Budget for Limited {
         Self::resize(charge, bytes)?;
         Ok(())
     }
-    fn is_limited(&self) -> bool {
-        Limited::is_limited(self)
-    }
-    fn charge_is_limited(charge: &Charge) -> bool {
+    pub(crate) fn charge_is_limited(charge: &Charge) -> bool {
         charge.allowance.is_limited()
     }
-    fn charge(&self) -> Charge {
+    pub(crate) fn charge(&self) -> Charge {
         Charge {
             allowance: self.clone(),
             bytes: 0,
         }
     }
-    fn allowance(charge: &Charge) -> Self {
+    pub(crate) fn allowance(charge: &Charge) -> Self {
         charge.allowance.clone()
     }
-    fn resize(charge: &mut Charge, bytes: u64) -> Result<()> {
+    pub(crate) fn resize(charge: &mut Charge, bytes: u64) -> Result<()> {
         charge.resize(bytes)
-    }
-}
-
-/// Test policy that uses the production ledger but can refuse one chosen
-/// growth operation. Keeping the policy beside [`Budget`] lets coverage count
-/// its monomorphizations as tests of production generic code rather than as
-/// test-module functions.
-#[cfg(test)]
-#[derive(Clone, Debug)]
-pub(crate) struct RefusingBudget {
-    inner: Limited,
-    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    fail_at: usize,
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-pub(crate) struct RefusingCharge {
-    inner: Charge,
-    attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    fail_at: usize,
-}
-
-#[cfg(test)]
-impl RefusingBudget {
-    pub(crate) fn new(fail_at: usize) -> Self {
-        Self {
-            inner: Limited::limited(64 * 1024 * 1024),
-            attempts: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            fail_at,
-        }
-    }
-
-    pub(crate) fn attempts(&self) -> usize {
-        self.attempts.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    pub(crate) fn used(&self) -> u64 {
-        self.inner.used()
-    }
-}
-
-#[cfg(test)]
-fn refuse_once(attempts: &std::sync::atomic::AtomicUsize, fail_at: usize) -> Result<()> {
-    if attempts.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == fail_at {
-        Err(Error::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl Budget for RefusingBudget {
-    type Charge = RefusingCharge;
-    type Failure = Error;
-    fn is_limited(&self) -> bool {
-        true
-    }
-    fn charge_is_limited(_: &Self::Charge) -> bool {
-        true
-    }
-
-    fn grow<T>(values: &mut Vec<T>, charge: &mut Self::Charge, additional: usize) -> Result<()> {
-        refuse_once(&charge.attempts, charge.fail_at)?;
-        <Limited as Budget>::grow(values, &mut charge.inner, additional)
-    }
-
-    fn charge(&self) -> Self::Charge {
-        RefusingCharge {
-            inner: <Limited as Budget>::charge(&self.inner),
-            attempts: self.attempts.clone(),
-            fail_at: self.fail_at,
-        }
-    }
-
-    fn allowance(charge: &Self::Charge) -> Self {
-        Self {
-            inner: <Limited as Budget>::allowance(&charge.inner),
-            attempts: charge.attempts.clone(),
-            fail_at: charge.fail_at,
-        }
-    }
-
-    fn resize(charge: &mut Self::Charge, bytes: u64) -> Result<()> {
-        if bytes > charge.inner.bytes() {
-            refuse_once(&charge.attempts, charge.fail_at)?;
-        }
-        <Limited as Budget>::resize(&mut charge.inner, bytes)
     }
 }
 
 /// Storage is dropped before its charge. Slice access cannot grow an allocation
 /// behind the ledger's back; growth and ownership transfer are explicit.
 #[derive(Debug)]
-pub(crate) struct Buffer<T, B: Budget = Allowance> {
+pub(crate) struct Buffer<T> {
     values: Vec<T>,
-    charge: B::Charge,
+    charge: Charge,
 }
-impl<T, B: Budget> Buffer<T, B> {
-    pub(crate) fn new(allowance: &B) -> Self {
+impl<T> Buffer<T> {
+    pub(crate) fn new(allowance: &Allowance) -> Self {
         Self {
             values: Vec::new(),
             charge: allowance.charge(),
         }
     }
-    pub(crate) fn with_capacity(capacity: usize, allowance: &B) -> Result<Self> {
+    pub(crate) fn with_capacity(capacity: usize, allowance: &Allowance) -> Result<Self> {
         let bytes = allocation_size::<T>(capacity)?;
         let mut out = Self::new(allowance);
-        B::resize(&mut out.charge, bytes)?;
+        Allowance::resize(&mut out.charge, bytes)?;
         out.values = Vec::with_capacity(capacity);
         Ok(out)
     }
-    pub(crate) fn filled(len: usize, value: T, allowance: &B) -> Result<Self>
+    pub(crate) fn filled(len: usize, value: T, allowance: &Allowance) -> Result<Self>
     where
         T: Clone,
     {
         // Keep vec![0; n]'s zeroed allocation fast path for finder links.
         let bytes = allocation_size::<T>(len)?;
         let mut out = Self::new(allowance);
-        B::resize(&mut out.charge, bytes)?;
+        Allowance::resize(&mut out.charge, bytes)?;
         out.values = vec![value; len];
         Ok(out)
     }
     /// [`Self::filled`] for values that are not `Clone`, each made by `make`.
     #[cfg(any(test, feature = "write"))]
-    pub(crate) fn filled_with(len: usize, make: impl FnMut() -> T, allowance: &B) -> Result<Self> {
+    pub(crate) fn filled_with(
+        len: usize,
+        make: impl FnMut() -> T,
+        allowance: &Allowance,
+    ) -> Result<Self> {
         let bytes = allocation_size::<T>(len)?;
         let mut out = Self::new(allowance);
-        B::resize(&mut out.charge, bytes)?;
+        Allowance::resize(&mut out.charge, bytes)?;
         out.values = std::iter::repeat_with(make).take(len).collect();
         Ok(out)
     }
@@ -240,7 +140,7 @@ impl<T, B: Budget> Buffer<T, B> {
     /// The total is checked first, so none of the copies can grow past its
     /// charged capacity.
     #[cfg(feature = "write")]
-    pub(crate) fn from_slices(slices: &[&[T]], allowance: &B) -> Result<Self>
+    pub(crate) fn from_slices(slices: &[&[T]], allowance: &Allowance) -> Result<Self>
     where
         T: Copy,
     {
@@ -269,15 +169,15 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.extend_from_within(range);
         Ok(())
     }
-    pub(crate) fn allowance(&self) -> B {
-        B::allowance(&self.charge)
+    pub(crate) fn allowance(&self) -> Allowance {
+        Allowance::allowance(&self.charge)
     }
     /// Whether this buffer's budget has a ceiling.
     pub(crate) fn is_limited(&self) -> bool {
-        B::charge_is_limited(&self.charge)
+        Allowance::charge_is_limited(&self.charge)
     }
     fn reserve(&mut self, additional: usize) -> Result<()> {
-        B::grow(&mut self.values, &mut self.charge, additional).map_err(Into::into)
+        Allowance::grow(&mut self.values, &mut self.charge, additional)
     }
     /// Grows to hold `total` values, doubling as usual but never past
     /// `ceiling` unless `total` itself needs more. A window that settles at a
@@ -302,9 +202,9 @@ impl<T, B: Budget> Buffer<T, B> {
         Ok(())
     }
     #[inline]
-    pub(crate) fn push(&mut self, value: T) -> std::result::Result<(), B::Failure> {
+    pub(crate) fn push(&mut self, value: T) -> std::result::Result<(), crate::codec::Error> {
         if self.values.len() == self.values.capacity() {
-            B::grow(&mut self.values, &mut self.charge, 1)?;
+            Allowance::grow(&mut self.values, &mut self.charge, 1)?;
         }
         self.values.push(value);
         Ok(())
@@ -316,9 +216,12 @@ impl<T, B: Budget> Buffer<T, B> {
         self.values.push(value);
     }
     pub(crate) fn try_push(&mut self, value: T) -> Result<()> {
-        self.push(value).map_err(Into::into)
+        self.push(value)
     }
-    pub(crate) fn collect(values: impl IntoIterator<Item = T>, allowance: &B) -> Result<Self> {
+    pub(crate) fn collect(
+        values: impl IntoIterator<Item = T>,
+        allowance: &Allowance,
+    ) -> Result<Self> {
         let values = values.into_iter();
         let mut out = Self::with_capacity(values.size_hint().0, allowance)?;
         for value in values {
@@ -342,9 +245,9 @@ impl<T, B: Budget> Buffer<T, B> {
         let peak = old
             .checked_add(new)
             .ok_or(Error::InvalidData("codec capacity overflows"))?;
-        B::resize(&mut self.charge, peak)?;
+        Allowance::resize(&mut self.charge, peak)?;
         self.values.reserve_exact(capacity - self.values.len());
-        B::resize(
+        Allowance::resize(
             &mut self.charge,
             allocation_size::<T>(self.values.capacity())?,
         )
@@ -356,13 +259,13 @@ impl<T, B: Budget> Buffer<T, B> {
         if capacity <= self.values.capacity() {
             return Ok(());
         }
-        B::resize(&mut self.charge, allocation_size::<T>(capacity)?)?;
+        Allowance::resize(&mut self.charge, allocation_size::<T>(capacity)?)?;
         self.values.reserve_exact(capacity - self.values.len());
         Ok(())
     }
     pub(crate) fn shrink_to(&mut self, capacity: usize) -> Result<()> {
         self.values.shrink_to(capacity);
-        B::resize(
+        Allowance::resize(
             &mut self.charge,
             allocation_size::<T>(self.values.capacity())?,
         )
@@ -393,7 +296,7 @@ impl<T, B: Budget> Buffer<T, B> {
     }
     pub(crate) fn try_collect(
         values: impl ExactSizeIterator<Item = Result<T>>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         let mut out = Self::with_capacity(values.len(), allowance)?;
         for value in values {
@@ -405,12 +308,12 @@ impl<T, B: Budget> Buffer<T, B> {
     pub(crate) fn pop(&mut self) -> Option<T> {
         self.values.pop()
     }
-    pub(crate) fn copied(values: &[T], allowance: &B) -> Result<Self>
+    pub(crate) fn copied(values: &[T], allowance: &Allowance) -> Result<Self>
     where
         T: Copy,
     {
         let mut out = Self::with_capacity(values.len(), allowance)?;
-        out.extend_from_slice(values).map_err(Into::into)?;
+        out.extend_from_slice(values)?;
         Ok(out)
     }
     /// Admit the final window before modifying it. A refusal keeps the old
@@ -426,14 +329,17 @@ impl<T, B: Budget> Buffer<T, B> {
         let start = self.len() - keep;
         self.values.copy_within(start.., 0);
         self.values.truncate(keep);
-        self.extend_from_slice(input).map_err(Into::into)
+        self.extend_from_slice(input)
     }
-    pub(crate) fn extend_from_slice(&mut self, values: &[T]) -> std::result::Result<(), B::Failure>
+    pub(crate) fn extend_from_slice(
+        &mut self,
+        values: &[T],
+    ) -> std::result::Result<(), crate::codec::Error>
     where
         T: Copy,
     {
         if values.len() > self.values.capacity() - self.values.len() {
-            B::grow(&mut self.values, &mut self.charge, values.len())?;
+            Allowance::grow(&mut self.values, &mut self.charge, values.len())?;
         }
         self.values.extend_from_slice(values);
         Ok(())
@@ -443,34 +349,34 @@ impl<T, B: Budget> Buffer<T, B> {
         self.reserve(prefix.len())?;
         let old_len = self.values.len();
         for value in prefix {
-            self.push(value).map_err(Into::into)?;
+            self.push(value)?;
         }
         let inserted = self.values.len() - old_len;
         self.values.rotate_right(inserted);
         Ok(())
     }
 }
-pub(crate) struct BufferIter<T, B: Budget> {
+pub(crate) struct BufferIter<T> {
     values: std::vec::IntoIter<T>,
-    _charge: B::Charge,
+    _charge: Charge,
 }
-impl<'a, T, B: Budget> IntoIterator for &'a Buffer<T, B> {
+impl<'a, T> IntoIterator for &'a Buffer<T> {
     type Item = &'a T;
     type IntoIter = std::slice::Iter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
-impl<'a, T, B: Budget> IntoIterator for &'a mut Buffer<T, B> {
+impl<'a, T> IntoIterator for &'a mut Buffer<T> {
     type Item = &'a mut T;
     type IntoIter = std::slice::IterMut<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter_mut()
     }
 }
-impl<T, B: Budget> IntoIterator for Buffer<T, B> {
+impl<T> IntoIterator for Buffer<T> {
     type Item = T;
-    type IntoIter = BufferIter<T, B>;
+    type IntoIter = BufferIter<T>;
     fn into_iter(self) -> Self::IntoIter {
         BufferIter {
             values: self.values.into_iter(),
@@ -478,7 +384,7 @@ impl<T, B: Budget> IntoIterator for Buffer<T, B> {
         }
     }
 }
-impl<T, B: Budget> Iterator for BufferIter<T, B> {
+impl<T> Iterator for BufferIter<T> {
     type Item = T;
     fn next(&mut self) -> Option<T> {
         self.values.next()
@@ -487,7 +393,7 @@ impl<T, B: Budget> Iterator for BufferIter<T, B> {
         self.values.size_hint()
     }
 }
-impl<T, B: Budget> ExactSizeIterator for BufferIter<T, B> {}
+impl<T> ExactSizeIterator for BufferIter<T> {}
 #[cfg(test)]
 impl<T> From<Vec<T>> for Buffer<T> {
     fn from(values: Vec<T>) -> Self {
@@ -507,7 +413,7 @@ impl<T> Buffer<T> {
         std::mem::take(&mut self.values)
     }
 }
-impl<B: Budget> Buffer<u8, B> {
+impl Buffer<u8> {
     pub(crate) fn read_to_end(&mut self, input: &mut impl std::io::Read) -> Result<()> {
         let mut chunk = [0u8; 32 * 1024];
         loop {
@@ -517,7 +423,7 @@ impl<B: Budget> Buffer<u8, B> {
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(Error::from(error)),
             };
-            self.extend_from_slice(&chunk[..len]).map_err(Into::into)?;
+            self.extend_from_slice(&chunk[..len])?;
         }
     }
     #[cfg(feature = "write")]
@@ -526,11 +432,11 @@ impl<B: Budget> Buffer<u8, B> {
         bit_pos: &mut usize,
         value: u64,
         count: usize,
-    ) -> std::result::Result<(), B::Failure> {
+    ) -> std::result::Result<(), crate::codec::Error> {
         let used = *bit_pos % 8;
         let additional = (used + count).div_ceil(8) - usize::from(used != 0);
         if additional > self.values.capacity() - self.values.len() {
-            B::grow(&mut self.values, &mut self.charge, additional)?;
+            Allowance::grow(&mut self.values, &mut self.charge, additional)?;
         }
         super::fast::write_msb_bits(&mut self.values, bit_pos, value, count);
         Ok(())
@@ -555,35 +461,35 @@ fn allocation_size<T>(capacity: usize) -> Result<u64> {
         .map(|bytes| bytes as u64)
         .ok_or(Error::InvalidData("codec capacity overflows"))
 }
-impl<B: Budget> std::io::Write for Buffer<u8, B> {
+impl std::io::Write for Buffer<u8> {
     fn write(&mut self, values: &[u8]) -> std::io::Result<usize> {
         self.extend_from_slice(values)
-            .map_err(|error| std::io::Error::other(crate::Error::from(error.into())))?;
+            .map_err(|error| std::io::Error::other(crate::Error::from(error)))?;
         Ok(values.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
 }
-impl<T, B: Budget> std::ops::Deref for Buffer<T, B> {
+impl<T> std::ops::Deref for Buffer<T> {
     type Target = [T];
     #[inline]
     fn deref(&self) -> &[T] {
         &self.values
     }
 }
-impl<T, B: Budget> std::ops::DerefMut for Buffer<T, B> {
+impl<T> std::ops::DerefMut for Buffer<T> {
     #[inline]
     fn deref_mut(&mut self) -> &mut [T] {
         &mut self.values
     }
 }
-impl<T: PartialEq, B: Budget, C: Budget> PartialEq<Buffer<T, C>> for Buffer<T, B> {
-    fn eq(&self, other: &Buffer<T, C>) -> bool {
+impl<T: PartialEq> PartialEq<Buffer<T>> for Buffer<T> {
+    fn eq(&self, other: &Buffer<T>) -> bool {
         **self == **other
     }
 }
-impl<T: PartialEq, B: Budget> PartialEq<Vec<T>> for Buffer<T, B> {
+impl<T: PartialEq> PartialEq<Vec<T>> for Buffer<T> {
     fn eq(&self, other: &Vec<T>) -> bool {
         &**self == other.as_slice()
     }
@@ -640,8 +546,7 @@ mod tests {
         assert!(!constructed);
         assert_eq!(small.used(), 0);
         let budget = Allowance::limited(32);
-        let failed =
-            Boxed::<[u8; 32], _>::try_new(|| Err::<[u8; 32], _>(Error::Cancelled), &budget);
+        let failed = Boxed::<[u8; 32]>::try_new(|| Err::<[u8; 32], _>(Error::Cancelled), &budget);
         assert!(matches!(failed, Err(Error::Cancelled)));
         assert_eq!(budget.used(), 0);
         let value = Boxed::try_new(|| Ok::<_, Error>([7u8; 32]), &budget).unwrap();
@@ -780,12 +685,12 @@ mod tests {
         let result = std::panic::catch_unwind(|| {
             let mut values = Buffer::with_capacity(1, &allowance).unwrap();
             values.push(Probe(allowance.clone())).unwrap();
-            assert!(Buffer::<u8, _>::with_capacity(4096, &allowance).is_err());
+            assert!(Buffer::<u8>::with_capacity(4096, &allowance).is_err());
             panic!("unwind the worker");
         });
         assert!(result.is_err());
         assert_eq!(allowance.used(), 0);
-        drop(Buffer::<u8, _>::with_capacity(4096, &allowance).unwrap());
+        drop(Buffer::<u8>::with_capacity(4096, &allowance).unwrap());
         assert_eq!(allowance.used(), 0);
     }
 
@@ -797,7 +702,7 @@ mod tests {
         let clone = allowance.clone();
         std::thread::spawn(move || {
             assert_eq!(clone.used(), 32);
-            assert!(Buffer::<u8, _>::with_capacity(1, &clone).is_err());
+            assert!(Buffer::<u8>::with_capacity(1, &clone).is_err());
             drop(retained);
             assert_eq!(clone.used(), 0);
         })
@@ -810,9 +715,9 @@ mod tests {
     fn independent_allowances_do_not_race_for_each_others_spare_bytes() {
         let first = Allowance::limited(16);
         let second = Allowance::limited(16);
-        let kept = Buffer::<u8, _>::with_capacity(16, &first).unwrap();
-        assert!(Buffer::<u8, _>::with_capacity(1, &first).is_err());
-        drop(Buffer::<u8, _>::with_capacity(16, &second).unwrap());
+        let kept = Buffer::<u8>::with_capacity(16, &first).unwrap();
+        assert!(Buffer::<u8>::with_capacity(1, &first).is_err());
+        drop(Buffer::<u8>::with_capacity(16, &second).unwrap());
         assert_eq!(first.used(), 16);
         assert_eq!(second.used(), 0);
         drop(kept);

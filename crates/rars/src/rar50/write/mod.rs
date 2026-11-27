@@ -1,4 +1,5 @@
 use super::*;
+use crate::codec::workspace::Allowance;
 use crate::crc32::Crc32;
 #[cfg(feature = "encryption")]
 use crate::crypto::rar50::Rar50Cipher;
@@ -664,13 +665,13 @@ fn source_integrity(
     )
 }
 
-fn source_integrity_with_allowance<B: crate::codec::workspace::Budget>(
+fn source_integrity_with_allowance(
     source: &EntrySource,
     expected_size: u64,
     block_size: usize,
     blake2sp: bool,
     progress: &dyn compress::CompressionProgress,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<(u32, Option<[u8; 32]>)> {
     if progress.is_cancelled() {
         return Err(Error::Cancelled);
@@ -871,7 +872,7 @@ fn encrypt_reader_to(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn encrypt_reader_with_allowance<B: crate::codec::workspace::Budget>(
+fn encrypt_reader_with_allowance(
     reader: &mut dyn Read,
     input_size: u64,
     output: &mut dyn Write,
@@ -879,7 +880,7 @@ fn encrypt_reader_with_allowance<B: crate::codec::workspace::Budget>(
     iv: [u8; 16],
     block_size: usize,
     progress: Option<ProgressReporter<'_>>,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()> {
     #[cfg(not(feature = "encryption"))]
     {

@@ -32,7 +32,7 @@ use crate::codec::rar50::{
     seed_chains, seed_run_tree, streaming_blocks_in_window, streaming_blocks_with_finder,
     streaming_blocks_with_tree, BlockSplitter, EncodeFilter, RunFinder,
 };
-use crate::codec::workspace::{Allowance, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Buffer};
 use crate::crc32::Crc32;
 use crate::rar50::blake2sp;
 use crate::streaming::preparation::Records;
@@ -249,9 +249,9 @@ pub(super) use super::plan::CompressPlan;
 use super::plan::{filter_search_bytes, Execution, ExecutionPlan, MemberPlan};
 
 /// A bounded run of adjacent blocks, sharing one copy of the preceding input.
-struct BlockJob<B: Budget> {
-    data: Buffer<u8, B>,
-    history: Buffer<u8, B>,
+struct BlockJob {
+    data: Buffer<u8>,
+    history: Buffer<u8>,
     /// Member index, end within `data`, and final-block flag.
     blocks: Records<(usize, usize, bool)>,
     /// Where `data` starts in its member. Only filtered runs read it.
@@ -271,10 +271,10 @@ struct BlockJob<B: Budget> {
     segments: Records<(std::ops::Range<usize>, usize)>,
     /// In a solid run that was filtered, each block's filter records. `data`
     /// already holds the filtered bytes, and the blocks stay as they were.
-    records: Option<Buffer<Buffer<EncodeFilter, B>, B>>,
+    records: Option<Buffer<Buffer<EncodeFilter>>>,
     /// The run's part of a window and index it shares with other runs of its
     /// member in the wave. `data` and `history` are empty when this is set.
-    shared: Option<SharedRun<B>>,
+    shared: Option<SharedRun>,
     /// Where in `data` the member's short tail starts, when it was joined to
     /// the last run and is to be coded as a job of its own once the filters
     /// are chosen ([`split_tail`]).
@@ -287,19 +287,19 @@ struct BlockJob<B: Budget> {
 /// A run's part of its group's window, and a finder standing where the run's
 /// own would: over the group's index for a run that walks chains, or the tree
 /// a run that searches one would have seeded.
-struct SharedRun<B: Budget> {
-    window: std::sync::Arc<Buffer<u8, B>>,
+struct SharedRun {
+    window: std::sync::Arc<Buffer<u8>>,
     /// Where the run starts and ends in `window`.
     start: usize,
     end: usize,
     /// None for a run that seeds its own tree.
-    finder: Option<RunFinder<B>>,
+    finder: Option<RunFinder>,
     /// Where the group's packed index starts in `window`. It covers no more
     /// than the runs that walk chains reach back over.
     index_start: usize,
     /// For a filtered run, the blocks it is coded in and their records. Its
     /// part of `window` already holds the filtered bytes.
-    filtered: Option<crate::codec::rar50::FilteredRunBlocks<B>>,
+    filtered: Option<crate::codec::rar50::FilteredRunBlocks>,
 }
 
 /// The most a shared window holds. A packed index keeps positions in 32 bits
@@ -335,22 +335,19 @@ const SHARED_WINDOW_LIMIT: usize = u32::MAX as usize / 6;
 ///
 /// Returns, for each group outside a `chain`, the trees the wave seeds for
 /// its runs before they code.
-fn share_member_windows<B: Budget + Send + Sync>(
-    jobs: &mut [BlockJob<B>],
+fn share_member_windows(
+    jobs: &mut [BlockJob],
     plan: &CompressPlan,
     chain: bool,
-    allowance: &B,
-) -> Result<Vec<TreeRuns<B>>>
-where
-    B::Charge: Send,
-{
+    allowance: &Allowance,
+) -> Result<Vec<TreeRuns>> {
     let options = plan.encode_options;
     if !options.optimal_parse {
         return Ok(Vec::new());
     }
     let dictionary = options.max_match_distance;
-    let own_window = |job: &BlockJob<B>| job.history.len().min(dictionary) + job.data.len();
-    let shareable = |job: &BlockJob<B>| {
+    let own_window = |job: &BlockJob| job.history.len().min(dictionary) + job.data.len();
+    let shareable = |job: &BlockJob| {
         let plain = job.filters.is_empty() && job.records.is_none();
         let (window, start) = (own_window(job), job.history.len().min(dictionary));
         (plain || start != 0)
@@ -361,14 +358,14 @@ where
     // A run alone in its group shares nothing, but one that seeds a tree from
     // history is still worth a group of its own: the wave seeds it on threads
     // its own job would leave idle.
-    let seeds_alone = |job: &BlockJob<B>| {
+    let seeds_alone = |job: &BlockJob| {
         let (window, start) = (own_window(job), job.history.len().min(dictionary));
         !chain
             && start != 0
             && crate::parallel::threads() > 1
             && (job.tree || crate::codec::rar50::searches_tree(window, start, options))
     };
-    let next_to = |before: &BlockJob<B>, after: &BlockJob<B>| {
+    let next_to = |before: &BlockJob, after: &BlockJob| {
         chain || before.offset + before.data.len() == after.offset
     };
     let mut members: Vec<usize> = jobs.iter().map(|job| job.blocks[0].0).collect();
@@ -420,11 +417,11 @@ where
     // A wave of small members holds many groups. Each is built on its own
     // part of the pool, as their jobs built their own indexes before, rather
     // than one after another.
-    let mut slots: Vec<Option<&mut BlockJob<B>>> = jobs.iter_mut().map(Some).collect();
+    let mut slots: Vec<Option<&mut BlockJob>> = jobs.iter_mut().map(Some).collect();
     let mut builds: Vec<_> = groups
         .into_iter()
         .map(|(indices, window_len)| {
-            let group: Vec<&mut BlockJob<B>> = indices
+            let group: Vec<&mut BlockJob> = indices
                 .iter()
                 .map(|&index| slots[index].take().expect("a run joins one group"))
                 .collect();
@@ -448,8 +445,8 @@ where
 
 /// The runs of a group that search a tree and have none yet, and how the wave
 /// seeds them ([`code_seeded_wave`]).
-struct TreeRuns<B: Budget> {
-    window: std::sync::Arc<Buffer<u8, B>>,
+struct TreeRuns {
+    window: std::sync::Arc<Buffer<u8>>,
     /// Their jobs' indexes in the wave.
     trees: Vec<usize>,
     /// Where each starts and ends in `window`.
@@ -458,13 +455,10 @@ struct TreeRuns<B: Budget> {
     chains: Vec<std::ops::Range<usize>>,
 }
 
-impl<B: Budget + Sync> TreeRuns<B>
-where
-    B::Charge: Send,
-{
+impl TreeRuns {
     /// `None` where no run of `group`, the wave's jobs at `indices`, is seeded
     /// before its job starts.
-    fn of(group: &[&mut BlockJob<B>], indices: &[usize], options: EncodeOptions) -> Option<Self> {
+    fn of(group: &[&mut BlockJob], indices: &[usize], options: EncodeOptions) -> Option<Self> {
         let trees: Vec<usize> = (0..group.len())
             .filter(|&index| {
                 group[index]
@@ -497,29 +491,22 @@ where
     }
 }
 
-fn share_group<B: Budget + Send + Sync>(
-    group: &mut [&mut BlockJob<B>],
+fn share_group(
+    group: &mut [&mut BlockJob],
     window_len: usize,
     options: EncodeOptions,
-    allowance: &B,
-) -> Result<()>
-where
-    B::Charge: Send,
-{
+    allowance: &Allowance,
+) -> Result<()> {
     let dictionary = options.max_match_distance;
     let first = &group[0];
     let history = &first.history[first.history.len().saturating_sub(dictionary)..];
     let mut window = Buffer::with_capacity(window_len, allowance)?;
-    window
-        .extend_from_slice(history)
-        .map_err(Into::<crate::codec::Error>::into)?;
+    window.extend_from_slice(history)?;
     let mut bounds = Vec::with_capacity(group.len());
     let mut at = Vec::with_capacity(group.len());
     for job in group.iter_mut() {
         let start = window.len();
-        window
-            .extend_from_slice(&job.data)
-            .map_err(Into::<crate::codec::Error>::into)?;
+        window.extend_from_slice(&job.data)?;
         let end = window.len();
         // Where the run's own collector would start: at the run, never past
         // where the run's window can insert.
@@ -530,10 +517,10 @@ where
 
     // Filtered runs are filtered where they lie, each on its own thread, as
     // each job filtered its own copy before.
-    struct Piece<'a, B: Budget> {
+    struct Piece<'a> {
         bytes: &'a mut [u8],
-        job: &'a BlockJob<B>,
-        filtered: Option<crate::codec::Result<crate::codec::rar50::FilteredRunBlocks<B>>>,
+        job: &'a BlockJob,
+        filtered: Option<crate::codec::Result<crate::codec::rar50::FilteredRunBlocks>>,
     }
     let mut pieces = Vec::with_capacity(group.len());
     let mut rest: &mut [u8] = &mut window[bounds[0].0..];
@@ -611,14 +598,12 @@ where
     Ok(())
 }
 
-impl<B: Budget> BlockJob<B> {
-    fn append(&mut self, data: Buffer<u8, B>) -> Result<()> {
+impl BlockJob {
+    fn append(&mut self, data: Buffer<u8>) -> Result<()> {
         if self.data.is_empty() {
             self.data = data;
         } else {
-            self.data
-                .extend_from_slice(&data)
-                .map_err(Into::<crate::codec::Error>::into)?;
+            self.data.extend_from_slice(&data)?;
         }
         Ok(())
     }
@@ -643,11 +628,11 @@ impl<B: Budget> BlockJob<B> {
     /// filtered as [`filter_run_in_place`](crate::codec::rar50::filter_run_in_place)
     /// filters a run that is a job of its own, and a run without filters
     /// keeps its blocks, as it does when it is a job of its own.
-    fn filter_in_place<C: Budget>(
+    fn filter_in_place(
         &self,
         bytes: &mut [u8],
-        allowance: &C,
-    ) -> crate::codec::Result<crate::codec::rar50::FilteredRunBlocks<C>> {
+        allowance: &Allowance,
+    ) -> crate::codec::Result<crate::codec::rar50::FilteredRunBlocks> {
         let last = self.blocks.last().is_some_and(|&(_, _, last)| last);
         if self.seams.is_empty() {
             return crate::codec::rar50::filter_run_in_place(
@@ -840,7 +825,7 @@ fn next_run_searches_tree(plan: &CompressPlan, unread: u64) -> bool {
 }
 
 /// A member being read, and the packed bytes it has produced so far.
-struct MemberStream<B: Budget> {
+struct MemberStream {
     member: usize,
     input_size: u64,
     started: bool,
@@ -854,14 +839,14 @@ struct MemberStream<B: Budget> {
     /// Members go out in order, so one waits for its last block to be packed.
     done: bool,
     /// A chunk read to decide a block boundary and not used by that block.
-    pushback: Buffer<u8, B>,
+    pushback: Buffer<u8>,
     /// How much of the member has gone into jobs so far.
     placed: usize,
     crc: Crc32,
     hash: Option<blake2sp::Hasher>,
 }
 
-impl<B: Budget> MemberStream<B> {
+impl MemberStream {
     fn new(
         member: usize,
         source: &EntrySource,
@@ -869,7 +854,7 @@ impl<B: Budget> MemberStream<B> {
         blake2sp: bool,
         resources: &WriterResources,
         progress: &dyn CompressionProgress,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         if size == 0 {
             progress.started(member, size);
@@ -931,8 +916,8 @@ impl<B: Budget> MemberStream<B> {
 }
 
 /// Writing a member can take workspace, so no wave may hold any when this runs.
-fn hand_on_done<B: Budget>(
-    streams: &mut [MemberStream<B>],
+fn hand_on_done(
+    streams: &mut [MemberStream],
     handed: &mut usize,
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()> {
@@ -1214,11 +1199,11 @@ fn probe_members(
 
 /// What a probe sample packs to coded on its own by the lazy parse of level 2,
 /// unfiltered: about the least any level above the greedy one saves.
-fn probe_packed_len<B: Budget>(
+fn probe_packed_len(
     sample: &[u8],
     plan: &CompressPlan,
     cancelled: &dyn Fn() -> bool,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<usize> {
     let options = super::filter_policy::encode_options_for_level(Some(2), sample.len() as u64)?;
     let packed = crate::codec::rar50::encode_owned_member(
@@ -1868,13 +1853,7 @@ impl BlockWave {
         true
     }
 
-    fn record<B: Budget>(
-        &mut self,
-        job: &BlockJob<B>,
-        plan: &CompressPlan,
-        filter_runs: bool,
-        history: u64,
-    ) {
+    fn record(&mut self, job: &BlockJob, plan: &CompressPlan, filter_runs: bool, history: u64) {
         let mut block = crate::codec::rar50::MAX_LZ_BLOCK_SIZE;
         if !plan.encode_options.optimal_parse && (plan.solid || !filter_runs) {
             let mut start = 0;
@@ -2234,14 +2213,14 @@ fn whole_member_wave_with_slots(
     (end, reserved)
 }
 
-fn compress_whole_member<B: Budget>(
+fn compress_whole_member(
     index: usize,
     source: &EntrySource,
     integrity: Integrity,
     plan: &CompressPlan,
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<CompressedMember> {
     let (input_size, _, _) = integrity;
     let mut crc = Crc32::new();
@@ -2421,7 +2400,7 @@ fn compress_fallback_members(
 /// runs share a wave never changes the archive. With `filter_runs`, each run
 /// chooses its own filters.
 #[allow(clippy::too_many_arguments)]
-fn compress_independent_members<B: Budget + Send + Sync>(
+fn compress_independent_members(
     sources: &[EntrySource],
     integrity: &[Integrity],
     plan: &CompressPlan,
@@ -2432,13 +2411,10 @@ fn compress_independent_members<B: Budget + Send + Sync>(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-    allowance: &B,
+    allowance: &Allowance,
     straight: &Straight<'_>,
     consume: &mut ConsumePacked<'_>,
-) -> Result<()>
-where
-    B::Charge: Send,
-{
+) -> Result<()> {
     let group_capacity = batch_capacity.min(source_preparation_window(sources));
     let mut group_start = 0;
     while group_start < sources.len() {
@@ -2469,7 +2445,7 @@ where
         let mut offsets = Records::collect((0..streams.len()).map(|_| Ok(0usize)), resources)?;
         let mut cursor = 0usize;
         let mut handed = 0usize;
-        let goes_straight = |stream: &MemberStream<B>| straight(stream.member, stream.input_size);
+        let goes_straight = |stream: &MemberStream| straight(stream.member, stream.input_size);
         while streams.iter().any(MemberStream::has_more) {
             // Between waves, so writing a whole member holds no workspace.
             hand_on_done(&mut streams, &mut handed, consume)?;
@@ -2665,7 +2641,7 @@ where
 
 /// One dictionary running through every member in order.
 #[allow(clippy::too_many_arguments)]
-fn compress_solid_chain<B: Budget + Send + Sync>(
+fn compress_solid_chain(
     sources: &[EntrySource],
     integrity: &[Integrity],
     plan: &CompressPlan,
@@ -2675,13 +2651,10 @@ fn compress_solid_chain<B: Budget + Send + Sync>(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-    allowance: &B,
+    allowance: &Allowance,
     straight: &Straight<'_>,
     consume: &mut ConsumePacked<'_>,
-) -> Result<()>
-where
-    B::Charge: Send,
-{
+) -> Result<()> {
     let source_window = source_preparation_window(sources);
     let mut streams = Records::new(sources.len(), resources)?;
 
@@ -2691,7 +2664,7 @@ where
     let mut handed = 0usize;
     // Runs cross into it as into any member, so both outputs pack alike; the
     // wave its first run is in ends with that run, and it opens after.
-    let goes_straight = |stream: &MemberStream<B>| {
+    let goes_straight = |stream: &MemberStream| {
         !stream.started && !stream.straight && straight(stream.member, stream.input_size)
     };
     let mut remaining = 0u64;
@@ -2852,8 +2825,8 @@ where
 
 /// A large member whose first run went into the spool opens once every
 /// member before it is out, and what it packed to so far follows its header.
-fn hand_on_opening<B: Budget>(
-    streams: &mut [MemberStream<B>],
+fn hand_on_opening(
+    streams: &mut [MemberStream],
     handed: &mut usize,
     straight: &Straight<'_>,
     consume: &mut ConsumePacked<'_>,
@@ -2889,11 +2862,11 @@ fn hand_on_opening<B: Budget>(
 /// One chunk, then further chunks while the data is not moving, which is the
 /// same question [`BlockSplitter`] answers for the buffered writer. Both have
 /// to reach the same answer or the same input packs to two different archives.
-fn read_block<B: Budget>(
-    stream: &mut MemberStream<B>,
+fn read_block(
+    stream: &mut MemberStream,
     block_size: usize,
     progress: &dyn CompressionProgress,
-) -> Result<Buffer<u8, B>> {
+) -> Result<Buffer<u8>> {
     if !stream.started {
         progress.started(stream.member, stream.input_size);
         stream.started = true;
@@ -2910,18 +2883,17 @@ fn read_block<B: Budget>(
             stream.pushback = next;
             break;
         }
-        data.extend_from_slice(&next)
-            .map_err(Into::<crate::codec::Error>::into)?;
+        data.extend_from_slice(&next)?;
     }
     Ok(data)
 }
 
 /// Reads one chunk, preferring anything a previous read put back.
-fn read_chunk<B: Budget>(
-    stream: &mut MemberStream<B>,
+fn read_chunk(
+    stream: &mut MemberStream,
     block_size: usize,
     progress: &dyn CompressionProgress,
-) -> Result<Buffer<u8, B>> {
+) -> Result<Buffer<u8>> {
     if progress.is_cancelled() {
         return Err(Error::Cancelled);
     }
@@ -2969,13 +2941,13 @@ static TAILS_CUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 
 /// Cuts each job's tail ([`BlockJob::tail`]) off into a job of its own,
 /// after it, where [`split_tail`] can.
-fn split_tails<B: Budget>(
-    jobs: Records<BlockJob<B>>,
+fn split_tails(
+    jobs: Records<BlockJob>,
     filter_runs: bool,
     plan: &CompressPlan,
     resources: &WriterResources,
-    allowance: &B,
-) -> Result<Records<BlockJob<B>>> {
+    allowance: &Allowance,
+) -> Result<Records<BlockJob>> {
     let tails = jobs.iter().filter(|job| job.tail.is_some()).count();
     let mut split = Records::new(jobs.len() + tails, resources)?;
     for mut job in jobs {
@@ -3005,14 +2977,14 @@ fn split_tails<B: Budget>(
 ///
 /// With `filter_runs`, the tail's history is left for the caller to fill
 /// once the job's filtered bytes are known.
-fn split_tail<B: Budget>(
-    job: &mut BlockJob<B>,
+fn split_tail(
+    job: &mut BlockJob,
     at: usize,
     filter_runs: bool,
     plan: &CompressPlan,
     resources: &WriterResources,
-    allowance: &B,
-) -> Result<Option<BlockJob<B>>> {
+    allowance: &Allowance,
+) -> Result<Option<BlockJob>> {
     let len = job.data.len();
     let run = job.seams.last().copied().unwrap_or(0);
     debug_assert!(run < at && at < len);
@@ -3087,7 +3059,7 @@ fn split_tail<B: Budget>(
 }
 
 /// The part of an explicit filter that falls in a job's run, ranged over it.
-fn explicit_run_filter<B: Budget>(job: &mut BlockJob<B>, spec: &crate::FilterSpec) -> Result<()> {
+fn explicit_run_filter(job: &mut BlockJob, spec: &crate::FilterSpec) -> Result<()> {
     let mut found = Vec::new();
     for run in job.runs(job.data.len()) {
         let offset = job.offset + run.start;
@@ -3119,8 +3091,8 @@ fn explicit_run_range(
 /// holds scratch for that job at a time. Without an execution ledger every
 /// piece of the wave is searched side by side instead, as many at once as
 /// there are threads ([`WaveWorkspace::peak`]).
-fn choose_run_filters<B: Budget>(
-    jobs: &mut [BlockJob<B>],
+fn choose_run_filters(
+    jobs: &mut [BlockJob],
     plan: &CompressPlan,
     required: u64,
     resources: &WriterResources,
@@ -3186,9 +3158,7 @@ fn choose_run_filters<B: Budget>(
 
 /// The pieces a job's filters are searched in, each with where it starts in
 /// its file. A joined job searches on the same grid as its runs would alone.
-fn filter_pieces<B: Budget>(
-    job: &BlockJob<B>,
-) -> impl Iterator<Item = (std::ops::Range<usize>, usize)> + '_ {
+fn filter_pieces(job: &BlockJob) -> impl Iterator<Item = (std::ops::Range<usize>, usize)> + '_ {
     let segments: Vec<(std::ops::Range<usize>, usize)> = if job.segments.is_empty() {
         job.runs(job.data.len())
             .map(|run| {
@@ -3213,14 +3183,14 @@ fn filter_pieces<B: Budget>(
 }
 
 /// The filters found in one piece of `job`'s data, ranged over the data.
-fn search_filter_piece<B: Budget, C: Budget>(
-    job: &BlockJob<B>,
+fn search_filter_piece(
+    job: &BlockJob,
     range: std::ops::Range<usize>,
     offset: usize,
     plan: &CompressPlan,
     progress: &dyn CompressionProgress,
     resources: &WriterResources,
-    allowance: &C,
+    allowance: &Allowance,
 ) -> Result<Records<crate::FilterSpec>> {
     let specs = super::filter_policy::run_filters_with_allowance(
         &job.data[range.clone()],
@@ -3243,22 +3213,19 @@ fn search_filter_piece<B: Budget, C: Budget>(
 /// Compresses a wave of blocks in parallel, then appends the results to their
 /// members in job order so output does not depend on scheduling.
 #[allow(clippy::too_many_arguments)]
-fn compress_wave<B: Budget + Send + Sync>(
-    jobs: Records<BlockJob<B>>,
-    seeding: Vec<TreeRuns<B>>,
+fn compress_wave(
+    jobs: Records<BlockJob>,
+    seeding: Vec<TreeRuns>,
     plan: &CompressPlan,
     _required: u64,
-    streams: &mut [MemberStream<B>],
+    streams: &mut [MemberStream],
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     consume: &mut ConsumePacked<'_>,
-) -> Result<()>
-where
-    B::Charge: Send,
-{
+) -> Result<()> {
     if resources.execution.is_some() {
-        let jobs = prepare_block_jobs::<B, crate::codec::workspace::Limited>(jobs, resources)?;
+        let jobs = prepare_block_jobs(jobs, resources)?;
         let packed_runs = run_jobs_admitted(
             jobs,
             resources,
@@ -3268,7 +3235,7 @@ where
         )?;
         return append_packed_runs(packed_runs, plan, streams, advance, error_context, consume);
     }
-    let jobs = prepare_block_jobs::<B, B>(jobs, resources)?;
+    let jobs = prepare_block_jobs(jobs, resources)?;
     let output = Records::new(jobs.len(), resources)?;
     let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
     let packed_runs = complete_jobs_dispatched(
@@ -3288,30 +3255,30 @@ where
     append_packed_runs(packed_runs, plan, streams, advance, error_context, consume)
 }
 
-type WaveSlot<B> = JobSlot<PreparedBlockJob<B, B>, PackedBlocks<B>>;
+type WaveSlot = JobSlot<PreparedBlockJob, PackedBlocks>;
 
 /// A wave job's index and slot.
-type WaveJob<'s, B> = (usize, &'s mut WaveSlot<B>);
+type WaveJob<'s> = (usize, &'s mut WaveSlot);
 
 /// What one of a wave's threads takes on in [`code_seeded_wave`].
-enum WaveUnit<'s, B: Budget> {
+enum WaveUnit<'s> {
     /// A job that needs no tree seeded for it.
-    Job(WaveJob<'s, B>),
+    Job(WaveJob<'s>),
     /// A run seeded alone, under a cap on how many threads it splits between,
     /// and then coded.
     Alone {
         window: &'s [u8],
         run: std::ops::Range<usize>,
-        job: WaveJob<'s, B>,
+        job: WaveJob<'s>,
         cap: Option<usize>,
     },
     /// Chains of runs seeded from shared trees.
-    Chains(Vec<WaveChain<'s, B>>),
+    Chains(Vec<WaveChain<'s>>),
 }
 
 /// A chain of runs seeded from a shared tree: their window, the runs, and
 /// their jobs.
-type WaveChain<'s, B> = (&'s [u8], &'s [std::ops::Range<usize>], Vec<WaveJob<'s, B>>);
+type WaveChain<'s> = (&'s [u8], &'s [std::ops::Range<usize>], Vec<WaveJob<'s>>);
 
 /// Runs a wave's jobs through `run`, each as soon as it can: one with no tree
 /// to seed at once, and one whose run `seeding` seeds alone as soon as its
@@ -3325,15 +3292,13 @@ type WaveChain<'s, B> = (&'s [u8], &'s [std::ops::Range<usize>], Vec<WaveJob<'s,
 /// seeded. Those chains go one after another, since each holds a seed tree
 /// while it seeds, which the wave is charged for once. Groups with none split
 /// the threads between them while they seed.
-fn code_seeded_wave<B: Budget + Send + Sync>(
-    slots: &mut [WaveSlot<B>],
-    seeding: &[TreeRuns<B>],
+fn code_seeded_wave(
+    slots: &mut [WaveSlot],
+    seeding: &[TreeRuns],
     options: EncodeOptions,
-    run: &RunSlot<'_, PreparedBlockJob<B, B>, PackedBlocks<B>>,
-) where
-    B::Charge: Send,
-{
-    let mut slots: Vec<Option<&mut WaveSlot<B>>> = slots.iter_mut().map(Some).collect();
+    run: &RunSlot<'_, PreparedBlockJob, PackedBlocks>,
+) {
+    let mut slots: Vec<Option<&mut WaveSlot>> = slots.iter_mut().map(Some).collect();
     let mut take = |index: usize| (index, slots[index].take().expect("a job is seeded once"));
     let lone = seeding.iter().filter(|runs| !runs.shares_a_tree()).count();
     let lone_cap = (crate::parallel::threads() / lone.max(1)).max(1);
@@ -3370,7 +3335,7 @@ fn code_seeded_wave<B: Budget + Send + Sync>(
     );
     // Hands a job its tree, or the error seeding it, and says whether it is
     // still to run.
-    let seeded = |(index, slot): &mut WaveJob<'_, B>, tree: crate::codec::Result<_>| match tree {
+    let seeded = |(index, slot): &mut WaveJob<'_>, tree: crate::codec::Result<_>| match tree {
         Ok(tree) => {
             let (job, _, _) = slot.0.as_mut().expect("a seeded job has not run");
             job.shared.as_mut().expect("a seeded run is shared").finder =
@@ -3425,13 +3390,13 @@ fn code_seeded_wave<B: Budget + Send + Sync>(
     });
 }
 
-type PackedBlocks<B> = Records<(usize, Buffer<u8, B>, bool)>;
-type PreparedBlockJob<B, C> = (BlockJob<B>, Records<(usize, bool)>, PackedBlocks<C>);
+type PackedBlocks = Records<(usize, Buffer<u8>, bool)>;
+type PreparedBlockJob = (BlockJob, Records<(usize, bool)>, PackedBlocks);
 
-fn prepare_block_jobs<B: Budget, C: Budget>(
-    jobs: Records<BlockJob<B>>,
+fn prepare_block_jobs(
+    jobs: Records<BlockJob>,
     resources: &WriterResources,
-) -> Result<Records<PreparedBlockJob<B, C>>> {
+) -> Result<Records<PreparedBlockJob>> {
     // Allocate boundary and result descriptors before dispatch. Worker outputs
     // carry their scoped codec charge; descriptor arrays keep the root charge.
     Records::collect(
@@ -3447,12 +3412,12 @@ fn prepare_block_jobs<B: Budget, C: Budget>(
     )
 }
 
-fn encode_block_job<B: Budget, C: Budget>(
-    (job, boundaries, mut output): PreparedBlockJob<B, C>,
+fn encode_block_job(
+    (job, boundaries, mut output): PreparedBlockJob,
     plan: &CompressPlan,
     progress: &dyn CompressionProgress,
-    allowance: &C,
-) -> Result<PackedBlocks<C>> {
+    allowance: &Allowance,
+) -> Result<PackedBlocks> {
     if !job.filters.is_empty() && job.seams.is_empty() && !job.tree {
         let (member, _, last) = *job.blocks.last().expect("a job holds a block");
         let mut reported = 0usize;
@@ -3500,9 +3465,7 @@ fn encode_block_job<B: Budget, C: Budget>(
     } else {
         let empty = Buffer::new(&data.allowance());
         let mut window = std::mem::replace(&mut job.history, empty);
-        window
-            .extend_from_slice(&data)
-            .map_err(Into::<crate::codec::Error>::into)?;
+        window.extend_from_slice(&data)?;
         drop(data);
         window
     };
@@ -3547,8 +3510,7 @@ fn encode_block_job<B: Budget, C: Budget>(
         let (member, _, last) = *job.blocks.last().expect("a job holds a block");
         let mut run = Buffer::new(allowance);
         for block in packed {
-            run.extend_from_slice(&block)
-                .map_err(Into::<crate::codec::Error>::into)?;
+            run.extend_from_slice(&block)?;
         }
         output.push((member, run, last))?;
         return Ok(output);
@@ -3561,12 +3523,12 @@ fn encode_block_job<B: Budget, C: Budget>(
 
 /// A run that shares its member's window and index with the other runs of
 /// the wave, coded by the same block walk as one with its own.
-fn encode_shared_block_job<B: Budget>(
-    (job, boundaries, mut output): PreparedBlockJob<B, B>,
+fn encode_shared_block_job(
+    (job, boundaries, mut output): PreparedBlockJob,
     plan: &CompressPlan,
     progress: &dyn CompressionProgress,
-    allowance: &B,
-) -> Result<PackedBlocks<B>> {
+    allowance: &Allowance,
+) -> Result<PackedBlocks> {
     let BlockJob {
         blocks,
         shared,
@@ -3637,8 +3599,7 @@ fn encode_shared_block_job<B: Budget>(
         let (member, _, last) = *blocks.last().expect("a job holds a block");
         let mut run = Buffer::new(allowance);
         for block in packed {
-            run.extend_from_slice(&block)
-                .map_err(Into::<crate::codec::Error>::into)?;
+            run.extend_from_slice(&block)?;
         }
         output.push((member, run, last))?;
         return Ok(output);
@@ -3649,10 +3610,10 @@ fn encode_shared_block_job<B: Budget>(
     Ok(output)
 }
 
-fn append_packed_runs<B: Budget, C: Budget>(
-    packed_runs: Records<PackedBlocks<C>>,
+fn append_packed_runs(
+    packed_runs: Records<PackedBlocks>,
     plan: &CompressPlan,
-    streams: &mut [MemberStream<B>],
+    streams: &mut [MemberStream],
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     consume: &mut ConsumePacked<'_>,
@@ -3772,7 +3733,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn independent<B: Budget + Send + Sync>(
+    fn independent(
         sources: &[EntrySource],
         integrity: &[Integrity],
         plan: &CompressPlan,
@@ -3782,12 +3743,9 @@ mod tests {
         resources: &WriterResources,
         advance: &dyn CompressionProgress,
         error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-        allowance: &B,
+        allowance: &Allowance,
         consume: &mut ConsumePacked<'_>,
-    ) -> Result<()>
-    where
-        B::Charge: Send,
-    {
+    ) -> Result<()> {
         compress_independent_members(
             sources,
             integrity,
@@ -3806,7 +3764,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn solid_chain<B: Budget + Send + Sync>(
+    fn solid_chain(
         sources: &[EntrySource],
         integrity: &[Integrity],
         plan: &CompressPlan,
@@ -3816,12 +3774,9 @@ mod tests {
         resources: &WriterResources,
         advance: &dyn CompressionProgress,
         error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-        allowance: &B,
+        allowance: &Allowance,
         consume: &mut ConsumePacked<'_>,
-    ) -> Result<()>
-    where
-        B::Charge: Send,
-    {
+    ) -> Result<()> {
         compress_solid_chain(
             sources,
             integrity,
@@ -4567,11 +4522,7 @@ mod tests {
             ];
             let initial = [(8192, 0, None), (2048, 0, None), (0, 0, None)];
             let mut expected_integrity = initial;
-            let encode = if solid {
-                solid_chain::<Allowance>
-            } else {
-                independent::<Allowance>
-            };
+            let encode = if solid { solid_chain } else { independent };
             let expected = packed_by(&mut expected_integrity, |integrity, consume| {
                 encode(
                     &sources,
@@ -4604,11 +4555,7 @@ mod tests {
             for limit in [0, 1023, 2048, 8192, 32768, 131072, 524288, 4 * 1024 * 1024] {
                 let allowance = Allowance::limited(limit);
                 let mut integrity = initial;
-                let encode = if solid {
-                    solid_chain::<crate::codec::workspace::Limited>
-                } else {
-                    independent::<crate::codec::workspace::Limited>
-                };
+                let encode = if solid { solid_chain } else { independent };
                 let result = packed_by(&mut integrity, |integrity, consume| {
                     encode(
                         &sources,
@@ -4645,11 +4592,7 @@ mod tests {
             assert!(refusals >= 3 && successes > 0);
 
             let allowance = Allowance::limited(4 * 1024 * 1024);
-            let encode = if solid {
-                solid_chain::<crate::codec::workspace::Limited>
-            } else {
-                independent::<crate::codec::workspace::Limited>
-            };
+            let encode = if solid { solid_chain } else { independent };
             let mut integrity = initial;
             let result = packed_by(&mut integrity, |integrity, consume| {
                 encode(
@@ -4698,11 +4641,7 @@ mod tests {
             };
             let mut expected_integrity = [(size as u64, 0, None); 2];
             let mut actual_integrity = expected_integrity;
-            let encode = if solid {
-                solid_chain::<Allowance>
-            } else {
-                independent::<Allowance>
-            };
+            let encode = if solid { solid_chain } else { independent };
             let expected = packed_by(&mut expected_integrity, |integrity, consume| {
                 encode(
                     &sources,
@@ -4720,11 +4659,7 @@ mod tests {
             })
             .unwrap();
             let allowance = Allowance::limited(64 * 1024 * 1024);
-            let encode = if solid {
-                solid_chain::<crate::codec::workspace::Limited>
-            } else {
-                independent::<crate::codec::workspace::Limited>
-            };
+            let encode = if solid { solid_chain } else { independent };
             let actual = packed_by(&mut actual_integrity, |integrity, consume| {
                 encode(
                     &sources,
@@ -6476,7 +6411,7 @@ mod tests {
                         let mut integrity = [(data.len() as u64, 0, None)];
                         let cut = TAILS_CUT.load(Ordering::Relaxed);
                         let mut spools = packed_by(&mut integrity, |integrity, consume| {
-                            compress_independent_members::<Allowance>(
+                            compress_independent_members(
                                 &sources,
                                 integrity,
                                 &plan,
@@ -6544,7 +6479,7 @@ mod tests {
                 let mut integrity = [(data.len() as u64, 0, None)];
                 let mut spools = super::super::plan::with_filter_search_bytes(256 * 1024, || {
                     packed_by(&mut integrity, |integrity, consume| {
-                        compress_independent_members::<Allowance>(
+                        compress_independent_members(
                             &sources,
                             integrity,
                             &plan,

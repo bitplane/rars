@@ -1,10 +1,7 @@
 //! RAR29 standard VM filter recognition and execution.
 use super::super::filters;
-#[cfg(all(test, feature = "write"))]
-use super::Allowance;
-use super::{
-    rar29_delta_messages, Budget, Buffer, Error, Result, StandardFilter, MAX_AUDIO_CHANNELS,
-};
+use super::{rar29_delta_messages, Buffer, Error, Result, StandardFilter, MAX_AUDIO_CHANNELS};
+use crate::codec::workspace::Allowance;
 use crate::crc32::crc32;
 
 pub(super) fn identify_standard_filter(code: &[u8]) -> Option<StandardFilter> {
@@ -52,9 +49,9 @@ pub(super) fn apply_standard_filter(
     )
 }
 
-pub(super) fn apply_standard_filter_with_allowance<B: Budget>(
+pub(super) fn apply_standard_filter_with_allowance(
     filter: StandardFilter,
-    data: &mut Buffer<u8, B>,
+    data: &mut Buffer<u8>,
     file_offset: u32,
     regs: &[u32; 7],
     control: &crate::read_control::ReadControl,
@@ -163,13 +160,13 @@ pub(super) fn rgb_decode_with_control(
     rgb_decode_with_allowance(data, width, pos_r, control, &Allowance::default())
         .map(Buffer::into_vec)
 }
-fn rgb_decode_with_allowance<B: Budget>(
+fn rgb_decode_with_allowance(
     data: &[u8],
     width: usize,
     pos_r: usize,
     control: &crate::read_control::ReadControl,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     control.check_codec()?;
     let mut poller = control.poller();
     if data.len() < 3 || width == 0 || !width.is_multiple_of(3) || width > data.len() || pos_r > 2 {
@@ -230,12 +227,12 @@ pub(super) fn audio_decode_with_control(
     audio_decode_with_allowance(data, channels, control, &Allowance::default())
         .map(Buffer::into_vec)
 }
-fn audio_decode_with_allowance<B: Budget>(
+fn audio_decode_with_allowance(
     data: &[u8],
     channels: usize,
     control: &crate::read_control::ReadControl,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     control.check_codec()?;
     let mut poller = control.poller();
     let mut out = Buffer::filled(data.len(), 0, allowance)?;
