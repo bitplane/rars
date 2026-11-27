@@ -802,15 +802,15 @@ impl TreeMatchFinder {
         let end = range
             .end
             .min(input.len().saturating_sub(Self::MIN_MATCH - 1));
+        let split = HashShares::balanced(input, range.start..end, shares);
         let insert = |share: usize| {
+            let owned = split.owned(share);
             // The tree collector leaves the same positions out, in cells
             // counted from the run the history is for.
             let mut noise = super::noise::NoiseScan::with_cells(range.end);
             for pos in range.start..end {
                 let hash = self.hash(input, pos);
-                if (shares == 1 || (hash * shares) >> Self::HASH_BITS == share)
-                    && !noise.skips(input, pos)
-                {
+                if owned.contains(&HashShares::bucket(hash)) && !noise.skips(input, pos) {
                     let inserted =
                         self.descend::<true>(input, pos, hash, len_limit(pos), 0, cut, None);
                     debug_assert!(
@@ -820,11 +820,10 @@ impl TreeMatchFinder {
                 }
             }
         };
-        // Share 0 holds the hash of a run of zeroes, which can be most of the
-        // work in machine code, and `spread` keeps it on this thread.
-        crate::parallel::spread(shares.max(1), insert);
+        crate::parallel::spread(split.len(), insert);
     }
 
+    #[inline]
     fn hash(&self, input: &[u8], pos: usize) -> usize {
         mix(
             u32::from_le_bytes([input[pos], input[pos + 1], input[pos + 2], input[pos + 3]]),
@@ -1203,29 +1202,117 @@ pub(crate) fn seed_shares(positions: usize) -> usize {
 }
 
 /// About how much of putting `positions` of `input` into a tree falls to the
-/// busiest of `shares` hash shares, as a fraction of the whole, from a sample
-/// of the positions. A share's hashes go in on one thread, so this much of
-/// the work is done in sequence however many threads there are: in machine
-/// code, say, where runs of zeroes all have one hash.
+/// busiest of `shares` hash shares ([`HashShares::balanced`]), as a fraction
+/// of the whole. A share's hashes go in on one thread, so this much of the
+/// work is done in sequence however many threads there are: in machine code,
+/// say, where runs of zeroes all have one hash.
 #[cfg(feature = "write")]
 pub(crate) fn seed_skew(input: &[u8], positions: std::ops::Range<usize>, shares: usize) -> f64 {
-    const STEP: usize = 7;
-    let bits = TreeMatchFinder::HASH_BITS;
-    let shares = shares.max(1);
     let end = positions
         .end
         .min(input.len().saturating_sub(TreeMatchFinder::MIN_MATCH - 1));
-    let mut counts = vec![0usize; shares];
-    for pos in (positions.start..end).step_by(STEP) {
-        let bytes = [input[pos], input[pos + 1], input[pos + 2], input[pos + 3]];
-        counts[(mix(u32::from_le_bytes(bytes), bits) * shares) >> bits] += 1;
+    HashShares::balanced(input, positions.start..end, shares).busiest
+}
+
+/// A split of a tree's hashes between threads that put positions in side by
+/// side, in contiguous ranges of hash buckets. Any split puts in the same
+/// links, since every hash's positions still go in in order on one thread,
+/// so the split only decides how evenly the work falls.
+#[cfg(feature = "write")]
+struct HashShares {
+    /// Share `s` owns the buckets from `bounds[s]` up to `bounds[s + 1]`.
+    bounds: Vec<usize>,
+    /// The fraction of the sampled positions the busiest share owns.
+    busiest: f64,
+    /// Which range the busiest share owns. It is numbered share 0, which
+    /// [`crate::parallel::spread`] keeps on the calling thread.
+    heaviest: usize,
+}
+
+#[cfg(feature = "write")]
+impl HashShares {
+    const BUCKET_BITS: u32 = 12;
+    /// One position in this many is sampled to weigh the buckets.
+    const STEP: usize = 7;
+
+    fn bucket(hash: usize) -> usize {
+        hash >> (TreeMatchFinder::HASH_BITS - Self::BUCKET_BITS)
     }
-    let total: usize = counts.iter().sum();
-    let busiest = counts.into_iter().max().unwrap_or(0);
-    if total == 0 {
-        1.0
-    } else {
-        busiest as f64 / total as f64
+
+    /// At most `shares` shares of the hashes at `positions`, each of which
+    /// must have four bytes, that leave the busiest as little of a sample of
+    /// them as contiguous ranges can. A hash that is a large part of the
+    /// input, such as a run of zeroes' in machine code, gets a share to
+    /// itself, and the rest spread over the others.
+    fn balanced(input: &[u8], positions: std::ops::Range<usize>, shares: usize) -> Self {
+        let buckets = 1 << Self::BUCKET_BITS;
+        if shares <= 1 {
+            return Self {
+                bounds: vec![0, buckets],
+                busiest: 1.0,
+                heaviest: 0,
+            };
+        }
+        let mut counts = [0u32; 1 << Self::BUCKET_BITS];
+        for pos in positions.step_by(Self::STEP) {
+            let bytes = [input[pos], input[pos + 1], input[pos + 2], input[pos + 3]];
+            counts[Self::bucket(mix(u32::from_le_bytes(bytes), TreeMatchFinder::HASH_BITS))] += 1;
+        }
+        let total: u64 = counts.iter().map(|&count| u64::from(count)).sum();
+        if total == 0 {
+            return Self {
+                bounds: vec![0, buckets],
+                busiest: 1.0,
+                heaviest: 0,
+            };
+        }
+        // Each share takes what is left over the shares left, closing before
+        // the bucket that would take it further past that than short of it.
+        // A bucket heavier than that closes the share before it and fills one
+        // of its own, and the rest spread over the shares after it.
+        let mut bounds = vec![0];
+        // Of the sample, `seen` is in the buckets so far and `closed` in the
+        // shares closed so far.
+        let (mut seen, mut closed) = (0u64, 0u64);
+        for (bucket, &count) in counts.iter().enumerate() {
+            let count = u64::from(count);
+            let left = (shares + 1 - bounds.len()) as u64;
+            let fair = (total - closed) / left;
+            if seen > closed && left > 1 && 2 * (seen - closed) + count > 2 * fair {
+                bounds.push(bucket);
+                closed = seen;
+            }
+            seen += count;
+        }
+        bounds.push(buckets);
+        let held = |range: &[usize]| -> u64 {
+            counts[range[0]..range[1]]
+                .iter()
+                .map(|&count| u64::from(count))
+                .sum()
+        };
+        let heaviest = (0..bounds.len() - 1)
+            .max_by_key(|&share| held(&bounds[share..share + 2]))
+            .unwrap_or(0);
+        Self {
+            busiest: held(&bounds[heaviest..heaviest + 2]) as f64 / total as f64,
+            bounds,
+            heaviest,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.bounds.len() - 1
+    }
+
+    /// The buckets share `share` owns.
+    fn owned(&self, share: usize) -> std::ops::Range<usize> {
+        let range = match share {
+            0 => self.heaviest,
+            share if share <= self.heaviest => share - 1,
+            share => share,
+        };
+        self.bounds[range]..self.bounds[range + 1]
     }
 }
 
@@ -2071,7 +2158,7 @@ mod tests {
 
     /// Few symbols with long copies, so descents run deep, hit the cut and
     /// match whole limits.
-    #[cfg(all(feature = "write", feature = "parallel"))]
+    #[cfg(feature = "write")]
     fn busy_input(len: usize) -> Vec<u8> {
         let mut state = 0x5eed_7ee5_0b5e_1234u64;
         let mut input: Vec<u8> = (0..len)
@@ -2162,6 +2249,101 @@ mod tests {
                     assert!(
                         tree.links() == *expected,
                         "run {run:?} at {threads} threads differs"
+                    );
+                }
+            });
+        }
+    }
+
+    /// Machine-code-like input: one hash, a run of zeroes', holds about a
+    /// fifth of the positions.
+    #[cfg(feature = "write")]
+    fn skewed_input(len: usize) -> Vec<u8> {
+        let mut input = busy_input(len);
+        for (index, chunk) in input.chunks_mut(40).enumerate() {
+            chunk[..8 + index % 5].fill(0);
+        }
+        input
+    }
+
+    /// A hash that holds a fifth of the positions gets a share of its own,
+    /// and the rest of the buckets spread over the other shares, each of
+    /// them covered once.
+    #[test]
+    #[cfg(feature = "write")]
+    fn a_heavy_hash_gets_a_share_of_its_own() {
+        let input = skewed_input(1 << 20);
+        let positions = 0..input.len() - 3;
+        let split = super::HashShares::balanced(&input, positions.clone(), 8);
+        assert_eq!(split.len(), 8);
+        let mut owned: Vec<_> = (0..split.len()).map(|share| split.owned(share)).collect();
+        let zeroes = super::HashShares::bucket(super::mix(0, TreeMatchFinder::HASH_BITS));
+        assert!(owned[0].contains(&zeroes) && owned[0].len() == 1);
+        owned.sort_by_key(|range| range.start);
+        assert_eq!(owned.first().map(|range| range.start), Some(0));
+        assert_eq!(
+            owned.last().map(|range| range.end),
+            Some(1 << super::HashShares::BUCKET_BITS)
+        );
+        assert!(owned.windows(2).all(|pair| pair[0].end == pair[1].start));
+        let uniform = super::HashShares {
+            bounds: (0..=8)
+                .map(|share| share << (super::HashShares::BUCKET_BITS - 3))
+                .collect(),
+            busiest: 1.0,
+            heaviest: 0,
+        };
+        let busiest = |split: &super::HashShares| {
+            (0..split.len())
+                .map(|share| {
+                    let owned = split.owned(share);
+                    positions
+                        .clone()
+                        .filter(|&pos| {
+                            owned.contains(&super::HashShares::bucket(super::mix(
+                                u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap()),
+                                TreeMatchFinder::HASH_BITS,
+                            )))
+                        })
+                        .count()
+                })
+                .max()
+                .unwrap()
+        };
+        let (balanced, even) = (busiest(&split), busiest(&uniform));
+        assert!(balanced < even, "{balanced} positions against {even}");
+        assert!((split.busiest - balanced as f64 / positions.len() as f64).abs() < 0.01);
+    }
+
+    /// A tree seeded with a split skewed by one hash is the one seeded on one
+    /// thread, link for link, however many shares and threads it splits
+    /// between.
+    #[test]
+    #[cfg(all(feature = "write", feature = "parallel"))]
+    fn a_skewed_split_seeds_the_tree_one_thread_seeds() {
+        let input = skewed_input(1 << 20);
+        let (nice, cut) = (48, 12);
+        let allowance = super::Allowance::default();
+        let seed = |shares| {
+            TreeMatchFinder::seeded(
+                input.len(),
+                &input,
+                0..input.len() - 3,
+                |pos| (input.len() - pos).min(nice),
+                cut,
+                shares,
+                &allowance,
+            )
+            .unwrap()
+            .links()
+        };
+        let expected = seed(1);
+        for threads in [1, 2, 8] {
+            crate::parallel::private_pool(threads).install(|| {
+                for shares in [2, 5, 16] {
+                    assert!(
+                        seed(shares) == expected,
+                        "{shares} shares at {threads} threads differ"
                     );
                 }
             });
