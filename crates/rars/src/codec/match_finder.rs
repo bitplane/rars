@@ -787,6 +787,22 @@ impl<B: Budget> TreeMatchFinder<B> {
         )
     }
 
+    /// Starts loading what the descent at `pos` reads first, the newest
+    /// position under its hash: its child links and its bytes. Called a
+    /// position ahead, those misses overlap the descent before it.
+    #[cfg(feature = "write")]
+    #[inline]
+    pub(crate) fn prefetch(&self, input: &[u8], pos: usize) {
+        if pos + Self::MIN_MATCH > input.len() {
+            return;
+        }
+        let newest = resolve(pos, self.head[self.hash(input, pos)].load(Relaxed));
+        if newest < pos {
+            crate::simd::prefetch(&self.son, (newest & self.mask) << 1);
+            crate::simd::prefetch(input, newest);
+        }
+    }
+
     /// Each hash's head and the two child links of each window slot, for
     /// tests to compare whole trees.
     #[cfg(test)]

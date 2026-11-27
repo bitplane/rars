@@ -36,57 +36,48 @@ pub(crate) fn write_msb_bits(
     }
 }
 
+/// How many bytes at `pos` repeat those `distance` back, up to `max_length`
+/// and the end of `input`.
+///
+/// Compares a word at a time and finds the first differing byte from the
+/// lowest set bit of the XOR. Small enough to inline into the match finders,
+/// where most calls end inside the first word.
 #[cfg(any(test, feature = "write"))]
+#[inline]
 pub(crate) fn match_length(input: &[u8], pos: usize, distance: usize, max_length: usize) -> usize {
     // Encoders supply older match-finder candidates or remembered distances
     // already admitted at an earlier position in this forward-moving parse.
     debug_assert!(distance != 0 && distance <= pos);
 
-    let max_length = max_length.min(input.len().saturating_sub(pos));
-    match_length_scalar(input, pos, distance, max_length, 0)
-}
-
-#[cfg(any(test, feature = "write"))]
-fn match_length_scalar(
-    input: &[u8],
-    pos: usize,
-    distance: usize,
-    max_length: usize,
-    mut length: usize,
-) -> usize {
-    while length + 32 <= max_length {
-        for offset in [0, 8, 16, 24] {
-            let current = u64::from_le_bytes(
-                input[pos + length + offset..pos + length + offset + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let previous = u64::from_le_bytes(
-                input[pos + length + offset - distance..pos + length + offset - distance + 8]
-                    .try_into()
-                    .unwrap(),
-            );
-            let difference = current ^ previous;
-            if difference != 0 {
-                return length + offset + (difference.trailing_zeros() / 8) as usize;
-            }
-        }
-        length += 32;
-    }
-    while length + 8 <= max_length {
-        let current = u64::from_le_bytes(input[pos + length..pos + length + 8].try_into().unwrap());
-        let previous = u64::from_le_bytes(
-            input[pos + length - distance..pos + length - distance + 8]
-                .try_into()
-                .unwrap(),
-        );
-        let difference = current ^ previous;
+    let Some(current) = input.get(pos..) else {
+        return 0;
+    };
+    let max_length = max_length.min(current.len());
+    let current = &current[..max_length];
+    let previous = &input[pos - distance..][..max_length];
+    let mut length = 0;
+    let (current_words, _) = current.as_chunks::<8>();
+    let (previous_words, _) = previous.as_chunks::<8>();
+    for (current, previous) in current_words.iter().zip(previous_words) {
+        let difference = u64::from_le_bytes(*current) ^ u64::from_le_bytes(*previous);
         if difference != 0 {
             return length + (difference.trailing_zeros() / 8) as usize;
         }
         length += 8;
     }
-    while length < max_length && input[pos + length] == input[pos + length - distance] {
+    if length < max_length && max_length >= 8 {
+        // The last word overlaps bytes already proven equal, so its first
+        // difference is still the first one past `length`.
+        let last = max_length - 8;
+        let difference = u64::from_le_bytes(current[last..].try_into().unwrap())
+            ^ u64::from_le_bytes(previous[last..].try_into().unwrap());
+        return if difference == 0 {
+            max_length
+        } else {
+            last + (difference.trailing_zeros() / 8) as usize
+        };
+    }
+    while length < max_length && current[length] == previous[length] {
         length += 1;
     }
     length
@@ -224,6 +215,27 @@ mod tests {
             let max = (input.len() - pos).min(96);
             let expected = reference_match_length(&input, pos, distance, max);
             assert_eq!(match_length(&input, pos, distance, max), expected);
+        }
+    }
+
+    #[test]
+    fn match_length_finds_every_mismatch_offset_at_every_extent() {
+        let base: Vec<u8> = (0..40u8).collect();
+        let mut input = base.clone();
+        input.extend_from_slice(&base);
+        let pos = base.len();
+        for mismatch in 0..=base.len() {
+            let mut input = input.clone();
+            if mismatch < base.len() {
+                input[pos + mismatch] ^= 0x80;
+            }
+            for max in 0..=base.len() {
+                assert_eq!(
+                    match_length(&input, pos, pos, max),
+                    reference_match_length(&input, pos, pos, max),
+                    "mismatch={mismatch}, max={max}"
+                );
+            }
         }
     }
 
