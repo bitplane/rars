@@ -1,6 +1,6 @@
 use super::{Archive, DecoderSession, ExtractedEntryMeta, FileHeader, Redirections, Settling};
 use crate::codec::rar50::HistoryRetention;
-use crate::codec::workspace::{Budget, Buffer};
+use crate::codec::workspace::Buffer;
 use crate::error::{Error, Result};
 use crate::output_limit::OutputBudget;
 use crate::read_control::ReadControl;
@@ -19,9 +19,9 @@ enum Outcome {
     FlushFailed(Error),
 }
 
-struct Job<B: Budget> {
+struct Job {
     writer: Box<dyn Write + Send>,
-    data: Buffer<u8, B>,
+    data: Buffer<u8>,
     verified_name: Option<Vec<u8>>,
 }
 
@@ -32,11 +32,11 @@ struct Done {
 }
 
 /// A member decoded on the calling thread while the one before it is written.
-pub(super) struct Decoded<'f, B: Budget> {
+pub(super) struct Decoded<'f> {
     file: &'f FileHeader,
     // False when the member failed the checks made before its output opens.
     opens: bool,
-    decoded: Result<(Buffer<u8, B>, Result<()>)>,
+    decoded: Result<(Buffer<u8>, Result<()>)>,
 }
 
 struct Pending<'f> {
@@ -46,15 +46,15 @@ struct Pending<'f> {
 }
 
 /// Writes each buffered solid member on its own thread so its successor decodes meanwhile.
-pub(super) struct Lane<'s, 'a, 'f, B: Budget> {
+pub(super) struct Lane<'s, 'a, 'f> {
     settling: &'s Settling<'a>,
-    jobs: Option<mpsc::Sender<Job<B>>>,
+    jobs: Option<mpsc::Sender<Job>>,
     done: mpsc::Receiver<Done>,
     thread: Option<JoinHandle<()>>,
     pending: Option<Pending<'f>>,
 }
 
-impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
+impl<'s, 'a, 'f> Lane<'s, 'a, 'f> {
     /// Only where outputs can be sent and nothing has to see a write as it happens.
     pub(super) fn start(
         settling: Option<&'s Settling<'a>>,
@@ -72,7 +72,7 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
                 && crate::parallel::may_spawn()
         })?;
         let control = budget.control.clone();
-        let (jobs, queued) = mpsc::channel::<Job<B>>();
+        let (jobs, queued) = mpsc::channel::<Job>();
         let (finished, done) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name("rars-write".into())
@@ -125,8 +125,8 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
         redirections: Redirections,
         buffered_decode_limit: u64,
         budget: &OutputBudget,
-        session: &mut DecoderSession<'_, B>,
-    ) -> Option<Decoded<'f, B>> {
+        session: &mut DecoderSession<'_>,
+    ) -> Option<Decoded<'f>> {
         if file.is_directory()
             || file.is_stored()
             || file.is_split_before()
@@ -158,7 +158,7 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
     /// Opens a decoded member's output and queues its write; Some when it settled at once.
     pub(super) fn write(
         &mut self,
-        decoded: Decoded<'f, B>,
+        decoded: Decoded<'f>,
         options: crate::ArchiveReadOptions<'_>,
         budget: &OutputBudget,
     ) -> Option<Result<()>> {
@@ -238,7 +238,7 @@ impl<'s, 'a, 'f, B: Budget> Lane<'s, 'a, 'f, B> {
     }
 }
 
-impl<B: Budget> Drop for Lane<'_, '_, '_, B> {
+impl Drop for Lane<'_, '_, '_> {
     fn drop(&mut self) {
         self.jobs = None;
         if let Some(thread) = self.thread.take() {
@@ -272,13 +272,13 @@ fn write_member(control: &ReadControl, writer: &mut dyn Write, mut bytes: &[u8])
     Outcome::Written
 }
 
-impl<B: Budget> DecoderSession<'_, B> {
+impl DecoderSession<'_> {
     /// Leaves a member that would still be written to fail at its write, so the chain goes on.
     fn decode_to_write(
         &mut self,
         archive: &Archive,
         file: &FileHeader,
-    ) -> Result<(Buffer<u8, B>, Result<()>)> {
+    ) -> Result<(Buffer<u8>, Result<()>)> {
         self.decoder.read_control.check()?;
         self.guard_solid_chain(file, |session| {
             session.claim_ahead(file);

@@ -2,7 +2,7 @@
 //! standard ones. Decoding reaches it only when
 //! `ArchiveReadOptions::allow_rar3_vm_programs` is set. The `Program` wrapper
 //! with plain vectors exists for the unit tests and fuzz targets.
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::{Error, Result};
 
 pub(super) const MEMORY_SIZE: usize = 0x40000;
@@ -181,17 +181,17 @@ impl Program {
 }
 
 #[derive(Debug)]
-pub(crate) struct OwnedProgram<B: Budget> {
-    static_data: Buffer<u8, B>,
-    instructions: Buffer<OwnedInstruction<B>, B>,
+pub(crate) struct OwnedProgram {
+    static_data: Buffer<u8>,
+    instructions: Buffer<OwnedInstruction>,
 }
 #[derive(Debug)]
-struct OwnedInstruction<B: Budget> {
+struct OwnedInstruction {
     opcode: Opcode,
     byte_mode: bool,
-    operands: Buffer<Operand, B>,
+    operands: Buffer<Operand>,
 }
-impl<B: Budget> OwnedProgram<B> {
+impl OwnedProgram {
     pub(crate) fn try_clone(&self) -> Result<Self> {
         let allowance = self.static_data.allowance();
         Ok(Self {
@@ -215,12 +215,12 @@ impl<B: Budget> OwnedProgram<B> {
         invocation: Invocation<'_>,
         control: &crate::read_control::ReadControl,
         instruction_limit: usize,
-    ) -> Result<OwnedExecutionResult<B>> {
+    ) -> Result<OwnedExecutionResult> {
         control.check_codec()?;
         let mut vm = Vm::with_allowance(self, invocation, &self.static_data.allowance())?;
         vm.run_with_limit(self, control, instruction_limit.min(MAX_INSTRUCTIONS))
     }
-    pub(crate) fn parse(blob: &[u8], allowance: &B) -> Result<Self> {
+    pub(crate) fn parse(blob: &[u8], allowance: &Allowance) -> Result<Self> {
         if blob.is_empty() {
             return Err(Error::InvalidData("RARVM program blob is empty"));
         }
@@ -274,7 +274,7 @@ impl<B: Budget> OwnedProgram<B> {
     }
 }
 #[cfg(test)]
-impl From<Program> for OwnedProgram<Allowance> {
+impl From<Program> for OwnedProgram {
     fn from(program: Program) -> Self {
         Self {
             static_data: program.static_data.into(),
@@ -292,7 +292,7 @@ impl From<Program> for OwnedProgram<Allowance> {
     }
 }
 #[cfg(any(test, fuzzing))]
-impl OwnedProgram<Allowance> {
+impl OwnedProgram {
     fn into_public(self) -> Program {
         Program {
             static_data: self.static_data.into_vec(),
@@ -337,7 +337,7 @@ impl ProgramCode for Program {
         self.instructions.len()
     }
 }
-impl<B: Budget> ProgramCode for OwnedProgram<B> {
+impl ProgramCode for OwnedProgram {
     fn static_data(&self) -> &[u8] {
         &self.static_data
     }
@@ -355,16 +355,16 @@ impl<B: Budget> ProgramCode for OwnedProgram<B> {
     }
 }
 #[derive(Debug)]
-pub(crate) struct OwnedExecutionResult<B: Budget> {
-    pub(crate) output: Buffer<u8, B>,
-    pub(crate) globals: Buffer<u8, B>,
+pub(crate) struct OwnedExecutionResult {
+    pub(crate) output: Buffer<u8>,
+    pub(crate) globals: Buffer<u8>,
     /// Instructions executed, counting the final one.
     pub(crate) instructions: usize,
     #[cfg(any(test, fuzzing))]
     pub(crate) regs: [u32; 8],
 }
 #[cfg(any(test, fuzzing))]
-impl OwnedExecutionResult<Allowance> {
+impl OwnedExecutionResult {
     fn into_public(self) -> ExecutionResult {
         ExecutionResult {
             output: self.output.into_vec(),
@@ -511,11 +511,11 @@ impl Opcode {
     }
 }
 
-fn parse_instruction_with_allowance<B: Budget>(
+fn parse_instruction_with_allowance(
     bits: &mut BitReader<'_>,
     instruction_index: usize,
-    allowance: &B,
-) -> Result<OwnedInstruction<B>> {
+    allowance: &Allowance,
+) -> Result<OwnedInstruction> {
     let opcode = if bits.read_bit()? == 0 {
         Opcode::from_encoded(bits.read_bits(3)? as u8)
     } else {
@@ -579,8 +579,8 @@ fn remap_jump_target(value: u32, instruction_index: usize) -> u32 {
     (instruction_index as i64).wrapping_add(distance) as u32
 }
 
-struct Vm<B: Budget = Allowance> {
-    memory: Buffer<u8, B>,
+struct Vm {
+    memory: Buffer<u8>,
     regs: [u32; 8],
     flags: u32,
 }
@@ -592,11 +592,11 @@ enum ShiftKind {
     ArithmeticRight,
 }
 
-impl<B: Budget> Vm<B> {
+impl Vm {
     fn with_allowance(
         program: &impl ProgramCode,
         invocation: Invocation<'_>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         if invocation.input.len() > GLOBAL_BASE {
             return Err(Error::InvalidData("RARVM filter input is too large"));
@@ -654,7 +654,7 @@ impl<B: Budget> Vm<B> {
         &mut self,
         program: &impl ProgramCode,
         control: &crate::read_control::ReadControl,
-    ) -> Result<OwnedExecutionResult<B>> {
+    ) -> Result<OwnedExecutionResult> {
         self.run_with_limit(program, control, MAX_INSTRUCTIONS)
     }
 
@@ -663,7 +663,7 @@ impl<B: Budget> Vm<B> {
         program: &impl ProgramCode,
         control: &crate::read_control::ReadControl,
         instruction_limit: usize,
-    ) -> Result<OwnedExecutionResult<B>> {
+    ) -> Result<OwnedExecutionResult> {
         let mut poller = control.poller();
         let mut ip = 0usize;
         let mut terminated = false;
@@ -1110,7 +1110,7 @@ fn write_u32(memory: &mut [u8], address: usize, value: u32) {
 }
 
 #[cfg(test)]
-impl Vm<Allowance> {
+impl Vm {
     fn new(program: &impl ProgramCode, invocation: Invocation<'_>) -> Result<Self> {
         Self::with_allowance(program, invocation, &Allowance::default())
     }

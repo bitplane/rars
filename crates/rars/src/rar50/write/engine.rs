@@ -2306,14 +2306,14 @@ fn recovery_payload<W: Write>(
 }
 
 #[cfg(feature = "recovery")]
-fn recovery_payload_with_allowance<W: Write, B: crate::codec::workspace::Budget>(
+fn recovery_payload_with_allowance<W: Write>(
     recovery_percent: u64,
     prefix: &mut (impl Read + Seek),
     prefix_len: u64,
     payload: impl FnOnce() -> Result<W>,
     resources: &WriterResources,
     progress: Option<ProgressReporter<'_>>,
-    allowance: &B,
+    allowance: &crate::codec::workspace::Allowance,
 ) -> Result<(W, u64, u32)> {
     let plan = plan_inline_recovery(prefix_len, recovery_percent)?;
     let (mode, required) = choose_recovery_memory_mode(plan, resources.memory_limit())?;

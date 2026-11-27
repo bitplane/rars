@@ -2764,7 +2764,7 @@ mod tests {
 
     #[test]
     fn reader_workspace_rar13_refusals_release_dictionary_input_and_stream_buffers() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
         let data = b"abcabcabc".repeat(64);
         for encrypted in crate::test_features::encryption_cases() {
             let password = encrypted.then_some(b"pw".as_slice());
@@ -2780,18 +2780,18 @@ mod tests {
             let archive = Archive::parse(&bytes).unwrap();
             let entry = &archive.entries[0];
             assert!(!entry.is_stored());
-            let run = |quota: &RefusingBudget| -> Result<()> {
+            let run = |quota: &Allowance| -> Result<()> {
                 let mut decoder = Decoder15::with_allowance(quota);
                 let mut out = Buffer::new(quota);
                 entry.write_compressed_to(&archive, password, &mut decoder, false, &mut out)?;
                 assert_eq!(&out[..], &data);
                 Ok(())
             };
-            let baseline = RefusingBudget::new(usize::MAX);
+            let baseline = Allowance::refusing(usize::MAX);
             run(&baseline).unwrap();
             assert_eq!(baseline.used(), 0);
             for index in 0..baseline.attempts() {
-                let quota = RefusingBudget::new(index);
+                let quota = Allowance::refusing(index);
                 let error = run(&quota).unwrap_err();
                 assert_eq!(
                     entry.entry_error("extracting", error).kind(),

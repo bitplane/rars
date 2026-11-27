@@ -18,7 +18,7 @@ mod history_tests;
 mod match_copy_tests;
 
 use super::packed_window::DRAINED;
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::{Error, Result, RAR20_ENDED_EARLY};
 use std::io::{Read, Write};
 
@@ -69,9 +69,9 @@ pub fn unpack20_decode(input: &[u8], output_size: usize) -> Result<Vec<u8>> {
 #[derive(Debug, Clone)]
 pub struct Unpack20 {
     pub(crate) read_control: crate::read_control::ReadControl,
-    state: Reader20State<Allowance>,
+    state: Reader20State,
 }
-impl Clone for Reader20State<Allowance> {
+impl Clone for Reader20State {
     fn clone(&self) -> Self {
         self.try_clone().expect("unlimited legacy decoder copy")
     }
@@ -110,7 +110,7 @@ impl Unpack20 {
     }
 }
 #[cfg(all(test, feature = "write"))]
-impl Reader20State<Allowance> {
+impl Reader20State {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
     }
@@ -120,14 +120,14 @@ impl Reader20State<Allowance> {
     }
 }
 #[derive(Debug)]
-pub(crate) struct Reader20State<B: Budget> {
+pub(crate) struct Reader20State {
     pub(crate) read_control: crate::read_control::ReadControl,
-    bits: BitReader<B>,
+    bits: BitReader,
     levels: [u8; OLD_LEVEL_COUNT],
-    main: Huffman<B>,
-    offsets: BitwiseHuffman<B>,
-    lengths: BitwiseHuffman<B>,
-    audio_tables: [BitwiseHuffman<B>; MAX_CHANNELS],
+    main: Huffman,
+    offsets: BitwiseHuffman,
+    lengths: BitwiseHuffman,
+    audio_tables: [BitwiseHuffman; MAX_CHANNELS],
     audio_block: bool,
     channels: usize,
     cur_channel: usize,
@@ -138,12 +138,12 @@ pub(crate) struct Reader20State<B: Budget> {
     last_length: usize,
     pending_match: Option<(usize, usize, bool)>,
     in_block: bool,
-    output: Buffer<u8, B>,
+    output: Buffer<u8>,
     base_offset: usize,
 }
 
-impl<B: Budget> Reader20State<B> {
-    pub(crate) fn with_allowance(allowance: &B) -> Self {
+impl Reader20State {
+    pub(crate) fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
             bits: BitReader::with_allowance(allowance),
@@ -198,11 +198,7 @@ impl<B: Budget> Reader20State<B> {
             base_offset: self.base_offset + drain,
         })
     }
-    pub fn decode_member_owned(
-        &mut self,
-        input: &[u8],
-        output_size: usize,
-    ) -> Result<Buffer<u8, B>> {
+    pub fn decode_member_owned(&mut self, input: &[u8], output_size: usize) -> Result<Buffer<u8>> {
         self.read_control.check_codec()?;
         let start = self.current_pos();
         let target = start
@@ -443,7 +439,7 @@ impl<B: Budget> Reader20State<B> {
         Ok(())
     }
 
-    fn read_level_lengths(bits: &mut BitReader<B>) -> Result<[u8; LEVEL_COUNT]> {
+    fn read_level_lengths(bits: &mut BitReader) -> Result<[u8; LEVEL_COUNT]> {
         let mut lengths = [0u8; LEVEL_COUNT];
         for length in &mut lengths {
             *length = bits.read_bits(4)? as u8;
@@ -810,21 +806,21 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
 }
 
 #[derive(Debug)]
-struct Huffman<B: Budget = Allowance, const LOOKUP: bool = true> {
-    state: super::canonical::Huffman<B>,
+struct Huffman<const LOOKUP: bool = true> {
+    state: super::canonical::Huffman,
 }
 
 // Accelerate the large LZ alphabet. Keep metadata and audio bitwise to
 // avoid lookup setup for small tables and extra work for one-bit audio codes.
-type BitwiseHuffman<B = Allowance> = Huffman<B, false>;
+type BitwiseHuffman = Huffman<false>;
 
-impl<B: Budget, const LOOKUP: bool> Huffman<B, LOOKUP> {
-    fn with_allowance(allowance: &B) -> Self {
+impl<const LOOKUP: bool> Huffman<LOOKUP> {
+    fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             state: super::canonical::Huffman::with_allowance(allowance),
         }
     }
-    fn with_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
+    fn with_lengths(lengths: &[u8], allowance: &Allowance) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
             if len > 15 {
@@ -853,7 +849,7 @@ impl<B: Budget, const LOOKUP: bool> Huffman<B, LOOKUP> {
         })
     }
     #[inline]
-    fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
+    fn decode(&self, bits: &mut BitReader) -> Result<usize> {
         if !LOOKUP {
             return self.state.decode(
                 || bits.read_bit(),
@@ -885,7 +881,7 @@ impl<B: Budget, const LOOKUP: bool> Huffman<B, LOOKUP> {
 }
 
 #[cfg(all(test, feature = "write"))]
-impl<const LOOKUP: bool> Huffman<Allowance, LOOKUP> {
+impl<const LOOKUP: bool> Huffman<LOOKUP> {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
         Self::with_lengths(lengths, &Allowance::default())
     }
@@ -896,15 +892,15 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct BitReader<B: Budget = Allowance> {
-    input: Buffer<u8, B>,
+struct BitReader {
+    input: Buffer<u8>,
     bit_pos: usize,
     // Bit position to refill the window at; `DRAINED` once the source is.
     refill_at: usize,
 }
 
-impl<B: Budget> BitReader<B> {
-    fn with_allowance(allowance: &B) -> Self {
+impl BitReader {
+    fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             input: Buffer::new(allowance),
             bit_pos: 0,
@@ -912,7 +908,7 @@ impl<B: Budget> BitReader<B> {
         }
     }
 
-    fn streaming(allowance: &B) -> Self {
+    fn streaming(allowance: &Allowance) -> Self {
         Self {
             refill_at: 0,
             ..Self::with_allowance(allowance)
@@ -936,7 +932,7 @@ impl<B: Budget> BitReader<B> {
     }
     fn append(&mut self, input: &[u8]) -> Result<()> {
         self.compact();
-        self.input.extend_from_slice(input).map_err(Into::into)
+        self.input.extend_from_slice(input)
     }
 
     fn compact(&mut self) {
@@ -1019,7 +1015,7 @@ impl<B: Budget> BitReader<B> {
 }
 
 #[cfg(all(test, feature = "write"))]
-impl BitReader<Allowance> {
+impl BitReader {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
     }

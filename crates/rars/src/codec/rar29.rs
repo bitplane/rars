@@ -32,7 +32,7 @@ use super::filters::MAX_DELTA_CHANNELS;
 use super::packed_window::DRAINED;
 use super::ppmd::{Ppmd7, PpmdByteReader};
 use super::rarvm;
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::{Error, Result, RAR29_ENDED_EARLY};
 use crate::read_control::Rar3VmPrograms;
 use std::io::{Read, Write};
@@ -140,9 +140,9 @@ fn rar29_delta_messages() -> DeltaErrorMessages {
 #[derive(Debug, Clone)]
 pub struct Unpack29 {
     pub(crate) read_control: crate::read_control::ReadControl,
-    state: Reader29State<Allowance>,
+    state: Reader29State,
 }
-impl Clone for Reader29State<Allowance> {
+impl Clone for Reader29State {
     fn clone(&self) -> Self {
         self.try_clone().expect("unlimited RAR3 decoder copy")
     }
@@ -224,14 +224,14 @@ impl Unpack29 {
     }
 }
 #[derive(Debug)]
-pub(crate) struct Reader29State<B: Budget> {
+pub(crate) struct Reader29State {
     pub(crate) read_control: crate::read_control::ReadControl,
-    bits: BitReader<B>,
+    bits: BitReader,
     levels: [u8; TABLE_COUNT],
-    main: Huffman<B>,
-    offsets: Huffman<B>,
-    low_offsets: Huffman<B>,
-    lengths: Huffman<B>,
+    main: Huffman,
+    offsets: Huffman,
+    low_offsets: Huffman,
+    lengths: Huffman,
     old_offsets: [usize; 4],
     last_offset: usize,
     last_length: usize,
@@ -240,13 +240,13 @@ pub(crate) struct Reader29State<B: Budget> {
     pending_match: Option<(usize, usize, bool)>,
     in_lz_block: bool,
     block_mode: BlockMode,
-    ppmd: Ppmd7<B>,
+    ppmd: Ppmd7,
     ppmd_esc: u8,
-    filters: Buffer<VmFilter<B>, B>,
-    programs: Buffer<VmProgram<B>, B>,
+    filters: Buffer<VmFilter>,
+    programs: Buffer<VmProgram>,
     last_filter: usize,
     base_offset: usize,
-    output: Buffer<u8, B>,
+    output: Buffer<u8>,
     last_block_end: Option<LzBlockEnd>,
     // Set when the last member's stream went on past its declared size.
     ran_past: bool,
@@ -316,15 +316,15 @@ fn require_ppmd_symbol(symbol: Option<u8>) -> Result<u8> {
 }
 
 #[derive(Debug)]
-struct VmFilter<B: Budget = Allowance> {
+struct VmFilter {
     program: usize,
     start: usize,
     size: usize,
     regs: [u32; 7],
-    global_data: Buffer<u8, B>,
+    global_data: Buffer<u8>,
 }
 
-impl<B: Budget> VmFilter<B> {
+impl VmFilter {
     /// Saturates so a block near the top of a 32-bit address space never wraps into range.
     fn end(&self) -> usize {
         self.start.saturating_add(self.size)
@@ -332,17 +332,17 @@ impl<B: Budget> VmFilter<B> {
 }
 
 #[derive(Debug)]
-struct VmProgram<B: Budget = Allowance> {
-    kind: VmProgramKind<B>,
+struct VmProgram {
+    kind: VmProgramKind,
     block_size: usize,
     exec_count: u32,
-    globals: Buffer<u8, B>,
+    globals: Buffer<u8>,
 }
 
 #[derive(Debug)]
-enum VmProgramKind<B: Budget = Allowance> {
+enum VmProgramKind {
     Standard(StandardFilter),
-    Generic(rarvm::OwnedProgram<B>),
+    Generic(rarvm::OwnedProgram),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -355,8 +355,8 @@ enum StandardFilter {
     Audio,
 }
 
-impl<B: Budget> Reader29State<B> {
-    pub(crate) fn with_allowance(allowance: &B) -> Self {
+impl Reader29State {
+    pub(crate) fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
             bits: BitReader::with_allowance(allowance),
@@ -457,7 +457,7 @@ impl<B: Budget> Reader29State<B> {
         &mut self,
         input: &[u8],
         output_size: usize,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.read_control.check_codec()?;
         self.reset_non_solid();
         self.decode_member_owned(input, output_size)
@@ -488,11 +488,7 @@ impl<B: Budget> Reader29State<B> {
         self.decode_member_from_reader(input, output_size, out)
     }
 
-    pub fn decode_member_owned(
-        &mut self,
-        input: &[u8],
-        output_size: usize,
-    ) -> Result<Buffer<u8, B>> {
+    pub fn decode_member_owned(&mut self, input: &[u8], output_size: usize) -> Result<Buffer<u8>> {
         let mut out = Buffer::new(&self.output.allowance());
         self.decode_member_to(input, output_size, &mut out)?;
         Ok(out)
@@ -805,7 +801,7 @@ impl<B: Budget> Reader29State<B> {
         Ok(())
     }
 
-    fn read_level_lengths(bits: &mut BitReader<B>) -> Result<[u8; LEVEL_COUNT]> {
+    fn read_level_lengths(bits: &mut BitReader) -> Result<[u8; LEVEL_COUNT]> {
         let mut lengths = [0u8; LEVEL_COUNT];
         let mut pos = 0usize;
         while pos < LEVEL_COUNT {
@@ -847,9 +843,7 @@ impl<B: Budget> Reader29State<B> {
                     let mut bits = CachedBits::at(&self.bits.input, self.bits.bit_pos);
                     let count = bits.quick_literals(&self.main.state, &mut literals[..room]);
                     self.bits.bit_pos = bits.position();
-                    self.output
-                        .extend_from_slice(&literals[..count])
-                        .map_err(Into::into)?;
+                    self.output.extend_from_slice(&literals[..count])?;
                 }
                 256 => {
                     self.read_end_of_block()?;
@@ -1143,7 +1137,7 @@ impl<B: Budget> Reader29State<B> {
         self.parse_vm_code_owned(first_byte, data)
     }
 
-    fn parse_vm_code_owned(&mut self, first_byte: u32, data: Buffer<u8, B>) -> Result<()> {
+    fn parse_vm_code_owned(&mut self, first_byte: u32, data: Buffer<u8>) -> Result<()> {
         let mut vm = BitReader {
             input: data,
             bit_pos: 0,
@@ -1277,7 +1271,7 @@ impl<B: Budget> Reader29State<B> {
         start: usize,
         end: usize,
         member_start: usize,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         let mut out = Buffer::with_capacity(end - start, &self.output.allowance())?;
         let mut pos = start;
         let filters = Buffer::collect(
@@ -1301,8 +1295,7 @@ impl<B: Budget> Reader29State<B> {
             if filter_start < pos {
                 return Err(Error::InvalidData("RAR 2.9 VM filters partially overlap"));
             }
-            out.extend_from_slice(self.raw_range(pos, filter_start)?)
-                .map_err(Into::into)?;
+            out.extend_from_slice(self.raw_range(pos, filter_start)?)?;
             let mut block = Buffer::copied(
                 self.raw_range(filter_start, filter_end)?,
                 &self.output.allowance(),
@@ -1403,11 +1396,10 @@ impl<B: Budget> Reader29State<B> {
                     break;
                 }
             }
-            out.extend_from_slice(&block).map_err(Into::into)?;
+            out.extend_from_slice(&block)?;
             pos = filter_end;
         }
-        out.extend_from_slice(self.raw_range(pos, end)?)
-            .map_err(Into::into)?;
+        out.extend_from_slice(self.raw_range(pos, end)?)?;
         let mut index = 0;
         self.filters.retain(|_| {
             let keep = !applied[index];
@@ -1487,7 +1479,7 @@ impl<B: Budget> Reader29State<B> {
                         let bytes: [u8; COPY_WIDTH] = self.output[from..from + COPY_WIDTH]
                             .try_into()
                             .expect("fixed-width slice");
-                        self.output.extend_from_slice(&bytes).map_err(Into::into)?;
+                        self.output.extend_from_slice(&bytes)?;
                         from += COPY_WIDTH;
                     }
                     self.output.truncate(at + now);
@@ -1590,7 +1582,7 @@ impl<B: Budget> Reader29State<B> {
 }
 
 #[cfg(all(test, feature = "write"))]
-impl Reader29State<Allowance> {
+impl Reader29State {
     fn filtered_range(&mut self, start: usize, end: usize, member_start: usize) -> Result<Vec<u8>> {
         self.filtered_range_owned(start, end, member_start)
             .map(Buffer::into_vec)
@@ -1624,17 +1616,17 @@ fn fill_levels(levels: &mut [u8], pos: &mut usize, count: usize, value: u8) -> R
 }
 
 #[derive(Debug)]
-struct Huffman<B: Budget = Allowance> {
-    state: super::canonical::Huffman<B>,
+struct Huffman {
+    state: super::canonical::Huffman,
 }
 
-impl<B: Budget> Huffman<B> {
-    fn with_allowance(allowance: &B) -> Self {
+impl Huffman {
+    fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             state: super::canonical::Huffman::with_allowance(allowance),
         }
     }
-    fn from_lengths_with_allowance(lengths: &[u8], allowance: &B) -> Result<Self> {
+    fn from_lengths_with_allowance(lengths: &[u8], allowance: &Allowance) -> Result<Self> {
         let mut count = [0u16; 16];
         for &len in lengths {
             if len != 0 {
@@ -1659,7 +1651,7 @@ impl<B: Budget> Huffman<B> {
     /// see the RAR 5 decoder's `HuffmanState::decode`.
     // Always inlined: it runs once per symbol.
     #[inline(always)]
-    fn decode(&self, bits: &mut BitReader<B>) -> Result<usize> {
+    fn decode(&self, bits: &mut BitReader) -> Result<usize> {
         let (peek, available) = bits.peek15();
         let (symbol, len) = self.state.decode_peeked_checked(
             peek,
@@ -1671,14 +1663,14 @@ impl<B: Budget> Huffman<B> {
         Ok(symbol)
     }
     #[inline(always)]
-    fn literal_follows(&self, bits: &BitReader<B>) -> bool {
+    fn literal_follows(&self, bits: &BitReader) -> bool {
         let entry = self.state.quick_entry(bits.peek15().0);
         entry != 0 && entry < 256 << 4
     }
 }
 
 #[cfg(all(test, feature = "write"))]
-impl Huffman<Allowance> {
+impl Huffman {
     fn from_lengths(lengths: &[u8]) -> Result<Self> {
         Self::from_lengths_with_allowance(lengths, &Allowance::default())
     }
@@ -1689,15 +1681,15 @@ fn validate_huffman_counts(count: &[u16; 16]) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct BitReader<B: Budget = Allowance> {
-    input: Buffer<u8, B>,
+struct BitReader {
+    input: Buffer<u8>,
     bit_pos: usize,
     // Bit position to refill the window at; `usize::MAX` once the source is drained.
     refill_at: usize,
 }
 
-impl<B: Budget> BitReader<B> {
-    fn with_allowance(allowance: &B) -> Self {
+impl BitReader {
+    fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             input: Buffer::new(allowance),
             bit_pos: 0,
@@ -1705,14 +1697,14 @@ impl<B: Budget> BitReader<B> {
         }
     }
 
-    fn streaming(allowance: &B) -> Self {
+    fn streaming(allowance: &Allowance) -> Self {
         Self {
             refill_at: 0,
             ..Self::with_allowance(allowance)
         }
     }
 
-    fn from_bytes_with_allowance(input: &[u8], allowance: &B) -> Result<Self> {
+    fn from_bytes_with_allowance(input: &[u8], allowance: &Allowance) -> Result<Self> {
         Ok(Self {
             input: Buffer::copied(input, allowance)?,
             bit_pos: 0,
@@ -1746,7 +1738,6 @@ impl<B: Budget> BitReader<B> {
         self.compact();
         self.input
             .extend_from_slice(input)
-            .map_err(Into::into)
             .expect("test input allowance");
     }
 
@@ -1882,14 +1873,14 @@ impl<B: Budget> BitReader<B> {
     }
 }
 
-impl<B: Budget> PpmdByteReader for BitReader<B> {
+impl PpmdByteReader for BitReader {
     fn read_ppmd_byte(&mut self) -> Result<u8> {
         self.read_bits(8).map(|value| value as u8)
     }
 }
 
 #[cfg(all(test, feature = "write"))]
-impl BitReader<Allowance> {
+impl BitReader {
     fn from_bytes(input: &[u8]) -> Self {
         Self::from_bytes_with_allowance(input, &Allowance::default()).expect("unlimited RAR3 input")
     }

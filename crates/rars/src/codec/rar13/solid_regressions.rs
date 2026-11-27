@@ -1,6 +1,6 @@
 use super::*;
-type Unpack15 = Reader15State<Allowance>;
-type BitReader = ReaderBits<Allowance>;
+type Unpack15 = Reader15State;
+type BitReader = ReaderBits;
 
 /// The options the RAR 1.3 writer uses at its default level.
 fn rar13_options() -> EncodeOptions {

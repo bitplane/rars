@@ -120,7 +120,7 @@ fn peeks_skips_and_reads_interleave_across_refills_and_tails() {
     }
 }
 
-fn literal_table() -> HuffmanState<Allowance> {
+fn literal_table() -> HuffmanState {
     let mut lengths = vec![0u8; 306];
     lengths[..254].fill(8);
     lengths[254] = 9;
@@ -131,7 +131,7 @@ fn literal_table() -> HuffmanState<Allowance> {
 }
 
 fn generic_literals(
-    table: &HuffmanState<Allowance>,
+    table: &HuffmanState,
     input: &[u8],
     start: usize,
     end: usize,
@@ -232,7 +232,7 @@ fn wide_reads_keep_every_bit_and_refuse_without_consuming() {
     }
 }
 
-fn byte_table(eights: &[usize], tens: &[usize], fours: &[usize]) -> HuffmanState<Allowance> {
+fn byte_table(eights: &[usize], tens: &[usize], fours: &[usize]) -> HuffmanState {
     let mut lengths = vec![0u8; 306];
     for (symbols, length) in [(eights, 8), (tens, 10), (fours, 4)] {
         for &symbol in symbols {

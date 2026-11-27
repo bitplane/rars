@@ -1,5 +1,4 @@
 use super::canonical::Huffman;
-use super::workspace::Budget;
 use super::{Error, Result};
 
 #[derive(Clone, Copy)]
@@ -135,7 +134,7 @@ impl<'a> CachedBits<'a> {
 
     /// Consumes nothing on `None`, leaving the code to the caller's full decoder.
     #[inline(always)]
-    pub(super) fn quick_literal<B: Budget>(&mut self, table: &Huffman<B>) -> Option<u8> {
+    pub(super) fn quick_literal(&mut self, table: &Huffman) -> Option<u8> {
         let (peek, available) = self.peek15();
         let entry = table.quick_entry(peek);
         let len = (entry & 15) as usize;
@@ -148,11 +147,7 @@ impl<'a> CachedBits<'a> {
 
     /// A call-free loop over a copy, so the reader stays in registers per literal.
     #[inline(always)]
-    pub(super) fn quick_literals<B: Budget>(
-        &mut self,
-        table: &Huffman<B>,
-        out: &mut [u8],
-    ) -> usize {
+    pub(super) fn quick_literals(&mut self, table: &Huffman, out: &mut [u8]) -> usize {
         let mut bits = *self;
         let mut count = 0;
         while count < out.len() {

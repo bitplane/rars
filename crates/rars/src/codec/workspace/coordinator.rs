@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn a_large_later_hint_waits_for_the_next_batch_in_publication_order() {
-        let overhead = std::mem::size_of::<Slot<usize, Buffer<u8, Limited>>>() as u64;
+        let overhead = std::mem::size_of::<Slot<usize, Buffer<u8>>>() as u64;
         let limit = 4 * (overhead + 16);
         let ledger = Allowance::limited(limit);
         let published = AtomicUsize::new(0);

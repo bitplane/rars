@@ -1,6 +1,6 @@
 #[test]
 fn reader20_workspace_refusals_release_lz_audio_input_and_checkpoints() {
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
     let data = b"resource accounting for legacy audio and LZ\n".repeat(24);
     let streams = [
         super::unpack20_encode_literals(&data).unwrap(),
@@ -8,7 +8,7 @@ fn reader20_workspace_refusals_release_lz_audio_input_and_checkpoints() {
     ];
     for packed in streams {
         for streaming in [false, true] {
-            let run = |budget: &RefusingBudget| -> super::Result<()> {
+            let run = |budget: &Allowance| -> super::Result<()> {
                 let mut decoder = super::Reader20State::with_allowance(budget);
                 if streaming {
                     let mut output = super::Buffer::new(budget);
@@ -26,13 +26,13 @@ fn reader20_workspace_refusals_release_lz_audio_input_and_checkpoints() {
                 assert_eq!(checkpoint.output, decoder.output);
                 Ok(())
             };
-            let baseline = RefusingBudget::new(usize::MAX);
+            let baseline = Allowance::refusing(usize::MAX);
             run(&baseline).unwrap();
             let attempts = baseline.attempts();
             assert!(attempts > 10);
             assert_eq!(baseline.used(), 0);
             for index in 0..attempts {
-                let budget = RefusingBudget::new(index);
+                let budget = Allowance::refusing(index);
                 assert!(
                     matches!(run(&budget), Err(Error::Cancelled)),
                     "allocation {index}, streaming={streaming}"
@@ -106,7 +106,7 @@ fn cancellation_interrupts_buffered_symbol_work() {
     );
     assert!(decoder.current_pos() > 0 && decoder.current_pos() < data.len());
 }
-type Unpack20 = super::Reader20State<super::Allowance>;
+type Unpack20 = super::Reader20State;
 use super::{
     encode_tokens_with_progress, level_code_lengths_for_used_symbols, unpack20_decode,
     unpack20_encode_literals, BitWriter, CostModel, EncodeOptions, EncodeToken, Error, Huffman,
@@ -171,7 +171,7 @@ fn decodes_rar20_lz_member() {
 #[test]
 fn rejects_oversubscribed_rar20_huffman_tables() {
     assert!(matches!(
-        Huffman::<_, true>::from_lengths(&[1, 1, 1]),
+        Huffman::<true>::from_lengths(&[1, 1, 1]),
         Err(Error::InvalidData("RAR 2.0 oversubscribed Huffman table"))
     ));
 }
@@ -199,7 +199,7 @@ fn rejects_an_empty_main_huffman_table() {
 #[test]
 fn internal_bit_and_huffman_helpers_reject_out_of_range_requests() {
     assert!(matches!(
-        Huffman::<_, true>::from_lengths(&[16]),
+        Huffman::<true>::from_lengths(&[16]),
         Err(Error::InvalidData("RAR 2.0 Huffman length is too large"))
     ));
     assert!(matches!(

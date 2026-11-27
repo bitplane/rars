@@ -45,7 +45,7 @@ fn encode(data: &[u8], max_order: usize, dictionary_mb: usize) -> (u8, Vec<u8>, 
     (0x20 | order_bits(max_order), input, symbols)
 }
 
-fn decode_all<B: Budget>(model: &mut Ppmd7<B>, input: &mut Bytes, count: usize) -> Vec<u8> {
+fn decode_all(model: &mut Ppmd7, input: &mut Bytes, count: usize) -> Vec<u8> {
     (0..count)
         .map(|_| model.decode_symbol(input).unwrap().expect("a symbol"))
         .collect()
@@ -346,13 +346,13 @@ fn the_writer_codes_exactly_what_the_previous_model_did() {
 }
 
 // A model ready to allocate from, with empty free lists.
-fn pool(dictionary_mb: usize) -> Ppmd7<Allowance> {
+fn pool(dictionary_mb: usize) -> Ppmd7 {
     let mut model = Ppmd7::for_encoding(6, dictionary_mb).unwrap();
     model.free_list = [0; NUM_INDEXES];
     model
 }
 
-fn free_blocks(model: &Ppmd7<Allowance>, indx: usize) -> Vec<u32> {
+fn free_blocks(model: &Ppmd7, indx: usize) -> Vec<u32> {
     let mut blocks = Vec::new();
     let mut node = model.free_list[indx];
     while node != 0 {
@@ -503,7 +503,7 @@ fn headers_set_order_escape_and_range_or_fail_cleanly() {
 }
 
 // A fresh model whose range coder reads `code` next.
-fn fresh(code: u32) -> Ppmd7<Allowance> {
+fn fresh(code: u32) -> Ppmd7 {
     let mut model = Ppmd7::with_allowance(&Allowance::default());
     let mut escape = ESCAPE;
     let mut input = vec![0];
@@ -549,7 +549,7 @@ fn a_failed_symbol_leaves_no_model_to_continue() {
         )
     };
     let mut escape = ESCAPE;
-    let continuing = |model: &mut Ppmd7<Allowance>, escape: &mut u8| {
+    let continuing = |model: &mut Ppmd7, escape: &mut u8| {
         model.decode_init(0x05, &mut Bytes { input: &[0; 8] }, escape)
     };
 

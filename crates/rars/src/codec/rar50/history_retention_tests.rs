@@ -1,5 +1,5 @@
 use super::*;
-use crate::codec::workspace::RefusingBudget;
+use crate::codec::workspace::Allowance;
 use std::io::{Cursor, Read};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -12,7 +12,7 @@ struct StateSnapshot {
     history_window: usize,
 }
 
-fn snapshot<B: Budget>(state: &ReaderState<B>) -> StateSnapshot {
+fn snapshot(state: &ReaderState) -> StateSnapshot {
     StateSnapshot {
         tables: format!("{:?}", state.tables),
         reps: state.reps,
@@ -73,7 +73,7 @@ fn packed(data: &[u8], version: u8, filter: Option<crate::FilterKind>) -> Vec<u8
         .encode_member_with_filters(data, version, &specs)
         .unwrap()
 }
-fn result(result: Result<Buffer<u8, impl Budget>>) -> std::result::Result<Vec<u8>, String> {
+fn result(result: Result<Buffer<u8>>) -> std::result::Result<Vec<u8>, String> {
     result
         .map(|buffer| buffer.to_vec())
         .map_err(|error| format!("{error:?}"))
@@ -201,7 +201,7 @@ fn independent_history_limited_keeps_every_original_growth_refusal_and_charge() 
     for version in [0, 1] {
         for filter in [None, Some(crate::FilterKind::Delta { channels: 4 })] {
             let packed = packed(&data, version, filter);
-            let baseline = RefusingBudget::new(usize::MAX);
+            let baseline = Allowance::refusing(usize::MAX);
             {
                 let mut state = ReaderState::new(&baseline);
                 reference_decode(
@@ -218,8 +218,8 @@ fn independent_history_limited_keeps_every_original_growth_refusal_and_charge() 
             assert_eq!(baseline.used(), 0);
             for fail_at in 0..=baseline.attempts() {
                 for cancel_at in [0, 3, 7, usize::MAX] {
-                    let old_budget = RefusingBudget::new(fail_at);
-                    let actual_budget = RefusingBudget::new(fail_at);
+                    let old_budget = Allowance::refusing(fail_at);
+                    let actual_budget = Allowance::refusing(fail_at);
                     let mut old = ReaderState::new(&old_budget);
                     let mut actual = ReaderState::new(&actual_budget);
                     let old_token = crate::ReadCancellation::new();
@@ -368,47 +368,14 @@ fn independent_history_numeric_limits_keep_original_refusal_values_and_state() {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct AllocationTrace(std::sync::Arc<std::sync::Mutex<Vec<u64>>>);
-impl Budget for AllocationTrace {
-    type Charge = Self;
-    type Failure = std::convert::Infallible;
-    fn is_limited(&self) -> bool {
-        false
-    }
-    fn charge_is_limited(_: &Self) -> bool {
-        false
-    }
-    fn grow<T>(
-        values: &mut Vec<T>,
-        _: &mut Self,
-        additional: usize,
-    ) -> std::result::Result<(), Self::Failure> {
-        values.reserve(additional);
-        Ok(())
-    }
-    fn charge(&self) -> Self {
-        self.clone()
-    }
-    fn allowance(charge: &Self) -> Self {
-        charge.clone()
-    }
-    fn resize(charge: &mut Self, bytes: u64) -> Result<()> {
-        charge.0.lock().unwrap().push(bytes);
-        Ok(())
-    }
-}
-
 #[test]
-fn independent_history_omits_only_final_explicit_buffer_admissions() {
+fn independent_history_keeps_no_window() {
     let data = source();
     for version in [0, 1] {
         for filter in filter_cases() {
             let packed = packed(&data, version, filter);
-            let retained = AllocationTrace::default();
-            let discarded = AllocationTrace::default();
-            let mut old = ReaderState::new(&retained);
-            let mut actual = ReaderState::new(&discarded);
+            let mut old = ReaderState::new(&Allowance::default());
+            let mut actual = ReaderState::new(&Allowance::default());
             let expected = result(reference_decode(
                 &mut old,
                 &mut Cursor::new(&packed),
@@ -435,16 +402,6 @@ fn independent_history_omits_only_final_explicit_buffer_admissions() {
             assert_eq!(old.history.capacity(), 4096 + 4096 / 4);
             assert!(actual.history.is_empty());
             assert_eq!(actual.history.capacity(), 0);
-            let old = retained.0.lock().unwrap();
-            let actual = discarded.0.lock().unwrap();
-            let omitted = if filter.is_some() { 2 } else { 1 };
-            assert_eq!(old.len() - actual.len(), omitted);
-            assert_eq!(
-                old.iter().sum::<u64>() - actual.iter().sum::<u64>(),
-                4096 + 4096 / 4 + if filter.is_some() { 4096 } else { 0 }
-            );
-            // This observes only explicit Buffer capacity admissions, not every
-            // allocator call or whole-chain peak memory.
         }
     }
 }
@@ -506,8 +463,8 @@ fn independent_history_filtered_unknown_version_keeps_validation_and_late_cancel
             ] {
                 for cancel_at in [0, 1, 3, 7, usize::MAX] {
                     for fail_at in [0, 1, 3, usize::MAX] {
-                        let old_budget = RefusingBudget::new(fail_at);
-                        let actual_budget = RefusingBudget::new(fail_at);
+                        let old_budget = Allowance::refusing(fail_at);
+                        let actual_budget = Allowance::refusing(fail_at);
                         let old_token = crate::ReadCancellation::new();
                         let actual_token = crate::ReadCancellation::new();
                         let mut old = ReaderState::new(&old_budget);
@@ -558,15 +515,15 @@ fn independent_history_filtered_unknown_version_keeps_validation_and_late_cancel
 
 // Full unchanged d2 buffered decoding body, independent of history-policy plumbing.
 #[allow(clippy::too_many_arguments)]
-fn reference_decode<B: Budget>(
-    state: &mut ReaderState<B>,
+fn reference_decode(
+    state: &mut ReaderState,
     input: &mut impl Read,
     algorithm_version: u8,
     output_size: usize,
     dictionary_size: usize,
     solid: bool,
     mode: DecodeMode,
-) -> Result<Buffer<u8, B>> {
+) -> Result<Buffer<u8>> {
     state.read_control.check_codec()?;
     let control = state.read_control.clone();
     let input = &mut control.reader(input);

@@ -15,7 +15,7 @@ fn original_peek(input: &[u8], position: usize, count: u8) -> Result<u32> {
 
 #[test]
 fn word_reads_preserve_values_errors_and_positions_at_every_alignment_and_tail() {
-    fn check<B: Budget>(budget: &B) {
+    fn check(budget: &Allowance) {
         for size in 0..=5 {
             for pattern in 0..=255u8 {
                 let input: Vec<_> = (0..size)
@@ -56,7 +56,7 @@ fn word_reads_preserve_values_errors_and_positions_at_every_alignment_and_tail()
 
 #[test]
 fn huffman_lookup_preserves_results_and_consumption_for_every_prefix_and_tail() {
-    fn check<B: Budget, const LOOKUP: bool>(budget: &B) {
+    fn check<const LOOKUP: bool>(budget: &Allowance) {
         for lengths in [
             vec![],
             vec![0; 19],
@@ -65,7 +65,7 @@ fn huffman_lookup_preserves_results_and_consumption_for_every_prefix_and_tail() 
             vec![0, 2, 2, 10, 11, 15],
             vec![15],
         ] {
-            let original = Huffman::<B, LOOKUP>::with_lengths(&lengths, budget).unwrap();
+            let original = Huffman::<LOOKUP>::with_lengths(&lengths, budget).unwrap();
             let table = original.try_clone().unwrap();
             drop(original);
             let mut bits = BitReader::with_allowance(budget);
@@ -99,17 +99,17 @@ fn huffman_lookup_preserves_results_and_consumption_for_every_prefix_and_tail() 
             }
         }
     }
-    check::<_, true>(&Allowance::default());
-    check::<_, false>(&Allowance::default());
+    check::<true>(&Allowance::default());
+    check::<false>(&Allowance::default());
     let budget = Allowance::limited(64 * 1024);
-    check::<_, true>(&budget);
-    check::<_, false>(&budget);
+    check::<true>(&budget);
+    check::<false>(&budget);
     assert_eq!(budget.used(), 0);
 }
 
 #[test]
 fn cloned_partial_byte_readers_compact_and_append_without_changing_bits() {
-    fn check<B: Budget>(budget: &B) {
+    fn check(budget: &Allowance) {
         let first = [0xa5, 0x3c, 0x96];
         let more = [0x7e, 0xe1, 0x09];
         let full = [first, more].concat();

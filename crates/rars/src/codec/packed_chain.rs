@@ -2,7 +2,7 @@
 //! Construction sees the captured input twice. Insertion only publishes the
 //! already-built prefix of one bucket; future positions remain unreachable.
 
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::{Error, Result};
 
 const HASH_BITS: u32 = 17;
@@ -181,7 +181,7 @@ fn decode_mixed(deltas: &mut [u32; UNITS], older: &[u8], mut newer: u32) -> usiz
 /// registers: inlined into the block loop, they spill on every candidate.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
-fn walk_paired<B: Budget>(
+fn walk_paired(
     packed: &[u8],
     input: &[u8],
     pos: usize,
@@ -190,8 +190,8 @@ fn walk_paired<B: Budget>(
     max_length: usize,
     max_distance: usize,
     cut: usize,
-    out: &mut Buffer<(u32, u32), B>,
-) -> std::result::Result<(), B::Failure> {
+    out: &mut Buffer<(u32, u32)>,
+) -> std::result::Result<(), crate::codec::Error> {
     let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
     // The oldest position still within reach.
     let floor = pos.saturating_sub(max_distance);
@@ -306,12 +306,12 @@ fn walk_paired<B: Budget>(
 
 /// The packed chains a finder walks: built for it alone, or shared.
 #[derive(Debug)]
-enum Stream<B: Budget> {
-    Own(Buffer<u8, B>),
-    Shared(std::sync::Arc<SharedPackedIndex<B>>),
+enum Stream {
+    Own(Buffer<u8>),
+    Shared(std::sync::Arc<SharedPackedIndex>),
 }
 
-impl<B: Budget> std::ops::Deref for Stream<B> {
+impl std::ops::Deref for Stream {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
         match self {
@@ -322,9 +322,9 @@ impl<B: Budget> std::ops::Deref for Stream<B> {
 }
 
 #[derive(Debug)]
-pub(crate) struct PackedMatchFinder<B: Budget = Allowance> {
-    cursor: Buffer<u32, B>,
-    packed: Stream<B>,
+pub(crate) struct PackedMatchFinder {
+    cursor: Buffer<u32>,
+    packed: Stream,
     next_position: usize,
 }
 
@@ -359,11 +359,11 @@ fn each_owned(
 /// input ends where that window does and its distances are measured the same
 /// way (see `rar50` encoder's block jobs).
 #[derive(Debug)]
-pub(crate) struct SharedPackedIndex<B: Budget = Allowance> {
-    packed: Buffer<u8, B>,
+pub(crate) struct SharedPackedIndex {
+    packed: Buffer<u8>,
 }
 
-impl<B: Budget> SharedPackedIndex<B> {
+impl SharedPackedIndex {
     /// Builds the index over `window` and hands out finders standing at each
     /// of `positions`, ascending, as if every position before it had been
     /// inserted.
@@ -388,8 +388,8 @@ impl<B: Budget> SharedPackedIndex<B> {
     pub(crate) fn finders_over(
         window: &[u8],
         positions: &[usize],
-        allowance: &B,
-    ) -> Result<Buffer<PackedMatchFinder<B>, B>> {
+        allowance: &Allowance,
+    ) -> Result<Buffer<PackedMatchFinder>> {
         if window.len() > PAIRED_INPUT_LIMIT {
             return Err(Error::InvalidData(
                 "shared packed window exceeds the paired walk's reach",
@@ -431,10 +431,10 @@ impl<B: Budget> SharedPackedIndex<B> {
         };
 
         // Each bucket's stream length, a part of the buckets at a time.
-        struct Count<B: Budget> {
+        struct Count {
             buckets: std::ops::Range<usize>,
-            lengths: Buffer<u32, B>,
-            head: Buffer<u32, B>,
+            lengths: Buffer<u32>,
+            head: Buffer<u32>,
             overflowed: bool,
         }
         let mut counts = Vec::new();
@@ -483,13 +483,13 @@ impl<B: Budget> SharedPackedIndex<B> {
         for _ in 0..targets.len() {
             cursors.push(Buffer::filled(BUCKETS, 0u32, allowance)?);
         }
-        struct Fill<'a, B: Budget> {
+        struct Fill<'a> {
             buckets: std::ops::Range<usize>,
             base: usize,
             packed: &'a mut [u8],
             cursors: Vec<&'a mut [u32]>,
-            write: Buffer<u32, B>,
-            head: Buffer<u32, B>,
+            write: Buffer<u32>,
+            head: Buffer<u32>,
         }
         let mut fills = Vec::new();
         let mut rest: &mut [u8] = &mut packed;
@@ -516,7 +516,7 @@ impl<B: Budget> SharedPackedIndex<B> {
         drop(chunks);
         crate::parallel::for_each_mut(&mut fills, |_, fill| {
             let part = (fill.buckets.start / span) as u8;
-            let insert = |fill: &mut Fill<'_, B>, positions: std::ops::Range<usize>| {
+            let insert = |fill: &mut Fill<'_>, positions: std::ops::Range<usize>| {
                 each_owned(owner, positions, part, |pos| {
                     let index = hash(window, pos) - fill.buckets.start;
                     let delta = delta_at(&mut fill.head, index, pos);
@@ -563,7 +563,7 @@ fn past_record(packed: &[u8], mut end: usize) -> usize {
 
 /// Every position's delta to the one before it in its bucket, bucket after
 /// bucket, and where each bucket starts.
-fn build<B: Budget>(input: &[u8], allowance: &B) -> Result<(Buffer<u8, B>, Buffer<u32, B>)> {
+fn build(input: &[u8], allowance: &Allowance) -> Result<(Buffer<u8>, Buffer<u32>)> {
     u32::try_from(input.len())
         .map_err(|_| Error::InvalidData("packed finder input exceeds u32 positions"))?;
     let mut head = Buffer::filled(BUCKETS, NO_LINK, allowance)?;
@@ -620,8 +620,8 @@ fn build<B: Budget>(input: &[u8], allowance: &B) -> Result<(Buffer<u8, B>, Buffe
     Ok((packed, cursor))
 }
 
-impl<B: Budget> PackedMatchFinder<B> {
-    pub(crate) fn with_allowance(input: &[u8], allowance: &B) -> Result<Self> {
+impl PackedMatchFinder {
+    pub(crate) fn with_allowance(input: &[u8], allowance: &Allowance) -> Result<Self> {
         let (packed, cursor) = build(input, allowance)?;
         Ok(Self {
             cursor,
@@ -635,7 +635,7 @@ impl<B: Budget> PackedMatchFinder<B> {
         self.next_position
     }
 
-    pub(crate) fn allowance(&self) -> B {
+    pub(crate) fn allowance(&self) -> Allowance {
         match &self.packed {
             Stream::Own(packed) => packed.allowance(),
             Stream::Shared(index) => index.packed.allowance(),
@@ -669,8 +669,8 @@ impl<B: Budget> PackedMatchFinder<B> {
         max_distance: usize,
         cut: usize,
         nice: usize,
-        out: &mut Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         debug_assert!(max_length >= 4 && pos + max_length <= input.len());
         debug_assert_eq!(self.next_position, pos + 1);
         if input.len() > PAIRED_INPUT_LIMIT {
@@ -711,8 +711,8 @@ impl<B: Budget> PackedMatchFinder<B> {
         max_distance: usize,
         cut: usize,
         nice: usize,
-        out: &mut Buffer<(u32, u32), B>,
-    ) -> std::result::Result<(), B::Failure> {
+        out: &mut Buffer<(u32, u32)>,
+    ) -> std::result::Result<(), crate::codec::Error> {
         let prefix = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
         let mut candidate = pos;
         let mut cursor = end_cursor;
@@ -764,11 +764,11 @@ impl<B: Budget> PackedMatchFinder<B> {
         cut: usize,
         nice: usize,
         max_match_length: usize,
-        runs: &mut Buffer<(u32, u32), B>,
-        starts: &mut Buffer<u32, B>,
-        commits: &mut Buffer<super::match_finder::CommittedMatch, B>,
+        runs: &mut Buffer<(u32, u32)>,
+        starts: &mut Buffer<u32>,
+        commits: &mut Buffer<super::match_finder::CommittedMatch>,
         noise: &mut super::noise::NoiseScan,
-    ) -> std::result::Result<(), B::Failure> {
+    ) -> std::result::Result<(), crate::codec::Error> {
         debug_assert!(block.start <= block.end && block.end <= input.len());
         let mut committed_through = block.start;
         for pos in block.clone() {
@@ -825,7 +825,7 @@ impl<B: Budget> PackedMatchFinder<B> {
 mod tests {
     use super::*;
     use crate::codec::match_finder::{MatchFinder, NO_POSITION};
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
 
     #[test]
     fn reverse_delta_codes_cover_all_width_boundaries() {
@@ -1396,7 +1396,7 @@ mod tests {
         // nearest collisions first prove zero and then one matching byte.
         compare(&input, 0, 128);
 
-        let budget = RefusingBudget::new(usize::MAX);
+        let budget = Allowance::refusing(usize::MAX);
         let mut finder = PackedMatchFinder::with_allowance(&input, &budget).unwrap();
         let constructor_attempts = budget.attempts();
         let mut end = 0;
@@ -1418,7 +1418,7 @@ mod tests {
 
         // One admitted output slot lets the first legal run survive; growing
         // for the second legal run refuses at exactly the same frontier point.
-        let budget = RefusingBudget::new(constructor_attempts + 1);
+        let budget = Allowance::refusing(constructor_attempts + 1);
         let mut finder = PackedMatchFinder::with_allowance(&input, &budget).unwrap();
         let mut runs = Buffer::with_capacity(1, &budget).unwrap();
         for pos in 0..=63 {
@@ -1445,7 +1445,7 @@ mod tests {
     fn packed_allocations_are_exact_charged_and_refusal_releases_them() {
         let input = fixture(2048);
         for fail_at in 0..4 {
-            let allowance = RefusingBudget::new(fail_at);
+            let allowance = Allowance::refusing(fail_at);
             let finder = PackedMatchFinder::with_allowance(&input, &allowance);
             drop(finder);
             assert_eq!(allowance.used(), 0, "refusal{fail_at}");

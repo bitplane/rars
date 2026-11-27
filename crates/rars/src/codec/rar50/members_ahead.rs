@@ -1,6 +1,7 @@
 use super::block_ops::{BlockOps, Flat, Replay};
 use super::blocks_ahead::{decode_pool, enter, held_bytes, Batch, Tables, BATCH_BYTES};
-use super::{read_compressed_block_salvaging, Budget, DecodeMode, ReaderState, Result};
+use super::{read_compressed_block_salvaging, DecodeMode, ReaderState, Result};
+use crate::codec::workspace::Allowance;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -25,12 +26,12 @@ pub(crate) enum Offered {
 }
 
 /// A member's blocks, decoding on the pool, for the buffered decoder to replay.
-pub(crate) struct Claimed<B: Budget> {
-    batches: Vec<Arc<Batch<B>>>,
+pub(crate) struct Claimed {
+    batches: Vec<Arc<Batch>>,
     spare: Arc<Mutex<Vec<BlockOps>>>,
 }
 
-impl<B: Budget> std::fmt::Debug for Claimed<B> {
+impl std::fmt::Debug for Claimed {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Claimed")
             .field("batches", &self.batches.len())
@@ -38,9 +39,9 @@ impl<B: Budget> std::fmt::Debug for Claimed<B> {
     }
 }
 
-struct Queued<B: Budget> {
+struct Queued {
     key: u64,
-    batches: Vec<Arc<Batch<B>>>,
+    batches: Vec<Arc<Batch>>,
     // The member that must replay to its final block first, unless this one carries tables.
     after: Option<u64>,
     charge: usize,
@@ -48,34 +49,34 @@ struct Queued<B: Budget> {
     abandoned: Arc<AtomicBool>,
 }
 
-impl<B: Budget> Drop for Queued<B> {
+impl Drop for Queued {
     fn drop(&mut self) {
         self.abandoned.store(true, Ordering::Relaxed);
     }
 }
 
-enum Carry<B: Budget> {
-    Parsed(Tables<B>),
+enum Carry {
+    Parsed(Tables),
     // Parsed only once a member that reuses them is offered.
-    In(Arc<Batch<B>>, usize),
+    In(Arc<Batch>, usize),
 }
 
 /// Lets a solid chain's later members decode on the pool while this thread replays one.
-pub(crate) struct MembersAhead<B: Budget> {
+pub(crate) struct MembersAhead {
     pool: Arc<rayon::ThreadPool>,
-    allowance: B,
+    allowance: Allowance,
     depth: usize,
-    queue: VecDeque<Queued<B>>,
+    queue: VecDeque<Queued>,
     held: usize,
     // The tables in force after the last member offered, and that member.
-    carry: Option<Carry<B>>,
+    carry: Option<Carry>,
     last: Option<u64>,
     replayed: Option<u64>,
     spare: Arc<Mutex<Vec<BlockOps>>>,
 }
 
-impl<B: Budget> MembersAhead<B> {
-    pub(crate) fn new(workers: usize, allowance: &B) -> Option<Self> {
+impl MembersAhead {
+    pub(crate) fn new(workers: usize, allowance: &Allowance) -> Option<Self> {
         Some(Self {
             pool: decode_pool(workers)?,
             allowance: allowance.clone(),
@@ -174,7 +175,7 @@ impl<B: Budget> MembersAhead<B> {
         Offered::Taken
     }
 
-    fn carried(&mut self) -> Option<Tables<B>> {
+    fn carried(&mut self) -> Option<Tables> {
         let tables = match self.carry.as_ref()? {
             Carry::Parsed(tables) => return Some(Arc::clone(tables)),
             Carry::In(batch, index) => {
@@ -207,7 +208,7 @@ impl<B: Budget> MembersAhead<B> {
     }
 
     /// Called for every compressed member decoded; `None` decodes it serially.
-    pub(crate) fn claim(&mut self, key: u64) -> Option<Claimed<B>> {
+    pub(crate) fn claim(&mut self, key: u64) -> Option<Claimed> {
         let replayed = self.replayed.take();
         let position = self.queue.iter().position(|queued| queued.key == key)?;
         // Members offered but passed over are never reached.
@@ -241,9 +242,9 @@ impl<B: Budget> MembersAhead<B> {
     }
 }
 
-impl<B: Budget> ReaderState<B> {
+impl ReaderState {
     /// The member's blocks from the pool, unless they must be decoded here.
-    pub(super) fn take_claimed(&mut self, mode: DecodeMode) -> Option<Claimed<B>> {
+    pub(super) fn take_claimed(&mut self, mode: DecodeMode) -> Option<Claimed> {
         let limited = self.is_limited();
         self.claimed
             .take()
@@ -256,16 +257,12 @@ impl<B: Budget> ReaderState<B> {
         std::mem::take(&mut self.replayed_whole)
     }
 
-    pub(crate) fn set_claimed(&mut self, claimed: Claimed<B>) {
+    pub(crate) fn set_claimed(&mut self, claimed: Claimed) {
         self.claimed = Some(claimed);
     }
 
     /// The buffered decoder's block loop, from operations decoded on the pool.
-    pub(super) fn replay_claimed(
-        &mut self,
-        claimed: Claimed<B>,
-        flat: &mut Flat<'_, B>,
-    ) -> Result<()> {
+    pub(super) fn replay_claimed(&mut self, claimed: Claimed, flat: &mut Flat<'_>) -> Result<()> {
         let mut out = Replay::begin(flat)?;
         let mut tables = self.tables.take();
         let mut replayed = Ok(());

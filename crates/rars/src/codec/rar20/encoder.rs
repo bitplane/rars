@@ -353,7 +353,7 @@ fn block_workspace(options: EncodeOptions, fixed_table: bool, len: u64, span: us
     let parse = if options.optimal_parse && !fixed_table {
         let window = (reach + 1).min(window_len);
         let near = window.min(LONGER_FRESH_OFFSET);
-        let tree = match_finder::TreeMatchFinder::<Allowance>::bytes_for_window(window);
+        let tree = match_finder::TreeMatchFinder::bytes_for_window(window);
         let chain = Rar20MatchFinder::bytes_for_reach(near, near) as usize;
         // Each position can keep one chain match alongside the tree's runs.
         // The list lives through collection, parsing and bit emission.
@@ -1096,7 +1096,7 @@ fn collect_match_lists(
     // The chain only offers three-byte matches nearer than LONGER_FRESH_OFFSET.
     let near = window.min(LONGER_FRESH_OFFSET);
     let mut chain = Rar20MatchFinder::for_reach(near, near);
-    let mut found: Buffer<(u32, u32), Allowance> = Buffer::new(&allowance);
+    let mut found: Buffer<(u32, u32)> = Buffer::new(&allowance);
     let candidates = options.max_match_candidates;
     let mut lists = MatchLists {
         counts: Vec::with_capacity(end - start),

@@ -1,6 +1,5 @@
-#[cfg(test)]
 use crate::codec::workspace::Allowance;
-use crate::codec::workspace::{Budget, Buffer};
+use crate::codec::workspace::Buffer;
 use crate::codec::Result;
 use std::ops::Range;
 
@@ -19,11 +18,11 @@ pub(crate) fn auto_x86_filter_ranges(data: &[u8], include_e9: bool) -> Vec<Range
         .into_vec()
 }
 
-pub(crate) fn ranges_with_allowance<B: Budget>(
+pub(crate) fn ranges_with_allowance(
     data: &[u8],
     include_e9: bool,
-    allowance: &B,
-) -> Result<Buffer<Range<usize>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Range<usize>>> {
     let mut ranges =
         auto_x86_filter_ranges_with_cluster_gap(data, include_e9, AUTO_X86_CLUSTER_GAP, allowance)?;
     for range in auto_x86_filter_ranges_with_cluster_gap(
@@ -39,12 +38,12 @@ pub(crate) fn ranges_with_allowance<B: Budget>(
     Ok(ranges)
 }
 
-fn auto_x86_filter_ranges_with_cluster_gap<B: Budget>(
+fn auto_x86_filter_ranges_with_cluster_gap(
     data: &[u8],
     include_e9: bool,
     cluster_gap: usize,
-    allowance: &B,
-) -> Result<Buffer<Range<usize>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Range<usize>>> {
     if data.len() <= 5 {
         return Ok(Buffer::new(allowance));
     }
@@ -116,8 +115,8 @@ fn auto_x86_filter_ranges_with_cluster_gap<B: Budget>(
     Ok(ranges)
 }
 
-fn push_range<B: Budget>(
-    ranges: &mut Buffer<Range<usize>, B>,
+fn push_range(
+    ranges: &mut Buffer<Range<usize>>,
     data_len: usize,
     start: usize,
     last: usize,

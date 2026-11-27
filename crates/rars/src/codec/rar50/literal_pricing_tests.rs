@@ -1,18 +1,18 @@
 use super::*;
-use crate::codec::workspace::RefusingBudget;
+use crate::codec::workspace::Allowance;
 
 // Retained upstream initialization, reach admission and backtracking. Pricing
 // uses the original scalar implementation below, never the literal shortcut.
 #[allow(clippy::too_many_arguments)]
-fn reference_optimal_tokens<B: Budget>(
+fn reference_optimal_tokens(
     combined: &[u8],
     block: std::ops::Range<usize>,
     options: EncodeOptions,
     distance_size: usize,
     prices: Option<&TokenPrices<'_>>,
-    matches: &BlockMatches<B>,
-    workspace: &mut OptimalWorkspace<B>,
-) -> Result<Buffer<EncodeToken, B>> {
+    matches: &BlockMatches,
+    workspace: &mut OptimalWorkspace,
+) -> Result<Buffer<EncodeToken>> {
     let start = block.start;
     let end = block.end;
     let span = end - start;
@@ -75,17 +75,13 @@ fn reference_optimal_tokens<B: Budget>(
     while index > 0 {
         let length = arrive_length[index] as usize;
         if length == 0 {
-            reversed
-                .push(EncodeToken::Literal(combined[start + index - 1]))
-                .map_err(Into::into)?;
+            reversed.push(EncodeToken::Literal(combined[start + index - 1]))?;
             index -= 1;
         } else {
-            reversed
-                .push(EncodeToken::Match {
-                    length,
-                    distance: arrive_distance[index] as usize,
-                })
-                .map_err(Into::into)?;
+            reversed.push(EncodeToken::Match {
+                length,
+                distance: arrive_distance[index] as usize,
+            })?;
             index -= length;
         }
     }
@@ -94,16 +90,16 @@ fn reference_optimal_tokens<B: Budget>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reference_encode_tokens<B: Budget>(
+fn reference_encode_tokens(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     options: EncodeOptions,
     distance_size: usize,
     initial_filters: &[EncodeFilter],
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<EncodeToken, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<EncodeToken>> {
     let start = block.start;
     let end = block.end;
     if options.optimal_parse {
@@ -172,17 +168,17 @@ fn reference_encode_tokens<B: Budget>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn reference_encode_block<B: Budget>(
+fn reference_encode_block(
     combined: &[u8],
     block: std::ops::Range<usize>,
-    search: MemberSearch<'_, B>,
+    search: MemberSearch<'_>,
     algorithm_version: u8,
     initial_filters: &[EncodeFilter],
     options: EncodeOptions,
     is_last: bool,
     progress: Option<&mut dyn FnMut(usize) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let distance_size = match algorithm_version {
         0 => DISTANCE_TABLE_SIZE_50,
         1 => DISTANCE_TABLE_SIZE_70,
@@ -224,7 +220,7 @@ fn noise(size: usize) -> Vec<u8> {
         .collect()
 }
 
-fn empty_matches<B: Budget>(span: usize, allowance: &B) -> Result<BlockMatches<B>> {
+fn empty_matches(span: usize, allowance: &Allowance) -> Result<BlockMatches> {
     Ok(BlockMatches {
         runs: Buffer::new(allowance),
         starts: Buffer::filled(span + 1, 0, allowance)?,
@@ -241,7 +237,7 @@ struct WorkspaceState {
     last_length: Vec<u32>,
 }
 
-fn workspace_state<B: Budget>(workspace: &OptimalWorkspace<B>) -> WorkspaceState {
+fn workspace_state(workspace: &OptimalWorkspace) -> WorkspaceState {
     WorkspaceState {
         price: workspace.price.to_vec(),
         length: workspace.arrive_length.to_vec(),
@@ -521,10 +517,7 @@ fn literal_pipeline_retains_validation_before_final_progress_and_cancellation() 
     }
 }
 
-fn bounded_parse<B: Budget>(
-    allowance: &B,
-    old: bool,
-) -> (Result<Vec<EncodeToken>>, WorkspaceState) {
+fn bounded_parse(allowance: &Allowance, old: bool) -> (Result<Vec<EncodeToken>>, WorkspaceState) {
     let data: Vec<_> = (0..32).collect();
     let options = EncodeOptions::new(128).with_optimal_parse(true);
     let mut workspace = OptimalWorkspace::new(allowance);
@@ -579,8 +572,8 @@ fn bounded_literal_parses_preserve_all_quota_failures_and_growth_attempts() {
     let mut saw_refusal = false;
     let mut saw_success = false;
     for fail_at in 0..24 {
-        let expected_budget = RefusingBudget::new(fail_at);
-        let actual_budget = RefusingBudget::new(fail_at);
+        let expected_budget = Allowance::refusing(fail_at);
+        let actual_budget = Allowance::refusing(fail_at);
         let expected = bounded_parse(&expected_budget, true);
         let actual = bounded_parse(&actual_budget, false);
         saw_refusal |= matches!(actual.0, Err(Error::Cancelled));
@@ -714,8 +707,8 @@ fn bounded_outer_reparses_keep_every_growth_refusal_and_callback() {
     let mut saw_success = false;
     for fail_at in 0..128 {
         for continue_work in [true, false] {
-            let expected_budget = RefusingBudget::new(fail_at);
-            let actual_budget = RefusingBudget::new(fail_at);
+            let expected_budget = Allowance::refusing(fail_at);
+            let actual_budget = Allowance::refusing(fail_at);
             let mut expected_reports = Vec::new();
             let mut expected_report = |amount| {
                 expected_reports.push(amount);

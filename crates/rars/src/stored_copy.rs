@@ -1,6 +1,6 @@
+use crate::codec::workspace::Allowance;
 use std::io::{ErrorKind, Read, Write};
 
-use crate::codec::workspace::Budget;
 use crate::output_pipeline::{self, PipeError};
 
 #[derive(Debug)]
@@ -18,18 +18,17 @@ impl From<CopyError> for crate::Error {
 }
 
 /// Returns bytes written; a `padded` member's bytes past `size` are cipher padding, read but dropped.
-pub(crate) fn copy<R, C, B>(
+pub(crate) fn copy<R, C>(
     reader: &mut R,
     size: u64,
     padded: bool,
     check: &mut C,
     writer: &mut dyn Write,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<u64, CopyError>
 where
     R: Read + Send,
     C: FnMut(&[u8]) + Send,
-    B: Budget,
 {
     let limit = if padded { size } else { u64::MAX };
     if let Some(_charge) = output_pipeline::admit(size, allowance) {
@@ -161,7 +160,7 @@ mod tests {
         }
     }
 
-    fn read_on_caller<B: Budget>(len: usize, allowance: &B) -> bool {
+    fn read_on_caller(len: usize, allowance: &Allowance) -> bool {
         let data = pattern(len);
         let mut reader = Tracing {
             data: &data,

@@ -1,25 +1,25 @@
 //! Canonical decoder mechanics shared by the explicit-table RAR formats.
 //! Code-length parsing, diagnostics and bit input remain format-specific.
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::{Error, Result};
 
 /// Codes up to this long are decoded by one lookup in [`Huffman::quick`].
 const QUICK_BITS: usize = 10;
 
 #[derive(Debug)]
-pub(super) struct Huffman<B: Budget = Allowance> {
-    symbols: Buffer<usize, B>,
+pub(super) struct Huffman {
+    symbols: Buffer<usize>,
     first_code: [u16; 16],
     first_index: [usize; 16],
     counts: [u16; 16],
     /// For every 10-bit prefix, `symbol << 4 | length`; 0 for long codes,
     /// invalid prefixes, or sparse alphabet indices too wide to pack.
-    quick: Buffer<u32, B>,
+    quick: Buffer<u32>,
     quick_has_wide_symbols: bool,
 }
 
-impl<B: Budget> Huffman<B> {
-    pub(super) fn with_allowance(allowance: &B) -> Self {
+impl Huffman {
+    pub(super) fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             symbols: Buffer::new(allowance),
             first_code: [0; 16],
@@ -34,7 +34,11 @@ impl<B: Budget> Huffman<B> {
     /// `lengths`; only nonzero lengths 1..=15 contribute symbols. Incomplete
     /// tables are accepted: unused alphabets and unassigned prefixes occur in
     /// the supported formats. Invalid prefixes are rejected when decoded.
-    pub(super) fn from_counts(lengths: &[u8], counts: [u16; 16], allowance: &B) -> Result<Self> {
+    pub(super) fn from_counts(
+        lengths: &[u8],
+        counts: [u16; 16],
+        allowance: &Allowance,
+    ) -> Result<Self> {
         let mut first_code = [0u16; 16];
         let mut code = 0u16;
         for len in 1..=15 {
@@ -74,7 +78,7 @@ impl<B: Budget> Huffman<B> {
     pub(super) fn from_counts_with_lookup(
         lengths: &[u8],
         counts: [u16; 16],
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         let mut table = Self::from_counts(lengths, counts, allowance)?;
         table.build_lookup()?;
@@ -304,11 +308,11 @@ mod tests {
 
     #[test]
     fn table_and_checkpoint_allocations_are_admitted_and_released() {
-        fn build_lookup<B: Budget>(
+        fn build_lookup(
             lengths: &[u8],
             counts: [u16; 16],
-            allowance: &B,
-        ) -> Result<Huffman<B>> {
+            allowance: &Allowance,
+        ) -> Result<Huffman> {
             let mut table = Huffman::from_counts(lengths, counts, allowance)?;
             table.build_lookup()?;
             Ok(table)
