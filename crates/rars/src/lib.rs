@@ -58,6 +58,8 @@ pub use header_damage::{HeaderDamage, HeaderDamageKind};
 #[cfg(feature = "write")]
 mod filter_search;
 #[cfg(feature = "write")]
+mod filter_stats;
+#[cfg(feature = "write")]
 mod incompressible;
 mod io_util;
 mod key_cache;
