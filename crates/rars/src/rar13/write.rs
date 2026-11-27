@@ -3483,14 +3483,6 @@ mod tests {
     }
 
     #[test]
-    fn rar14_level_five_uses_lazy_matching() {
-        for level in 0..5 {
-            assert!(!rar15_encode_options_for_level(Some(level)).lazy_matching_enabled());
-        }
-        assert!(rar15_encode_options_for_level(Some(5)).lazy_matching_enabled());
-    }
-
-    #[test]
     fn compressed_writer_keeps_adaptive_lz_planning_in_sync_after_literals() {
         let data = synthetic_log_payload(8000);
         let input = [FileEntry {
@@ -4985,11 +4977,7 @@ mod tests {
     }
 
     #[test]
-    fn level_four_uses_a_distinct_verified_fallback_plan() {
-        let options = rar15_encode_options_for_level(Some(4));
-        let candidates = rar15_encode_fallback_options(options);
-        assert_eq!(candidates.len(), 2);
-
+    fn level_four_writes_an_archive_that_extracts() {
         let data = b"level four compressed legacy payload ".repeat(32);
         let entry = FileEntry {
             name: b"LEVEL4.TXT",

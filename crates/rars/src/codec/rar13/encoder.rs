@@ -273,11 +273,6 @@ impl EncodeOptions {
     pub const fn old_distance_tokens_enabled(self) -> bool {
         self.old_distance_tokens
     }
-
-    #[cfg(test)]
-    pub(crate) const fn lazy_matching_enabled(self) -> bool {
-        self.lazy_matching
-    }
 }
 
 impl Default for EncodeOptions {
