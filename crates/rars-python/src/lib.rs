@@ -950,7 +950,28 @@ impl ReadProgress {
             writer,
             progress: Arc::clone(self),
             pending: 0,
+            reports: true,
         })
+    }
+
+    /// Counts a writer that may run on a worker thread, leaving the reports
+    /// to the calling thread, so the callback never runs anywhere else.
+    fn counted_quietly<W: Write>(self: &Arc<Self>, name: &[u8], writer: W) -> CountedWriter<W> {
+        self.entry(name);
+        CountedWriter {
+            writer,
+            progress: Arc::clone(self),
+            pending: 0,
+            reports: false,
+        }
+    }
+
+    fn hand_over(&self, bytes: u64, report: bool) {
+        if report {
+            self.advance(bytes);
+        } else {
+            self.lock().completed += bytes;
+        }
     }
 
     /// A raising callback's exception wins over the cancellation it caused; success reports once more, finished.
@@ -1064,18 +1085,20 @@ fn tracked<'a>(
 /// Hands counts over a mebibyte at a time, so a decoder's writes don't each take the progress lock.
 const COUNTED_BATCH: u64 = 1 << 20;
 
-struct CountedWriter {
-    writer: Box<dyn Write>,
+struct CountedWriter<W: Write> {
+    writer: W,
     progress: Arc<ReadProgress>,
     pending: u64,
+    reports: bool,
 }
 
-impl Write for CountedWriter {
+impl<W: Write> Write for CountedWriter<W> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         let written = self.writer.write(bytes)?;
         self.pending += written as u64;
         if self.pending >= COUNTED_BATCH {
-            self.progress.advance(std::mem::take(&mut self.pending));
+            self.progress
+                .hand_over(std::mem::take(&mut self.pending), self.reports);
         }
         Ok(written)
     }
@@ -1085,10 +1108,10 @@ impl Write for CountedWriter {
     }
 }
 
-impl Drop for CountedWriter {
+impl<W: Write> Drop for CountedWriter<W> {
     fn drop(&mut self) {
         if self.pending > 0 {
-            self.progress.advance(self.pending);
+            self.progress.hand_over(self.pending, self.reports);
         }
     }
 }
@@ -4468,6 +4491,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
 struct ExtractOutputs<'a> {
     outputs: DirOutputs<'a>,
     progress: Option<Arc<ReadProgress>>,
+    /// Writing in place or flattened, opening reads what the members before it published.
+    can_settle: bool,
 }
 
 /// What an extraction wrote, and the links it left out.
@@ -4529,6 +4554,7 @@ impl<'a> ExtractOutputs<'a> {
         Self {
             outputs: DirOutputs::new(out_dir, family, options.legacy_name_encoding, mode, failed),
             progress,
+            can_settle: !mode.in_place && !mode.flatten,
         }
     }
 
@@ -4538,6 +4564,26 @@ impl<'a> ExtractOutputs<'a> {
             Some(progress) if !meta.is_directory => progress.counted(&meta.name, writer),
             _ => writer,
         })
+    }
+
+    fn open_settled(
+        &mut self,
+        meta: &rars_rs::ExtractedEntryMeta,
+    ) -> rars_rs::Result<Box<dyn Write + Send>> {
+        let writer = self.outputs.open_settled(meta)?;
+        Ok(match &self.progress {
+            Some(progress) if !meta.is_directory => {
+                Box::new(progress.counted_quietly(&meta.name, writer))
+            }
+            _ => writer,
+        })
+    }
+
+    fn settle(&mut self, verified: bool) -> rars_rs::Result<()> {
+        if let Some(progress) = &self.progress {
+            progress.advance(0);
+        }
+        self.outputs.settle(verified)
     }
 
     fn open_legacy_link(
@@ -4598,6 +4644,18 @@ fn extract_selected<S: Selection>(
     outputs: &std::cell::RefCell<ExtractOutputs<'_>>,
 ) -> rars_rs::Result<()> {
     let Some(selected) = selected else {
+        // Salvage keeps a failed member's output, which it can only do before
+        // the next member opens.
+        let can_settle = outputs.borrow().can_settle && !options.salvage;
+        if let (rars_rs::Archive::Rar50Plus(rar50), true) = (archive, can_settle) {
+            return rars_rs::output_links::extract_rar50_settled_with_links(
+                rar50,
+                options,
+                |meta| outputs.borrow_mut().open_settled(meta),
+                |meta, link| outputs.borrow_mut().link(meta, link),
+                |_, verified| outputs.borrow_mut().settle(verified),
+            );
+        }
         // RAR 5 decodes members in parallel only where there are no links to create.
         if archive.family() == rars_rs::ArchiveFamily::Rar50Plus
             && !archive.member_refs().any(|member| member.is_redirection())
