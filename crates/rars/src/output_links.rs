@@ -81,9 +81,11 @@ where
     options.check_cancelled()?;
     archive.extract_settled(
         options,
-        |meta| open(&crate::rar50_meta(meta)),
-        |meta, redirection| crate::extraction_links::emit_rar50_link(meta, redirection, &mut link),
-        |meta, verified| settled(&crate::rar50_meta(meta), verified),
+        &mut |meta| open(&crate::rar50_meta(meta)),
+        &mut |meta, redirection| {
+            crate::extraction_links::emit_rar50_link(meta, redirection, &mut link)
+        },
+        &mut |meta, verified| settled(&crate::rar50_meta(meta), verified),
     )
 }
 

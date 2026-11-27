@@ -398,36 +398,30 @@ impl FileHeader {
 pub fn extract_volumes_to<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
+    mut open: F,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    extract_volumes_with_links(volumes, options, skip_legacy_links(open), None)
+    extract_volumes_with_links(volumes, options, &mut skip_legacy_links(&mut open), None)
 }
 
 /// Streams a multivolume archive set as [`extract_volumes_to`] does, but hands
 /// Unix symbolic links to `open` as ordinary members whose data is the target.
-pub(crate) fn extract_volume_payloads<F>(
+pub(crate) fn extract_volume_payloads(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> Result<()> {
     extract_volumes_with_links(volumes, options, open, None)
 }
 
-pub(crate) fn extract_volumes_with_links<F>(
+pub(crate) fn extract_volumes_with_links(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: Option<&mut LegacyLink<'_>>,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     if let Some(limit) = options.max_reader_workspace_bytes {
         return extract_volumes_with_allowance(
             volumes,
@@ -440,30 +434,24 @@ where
     extract_volumes_with_allowance(volumes, options, open, links, &Allowance::default())
 }
 
-fn extract_volumes_with_allowance<F>(
+fn extract_volumes_with_allowance(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: Option<&mut LegacyLink<'_>>,
     allowance: &Allowance,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);
     volumes::extract(&mut feed, options, open, links, allowance)
 }
 
-pub(crate) fn extract_from_feed<F>(
+pub(crate) fn extract_from_feed(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: Option<&mut LegacyLink<'_>>,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     if let Some(limit) = options.max_reader_workspace_bytes {
         return volumes::extract(feed, options, open, links, &Allowance::limited(limit));
     }

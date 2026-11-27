@@ -8,18 +8,14 @@ use crate::volume_extract::{
 };
 use std::ops::Range;
 
-pub(super) fn extract<F, R>(
+pub(super) fn extract(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    open: &mut F,
-    redirect: &mut R,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     redirections: Redirections,
     allowance: &Allowance,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-{
+) -> Result<()> {
     options.check_cancelled()?;
     let Some(mut volume) = feed.next()? else {
         return Err(Error::InvalidHeader("RAR 5 volume set is empty"));
@@ -190,18 +186,15 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
 ///
 /// When it fails with a member error handler set, the rest of its volumes
 /// are still read, so the walk can go on to the members after it.
-fn extract_split<F>(
+fn extract_split(
     volume: &Archive,
     first: &FileHeader,
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
     session: &mut DecoderSession<'_>,
     budget: &mut OutputBudget,
-    open: &mut F,
-) -> std::result::Result<Archive, SplitFailure<Archive>>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> std::result::Result<Archive, SplitFailure<Archive>> {
     validate_split_fragment(first, options.password)?;
     let mut walk = SplitWalk::new(feed, volume, first, &session.allowance)?;
     let salvage = options.salvage;
@@ -231,18 +224,15 @@ where
     }
 }
 
-fn extract_split_walk<F>(
+fn extract_split_walk(
     volume: &Archive,
     first: &FileHeader,
     walk: &mut SplitWalk<'_, '_, '_>,
     salvage: bool,
     session: &mut DecoderSession<'_>,
     budget: &mut OutputBudget,
-    open: &mut F,
-) -> Result<Box<dyn Write>>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> Result<Box<dyn Write>> {
     // Parts written before the size was known record it only in the last header.
     let sized;
     let first = if first.known_unpacked_size().is_none() {

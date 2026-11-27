@@ -8,16 +8,13 @@ use crate::volume_extract::{
 };
 use std::ops::Range;
 
-pub(super) fn extract<F>(
+pub(super) fn extract(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    mut open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     mut links: Option<&mut LegacyLink<'_>>,
     allowance: &Allowance,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     options.check_cancelled()?;
     let Some(mut volume) = feed.next()? else {
         return Err(Error::InvalidHeader("RAR 1.5 volume set is empty"));
@@ -54,7 +51,7 @@ where
                     options,
                     &mut session,
                     &mut budget,
-                    &mut open,
+                    open,
                     &mut links,
                 ) {
                     Ok(last) => last,
@@ -183,19 +180,16 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
 /// When it fails with a member error handler set, the rest of its volumes
 /// are still read, so the walk can go on to the members after it.
 #[allow(clippy::too_many_arguments)]
-fn extract_split<F>(
+fn extract_split(
     volume: &Archive,
     first: &FileHeader,
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
     session: &mut DecoderSession<'_>,
     budget: &mut OutputBudget,
-    open: &mut F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: &mut Option<&mut LegacyLink<'_>>,
-) -> std::result::Result<Archive, SplitFailure<Archive>>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> std::result::Result<Archive, SplitFailure<Archive>> {
     validate_split_fragment(first, session.password)?;
     let allowance = session.allowance.clone();
     let mut walk = SplitWalk::new(feed, volume, first, &allowance)?;
@@ -229,19 +223,16 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_split_walk<F>(
+fn extract_split_walk(
     volume: &Archive,
     first: &FileHeader,
     walk: &mut SplitWalk<'_, '_, '_>,
     salvage: bool,
     session: &mut DecoderSession<'_>,
     budget: &mut OutputBudget,
-    open: &mut F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: &mut Option<&mut LegacyLink<'_>>,
-) -> Result<Option<Box<dyn Write>>>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<Option<Box<dyn Write>>> {
     let password = session.password;
     let allowance = session.allowance.clone();
     let meta = ExtractedEntryMeta {

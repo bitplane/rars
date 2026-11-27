@@ -84,7 +84,7 @@ impl Archive {
             }
             Self::Rar15To40(archive) => archive.extract_parallel_with_links(
                 options,
-                |meta| open(&crate::rar15_40_meta(meta)),
+                &mut |meta| open(&crate::rar15_40_meta(meta)),
                 Some(&mut |meta, target| {
                     link(
                         &crate::rar15_40_meta(meta),
@@ -97,8 +97,8 @@ impl Archive {
             ),
             Self::Rar50Plus(archive) => archive.extract_parallel_with_redirections(
                 options,
-                |meta| open(&crate::rar50_meta(meta)),
-                |meta, redirection| {
+                &mut |meta| open(&crate::rar50_meta(meta)),
+                &mut |meta, redirection| {
                     ExtractedLink::rar50(redirection)
                         .and_then(|kind| link(&crate::rar50_meta(meta), kind))
                         .map_err(|error| link_error(error, &meta.name))
@@ -133,7 +133,7 @@ where
         crate::ArchiveFamily::Rar15To40 => crate::rar15_40::extract_volumes_with_links(
             &crate::rar15_40_volumes(archives)?,
             options,
-            |meta| open(&crate::rar15_40_meta(meta)),
+            &mut |meta| open(&crate::rar15_40_meta(meta)),
             Some(&mut |meta, target| {
                 link(
                     &crate::rar15_40_meta(meta),
@@ -216,12 +216,9 @@ pub(crate) fn legacy_meta_is_link(meta: &crate::rar15_40::ExtractedEntryMeta) ->
 /// Wraps a byte-oriented `open` so legacy symbolic links never reach it, as
 /// RAR 5 redirections never do. A link's payload is still decoded, into a
 /// sink, so its checksum is verified and a solid stream keeps its history.
-pub(crate) fn skip_legacy_links<F>(
-    mut open: F,
-) -> impl FnMut(&crate::rar15_40::ExtractedEntryMeta) -> Result<Box<dyn Write>>
-where
-    F: FnMut(&crate::rar15_40::ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+pub(crate) fn skip_legacy_links(
+    open: &mut dyn FnMut(&crate::rar15_40::ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> impl FnMut(&crate::rar15_40::ExtractedEntryMeta) -> Result<Box<dyn Write>> + '_ {
     move |meta| {
         if legacy_meta_is_link(meta) {
             Ok(Box::new(std::io::sink()))

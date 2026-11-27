@@ -636,16 +636,13 @@ impl Archive {
         )
     }
 
-    fn extract_impl<F>(
+    fn extract_impl(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
-    ) -> Result<crate::ExtractionOutcome>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<crate::ExtractionOutcome> {
         if let Some(limit) = options.max_reader_workspace_bytes {
             return self.extract_with_allowance(
                 options,
@@ -658,17 +655,14 @@ impl Archive {
         self.extract_with_allowance(options, open, selector, on_error, &Allowance::default())
     }
 
-    fn extract_with_allowance<F>(
+    fn extract_with_allowance(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         allowance: &Allowance,
-    ) -> Result<crate::ExtractionOutcome>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<crate::ExtractionOutcome> {
         options.check_cancelled()?;
         let password = options.password;
         let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -1182,39 +1176,38 @@ where
 pub fn extract_volumes_to_with_options<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
+    mut open: F,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
     if let Some(limit) = options.max_reader_workspace_bytes {
-        return extract_volumes_with_allowance(volumes, options, open, &Allowance::limited(limit));
+        return extract_volumes_with_allowance(
+            volumes,
+            options,
+            &mut open,
+            &Allowance::limited(limit),
+        );
     }
-    extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
+    extract_volumes_with_allowance(volumes, options, &mut open, &Allowance::default())
 }
 
-fn extract_volumes_with_allowance<F>(
+fn extract_volumes_with_allowance(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     allowance: &Allowance,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);
     volumes::extract(&mut feed, options, open, allowance)
 }
 
-pub(crate) fn extract_from_feed<F>(
+pub(crate) fn extract_from_feed(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    open: F,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> Result<()> {
     if let Some(limit) = options.max_reader_workspace_bytes {
         return volumes::extract(feed, options, open, &Allowance::limited(limit));
     }

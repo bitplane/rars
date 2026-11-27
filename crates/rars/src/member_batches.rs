@@ -82,7 +82,7 @@ pub(crate) enum Decoded<M> {
 /// output instead, as legacy symbolic links do; it returns whether it did.
 pub(crate) fn publish<M>(
     entry: Decoded<M>,
-    open: &mut impl FnMut(&M) -> Result<Box<dyn Write>>,
+    open: &mut dyn FnMut(&M) -> Result<Box<dyn Write>>,
     control: &ReadControl,
     name: impl Fn(&M) -> &[u8],
     divert: impl FnOnce(&M, &[u8]) -> Result<bool>,

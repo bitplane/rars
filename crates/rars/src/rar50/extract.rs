@@ -1080,20 +1080,16 @@ impl Archive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn extract_to_impl<F, R>(
+    fn extract_to_impl(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
-        redirect: &mut R,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
         redirections: Redirections,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         settling: Option<&Settling<'_>>,
-    ) -> Result<crate::ExtractionOutcome>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-    {
+    ) -> Result<crate::ExtractionOutcome> {
         if let Some(limit) = options.max_reader_workspace_bytes {
             return self.extract_with_allowance(
                 options,
@@ -1119,21 +1115,17 @@ impl Archive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn extract_with_allowance<F, R>(
+    fn extract_with_allowance(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
-        redirect: &mut R,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
         redirections: Redirections,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         settling: Option<&Settling<'_>>,
         allowance: &Allowance,
-    ) -> Result<crate::ExtractionOutcome>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-    {
+    ) -> Result<crate::ExtractionOutcome> {
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
@@ -1303,18 +1295,15 @@ impl Archive {
 
     /// Streams one independent member on the calling thread, between batches.
     #[allow(clippy::too_many_arguments)]
-    fn extract_inline<F>(
+    fn extract_inline(
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
         buffered_decode_limit: u64,
         allowance: &Allowance,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         redirect: Option<&mut Redirect<'_>>,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<()> {
         options.check_cancelled()?;
         file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;
         if let Some(redirection) = &file.redirection {
@@ -1349,17 +1338,13 @@ impl Archive {
     /// As [`Self::extract_to_parallel_buffered`], and reports each redirection
     /// to `redirect` in archive order, as [`Self::extract_to_with_redirections`]
     /// does.
-    pub(crate) fn extract_parallel_with_redirections<F, R>(
+    pub(crate) fn extract_parallel_with_redirections(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        mut open: F,
-        mut redirect: R,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-    {
-        self.parallel_to_impl(options, &mut open, Some(&mut redirect), false, None)
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+        redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+    ) -> Result<()> {
+        self.parallel_to_impl(options, open, Some(redirect), false, None)
     }
 
     /// As [`Self::extract_parallel_with_redirections`], and tells `settled`
@@ -1371,40 +1356,32 @@ impl Archive {
     /// once it has settled. Redirections are reported only once every member
     /// opened before them has settled. An error from `settled` is the member's
     /// own. When the call fails, members opened and not settled are unverified.
-    pub(crate) fn extract_settled<F, R, S>(
+    pub(crate) fn extract_settled(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        mut open: F,
-        mut redirect: R,
-        mut settled: S,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + Send>>,
-        R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-        S: FnMut(&ExtractedEntryMeta, bool) -> Result<()>,
-    {
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write + Send>>,
+        redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
+        settled: &mut dyn FnMut(&ExtractedEntryMeta, bool) -> Result<()>,
+    ) -> Result<()> {
         let settling = Settling {
-            open: std::cell::RefCell::new(&mut open),
-            settled: std::cell::RefCell::new(&mut settled),
+            open: std::cell::RefCell::new(open),
+            settled: std::cell::RefCell::new(settled),
             opened: std::cell::RefCell::new(None),
         };
         self.parallel_to_impl(
             options,
             &mut |meta| settling.open_tracked(meta),
-            Some(&mut redirect),
+            Some(redirect),
             false,
             Some(&settling),
         )
     }
 
-    pub(crate) fn test_to<F>(
+    pub(crate) fn test_to(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        mut tested: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<()>,
-    {
+        tested: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<()>,
+    ) -> Result<()> {
         self.parallel_to_impl(
             options,
             &mut |meta| {
@@ -1417,17 +1394,14 @@ impl Archive {
         )
     }
 
-    fn parallel_to_impl<F>(
+    fn parallel_to_impl(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
         settling: Option<&Settling<'_>>,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<()> {
         options.check_cancelled()?;
         // Solid chains, ordered total-output charging and the shared scratch
         // all need one session in archive order, as does salvage.
@@ -1482,18 +1456,15 @@ impl Archive {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn parallel_with<F>(
+    fn parallel_with(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut redirect: Option<&mut Redirect<'_>>,
         verification: bool,
         settling: Option<&Settling<'_>>,
         allowance: &Allowance,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<()> {
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
         let publication = crate::read_control::ReadControl::for_options(&options);
         let redirections = if verification {
@@ -2249,14 +2220,11 @@ where
     )
 }
 
-pub(crate) fn test_volumes_to<F>(
+pub(crate) fn test_volumes_to(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    mut tested: F,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<()>,
-{
+    tested: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<()>,
+) -> Result<()> {
     options.check_cancelled()?;
     extract_volumes_to_impl(
         volumes,
@@ -2290,33 +2258,25 @@ where
     )
 }
 
-fn extract_volumes_to_impl<F, R>(
+fn extract_volumes_to_impl(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    open: &mut F,
-    redirect: &mut R,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     redirections: Redirections,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-{
+) -> Result<()> {
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);
     extract_from_feed(&mut feed, options, open, redirect, redirections)
 }
 
-pub(crate) fn extract_from_feed<F, R>(
+pub(crate) fn extract_from_feed(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    open: &mut F,
-    redirect: &mut R,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+    redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     redirections: Redirections,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    R: FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-{
+) -> Result<()> {
     if let Some(limit) = options.max_reader_workspace_bytes {
         return volumes::extract(
             feed,

@@ -1232,7 +1232,7 @@ impl Archive {
                     _ => None,
                 });
                 let mut feed = input.feed(&mut set, options);
-                rar13::extract_from_feed(&mut feed, options, |meta| open(&rar13_meta(meta)))
+                rar13::extract_from_feed(&mut feed, options, &mut |meta| open(&rar13_meta(meta)))
                     .map_err(|error| annotate(error, feed.current_index()))
             }
             Self::Rar15To40(first) => {
@@ -1252,21 +1252,21 @@ impl Archive {
                         )
                     }
                 });
-                let open = |meta: &rar15_40::ExtractedEntryMeta| open(&rar15_40_meta(meta));
+                let mut open = |meta: &rar15_40::ExtractedEntryMeta| open(&rar15_40_meta(meta));
                 match legacy.as_mut() {
                     Some(link) => rar15_40::extract_from_feed(
                         &mut feed,
                         options,
-                        open,
+                        &mut open,
                         Some(link as &mut extraction_links::LegacyLink<'_>),
                     ),
                     None if arriving => rar15_40::extract_from_feed(
                         &mut feed,
                         options,
-                        extraction_links::skip_legacy_links(open),
+                        &mut extraction_links::skip_legacy_links(&mut open),
                         None,
                     ),
-                    None => rar15_40::extract_from_feed(&mut feed, options, open, None),
+                    None => rar15_40::extract_from_feed(&mut feed, options, &mut open, None),
                 }
                 .map_err(|error| annotate(error, feed.current_index()))
             }
@@ -1624,10 +1624,10 @@ impl Archive {
         options.check_cancelled()?;
         match self {
             Self::Rar50Plus(archive) => {
-                return archive.test_to(options, |meta| tested(&rar50_meta(meta)));
+                return archive.test_to(options, &mut |meta| tested(&rar50_meta(meta)));
             }
             Self::Rar15To40(archive) => {
-                return archive.test_to(options, |meta| tested(&rar15_40_meta(meta)));
+                return archive.test_to(options, &mut |meta| tested(&rar15_40_meta(meta)));
             }
             Self::Rar13(_) => {}
         }
@@ -2250,37 +2250,31 @@ where
 pub fn extract_volumes_to_with_options<F>(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,
-    open: F,
+    mut open: F,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    extract_volumes_impl(archives, options, open, true)
+    extract_volumes_impl(archives, options, &mut open, true)
 }
 
 /// Streams a volume set as [`extract_volumes_to_with_options`] does, but hands
 /// RAR 1.5-4.x Unix symbolic links to `open` as ordinary members whose data is
 /// the target, for callers that read or verify every payload.
-pub(crate) fn extract_volume_payloads<F>(
+pub(crate) fn extract_volume_payloads(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,
-    open: F,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> Result<()> {
     extract_volumes_impl(archives, options, open, false)
 }
 
-fn extract_volumes_impl<F>(
+fn extract_volumes_impl(
     archives: &[Archive],
     options: ArchiveReadOptions<'_>,
-    mut open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     skip_links: bool,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     let _cap = crate::parallel::ThreadCap::set(options.threads);
     options.check_cancelled()?;
     let Some(first) = archives.first() else {
@@ -2295,11 +2289,11 @@ where
         }
         ArchiveFamily::Rar15To40 => {
             let typed = rar15_40_volumes(archives)?;
-            let open = |meta: &rar15_40::ExtractedEntryMeta| open(&rar15_40_meta(meta));
+            let mut open = |meta: &rar15_40::ExtractedEntryMeta| open(&rar15_40_meta(meta));
             if skip_links {
-                rar15_40::extract_volumes_to(&typed, options, open)
+                rar15_40::extract_volumes_to(&typed, options, &mut open)
             } else {
-                rar15_40::extract_volume_payloads(&typed, options, open)
+                rar15_40::extract_volume_payloads(&typed, options, &mut open)
             }
         }
         ArchiveFamily::Rar50Plus => {
@@ -2338,9 +2332,9 @@ where
     if first.family() == ArchiveFamily::Rar50Plus {
         volume_order::check_set(archives)?;
         let typed = rar50_volumes(archives)?;
-        return rar50::test_volumes_to(&typed, options, |meta| tested(&rar50_meta(meta)));
+        return rar50::test_volumes_to(&typed, options, &mut |meta| tested(&rar50_meta(meta)));
     }
-    extract_volume_payloads(archives, options, |meta| {
+    extract_volume_payloads(archives, options, &mut |meta| {
         tested(meta)?;
         Ok(Box::new(std::io::sink()) as Box<dyn Write>)
     })

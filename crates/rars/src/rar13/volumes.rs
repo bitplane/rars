@@ -6,15 +6,12 @@ use crate::volume_extract::{
     flush_split, FragmentWalk, LazyChain, SplitFailure, VolumeEnd, VolumeFeed,
 };
 
-pub(super) fn extract<F>(
+pub(super) fn extract(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    mut open: F,
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     allowance: &Allowance,
-) -> Result<()>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+) -> Result<()> {
     options.check_cancelled()?;
     let Some(mut volume) = feed.next()? else {
         return Err(Error::InvalidHeader("RAR 1.3 volume set is empty"));
@@ -53,7 +50,7 @@ where
                     &mut budget,
                     &mut unpack15,
                     solid,
-                    &mut open,
+                    open,
                 ) {
                     Ok(last) => {
                         extracted_count += 1;
@@ -154,18 +151,15 @@ where
 /// RAR 1.5 and later, a fragment's header gives no checksum of its own
 /// packed data (RAR 1.402 writes a running checksum of the input there), so
 /// the damaged volume isn't named.
-fn extract_split<F>(
+fn extract_split(
     volume: &Archive,
     first: &Entry,
     feed: &mut VolumeFeed<'_, '_, Archive>,
     budget: &mut OutputBudget,
     unpack15: &mut Decoder15,
     solid: bool,
-    open: &mut F,
-) -> std::result::Result<Archive, SplitFailure<Archive>>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> std::result::Result<Archive, SplitFailure<Archive>> {
     let options = feed.options();
     options.check_cancelled()?;
     budget.check(u64::from(first.header.unp_size), &first.name)?;
@@ -200,18 +194,15 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn extract_split_walk<F>(
+fn extract_split_walk(
     volume: &Archive,
     first: &Entry,
     walk: &mut SplitWalk<'_, '_, '_>,
     budget: &mut OutputBudget,
     unpack15: &mut Decoder15,
     solid: bool,
-    open: &mut F,
-) -> Result<Box<dyn Write>>
-where
-    F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-{
+    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
+) -> Result<Box<dyn Write>> {
     let options = walk.options;
     let first_reader = volume
         .source
