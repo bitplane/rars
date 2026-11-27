@@ -1992,6 +1992,12 @@ pub(crate) enum RunFinder<B: Budget> {
     Tree(Rar50TreeMatchFinder<B>),
 }
 
+/// What the links of one window slot take in a tree over a window of
+/// `window` positions.
+pub(crate) fn tree_link_bytes(window: usize) -> u64 {
+    Rar50TreeMatchFinder::<Allowance>::link_bytes_per_slot(window) as u64
+}
+
 /// The most [`seed_chain`] holds besides the trees it returns.
 pub(crate) fn run_trees_workspace(options: EncodeOptions) -> u64 {
     if !options.optimal_parse {

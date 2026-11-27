@@ -236,10 +236,10 @@ pub(crate) struct AddArgs {
     /// time and memory to search.
     #[arg(long, value_name = "SIZE", value_parser = crate::parse_size_string)]
     pub dict_size: Option<usize>,
-    /// Maximum total compression working memory (default: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
+    /// Maximum total compression working memory (default: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)
     ///
-    /// At 283m or above, the budget only affects how much work runs at once.
-    /// Below 283m it can also change the archive by planning smaller jobs.
+    /// At 256m or above, the budget only affects how much work runs at once.
+    /// Below 256m it can also change the archive by planning smaller jobs.
     ///
     /// Left unset rather than defaulted here, so a volume set below RAR 5, which
     /// is still built in memory, can tell an explicit request from a default and

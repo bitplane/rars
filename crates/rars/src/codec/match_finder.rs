@@ -710,12 +710,18 @@ impl<B: Budget> TreeMatchFinder<B> {
     #[cfg(feature = "write")]
     pub(crate) fn bytes_for_window(window: usize) -> usize {
         let slots = window.max(1).next_power_of_two();
-        let links = if slots <= NarrowLinks::<B>::MAX_WINDOW {
-            6 * slots
+        (1 << Self::HASH_BITS) * size_of::<u32>() + Self::link_bytes_per_slot(slots) * slots
+    }
+
+    /// What the two links of one window slot take in a window of `window`
+    /// positions.
+    #[cfg(feature = "write")]
+    pub(crate) fn link_bytes_per_slot(window: usize) -> usize {
+        if window.max(1).next_power_of_two() <= NarrowLinks::<B>::MAX_WINDOW {
+            6
         } else {
-            2 * slots * size_of::<u32>()
-        };
-        (1 << Self::HASH_BITS) * size_of::<u32>() + links
+            2 * size_of::<u32>()
+        }
     }
 
     /// Builds a finder that remembers the last `window` positions, at six

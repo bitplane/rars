@@ -154,7 +154,7 @@ rar50\t''
 rar70\t''"
 complete -c rars -n "__fish_rars_using_subcommand add" -l level -d 'Compression level (0..5; 0 implies --store)' -r
 complete -c rars -n "__fish_rars_using_subcommand add" -l dict-size -d 'Dictionary size (e.g. 4m, 128k; RAR 1.5+)' -r
-complete -c rars -n "__fish_rars_using_subcommand add" -l memory-limit -d 'Maximum total compression working memory (default: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)' -r
+complete -c rars -n "__fish_rars_using_subcommand add" -l memory-limit -d 'Maximum total compression working memory (default: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)' -r
 complete -c rars -n "__fish_rars_using_subcommand add" -l max-memory -d 'Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace' -r
 complete -c rars -n "__fish_rars_using_subcommand add" -l temp-dir -d 'Directory for temporary compressed payloads (RAR 5+)' -r -F
 complete -c rars -n "__fish_rars_using_subcommand add" -l comment -d 'Archive-level comment' -r
@@ -196,7 +196,7 @@ rar50\t''
 rar70\t''"
 complete -c rars -n "__fish_rars_using_subcommand a" -l level -d 'Compression level (0..5; 0 implies --store)' -r
 complete -c rars -n "__fish_rars_using_subcommand a" -l dict-size -d 'Dictionary size (e.g. 4m, 128k; RAR 1.5+)' -r
-complete -c rars -n "__fish_rars_using_subcommand a" -l memory-limit -d 'Maximum total compression working memory (default: 283m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)' -r
+complete -c rars -n "__fish_rars_using_subcommand a" -l memory-limit -d 'Maximum total compression working memory (default: 256m, plus 160m per thread past the first, up to a quarter of RAM or the cgroup limit on Linux)' -r
 complete -c rars -n "__fish_rars_using_subcommand a" -l max-memory -d 'Hard managed-allocation ceiling for RAR5/7, separate from estimated workspace' -r
 complete -c rars -n "__fish_rars_using_subcommand a" -l temp-dir -d 'Directory for temporary compressed payloads (RAR 5+)' -r -F
 complete -c rars -n "__fish_rars_using_subcommand a" -l comment -d 'Archive-level comment' -r

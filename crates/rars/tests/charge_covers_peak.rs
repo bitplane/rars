@@ -898,7 +898,7 @@ fn rar5_level5_fitted_dictionary_charge_covers_three_symbol_noise() {
         mib(allocated),
         mib(charged)
     );
-    assert_eq!(charged, rars::DEFAULT_WRITER_PLANNING_LIMIT);
+    assert_eq!(charged, rars::DEFAULT_WRITER_MEMORY_LIMIT);
     assert!(allocated <= charged);
 }
 
