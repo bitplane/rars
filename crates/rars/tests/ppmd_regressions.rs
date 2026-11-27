@@ -1,35 +1,19 @@
+#[path = "support/fixtures.rs"]
+mod fixtures;
+#[path = "support/sinks.rs"]
+mod sinks;
+use fixtures::fixture;
+use sinks::Capture;
+
 use rars::crc32::crc32;
 use rars::rar15_40::Archive;
 use rars::{ArchiveMember, ArchiveReadOptions, ArchiveReader, ExtractionErrorAction, Result};
 use std::cell::RefCell;
-use std::io::{Result as IoResult, Write};
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Mutex;
 
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/rar15_40/ppmd")
-        .join(name)
-}
-
-struct CollectWriter {
-    data: Rc<RefCell<Vec<u8>>>,
-}
-
 struct CollectedEntry {
     data: Vec<u8>,
-}
-
-impl Write for CollectWriter {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.data.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        Ok(())
-    }
 }
 
 fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>> {
@@ -37,7 +21,7 @@ fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>> {
     archive.extract_to(ArchiveReadOptions::default(), |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
-        Ok(Box::new(CollectWriter { data }))
+        Ok(Box::new(Capture(data)))
     })?;
     Ok(entries
         .into_inner()
@@ -50,8 +34,8 @@ fn collect_extract(archive: &Archive) -> Result<Vec<CollectedEntry>> {
 
 #[test]
 fn ppmd_block_can_emit_embedded_lz_distance_matches() {
-    let expected = std::fs::read(fixture("ppmd_lz_match.txt")).unwrap();
-    let archive = Archive::parse_path(fixture("ppmd_lz_match_rar300.rar")).unwrap();
+    let expected = std::fs::read(fixture("rar15_40/ppmd/ppmd_lz_match.txt")).unwrap();
+    let archive = Archive::parse_path(fixture("rar15_40/ppmd/ppmd_lz_match_rar300.rar")).unwrap();
     let files: Vec<_> = archive.files().collect();
 
     assert_eq!(files.len(), 1);
@@ -70,7 +54,7 @@ fn ppmd_block_can_emit_embedded_lz_distance_matches() {
 
 #[test]
 fn ppmd_block_can_emit_embedded_one_byte_lz_repeats() {
-    let archive = Archive::parse_path(fixture("ppmd_lz_repeat_rar3.cbr")).unwrap();
+    let archive = Archive::parse_path(fixture("rar15_40/ppmd/ppmd_lz_repeat_rar3.cbr")).unwrap();
     let files: Vec<_> = archive.files().collect();
 
     assert_eq!(files.len(), 2);
@@ -109,7 +93,7 @@ fn a_member_continuing_a_failed_ppmd_model_fails_cleanly() {
             "RAR 2.9 PPMd model is corrupt",
         ),
     ] {
-        let data = std::fs::read(fixture(name)).unwrap();
+        let data = std::fs::read(fixture(format!("rar15_40/ppmd/{name}"))).unwrap();
         let failures = Mutex::new(Vec::new());
         let handler = |member: &ArchiveMember, error: &rars::Error| {
             failures

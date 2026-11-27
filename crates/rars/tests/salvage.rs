@@ -4,6 +4,9 @@
 
 #[path = "support/scratch.rs"]
 mod scratch;
+#[path = "support/vint.rs"]
+mod vint;
+use vint::read_vint;
 
 use rars::rar15_40::{write_compressed_archive, FileEntry, Rar29Method, WriterOptions};
 use rars::{
@@ -321,18 +324,6 @@ fn shift_declared_size(bytes: &mut [u8], index: usize, delta: i64) {
 /// RAR 5 keeps the size as a variable-length number after the file flags.
 /// The new size is written in as many bytes as the old one took.
 fn shift_rar50_declared_size(bytes: &mut [u8], block: &rars::rar50::BlockHeader, delta: i64) {
-    fn read_vint(bytes: &[u8], at: &mut usize) -> u64 {
-        let mut value = 0;
-        for shift in (0..).step_by(7) {
-            let byte = bytes[*at];
-            *at += 1;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-        }
-        value
-    }
     let mut at = block.header_range.start;
     read_vint(bytes, &mut at);
     let start = at;

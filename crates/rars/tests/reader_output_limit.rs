@@ -1,5 +1,12 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/sinks.rs"]
+mod sinks;
+use data::xorshift;
+use sinks::Capture;
+
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder};
 
 fn archive(size: usize) -> rars::rar50::Archive {
@@ -31,17 +38,6 @@ fn unknown_size_flag_does_not_mean_zero_or_the_placeholder_value() {
 
 use rars::{ArchiveReadOptions, Error, ErrorKind};
 use std::{cell::RefCell, io::Write, rc::Rc};
-
-struct Capture(Rc<RefCell<Vec<u8>>>);
-impl Write for Capture {
-    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(b);
-        Ok(b.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
 
 #[test]
 fn rar5_output_admission_covers_modes_and_preserves_content() {
@@ -764,15 +760,7 @@ fn output_options(
 #[test]
 #[cfg(feature = "encryption")]
 fn total_admission_precedes_compressed_payload_decryption_including_split_streams() {
-    let mut state = 0x1234_5678u32;
-    let noise: Vec<u8> = (0..4096)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let noise = xorshift(4096, 0x1234_5678);
     let payload = noise.repeat(3);
     for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         let mut builder = Builder::new(format).password(Some(b"secret".to_vec()));

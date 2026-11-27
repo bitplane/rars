@@ -1,19 +1,15 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+use data::xorshift;
+
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};
 
 #[test]
 #[cfg(feature = "encryption")]
 fn dictionary_limit_covers_streaming_and_encrypted_split_members() {
-    let mut state = 0x1234_5678u32;
-    let noise: Vec<u8> = (0..4096)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let noise = xorshift(4096, 0x1234_5678);
     for format in [ArchiveVersion::Rar50, ArchiveVersion::Rar70] {
         let mut builder = Builder::new(format).password(Some(b"secret".to_vec()));
         builder

@@ -1,5 +1,9 @@
 #![cfg(feature = "write")]
 
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::SyncCapture;
+
 use rars::{rar50, ArchiveVersion, EntrySource, FeatureSet, WriterResources};
 use std::io::Cursor;
 use std::sync::{
@@ -117,23 +121,10 @@ fn rar50_volume_set_reads_a_stored_member_through_one_open() {
         let extracted = Arc::new(std::sync::Mutex::new(Vec::new()));
         let into = extracted.clone();
         rar50::extract_volumes_to(&archives, options, move |_| {
-            Ok(Box::new(Collect(into.clone())))
+            Ok(Box::new(SyncCapture(into.clone())))
         })
         .unwrap();
         assert_eq!(*extracted.lock().unwrap(), vec![b'A'; 4096]);
-    }
-}
-
-struct Collect(Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Collect {
-    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
     }
 }
 

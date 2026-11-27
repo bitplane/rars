@@ -9,26 +9,14 @@
 //! Real use is resident memory, read from `/proc`. The test is the only one
 //! in its binary, so nothing else runs in the process.
 
+#[path = "support/proc_status.rs"]
+mod proc_status;
+use proc_status::status;
+
 use rars::rar15_40::{self, FileEntry, FilterPolicy, Rar29Method, WriterOptions};
 use rars::{ArchiveReader, ArchiveVersion, FeatureSet};
 
 const MIB: u64 = 1024 * 1024;
-
-/// One field of `/proc/self/status`, in bytes.
-fn status(field: &str) -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status
-        .lines()
-        .find(|line| line.starts_with(field))
-        .unwrap_or_else(|| panic!("no {field} in /proc/self/status"));
-    let kib: u64 = line[field.len()..]
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .unwrap();
-    kib * 1024
-}
 
 fn text(member: usize) -> Vec<u8> {
     format!("member {member}: a short source file, coded as PPMd text\n")

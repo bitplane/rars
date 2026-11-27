@@ -3,6 +3,10 @@
 //! `volume_size` is the size of each volume file, headers included, the way
 //! RAR's own `-v` switch counts it.
 
+#[path = "support/data.rs"]
+mod data;
+use data::noise;
+
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, Error};
 
 const LEGACY: [ArchiveVersion; 6] = [
@@ -15,18 +19,6 @@ const LEGACY: [ArchiveVersion; 6] = [
 ];
 const MODERN: [ArchiveVersion; 2] = [ArchiveVersion::Rar50, ArchiveVersion::Rar70];
 const PASSWORD: &[u8] = b"secret";
-
-fn noise(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(2654435761) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
 
 #[derive(Clone, Copy, Debug)]
 struct Case {

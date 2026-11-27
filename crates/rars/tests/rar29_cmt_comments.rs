@@ -1,5 +1,12 @@
 #![cfg(all(feature = "write", feature = "encryption"))]
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/sinks.rs"]
+mod sinks;
+use data::half_noise;
+use sinks::Capture;
+
 use rars::rar15_40::{
     extract_volumes_to, write_compressed_archive_with_comment, write_stored_archive_with_comment,
     write_volumes_with_comment_to, Archive, Block, CollectedVolumes, EntrySource, FileEntry,
@@ -7,7 +14,6 @@ use rars::rar15_40::{
 };
 use rars::{ArchiveReadOptions, ArchiveVersion, FeatureSet, WriterResources};
 use std::cell::RefCell;
-use std::io::Write;
 use std::rc::Rc;
 
 const COMMENT: &[u8] = b"rar29 archive note\r\n";
@@ -17,19 +23,7 @@ const FHD_PASSWORD: u16 = 0x0004;
 const MARK_AND_MAIN: usize = 7 + 13;
 
 fn noise(len: usize) -> Vec<u8> {
-    let mut state = 0x9e37_79b9u32;
-    (0..len)
-        .map(|i| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            if i % 2 == 0 {
-                state as u8
-            } else {
-                b"cmt comment volumes "[i % 20]
-            }
-        })
-        .collect()
+    half_noise(len, 0x9e37_79b9, b"cmt comment volumes ")
 }
 
 fn options(target: ArchiveVersion, header_encryption: bool) -> WriterOptions {
@@ -114,24 +108,11 @@ fn comment_subblocks(archive: &Archive) -> usize {
         .count()
 }
 
-struct Collect(Rc<RefCell<Vec<u8>>>);
-
-impl Write for Collect {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn extract_only_member(archives: &[Archive], password: Option<&[u8]>) -> Vec<u8> {
     let data = Rc::new(RefCell::new(Vec::new()));
     let options = ArchiveReadOptions::with_optional_password(password);
     extract_volumes_to(archives, options, |_| {
-        Ok(Box::new(Collect(Rc::clone(&data))))
+        Ok(Box::new(Capture(Rc::clone(&data))))
     })
     .unwrap();
     let out = data.borrow().clone();

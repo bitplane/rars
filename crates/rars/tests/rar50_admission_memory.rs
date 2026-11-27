@@ -10,29 +10,16 @@
 //! what glibc keeps after a free count against the budget as well. The test
 //! is the only one in its binary, so nothing else runs in the process.
 
+#[path = "support/proc_status.rs"]
+mod proc_status;
 #[path = "support/scratch.rs"]
 mod scratch;
+use proc_status::status;
 
 use rars::rar50::{self, ArchiveEntry, ArchiveExtras, FilterPolicy, WriterOptions};
 use rars::{ArchiveVersion, EntrySource, FeatureSet, WriterResources};
 
 const MIB: u64 = 1024 * 1024;
-
-/// One field of `/proc/self/status`, in bytes.
-fn status(field: &str) -> u64 {
-    let status = std::fs::read_to_string("/proc/self/status").unwrap();
-    let line = status
-        .lines()
-        .find(|line| line.starts_with(field))
-        .unwrap_or_else(|| panic!("no {field} in /proc/self/status"));
-    let kib: u64 = line[field.len()..]
-        .trim()
-        .trim_end_matches("kB")
-        .trim()
-        .parse()
-        .unwrap();
-    kib * 1024
-}
 
 fn noise(size: usize, seed: u64) -> Vec<u8> {
     let mut state = seed;

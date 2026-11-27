@@ -9,8 +9,11 @@ use rars::{
 use std::io::{Cursor, Read, Seek, SeekFrom};
 use std::sync::{atomic::Ordering, Arc};
 
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::xorshift;
 
 #[test]
 fn staging_finished_events_require_verified_payloads() {
@@ -890,15 +893,7 @@ fn stage_from_set(
 
 #[test]
 fn volume_set_staging_follows_split_members_into_later_volumes() {
-    let mut state = 0x9e37_79b9u32;
-    let large: Vec<u8> = (0..20_000)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let large = xorshift(20_000, 0x9e37_79b9);
     for solid in [false, true] {
         let mut builder = Builder::new(ArchiveVersion::Rar50)
             .solid(solid)

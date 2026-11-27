@@ -2,8 +2,11 @@
 //! Spools that stay small are held in memory, charged to the writer's budget,
 //! and make no temporary files. Large ones still go to disk.
 
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::xorshift;
 
 use rars::rar50::{self, ArchiveEntry, ArchiveExtras, FilterPolicy, WriterOptions};
 use rars::{
@@ -66,20 +69,9 @@ fn write_watched(builder: &Builder, resources: &WriterResources, dir: &Path) -> 
     })
 }
 
-fn noise(len: usize, mut seed: u32) -> Vec<u8> {
-    (0..len)
-        .map(|_| {
-            seed ^= seed << 13;
-            seed ^= seed >> 17;
-            seed ^= seed << 5;
-            seed as u8
-        })
-        .collect()
-}
-
 /// Packs to about half its size, so the packed member is spooled.
 fn nibbles(len: usize, seed: u32) -> Vec<u8> {
-    noise(len, seed)
+    xorshift(len, seed)
         .into_iter()
         .map(|byte| b'a' + (byte & 15))
         .collect()
@@ -95,7 +87,7 @@ fn small_members(builder: &mut Builder) {
         )
         .unwrap();
     builder
-        .add_bytes(b"noise".to_vec(), noise(256 * 1024, 7), None, None)
+        .add_bytes(b"noise".to_vec(), xorshift(256 * 1024, 7), None, None)
         .unwrap();
     builder
         .add_bytes(b"zeros".to_vec(), vec![0; 512 * 1024], None, None)

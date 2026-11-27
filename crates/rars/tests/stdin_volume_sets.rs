@@ -4,6 +4,13 @@
 //! the last says its member's size is unknown, and the last says what it is.
 //! The sets here are built by our writer and patched to match.
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/vint.rs"]
+mod vint;
+use data::xorshift;
+use vint::{read_vint, vint};
+
 use rars::{
     drop_incomplete_members, extract_volumes_to_with_options, Archive, ArchiveReadOptions,
     ArchiveReader, ArchiveVersion, Builder, ExtractedEntryMeta, MissingPart,
@@ -12,18 +19,6 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 const NAME: &[u8] = b"data.txt";
-
-fn noise(len: usize) -> Vec<u8> {
-    let mut state = 0x9e37_79b9_u32;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
 
 /// One member split across every volume of the set.
 fn build_set(version: ArchiveVersion, stored: bool, data: &[u8]) -> Vec<Vec<u8>> {
@@ -92,32 +87,6 @@ fn set_rar4_size(volume: &mut Vec<u8>, file: &rars::rar15_40::FileHeader, size: 
     volume[high_unp..high_unp + 4].copy_from_slice(&((unp_size >> 32) as u32).to_le_bytes());
     let crc = rars::crc32::crc32(&volume[start + 2..start + head_size]) as u16;
     volume[start..start + 2].copy_from_slice(&crc.to_le_bytes());
-}
-
-fn read_vint(bytes: &[u8], at: &mut usize) -> u64 {
-    let mut value = 0;
-    for shift in (0..).step_by(7) {
-        let byte = bytes[*at];
-        *at += 1;
-        value |= u64::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            break;
-        }
-    }
-    value
-}
-
-fn vint(mut value: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    loop {
-        let byte = (value & 0x7f) as u8;
-        value >>= 7;
-        if value == 0 {
-            out.push(byte);
-            return out;
-        }
-        out.push(byte | 0x80);
-    }
 }
 
 const HFL_EXTRA: u64 = 0x01;
@@ -215,7 +184,7 @@ fn cases() -> impl Iterator<Item = (ArchiveVersion, bool)> {
 
 #[test]
 fn a_set_written_from_stdin_is_complete() {
-    let data = noise(30_000);
+    let data = xorshift(30_000, 0x9e37_79b9);
     for (version, stored) in cases() {
         let case = format!("{version:?} stored={stored}");
         let volumes = from_stdin(build_set(version, stored, &data));
@@ -241,7 +210,7 @@ fn a_set_written_from_stdin_is_complete() {
 
 #[test]
 fn a_set_from_stdin_missing_its_last_volume_is_still_incomplete() {
-    let data = noise(30_000);
+    let data = xorshift(30_000, 0x9e37_79b9);
     for (version, stored) in cases() {
         let case = format!("{version:?} stored={stored}");
         let volumes = from_stdin(build_set(version, stored, &data));
@@ -267,7 +236,7 @@ fn broken_before_last(volumes: &[Vec<u8>]) -> Vec<(Vec<u8>, usize, MissingPart)>
 
 #[test]
 fn a_known_size_that_changes_still_breaks_the_set() {
-    let data = noise(30_000);
+    let data = xorshift(30_000, 0x9e37_79b9);
     let wrong = Size::Known(data.len() as u64 + 1);
     for (version, stored) in cases() {
         let case = format!("{version:?} stored={stored}");
@@ -311,7 +280,7 @@ fn a_set_from_stdin_is_decoded_as_its_volumes_arrive() {
     // Past the size at which output goes out a chunk at a time, and
     // compressible, so that it isn't stored instead, but not so much that it
     // packs into the megabyte a RAR 1.5-4 decoder reads ahead.
-    let data: Vec<u8> = noise(3 << 20)
+    let data: Vec<u8> = xorshift(3 << 20, 0x9e37_79b9)
         .into_iter()
         .enumerate()
         .map(|(at, byte)| if at % 2 == 0 { byte } else { b"text "[at % 5] })
@@ -410,7 +379,7 @@ fn a_set_from_stdin_is_decoded_as_its_volumes_arrive() {
 /// still has to come to the size its last part gives.
 #[test]
 fn a_set_from_stdin_must_match_the_size_its_last_part_gives() {
-    let data = noise(30_000);
+    let data = xorshift(30_000, 0x9e37_79b9);
     for (version, stored) in [ArchiveVersion::Rar29, ArchiveVersion::Rar50]
         .into_iter()
         .flat_map(|version| [(version, true), (version, false)])
@@ -437,7 +406,7 @@ fn a_set_from_stdin_must_match_the_size_its_last_part_gives() {
 #[cfg(feature = "encryption")]
 #[test]
 fn salvage_keeps_an_encrypted_split_member_up_to_a_missing_volume() {
-    let data: Vec<u8> = noise(60_000)
+    let data: Vec<u8> = xorshift(60_000, 0x9e37_79b9)
         .into_iter()
         .enumerate()
         .map(|(at, byte)| if at % 7 == 0 { byte } else { b"text "[at % 5] })

@@ -1,5 +1,9 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+use data::xorshift;
+
 use rars::{
     rar13, rar15_40, rar50, Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder,
     Error, ErrorKind, ExtractionDecision, ExtractionErrorAction, ExtractionOutcome,
@@ -416,19 +420,8 @@ fn read_options_keep_one_flush_after_all_writes() {
     }
 }
 
-fn noise(len: usize, mut state: u32) -> Vec<u8> {
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
-
 fn split_set(version: ArchiveVersion, store: bool) -> (Vec<Archive>, usize) {
-    let data = noise(30_000, 365);
+    let data = xorshift(30_000, 365);
     let len = data.len();
     let mut builder = builder(version, store, false).volume_size(Some(4096));
     add(&mut builder, FIRST, data);
@@ -532,7 +525,7 @@ fn many_members(version: ArchiveVersion) -> Vec<u8> {
         add(
             &mut builder,
             &name,
-            noise(100 + index as usize * 397, index + 1),
+            xorshift(100 + index as usize * 397, index + 1),
         );
     }
     builder.to_bytes().unwrap()
@@ -657,7 +650,7 @@ fn assert_my_error(error: &Error) {
 /// A 4 KiB first member with no long repeats, then a short second one.
 fn uneven_fixture(version: ArchiveVersion, store: bool) -> Vec<u8> {
     let mut builder = builder(version, store, false);
-    let letters = noise(4096, 77)
+    let letters = xorshift(4096, 77)
         .into_iter()
         .map(|b| b"abcdefg "[usize::from(b % 8)])
         .collect();

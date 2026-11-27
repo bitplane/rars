@@ -1,5 +1,9 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+use data::noise;
+
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder};
 use std::collections::BTreeMap;
 use std::io::{Read, Seek, Write};
@@ -24,18 +28,6 @@ fn cases() -> impl Iterator<Item = (ArchiveVersion, bool)> {
 
 type Members = BTreeMap<Vec<u8>, Vec<u8>>;
 type Outputs = Arc<Mutex<Members>>;
-
-fn noise(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(2654435761) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
 
 fn build_set(version: ArchiveVersion, stored: bool) -> (Members, Vec<Vec<u8>>) {
     let mut builder = Builder::new(version)

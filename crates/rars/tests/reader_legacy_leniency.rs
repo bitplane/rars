@@ -3,26 +3,20 @@
 //! refused. Zero padding after a member's last code, malformed optional old
 //! blocks, and a file that ends in or before a block that follows every member.
 
+#[path = "support/data.rs"]
+mod data;
+#[path = "support/fixtures.rs"]
+mod fixtures;
+use data::lcg;
+use fixtures::fixture;
+
 use rars::crc32::crc32;
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder, Error, TruncatedBlock};
 use std::io::Write;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/rar15_40")
-        .join(name)
-}
-
 fn members() -> Vec<(Vec<u8>, Vec<u8>)> {
-    let mut state = 489u32;
-    let noise: Vec<u8> = (0..5000)
-        .map(|_| {
-            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-            (state >> 24) as u8
-        })
-        .collect();
+    let noise = lcg(5000, 489);
     vec![
         (
             b"first.txt".to_vec(),
@@ -107,7 +101,7 @@ fn pad_legacy_member(bytes: &mut Vec<u8>, pos: usize, padding: &[u8]) {
 
 #[test]
 fn rar29_lz_members_may_end_in_whole_zero_bytes() {
-    let bytes = std::fs::read(fixture("zero_padding/rar29.rar")).unwrap();
+    let bytes = std::fs::read(fixture("rar15_40/zero_padding/rar29.rar")).unwrap();
     let archive = ArchiveReader::read(&bytes).unwrap();
     let entries = verified(&archive).unwrap();
     let mut first = (0..=255u8).collect::<Vec<_>>().repeat(6);

@@ -1,7 +1,11 @@
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::Capture;
+
 use rars::rar13::{extract_volumes_to, file_checksum, Archive, Entry};
 use rars::{detect_archive_family, find_archive_start, ArchiveFamily, Error};
 use std::cell::RefCell;
-use std::io::{ErrorKind, Result as IoResult, Write};
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -42,10 +46,6 @@ const ENCRYPTED_SPLIT: [&[u8]; 3] = [
     include_bytes!("fixtures/rar13/encrypted_split/ESPLIT.R01"),
 ];
 
-struct CollectWriter {
-    data: Rc<RefCell<Vec<u8>>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CollectedEntry {
     name: Vec<u8>,
@@ -53,17 +53,6 @@ struct CollectedEntry {
     file_time: u32,
     file_attr: u8,
     is_directory: bool,
-}
-
-impl Write for CollectWriter {
-    fn write(&mut self, buf: &[u8]) -> IoResult<usize> {
-        self.data.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> IoResult<()> {
-        Ok(())
-    }
 }
 
 /// RAR 1.4 stores `LHD_SOLID` at +17 bit 4 and never reads it back: solid
@@ -118,7 +107,7 @@ fn collect_extract(
     archive.extract_to(password, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
-        Ok(Box::new(CollectWriter { data }))
+        Ok(Box::new(Capture(data)))
     })?;
     Ok(entries
         .into_inner()
@@ -141,7 +130,7 @@ fn collect_extract_volumes(
     extract_volumes_to(archives, password, |meta| {
         let data = Rc::new(RefCell::new(Vec::new()));
         entries.borrow_mut().push((meta.clone(), Rc::clone(&data)));
-        Ok(Box::new(CollectWriter { data }))
+        Ok(Box::new(Capture(data)))
     })?;
     Ok(entries
         .into_inner()
@@ -162,13 +151,7 @@ fn collect_entry(
     password: Option<&[u8]>,
 ) -> Result<Vec<u8>, Error> {
     let data = Rc::new(RefCell::new(Vec::new()));
-    entry.write_to(
-        archive,
-        password,
-        &mut CollectWriter {
-            data: Rc::clone(&data),
-        },
-    )?;
+    entry.write_to(archive, password, &mut Capture(Rc::clone(&data)))?;
     let data = data.borrow().clone();
     Ok(data)
 }

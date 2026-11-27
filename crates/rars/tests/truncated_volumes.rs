@@ -1,24 +1,15 @@
 #![cfg(feature = "write")]
 
 use rars::{Archive, ArchiveReader, ArchiveVersion, Builder};
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::noise;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const VOLUME_SIZE: usize = 4096;
-
-fn noise(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(2654435761) | 1;
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
 
 fn write_set(
     name: &str,

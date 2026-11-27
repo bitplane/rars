@@ -1,12 +1,15 @@
 #![cfg(feature = "write")]
 
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::Capture;
+
 use rars::rar15_40::{
     extract_volumes_to, write_volumes_to, Archive, CollectedVolumes, EntrySource, MemberCoding,
     StreamingEntry, WriterOptions,
 };
 use rars::{ArchiveReadOptions, ArchiveVersion, FeatureSet, WriterResources};
 use std::cell::RefCell;
-use std::io::Write;
 use std::rc::Rc;
 
 fn bytes(len: usize, seed: u32) -> Vec<u8> {
@@ -66,19 +69,6 @@ struct Extracted {
     data: Vec<u8>,
 }
 
-struct Collect(Rc<RefCell<Vec<u8>>>);
-
-impl Write for Collect {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.borrow_mut().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
 fn extract(volumes: &[Vec<u8>], password: Option<&[u8]>) -> Vec<Extracted> {
     let archives: Vec<_> = volumes
         .iter()
@@ -94,7 +84,7 @@ fn extract(volumes: &[Vec<u8>], password: Option<&[u8]>) -> Vec<Extracted> {
         found
             .borrow_mut()
             .push((meta.name.clone(), meta.is_directory, Rc::clone(&data)));
-        Ok(Box::new(Collect(data)))
+        Ok(Box::new(Capture(data)))
     })
     .unwrap();
     found

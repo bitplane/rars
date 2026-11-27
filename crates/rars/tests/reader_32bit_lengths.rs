@@ -1,17 +1,13 @@
+#[path = "support/vint.rs"]
+mod vint;
+use vint::vint;
+
 use rars::{ArchiveReadOptions, ArchiveReader, Error};
 use std::io;
 
-fn vint(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 128 {
-        out.push((value as u8 & 0x7f) | 0x80);
-        value >>= 7;
-    }
-    out.push(value as u8);
-}
-
 fn block(body: &[u8]) -> Vec<u8> {
     let mut encoded = Vec::new();
-    vint(body.len() as u64, &mut encoded);
+    encoded.extend(vint(body.len() as u64));
     encoded.extend_from_slice(body);
     let mut block = rars::crc32::crc32(&encoded).to_le_bytes().to_vec();
     block.extend_from_slice(&encoded);
@@ -26,9 +22,9 @@ fn advertised_member(unpacked_size: u64, compression_info: u64, split_flags: u8)
     // compression info, host OS, and the one-byte name. No payload is needed
     // because the advertised lengths must be rejected before decoding.
     let mut file = vec![2, split_flags, 0];
-    vint(unpacked_size, &mut file);
+    file.extend(vint(unpacked_size));
     file.push(0);
-    vint(compression_info, &mut file);
+    file.extend(vint(compression_info));
     file.extend_from_slice(&[0, 1, b'x']);
     bytes.extend_from_slice(&block(&file));
     ArchiveReader::read_owned(bytes).expect("the size declaration must parse")

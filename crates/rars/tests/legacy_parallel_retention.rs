@@ -4,8 +4,12 @@
     not(all(target_arch = "wasm32", target_os = "unknown"))
 ))]
 
+#[path = "support/sinks.rs"]
+mod sinks;
+use sinks::SyncCapture;
+
 use rars::{rar15_40, ArchiveReadOptions, ArchiveVersion, Builder, Error};
-use std::io::{self, Write};
+use std::io::{self};
 use std::sync::{Arc, Mutex};
 
 const VERSIONS: [ArchiveVersion; 5] = [
@@ -76,19 +80,6 @@ fn publishes_one_worker_window_before_a_later_decode_failure() {
     }
 }
 
-struct Capture(Arc<Mutex<Vec<u8>>>);
-
-impl Write for Capture {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 #[test]
 fn preserves_order_and_content_across_windows_including_empty_members() {
     let pool = rayon::ThreadPoolBuilder::new()
@@ -104,7 +95,7 @@ fn preserves_order_and_content_across_windows_including_empty_members() {
                 archive
                     .extract_to_parallel_buffered(ArchiveReadOptions::new(), |meta| {
                         opened.push(meta.name.clone());
-                        Ok(Box::new(Capture(data.clone())))
+                        Ok(Box::new(SyncCapture(data.clone())))
                     })
                     .unwrap();
                 assert_eq!(opened, [b"0", b"1", b"2", b"3", b"4"]);

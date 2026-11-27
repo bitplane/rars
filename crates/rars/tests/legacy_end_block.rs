@@ -1,5 +1,9 @@
 #![cfg(feature = "write")]
 
+#[path = "support/data.rs"]
+mod data;
+use data::xorshift;
+
 use rars::{ArchiveVersion, Builder};
 
 // As RAR 3.00 writes them: the last volume or a lone archive, then one with more to come.
@@ -14,15 +18,7 @@ const WITH_END_BLOCK: [ArchiveVersion; 3] = [
 
 fn builder(version: ArchiveVersion, stored: bool) -> Builder {
     let mut builder = Builder::new(version).store(stored);
-    let mut state = 0x9e37_79b9u32;
-    let data: Vec<u8> = (0..20_000)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect();
+    let data = xorshift(20_000, 0x9e37_79b9);
     builder
         .add_bytes(b"file".to_vec(), data, None, None)
         .unwrap();

@@ -3,6 +3,10 @@
 //! Volume sets with volumes missing: the members wholly inside the volumes
 //! present still read, and the split ones are named.
 
+#[path = "support/data.rs"]
+mod data;
+use data::half_noise;
+
 use rars::rar15_40::{write_volumes_to, CollectedVolumes, EntrySource, StreamingEntry};
 use rars::{
     drop_incomplete_members, extract_volumes_to_with_options, Archive, ArchiveReadOptions,
@@ -16,20 +20,11 @@ use std::sync::{Arc, Mutex};
 type Members = BTreeMap<Vec<u8>, Vec<u8>>;
 
 fn noise(seed: u32, len: usize) -> Vec<u8> {
-    let mut state = seed.wrapping_mul(2_654_435_761) | 1;
-    (0..len)
-        .map(|index| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            // Half noise, half text, so compressed members still span volumes.
-            if index % 2 == 0 {
-                state as u8
-            } else {
-                b"partial volume set "[index % 19]
-            }
-        })
-        .collect()
+    half_noise(
+        len,
+        seed.wrapping_mul(2_654_435_761) | 1,
+        b"partial volume set ",
+    )
 }
 
 /// Sizes that leave some members inside one volume and split others over several.

@@ -2,8 +2,11 @@
 //! RAR 5 members carry a CRC32, as rar writes them, and a BLAKE2sp hash record
 //! beside it only when asked for, the hash rar's `-htb` writes.
 
+#[path = "support/data.rs"]
+mod data;
 #[path = "support/scratch.rs"]
 mod scratch;
+use data::xorshift;
 
 use rars::rar50::{Archive, Block};
 use rars::{ArchiveReader, ArchiveVersion, Builder, Error};
@@ -12,22 +15,11 @@ use std::sync::{Arc, Mutex};
 
 const PASSWORD: &[u8] = b"pw";
 
-fn noise(len: usize, mut state: u32) -> Vec<u8> {
-    (0..len)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 17;
-            state ^= state << 5;
-            state as u8
-        })
-        .collect()
-}
-
 fn members() -> Vec<(&'static [u8], Vec<u8>)> {
     let text = b"the quick brown fox jumps over the lazy dog\n".repeat(900);
     vec![
         (b"text.txt", text),
-        (b"noise.bin", noise(100_000, 0x2545_f491)),
+        (b"noise.bin", xorshift(100_000, 0x2545_f491)),
         (b"empty", Vec::new()),
     ]
 }
