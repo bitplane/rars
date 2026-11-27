@@ -280,11 +280,11 @@ where
     Ok(writer)
 }
 
-fn packed_reader<R: Read>(
-    chain: R,
+fn packed_reader<'a>(
+    chain: LazyChain<'a>,
     encrypted: bool,
     password: Option<&[u8]>,
-) -> Result<PackedReader<R>> {
+) -> Result<PackedReader<'a>> {
     if !encrypted {
         return Ok(PackedReader::Plain(chain));
     }

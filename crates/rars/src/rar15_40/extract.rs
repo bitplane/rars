@@ -6,7 +6,7 @@ use crate::codec::rar20::Reader20State;
 use crate::codec::rar29::Reader29State;
 use crate::codec::workspace::{Allowance, Boxed, Budget, Buffer};
 use crate::extraction_links::{check_legacy_size, legacy_output, skip_legacy_links, LegacyLink};
-use crate::volume_extract::VolumeFeed;
+use crate::volume_extract::{LazyChain, VolumeFeed};
 use std::io::{Read, Write};
 
 enum CodecState<B: Budget = Allowance> {
@@ -97,7 +97,7 @@ impl<B: Budget> CodecState<B> {
     /// only, keeping it if it ends cleanly, and returns whether it did and
     /// went past the declared size. RAR 2.9 does this itself, up to its
     /// end-of-file marker.
-    fn run_on(&mut self, input: &mut impl Read) -> bool {
+    fn run_on(&mut self, input: &mut PackedReader<'_, B>) -> bool {
         match self {
             Self::Unpack15(decoder) => decoder.run_on(input),
             Self::Unpack20(decoder) => decoder.run_on(input),
@@ -109,7 +109,7 @@ impl<B: Budget> CodecState<B> {
     /// the error that says so, for the caller to weigh against the CRC.
     fn decode_to(
         &mut self,
-        input: &mut impl Read,
+        input: &mut PackedReader<'_, B>,
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
@@ -152,7 +152,7 @@ impl<B: Budget> CodecState<B> {
     /// Returns the output's CRC; a split member's last header holds the one to check it against.
     fn decode_split_to(
         &mut self,
-        input: &mut impl Read,
+        input: &mut PackedReader<'_, B>,
         file: &FileHeader,
         solid: bool,
         password: Option<&[u8]>,
@@ -296,7 +296,7 @@ impl<'a, B: Budget> DecoderSession<'a, B> {
 
     fn decode_split_to(
         &mut self,
-        input: &mut impl Read,
+        input: &mut PackedReader<'_, B>,
         first: &FileHeader,
         out: &mut impl Write,
     ) -> Result<Decoded> {
@@ -504,11 +504,11 @@ impl<B: Budget> SplitCipher<B> {
     }
 }
 
-pub(super) enum PackedReader<R, B: Budget = Allowance> {
-    Plain(R),
-    Encrypted(Boxed<DecryptingReader<R, B>, B>),
+pub(super) enum PackedReader<'a, B: Budget = Allowance> {
+    Plain(LazyChain<'a>),
+    Encrypted(Boxed<DecryptingReader<LazyChain<'a>, B>, B>),
 }
-impl<R: Read, B: Budget> Read for PackedReader<R, B> {
+impl<B: Budget> Read for PackedReader<'_, B> {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(reader) => reader.read(out),
@@ -1623,7 +1623,7 @@ mod tests {
             let reader = volume
                 .source
                 .owned_range_reader(first.packed_range.clone())?;
-            let chain = crate::volume_extract::LazyChain::new(walk, reader);
+            let chain = LazyChain::new(&mut *walk, reader);
             let reader = volumes::packed_reader(
                 chain,
                 first,

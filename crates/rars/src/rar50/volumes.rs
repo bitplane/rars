@@ -348,12 +348,12 @@ fn split_decryptor<B: Budget>(
     }))
 }
 
-pub(super) fn packed_reader<R: Read, B: Budget>(
-    chain: R,
+pub(super) fn packed_reader<'a, B: Budget>(
+    chain: LazyChain<'a>,
     decryptor: Option<&SplitDecryptor>,
     allowance: &B,
     salvage: bool,
-) -> Result<PackedReader<R, B>> {
+) -> Result<PackedReader<'a, B>> {
     let Some(decryptor) = decryptor else {
         return Ok(PackedReader::Plain(chain));
     };
@@ -413,7 +413,7 @@ pub(super) fn write_stored<B: Budget>(
     let mut sums = SplitChecksums::new(first);
     let salvage = walk.options.salvage;
     let mut reader = packed_reader(
-        LazyChain::new(walk, first_reader),
+        LazyChain::new(&mut *walk, first_reader),
         decryptor,
         allowance,
         salvage,
@@ -514,7 +514,7 @@ impl<B: Budget> DecoderSession<'_, B> {
                 &self.allowance,
                 salvage,
             )?;
-            control.finish(unchecked.stream_packed_with_crc_policy::<true, _, _>(
+            control.finish(unchecked.stream_packed_with_crc_policy::<true, _>(
                 &mut packed,
                 None,
                 &mut decoder,

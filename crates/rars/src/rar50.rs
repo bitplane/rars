@@ -31,9 +31,9 @@ pub(crate) mod producer;
 pub(crate) mod write;
 
 pub(crate) use extract::test_volumes_to;
-pub(crate) use extract::CommentChecksum;
 pub(crate) use extract::{extract_from_feed, Redirections};
 pub use extract::{extract_volumes_to, extract_volumes_to_with_redirections};
+pub(crate) use extract::{packed_bytes, CommentChecksum};
 #[cfg(feature = "write")]
 pub use write::{
     write_readable_archive_to, write_readable_archive_with_progress, write_seekable_archive_to,

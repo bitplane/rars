@@ -873,7 +873,7 @@ impl<B: Budget> ReaderState<B> {
         history: HistoryRetention,
     ) -> Result<Buffer<u8, B>> {
         self.read_control.check_codec()?;
-        let mut input = std::io::Cursor::new(input);
+        let mut input = crate::rar50::packed_bytes::<B>(input);
         self.decode_member_from_reader_with_dictionary_and_history(
             &mut input,
             algorithm_version,

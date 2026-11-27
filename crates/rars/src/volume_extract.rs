@@ -264,26 +264,37 @@ pub(crate) enum VolumeEnd {
 }
 
 /// Yields a split member's packed fragments, fetching later volumes on demand.
-pub(crate) trait FragmentWalk {
+pub(crate) trait FragmentWalk: Send {
     fn next_fragment(&mut self) -> crate::Result<Option<RangeReader<'static>>>;
 }
 
-/// Reads a split member's fragments as one stream, asking the walk for each next one.
-pub(crate) struct LazyChain<'w, W> {
-    walk: &'w mut W,
-    current: Option<RangeReader<'static>>,
+/// Reads one packed range and follows continuation fragments when present.
+pub(crate) struct LazyChain<'w> {
+    walk: Option<&'w mut dyn FragmentWalk>,
+    current: Option<RangeReader<'w>>,
 }
 
-impl<'w, W: FragmentWalk> LazyChain<'w, W> {
-    pub(crate) fn new(walk: &'w mut W, first: RangeReader<'static>) -> Self {
+impl<'w> LazyChain<'w> {
+    pub(crate) fn single(reader: RangeReader<'w>) -> Self {
         Self {
-            walk,
+            walk: None,
+            current: Some(reader),
+        }
+    }
+
+    pub(crate) fn bytes(bytes: &'w [u8]) -> Self {
+        Self::single(RangeReader::Memory(std::io::Cursor::new(bytes)))
+    }
+
+    pub(crate) fn new(walk: &'w mut dyn FragmentWalk, first: RangeReader<'static>) -> Self {
+        Self {
+            walk: Some(walk),
             current: Some(first),
         }
     }
 }
 
-impl<W: FragmentWalk> Read for LazyChain<'_, W> {
+impl Read for LazyChain<'_> {
     fn read(&mut self, out: &mut [u8]) -> Result<usize> {
         if out.is_empty() {
             return Ok(0);
@@ -295,7 +306,9 @@ impl<W: FragmentWalk> Read for LazyChain<'_, W> {
             }
             // Drop the spent fragment before pulling the next volume.
             self.current = None;
-            self.current = self.walk.next_fragment().map_err(std::io::Error::other)?;
+            if let Some(walk) = &mut self.walk {
+                self.current = walk.next_fragment().map_err(std::io::Error::other)?;
+            }
         }
         Ok(0)
     }
