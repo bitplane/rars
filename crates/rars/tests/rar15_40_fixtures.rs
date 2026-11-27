@@ -2875,126 +2875,6 @@ fn rar20_writer_stores_member_when_lz_payload_would_grow() {
 }
 
 #[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar20_archives_that_reader_extracts_with_password() {
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar20, features);
-
-    let stored = [StoredEntry {
-        name: b"rar20-secret-store.txt",
-        data: b"RAR 2.0 encrypted stored payload\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-    let stored_bytes = write_stored_archive(&stored, options).unwrap();
-    let stored_archive = Archive::parse(&stored_bytes).unwrap();
-    let stored_file = stored_archive.files().next().unwrap();
-    assert_eq!(stored_file.unp_ver, 20);
-    assert!(stored_file.is_encrypted());
-    assert_eq!(stored_file.pack_size % 16, 0);
-    assert!(matches!(
-        collect_extract(&stored_archive),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_with_password(&stored_archive, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted = collect_extract_with_password(&stored_archive, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored[0].data);
-
-    let compressed = [FileEntry {
-        name: b"rar20-secret-compressed.txt",
-        data: b"RAR 2.0 encrypted compressed payload payload payload\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-    let compressed_bytes = write_compressed_archive(&compressed, options).unwrap();
-    let compressed_archive = Archive::parse(&compressed_bytes).unwrap();
-    let compressed_file = compressed_archive.files().next().unwrap();
-    assert_eq!(compressed_file.unp_ver, 20);
-    assert!(compressed_file.is_encrypted());
-    assert_eq!(compressed_file.pack_size % 16, 0);
-    assert!(matches!(
-        collect_extract(&compressed_archive),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_with_password(&compressed_archive, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted = collect_extract_with_password(&compressed_archive, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed[0].data);
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar29_archives_that_reader_extracts_with_password() {
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar29, features);
-
-    let stored = [StoredEntry {
-        name: b"rar29-secret-store.txt",
-        data: b"RAR 2.9 encrypted stored payload\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-    let stored_bytes = write_stored_archive(&stored, options).unwrap();
-    let stored_archive = Archive::parse(&stored_bytes).unwrap();
-    let stored_file = stored_archive.files().next().unwrap();
-    assert_eq!(stored_file.unp_ver, 29);
-    assert!(stored_file.is_encrypted());
-    assert!(stored_file.salt.is_some());
-    assert_eq!(stored_file.pack_size % 16, 0);
-    assert!(matches!(
-        collect_extract(&stored_archive),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_with_password(&stored_archive, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted = collect_extract_with_password(&stored_archive, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored[0].data);
-
-    let compressed = [FileEntry {
-        name: b"rar29-secret-compressed.txt",
-        data: b"RAR 2.9 encrypted compressed payload payload payload\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-    let compressed_bytes = write_compressed_archive(&compressed, options).unwrap();
-    let compressed_archive = Archive::parse(&compressed_bytes).unwrap();
-    let compressed_file = compressed_archive.files().next().unwrap();
-    assert_eq!(compressed_file.unp_ver, 29);
-    assert!(compressed_file.is_encrypted());
-    assert!(compressed_file.salt.is_some());
-    assert_eq!(compressed_file.pack_size % 16, 0);
-    assert!(matches!(
-        collect_extract(&compressed_archive),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_with_password(&compressed_archive, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted = collect_extract_with_password(&compressed_archive, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed[0].data);
-}
-
-#[test]
 #[cfg(feature = "write")]
 fn writes_literal_compressed_rar29_archive_that_reader_extracts() {
     let entries = [
@@ -4650,269 +4530,156 @@ fn writes_solid_compressed_rar15_archive_that_reader_extracts() {
     assert_eq!(extracted[1].data, entries[1].data);
 }
 
+/// Every legacy way of protecting an archive with a password, stored and
+/// compressed: what the headers say, and what extraction does without the
+/// password, with a wrong one and with the right one.
 #[test]
 #[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar15_archives_that_reader_extracts_with_password() {
-    let features = FeatureSet::store_only();
-
-    let stored = [StoredEntry {
-        name: b"secret-store.txt",
-        data: b"stored secret\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-    let stored_bytes =
-        write_stored_archive(&stored, WriterOptions::new(ArchiveVersion::Rar15, features)).unwrap();
-    let stored_archive = Archive::parse(&stored_bytes).unwrap();
-    let stored_file = stored_archive.files().next().unwrap();
-    assert!(stored_file.is_encrypted());
-    assert!(matches!(
-        collect_extract(&stored_archive),
-        Err(Error::NeedPassword)
-    ));
-    let extracted = collect_extract_with_password(&stored_archive, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored[0].data);
-
-    let compressed = [FileEntry {
-        name: b"secret-compressed.txt",
-        data: b"compressed secret compressed secret\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-    let compressed_bytes = write_compressed_archive(
-        &compressed,
-        WriterOptions::new(ArchiveVersion::Rar15, features),
-    )
-    .unwrap();
-    let compressed_archive = Archive::parse(&compressed_bytes).unwrap();
-    let compressed_file = compressed_archive.files().next().unwrap();
-    assert!(compressed_file.is_encrypted());
-    assert!(matches!(
-        collect_extract_with_password(&compressed_archive, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted = collect_extract_with_password(&compressed_archive, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed[0].data);
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_aes_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
-    let features = FeatureSet::store_only();
-
-    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        let stored = [StoredEntry {
-            name: b"aes-store.txt",
-            data: b"stored aes secret\n",
-            file_time: 0x5a21_0000,
-            file_attr: 0x20,
-            host_os: 3,
-            password: Some(b"password"),
-            file_comment: None,
-        }];
-        let stored_bytes = write_stored_archive(&stored, WriterOptions::new(target, features))
-            .unwrap_or_else(|error| panic!("{target:?} stored AES writer failed: {error}"));
-        let stored_archive = Archive::parse(&stored_bytes).unwrap();
-        let stored_file = stored_archive.files().next().unwrap();
-        assert!(stored_file.is_encrypted());
-        assert_eq!(stored_file.unp_ver, 29);
-        assert!(stored_file.salt.is_some());
-        assert_eq!(stored_file.pack_size % 16, 0);
-        assert!(matches!(
-            collect_extract(&stored_archive),
-            Err(Error::NeedPassword)
-        ));
-        assert!(matches!(
-            collect_extract_with_password(&stored_archive, Some(b"wrong")),
-            Err(Error::WrongPasswordOrCorruptData)
-        ));
-        let extracted = collect_extract_with_password(&stored_archive, Some(b"password")).unwrap();
-        assert_eq!(extracted[0].data, stored[0].data);
-
-        let compressed = [FileEntry {
-            name: b"aes-compressed.txt",
-            data: b"compressed aes secret compressed aes secret\n",
-            file_time: 0x5a21_0000,
-            file_attr: 0x20,
-            host_os: 3,
-            password: Some(b"password"),
-            file_comment: None,
-        }];
-        let compressed_bytes =
-            write_compressed_archive(&compressed, WriterOptions::new(target, features))
-                .unwrap_or_else(|error| panic!("{target:?} compressed AES writer failed: {error}"));
-        let compressed_archive = Archive::parse(&compressed_bytes).unwrap();
-        let compressed_file = compressed_archive.files().next().unwrap();
-        assert!(compressed_file.is_encrypted());
-        assert_eq!(compressed_file.unp_ver, 29);
-        assert!(compressed_file.salt.is_some());
-        assert_eq!(compressed_file.pack_size % 16, 0);
-        assert!(matches!(
-            collect_extract(&compressed_archive),
-            Err(Error::NeedPassword)
-        ));
-        assert!(matches!(
-            collect_extract_with_password(&compressed_archive, Some(b"wrong")),
-            Err(Error::WrongPasswordOrCorruptData)
-        ));
-        let extracted =
-            collect_extract_with_password(&compressed_archive, Some(b"password")).unwrap();
-        assert_eq!(extracted[0].data, compressed[0].data);
-    }
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
-    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
+fn writes_password_protected_archives_that_reader_extracts_with_password() {
+    const PASSWORD: &[u8] = b"password";
+    let one: &[(&[u8], &[u8])] = &[(
+        b"secret.txt",
+        b"password protected payload payload payload\n",
+    )];
+    let two: &[(&[u8], &[u8])] = &[
+        (
+            b"solid-header-one.txt",
+            b"solid header encrypted common prefix one one one\n",
+        ),
+        (
+            b"solid-header-two.txt",
+            b"solid header encrypted common prefix two two two\n",
+        ),
+    ];
+    // (target, stored, header encryption, solid)
+    let cases = [
+        (ArchiveVersion::Rar15, true, false, false),
+        (ArchiveVersion::Rar15, false, false, false),
+        (ArchiveVersion::Rar20, true, false, false),
+        (ArchiveVersion::Rar20, false, false, false),
+        (ArchiveVersion::Rar29, true, false, false),
+        (ArchiveVersion::Rar29, false, false, false),
+        (ArchiveVersion::Rar30, true, false, false),
+        (ArchiveVersion::Rar30, false, false, false),
+        (ArchiveVersion::Rar30, false, true, false),
+        (ArchiveVersion::Rar30, false, true, true),
+        (ArchiveVersion::Rar40, true, false, false),
+        (ArchiveVersion::Rar40, false, false, false),
+        (ArchiveVersion::Rar40, false, true, false),
+        (ArchiveVersion::Rar40, false, true, true),
+    ];
+    for (target, stored, header_encryption, solid) in cases {
+        let case = format!("{target:?} stored={stored} headers={header_encryption} solid={solid}");
+        let members = if solid { two } else { one };
         let mut features = FeatureSet::store_only();
-        features.header_encryption = true;
-        let entries = [FileEntry {
-            name: b"header-secret.txt",
-            data: b"RAR 3.x header encrypted writer payload\n",
-            file_time: 0x5a21_0000,
-            file_attr: 0x20,
-            host_os: 3,
-            password: Some(b"password"),
-            file_comment: None,
-        }];
-        let bytes =
-            write_compressed_archive(&entries, WriterOptions::new(target, features)).unwrap();
+        features.header_encryption = header_encryption;
+        features.solid = solid;
+        let options = WriterOptions::new(target, features);
+        let write = || {
+            if stored {
+                let entries: Vec<_> = members
+                    .iter()
+                    .map(|&(name, data)| StoredEntry {
+                        name,
+                        data,
+                        file_time: 0x5a21_0000,
+                        file_attr: 0x20,
+                        host_os: 3,
+                        password: Some(PASSWORD),
+                        file_comment: None,
+                    })
+                    .collect();
+                write_stored_archive(&entries, options)
+            } else {
+                let entries: Vec<_> = members
+                    .iter()
+                    .map(|&(name, data)| FileEntry {
+                        name,
+                        data,
+                        file_time: 0x5a21_0000,
+                        file_attr: 0x20,
+                        host_os: 3,
+                        password: Some(PASSWORD),
+                        file_comment: None,
+                    })
+                    .collect();
+                write_compressed_archive(&entries, options)
+            }
+            .unwrap_or_else(|error| panic!("{case}: {error}"))
+        };
+        let bytes = write();
 
-        assert!(matches!(Archive::parse(&bytes), Err(Error::NeedPassword)));
-        let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
-        assert!(archive.main.has_encrypted_headers());
+        let archive = if header_encryption {
+            assert!(
+                matches!(Archive::parse(&bytes), Err(Error::NeedPassword)),
+                "{case}"
+            );
+            let archive = Archive::parse_with_password(&bytes, Some(PASSWORD)).unwrap();
+            assert!(archive.main.has_encrypted_headers(), "{case}");
+            // A reader that finds the headers encrypted expects each one to be
+            // introduced by its own salt, so after the last member it reads
+            // eight more bytes. 7-Zip refuses an archive that ends there; unrar
+            // never looks.
+            assert!(
+                matches!(archive.blocks.last(), Some(Block::End(_))),
+                "{case}: no end-of-archive block"
+            );
+            archive
+        } else {
+            Archive::parse(&bytes).unwrap()
+        };
+        assert_eq!(archive.main.is_solid(), solid, "{case}");
         let files: Vec<_> = archive.files().collect();
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].name, b"header-secret.txt");
-        assert!(files[0].is_encrypted());
+        assert_eq!(files.len(), members.len(), "{case}");
+        for (index, (file, &(name, _))) in files.iter().zip(members).enumerate() {
+            assert_eq!(file.name, name, "{case}");
+            assert!(file.is_encrypted(), "{case}");
+            assert_eq!(file.is_solid(), solid && index > 0, "{case} member {index}");
+        }
+        let file = files[0];
+        match target {
+            ArchiveVersion::Rar15 => {}
+            ArchiveVersion::Rar20 => assert_eq!(file.unp_ver, 20, "{case}"),
+            _ => assert_eq!(file.unp_ver, 29, "{case}"),
+        }
+        if !header_encryption && target != ArchiveVersion::Rar15 {
+            assert_eq!(file.pack_size % 16, 0, "{case}");
+        }
+        if !matches!(target, ArchiveVersion::Rar15 | ArchiveVersion::Rar20) && !header_encryption {
+            assert!(file.salt.is_some(), "{case}");
+            // A second write of the same member draws a fresh salt.
+            let again = write();
+            assert_ne!(again, bytes, "{case}");
+            let again = Archive::parse(&again).unwrap();
+            assert_ne!(again.files().next().unwrap().salt, file.salt, "{case}");
+            assert_eq!(
+                collect_extract_with_password(&again, Some(PASSWORD)).unwrap()[0].data,
+                members[0].1,
+                "{case}"
+            );
+        }
 
-        let extracted = collect_extract_with_password(&archive, Some(b"password")).unwrap();
-        assert_eq!(extracted.len(), 1);
-        assert_eq!(extracted[0].data, entries[0].data);
+        if !header_encryption {
+            assert!(
+                matches!(collect_extract(&archive), Err(Error::NeedPassword)),
+                "{case}"
+            );
+        }
+        if !header_encryption {
+            assert!(
+                matches!(
+                    collect_extract_with_password(&archive, Some(b"wrong")),
+                    Err(Error::WrongPasswordOrCorruptData)
+                ),
+                "{case}"
+            );
+        }
+        let extracted = collect_extract_with_password(&archive, Some(PASSWORD)).unwrap();
+        assert_eq!(extracted.len(), members.len(), "{case}");
+        for (entry, &(_, data)) in extracted.iter().zip(members) {
+            assert_eq!(entry.data, data, "{case}");
+        }
     }
-}
-
-/// A reader that finds the headers encrypted expects every one of them to be
-/// introduced by its own salt, so when the last member's payload ends it reads
-/// eight more bytes looking for the next group. Ending the file there is a short
-/// read rather than a clean end, and 7-Zip treats it as a failed decryption and
-/// refuses to open the archive at all. unrar stops at the last member and never
-/// looks, which is why every header-encrypted archive we wrote was unreadable in
-/// 7-Zip and nothing said so.
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn a_header_encrypted_archive_ends_with_an_end_of_archive_block() {
-    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        let mut features = FeatureSet::store_only();
-        features.header_encryption = true;
-        let entries = [FileEntry {
-            name: b"header-secret.txt",
-            data: b"RAR 3.x header encrypted writer payload\n",
-            file_time: 0x5a21_0000,
-            file_attr: 0x20,
-            host_os: 3,
-            password: Some(b"password"),
-            file_comment: None,
-        }];
-        let bytes =
-            write_compressed_archive(&entries, WriterOptions::new(target, features)).unwrap();
-        let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
-
-        assert!(
-            matches!(archive.blocks.last(), Some(Block::End(_))),
-            "{target:?} archive does not end with an end-of-archive block"
-        );
-    }
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_solid_header_encrypted_rar3_and_rar4_archives_that_reader_extracts_with_password() {
-    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        let mut features = FeatureSet::store_only();
-        features.header_encryption = true;
-        features.solid = true;
-        let entries = [
-            FileEntry {
-                name: b"solid-header-one.txt",
-                data: b"solid header encrypted common prefix one one one\n",
-                file_time: 0x5a21_0000,
-                file_attr: 0x20,
-                host_os: 3,
-                password: Some(b"password"),
-                file_comment: None,
-            },
-            FileEntry {
-                name: b"solid-header-two.txt",
-                data: b"solid header encrypted common prefix two two two\n",
-                file_time: 0x5a21_0000,
-                file_attr: 0x20,
-                host_os: 3,
-                password: Some(b"password"),
-                file_comment: None,
-            },
-        ];
-        let bytes =
-            write_compressed_archive(&entries, WriterOptions::new(target, features)).unwrap();
-
-        assert!(matches!(Archive::parse(&bytes), Err(Error::NeedPassword)));
-        let archive = Archive::parse_with_password(&bytes, Some(b"password")).unwrap();
-        assert!(archive.main.has_encrypted_headers());
-        assert!(archive.main.is_solid());
-        let files: Vec<_> = archive.files().collect();
-        assert_eq!(files.len(), 2);
-        assert!(!files[0].is_solid());
-        assert!(files[1].is_solid());
-        assert!(files.iter().all(|file| file.is_encrypted()));
-
-        let extracted = collect_extract_with_password(&archive, Some(b"password")).unwrap();
-        assert_eq!(extracted[0].data, entries[0].data);
-        assert_eq!(extracted[1].data, entries[1].data);
-    }
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn rar3_and_rar4_aes_writer_uses_fresh_salts() {
-    let features = FeatureSet::store_only();
-    let entry = [FileEntry {
-        name: b"aes-salt.txt",
-        data: b"same plaintext same password\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    }];
-
-    let first =
-        write_compressed_archive(&entry, WriterOptions::new(ArchiveVersion::Rar30, features))
-            .unwrap();
-    let second =
-        write_compressed_archive(&entry, WriterOptions::new(ArchiveVersion::Rar30, features))
-            .unwrap();
-    let first_archive = Archive::parse(&first).unwrap();
-    let second_archive = Archive::parse(&second).unwrap();
-    let first_file = first_archive.files().next().unwrap();
-    let second_file = second_archive.files().next().unwrap();
-
-    assert_ne!(first, second);
-    assert_ne!(first_file.salt, second_file.salt);
-    assert_eq!(
-        collect_extract_with_password(&first_archive, Some(b"password")).unwrap()[0].data,
-        entry[0].data
-    );
-    assert_eq!(
-        collect_extract_with_password(&second_archive, Some(b"password")).unwrap()[0].data,
-        entry[0].data
-    );
 }
 
 #[test]
@@ -4984,39 +4751,6 @@ fn a_volume_set_that_fits_in_one_volume_is_written_not_refused() {
 
     let extracted = collect_extract_volumes(&archives).unwrap();
     assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0].data, entry.data);
-}
-
-#[test]
-#[cfg(feature = "write")]
-fn writes_compressed_rar15_volume_set_that_reader_reassembles() {
-    let entry = FileEntry {
-        name: b"split-compressed.txt",
-        data: b"abcabcabcabcabcabcabcabcabcabcabcabcabcabc",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: None,
-        file_comment: None,
-    };
-
-    let parts = volume_size::sized_for_payload(8, |volume_size| {
-        write_compressed_volumes(entry, WriterOptions::default(), volume_size)
-    })
-    .unwrap();
-    assert!(parts.len() >= 2);
-
-    let archives: Vec<_> = parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    assert!(archives[0].main.is_volume());
-    assert!(archives[0].main.is_first_volume());
-    assert!(archives[0].files().next().unwrap().is_split_after());
-
-    let extracted = collect_extract_volumes(&archives).unwrap();
-    assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0].name, entry.name);
     assert_eq!(extracted[0].data, entry.data);
 }
 
@@ -5100,472 +4834,6 @@ fn compressed_rar29_volumes_keep_requested_dictionary_size() {
         .iter()
         .all(|archive| archive.files().next().unwrap().block.flags & 0x00e0 == 0x00a0));
     assert_eq!(collect_extract_volumes(&archives).unwrap()[0].data, data);
-}
-
-#[test]
-#[cfg(feature = "write")]
-fn writes_compressed_rar20_volume_set_that_reader_reassembles() {
-    let entry = FileEntry {
-        name: b"split-rar20-compressed.txt",
-        data: &b"rar20 split compressed phrase alpha beta gamma "[..].repeat(32),
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: None,
-        file_comment: None,
-    };
-    let options = WriterOptions::new(ArchiveVersion::Rar20, FeatureSet::store_only());
-
-    let parts = volume_size::sized_for_payload(8, |volume_size| {
-        write_compressed_volumes(entry, options, volume_size)
-    })
-    .unwrap();
-    assert!(parts.len() >= 2);
-
-    let archives: Vec<_> = parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    assert!(archives[0].main.is_volume());
-    assert!(archives[0].main.is_first_volume());
-    let first_file = archives[0].files().next().unwrap();
-    assert_eq!(first_file.unp_ver, 20);
-    assert!(first_file.is_split_after());
-
-    let extracted = collect_extract_volumes(&archives).unwrap();
-    assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0].name, entry.name);
-    assert_eq!(extracted[0].data, entry.data);
-}
-
-#[test]
-#[cfg(feature = "write")]
-fn writes_compressed_rar29_volume_set_that_reader_reassembles() {
-    let entry = FileEntry {
-        name: b"split-rar29-compressed.txt",
-        data: &b"rar29 split compressed phrase alpha beta gamma "[..].repeat(32),
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: None,
-        file_comment: None,
-    };
-    let options = WriterOptions::new(ArchiveVersion::Rar29, FeatureSet::store_only());
-
-    let parts = volume_size::sized_for_payload(8, |volume_size| {
-        write_compressed_volumes(entry, options, volume_size)
-    })
-    .unwrap();
-    assert!(parts.len() >= 2);
-
-    let archives: Vec<_> = parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    assert!(archives[0].main.is_volume());
-    assert!(archives[0].main.is_first_volume());
-    let first_file = archives[0].files().next().unwrap();
-    assert_eq!(first_file.unp_ver, 29);
-    assert!(first_file.is_split_after());
-
-    let extracted = collect_extract_volumes(&archives).unwrap();
-    assert_eq!(extracted.len(), 1);
-    assert_eq!(extracted[0].name, entry.name);
-    assert_eq!(extracted[0].data, entry.data);
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar15_volume_sets_that_reader_reassembles_with_password() {
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar15, features);
-
-    let stored = StoredEntry {
-        name: b"split-secret-store.bin",
-        data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_stored_volumes(stored, options, volume_size)
-    })
-    .unwrap();
-    let stored_archives: Vec<_> = stored_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    assert!(stored_archives[0].files().next().unwrap().is_encrypted());
-    assert!(matches!(
-        collect_extract_volumes(&stored_archives),
-        Err(Error::NeedPassword)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&stored_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored.data);
-
-    let compressed = FileEntry {
-        name: b"split-secret-compressed.txt",
-        data: b"secret compressed secret compressed secret compressed\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_compressed_volumes(compressed, options, volume_size)
-    })
-    .unwrap();
-    let compressed_archives: Vec<_> = compressed_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    assert!(compressed_archives[0]
-        .files()
-        .next()
-        .unwrap()
-        .is_encrypted());
-    assert!(matches!(
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed.data);
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar20_volume_sets_that_reader_reassembles_with_password() {
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar20, features);
-
-    let stored = StoredEntry {
-        name: b"split-rar20-secret-store.bin",
-        data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_stored_volumes(stored, options, volume_size)
-    })
-    .unwrap();
-    let stored_archives: Vec<_> = stored_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    let first_stored = stored_archives[0].files().next().unwrap();
-    assert_eq!(first_stored.unp_ver, 20);
-    assert!(first_stored.is_encrypted());
-    assert!(matches!(
-        collect_extract_volumes(&stored_archives),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_volumes_with_password(&stored_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&stored_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored.data);
-
-    let compressed = FileEntry {
-        name: b"split-rar20-secret-compressed.txt",
-        data: b"secret rar20 compressed secret rar20 compressed secret rar20 compressed\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_compressed_volumes(compressed, options, volume_size)
-    })
-    .unwrap();
-    let compressed_archives: Vec<_> = compressed_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    let first_compressed = compressed_archives[0].files().next().unwrap();
-    assert_eq!(first_compressed.unp_ver, 20);
-    assert!(first_compressed.is_encrypted());
-    assert!(matches!(
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed.data);
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar29_volume_sets_that_reader_reassembles_with_password() {
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(ArchiveVersion::Rar29, features);
-
-    let stored = StoredEntry {
-        name: b"split-rar29-secret-store.bin",
-        data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let stored_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_stored_volumes(stored, options, volume_size)
-    })
-    .unwrap();
-    let stored_archives: Vec<_> = stored_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    let first_stored = stored_archives[0].files().next().unwrap();
-    assert_eq!(first_stored.unp_ver, 29);
-    assert!(first_stored.is_encrypted());
-    assert!(first_stored.salt.is_some());
-    for archive in &stored_archives[1..] {
-        assert_eq!(archive.files().next().unwrap().salt, first_stored.salt);
-    }
-    assert!(matches!(
-        collect_extract_volumes(&stored_archives),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_volumes_with_password(&stored_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&stored_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored.data);
-
-    let compressed = FileEntry {
-        name: b"split-rar29-secret-compressed.txt",
-        data: b"secret rar29 compressed secret rar29 compressed secret rar29 compressed\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let compressed_parts = volume_size::sized_for_payload(24, |volume_size| {
-        write_compressed_volumes(compressed, options, volume_size)
-    })
-    .unwrap();
-    let compressed_archives: Vec<_> = compressed_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    let first_compressed = compressed_archives[0].files().next().unwrap();
-    assert_eq!(first_compressed.unp_ver, 29);
-    assert!(first_compressed.is_encrypted());
-    assert!(first_compressed.salt.is_some());
-    for archive in &compressed_archives[1..] {
-        assert_eq!(archive.files().next().unwrap().salt, first_compressed.salt);
-    }
-    assert!(matches!(
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed.data);
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_encrypted_rar3_and_rar4_volume_sets_that_reader_reassembles_with_password() {
-    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        assert_encrypted_rar3_volume_sets_round_trip(target);
-    }
-}
-
-#[test]
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn writes_header_encrypted_rar3_and_rar4_volume_sets_that_reader_reassembles_with_password() {
-    for target in [ArchiveVersion::Rar30, ArchiveVersion::Rar40] {
-        assert_header_encrypted_rar3_volume_sets_round_trip(target);
-    }
-}
-
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn assert_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
-    let features = FeatureSet::store_only();
-    let options = WriterOptions::new(target, features);
-
-    let stored = StoredEntry {
-        name: b"rar30-split-secret-store.bin",
-        data: b"abcdefghijklmnopqrstuvwxyz0123456789",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let stored_parts = volume_size::sized_for_payload(10, |volume_size| {
-        write_stored_volumes(stored, options, volume_size)
-    })
-    .unwrap();
-    let stored_archives: Vec<_> = stored_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    let first_stored = stored_archives[0].files().next().unwrap();
-    assert!(first_stored.is_encrypted());
-    assert!(first_stored.salt.is_some());
-    assert_eq!(
-        first_stored.file_crc,
-        crc32(&first_stored.packed_data(&stored_archives[0]).unwrap())
-    );
-    for archive in &stored_archives[1..] {
-        assert_eq!(archive.files().next().unwrap().salt, first_stored.salt);
-    }
-    assert!(matches!(
-        collect_extract_volumes(&stored_archives),
-        Err(Error::NeedPassword)
-    ));
-    assert!(matches!(
-        collect_extract_volumes_with_password(&stored_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&stored_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored.data);
-
-    let compressed = FileEntry {
-        name: b"rar30-split-secret-compressed.txt",
-        data: b"secret compressed secret compressed secret compressed\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let compressed_parts = volume_size::sized_for_payload(8, |volume_size| {
-        write_compressed_volumes(compressed, options, volume_size)
-    })
-    .unwrap();
-    let compressed_archives: Vec<_> = compressed_parts
-        .iter()
-        .map(|part| Archive::parse(part).unwrap())
-        .collect();
-    let first_compressed = compressed_archives[0].files().next().unwrap();
-    assert!(first_compressed.is_encrypted());
-    assert!(first_compressed.salt.is_some());
-    assert_eq!(
-        first_compressed.file_crc,
-        crc32(
-            &first_compressed
-                .packed_data(&compressed_archives[0])
-                .unwrap()
-        )
-    );
-    for archive in &compressed_archives[1..] {
-        assert_eq!(archive.files().next().unwrap().salt, first_compressed.salt);
-    }
-    assert!(matches!(
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed.data);
-}
-
-#[cfg(all(feature = "write", feature = "encryption"))]
-fn assert_header_encrypted_rar3_volume_sets_round_trip(target: ArchiveVersion) {
-    let mut features = FeatureSet::store_only();
-    features.header_encryption = true;
-    let options = WriterOptions::new(target, features);
-
-    let stored = StoredEntry {
-        name: b"rar30-header-split-secret-store.bin",
-        data: b"header encrypted stored split data repeats repeats",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let stored_parts = volume_size::sized_for_payload_probed(
-        24,
-        |volume_size| {
-            let probe = StoredEntry {
-                data: &stored.data[..1],
-                ..stored
-            };
-            write_stored_volumes(probe, options, volume_size)
-        },
-        |volume_size| write_stored_volumes(stored, options, volume_size),
-    )
-    .unwrap();
-    assert!(matches!(
-        Archive::parse(&stored_parts[0]),
-        Err(Error::NeedPassword)
-    ));
-    let stored_archives: Vec<_> = stored_parts
-        .iter()
-        .map(|part| Archive::parse_with_password(part, Some(b"password")).unwrap())
-        .collect();
-    assert!(stored_archives[0].main.has_encrypted_headers());
-    assert!(stored_archives[0].files().next().unwrap().is_encrypted());
-    assert!(matches!(
-        collect_extract_volumes_with_password(&stored_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&stored_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, stored.data);
-
-    let compressed = FileEntry {
-        name: b"rar30-header-split-secret-compressed.txt",
-        data: b"header encrypted compressed split data repeats repeats repeats\n",
-        file_time: 0x5a21_0000,
-        file_attr: 0x20,
-        host_os: 3,
-        password: Some(b"password"),
-        file_comment: None,
-    };
-    let compressed_parts = volume_size::sized_for_payload_probed(
-        24,
-        |volume_size| {
-            let probe = FileEntry {
-                data: &compressed.data[..1],
-                ..compressed
-            };
-            write_compressed_volumes(probe, options, volume_size)
-        },
-        |volume_size| write_compressed_volumes(compressed, options, volume_size),
-    )
-    .unwrap();
-    assert!(matches!(
-        Archive::parse(&compressed_parts[0]),
-        Err(Error::NeedPassword)
-    ));
-    let compressed_archives: Vec<_> = compressed_parts
-        .iter()
-        .map(|part| Archive::parse_with_password(part, Some(b"password")).unwrap())
-        .collect();
-    assert!(compressed_archives[0].main.has_encrypted_headers());
-    assert!(compressed_archives[0]
-        .files()
-        .next()
-        .unwrap()
-        .is_encrypted());
-    assert!(matches!(
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"wrong")),
-        Err(Error::WrongPasswordOrCorruptData)
-    ));
-    let extracted =
-        collect_extract_volumes_with_password(&compressed_archives, Some(b"password")).unwrap();
-    assert_eq!(extracted[0].data, compressed.data);
 }
 
 #[test]
