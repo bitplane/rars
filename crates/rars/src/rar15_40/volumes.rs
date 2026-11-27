@@ -4,7 +4,7 @@ use crate::extraction_links::{decode_legacy_output, legacy_meta_is_link};
 use crate::output_limit::OutputBudget;
 use crate::source::{ArchiveSource, RangeReader};
 use crate::volume_extract::{
-    flush_split, FragmentWalk, LazyChain, SplitFailure, VolumeEnd, VolumeFeed,
+    flush_split, LazyChain, SplitFailure, SplitFormat, VolumeEnd, VolumeFeed,
 };
 use std::ops::Range;
 
@@ -418,7 +418,7 @@ fn write_stored(
         )
     };
     let last = walk.finish()?.clone();
-    if walk.packed_len != expected_packed_len {
+    if walk.state.0 != expected_packed_len {
         return Err(Error::InvalidHeader(
             "RAR 1.5 split stored file has wrong reassembled size",
         ));
@@ -538,56 +538,83 @@ impl Fragment {
     }
 }
 
-/// Fetches a split member's later volumes as its reader reaches each fragment's end.
-pub(super) struct SplitWalk<'f, 'p, 'o> {
-    feed: &'f mut VolumeFeed<'p, 'o, Archive>,
-    options: crate::ArchiveReadOptions<'o>,
-    first: FileHeader,
-    /// The member's size, once a fragment states it.
-    size: Option<u64>,
-    split_after: bool,
-    last: Option<Archive>,
-    packed_len: usize,
-    prefetched: std::collections::VecDeque<RangeReader<'static>>,
-    /// Each fragment read so far, charged to the reader workspace.
-    fragments: Buffer<Fragment>,
-    /// A refused or missing volume, reported as itself rather than as a decode failure.
-    failure: Option<Error>,
+/// RAR 1.5 to 4.x split members, for the shared [`SplitWalk`](crate::volume_extract::SplitWalk).
+pub(super) enum Rar15To40 {}
+
+pub(super) type SplitWalk<'f, 'p, 'o> = crate::volume_extract::SplitWalk<'f, 'p, 'o, Rar15To40>;
+
+/// How much packed data a member's fragments hold so far.
+#[derive(Default)]
+pub(super) struct PackedLen(pub(super) usize);
+
+impl SplitFormat for Rar15To40 {
+    type Archive = Archive;
+    type Header = FileHeader;
+    type Fragment = Fragment;
+    type State = PackedLen;
+    const INCOMPLETE: &'static str = "RAR 1.5 split entry is incomplete";
+    const INTERRUPTED: &'static str = "RAR 1.5 split entry is interrupted by a regular entry";
+
+    fn first_header(volume: &Archive) -> Option<&FileHeader> {
+        volume.files().next()
+    }
+    fn header_count(volume: &Archive) -> usize {
+        volume.files().count()
+    }
+    fn known_size(file: &FileHeader) -> Option<u64> {
+        file.known_unp_size()
+    }
+    fn is_split_after(file: &FileHeader) -> bool {
+        file.is_split_after()
+    }
+    fn reader(volume: &Archive, file: &FileHeader) -> Result<RangeReader<'static>> {
+        volume.source.owned_range_reader(file.packed_range.clone())
+    }
+    fn fragment(index: usize, volume: &Archive, file: &FileHeader) -> Fragment {
+        Fragment::of(index, volume, file)
+    }
+    fn record(state: &mut PackedLen, file: &FileHeader) -> Result<()> {
+        state.0 = packed_len(state.0, file)?;
+        Ok(())
+    }
+
+    fn validate_continuation(walk: &SplitWalk<'_, '_, '_>, file: &FileHeader) -> Result<()> {
+        if !file.is_split_before() {
+            return Err(Error::InvalidHeader(Self::INTERRUPTED));
+        }
+        validate_split_fragment(file, walk.options.password)?;
+        let first = &walk.first;
+        // The stored name may differ; size, method and CRC still tie the fragment to its member.
+        if let (Some(size), Some(known)) = (file.known_unp_size(), walk.size) {
+            if size != known {
+                return Err(Error::InvalidHeader(
+                    "RAR 1.5 split entry unpacked size changed",
+                ));
+            }
+        }
+        if file.method != first.method {
+            return Err(Error::InvalidHeader(
+                "RAR 1.5 split entry compression method changed",
+            ));
+        }
+        if file.unp_ver != first.unp_ver {
+            return Err(Error::InvalidHeader(
+                "RAR 1.5 split entry unpack version changed",
+            ));
+        }
+        if file.is_encrypted() != first.is_encrypted() {
+            return Err(Error::InvalidHeader(
+                "RAR 1.5 split entry encryption flag changed",
+            ));
+        }
+        if first.is_encrypted() && first.unp_ver >= 29 && file.salt != first.salt {
+            return Err(Error::InvalidHeader("RAR 3.x split entry salt changed"));
+        }
+        Ok(())
+    }
 }
 
-impl<'f, 'p, 'o> SplitWalk<'f, 'p, 'o> {
-    fn new(
-        feed: &'f mut VolumeFeed<'p, 'o, Archive>,
-        volume: &Archive,
-        first: &FileHeader,
-        allowance: &Allowance,
-    ) -> Result<Self> {
-        let mut fragments = Buffer::new(allowance);
-        fragments.try_push(Fragment::of(feed.current_index(), volume, first))?;
-        Ok(Self {
-            fragments,
-            options: feed.options(),
-            feed,
-            first: first.clone(),
-            size: first.known_unp_size(),
-            split_after: true,
-            last: None,
-            packed_len: packed_len(0, first)?,
-            prefetched: Default::default(),
-            failure: None,
-        })
-    }
-
-    /// Reads past any fragments the decoder did not need and returns the member's last header.
-    fn finish(&mut self) -> Result<&FileHeader> {
-        while self.next_fragment()?.is_some() {}
-        // Salvaging, a failure ends the fragments rather than failing.
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
-        }
-        self.last_header()
-    }
-
+impl SplitWalk<'_, '_, '_> {
     /// Turns a failed member's error into the checksum mismatch of the
     /// fragment whose packed data disagrees with its header, if one does.
     /// Sink and reader I/O, limits, cancellation and headers that contradict
@@ -628,98 +655,6 @@ impl<'f, 'p, 'o> SplitWalk<'f, 'p, 'o> {
             })
         })
     }
-
-    fn last_header(&self) -> Result<&FileHeader> {
-        self.last
-            .as_ref()
-            .and_then(|volume| volume.files().next())
-            .ok_or(Error::InvalidHeader("RAR 1.5 split entry is incomplete"))
-    }
-
-    /// Fetches every remaining volume of the member before any of its data is read.
-    fn prefetch(&mut self) -> Result<&FileHeader> {
-        while let Some(reader) = self
-            .advance()
-            .inspect_err(|error| self.failure = Some(error.clone()))?
-        {
-            self.prefetched.push_back(reader);
-        }
-        self.last_header()
-    }
-
-    fn into_last_volume(mut self) -> Result<Archive> {
-        self.finish()?;
-        Ok(self.last.expect("finish found the last fragment"))
-    }
-
-    pub(super) fn validate_continuation(&self, file: &FileHeader) -> Result<()> {
-        if !file.is_split_before() {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 split entry is interrupted by a regular entry",
-            ));
-        }
-        validate_split_fragment(file, self.options.password)?;
-        let first = &self.first;
-        // The stored name may differ; size, method and CRC still tie the fragment to its member.
-        if let (Some(size), Some(known)) = (file.known_unp_size(), self.size) {
-            if size != known {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 split entry unpacked size changed",
-                ));
-            }
-        }
-        if file.method != first.method {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 split entry compression method changed",
-            ));
-        }
-        if file.unp_ver != first.unp_ver {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 split entry unpack version changed",
-            ));
-        }
-        if file.is_encrypted() != first.is_encrypted() {
-            return Err(Error::InvalidHeader(
-                "RAR 1.5 split entry encryption flag changed",
-            ));
-        }
-        if first.is_encrypted() && first.unp_ver >= 29 && file.salt != first.salt {
-            return Err(Error::InvalidHeader("RAR 3.x split entry salt changed"));
-        }
-        Ok(())
-    }
-
-    fn advance(&mut self) -> Result<Option<RangeReader<'static>>> {
-        if !self.split_after {
-            return Ok(None);
-        }
-        loop {
-            let missing = self.feed.missing_next();
-            let Some(volume) = self.feed.next_part()? else {
-                // The volumes given ran out while the member continues.
-                return Err(missing);
-            };
-            let Some(file) = volume.files().next() else {
-                continue;
-            };
-            self.validate_continuation(file)?;
-            if file.is_split_after() && volume.files().count() != 1 {
-                return Err(Error::InvalidHeader(
-                    "RAR 1.5 split entry is interrupted by a regular entry",
-                ));
-            }
-            self.size = self.size.or(file.known_unp_size());
-            self.fragments
-                .try_push(Fragment::of(self.feed.current_index(), &volume, file))?;
-            self.packed_len = packed_len(self.packed_len, file)?;
-            let reader = volume
-                .source
-                .owned_range_reader(file.packed_range.clone())?;
-            self.split_after = file.is_split_after();
-            self.last = Some(volume);
-            return Ok(Some(reader));
-        }
-    }
 }
 
 pub(super) fn packed_len(total: usize, file: &FileHeader) -> Result<usize> {
@@ -731,32 +666,6 @@ pub(super) fn packed_len(total: usize, file: &FileHeader) -> Result<usize> {
         .ok_or(Error::InvalidHeader(
             "RAR 1.5 split packed size overflows usize",
         ))
-}
-
-impl FragmentWalk for SplitWalk<'_, '_, '_> {
-    fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
-        // Fragments fetched before a failure are still read, when salvaging.
-        if let Some(reader) = self.prefetched.pop_front() {
-            return Ok(Some(reader));
-        }
-        let error = match &self.failure {
-            Some(error) => error.clone(),
-            None => match self.advance() {
-                Ok(reader) => return Ok(reader),
-                Err(error) => {
-                    self.failure = Some(error.clone());
-                    error
-                }
-            },
-        };
-        // Salvaging, the member's data ends where its volumes give out, so
-        // the decoder delivers what it decoded first. The failure is still
-        // the member's, once it is decoded.
-        if self.options.salvage {
-            return Ok(None);
-        }
-        Err(error)
-    }
 }
 
 #[cfg(all(test, feature = "write"))]
