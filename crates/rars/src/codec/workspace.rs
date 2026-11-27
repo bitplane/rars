@@ -4,7 +4,7 @@
 use super::{Error, Result};
 pub(crate) mod coordinator;
 mod ledger;
-pub(crate) use ledger::{Charge, Limited, Reservation, RESERVATION_BYTES};
+pub(crate) use ledger::{Charge, Limited, Reservation};
 
 /// Whether `error` is a codec workspace refusal.
 pub(crate) fn is_refusal(error: &crate::Error) -> bool {
@@ -110,9 +110,7 @@ impl Budget for Limited {
             .checked_add(charge.bytes)
             .ok_or(Error::InvalidData("codec capacity overflows"))?;
         Self::resize(charge, peak)?;
-        let mut replacement = Vec::with_capacity(capacity);
-        replacement.append(values);
-        *values = replacement;
+        values.reserve_exact(capacity - values.len());
         Self::resize(charge, bytes)?;
         Ok(())
     }

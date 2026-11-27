@@ -2,7 +2,7 @@
 //! unused allowance, and publication starts only after every callback joins.
 //! A member refused within its share ends the run, so the caller can stream
 //! it with the whole workspace, as sequential extraction would.
-use super::{Buffer, Limited, Reservation, RESERVATION_BYTES};
+use super::{Buffer, Limited, Reservation};
 use crate::{Error, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -34,16 +34,12 @@ where
     let overhead = std::mem::size_of::<Slot<T, O>>() as u64;
     // A member estimated above the whole workspace runs alone with all of it,
     // as it would sequentially; its real allocations decide.
-    let ceiling = ledger
-        .available()
-        .saturating_sub(overhead + RESERVATION_BYTES);
+    let ceiling = ledger.available().saturating_sub(overhead);
     let hint = |item| hint(item).min(ceiling);
     let mut items = items.peekable();
     let mut published = 0;
     while let Some(&first) = items.peek() {
-        let first_cost = hint(first)
-            .saturating_add(overhead)
-            .saturating_add(RESERVATION_BYTES);
+        let first_cost = hint(first).saturating_add(overhead);
         ledger.check_capacity(first_cost)?;
         let capacity = crate::parallel::default_window()
             .max(1)
@@ -53,9 +49,7 @@ where
         while slots.len() < capacity {
             let Some(&item) = items.peek() else { break };
             let hint = hint(item);
-            let next = required
-                .saturating_add(hint)
-                .saturating_add(RESERVATION_BYTES);
+            let next = required.saturating_add(hint);
             if next > ledger.available() {
                 break;
             }
@@ -79,9 +73,8 @@ where
         }
         let stopped = AtomicBool::new(false);
         crate::parallel::for_each_mut(&mut slots, |_, slot| {
-            let mut reservation = slot.reservation.take().expect("admitted worker");
+            let reservation = slot.reservation.take().expect("admitted worker");
             if !stopped.load(Ordering::Acquire) {
-                reservation.start();
                 let result = map(slot.item, &reservation.allowance());
                 if result.is_err() {
                     stopped.store(true, Ordering::Release);
@@ -125,7 +118,7 @@ mod tests {
     #[test]
     fn a_large_later_hint_waits_for_the_next_batch_in_publication_order() {
         let overhead = std::mem::size_of::<Slot<usize, Buffer<u8, Limited>>>() as u64;
-        let limit = 4 * (overhead + RESERVATION_BYTES + 16);
+        let limit = 4 * (overhead + 16);
         let ledger = Allowance::limited(limit);
         let published = AtomicUsize::new(0);
         extract_windowed(
@@ -133,7 +126,7 @@ mod tests {
             &ledger,
             |index| {
                 if index == 1 {
-                    limit - overhead - RESERVATION_BYTES
+                    limit - overhead
                 } else {
                     16
                 }
@@ -221,7 +214,7 @@ mod tests {
             |_| 256,
             |index, local| Ok(Buffer::filled(256, index as u8, local)?),
             |data| {
-                assert!(ledger.used() >= data.len() as u64 + RESERVATION_BYTES);
+                assert!(ledger.used() >= data.len() as u64);
                 assert!(ledger.used() <= ledger.limit());
                 published.fetch_add(1, Ordering::Relaxed);
                 Ok(())
