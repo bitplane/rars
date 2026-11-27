@@ -3937,9 +3937,11 @@ impl MatchRunPrice<'_> {
     /// The loop every endpoint goes through.
     ///
     /// Endpoints are compared eight at a time, which the compiler does in
-    /// vector registers, and only a group with a winner is updated. A
-    /// branch-free update of all three arrays stores every endpoint where few
-    /// of them win.
+    /// vector registers, and only a group with a winner is updated. Offering
+    /// an endpoint the same price twice changes nothing, since only a
+    /// strictly cheaper offer wins, so a run that is not a multiple of eight
+    /// ends on a group overlapping the one before. A run shorter than a group
+    /// is offered one endpoint at a time.
     #[inline(always)]
     fn relax_lengths(
         &self,
@@ -3950,40 +3952,43 @@ impl MatchRunPrice<'_> {
         distance: u32,
         paths: &mut Arrivals<'_>,
     ) {
-        const GROUP: usize = 8;
         if first > last {
             return;
         }
         let count = last + 1 - first;
         let costs = &self.lengths[first - self.bonus..][..count];
-        let price = &mut paths.price[index + first..][..count];
-        let arrive_length = &mut paths.length[index + first..][..count];
-        let arrive_distance = &mut paths.distance[index + first..][..count];
-        let mut offset = 0;
-        while offset < count {
-            let group = GROUP.min(count - offset);
-            if group == GROUP {
-                let costs: &[u8; GROUP] = costs[offset..offset + GROUP].try_into().unwrap();
-                let prices: &[u32; GROUP] = price[offset..offset + GROUP].try_into().unwrap();
-                let mut wins = false;
-                for (&cost, &price) in costs.iter().zip(prices) {
-                    wins |= base.saturating_add(u32::from(cost)) < price;
-                }
-                if !wins {
-                    offset += GROUP;
-                    continue;
-                }
-            }
-            for at in offset..offset + group {
-                let reached = base.saturating_add(u32::from(costs[at]));
-                if reached < price[at] {
-                    price[at] = reached;
+        let at = index + first;
+        let price = &mut paths.price[at..at + count];
+        let arrive_length = &mut paths.length[at..at + count];
+        let arrive_distance = &mut paths.distance[at..at + count];
+        if count < RELAX_GROUP {
+            for offset in 0..count {
+                let reached = base.saturating_add(u32::from(costs[offset]));
+                if reached < price[offset] {
+                    price[offset] = reached;
                     // Lengths stop at MAX_ENCODER_MATCH_LENGTH, far inside a u32.
-                    arrive_length[at] = (first + at) as u32;
-                    arrive_distance[at] = distance;
+                    arrive_length[offset] = (first + offset) as u32;
+                    arrive_distance[offset] = distance;
                 }
             }
-            offset += group;
+            return;
+        }
+        let mut offset = 0;
+        loop {
+            let group = offset..offset + RELAX_GROUP;
+            relax_group(
+                base,
+                first + offset,
+                distance,
+                costs[group.clone()].try_into().unwrap(),
+                (&mut price[group.clone()]).try_into().unwrap(),
+                (&mut arrive_length[group.clone()]).try_into().unwrap(),
+                (&mut arrive_distance[group]).try_into().unwrap(),
+            );
+            if offset + RELAX_GROUP == count {
+                return;
+            }
+            offset = (offset + RELAX_GROUP).min(count - RELAX_GROUP);
         }
     }
 
@@ -3999,6 +4004,40 @@ impl MatchRunPrice<'_> {
         }
         debug_assert!(length <= MAX_ENCODER_MATCH_LENGTH);
         Some(self.distance + u32::from(self.lengths[encoded]))
+    }
+}
+
+/// How many endpoints [`MatchRunPrice::relax_lengths`] compares at once.
+const RELAX_GROUP: usize = 8;
+
+/// Offers the endpoints of one group the price `base` plus each one's cost,
+/// and the length and distance of the match that reaches them. Lane zero is
+/// the match of length `length`.
+#[inline(always)]
+fn relax_group(
+    base: u32,
+    length: usize,
+    distance: u32,
+    costs: &[u8; RELAX_GROUP],
+    price: &mut [u32; RELAX_GROUP],
+    arrive_length: &mut [u32; RELAX_GROUP],
+    arrive_distance: &mut [u32; RELAX_GROUP],
+) {
+    let mut wins = false;
+    for (&cost, &price) in costs.iter().zip(price.iter()) {
+        wins |= base.saturating_add(u32::from(cost)) < price;
+    }
+    if !wins {
+        return;
+    }
+    for lane in 0..RELAX_GROUP {
+        let reached = base.saturating_add(u32::from(costs[lane]));
+        if reached < price[lane] {
+            price[lane] = reached;
+            // Lengths stop at MAX_ENCODER_MATCH_LENGTH, far inside a u32.
+            arrive_length[lane] = (length + lane) as u32;
+            arrive_distance[lane] = distance;
+        }
     }
 }
 
