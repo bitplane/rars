@@ -58,6 +58,8 @@ pub use header_damage::{HeaderDamage, HeaderDamageKind};
 #[cfg(feature = "write")]
 mod filter_search;
 #[cfg(feature = "write")]
+mod filter_stats;
+#[cfg(feature = "write")]
 mod incompressible;
 mod io_util;
 mod key_cache;
@@ -93,6 +95,8 @@ mod producer;
 mod progress;
 #[doc(hidden)]
 pub mod publish;
+#[doc(hidden)]
+pub mod publish_queue;
 mod read_control;
 #[doc(hidden)]
 pub mod read_session;

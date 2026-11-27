@@ -2015,9 +2015,9 @@ where
     state.skip_existing = policy == OverwritePolicy::Never;
     // As with unrar, a later member on the same path replaces an earlier one,
     // as `-ap` can make happen.
-    state.overwrite_repeats = true;
+    state.allow_overwrite_repeats();
     let published = Arc::clone(progress);
-    state.on_published = Some(Box::new(move |output: &ExtractedOutput| {
+    state.report_to(Box::new(move |output: &ExtractedOutput| {
         published.published(&output.meta.name, &output.path);
     }));
     // Goes past a failed member. `-kb` keeps what was read of it; otherwise
@@ -2040,11 +2040,11 @@ where
     let state = RefCell::new(state);
     // Starts the line of a member whose output has just opened, if it has one.
     let opened = |state: &ExtractOutputState<'_>, before: usize, member: &[u8], link: bool| {
-        if state.outputs.len() == before {
+        if state.opened() == before {
             progress.pass(member);
             return;
         }
-        let output = state.outputs.last().expect("an output opened");
+        let output = state.last_opened().expect("an output opened");
         let shown = output.path.display().to_string();
         if output.meta.is_directory {
             progress.whole("Creating", member, &shown);
@@ -2077,7 +2077,7 @@ where
                 return Ok(Box::new(std::io::sink()) as Box<dyn Write>);
             }
             let written = written(invocation, meta);
-            let before = state.outputs.len();
+            let before = state.opened();
             let opened_writer = if invocation.keep_broken {
                 kept.open(&mut state, &written)
             } else {
@@ -2112,7 +2112,7 @@ where
                 },
                 link => link,
             };
-            let before = state.outputs.len();
+            let before = state.opened();
             failures.callback(state.create_link(&written(invocation, meta), link))?;
             opened(&state, before, &meta.name, true);
             Ok(())

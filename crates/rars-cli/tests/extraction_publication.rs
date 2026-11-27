@@ -632,3 +632,63 @@ fn a_file_landing_on_an_earlier_members_directory_is_refused_alike() {
         );
     }
 }
+
+/// Members landing on one output path are kept apart, overwritten or refused
+/// as the policy says, whether the first was published before the second
+/// opened or after, so every thread count leaves the same files.
+#[test]
+fn members_on_one_output_path_publish_alike_at_every_thread_count() {
+    let root = scratch::case("extraction-publish-repeats");
+    let archive = root.join("archive.rar");
+    write_archive(
+        &archive,
+        ArchiveVersion::Rar50,
+        &[
+            (b"a/x.txt", b"first"),
+            (b"b/x.txt", b"second"),
+            (b"c/y.txt", b"tail"),
+        ],
+    );
+    for args in [
+        &["--flatten", "--overwrite=always"][..],
+        &["--flatten", "--overwrite=rename"],
+        &["--flatten", "--overwrite=never"],
+        &["--overwrite=rename"],
+    ] {
+        let run = extract_at_thread_counts(&archive, &root, args, |out| {
+            let _ = fs::remove_dir_all(out);
+        });
+        let all = args.contains(&"--overwrite=never");
+        assert_eq!(run.0 == Some(0), !all, "{args:?}: {}", run.2);
+        if args.contains(&"--overwrite=always") {
+            assert!(run.3.contains(&("x.txt".to_string(), b"second".to_vec())));
+        }
+    }
+}
+
+/// A symbolic link member is published after the members before it, and
+/// points where it would at one thread.
+#[cfg(unix)]
+#[test]
+fn a_symbolic_link_among_published_members_matches_one_thread() {
+    let root = scratch::case("extraction-publish-symlink");
+    let archive = root.join("archive.rar");
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    builder
+        .add_bytes(b"d/real.txt".to_vec(), b"hello".repeat(2000), None, None)
+        .unwrap();
+    builder
+        .add_unix_symlink(b"d/link".to_vec(), b"real.txt".to_vec(), false, None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"d/after.txt".to_vec(), b"tail".repeat(3000), None, None)
+        .unwrap();
+    fs::write(&archive, builder.to_bytes().unwrap()).unwrap();
+    for args in [&["--overwrite=always"][..], &["--overwrite=never"]] {
+        let run = extract_at_thread_counts(&archive, &root, args, |out| {
+            let _ = fs::remove_dir_all(out);
+        });
+        assert_eq!(run.0, Some(0), "{args:?}: {}", run.2);
+        assert!(run.3.iter().any(|(name, _)| name == "d/link"), "{run:?}");
+    }
+}

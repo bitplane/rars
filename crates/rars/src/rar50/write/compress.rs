@@ -1203,15 +1203,15 @@ fn probe_members(
     Ok(any.then_some(stored))
 }
 
-/// What a probe sample packs to coded on its own at level 1, unfiltered: the
-/// cheapest coding there is, and about the least any level saves.
+/// What a probe sample packs to coded on its own by the lazy parse of level 2,
+/// unfiltered: about the least any level above the greedy one saves.
 fn probe_packed_len<B: Budget>(
     sample: &[u8],
     plan: &CompressPlan,
     cancelled: &dyn Fn() -> bool,
     allowance: &B,
 ) -> Result<usize> {
-    let options = super::filter_policy::encode_options_for_level(Some(1), sample.len() as u64)?;
+    let options = super::filter_policy::encode_options_for_level(Some(2), sample.len() as u64)?;
     let packed = crate::codec::rar50::encode_owned_member(
         sample,
         plan.algorithm_version,
@@ -2270,7 +2270,7 @@ fn compress_whole_member<B: Budget>(
             &data,
             &plan.filter_policy,
             plan.algorithm_version,
-            plan.candidates.len(),
+            &plan.candidates,
         )
         .max(input_size)
         .max(1);
@@ -6342,6 +6342,94 @@ mod tests {
                 assert!(decoded == data, "the member does not round-trip");
             }
         }
+    }
+
+    /// Runs of mostly noise, which the match finders leave out, code the same
+    /// member at 1, 2, 4 and 8 threads, with a tail that joins its run at 1
+    /// thread and is cut off above (#738). Copies of earlier bytes sit just
+    /// before and across each run's end, where a run coded in a window of its
+    /// own sees no further and a joined one does.
+    #[cfg(all(
+        feature = "parallel",
+        not(all(target_arch = "wasm32", target_os = "unknown"))
+    ))]
+    #[test]
+    fn noise_in_runs_codes_alike_on_any_thread_count() {
+        const MIB: usize = 1024 * 1024;
+        let options = EncodeOptions::new(8)
+            .with_max_match_distance(2 * MIB)
+            .with_optimal_parse(true);
+        let tail = 300 * 1024;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut data: Vec<u8> = (0..5 * MIB + tail)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect();
+        // Numbered lines open each run, enough for the member's samples to
+        // show it compresses.
+        let mut lines = Vec::new();
+        for line in 0..10_000u32 {
+            lines.extend_from_slice(format!("{line:07} between the noise\n").as_bytes());
+        }
+        for seam in (1..=5).map(|run| run * MIB) {
+            let start = seam - MIB;
+            data[start..start + lines.len()].copy_from_slice(&lines);
+            data.copy_within(seam - MIB / 2..seam - MIB / 2 + 900, seam - 1500);
+            data.copy_within(seam - 3000..seam - 2300, seam + 100);
+            // Too few lines to stop the noise around them being noise.
+            data.copy_within(start + 1000..start + 1064, seam - 1000);
+            data.copy_within(start + 5000..start + 5064, seam - 400);
+        }
+        let sources = [EntrySource::from_bytes(data.clone())];
+        let scratch = crate::scratch::case("noise-runs-threads");
+        let plan = CompressPlan {
+            algorithm_version: 0,
+            encode_options: options,
+            dictionary_size: 2 * MIB as u64,
+            block_size: crate::codec::rar50::LZ_BLOCK_SIZE,
+            solid: false,
+            method: 1,
+            filter_policy: FilterPolicy::None,
+            candidates: vec![options].into(),
+            blake2sp: true,
+        };
+        let code = |threads: usize| -> (Vec<u8>, usize) {
+            crate::parallel::private_pool(threads).install(|| {
+                super::super::plan::with_filter_search_bytes(MIB, || {
+                    assert_eq!(member_run_size(&plan), MIB);
+                    let resources = WriterResources::default().with_temp_dir(&*scratch);
+                    let cut = TAILS_CUT.load(Ordering::Relaxed);
+                    let mut members =
+                        compress_members_reporting(&sources, plan.clone(), &resources, &|_| true)
+                            .unwrap();
+                    let cut = TAILS_CUT.load(Ordering::Relaxed) - cut;
+                    let mut packed = Vec::new();
+                    members[0].packed.copy_to(&mut packed).unwrap();
+                    (packed, cut)
+                })
+            })
+        };
+        let (one, _) = code(1);
+        for threads in [2, 4, 8] {
+            let (packed, cut) = code(threads);
+            // Tests running beside this one may cut tails too, but none take
+            // one away.
+            assert!(cut > 0, "{threads} threads coded the tail with its run");
+            assert!(packed == one, "{threads} threads changed the member");
+        }
+        let decoded = crate::codec::rar50::decode_lz(&one, 0, data.len()).unwrap();
+        assert!(decoded == data, "the member does not round-trip");
+        // The copies and the text are found, noise and all.
+        assert!(
+            one.len() < data.len() - 5 * 1500,
+            "{} of {}",
+            one.len(),
+            data.len()
+        );
     }
 
     /// A tail long enough for a thread of its own is cut off the run it joined

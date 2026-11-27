@@ -6745,7 +6745,8 @@ fn write_with_extras(
     let mut out = Vec::new();
     rar50::write_streaming_archive_to(
         entries,
-        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(1),
+        // Level 2, the quickest level that searches filters.
+        rar50::WriterOptions::new(ArchiveVersion::Rar50, features).with_compression_level(2),
         extras,
         &rars::WriterResources::default(),
         &mut out,

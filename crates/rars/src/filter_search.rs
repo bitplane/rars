@@ -270,6 +270,14 @@ pub(crate) trait OwnedSearch {
     fn trusts_x86_scanner(&self) -> bool {
         false
     }
+    /// Whether the search judges by byte statistics where it can, rather than
+    /// by sample encodes: the screens and the trial price their samples by
+    /// [`crate::filter_stats::lz_cost`] (see [`priced`] and [`priced_pairs`]),
+    /// and the x86 screen counts operand repeats (see
+    /// [`x86_counted_regions`]). For a level that would rather be fast.
+    fn estimates(&self) -> bool {
+        false
+    }
     fn filtered_bytes(
         &self,
         data: &[u8],
@@ -458,6 +466,9 @@ impl<S: OwnedSearch> OwnedSearch for ReportingSearch<'_, S> {
     fn trusts_x86_scanner(&self) -> bool {
         self.search.trusts_x86_scanner()
     }
+    fn estimates(&self) -> bool {
+        self.search.estimates()
+    }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
     }
@@ -541,6 +552,93 @@ fn text_byte_count(sample: &[u8]) -> usize {
         .iter()
         .filter(|&&byte| matches!(byte, b'\t' | b'\n' | b'\r' | 0x20..=0x7e))
         .count()
+}
+
+/// What `bytes` packs to, for comparing one way of filtering a sample with
+/// another: an encode at `options`, or for a search that
+/// [`OwnedSearch::estimates`], [`crate::filter_stats::lz_cost`] of it.
+///
+/// The estimate parses with one candidate per position and builds no tables,
+/// so it costs a fraction of the lightest encode. It ranks filters the way an
+/// encode does on all but the closest calls. The screens that see many of
+/// those close calls settle them with an encode (see [`priced_pairs`]).
+fn priced<S: OwnedSearch>(search: &S, bytes: &[u8], options: S::Options) -> Result<usize> {
+    let pricing = if search.estimates() {
+        Pricing::Estimate
+    } else {
+        Pricing::Encode
+    };
+    price(search, bytes, options, pricing)
+}
+
+/// How a sample is priced: see [`priced`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pricing {
+    Estimate,
+    Encode,
+}
+
+fn price<S: OwnedSearch>(
+    search: &S,
+    bytes: &[u8],
+    options: S::Options,
+    pricing: Pricing,
+) -> Result<usize> {
+    match pricing {
+        Pricing::Estimate => {
+            Ok(crate::filter_stats::lz_cost(bytes, search.allowance())?.div_ceil(8) as usize)
+        }
+        Pricing::Encode => Ok(search.encode_plain(bytes, options, None)?.len()),
+    }
+}
+
+/// The ratio of the challenger's estimate to the reference's, as a fraction,
+/// below which the estimate is trusted to say the challenger wins. At or above
+/// one it is trusted to say the challenger loses. In between, a screen that
+/// [`OwnedSearch::estimates`] encodes the pair after all.
+///
+/// The estimate prices short samples of structured data with less overhead
+/// than an encode does, so a filter that only just wins by it often loses in
+/// fact. It is the narrow wins that need the encode, and they are a fraction
+/// of the samples.
+const ESTIMATE_SURE_WIN: (usize, usize) = (3, 5);
+
+/// What each of `count` pairs packs to, as `[reference, challenger]`.
+/// `price(search, index, side, pricing)` prices one side of one pair: side 0
+/// is the reference, 1 the challenger.
+///
+/// A search that [`OwnedSearch::estimates`] takes the estimate wherever it is
+/// sure (see [`ESTIMATE_SURE_WIN`]) and encodes the rest. Any other encodes
+/// everything.
+fn priced_pairs<S: OwnedSearch>(
+    search: &S,
+    count: usize,
+    longest: usize,
+    price: &(dyn Fn(&S, usize, usize, Pricing) -> Result<usize> + Sync),
+) -> Result<Vec<[usize; 2]>> {
+    let mut prices = vec![[0; 2]; count];
+    let mut unsure = Vec::new();
+    if search.estimates() {
+        let (numerator, denominator) = ESTIMATE_SURE_WIN;
+        for (index, prices) in prices.iter_mut().enumerate() {
+            let reference = price(search, index, 0, Pricing::Estimate)?;
+            let challenger = price(search, index, 1, Pricing::Estimate)?;
+            if challenger >= reference || challenger * denominator < reference * numerator {
+                *prices = [reference, challenger];
+            } else {
+                unsure.push(index);
+            }
+        }
+    } else {
+        unsure.extend(0..count);
+    }
+    let encoded = search.each(2 * unsure.len(), longest, &|search: &S, job| {
+        price(search, unsure[job / 2], job % 2, Pricing::Encode)
+    })?;
+    for (&index, encoded) in unsure.iter().zip(encoded.chunks(2)) {
+        prices[index] = [encoded[0], encoded[1]];
+    }
+    Ok(prices)
 }
 
 fn screen_wins(filtered: usize, baseline: usize) -> bool {
@@ -633,25 +731,26 @@ fn screen_kinds<S: OwnedSearch>(
     // Only when the screen measures at the settings the finalists will use. A
     // format that screens at reduced effort, which RAR 2.9 does, is measuring
     // something else and keeps the two-encode path.
-    let measures_the_member = sample.len() == data.len() && screen_options == options;
+    let measures_the_member =
+        sample.len() == data.len() && screen_options == options && !search.estimates();
     let kinds = search.screened_kinds(data)?;
     // The plain sample, then each kind: what it packed to, and the bytes when
     // they are a measurement.
     let mut packed = search
         .each(kinds.len() + 1, sample.len(), &|search: &S, index| {
             let bytes = match index.checked_sub(1).map(|kind| kinds[kind]) {
-                None => search.encode_plain(sample, screen_options, None)?,
+                None if measures_the_member => search.encode_plain(sample, screen_options, None)?,
+                None => return Ok((priced(search, sample, screen_options)?, None)),
                 Some(kind) => {
                     let filters = [FilterSpec::whole(kind)];
-                    if measures_the_member {
-                        search.encode_filtered(data, &filters, options, None)?
-                    } else {
+                    if !measures_the_member {
                         let transformed = search.filtered_bytes(sample, &filters)?;
-                        search.encode_plain(&transformed, screen_options, None)?
+                        return Ok((priced(search, &transformed, screen_options)?, None));
                     }
+                    search.encode_filtered(data, &filters, options, None)?
                 }
             };
-            Ok((bytes.len(), measures_the_member.then_some(bytes)))
+            Ok((bytes.len(), Some(bytes)))
         })?
         .into_iter();
     let (baseline, plain) = packed.next().expect("the plain sample is encoded");
@@ -806,6 +905,9 @@ fn x86_screened_regions<S: OwnedSearch>(
             jumps_cost_more: false,
         });
     }
+    if search.estimates() {
+        return x86_counted_regions(search, data, regions);
+    }
     // Scanner padding makes a region too short to sample possible only when
     // the entire member is too short to provide a useful x86 sample.
     let sampled = Buffer::collect(
@@ -895,6 +997,55 @@ fn x86_screened_regions<S: OwnedSearch>(
         jumps_cost_more,
     })
 }
+
+/// [`x86_screened_regions`] judged by how converting the operands changes how
+/// often they repeat (see [`crate::filter_stats::x86_repeat_gain`]) rather
+/// than by sample encodes.
+///
+/// What the x86 filters buy is calls to one place from many: converted, their
+/// operands are the same four bytes, and the coder matches them. In code most
+/// operands that repeat do so only once converted; in data that merely holds
+/// the opcode bytes they repeat as often either way, or less once converted.
+/// A region whose operands gain fewer than one repeat in
+/// [`X86_REPEAT_GAIN_SHARE`] is dropped, and the jumps are converted where
+/// counting them in does not cost repeats.
+fn x86_counted_regions<S: OwnedSearch>(
+    search: &S,
+    data: &[u8],
+    regions: &[Range<usize>],
+) -> Result<X86Screen<S::Memory>> {
+    let mut kept = Buffer::new(search.allowance());
+    let pays = |gain: i64, opcodes: usize| {
+        gain > 0 && gain.unsigned_abs() as usize * X86_REPEAT_GAIN_SHARE >= opcodes
+    };
+    for region in regions {
+        let gain = crate::filter_stats::x86_repeat_gain(
+            &data[region.clone()],
+            region.start,
+            search.allowance(),
+        )?;
+        if pays(gain.calls + gain.jumps, gain.opcodes) {
+            kept.try_push((region.clone(), gain.jumps >= 0))?;
+        } else if pays(gain.calls, gain.opcodes) {
+            kept.try_push((region.clone(), false))?;
+        }
+    }
+    let jumps_pay = kept.iter().any(|&(_, jumps)| jumps);
+    let jumps_cost_more = kept.iter().any(|&(_, jumps)| !jumps);
+    Ok(X86Screen {
+        rejected_a_region: kept.len() < regions.len(),
+        kept: Buffer::collect(
+            kept.into_iter().map(|(region, _)| region),
+            search.allowance(),
+        )?,
+        jumps_pay,
+        jumps_cost_more,
+    })
+}
+
+/// One repeat gained in how many operands is what [`x86_counted_regions`]
+/// takes to be code.
+const X86_REPEAT_GAIN_SHARE: usize = 32;
 
 /// How much of an x86 region each of its screen samples stands for.
 ///
@@ -1145,24 +1296,23 @@ fn table_screened_regions<S: OwnedSearch>(
         search.allowance(),
     )?;
     // Each region's sample left alone, then under delta at its stride.
-    let packed = search.each(
-        2 * sampled.len(),
+    let packed = priced_pairs(
+        search,
+        sampled.len(),
         SCREEN_SAMPLE_LEN.min(data.len()),
-        &|search: &S, index| {
-            let (region, stride) = &sampled[index / 2];
+        &|search: &S, index, side, pricing| {
+            let (region, stride) = &sampled[index];
             let sample = screen_sample(&data[region.clone()]);
-            if index % 2 == 0 {
-                return Ok(search.encode_plain(sample, screen_options, None)?.len());
+            if side == 0 {
+                return price(search, sample, screen_options, pricing);
             }
             let filters = [FilterSpec::whole(FilterKind::Delta { channels: *stride })];
             let transformed = search.filtered_bytes(sample, &filters)?;
-            Ok(search
-                .encode_plain(&transformed, screen_options, None)?
-                .len())
+            price(search, &transformed, screen_options, pricing)
         },
     )?;
     let mut kept = Buffer::new(search.allowance());
-    for (region, packed) in sampled.iter().zip(packed.chunks(2)) {
+    for (region, packed) in sampled.iter().zip(packed) {
         if screen_wins(packed[1], packed[0]) {
             kept.try_push(region.clone())?;
         }
@@ -1264,14 +1414,15 @@ fn tables_outside_code<S: OwnedSearch>(
     } else {
         FilterKind::E8
     };
-    // Each table priced as a table, then as code. Sampled as the x86 screen
+    // Each table priced as code, then as a table. Sampled as the x86 screen
     // samples a region, so a table as long as the code it lies in is not
     // judged on whatever its middle holds.
-    let packed = search.each(
-        2 * tables.len(),
+    let packed = priced_pairs(
+        search,
+        tables.len(),
         SCREEN_SAMPLE_LEN.min(data.len()),
-        &|search: &S, index| {
-            let (region, stride) = &tables[index / 2];
+        &|search: &S, index, side, pricing| {
+            let (region, stride) = &tables[index];
             let mut packed = 0;
             for within in x86_region_samples(region, search.x86_region_sample_span()) {
                 let in_code = code
@@ -1281,20 +1432,19 @@ fn tables_outside_code<S: OwnedSearch>(
                 if !in_code {
                     continue;
                 }
-                let filtered = if index % 2 == 0 {
+                let filtered = if side == 1 {
                     let filters = [FilterSpec::whole(FilterKind::Delta { channels: *stride })];
                     search.filtered_bytes(&data[within], &filters)?
                 } else {
                     filtered_sample(search, data, within, kind)?
                 };
-                packed += search.encode_plain(&filtered, screen_options, None)?.len();
+                packed += price(search, &filtered, screen_options, pricing)?;
             }
             Ok(packed)
         },
     )?;
     let mut kept = Buffer::new(search.allowance());
-    for (region, packed) in tables.into_iter().zip(packed.chunks(2)) {
-        let (as_table, as_code) = (packed[0], packed[1]);
+    for (region, [as_code, as_table]) in tables.into_iter().zip(packed) {
         if as_code < as_table {
             continue;
         }
@@ -1492,11 +1642,7 @@ fn trial_size<S: OwnedSearch>(
                 .map(|&(_, _, packed)| packed);
             Ok(match found {
                 Some(packed) => (hash, packed, false),
-                None => (
-                    hash,
-                    search.encode_plain(bytes, trial_options, None)?.len(),
-                    true,
-                ),
+                None => (hash, priced(search, bytes, trial_options)?, true),
             })
         },
     )?;
@@ -1555,7 +1701,9 @@ fn trial_winner<S: OwnedSearch>(
         let packed = search.each(all.len(), data.len(), &|search: &S, index| {
             let specs = &all[index].0;
             Ok(if specs.is_empty() {
-                search.encode_plain(data, trial_options, None)?.len()
+                priced(search, data, trial_options)?
+            } else if search.estimates() {
+                priced(search, &search.filtered_bytes(data, specs)?, trial_options)?
             } else {
                 search
                     .encode_filtered(data, specs, trial_options, None)?
@@ -1809,6 +1957,9 @@ impl<S: OwnedSearch + Sync, R> OwnedSearch for SideBySideSearch<'_, S, R> {
     fn trusts_x86_scanner(&self) -> bool {
         self.search.trusts_x86_scanner()
     }
+    fn estimates(&self) -> bool {
+        self.search.estimates()
+    }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)
     }
@@ -1938,6 +2089,9 @@ impl<S: OwnedSearch> OwnedSearch for SharedReporting<'_, S> {
     }
     fn trusts_x86_scanner(&self) -> bool {
         self.search.trusts_x86_scanner()
+    }
+    fn estimates(&self) -> bool {
+        self.search.estimates()
     }
     fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
         self.search.filtered_bytes(data, filters)

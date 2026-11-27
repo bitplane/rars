@@ -763,7 +763,7 @@ fn the_rar50_scratch_path_delivers_a_failed_member() {
     );
     let mut bytes = Rar50Writer::new(
         Rar50WriterOptions::new(ArchiveVersion::Rar50, FeatureSet::store_only())
-            .with_compression_level(1),
+            .with_compression_level(2),
     )
     .entries([entry])
     .filter_policy(FilterPolicy::Explicit(FilterSpec::range(

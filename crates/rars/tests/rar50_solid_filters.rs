@@ -69,14 +69,14 @@ fn write(policy: FilterPolicy, resources: &WriterResources) -> Vec<u8> {
     let mut features = FeatureSet::store_only();
     features.solid = true;
     let mut bytes = Vec::new();
-    // Runs follow the dictionary, not the level, and level 1 still searches
+    // Runs follow the dictionary, not the level, and level 2 still searches
     // filters for each run. Its lazy parse still packs the filtered archive
     // to under half the plain one, at a fraction of level 3's cost, and the
     // filtered archive is written twice: once per thread count.
     rar50::write_streaming_archive_with_progress(
         &entries,
         WriterOptions::new(ArchiveVersion::Rar50, features)
-            .with_compression_level(1)
+            .with_compression_level(2)
             .with_dictionary_size(128 * 1024),
         ArchiveExtras::default().with_filter_policy(policy),
         resources,

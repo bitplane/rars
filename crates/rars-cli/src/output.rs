@@ -611,7 +611,7 @@ mod tests {
                 false,
             ))
             .unwrap();
-        let storage = state.staging.as_ref().unwrap().root.clone();
+        let storage = state.publisher.state().staging().unwrap().root.clone();
         let alias = storage
             .file_name()
             .unwrap()
@@ -1105,7 +1105,7 @@ mod tests {
                 .unwrap()
                 .write_all(b"payload")
                 .unwrap();
-            assert_eq!(state.outputs[0].name, meta.name);
+            assert_eq!(state.last_opened().unwrap().name, meta.name);
             redirection.target_name = meta.name.clone();
             redirection.redirection_type = kind;
             let link = if crate::scratch::supports_raw_byte_names(&dir) {

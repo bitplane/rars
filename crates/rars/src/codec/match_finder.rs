@@ -188,6 +188,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
         self.mask + 1
     }
 
+    #[inline]
     fn hash(&self, input: &[u8], pos: usize) -> usize {
         let value = if MIN_MATCH == 3 {
             u32::from(input[pos])
@@ -230,6 +231,7 @@ impl<const MIN_MATCH: usize, B: Budget> MatchFinder<MIN_MATCH, B> {
 
     /// Records `pos` as a future match candidate. Positions too close to the
     /// end of the input to fit `MIN_MATCH` bytes are ignored.
+    #[inline]
     pub(crate) fn insert(&mut self, input: &[u8], pos: usize) {
         if pos + MIN_MATCH <= input.len() {
             let hash = self.hash(input, pos);
@@ -403,6 +405,25 @@ impl<B: Budget> MatchFinder<4, B> {
     pub(crate) fn insert_and_first(&mut self, input: &[u8], pos: usize) -> usize {
         debug_assert!(pos + 4 <= input.len());
         self.record_and_first(self.hash(input, pos), pos)
+    }
+
+    /// Inserts each of `positions` in order, every one with four bytes
+    /// readable at it: the stretch a parse steps over inside a match.
+    #[cfg(feature = "write")]
+    #[inline]
+    pub(crate) fn insert_run(&mut self, input: &[u8], positions: std::ops::Range<usize>) {
+        if positions.is_empty() {
+            return;
+        }
+        debug_assert!(positions.start >= self.newest);
+        debug_assert!(positions.end + 3 <= input.len());
+        let last = positions.end - 1;
+        for pos in positions {
+            let hash = self.hash(input, pos);
+            self.prev[pos & self.mask] = self.head[hash];
+            self.head[hash] = pos as u32;
+        }
+        self.newest = self.newest.max(last);
     }
 
     #[inline]
@@ -714,7 +735,10 @@ impl<B: Budget> TreeMatchFinder<B> {
     }
 
     /// Inserts the positions of `range` that have four bytes left, as
-    /// [`Self::seeded`] does, split between `shares` threads by hash.
+    /// [`Self::seeded`] does, split between `shares` threads by hash. Noise
+    /// is left out ([`super::noise::NoiseScan::skips`]), judged in cells
+    /// counted from the end of `range`, where the run it is history for
+    /// starts.
     ///
     /// Each hash's positions still go in in order, so the links come out the
     /// same on any number of threads, provided no position of `range` shares
@@ -734,9 +758,14 @@ impl<B: Budget> TreeMatchFinder<B> {
             .end
             .min(input.len().saturating_sub(Self::MIN_MATCH - 1));
         let insert = |share: usize| {
+            // The tree collector leaves the same positions out, in cells
+            // counted from the run the history is for.
+            let mut noise = super::noise::NoiseScan::with_cells(range.end);
             for pos in range.start..end {
                 let hash = self.hash(input, pos);
-                if shares == 1 || (hash * shares) >> Self::HASH_BITS == share {
+                if (shares == 1 || (hash * shares) >> Self::HASH_BITS == share)
+                    && !noise.skips(input, pos)
+                {
                     let inserted =
                         self.descend::<true>(input, pos, hash, len_limit(pos), 0, cut, None);
                     debug_assert!(
