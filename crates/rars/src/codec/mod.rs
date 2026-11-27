@@ -8,6 +8,8 @@ pub mod filters;
 mod huffman;
 #[cfg(any(test, feature = "write"))]
 mod match_finder;
+#[cfg(any(test, feature = "write"))]
+pub(crate) mod noise;
 #[cfg(feature = "write")]
 pub(crate) mod packed_chain;
 pub(crate) mod packed_window;

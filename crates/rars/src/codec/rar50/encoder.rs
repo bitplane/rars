@@ -2,6 +2,7 @@
 
 use super::super::huffman;
 use super::super::match_finder;
+use super::super::noise::{self, NoiseScan};
 use super::*;
 #[cfg(test)]
 use std::io::Write;
@@ -35,6 +36,8 @@ const MAX_COMPRESSED_BLOCK_OUTPUT: usize = 4 * 1024 * 1024;
 pub(crate) const LZ_BLOCK_SIZE: usize = 64 * 1024;
 
 const _: () = assert!(LZ_BLOCK_SIZE <= MAX_COMPRESSED_BLOCK_OUTPUT);
+// Runs are read a block at a time, so they start and end on noise cells.
+const _: () = assert!(LZ_BLOCK_SIZE.is_multiple_of(noise::CELL));
 
 /// The most input one block may cover once blocks are being extended.
 ///
@@ -2164,6 +2167,7 @@ fn collector_at<B: Budget>(
             debug_assert_eq!(finder.position(), at.min(combined.len().saturating_sub(3)));
             Ok(OptimalCollector {
                 finder: CollectorFinder::Packed(finder),
+                noise: NoiseScan::with_cells(at),
             })
         }
         Some(RunFinder::Tree(tree)) => {
@@ -2173,6 +2177,9 @@ fn collector_at<B: Budget>(
     }
 }
 
+// One per member or run being coded, so the collector's noise histogram is
+// not worth a box.
+#[allow(clippy::large_enum_variant)]
 enum SharedMemberSearch<B: Budget> {
     Lazy(Rar50MatchFinder<B>),
     Optimal(OptimalCollector<B>),
@@ -2221,6 +2228,11 @@ struct BlockMatches<B: Budget = Allowance> {
 /// best. See [`searches_tree`] for which parses get one.
 struct OptimalCollector<B: Budget = Allowance> {
     finder: CollectorFinder<B>,
+    /// Which positions the finder leaves out ([`NoiseScan::skips`]), in
+    /// cells counted from where the run starts, so that the run's blocks
+    /// collect the same whether its window ends with it or runs on into the
+    /// next run, and its tree holds what a tree seeded there would.
+    noise: NoiseScan,
 }
 
 #[test]
@@ -2250,6 +2262,7 @@ fn packed_collector_preserves_frontiers_across_committed_interiors_and_blocks() 
         finder: CollectorFinder::Chains(
             member_finder_with_allowance(&input, start, options, &allowance).unwrap(),
         ),
+        noise: NoiseScan::with_cells(start),
     };
     for block in [
         start..start + LZ_BLOCK_SIZE,
@@ -2506,6 +2519,7 @@ impl<B: Budget> OptimalCollector<B> {
             }
             return Ok(Self {
                 finder: CollectorFinder::Packed(finder),
+                noise: NoiseScan::with_cells(start),
             });
         }
 
@@ -2513,6 +2527,7 @@ impl<B: Budget> OptimalCollector<B> {
             finder: CollectorFinder::Chains(member_finder_with_allowance(
                 combined, start, options, allowance,
             )?),
+            noise: NoiseScan::with_cells(start),
         })
     }
 
@@ -2540,6 +2555,7 @@ impl<B: Budget> OptimalCollector<B> {
         };
         Ok(Self {
             finder: CollectorFinder::Tree(tree, stretches),
+            noise: NoiseScan::with_cells(start),
         })
     }
 
@@ -2582,6 +2598,7 @@ impl<B: Budget> OptimalCollector<B> {
                     &mut matches.runs,
                     &mut matches.starts,
                     &mut matches.commits,
+                    &mut self.noise,
                 )
                 .map_err(Into::into)?;
             return Ok(matches);
@@ -2605,7 +2622,7 @@ impl<B: Budget> OptimalCollector<B> {
                             stretches.insert(combined, pos)
                         });
                     let avail = combined.len() - pos;
-                    if avail < 4 {
+                    if avail < 4 || self.noise.skips(combined, pos) {
                         continue;
                     }
                     // Compares stop where the parse stops caring about better
@@ -2665,7 +2682,11 @@ impl<B: Budget> OptimalCollector<B> {
                         match_finder::NO_POSITION
                     };
                     let max_length = (block.end - pos).min(MAX_ENCODER_MATCH_LENGTH);
-                    if !searching || max_distance == 0 || max_length < 4 {
+                    if !searching
+                        || max_distance == 0
+                        || max_length < 4
+                        || self.noise.skips(combined, pos)
+                    {
                         continue;
                     }
 
@@ -4498,10 +4519,23 @@ fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
     let mut state = EncoderMatchState::default();
     let mut next_report = 0usize;
     let mut pending_match: Option<MatchCandidate> = None;
+    // The scan decides only where the chain is walked; every position still
+    // goes into it.
+    let mut noise = NoiseScan::with_cells(start);
     while pos < end {
-        let candidate = pending_match
-            .take()
-            .or_else(|| best_match(combined, pos, end, finder, options, &state, distance_size));
+        let candidate = pending_match.take().or_else(|| {
+            let chain = !noise.skips(combined, pos);
+            best_match_with(
+                combined,
+                pos,
+                end,
+                finder,
+                options,
+                &state,
+                distance_size,
+                chain,
+            )
+        });
         if let Some(candidate) = candidate {
             let (emit_literal, cached_next) = lazy_match_decision(
                 combined,
@@ -4512,6 +4546,7 @@ fn lazy_tokens<B: Budget, T: From<EncodeToken>>(
                 &state,
                 distance_size,
                 candidate,
+                &mut noise,
             );
             if emit_literal {
                 tokens
@@ -4655,6 +4690,7 @@ fn lazy_match_decision<B: Budget>(
     state: &EncoderMatchState,
     distance_size: usize,
     current: MatchCandidate,
+    noise: &mut NoiseScan,
 ) -> (bool, Option<MatchCandidate>) {
     if !options.lazy_matching {
         return (false, None);
@@ -4665,7 +4701,7 @@ fn lazy_match_decision<B: Budget>(
         if pos + offset >= end {
             break;
         }
-        let next = best_match(
+        let next = best_match_with(
             input,
             pos + offset,
             end,
@@ -4673,6 +4709,7 @@ fn lazy_match_decision<B: Budget>(
             options,
             state,
             distance_size,
+            !noise.skips(input, pos + offset),
         );
         if offset == 1 {
             cached_next = next;
@@ -4692,6 +4729,7 @@ struct MatchCandidate {
     score: isize,
 }
 
+#[cfg(test)]
 fn best_match<B: Budget>(
     input: &[u8],
     pos: usize,
@@ -4700,6 +4738,22 @@ fn best_match<B: Budget>(
     options: EncodeOptions,
     state: &EncoderMatchState,
     distance_size: usize,
+) -> Option<MatchCandidate> {
+    best_match_with(input, pos, end, finder, options, state, distance_size, true)
+}
+
+/// The best match at `pos`, from the remembered distances and, when `chain`
+/// is set, the hash chain.
+#[allow(clippy::too_many_arguments)]
+fn best_match_with<B: Budget>(
+    input: &[u8],
+    pos: usize,
+    end: usize,
+    finder: &Rar50MatchFinder<B>,
+    options: EncodeOptions,
+    state: &EncoderMatchState,
+    distance_size: usize,
+    chain: bool,
 ) -> Option<MatchCandidate> {
     let max_distance = pos.min(options.max_match_distance);
     let max_length = (end - pos).min(MAX_ENCODER_MATCH_LENGTH);
@@ -4724,7 +4778,7 @@ fn best_match<B: Budget>(
         }
     }
 
-    {
+    if chain {
         let mut candidate = finder.first(input, pos);
         while candidate != match_finder::NO_POSITION {
             let distance = pos - candidate;
