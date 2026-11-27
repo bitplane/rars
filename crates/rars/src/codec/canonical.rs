@@ -14,7 +14,6 @@ pub(super) struct Huffman<B: Budget = Allowance> {
     counts: [u16; 16],
     /// For every 10-bit prefix, `symbol << 4 | length`; 0 for long codes,
     /// invalid prefixes, or sparse alphabet indices too wide to pack.
-    /// Bounded readers leave this empty to preserve their workspace budget.
     quick: Buffer<u32, B>,
     quick_has_wide_symbols: bool,
 }
@@ -71,18 +70,14 @@ impl<B: Budget> Huffman<B> {
         })
     }
 
-    /// Prepare the peek decoder. Bounded readers scan canonical codes to
-    /// preserve the symbol-only workspace cost; unrestricted readers allocate
-    /// acceleration storage.
+    /// [`Self::from_counts`] with the quick lookup table built.
     pub(super) fn from_counts_with_lookup(
         lengths: &[u8],
         counts: [u16; 16],
         allowance: &B,
     ) -> Result<Self> {
         let mut table = Self::from_counts(lengths, counts, allowance)?;
-        if !B::LIMITED {
-            table.build_lookup()?;
-        }
+        table.build_lookup()?;
         Ok(table)
     }
 
@@ -133,26 +128,19 @@ impl<B: Budget> Huffman<B> {
     /// The quick-table entry (`symbol << 4 | length`) for a 15-bit peek, or 0.
     #[inline(always)]
     pub(super) fn quick_entry(&self, peek: u32) -> u32 {
-        if B::LIMITED {
-            return 0;
-        }
         let index = (peek >> (15 - QUICK_BITS)) as usize;
         self.quick.get(index).copied().unwrap_or(0)
     }
 
     /// Decodes from the next 15 bits of input, most significant first (`peek`),
     /// without consuming them: the symbol and its code's length, or `None` if
-    /// they start no code. Unrestricted readers use one lookup for codes of
-    /// up to 10 bits; bounded readers scan without extra storage. The caller
-    /// consumes only the code's bits, and must
-    /// check that they were real input rather than padding past its end.
+    /// they start no code. Codes of up to 10 bits take one lookup. The caller
+    /// consumes only the code's bits, and must check that they were real input
+    /// rather than padding past its end.
     // Always inlined: with a second caller the compiler stops inlining this
     // inner loop into RAR5.
     #[inline(always)]
     pub(super) fn decode_peeked(&self, peek: u32) -> Option<(usize, usize)> {
-        if B::LIMITED {
-            return self.decode_scan(peek);
-        }
         debug_assert!(!self.quick.is_empty());
         let entry = self.quick[(peek >> (15 - QUICK_BITS)) as usize];
         if entry != 0 {
@@ -176,8 +164,7 @@ impl<B: Budget> Huffman<B> {
         None
     }
 
-    // Full-width symbols for bounded readers and rare wide sparse alphabets.
-    // Keep the scan out of the always-inlined unrestricted lookup path.
+    // Rare wide sparse alphabets. Kept out of the always-inlined lookup path.
     #[inline(never)]
     fn decode_scan(&self, peek: u32) -> Option<(usize, usize)> {
         for len in 1..=15 {

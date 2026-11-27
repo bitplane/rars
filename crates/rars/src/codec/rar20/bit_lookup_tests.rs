@@ -1,5 +1,4 @@
 use super::*;
-use crate::codec::workspace::RefusingBudget;
 
 fn original_peek(input: &[u8], position: usize, count: u8) -> Result<u32> {
     if count > 24 {
@@ -102,7 +101,7 @@ fn huffman_lookup_preserves_results_and_consumption_for_every_prefix_and_tail() 
     }
     check::<_, true>(&Allowance::default());
     check::<_, false>(&Allowance::default());
-    let budget = Allowance::limited(4096);
+    let budget = Allowance::limited(64 * 1024);
     check::<_, true>(&budget);
     check::<_, false>(&budget);
     assert_eq!(budget.used(), 0);
@@ -132,60 +131,6 @@ fn cloned_partial_byte_readers_compact_and_append_without_changing_bits() {
     let budget = Allowance::limited(1024);
     check(&budget);
     assert_eq!(budget.used(), 0);
-}
-
-#[test]
-fn bounded_tables_and_clones_keep_symbol_only_cost_and_refusal_points() {
-    let lengths = [0, 2, 2, 10, 11, 15];
-    let mut counts = [0; 16];
-    for &len in &lengths {
-        if len != 0 {
-            counts[usize::from(len)] += 1;
-        }
-    }
-    fn run<B: Budget>(old: bool, lengths: &[u8], counts: [u16; 16], budget: &B) -> Result<()> {
-        let table = if old {
-            Huffman::<B> {
-                state: super::super::canonical::Huffman::from_counts(lengths, counts, budget)?,
-            }
-        } else {
-            Huffman::<B>::with_lengths(lengths, budget)?
-        };
-        let _copy = table.try_clone()?;
-        Ok(())
-    }
-    let symbols = 5 * std::mem::size_of::<usize>() as u64;
-    for limit in 0..=symbols * 2 {
-        let budget = Allowance::limited(limit);
-        let expected = run(true, &lengths, counts, &budget);
-        assert_eq!(budget.used(), 0);
-        assert_eq!(
-            run(false, &lengths, counts, &budget),
-            expected,
-            "limit={limit}"
-        );
-        assert_eq!(budget.used(), 0);
-    }
-    let budget = Allowance::limited(symbols * 2);
-    let table = Huffman::<_, true>::with_lengths(&lengths, &budget).unwrap();
-    assert_eq!(budget.used(), symbols);
-    let copy = table.try_clone().unwrap();
-    assert_eq!(budget.used(), symbols * 2);
-    drop((table, copy));
-    assert_eq!(budget.used(), 0);
-    let baseline = RefusingBudget::new(usize::MAX);
-    run(true, &lengths, counts, &baseline).unwrap();
-    for failure in 0..=baseline.attempts() {
-        let old = RefusingBudget::new(failure);
-        let new = RefusingBudget::new(failure);
-        assert_eq!(
-            run(false, &lengths, counts, &new),
-            run(true, &lengths, counts, &old)
-        );
-        assert_eq!(new.attempts(), old.attempts());
-        assert_eq!(old.used(), 0);
-        assert_eq!(new.used(), 0);
-    }
 }
 
 #[test]

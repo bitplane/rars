@@ -339,9 +339,7 @@ impl<B: Budget> Reader15State<B> {
                 .saturating_add(OUTPUT_CHUNK)
                 .min(self.target);
             let capacity = chunk_target - self.output_written;
-            if chunk.capacity() < capacity || (B::LIMITED && chunk.capacity() != capacity) {
-                // Matches can grow a chunk past its target. Bounded readers
-                // start each chunk at its requested capacity, including the tail.
+            if chunk.capacity() < capacity {
                 // Release the previous charge before admitting its replacement.
                 drop(chunk);
                 chunk = Buffer::with_capacity(capacity, &allowance)?;

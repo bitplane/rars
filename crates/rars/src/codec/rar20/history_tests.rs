@@ -183,44 +183,22 @@ fn checkpoints_drop_obsolete_bytes_before_restoration_and_growth() {
     }
 }
 
-#[derive(Debug, PartialEq)]
-struct Outcome {
-    result: Result<()>,
-    output: Vec<u8>,
-    capacity: usize,
-    base_offset: usize,
-}
-
-fn bounded_run<B: Budget>(old: bool, budget: &B) -> Outcome {
+fn bounded_run<B: Budget>(budget: &B) -> Result<()> {
     let mut state = Reader20State::with_allowance(budget);
-    let result = (|| {
-        state.output.resize(MAX_HISTORY, 1)?;
-        for size in [1024, HISTORY_TRIM_BATCH - 1, HISTORY_TRIM_BATCH + 1] {
-            if !old {
-                state.prepare_history(size);
-            }
-            for _ in 0..size {
-                state.output.try_push(3)?;
-            }
-            if old {
-                eager(&mut state);
-            } else {
-                state.finish_history();
-            }
-            let _copy = state.try_clone()?;
+    state.output.resize(MAX_HISTORY, 1)?;
+    for size in [1024, HISTORY_TRIM_BATCH - 1, HISTORY_TRIM_BATCH + 1] {
+        state.prepare_history(size);
+        for _ in 0..size {
+            state.output.try_push(3)?;
         }
-        Ok(())
-    })();
-    Outcome {
-        result,
-        output: state.output.to_vec(),
-        capacity: state.output.capacity(),
-        base_offset: state.base_offset,
+        state.finish_history();
+        let _copy = state.try_clone()?;
     }
+    Ok(())
 }
 
 #[test]
-fn bounded_growth_refusals_and_failure_prefixes_are_unchanged() {
+fn bounded_growth_refusals_release_everything() {
     for limit in [
         0,
         MAX_HISTORY - 1,
@@ -232,25 +210,16 @@ fn bounded_growth_refusals_and_failure_prefixes_are_unchanged() {
         6 * MAX_HISTORY,
     ] {
         let budget = Allowance::limited(limit as u64);
-        let expected = bounded_run(true, &budget);
-        assert_eq!(budget.used(), 0);
-        assert_eq!(bounded_run(false, &budget), expected, "limit={limit}");
-        assert_eq!(budget.used(), 0);
+        let _ = bounded_run(&budget);
+        assert_eq!(budget.used(), 0, "limit={limit}");
     }
+    assert!(bounded_run(&Allowance::limited(6 * MAX_HISTORY as u64)).is_ok());
     let baseline = RefusingBudget::new(usize::MAX);
-    assert!(bounded_run(true, &baseline).result.is_ok());
-    assert_eq!(baseline.used(), 0);
+    assert!(bounded_run(&baseline).is_ok());
     for failure in 0..=baseline.attempts() {
-        let old = RefusingBudget::new(failure);
-        let new = RefusingBudget::new(failure);
-        assert_eq!(
-            bounded_run(false, &new),
-            bounded_run(true, &old),
-            "failure={failure}"
-        );
-        assert_eq!(new.attempts(), old.attempts());
-        assert_eq!(new.used(), 0);
-        assert_eq!(old.used(), 0);
+        let budget = RefusingBudget::new(failure);
+        let _ = bounded_run(&budget);
+        assert_eq!(budget.used(), 0, "failure={failure}");
     }
 }
 

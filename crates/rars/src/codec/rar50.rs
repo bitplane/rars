@@ -808,9 +808,10 @@ impl<B: Budget> ReaderState<B> {
         if solid {
             return std::mem::replace(self, decoder);
         }
+        // An independent member needs no old bytes. Reusing the allocation
+        // keeps allocators from retaining a freed window per member. Under a
+        // limit it would carry one member's charge into the next.
         if !B::LIMITED {
-            // An independent member needs no old bytes. Reusing the allocation
-            // keeps allocators from retaining a freed window per member.
             let mut history = match self.streamed_history.take() {
                 Some(ring) => ring.bytes,
                 None => std::mem::replace(&mut self.history, Buffer::new(&decoder.allowance())),
@@ -3102,11 +3103,7 @@ impl<B: Budget> HuffmanState<B> {
 
         Ok(Self {
             state: super::canonical::Huffman::from_counts_with_lookup(lengths, count, allowance)?,
-            literals: if B::LIMITED {
-                ByteLiterals::Scalar
-            } else {
-                ByteLiterals::of(lengths, &count)
-            },
+            literals: ByteLiterals::of(lengths, &count),
         })
     }
     fn try_clone(&self) -> Result<Self> {
@@ -3149,9 +3146,6 @@ impl BitReader<'_> {
         end: usize,
         out: &mut [u8],
     ) -> usize {
-        if B::LIMITED {
-            return 0;
-        }
         match table.literals {
             ByteLiterals::Scalar => self.literal_run::<B, 0>(table, end, out),
             ByteLiterals::All => self.literal_run::<B, 1>(table, end, out),

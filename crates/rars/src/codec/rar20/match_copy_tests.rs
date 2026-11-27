@@ -51,9 +51,6 @@ fn assert_same<B: Budget>(actual: &Reader20State<B>, expected: &Reader20State<B>
     assert_eq!(actual.output, expected.output);
     assert_eq!(actual.pending_match, expected.pending_match);
     assert_eq!(actual.base_offset, expected.base_offset);
-    if B::LIMITED {
-        assert_eq!(actual.output.capacity(), expected.output.capacity());
-    }
 }
 
 #[test]
@@ -149,12 +146,9 @@ fn pending_long_matches_survive_history_trimming() {
     assert_eq!(budget.used(), 0);
 }
 
-#[derive(Debug, PartialEq)]
 struct Outcome {
     result: Result<()>,
     output: Vec<u8>,
-    capacity: usize,
-    pending: Option<(usize, usize, bool)>,
 }
 fn limited_run<B: Budget>(old: bool, budget: &B, offset: usize) -> Outcome {
     let mut state = Reader20State::with_allowance(budget);
@@ -166,36 +160,41 @@ fn limited_run<B: Budget>(old: bool, budget: &B, offset: usize) -> Outcome {
     Outcome {
         result,
         output: state.output.to_vec(),
-        capacity: state.output.capacity(),
-        pending: state.pending_match,
     }
 }
 
 #[test]
-fn bounded_limits_and_every_refusal_keep_the_scalar_failure_prefix() {
+fn refusals_during_a_long_match_leave_a_prefix_and_release_everything() {
     for offset in [0, 1, 3, 4] {
+        let full = limited_run(true, &Allowance::default(), offset);
+        assert!(full.result.is_ok());
+        let check = |actual: Outcome, at: &str| {
+            if actual.result.is_ok() {
+                assert_eq!(actual.output, full.output, "{at}, offset={offset}");
+            } else {
+                assert!(
+                    full.output.starts_with(&actual.output),
+                    "{at}, offset={offset}"
+                );
+            }
+        };
         for limit in 0..=800 {
             let budget = Allowance::limited(limit);
-            let expected = limited_run(true, &budget, offset);
-            assert_eq!(budget.used(), 0);
-            let actual = limited_run(false, &budget, offset);
-            assert_eq!(actual, expected, "limit={limit}, offset={offset}");
+            check(
+                limited_run(false, &budget, offset),
+                &format!("limit={limit}"),
+            );
             assert_eq!(budget.used(), 0);
         }
         let baseline = RefusingBudget::new(usize::MAX);
-        assert!(limited_run(true, &baseline, offset).result.is_ok());
-        assert_eq!(baseline.used(), 0);
+        assert!(limited_run(false, &baseline, offset).result.is_ok());
         for failure in 0..=baseline.attempts() {
-            let original_budget = RefusingBudget::new(failure);
-            let new_budget = RefusingBudget::new(failure);
-            assert_eq!(
-                limited_run(false, &new_budget, offset),
-                limited_run(true, &original_budget, offset),
-                "failure={failure}, offset={offset}"
+            let budget = RefusingBudget::new(failure);
+            check(
+                limited_run(false, &budget, offset),
+                &format!("failure={failure}"),
             );
-            assert_eq!(new_budget.attempts(), original_budget.attempts());
-            assert_eq!(original_budget.used(), 0);
-            assert_eq!(new_budget.used(), 0);
+            assert_eq!(budget.used(), 0);
         }
     }
 }

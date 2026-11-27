@@ -5763,14 +5763,14 @@ mod emission_ledger_tests {
             prefix.write_all(&data).unwrap();
             let mut expected = Vec::new();
             write_recovery_service(10, &mut prefix, None, &base, None, &mut expected).unwrap();
-            for limit in [131072, 8 * 1024 * 1024] {
+            for limit in [4096, 8 * 1024 * 1024] {
                 let ledger = Allowance::limited(limit);
                 let resources = base.clone().with_execution_allowance(ledger.clone());
                 let retained = Bytes::zeroed(128, &resources).unwrap();
                 let mut actual = Vec::new();
                 let result =
                     write_recovery_service(10, &mut prefix, None, &resources, None, &mut actual);
-                if limit == 131072 {
+                if limit == 4096 {
                     assert_eq!(result.unwrap_err().kind(), crate::ErrorKind::ResourceLimit);
                     assert!(actual.is_empty());
                 } else {
