@@ -112,202 +112,6 @@ impl std::ops::DerefMut for Bytes {
     }
 }
 
-/// Fixed-capacity descriptor array, admitted before allocating. Consuming its
-/// elements keeps the backing allocation charged until the iterator is dropped.
-#[derive(Debug)]
-pub(crate) struct Records<T> {
-    values: Vec<T>,
-    limit: usize,
-    charge: Option<CapacityCharge>,
-}
-#[cfg(test)]
-impl<T: Clone> Clone for Records<T> {
-    fn clone(&self) -> Self {
-        assert!(
-            self.charge.is_none(),
-            "charged owners require fallible copying"
-        );
-        self.values.clone().into()
-    }
-}
-#[cfg(test)]
-impl<T> From<Vec<T>> for Records<T> {
-    fn from(values: Vec<T>) -> Self {
-        Self {
-            limit: values.capacity(),
-            values,
-            charge: None,
-        }
-    }
-}
-impl<T> Records<T> {
-    pub(crate) fn new(limit: usize, resources: &WriterResources) -> Result<Self> {
-        Self::with_charge(limit, resources.preparation_charge())
-    }
-    pub(crate) fn with_charge(limit: usize, mut charge: Option<CapacityCharge>) -> Result<Self> {
-        let bytes = limit
-            .checked_mul(std::mem::size_of::<T>())
-            .filter(|bytes| *bytes <= isize::MAX as usize)
-            .ok_or(Error::InvalidArgument(
-                "preparation records capacity overflows",
-            ))?;
-        if let Some(charge) = &mut charge {
-            charge.grow_to(bytes as u64)?;
-        }
-        // with_capacity requests exactly this layout. No subsequent growth is allowed.
-        Ok(Self {
-            values: Vec::with_capacity(limit),
-            limit,
-            charge,
-        })
-    }
-    pub(crate) fn collect<I>(values: I, resources: &WriterResources) -> Result<Self>
-    where
-        I: ExactSizeIterator<Item = Result<T>>,
-    {
-        let mut out = Self::new(values.len(), resources)?;
-        for value in values {
-            out.push(value?)?;
-        }
-        Ok(out)
-    }
-
-    /// Grow only on explicit request, reserving the old and replacement arrays
-    /// together before moving elements. Fixed-admission callers use `push`.
-    pub(crate) fn push_growing(&mut self, value: T) -> Result<()> {
-        if self.values.len() == self.limit {
-            let limit = self
-                .limit
-                .max(1)
-                .checked_mul(2)
-                .ok_or(Error::InvalidArgument(
-                    "preparation records capacity overflows",
-                ))?;
-            let bytes = limit
-                .checked_mul(std::mem::size_of::<T>())
-                .filter(|bytes| *bytes <= isize::MAX as usize)
-                .ok_or(Error::InvalidArgument(
-                    "preparation records capacity overflows",
-                ))?;
-            if let Some(charge) = &mut self.charge {
-                charge.grow_to((bytes as u64).checked_add(charge.bytes()).ok_or(
-                    Error::InvalidArgument("preparation records capacity overflows"),
-                )?)?;
-            }
-            let mut replacement = Vec::with_capacity(limit);
-            replacement.append(&mut self.values);
-            self.values = replacement;
-            self.limit = limit;
-            if let Some(charge) = &mut self.charge {
-                charge.shrink_to(bytes as u64);
-            }
-        }
-        self.push(value)
-    }
-
-    #[cfg(test)]
-    #[allow(dead_code)] // Only feature combinations with the fallback tests use it.
-    pub(crate) fn pop(&mut self) -> Option<T> {
-        self.values.pop()
-    }
-
-    pub(crate) fn push(&mut self, value: T) -> Result<()> {
-        if self.values.len() == self.limit {
-            return Err(Error::WriterFailure(
-                "preparation record count exceeded admission",
-            ));
-        }
-        self.values.push(value);
-        Ok(())
-    }
-}
-impl<T> std::ops::Deref for Records<T> {
-    type Target = [T];
-    fn deref(&self) -> &[T] {
-        &self.values
-    }
-}
-impl<T> std::ops::DerefMut for Records<T> {
-    fn deref_mut(&mut self) -> &mut [T] {
-        &mut self.values
-    }
-}
-pub(crate) struct RecordIter<T> {
-    iter: std::vec::IntoIter<T>,
-    _charge: Option<CapacityCharge>,
-}
-impl<T> Iterator for RecordIter<T> {
-    type Item = T;
-    fn next(&mut self) -> Option<T> {
-        self.iter.next()
-    }
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.iter.size_hint()
-    }
-}
-impl<T> ExactSizeIterator for RecordIter<T> {}
-
-impl<T> IntoIterator for Records<T> {
-    type Item = T;
-    type IntoIter = RecordIter<T>;
-    fn into_iter(self) -> Self::IntoIter {
-        RecordIter {
-            iter: self.values.into_iter(),
-            _charge: self.charge,
-        }
-    }
-}
-impl<'a, T> IntoIterator for &'a Records<T> {
-    type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.iter()
-    }
-}
-impl<'a, T> IntoIterator for &'a mut Records<T> {
-    type Item = &'a mut T;
-    type IntoIter = std::slice::IterMut<'a, T>;
-    fn into_iter(self) -> Self::IntoIter {
-        self.values.iter_mut()
-    }
-}
-
-pub(crate) struct Owned<T> {
-    value: Box<T>,
-    _charge: Option<CapacityCharge>,
-}
-impl<T> Owned<T> {
-    pub(crate) fn new(value: T, resources: &WriterResources) -> Result<Self> {
-        let mut charge = resources.preparation_charge();
-        if let Some(charge) = &mut charge {
-            charge.grow_to(std::mem::size_of::<T>() as u64)?;
-        }
-        Ok(Self {
-            value: Box::new(value),
-            _charge: charge,
-        })
-    }
-    pub(crate) fn into_inner(self) -> T {
-        *self.value
-    }
-}
-impl<T> std::ops::Deref for Owned<T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        &self.value
-    }
-}
-impl<T> std::ops::DerefMut for Owned<T> {
-    fn deref_mut(&mut self) -> &mut T {
-        &mut self.value
-    }
-}
-
-impl<T> AsRef<T> for Owned<T> {
-    fn as_ref(&self) -> &T {
-        self
-    }
-}
 impl PartialEq for Bytes {
     fn eq(&self, other: &Self) -> bool {
         **self == **other
@@ -326,6 +130,8 @@ impl PartialEq<Bytes> for Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn preparation_vint_encodes_single_and_multiple_byte_boundaries() {
         use super::*;
@@ -341,9 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn fixed_preparation_capacity_refuses_extra_records_and_impossible_growth() {
-        use super::*;
-
+    fn fixed_preparation_capacity_refuses_impossible_growth() {
         let resources = WriterResources::default().with_max_preparation_bytes(64);
         let mut bytes = Bytes::zeroed(4, &resources).unwrap();
         bytes.grow(4).unwrap();
@@ -355,16 +159,6 @@ mod tests {
         assert_eq!(bytes, vec![0; 4]);
         assert_eq!(vec![0; 4], bytes);
         assert_eq!(bytes, Bytes::zeroed(4, &resources).unwrap());
-
-        let mut records = Records::new(1, &resources).unwrap();
-        records.push(7u8).unwrap();
-        assert!(matches!(
-            records.push(9),
-            Err(Error::WriterFailure(
-                "preparation record count exceeded admission"
-            ))
-        ));
-        assert_eq!(&*records, &[7]);
     }
 
     #[test]
@@ -389,30 +183,6 @@ mod tests {
         assert_eq!(ledger.used(), 0);
     }
 
-    #[test]
-    fn descriptor_growth_counts_replacement_peak_and_preserves_refused_input() {
-        let resources = WriterResources::default().with_max_preparation_bytes(23);
-        let mut records = Records::new(1, &resources).unwrap();
-        records.push(7u64).unwrap();
-        assert!(matches!(
-            records.push_growing(9),
-            Err(Error::WriterPreparationLimitExceeded { required: 24, .. })
-        ));
-        assert_eq!(&*records, &[7]);
-        assert_eq!(used(&resources), 8);
-        drop(records);
-        assert_eq!(used(&resources), 0);
-        let resources = resources.with_max_preparation_bytes(24);
-        let mut records = Records::new(1, &resources).unwrap();
-        records.push(7u64).unwrap();
-        records.push_growing(9).unwrap();
-        assert_eq!(&*records, &[7, 9]);
-        assert_eq!(used(&resources), 16);
-        drop(records);
-        assert_eq!(used(&resources), 0);
-    }
-
-    use super::*;
     fn used(resources: &WriterResources) -> u64 {
         *resources
             .preparation_budget
@@ -456,27 +226,11 @@ mod tests {
     }
 
     #[test]
-    fn records_and_boxed_state_keep_their_allocation_charged_until_freed() {
-        struct Probe(WriterResources);
-        impl Drop for Probe {
-            fn drop(&mut self) {
-                assert!(used(&self.0) > 0);
-            }
-        }
+    fn prepared_bytes_release_their_charge_on_unwind() {
         let resources = WriterResources::default().with_max_preparation_bytes(4096);
-        let mut records = Records::new(2, &resources).unwrap();
-        records.push(Probe(resources.clone())).unwrap();
-        records.push(Probe(resources.clone())).unwrap();
-        let bytes = 2 * std::mem::size_of::<Probe>() as u64;
-        assert_eq!(used(&resources), bytes);
-        let mut iter = records.into_iter();
-        drop(iter.next());
-        assert_eq!(used(&resources), bytes);
-        drop(iter);
-        assert_eq!(used(&resources), 0);
         let failure = std::panic::catch_unwind(|| {
-            let _owned = Owned::new(Probe(resources.clone()), &resources).unwrap();
             let _bytes = Bytes::zeroed(100, &resources).unwrap();
+            assert_eq!(used(&resources), 100);
             panic!("injected failure");
         });
         assert!(failure.is_err());

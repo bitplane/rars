@@ -1,8 +1,5 @@
 //! Final collectors retain capacity until transfer, including adapter copies.
-use super::{
-    preparation::{Bytes, Records},
-    CapacityCharge, WriterResources,
-};
+use super::{preparation::Bytes, CapacityCharge, WriterResources};
 use crate::{Error, Result};
 use std::{
     io::{self, Write},
@@ -53,7 +50,7 @@ impl Write for WriterOutput {
 
 /// A collected volume set retaining its aggregate charge through adapter copies.
 pub struct WriterVolumes {
-    outputs: Records<WriterOutput>,
+    outputs: Vec<WriterOutput>,
     resources: WriterResources,
 }
 impl WriterVolumes {
@@ -94,7 +91,7 @@ impl WriterVolumes {
 }
 
 struct Shared {
-    outputs: Mutex<Records<WriterOutput>>,
+    outputs: Mutex<Vec<WriterOutput>>,
     _charge: Option<CapacityCharge>,
 }
 pub(crate) struct VolumeCollector {
@@ -115,7 +112,7 @@ impl VolumeCollector {
         }
         Ok(Self {
             shared: Arc::new(Shared {
-                outputs: Mutex::new(Records::with_charge(0, resources.execution_charge())?),
+                outputs: Mutex::new(Vec::with_capacity(0)),
                 _charge: charge,
             }),
             resources: resources.clone(),
@@ -142,7 +139,7 @@ impl VolumeCollector {
         if let Some(charge) = &mut charge {
             charge.grow_to(std::mem::size_of::<VolumeOutput>() as u64)?;
         }
-        outputs.push_growing(WriterOutput::new(&self.resources))?;
+        outputs.push(WriterOutput::new(&self.resources));
         Ok(VolumeOutput {
             shared: self.shared.clone(),
             index,

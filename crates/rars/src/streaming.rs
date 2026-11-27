@@ -531,16 +531,16 @@ impl WriterResources {
             .transpose()
     }
 
-    /// Bound RAR5/7 engine header scratch, images, descriptor arrays and boxed
-    /// preparation state, including volume and recovery headers. Capacity is
-    /// reserved before allocation, including old/replacement overlap on growth.
-    /// Configuring creates a new ledger shared by resource clones; default is
-    /// unlimited. Legacy writers explicitly refuse this policy.
+    /// Bound RAR5/7 engine header scratch and images, including volume and
+    /// recovery headers. Capacity is reserved before allocation, including
+    /// old/replacement overlap on growth. Configuring creates a new ledger shared
+    /// by resource clones; default is unlimited. Legacy writers explicitly refuse
+    /// this policy.
     ///
-    /// Coordinator plan/job/result descriptor arrays also count; their pointed-to
-    /// input/history and codec payload buffers do not. Codec/KDF/recovery workspace,
-    /// input conversion, source/sink callbacks, collectors, diagnostics and allocator
-    /// overhead are outside this quota. This is not a total writer-memory cap.
+    /// Coordinator bookkeeping, input/history and codec payload buffers,
+    /// codec/KDF/recovery workspace, input conversion, source/sink callbacks,
+    /// collectors, diagnostics and allocator overhead are outside this quota.
+    /// This is not a total writer-memory cap.
     pub fn with_max_preparation_bytes(mut self, limit: u64) -> Self {
         self.preparation_budget = Some(Arc::new(StorageBudget {
             resource: StorageResource::Preparation,
