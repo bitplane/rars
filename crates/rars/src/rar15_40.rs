@@ -1985,11 +1985,11 @@ impl Archive {
     ///
     /// Unix symbolic links are left out: `open` is never called for them.
     /// [`crate::Archive::extract_with_links`] reports them.
-    pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, open: F) -> Result<()>
+    pub fn extract_to<F>(&self, options: crate::ArchiveReadOptions<'_>, mut open: F) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.extract_impl(options, &mut skip_legacy_links(open), None, None, None)
+        self.extract_impl(options, &mut skip_legacy_links(&mut open), None, None, None)
             .map(|_| ())
     }
 
@@ -2008,17 +2008,14 @@ impl Archive {
         )
     }
 
-    fn extract_impl<F>(
+    fn extract_impl(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         links: Option<&mut LegacyLink<'_>>,
-    ) -> Result<crate::ExtractionOutcome>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<crate::ExtractionOutcome> {
         if let Some(limit) = options.max_reader_workspace_bytes {
             return self.extract_with_allowance(
                 options,
@@ -2039,18 +2036,15 @@ impl Archive {
         )
     }
 
-    fn extract_with_allowance<F>(
+    fn extract_with_allowance(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         mut links: Option<&mut LegacyLink<'_>>,
         allowance: &Allowance,
-    ) -> Result<crate::ExtractionOutcome>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<crate::ExtractionOutcome> {
         debug_assert!(links.is_none() || selector.is_none());
         options.check_cancelled()?;
         let password = options.password;
@@ -2155,18 +2149,15 @@ impl Archive {
     }
 
     /// Streams one independent member on the calling thread, between batches.
-    fn extract_inline<F>(
+    fn extract_inline(
         &self,
         file: &FileHeader,
         options: crate::ArchiveReadOptions<'_>,
         shared: &crate::read_control::ReadControl,
         allowance: &Allowance,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         links: &mut Option<&mut LegacyLink<'_>>,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<()> {
         let mut budget = crate::output_limit::OutputBudget::new(options);
         budget.control.share_vm_work(shared);
         let mut session = DecoderSession::with_allowance(false, options.password, allowance);
@@ -2191,35 +2182,29 @@ impl Archive {
     pub fn extract_to_parallel_buffered<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: F,
+        mut open: F,
     ) -> Result<()>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     {
-        self.extract_parallel_with_links(options, skip_legacy_links(open), None)
+        self.extract_parallel_with_links(options, &mut skip_legacy_links(&mut open), None)
     }
 
-    pub(crate) fn extract_parallel_with_links<F>(
+    pub(crate) fn extract_parallel_with_links(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        mut open: F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         links: Option<&mut LegacyLink<'_>>,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
-        self.parallel_impl(options, &mut open, links, false)
+    ) -> Result<()> {
+        self.parallel_impl(options, open, links, false)
     }
 
     /// Verifies member payloads on workers without buffering their output.
-    pub(crate) fn test_to<F>(
+    pub(crate) fn test_to(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        mut tested: F,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<()>,
-    {
+        tested: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<()>,
+    ) -> Result<()> {
         self.parallel_impl(
             options,
             &mut |meta| {
@@ -2231,16 +2216,13 @@ impl Archive {
         )
     }
 
-    fn parallel_impl<F>(
+    fn parallel_impl(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         links: Option<&mut LegacyLink<'_>>,
         verification: bool,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<()> {
         options.check_cancelled()?;
         // Solid chains, ordered total-output charging and salvage need one session.
         if options.max_total_output_bytes.is_some()
@@ -2266,17 +2248,14 @@ impl Archive {
         options.check_cancelled()
     }
 
-    fn parallel_with<F>(
+    fn parallel_with(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        open: &mut F,
+        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut links: Option<&mut LegacyLink<'_>>,
         verification: bool,
         allowance: &Allowance,
-    ) -> Result<()>
-    where
-        F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    {
+    ) -> Result<()> {
         let emit_links = links.is_some();
         let publication = crate::read_control::ReadControl::for_options(&options);
         let plan = |file: &FileHeader| {
