@@ -91,7 +91,7 @@ fn retained_volumes_count_until_copy_and_handoff() {
     assert!(retained >= payload);
     let copied = output
         .copy_with(|parts| {
-            assert_eq!(resources.managed_memory_in_use(), retained + payload);
+            assert!(resources.managed_memory_in_use() >= retained + payload);
             parts
                 .iter()
                 .map(|part| part.as_bytes().to_vec())

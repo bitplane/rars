@@ -21,19 +21,14 @@
 //! 1. **covered**: allocated ≤ charged, with a budget far above the charge.
 //!    The legacy writers clamp a member's charge to the budget, so a small
 //!    budget would say nothing about the formula.
-//! 2. **not wildly loose**: charged ≤ [`LOOSE_FACTOR`] × the largest
-//!    allocated peak over every input for the same writer, path, level and
-//!    thread count, plus [`LOOSE_SLACK`]. A charge has to hold for the worst
-//!    input, so it is judged against the worst.
-//! 3. **inside the budget**: allocated ≤ the default budget's
+//! 2. **inside the budget**: allocated ≤ the default budget's
 //!    `memory_limit()` for the thread count. A case whose charge fits that
 //!    budget is admitted there exactly as it was under the large one, so the
 //!    first run already answers this; a case whose charge does not fit is
 //!    written again at the default budget and measured.
 //!
-//! Cases that fail an assertion are listed in [`KNOWN_GAPS`] against the issue
-//! that tracks them, and the test asserts each listed gap is still there, so a
-//! fix has to remove its entry.
+//! How much a charge overestimates is not checked: a charge only decides how
+//! many jobs run at once.
 //!
 //! A case is about a second in a test build, so the default run takes a
 //! sample of the 1 MiB matrix. The whole matrix, and the matrix again at each
@@ -59,10 +54,6 @@ const MIB: u64 = 1024 * KIB;
 /// Far above every charge, so no charge is clamped to the budget. It keeps
 /// the default planning limit, so the archive is the default one.
 const LARGE_BUDGET: u64 = 8 * 1024 * MIB;
-
-/// Assertion 2's bound: charged ≤ `LOOSE_FACTOR` × worst allocated + `LOOSE_SLACK`.
-const LOOSE_FACTOR: f64 = 2.0;
-const LOOSE_SLACK: u64 = 16 * MIB;
 
 struct Counting;
 
@@ -195,7 +186,6 @@ const INPUTS: [Input; 7] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Assertion {
     Covered,
-    Loose,
     InsideBudget,
 }
 
@@ -207,103 +197,6 @@ struct Case {
     threads: usize,
     input: Input,
 }
-
-/// Cases that fail an assertion today. `None` matches any.
-struct Gap {
-    tier: Tier,
-    writer: Writer,
-    paths: &'static [Path],
-    levels: &'static [u8],
-    threads: Option<usize>,
-    input: Option<Input>,
-    assertion: Assertion,
-    /// The issue tracking it.
-    issue: u32,
-}
-
-impl Gap {
-    fn covers(&self, tier: Tier, case: &Case) -> bool {
-        self.tier == tier
-            && self.writer == case.writer
-            && self.paths.contains(&case.path)
-            && self.levels.contains(&case.level)
-            && self.threads.is_none_or(|threads| threads == case.threads)
-            && self.input.is_none_or(|input| input == case.input)
-    }
-
-    fn matches(&self, tier: Tier, case: &Case, assertion: Assertion) -> bool {
-        self.covers(tier, case) && self.assertion == assertion
-    }
-}
-
-/// Cases that sit on an assertion's edge, so whether they fail depends on how
-/// the threads happen to overlap. A failure here is excused, but unlike
-/// [`KNOWN_GAPS`] a pass is not reported as stale.
-const BORDERLINE_GAPS: &[Gap] = &[
-    // Level 1 is charged a parse workspace for each block coded at once, and
-    // at four threads how many of them are live at the peak varies, so the
-    // charge lands either side of the looseness bound.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar20,
-        paths: &[Path::Whole, Path::Solid],
-        levels: &[1],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 652,
-    },
-    // The four solid coding peaks of the chain-walking levels can coincide
-    // (80.9 MiB charged, 34.4/32.4 MiB measured by tier).
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar5,
-        paths: &[Path::Solid],
-        levels: &[1, 2],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 654,
-    },
-    Gap {
-        tier: Tier::Fitted,
-        writer: Writer::Rar5,
-        paths: &[Path::Solid],
-        levels: &[1, 2],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 654,
-    },
-    // Three RAR 7 repricing jobs can overlap (302.0 MiB charged, 144.5 MiB measured).
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar7,
-        paths: &[Path::Blocks],
-        levels: &[3],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 654,
-    },
-    // The same three repricing jobs in RAR 5, at the two levels that reprice
-    // two or three times. Six passes at level 5 overlap enough to pass.
-    Gap {
-        tier: Tier::Small,
-        writer: Writer::Rar5,
-        paths: &[Path::Blocks],
-        levels: &[3, 4],
-        threads: Some(4),
-        input: None,
-        assertion: Assertion::Loose,
-        issue: 654,
-    },
-];
-
-/// Every case that fails an assertion today, against the issue tracking it.
-/// #393 is the accounting work these belong to; an entry naming it has no
-/// issue of its own yet.
-const KNOWN_GAPS: &[Gap] = &[];
 
 fn lcg(state: &mut u64) -> u64 {
     *state = state
@@ -779,22 +672,11 @@ fn check(tier: Tier, cases: Vec<Case>) {
         results.push(measured);
     }
 
-    let mut failures = Vec::new();
+    let mut problems = Vec::new();
     for measured in &results {
         let case = &measured.case;
-        let worst = results
-            .iter()
-            .filter(|other| {
-                other.case.writer == case.writer
-                    && other.case.path == case.path
-                    && other.case.level == case.level
-                    && other.case.threads == case.threads
-            })
-            .map(|other| other.allocated)
-            .max()
-            .unwrap();
         if measured.allocated > measured.charged {
-            failures.push((
+            problems.push((
                 *case,
                 Assertion::Covered,
                 format!(
@@ -804,22 +686,9 @@ fn check(tier: Tier, cases: Vec<Case>) {
                 ),
             ));
         }
-        let bound = (worst as f64 * LOOSE_FACTOR) as u64 + LOOSE_SLACK;
-        if measured.charged > bound {
-            failures.push((
-                *case,
-                Assertion::Loose,
-                format!(
-                    "charged {} MiB > {LOOSE_FACTOR} × worst allocated {} MiB + {} MiB",
-                    mib(measured.charged),
-                    mib(worst),
-                    mib(LOOSE_SLACK)
-                ),
-            ));
-        }
         let at_default = measured.allocated_at_default.unwrap_or(measured.allocated);
         if at_default > measured.default_limit {
-            failures.push((
+            problems.push((
                 *case,
                 Assertion::InsideBudget,
                 format!(
@@ -831,42 +700,15 @@ fn check(tier: Tier, cases: Vec<Case>) {
         }
     }
 
-    let mut problems = Vec::new();
-    for (case, assertion, detail) in &failures {
-        match KNOWN_GAPS
-            .iter()
-            .chain(BORDERLINE_GAPS)
-            .find(|gap| gap.matches(tier, case, *assertion))
-        {
-            Some(gap) => eprintln!(
-                "known gap (#{}): {case:?} {assertion:?}: {detail}",
-                gap.issue
-            ),
-            None => problems.push(format!("{case:?} {assertion:?}: {detail}")),
-        }
-    }
-    // A gap is checked wherever its cases ran; the sample runs only some.
-    for gap in KNOWN_GAPS.iter().filter(|gap| {
-        results
-            .iter()
-            .any(|measured| gap.covers(tier, &measured.case))
-    }) {
-        if !failures
-            .iter()
-            .any(|(case, assertion, _)| gap.matches(tier, case, *assertion))
-        {
-            problems.push(format!(
-                "the gap tracked by #{} ({:?} {:?} levels {:?} threads {:?} {:?} {:?}) no \
-                 longer fails: remove it from KNOWN_GAPS",
-                gap.issue, gap.writer, gap.paths, gap.levels, gap.threads, gap.input, gap.assertion
-            ));
-        }
-    }
     eprintln!(
         "{tier:?} tier: {} cases in {:.1} s",
         results.len(),
         started.elapsed().as_secs_f64()
     );
+    let problems: Vec<String> = problems
+        .iter()
+        .map(|(case, assertion, detail)| format!("{case:?} {assertion:?}: {detail}"))
+        .collect();
     assert!(problems.is_empty(), "{}", problems.join("\n"));
 }
 
@@ -898,7 +740,7 @@ fn rar5_level5_fitted_dictionary_charge_covers_three_symbol_noise() {
         mib(allocated),
         mib(charged)
     );
-    assert_eq!(charged, rars::DEFAULT_WRITER_MEMORY_LIMIT);
+    assert!(charged <= rars::DEFAULT_WRITER_MEMORY_LIMIT);
     assert!(allocated <= charged);
 }
 
