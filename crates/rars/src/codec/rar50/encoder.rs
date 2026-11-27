@@ -2418,7 +2418,7 @@ fn runs_share_a_seed_tree_unless_one_hash_holds_most_of_the_window() {
                 (state % 64) as u8 + 1
             })
             .collect();
-        for chunk in window.chunks_exact_mut(40) {
+        for chunk in window.as_chunks_mut::<40>().0 {
             chunk[..zeroes].fill(0);
         }
         window
@@ -2435,7 +2435,8 @@ fn runs_share_a_seed_tree_unless_one_hash_holds_most_of_the_window() {
         .collect();
     crate::parallel::private_pool(16).install(|| {
         let together = seed_chains(&window(11), &runs, options);
-        assert_eq!(together, [0..runs.len()]);
+        assert_eq!(together.len(), 1);
+        assert_eq!(together[0], 0..runs.len());
         let apart = seed_chains(&window(28), &runs, options);
         assert_eq!(apart.len(), runs.len());
     });
