@@ -3,17 +3,21 @@
 //! Shared with the Python binding; not part of the stable API.
 
 use crate::extract_dir::{ExtractedDir, SkippedLink};
+use crate::in_flight::InFlight;
 use crate::output_links::{create_link_output, link_source_path};
 use crate::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
 use crate::output_tree::{FileDir, HeldFile, OutputTree, TreeEntry};
+use crate::publish_queue::{PublishQueue, PublishStep};
 use crate::ExtractedLink;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 /// How [`DirOutputs`] writes.
 #[derive(Debug, Clone, Copy)]
@@ -32,32 +36,59 @@ pub struct DirMode {
 /// the destination is never written through, unless writing in place.
 pub struct DirOutputs<'a> {
     out_dir: &'a Path,
-    family: crate::ArchiveFamily,
     encoding: Option<crate::filename::LegacyNameEncoding>,
     overwrite: OverwritePolicy,
     in_place: bool,
     flatten: bool,
+    restore_times: bool,
     exists_hint: &'static str,
     flat_names: crate::output_staging::FlatNames,
-    renames: crate::output_staging::RenameCounters,
     /// Destinations taken under `Rename`, so a repeated stored path fails as in the CLI.
     rename_claims: HashSet<PathBuf>,
-    times: Option<crate::output_times::OutputTimes>,
-    staging: Option<ExtractionStaging>,
     staged: usize,
+    storage: Option<Storage>,
     pending: Option<PendingOutput>,
-    published: Vec<PathBuf>,
-    /// Where each output went, by its stored path, for hard links and copies.
-    created: HashMap<PathBuf, PathBuf>,
+    /// Members opened by [`Self::open_settled`] and not yet settled, oldest first.
+    unsettled: VecDeque<Unsettled>,
+    /// Where unsettled members go.
+    unsettled_paths: InFlight,
     skipped_links: Vec<SkippedLink>,
     /// Members a member error handler went past, whose pending output is dropped.
     failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
+    queue: PublishQueue<Publishing>,
+    /// A failure to publish was handed on: the run going on publishes what is held behind it.
+    failure_given: bool,
+}
+
+/// Where files stage, once the storage is made.
+#[derive(Clone)]
+struct Storage {
+    root: PathBuf,
+    /// Staged by descriptor: this directory of the storage, and its path.
+    files: Option<(FileDir, PathBuf)>,
+}
+
+/// What publishing changes, and opening reads through the queue's lock.
+struct Publishing {
+    out_dir: PathBuf,
+    family: crate::ArchiveFamily,
+    encoding: Option<crate::filename::LegacyNameEncoding>,
+    overwrite: OverwritePolicy,
+    flatten: bool,
+    renames: crate::output_staging::RenameCounters,
+    times: Option<crate::output_times::OutputTimes>,
+    staging: Option<ExtractionStaging>,
+    /// Where files stage, once [`Self::staging`] is made.
+    storage: Option<Storage>,
     /// The output directory walked by descriptor, where the platform allows,
     /// once it exists. Each directory is opened once without following a
     /// symlink, and files are created and published relative to it.
     out_tree: Option<OutputTree>,
-    /// Where files stage by descriptor in the staging storage, and its path.
-    staged_files: Option<(FileDir, PathBuf)>,
+    published: Vec<PathBuf>,
+    /// Where each output went, by its stored path, for hard links and copies.
+    created: HashMap<PathBuf, PathBuf>,
+    /// Where outputs queued and not yet published go.
+    queued: InFlight,
 }
 
 /// Where staged files go in a staging storage walked by descriptor. Links
@@ -69,6 +100,8 @@ struct PendingOutput {
     staged: Option<PathBuf>,
     /// Staged by descriptor: the directory it is in and its name there.
     staged_at: Option<(FileDir, std::ffi::OsString)>,
+    /// Whether the staged file took its time as it closed.
+    time_set: Option<Arc<AtomicBool>>,
     /// Written in place by descriptor: the file, once the library is done writing it.
     held: Option<Arc<OnceLock<fs::File>>>,
     stored: PathBuf,
@@ -76,6 +109,37 @@ struct PendingOutput {
     meta: crate::ExtractedEntryMeta,
     /// A legacy symlink's target, buffered until verified.
     link_target: Option<Arc<Mutex<Vec<u8>>>>,
+}
+
+enum Unsettled {
+    Refused,
+    /// Made once it settles, so a file before it in the archive is published first.
+    Directory {
+        meta: crate::ExtractedEntryMeta,
+        destination: PathBuf,
+    },
+    Output {
+        pending: PendingOutput,
+        /// Looked at again as it settles: a member before it can change what is at its destination.
+        recheck: bool,
+    },
+}
+
+enum Job {
+    Output(PendingOutput),
+    Directory {
+        meta: crate::ExtractedEntryMeta,
+        destination: PathBuf,
+    },
+}
+
+impl Job {
+    fn destination(&self) -> (&Path, bool) {
+        match self {
+            Self::Output(pending) => (&pending.destination, false),
+            Self::Directory { destination, .. } => (destination, true),
+        }
+    }
 }
 
 struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
@@ -94,6 +158,37 @@ impl Write for SharedBuffer {
     }
 }
 
+/// Takes its member's time as it closes, so the publish needs no call by name.
+struct StagedFile {
+    file: fs::File,
+    modified: Option<SystemTime>,
+    set: Arc<AtomicBool>,
+}
+
+impl Write for StagedFile {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.file.write(bytes)
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.file.write_all(bytes)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Some(modified) = self.modified {
+            if self.file.set_modified(modified).is_ok() {
+                self.set.store(true, Ordering::Release);
+            }
+        }
+    }
+}
+
 impl<'a> DirOutputs<'a> {
     /// Outputs under `out_dir` for an archive of `family`, decoding legacy
     /// names with `encoding`. A member named in `failed` when its output
@@ -105,40 +200,593 @@ impl<'a> DirOutputs<'a> {
         mode: DirMode,
         failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
     ) -> Self {
-        Self {
-            out_dir,
+        let mut queue = PublishQueue::new(Publishing {
+            out_dir: out_dir.to_path_buf(),
             family,
             encoding,
             overwrite: mode.overwrite,
-            in_place: mode.in_place,
             flatten: mode.flatten,
-            exists_hint: mode.exists_hint,
-            flat_names: Default::default(),
             renames: Default::default(),
-            rename_claims: HashSet::new(),
             times: mode
                 .restore_times
                 .then(crate::output_times::OutputTimes::new),
             staging: None,
-            staged: 0,
-            pending: None,
+            storage: None,
+            out_tree: None,
             published: Vec::new(),
             created: HashMap::new(),
+            queued: InFlight::default(),
+        });
+        // In place, opening writes the destination; flattened, it claims names publishing keeps.
+        queue.publish_on_thread(!mode.in_place && !mode.flatten);
+        Self {
+            out_dir,
+            encoding,
+            overwrite: mode.overwrite,
+            in_place: mode.in_place,
+            flatten: mode.flatten,
+            restore_times: mode.restore_times,
+            exists_hint: mode.exists_hint,
+            flat_names: Default::default(),
+            rename_claims: HashSet::new(),
+            staged: 0,
+            storage: None,
+            pending: None,
+            unsettled: VecDeque::new(),
+            unsettled_paths: InFlight::default(),
             skipped_links: Vec::new(),
             failed,
-            out_tree: None,
-            staged_files: None,
+            queue,
+            failure_given: false,
         }
     }
 
+    /// For code the run calls out to, which can look at the output directory.
+    pub fn publish_waiter(&self) -> impl Fn() + Send + Sync + 'static {
+        self.queue.waiter()
+    }
+
+    /// The run went on past the failure handed on: outputs held behind it publish.
+    fn go_on(&mut self) {
+        if std::mem::take(&mut self.failure_given) {
+            self.queue.resume();
+        }
+    }
+
+    /// The first failure to publish an output queued earlier.
+    fn publish_failure(&mut self) -> crate::Result<()> {
+        match self.queue.take_failure() {
+            Some(failure) => {
+                self.failure_given = true;
+                Err(failure)
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn submit(&mut self, job: Job) {
+        let (destination, directory) = job.destination();
+        self.queue.state().note_queued(destination, directory);
+        self.queue.submit(job);
+    }
+
+    /// Stored path for link lookups, destination, and what is there now, once
+    /// no output queued ahead of it can change what opening finds.
+    fn destination(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<(PathBuf, PathBuf, Option<TreeEntry>)> {
+        {
+            let mut state = self.queue.state();
+            let found = state.destination(meta)?;
+            if !state.waits_for_queued(&found.1, meta.is_directory) {
+                return Ok(found);
+            }
+        }
+        self.queue.wait();
+        // A failure held what is queued behind it: what opening would find isn't settled.
+        self.publish_failure()?;
+        self.queue.state().destination(meta)
+    }
+
+    /// The time to give a published file, if any.
+    fn modified_time(&self, meta: &crate::ExtractedEntryMeta) -> Option<SystemTime> {
+        if !self.restore_times {
+            return None;
+        }
+        meta.modified
+            .and_then(|time| SystemTime::try_from(time).ok())
+    }
+
+    fn claim(&mut self, destination: &Path, meta: &crate::ExtractedEntryMeta) -> crate::Result<()> {
+        if self.flatten {
+            let relative = destination
+                .strip_prefix(self.out_dir)
+                .expect("checked output path is under the output directory");
+            return self
+                .flat_names
+                .claim(relative, &meta.name, self.overwrite)
+                .map_err(|error| refused_output(error, &meta.name));
+        }
+        if self.overwrite == OverwritePolicy::Rename
+            && !meta.is_directory
+            && !self.rename_claims.insert(destination.to_path_buf())
+        {
+            return Err(crate::Error::InvalidHeader(
+                "multiple archive entries map to the same output path",
+            ));
+        }
+        if self.encoding.is_some() {
+            let repeated = || {
+                Err(crate::Error::InvalidArgument(
+                    "multiple entries map to the same decoded output path",
+                ))
+            };
+            if self.unsettled_paths.holds(self.relative(destination)) {
+                return repeated();
+            }
+            if self.queue.state().is_queued(destination) {
+                self.queue.wait();
+            }
+            if self.queue.state().is_published(destination) {
+                return repeated();
+            }
+        }
+        Ok(())
+    }
+
+    /// What `<destination> already exists` says when `Never` refuses it.
+    fn already_exists(&self, destination: &Path) -> io::Error {
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "{} already exists{}",
+                destination.display(),
+                self.exists_hint
+            ),
+        )
+    }
+
+    /// Opens a file or directory member's output. The library has verified
+    /// the previous member by the time it asks for another output.
+    pub fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>> {
+        self.go_on();
+        self.publish_previous()?;
+        if self.flatten && meta.is_directory {
+            return Ok(Box::new(io::sink()));
+        }
+        let (stored, destination, existing) = self.destination(meta)?;
+        self.claim(&destination, meta)?;
+        if meta.is_directory {
+            self.submit(Job::Directory {
+                meta: meta.clone(),
+                destination,
+            });
+            self.publish_failure()?;
+            return Ok(Box::new(io::sink()));
+        }
+        if self.overwrite == OverwritePolicy::Never && exists(&destination, existing.as_ref()) {
+            return Err(self.already_exists(&destination).into());
+        }
+        if self.in_place {
+            return self.open_in_place(stored, destination, meta);
+        }
+        Ok(self.open_staged(stored, destination, meta)?)
+    }
+
+    /// For [`Self::settle`]: opening can't read what members still unsettled will publish, so writing in place or flattened can't use it.
+    pub fn open_settled(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write + Send>> {
+        debug_assert!(!self.in_place && !self.flatten);
+        self.go_on();
+        let opened = self
+            .publish_failure()
+            .and_then(|()| self.open_unsettled(meta));
+        let (writer, unsettled) = match opened {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.unsettled.push_back(Unsettled::Refused);
+                return Err(error);
+            }
+        };
+        let destination = match &unsettled {
+            Unsettled::Output { pending, .. } => Some((&pending.destination, false)),
+            Unsettled::Directory { destination, .. } => Some((destination, true)),
+            Unsettled::Refused => None,
+        };
+        if let Some((destination, directory)) = destination {
+            let relative = self.relative(destination);
+            self.unsettled_paths.add(relative, directory);
+        }
+        self.unsettled.push_back(unsettled);
+        Ok(writer)
+    }
+
+    fn open_unsettled(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<(Box<dyn Write + Send>, Unsettled)> {
+        let (stored, destination, existing) = self.destination(meta)?;
+        self.claim(&destination, meta)?;
+        if meta.is_directory {
+            let unsettled = Unsettled::Directory {
+                meta: meta.clone(),
+                destination,
+            };
+            return Ok((Box::new(io::sink()), unsettled));
+        }
+        if self.overwrite == OverwritePolicy::Never && exists(&destination, existing.as_ref()) {
+            return Err(self.already_exists(&destination).into());
+        }
+        let recheck = self
+            .unsettled_paths
+            .changes(self.relative(&destination), false);
+        let writer = self.open_staged(stored, destination, meta)?;
+        let pending = self.pending.take().expect("staged above");
+        Ok((writer, Unsettled::Output { pending, recheck }))
+    }
+
+    /// Queues or drops the oldest member from [`Self::open_settled`]. An error
+    /// is that member's own, or an earlier member's that failed to publish.
+    pub fn settle(&mut self, verified: bool) -> crate::Result<()> {
+        self.go_on();
+        let unsettled = self
+            .unsettled
+            .pop_front()
+            .expect("only members opened are settled");
+        match unsettled {
+            Unsettled::Refused => {}
+            Unsettled::Directory { meta, destination } => {
+                self.forget_unsettled(&destination, true);
+                if verified {
+                    self.submit(Job::Directory { meta, destination });
+                }
+            }
+            Unsettled::Output { pending, recheck } => {
+                self.forget_unsettled(&pending.destination, false);
+                if !verified {
+                    drop_staged(&pending);
+                    return self.publish_failure();
+                }
+                if recheck {
+                    let (_, destination, existing) = self.destination(&pending.meta)?;
+                    if self.overwrite == OverwritePolicy::Never
+                        && exists(&destination, existing.as_ref())
+                    {
+                        drop_staged(&pending);
+                        return Err(self.already_exists(&destination).into());
+                    }
+                }
+                self.submit(Job::Output(pending));
+            }
+        }
+        self.publish_failure()
+    }
+
+    fn forget_unsettled(&mut self, destination: &Path, directory: bool) {
+        let relative = self.relative(destination);
+        self.unsettled_paths.remove(relative, directory);
+    }
+
+    fn relative<'p>(&self, destination: &'p Path) -> &'p Path {
+        destination
+            .strip_prefix(self.out_dir)
+            .expect("checked output path is under the output directory")
+    }
+
+    /// Opens a member at its destination by the overwrite policy, never
+    /// following a symlink and never writing through a hard link or
+    /// anything but a regular file.
+    fn open_in_place(
+        &mut self,
+        stored: PathBuf,
+        destination: PathBuf,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write>> {
+        let parent = destination
+            .parent()
+            .expect("checked output path has a file name")
+            .to_path_buf();
+        let mut state = self.queue.state();
+        state.tree(true)?;
+        let overwrite = self.overwrite;
+        let state = &mut *state;
+        let (destination, writer, held): (_, Box<dyn Write>, _) = match &mut state.out_tree {
+            Some(tree) => {
+                let relative = destination
+                    .strip_prefix(self.out_dir)
+                    .expect("checked output path is under the output directory");
+                let (dir, _) = tree.parent_dir(relative).map_err(|error| {
+                    like_create_dir_all(refused_walk(error, &meta.name), &parent)
+                })?;
+                let name = relative.file_name().expect("output path has a name");
+                let (destination, file) = match overwrite {
+                    OverwritePolicy::Never => {
+                        let file = dir.create_file(name, 0o666)?;
+                        (destination, file)
+                    }
+                    OverwritePolicy::Rename => {
+                        dir.create_numbered(&destination, 0o666, &mut state.renames)?
+                    }
+                    OverwritePolicy::Always => {
+                        let opened = dir.open_in_place(name, 0o666)?;
+                        if opened.len > 0 {
+                            opened.file.set_len(0)?;
+                        }
+                        (destination, opened.file)
+                    }
+                };
+                let (writer, held) = HeldFile::new(file);
+                (destination, Box::new(writer), Some(held))
+            }
+            None => {
+                fs::create_dir_all(&parent)?;
+                // Creating the parents may have raced a symlink into place.
+                let (_, destination, _) = state.destination(meta)?;
+                let (destination, file) = crate::output_staging::open_in_place(
+                    &destination,
+                    overwrite,
+                    &mut state.renames,
+                )?;
+                (destination, Box::new(file), None)
+            }
+        };
+        self.pending = Some(PendingOutput {
+            staged: None,
+            staged_at: None,
+            time_set: None,
+            held,
+            stored,
+            destination,
+            meta: meta.clone(),
+            link_target: None,
+        });
+        Ok(writer)
+    }
+
+    /// Stages a member's file, to publish once it verifies.
+    fn open_staged(
+        &mut self,
+        stored: PathBuf,
+        destination: PathBuf,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write + Send>> {
+        if self.storage.is_none() {
+            self.storage = Some(self.queue.state().storage()?);
+        }
+        let storage = self.storage.as_ref().expect("made above");
+        if storage.files.is_none() {
+            let state = self.queue.state();
+            let staging = state.staging.as_ref().expect("made with the storage");
+            staging
+                .reject_alias(&destination)
+                .map_err(|error| refused_output(error, &meta.name))?;
+        } else if destination.starts_with(&storage.root) {
+            // Walked before the storage was there to refuse.
+            return Err(refused_output(
+                crate::Error::InvalidHeader("archive path conflicts with extraction storage"),
+                &meta.name,
+            ));
+        }
+        let index = self.staged.to_string();
+        let (staged, staged_at, file) = match &storage.files {
+            Some((dir, root)) => {
+                let name = std::ffi::OsString::from(index);
+                let file = dir.create_file(&name, 0o666)?;
+                (root.join(&name), Some((dir.clone(), name)), file)
+            }
+            None => {
+                let staged = storage.root.join(index);
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staged)?;
+                (staged, None, file)
+            }
+        };
+        self.staged += 1;
+        let modified = self.modified_time(meta);
+        let set = Arc::new(AtomicBool::new(false));
+        self.pending = Some(PendingOutput {
+            staged: Some(staged),
+            staged_at,
+            time_set: modified.is_some().then(|| Arc::clone(&set)),
+            held: None,
+            stored,
+            destination,
+            meta: meta.clone(),
+            link_target: None,
+        });
+        Ok(Box::new(StagedFile {
+            file,
+            modified,
+            set,
+        }))
+    }
+
+    /// Publishes the member written last, once it has verified.
+    pub fn publish_pending(&mut self) -> crate::Result<()> {
+        self.go_on();
+        self.publish_previous()
+    }
+
+    /// Queues the member written last, which has verified, and reports any failure to publish.
+    fn publish_previous(&mut self) -> crate::Result<()> {
+        let Some(pending) = self.pending.take() else {
+            return self.publish_failure();
+        };
+        // The library reports a failed member before it asks for the next output.
+        let failed = self.failed.is_some_and(|failed| {
+            let mut failed = failed.lock().expect("failed members lock poisoned");
+            let gone_past = failed.contains(&pending.meta.name);
+            failed.clear();
+            gone_past
+        });
+        if failed {
+            drop_staged(&pending);
+            return self.publish_failure();
+        }
+        if let Some(target) = pending.link_target {
+            let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
+            crate::output_links::check_legacy_symlink_target(
+                &pending.meta.name,
+                target.len() as u64,
+                Some(&target),
+            )?;
+            return self.link_after_queue(
+                &pending.meta,
+                ExtractedLink::Symlink {
+                    target: &target,
+                    directory: false,
+                },
+            );
+        }
+        self.submit(Job::Output(pending));
+        self.publish_failure()
+    }
+
+    /// Buffers a legacy symlink's target; the link is made once the target is verified.
+    pub fn open_legacy_link(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write>> {
+        self.go_on();
+        self.publish_previous()?;
+        let target = Arc::new(Mutex::new(Vec::new()));
+        self.pending = Some(PendingOutput {
+            staged: None,
+            staged_at: None,
+            time_set: None,
+            held: None,
+            stored: PathBuf::new(),
+            destination: PathBuf::new(),
+            meta: meta.clone(),
+            link_target: Some(Arc::clone(&target)),
+        });
+        Ok(Box::new(SharedBuffer(target)))
+    }
+
+    /// Creates a link member, or records it as skipped when it could lead
+    /// outside the directory.
+    pub fn link(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+        link: ExtractedLink<'_>,
+    ) -> crate::Result<()> {
+        self.go_on();
+        self.link_after_queue(meta, link)
+    }
+
+    /// A link finds what it names, and is made, once every earlier output is published.
+    fn link_after_queue(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+        link: ExtractedLink<'_>,
+    ) -> crate::Result<()> {
+        self.publish_previous()?;
+        self.queue.wait();
+        self.publish_failure()?;
+        let (stored, destination, existing) = self.queue.state().destination(meta)?;
+        let relative = destination
+            .strip_prefix(self.out_dir)
+            .expect("checked output path is under the output directory")
+            .to_path_buf();
+        let Some(target) = crate::output_links::link_target(
+            self.out_dir,
+            &relative,
+            meta,
+            link,
+            self.queue.state().family,
+            self.flatten,
+        )?
+        else {
+            self.skipped_links.push(SkippedLink {
+                name: meta.name.clone(),
+                target: link.target().to_vec(),
+            });
+            return Ok(());
+        };
+        self.claim(&destination, meta)?;
+        if !self.in_place
+            && self.overwrite == OverwritePolicy::Never
+            && exists(&destination, existing.as_ref())
+        {
+            return Err(self.already_exists(&destination).into());
+        }
+        let staged = (!self.in_place).then(|| self.staged.to_string());
+        self.staged += usize::from(staged.is_some());
+        self.queue
+            .state()
+            .make_link(meta, link, stored, &relative, &target, staged.as_deref())
+    }
+
+    /// A member still in flight when extraction failed never reaches its destination.
+    pub fn finish(mut self, result: crate::Result<()>) -> crate::Result<ExtractedDir> {
+        // Members not settled when extraction failed never verified.
+        for unsettled in std::mem::take(&mut self.unsettled) {
+            if let Unsettled::Output { pending, .. } = unsettled {
+                drop_staged(&pending);
+            }
+        }
+        let published = match &result {
+            Ok(()) => self.publish_pending(),
+            Err(error) => {
+                let verified = matches!(
+                    (failed_entry_name(error), &self.pending),
+                    (Some(failed), Some(pending)) if failed != pending.meta.name.as_slice()
+                );
+                if verified {
+                    // The extraction's own error wins over a failure to publish.
+                    let _ = self.publish_previous();
+                }
+                Ok(())
+            }
+        };
+        let Self {
+            queue,
+            flatten,
+            overwrite,
+            skipped_links,
+            ..
+        } = self;
+        // A run that ended on a failure handed on drops the outputs held behind it.
+        let (state, failures) = queue.finish();
+        let restored = match &state.times {
+            Some(times) => times.restore(),
+            None => Ok(()),
+        };
+        result?;
+        published?;
+        if let Some(failure) = failures.into_iter().next() {
+            return Err(failure);
+        }
+        restored?;
+        let mut paths = state.published.clone();
+        if flatten && overwrite == OverwritePolicy::Always {
+            // A member that replaced an earlier one is listed once, where it last landed.
+            let mut seen = HashSet::new();
+            paths.reverse();
+            paths.retain(|path| seen.insert(path.clone()));
+            paths.reverse();
+        }
+        Ok(ExtractedDir {
+            paths,
+            skipped_links,
+        })
+    }
+}
+
+impl Publishing {
     /// The output directory walked by descriptor, opened once it exists, or
     /// made first if `create`. `None` where the platform has no such walk.
     fn tree(&mut self, create: bool) -> crate::Result<Option<&mut OutputTree>> {
         if self.out_tree.is_none() && crate::output_tree::AVAILABLE {
             if create {
-                fs::create_dir_all(self.out_dir)?;
+                fs::create_dir_all(&self.out_dir)?;
             }
-            self.out_tree = OutputTree::open(self.out_dir)?;
+            self.out_tree = OutputTree::open(&self.out_dir)?;
         }
         Ok(self.out_tree.as_mut())
     }
@@ -148,6 +796,12 @@ impl<'a> DirOutputs<'a> {
         if let Some(tree) = &mut self.out_tree {
             tree.forget();
         }
+    }
+
+    fn relative<'p>(&self, destination: &'p Path) -> &'p Path {
+        destination
+            .strip_prefix(&self.out_dir)
+            .expect("checked output path is under the output directory")
     }
 
     /// Stored path for link lookups, and destination, which flattening
@@ -169,277 +823,86 @@ impl<'a> DirOutputs<'a> {
                 entry => Ok((stored, path, Some(entry))),
             };
         }
-        crate::filename::checked_output_path(self.out_dir, &relative).map_err(refuse)?;
+        crate::filename::checked_output_path(&self.out_dir, &relative).map_err(refuse)?;
         if let Some(staging) = &self.staging {
             staging.reject_alias(&path).map_err(refuse)?;
         }
         Ok((stored, path, None))
     }
 
-    /// The time to give a published file, if any.
-    fn modified_time(&self, meta: &crate::ExtractedEntryMeta) -> Option<std::time::SystemTime> {
-        self.times.as_ref()?;
-        meta.modified
-            .and_then(|time| std::time::SystemTime::try_from(time).ok())
+    /// Whether what opening finds at `destination` can still change as the outputs queued land.
+    fn waits_for_queued(&self, destination: &Path, directory: bool) -> bool {
+        self.queued.changes(self.relative(destination), directory)
     }
 
-    fn claim(&mut self, destination: &Path, meta: &crate::ExtractedEntryMeta) -> crate::Result<()> {
-        if self.flatten {
-            let relative = destination
-                .strip_prefix(self.out_dir)
-                .expect("checked output path is under the output directory");
-            return self
-                .flat_names
-                .claim(relative, &meta.name, self.overwrite)
-                .map_err(|error| refused_output(error, &meta.name));
-        }
-        if self.overwrite == OverwritePolicy::Rename
-            && !meta.is_directory
-            && !self.rename_claims.insert(destination.to_path_buf())
-        {
-            return Err(crate::Error::InvalidHeader(
-                "multiple archive entries map to the same output path",
-            ));
-        }
-        if self.encoding.is_some() && self.published.iter().any(|path| path == destination) {
-            return Err(crate::Error::InvalidArgument(
-                "multiple entries map to the same decoded output path",
-            ));
-        }
-        Ok(())
+    fn is_published(&self, destination: &Path) -> bool {
+        self.published.iter().any(|path| path == destination)
     }
 
-    /// What `<destination> already exists` says when `Never` refuses it.
-    fn already_exists(&self, destination: &Path) -> io::Error {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!(
-                "{} already exists{}",
-                destination.display(),
-                self.exists_hint
-            ),
-        )
+    fn is_queued(&self, destination: &Path) -> bool {
+        self.queued.holds(self.relative(destination))
     }
 
-    /// Opens a file or directory member's output. The library has verified
-    /// the previous member by the time it asks for another output.
-    pub fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>> {
-        self.publish_pending()?;
-        if self.flatten && meta.is_directory {
-            return Ok(Box::new(io::sink()));
+    fn note_queued(&mut self, destination: &Path, directory: bool) {
+        let relative = self.relative(destination).to_path_buf();
+        self.queued.add(&relative, directory);
+    }
+
+    fn note_published(&mut self, destination: &Path, directory: bool) {
+        let relative = self.relative(destination).to_path_buf();
+        self.queued.remove(&relative, directory);
+    }
+
+    /// Makes the staging storage. Where the output directory is walked by
+    /// descriptor, so is the storage, and the walks refuse it.
+    fn storage(&mut self) -> crate::Result<Storage> {
+        if let Some(storage) = &self.storage {
+            return Ok(storage.clone());
         }
-        let (stored, destination, existing) = self.destination(meta)?;
-        self.claim(&destination, meta)?;
-        if meta.is_directory {
-            self.create_directory(&destination, existing.as_ref(), &meta.name)?;
-            self.record_published(stored, destination, meta, true);
-            return Ok(Box::new(io::sink()));
+        let staging = ExtractionStaging::new(&self.out_dir)?;
+        let mut files = None;
+        if let Some(tree) = self.tree(false)? {
+            if let Some(mut storage) = OutputTree::open(&staging.root)? {
+                tree.forbid(storage.identity());
+                let dir = storage.file_dir(Path::new(STAGED_FILES))?;
+                files = Some((dir, staging.root.join(STAGED_FILES)));
+            }
         }
-        let exists = match &existing {
-            Some(entry) => *entry != TreeEntry::Missing,
-            None => fs::symlink_metadata(&destination).is_ok(),
+        let storage = Storage {
+            root: staging.root.clone(),
+            files,
         };
-        if self.overwrite == OverwritePolicy::Never && exists {
-            return Err(self.already_exists(&destination).into());
-        }
-        if self.in_place {
-            return self.open_in_place(stored, destination, meta);
-        }
-        self.open_staged(stored, destination, meta)
+        self.staging = Some(staging);
+        self.storage = Some(storage.clone());
+        Ok(storage)
     }
 
     /// Makes a directory member, and any missing parents.
-    fn create_directory(
-        &mut self,
-        destination: &Path,
-        existing: Option<&TreeEntry>,
-        name: &[u8],
-    ) -> crate::Result<()> {
-        let relative = destination
-            .strip_prefix(self.out_dir)
-            .expect("checked output path is under the output directory");
+    fn create_directory(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<()> {
+        // A symlink may have been linked into the way since it opened.
+        let (stored, destination, existing) = self.destination(meta)?;
         if matches!(existing, Some(TreeEntry::Other(_))) {
             // What `create_dir_all` says of a file in the way.
             return Err(file_in_the_way().into());
         }
+        let relative = self.relative(&destination).to_path_buf();
         match self.tree(true)? {
             Some(tree) => {
-                tree.create_dirs(relative)
-                    .map_err(|error| like_create_dir_all(refused_walk(error, name), destination))?;
+                tree.create_dirs(&relative).map_err(|error| {
+                    like_create_dir_all(refused_walk(error, &meta.name), &destination)
+                })?;
             }
-            None => fs::create_dir_all(destination)?,
+            None => fs::create_dir_all(&destination)?,
         }
+        self.record_published(stored, destination, meta, true);
         Ok(())
     }
 
-    /// Opens a member at its destination by the overwrite policy, never
-    /// following a symlink and never writing through a hard link or
-    /// anything but a regular file.
-    fn open_in_place(
-        &mut self,
-        stored: PathBuf,
-        destination: PathBuf,
-        meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write>> {
-        let parent = destination
-            .parent()
-            .expect("checked output path has a file name")
-            .to_path_buf();
-        self.tree(true)?;
-        let (destination, writer, held): (_, Box<dyn Write>, _) = match &mut self.out_tree {
-            Some(tree) => {
-                let relative = destination
-                    .strip_prefix(self.out_dir)
-                    .expect("checked output path is under the output directory");
-                let (dir, _) = tree.parent_dir(relative).map_err(|error| {
-                    like_create_dir_all(refused_walk(error, &meta.name), &parent)
-                })?;
-                let name = relative.file_name().expect("output path has a name");
-                let (destination, file) = match self.overwrite {
-                    OverwritePolicy::Never => {
-                        let file = dir.create_file(name, 0o666)?;
-                        (destination, file)
-                    }
-                    OverwritePolicy::Rename => {
-                        dir.create_numbered(&destination, 0o666, &mut self.renames)?
-                    }
-                    OverwritePolicy::Always => {
-                        let opened = dir.open_in_place(name, 0o666)?;
-                        if opened.len > 0 {
-                            opened.file.set_len(0)?;
-                        }
-                        (destination, opened.file)
-                    }
-                };
-                let (writer, held) = HeldFile::new(file);
-                (destination, Box::new(writer), Some(held))
-            }
-            None => {
-                fs::create_dir_all(&parent)?;
-                // Creating the parents may have raced a symlink into place.
-                let (_, destination, _) = self.destination(meta)?;
-                let (destination, file) = crate::output_staging::open_in_place(
-                    &destination,
-                    self.overwrite,
-                    &mut self.renames,
-                )?;
-                (destination, Box::new(file), None)
-            }
-        };
-        self.pending = Some(PendingOutput {
-            staged: None,
-            staged_at: None,
-            held,
-            stored,
-            destination,
-            meta: meta.clone(),
-            link_target: None,
-        });
-        Ok(writer)
-    }
-
-    /// The staging storage, made on first use. Where the output directory is
-    /// walked by descriptor, so is the storage, and the walks refuse it.
-    fn staging(&mut self) -> crate::Result<&ExtractionStaging> {
-        if self.staging.is_none() {
-            let staging = ExtractionStaging::new(self.out_dir)?;
-            if let Some(tree) = self.tree(false)? {
-                if let Some(mut storage) = OutputTree::open(&staging.root)? {
-                    tree.forbid(storage.identity());
-                    let files = storage.file_dir(Path::new(STAGED_FILES))?;
-                    self.staged_files = Some((files, staging.root.join(STAGED_FILES)));
-                }
-            }
-            self.staging = Some(staging);
-        }
-        Ok(self.staging.as_ref().expect("made above"))
-    }
-
-    /// Stages a member's file, to publish once it verifies.
-    fn open_staged(
-        &mut self,
-        stored: PathBuf,
-        destination: PathBuf,
-        meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write>> {
-        self.staging()?;
-        let staging = self.staging.as_ref().expect("made above");
-        if self.staged_files.is_none() {
-            staging
-                .reject_alias(&destination)
-                .map_err(|error| refused_output(error, &meta.name))?;
-        } else if destination.starts_with(&staging.root) {
-            // Walked before the storage was there to refuse.
-            return Err(refused_output(
-                crate::Error::InvalidHeader("archive path conflicts with extraction storage"),
-                &meta.name,
-            ));
-        }
-        let index = self.staged.to_string();
-        let (staged, staged_at, file) = match &self.staged_files {
-            Some((dir, root)) => {
-                let name = std::ffi::OsString::from(index);
-                let file = dir.create_file(&name, 0o666)?;
-                (root.join(&name), Some((dir.clone(), name)), file)
-            }
-            None => {
-                let staged = staging.root.join(index);
-                let file = fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(&staged)?;
-                (staged, None, file)
-            }
-        };
-        self.staged += 1;
-        self.pending = Some(PendingOutput {
-            staged: Some(staged),
-            staged_at,
-            held: None,
-            stored,
-            destination,
-            meta: meta.clone(),
-            link_target: None,
-        });
-        Ok(Box::new(file))
-    }
-
-    /// Publishes the member written last, once it has verified.
-    pub fn publish_pending(&mut self) -> crate::Result<()> {
-        let Some(pending) = self.pending.take() else {
-            return Ok(());
-        };
-        // The library reports a failed member before it asks for the next output.
-        let failed = self.failed.is_some_and(|failed| {
-            let mut failed = failed.lock().expect("failed members lock poisoned");
-            let gone_past = failed.contains(&pending.meta.name);
-            failed.clear();
-            gone_past
-        });
-        if failed {
-            if let Some(staged) = &pending.staged {
-                let _ = fs::remove_file(staged);
-            }
-            return Ok(());
-        }
-        if let Some(target) = pending.link_target {
-            let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
-            crate::output_links::check_legacy_symlink_target(
-                &pending.meta.name,
-                target.len() as u64,
-                Some(&target),
-            )?;
-            return self.link(
-                &pending.meta,
-                ExtractedLink::Symlink {
-                    target: &target,
-                    directory: false,
-                },
-            );
-        }
+    fn publish_output(&mut self, pending: PendingOutput) -> crate::Result<()> {
         let Some(staged) = &pending.staged else {
             // Written in place: by descriptor, its time goes on through its own.
-            let later = match (&pending.held, self.modified_time(&pending.meta)) {
+            let modified = self.modified_time(&pending.meta);
+            let later = match (&pending.held, modified) {
                 (Some(held), Some(modified)) => !held
                     .get()
                     .is_some_and(|file| file.set_modified(modified).is_ok()),
@@ -448,9 +911,15 @@ impl<'a> DirOutputs<'a> {
             self.record_published(pending.stored, pending.destination, &pending.meta, later);
             return Ok(());
         };
+        let time_set = pending
+            .time_set
+            .as_ref()
+            .is_some_and(|set| set.load(Ordering::Acquire));
         if let Some((dir, name)) = &pending.staged_at {
-            if let Some(published) = self.publish_by_descriptor(&pending, dir, name)? {
-                self.record_published(pending.stored, published.0, &pending.meta, published.1);
+            if let Some((published, later)) =
+                self.publish_by_descriptor(&pending, dir, name, time_set)?
+            {
+                self.record_published(pending.stored, published, &pending.meta, later);
                 return Ok(());
             }
             // The filesystem can't rename it into place: publish it by path.
@@ -471,8 +940,14 @@ impl<'a> DirOutputs<'a> {
             None,
             &mut self.renames,
         )?;
-        self.record_published(pending.stored, destination, &pending.meta, true);
+        self.record_published(pending.stored, destination, &pending.meta, !time_set);
         Ok(())
+    }
+
+    fn modified_time(&self, meta: &crate::ExtractedEntryMeta) -> Option<SystemTime> {
+        self.times.as_ref()?;
+        meta.modified
+            .and_then(|time| SystemTime::try_from(time).ok())
     }
 
     /// Publishes a file staged by descriptor, renaming it from the storage
@@ -484,15 +959,14 @@ impl<'a> DirOutputs<'a> {
         pending: &PendingOutput,
         dir: &FileDir,
         name: &std::ffi::OsStr,
+        time_set: bool,
     ) -> crate::Result<Option<(PathBuf, bool)>> {
         let later = match self.modified_time(&pending.meta) {
+            Some(_) if time_set => false,
             Some(modified) => dir.set_metadata(name, Some(modified), None).is_err(),
             None => true,
         };
-        let relative = pending
-            .destination
-            .strip_prefix(self.out_dir)
-            .expect("checked output path is under the output directory");
+        let relative = self.relative(&pending.destination).to_path_buf();
         let parent = pending
             .destination
             .parent()
@@ -505,7 +979,7 @@ impl<'a> DirOutputs<'a> {
             .publish(
                 name,
                 tree,
-                relative,
+                &relative,
                 &pending.destination,
                 self.overwrite,
                 &mut self.renames,
@@ -516,59 +990,21 @@ impl<'a> DirOutputs<'a> {
         Ok(published.map(|published| (published, later)))
     }
 
-    /// Buffers a legacy symlink's target; the link is made once the target is verified.
-    pub fn open_legacy_link(
-        &mut self,
-        meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write>> {
-        self.publish_pending()?;
-        let target = Arc::new(Mutex::new(Vec::new()));
-        self.pending = Some(PendingOutput {
-            staged: None,
-            staged_at: None,
-            held: None,
-            stored: PathBuf::new(),
-            destination: PathBuf::new(),
-            meta: meta.clone(),
-            link_target: Some(Arc::clone(&target)),
-        });
-        Ok(Box::new(SharedBuffer(target)))
-    }
-
-    /// Creates a link member, or records it as skipped when it could lead
-    /// outside the directory.
-    pub fn link(
+    /// Makes a link at `relative`, in place, or staged as `staged` and then published.
+    fn make_link(
         &mut self,
         meta: &crate::ExtractedEntryMeta,
         link: ExtractedLink<'_>,
+        stored: PathBuf,
+        relative: &Path,
+        target: &Path,
+        staged: Option<&str>,
     ) -> crate::Result<()> {
-        self.publish_pending()?;
-        let (stored, destination, existing) = self.destination(meta)?;
-        let relative = destination
-            .strip_prefix(self.out_dir)
-            .expect("checked output path is under the output directory")
-            .to_path_buf();
-        let Some(target) = crate::output_links::link_target(
-            self.out_dir,
-            &relative,
-            meta,
-            link,
-            self.family,
-            self.flatten,
-        )?
-        else {
-            self.skipped_links.push(SkippedLink {
-                name: meta.name.clone(),
-                target: link.target().to_vec(),
-            });
-            return Ok(());
-        };
-        self.claim(&destination, meta)?;
-        if self.in_place {
+        let Some(staged) = staged else {
             let created = create_link_output(
-                self.out_dir,
-                &relative,
-                &target,
+                &self.out_dir,
+                relative,
+                target,
                 link,
                 self.overwrite,
                 &self.created,
@@ -579,31 +1015,24 @@ impl<'a> DirOutputs<'a> {
             let (path, file) = created?;
             self.record_published(stored, path, meta, file);
             return Ok(());
-        }
-        let exists = match &existing {
-            Some(entry) => *entry != TreeEntry::Missing,
-            None => fs::symlink_metadata(&destination).is_ok(),
         };
-        if self.overwrite == OverwritePolicy::Never && exists {
-            return Err(self.already_exists(&destination).into());
-        }
-        let root = self.staging()?.root.clone();
+        let root = self.storage()?.root;
         let (staged, file) = create_link_output(
             &root,
-            Path::new(&self.staged.to_string()),
-            &target,
+            Path::new(staged),
+            target,
             link,
             OverwritePolicy::Never,
             &self.created,
             &mut self.renames,
         )?;
-        self.staged += 1;
         let source = match link {
             ExtractedLink::HardLink { .. } => {
-                Some(link_source_path(&target, &self.created)?.to_path_buf())
+                Some(link_source_path(target, &self.created)?.to_path_buf())
             }
             _ => None,
         };
+        let destination = self.out_dir.join(relative);
         fs::create_dir_all(
             destination
                 .parent()
@@ -646,41 +1075,33 @@ impl<'a> DirOutputs<'a> {
         self.created.insert(stored, path.clone());
         self.published.push(path);
     }
+}
 
-    /// A member still in flight when extraction failed never reaches its destination.
-    pub fn finish(mut self, result: crate::Result<()>) -> crate::Result<ExtractedDir> {
-        let published = match result {
-            Ok(()) => self.publish_pending(),
-            Err(error) => {
-                let verified = matches!(
-                    (failed_entry_name(&error), &self.pending),
-                    (Some(failed), Some(pending)) if failed != pending.meta.name.as_slice()
-                );
-                if verified {
-                    // The extraction's own error wins over a failure to publish.
-                    let _ = self.publish_pending();
-                }
-                Err(error)
-            }
+impl PublishStep for Publishing {
+    type Job = Job;
+
+    fn publish(&mut self, job: Job) -> crate::Result<()> {
+        let (destination, directory) = job.destination();
+        let (destination, directory) = (destination.to_path_buf(), directory);
+        let published = match job {
+            Job::Output(pending) => self.publish_output(pending),
+            Job::Directory { meta, .. } => self.create_directory(&meta),
         };
-        let restored = match &self.times {
-            Some(times) => times.restore(),
-            None => Ok(()),
-        };
-        published?;
-        restored?;
-        let mut paths = std::mem::take(&mut self.published);
-        if self.flatten && self.overwrite == OverwritePolicy::Always {
-            // A member that replaced an earlier one is listed once, where it last landed.
-            let mut seen = HashSet::new();
-            paths.reverse();
-            paths.retain(|path| seen.insert(path.clone()));
-            paths.reverse();
-        }
-        Ok(ExtractedDir {
-            paths,
-            skipped_links: std::mem::take(&mut self.skipped_links),
-        })
+        self.note_published(&destination, directory);
+        published
+    }
+}
+
+fn exists(destination: &Path, existing: Option<&TreeEntry>) -> bool {
+    match existing {
+        Some(entry) => *entry != TreeEntry::Missing,
+        None => fs::symlink_metadata(destination).is_ok(),
+    }
+}
+
+fn drop_staged(pending: &PendingOutput) {
+    if let Some(staged) = &pending.staged {
+        let _ = fs::remove_file(staged);
     }
 }
 
@@ -777,3 +1198,7 @@ fn like_create_dir_all(error: crate::Error, directory: &Path) -> crate::Error {
     let _ = directory;
     error
 }
+
+#[cfg(test)]
+#[path = "output_dir_tests.rs"]
+mod tests;

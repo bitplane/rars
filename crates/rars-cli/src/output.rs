@@ -623,14 +623,16 @@ mod tests {
         let result = state.open_entry(&rars::ExtractedEntryMeta::new(name, None, 0, false));
         if aliases_storage {
             assert!(matches!(
-                result,
+                &result,
                 Err(Error::InvalidHeader(
                     "archive path conflicts with extraction storage"
                 ))
             ));
-            // The earlier member was published before the alias was refused,
+            // The earlier member is published as the run ends at the refusal,
             // leaving nothing staged, only perhaps the empty directory files
             // stage in.
+            let error = result.err().unwrap();
+            state.publish_before_failure(&error).unwrap();
             let staged: Vec<_> = fs::read_dir(&storage)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())

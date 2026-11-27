@@ -2016,6 +2016,10 @@ where
     // As with unrar, a later member on the same path replaces an earlier one,
     // as `-ap` can make happen.
     state.allow_overwrite_repeats();
+    if policy == OverwritePolicy::Rename {
+        // A renamed member's line ends as it is published.
+        state.publish_on_calling_thread();
+    }
     let published = Arc::clone(progress);
     state.report_to(Box::new(move |output: &ExtractedOutput| {
         published.published(&output.meta.name, &output.path);
@@ -2118,6 +2122,7 @@ where
             Ok(())
         },
     );
+    let result = result.and_then(|()| state.borrow_mut().queued_failure());
     state.borrow_mut().discard_failed(&failures.take_failed());
     if let Err(error) = result {
         let _ = state.borrow_mut().publish_before_failure(&error);
