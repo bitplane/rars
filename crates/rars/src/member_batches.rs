@@ -7,7 +7,7 @@
 //! archive, and inline members leave the worker pool idle for any parallelism
 //! inside their own decode.
 
-use crate::codec::workspace::{coordinator, Budget, Buffer, Limited};
+use crate::codec::workspace::{coordinator, Buffer, Limited};
 use crate::read_control::ReadControl;
 use crate::{Error, Result};
 use std::io::Write;
@@ -69,19 +69,19 @@ fn flush<T: Copy, C: ?Sized>(
 }
 
 /// What a worker hands back for in-order publication.
-pub(crate) enum Decoded<M, B: Budget> {
+pub(crate) enum Decoded<M> {
     /// Nothing to publish, such as a redirection that is not extracted.
     Nothing,
     /// Published by opening its writer: a directory, or a verified member.
     Opened(M),
     /// Decoded output, written once the members before it are published.
-    File { meta: M, data: Buffer<u8, B> },
+    File { meta: M, data: Buffer<u8> },
 }
 
 /// Publishes one worker result through `open`. `divert` can take a file's
 /// output instead, as legacy symbolic links do; it returns whether it did.
-pub(crate) fn publish<M, B: Budget>(
-    entry: Decoded<M, B>,
+pub(crate) fn publish<M>(
+    entry: Decoded<M>,
     open: &mut impl FnMut(&M) -> Result<Box<dyn Write>>,
     control: &ReadControl,
     name: impl Fn(&M) -> &[u8],
@@ -108,31 +108,6 @@ pub(crate) fn publish<M, B: Budget>(
     control.check()
 }
 
-/// A workspace policy the driver can schedule worker batches under. Each
-/// worker decodes with the allowance it is handed.
-pub(crate) trait Workers: Budget<Charge: Send> + Sync {
-    /// Decodes `members` on workers and publishes them in archive order. The
-    /// members ahead of a failure are published before it returns. Returns how
-    /// many were published: fewer than all means the next was refused within
-    /// a worker's share of a limited workspace.
-    /// `capacity` bounds an unlimited batch's planned cost, which a member
-    /// holds until it is published, or with `retained` false only while it
-    /// decodes; a limited workspace instead admits each batch by `hint`
-    /// against its ledger.
-    #[allow(clippy::too_many_arguments)]
-    fn batches<T: Copy + Send, O: Send, C: ?Sized>(
-        &self,
-        members: &[(T, u64)],
-        capacity: u64,
-        retained: bool,
-        ctx: &mut C,
-        hint: impl Fn(T) -> u64,
-        check: impl Fn() -> Result<()> + Sync,
-        decode: impl Fn(T, &Self) -> Result<O> + Sync + Send,
-        publish: impl FnMut(&mut C, O) -> Result<()>,
-    ) -> Result<usize>;
-}
-
 /// Workspace, by the members' hints, that the members an unlimited policy has
 /// running may hold together: 1 GiB, or a quarter of the memory this process
 /// may use when that is less. Sequential extraction holds one member's; this
@@ -147,15 +122,24 @@ fn scaled_running_workspace(physical: Option<u64>) -> u64 {
     physical.map_or(CEILING, |total| CEILING.min(total / 4))
 }
 
-/// A limited workspace admits each member by `hint` against its ledger.
-///
-/// Unlimited: at most one member per worker. Members start as soon as there is room, not
-/// a batch at a time, so a slow member holds back only the publication of
-/// those after it. The results not yet published hold at most `capacity`
-/// bytes of cost, and the running members [`running_workspace`] by their
-/// hints; a member over either waits until that one is empty.
-impl Workers for Limited {
-    fn batches<T: Copy + Send, O: Send, C: ?Sized>(
+impl Limited {
+    /// Decodes `members` on workers and publishes them in archive order. The
+    /// members ahead of a failure are published before it returns. Returns how
+    /// many were published: fewer than all means the next was refused within
+    /// a worker's share of a limited workspace.
+    /// `capacity` bounds an unlimited batch's planned cost, which a member
+    /// holds until it is published, or with `retained` false only while it
+    /// decodes; a limited workspace instead admits each batch by `hint`
+    /// against its ledger.
+    ///
+    /// Unlimited, at most one member runs per worker. Members start as soon
+    /// as there is room, not a batch at a time, so a slow member holds back
+    /// only the publication of those after it. The results not yet published
+    /// hold at most `capacity` bytes of cost, and the running members
+    /// [`running_workspace`] by their hints; a member over either waits until
+    /// that one is empty.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn batches<T: Copy + Send, O: Send, C: ?Sized>(
         &self,
         members: &[(T, u64)],
         capacity: u64,

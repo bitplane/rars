@@ -21,7 +21,7 @@
 //! wins. Only that full comparison is sure never to come out larger than
 //! leaving the data alone.
 
-use crate::codec::workspace::{Allowance, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Buffer};
 use crate::{FilterKind, FilterSpec, Result};
 use std::ops::Range;
 
@@ -229,16 +229,15 @@ pub(crate) trait FilterSearch {
     ) -> Result<Vec<u8>>;
 }
 
-pub(crate) type FilterChoice<B> = (Buffer<FilterSpec, B>, Buffer<u8, B>);
-type Finalist<B> = (Buffer<FilterSpec, B>, Option<Buffer<u8, B>>);
-type TableRegions<B> = Buffer<(Range<usize>, usize), B>;
+pub(crate) type FilterChoice = (Buffer<FilterSpec>, Buffer<u8>);
+type Finalist = (Buffer<FilterSpec>, Option<Buffer<u8>>);
+type TableRegions = Buffer<(Range<usize>, usize)>;
 
 /// Search owners cannot detach bounded byte storage while candidates compete.
 pub(crate) trait OwnedSearch {
     type Options: Copy + PartialEq + Send + Sync;
-    type Memory: Budget;
-    fn allowance(&self) -> &Self::Memory;
-    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>>;
+    fn allowance(&self) -> &Allowance;
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind>>;
     fn detects_x86(&self) -> bool;
     /// Whether to measure the E8-only filter wherever the x86 screen keeps
     /// code, rather than only where a sample says the jumps cost more. See
@@ -278,18 +277,14 @@ pub(crate) trait OwnedSearch {
     fn estimates(&self) -> bool {
         false
     }
-    fn filtered_bytes(
-        &self,
-        data: &[u8],
-        filters: &[FilterSpec],
-    ) -> Result<Buffer<u8, Self::Memory>>;
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>>;
     /// See [`FilterSearch::filtered_window`], and the same default.
     fn filtered_window(
         &self,
         data: &[u8],
         offset: usize,
         filters: &[FilterSpec],
-    ) -> Result<Buffer<u8, Self::Memory>> {
+    ) -> Result<Buffer<u8>> {
         let mut padded = Buffer::filled(offset + data.len(), 0, self.allowance())?;
         padded[offset..].copy_from_slice(data);
         let filters = Buffer::collect(
@@ -308,14 +303,14 @@ pub(crate) trait OwnedSearch {
         data: &[u8],
         options: Self::Options,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, Self::Memory>>;
+    ) -> Result<Buffer<u8>>;
     fn encode_filtered(
         &self,
         data: &[u8],
         filters: &[FilterSpec],
         options: Self::Options,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, Self::Memory>>;
+    ) -> Result<Buffer<u8>>;
     /// `job(self, index)` for each index below `count`, in index order. The
     /// jobs are encodes that do not depend on one another, none of them
     /// longer than `longest` bytes. A failure is the lowest failing index's,
@@ -335,7 +330,6 @@ pub(crate) trait OwnedSearch {
 struct UnlimitedSearch<'a, S>(&'a S, Allowance);
 impl<S: FilterSearch> OwnedSearch for UnlimitedSearch<'_, S> {
     type Options = S::Options;
-    type Memory = Allowance;
     fn allowance(&self) -> &Allowance {
         &self.1
     }
@@ -446,11 +440,10 @@ impl<S: OwnedSearch> Reporting<'_, '_, S> {
 }
 impl<S: OwnedSearch> OwnedSearch for Reporting<'_, '_, S> {
     type Options = S::Options;
-    type Memory = S::Memory;
-    fn allowance(&self) -> &Self::Memory {
+    fn allowance(&self) -> &Allowance {
         self.search.allowance()
     }
-    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, S::Memory>> {
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind>> {
         self.search.screened_kinds(data)
     }
     fn detects_x86(&self) -> bool {
@@ -480,7 +473,7 @@ impl<S: OwnedSearch> OwnedSearch for Reporting<'_, '_, S> {
     fn estimates(&self) -> bool {
         self.search.estimates()
     }
-    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>> {
         self.search.filtered_bytes(data, filters)
     }
     fn filtered_window(
@@ -488,7 +481,7 @@ impl<S: OwnedSearch> OwnedSearch for Reporting<'_, '_, S> {
         data: &[u8],
         offset: usize,
         filters: &[FilterSpec],
-    ) -> Result<Buffer<u8, S::Memory>> {
+    ) -> Result<Buffer<u8>> {
         self.search.filtered_window(data, offset, filters)
     }
     fn encode_plain(
@@ -496,7 +489,7 @@ impl<S: OwnedSearch> OwnedSearch for Reporting<'_, '_, S> {
         data: &[u8],
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, S::Memory>> {
+    ) -> Result<Buffer<u8>> {
         self.pass(|progress| self.search.encode_plain(data, options, progress))
     }
     fn encode_filtered(
@@ -505,7 +498,7 @@ impl<S: OwnedSearch> OwnedSearch for Reporting<'_, '_, S> {
         filters: &[FilterSpec],
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, S::Memory>> {
+    ) -> Result<Buffer<u8>> {
         self.pass(|progress| {
             self.search
                 .encode_filtered(data, filters, options, progress)
@@ -684,7 +677,7 @@ fn filtered_sample<S: OwnedSearch>(
     data: &[u8],
     sample: Range<usize>,
     kind: FilterKind,
-) -> Result<Buffer<u8, S::Memory>> {
+) -> Result<Buffer<u8>> {
     search.filtered_window(
         &data[sample.clone()],
         sample.start,
@@ -693,20 +686,20 @@ fn filtered_sample<S: OwnedSearch>(
 }
 
 /// What the screen made of one filter kind.
-struct ScreenedKind<B: Budget> {
+struct ScreenedKind {
     kind: FilterKind,
     /// The bytes, when the screen encoded the whole member the way the writer
     /// would write it, so the search can take this as its measurement.
-    measured: Option<Buffer<u8, B>>,
+    measured: Option<Buffer<u8>>,
     /// Whether it beat leaving the data alone by enough to be worth spending
     /// another encode on a narrower range of the same filter.
     worth_a_range: bool,
 }
 
 /// What the screen learned, along with any encodes the search can reuse.
-struct ScreenOutcome<B: Budget> {
-    kinds: Buffer<ScreenedKind<B>, B>,
-    plain: Option<Buffer<u8, B>>,
+struct ScreenOutcome {
+    kinds: Buffer<ScreenedKind>,
+    plain: Option<Buffer<u8>>,
 }
 
 /// Which of the detectorless filters shrink a sample of the member.
@@ -727,7 +720,7 @@ fn screen_kinds<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<ScreenOutcome<S::Memory>> {
+) -> Result<ScreenOutcome> {
     let sample = screen_sample(data);
     let mut outcome = ScreenOutcome {
         kinds: Buffer::new(search.allowance()),
@@ -839,7 +832,7 @@ fn screen_kinds<S: OwnedSearch>(
 }
 
 /// Where the scanner thinks x86 code lives, merged into disjoint regions.
-fn x86_code_regions<B: Budget>(data: &[u8], allowance: &B) -> Result<Buffer<Range<usize>, B>> {
+fn x86_code_regions(data: &[u8], allowance: &Allowance) -> Result<Buffer<Range<usize>>> {
     disjoint_ranges(crate::x86_filter_scan::ranges_with_allowance(
         data, true, allowance,
     )?)
@@ -881,7 +874,7 @@ fn x86_screened_regions<S: OwnedSearch>(
     data: &[u8],
     regions: &[Range<usize>],
     options: S::Options,
-) -> Result<X86Screen<S::Memory>> {
+) -> Result<X86Screen> {
     // At the screens' settings, unless the search is exhaustive. A tar of
     // `/usr` has a region for nearly every file, and at the caller's settings
     // every sample would go through the shortest-path parse.
@@ -1022,7 +1015,7 @@ fn x86_counted_regions<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     regions: &[Range<usize>],
-) -> Result<X86Screen<S::Memory>> {
+) -> Result<X86Screen> {
     let mut kept = Buffer::new(search.allowance());
     let pays = |gain: i64, opcodes: usize| {
         gain > 0 && gain.unsigned_abs() as usize * X86_REPEAT_GAIN_SHARE >= opcodes
@@ -1082,9 +1075,9 @@ fn x86_region_samples(
 }
 
 /// What the x86 screen made of the regions the scanner proposed.
-struct X86Screen<B: Budget> {
+struct X86Screen {
     /// The regions worth filtering, empty when none of them is.
-    kept: Buffer<Range<usize>, B>,
+    kept: Buffer<Range<usize>>,
     /// Whether any region came out bigger under the filter, which rules out
     /// filtering the member end to end.
     rejected_a_region: bool,
@@ -1116,10 +1109,7 @@ struct X86Screen<B: Budget> {
 /// And usually one kind rather than two, because the screen has already asked
 /// whether the jump opcodes are worth converting. That takes an unstripped
 /// binary from five whole-member encodes to two.
-fn x86_finalists<B: Budget>(
-    data: &[u8],
-    screen: &X86Screen<B>,
-) -> Result<Buffer<Buffer<FilterSpec, B>, B>> {
+fn x86_finalists(data: &[u8], screen: &X86Screen) -> Result<Buffer<Buffer<FilterSpec>>> {
     let allowance = screen.kept.allowance();
     let regions = &screen.kept;
     let covered: usize = regions.iter().map(|range| range.len()).sum();
@@ -1213,16 +1203,16 @@ fn stride_hits(window: &[u8], max_stride: usize) -> [usize; MAX_TABLE_STRIDE + 1
 /// is a few hundred kilobytes of 24-byte records inside a binary that delta
 /// with stride 24 nearly halves, while the same filter over the whole member
 /// is a disaster. The filter has to cover the table and stop.
-fn table_regions<B: Budget>(
+fn table_regions(
     data: &[u8],
     max_stride: usize,
     scan_window: usize,
-    allowance: &B,
-) -> Result<Buffer<(Range<usize>, usize), B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<(Range<usize>, usize)>> {
     let max_stride = max_stride.min(MAX_TABLE_STRIDE);
     // A window has to hold more than a stride's worth of bytes to be scored.
     let scan_window = scan_window.max(2 * MAX_TABLE_STRIDE);
-    let mut regions: Buffer<(Range<usize>, usize), B> = Buffer::new(allowance);
+    let mut regions: Buffer<(Range<usize>, usize)> = Buffer::new(allowance);
     for start in (0..).map(|window| window * scan_window) {
         let Some(window) = data.get(start..start + scan_window) else {
             break;
@@ -1293,7 +1283,7 @@ fn table_screened_regions<S: OwnedSearch>(
     data: &[u8],
     regions: &[(Range<usize>, usize)],
     options: S::Options,
-) -> Result<TableRegions<S::Memory>> {
+) -> Result<TableRegions> {
     let screen_options = search.screen_options(options);
     let sampled = Buffer::collect(
         regions
@@ -1331,11 +1321,11 @@ fn table_screened_regions<S: OwnedSearch>(
 
 /// `range` with the `removed` ranges cut out of it. `removed` must be sorted
 /// and disjoint.
-fn subtract_owned<B: Budget>(
+fn subtract_owned(
     range: Range<usize>,
     removed: &[Range<usize>],
-    allowance: &B,
-) -> Result<Buffer<Range<usize>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Range<usize>>> {
     let mut kept = Buffer::new(allowance);
     let mut start = range.start;
     for cut in removed {
@@ -1363,11 +1353,11 @@ fn subtract_owned<B: Budget>(
 /// The tables win where the two overlap. A verified table stride is worth tens
 /// of percent of its region where the x86 filter is worth a few. Grafting the
 /// tables into every finalist lets them ride with whichever x86 variant wins.
-fn graft_owned<B: Budget>(
-    specs: Buffer<FilterSpec, B>,
+fn graft_owned(
+    specs: Buffer<FilterSpec>,
     tables: &[(Range<usize>, usize)],
     member: usize,
-) -> Result<Buffer<FilterSpec, B>> {
+) -> Result<Buffer<FilterSpec>> {
     if tables.is_empty() {
         return Ok(specs);
     }
@@ -1413,10 +1403,10 @@ fn graft_owned<B: Budget>(
 fn tables_outside_code<S: OwnedSearch>(
     search: &S,
     data: &[u8],
-    tables: TableRegions<S::Memory>,
-    code: &X86Screen<S::Memory>,
+    tables: TableRegions,
+    code: &X86Screen,
     options: S::Options,
-) -> Result<TableRegions<S::Memory>> {
+) -> Result<TableRegions> {
     let screen_options = search.screen_options(options);
     let kind = if code.jumps_pay {
         FilterKind::E8E9
@@ -1472,7 +1462,7 @@ fn finalists<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<Buffer<Finalist<S::Memory>, S::Memory>> {
+) -> Result<Buffer<Finalist>> {
     let screen = screen_kinds(search, data, options)?;
     let allowance = search.allowance();
     let mut finalists = Buffer::collect([(Buffer::new(allowance), screen.plain)], allowance)?;
@@ -1537,7 +1527,7 @@ fn finalists<S: OwnedSearch>(
                         == right.range.as_ref().unwrap_or(&member)
             })
     };
-    let mut kept: Buffer<Finalist<S::Memory>, S::Memory> = Buffer::new(allowance);
+    let mut kept: Buffer<Finalist> = Buffer::new(allowance);
     for (specs, measured) in finalists {
         if kept.iter().any(|(earlier, _)| same(earlier, &specs)) {
             continue;
@@ -1607,7 +1597,7 @@ fn trial_size<S: OwnedSearch>(
     data: &[u8],
     specs: &[FilterSpec],
     trial_options: S::Options,
-    seen: &mut Buffer<(usize, u64, usize), S::Memory>,
+    seen: &mut Buffer<(usize, u64, usize)>,
 ) -> Result<usize> {
     let windows = Buffer::collect(trial_windows(data.len()), search.allowance())?;
     let known = &*seen;
@@ -1691,8 +1681,8 @@ fn trial_winner<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    finalists: &mut Buffer<Finalist<S::Memory>, S::Memory>,
-) -> Result<Option<Finalist<S::Memory>>> {
+    finalists: &mut Buffer<Finalist>,
+) -> Result<Option<Finalist>> {
     if finalists.len() <= 1 {
         return Ok(finalists.pop());
     }
@@ -1755,7 +1745,7 @@ fn ranked_finalists<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<Buffer<Finalist<S::Memory>, S::Memory>> {
+) -> Result<Buffer<Finalist>> {
     let mut finalists = finalists(search, data, options)?;
     Ok(match trial_winner(search, data, options, &mut finalists)? {
         Some(winner) => Buffer::collect([winner], search.allowance())?,
@@ -1944,11 +1934,10 @@ impl<S> SideBySideSearch<'_, '_, S> {
 
 impl<S: OwnedSearch + Sync> OwnedSearch for SideBySideSearch<'_, '_, S> {
     type Options = S::Options;
-    type Memory = S::Memory;
-    fn allowance(&self) -> &Self::Memory {
+    fn allowance(&self) -> &Allowance {
         self.search.allowance()
     }
-    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind, S::Memory>> {
+    fn screened_kinds(&self, data: &[u8]) -> Result<Buffer<FilterKind>> {
         self.search.screened_kinds(data)
     }
     fn detects_x86(&self) -> bool {
@@ -1978,7 +1967,7 @@ impl<S: OwnedSearch + Sync> OwnedSearch for SideBySideSearch<'_, '_, S> {
     fn estimates(&self) -> bool {
         self.search.estimates()
     }
-    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, S::Memory>> {
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>> {
         self.search.filtered_bytes(data, filters)
     }
     fn filtered_window(
@@ -1986,7 +1975,7 @@ impl<S: OwnedSearch + Sync> OwnedSearch for SideBySideSearch<'_, '_, S> {
         data: &[u8],
         offset: usize,
         filters: &[FilterSpec],
-    ) -> Result<Buffer<u8, S::Memory>> {
+    ) -> Result<Buffer<u8>> {
         self.search.filtered_window(data, offset, filters)
     }
     fn encode_plain(
@@ -1994,7 +1983,7 @@ impl<S: OwnedSearch + Sync> OwnedSearch for SideBySideSearch<'_, '_, S> {
         data: &[u8],
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, S::Memory>> {
+    ) -> Result<Buffer<u8>> {
         self.pass(|progress| self.search.encode_plain(data, options, progress))
     }
     fn encode_filtered(
@@ -2003,7 +1992,7 @@ impl<S: OwnedSearch + Sync> OwnedSearch for SideBySideSearch<'_, '_, S> {
         filters: &[FilterSpec],
         options: Self::Options,
         _: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, S::Memory>> {
+    ) -> Result<Buffer<u8>> {
         self.pass(|progress| {
             self.search
                 .encode_filtered(data, filters, options, progress)
@@ -2056,7 +2045,7 @@ fn side_by_side<'r, S>(
     data: &[u8],
     options: S::Options,
     admit: &(dyn Fn(usize) -> Option<Room<'r>> + Sync),
-) -> Result<FilterChoice<S::Memory>>
+) -> Result<FilterChoice>
 where
     S: OwnedSearch + Sync,
 {
@@ -2114,14 +2103,14 @@ fn smallest<'r, S>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    finalists: impl Iterator<Item = Finalist<S::Memory>>,
+    finalists: impl Iterator<Item = Finalist>,
     at_once: usize,
     admit: &(dyn Fn(usize) -> Option<Room<'r>> + Sync),
-) -> Result<Option<FilterChoice<S::Memory>>>
+) -> Result<Option<FilterChoice>>
 where
     S: OwnedSearch + Sync,
 {
-    let encode = |(specs, measured): Finalist<S::Memory>| -> Result<FilterChoice<S::Memory>> {
+    let encode = |(specs, measured): Finalist| -> Result<FilterChoice> {
         let packed = match measured {
             Some(packed) => packed,
             None if specs.is_empty() => search.encode_plain(data, options, None)?,
@@ -2130,7 +2119,7 @@ where
         Ok((specs, packed))
     };
     let mut finalists = finalists.peekable();
-    let mut best: Option<FilterChoice<S::Memory>> = None;
+    let mut best: Option<FilterChoice> = None;
     while let Some(first) = finalists.next() {
         // A finalist the screen measured costs no encode, and so no room.
         let mut encodes = usize::from(first.1.is_none());
@@ -2190,7 +2179,7 @@ pub(crate) fn choose_owned_specs<S: OwnedSearch>(
     data: &[u8],
     options: S::Options,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-) -> Result<Buffer<FilterSpec, S::Memory>> {
+) -> Result<Buffer<FilterSpec>> {
     specs_only(
         &Reporting {
             search,
@@ -2205,7 +2194,7 @@ fn specs_only<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<Buffer<FilterSpec, S::Memory>> {
+) -> Result<Buffer<FilterSpec>> {
     let finalists = ranked_finalists(search, data, options)?;
     // Only the sizes are compared, as [`choose_filter_inner_from`] compares
     // them: the smallest wins and the earliest takes a tie.
@@ -2240,7 +2229,7 @@ pub(crate) fn choose_owned<S: OwnedSearch>(
     data: &[u8],
     options: S::Options,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-) -> Result<FilterChoice<S::Memory>> {
+) -> Result<FilterChoice> {
     choose_filter_inner(
         &Reporting {
             search,
@@ -2255,7 +2244,7 @@ fn choose_filter_inner<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-) -> Result<FilterChoice<S::Memory>> {
+) -> Result<FilterChoice> {
     let finalists = ranked_finalists(search, data, options)?;
     choose_filter_inner_from(search, data, options, finalists)
 }
@@ -2266,9 +2255,9 @@ fn choose_filter_inner_from<S: OwnedSearch>(
     search: &S,
     data: &[u8],
     options: S::Options,
-    finalists: Buffer<Finalist<S::Memory>, S::Memory>,
-) -> Result<FilterChoice<S::Memory>> {
-    let mut best: Option<FilterChoice<S::Memory>> = None;
+    finalists: Buffer<Finalist>,
+) -> Result<FilterChoice> {
+    let mut best: Option<FilterChoice> = None;
     for (specs, measured) in finalists {
         let packed = match measured {
             Some(packed) => packed,
@@ -2361,11 +2350,9 @@ pub(crate) fn disjoint_filter_ranges(ranges: Vec<Range<usize>>) -> Vec<Range<usi
         .expect("unlimited ranges")
         .into_vec()
 }
-fn disjoint_ranges<B: Budget>(
-    mut ranges: Buffer<Range<usize>, B>,
-) -> Result<Buffer<Range<usize>, B>> {
+fn disjoint_ranges(mut ranges: Buffer<Range<usize>>) -> Result<Buffer<Range<usize>>> {
     ranges.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut disjoint: Buffer<Range<usize>, B> = Buffer::new(&ranges.allowance());
+    let mut disjoint: Buffer<Range<usize>> = Buffer::new(&ranges.allowance());
     for range in ranges {
         if let Some(last) = disjoint.last_mut() {
             if range.start <= last.end {
@@ -2384,7 +2371,7 @@ mod tests {
         search: &S,
         data: &[u8],
         options: S::Options,
-    ) -> Result<ScreenOutcome<Allowance>> {
+    ) -> Result<ScreenOutcome> {
         super::screen_kinds(
             &UnlimitedSearch(search, Allowance::default()),
             data,
@@ -2401,7 +2388,7 @@ mod tests {
         data: &[u8],
         regions: &[Range<usize>],
         options: S::Options,
-    ) -> Result<X86Screen<Allowance>> {
+    ) -> Result<X86Screen> {
         super::x86_screened_regions(
             &UnlimitedSearch(search, Allowance::default()),
             data,
@@ -2409,7 +2396,7 @@ mod tests {
             options,
         )
     }
-    fn x86_finalists(data: &[u8], screen: &X86Screen<Allowance>) -> Vec<Vec<FilterSpec>> {
+    fn x86_finalists(data: &[u8], screen: &X86Screen) -> Vec<Vec<FilterSpec>> {
         super::x86_finalists(data, screen)
             .unwrap()
             .into_iter()
@@ -2995,10 +2982,10 @@ mod tests {
 
     #[test]
     fn x86_region_scan_releases_all_storage_on_each_admission_failure() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
 
         let data = calls_to_fixed_addresses(256 * 1024);
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         let regions = super::x86_code_regions(&data, &baseline).unwrap();
         assert!(!regions.is_empty());
         drop(regions);
@@ -3006,7 +2993,7 @@ mod tests {
         assert!(baseline.attempts() > 0);
 
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert_eq!(
                 super::x86_code_regions(&data, &budget).unwrap_err(),
                 crate::Error::Cancelled,
@@ -3018,9 +3005,9 @@ mod tests {
 
     #[test]
     fn x86_candidate_construction_releases_storage_on_each_admission_failure() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
 
-        let run = |budget: &RefusingBudget| -> Result<()> {
+        let run = |budget: &Allowance| -> Result<()> {
             let screen = X86Screen {
                 rejected_a_region: true,
                 kept: Buffer::collect(std::iter::once(0..3), budget)?,
@@ -3032,11 +3019,11 @@ mod tests {
             assert!(finalists.iter().all(|specs| specs.len() == 1));
             Ok(())
         };
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert_eq!(
                 run(&budget),
                 Err(crate::Error::Cancelled),
@@ -3048,9 +3035,9 @@ mod tests {
 
     #[test]
     fn table_grafting_releases_storage_on_each_admission_failure() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
 
-        let run = |budget: &RefusingBudget| -> Result<()> {
+        let run = |budget: &Allowance| -> Result<()> {
             let specs = Buffer::collect([FilterSpec::whole(FilterKind::E8E9)], budget)?;
             let grafted = super::graft_owned(specs, &[(20..40, 2)], 100)?;
             assert_eq!(grafted.len(), 3);
@@ -3059,11 +3046,11 @@ mod tests {
             assert_eq!(grafted[2].range, Some(40..100));
             Ok(())
         };
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert_eq!(
                 run(&budget),
                 Err(crate::Error::Cancelled),
@@ -3124,17 +3111,16 @@ mod tests {
 
     #[test]
     fn bounded_delta_finalists_release_storage_on_each_admission_failure() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
 
-        struct DeltaSearch(RefusingBudget);
+        struct DeltaSearch(Allowance);
         impl OwnedSearch for DeltaSearch {
             type Options = ();
-            type Memory = RefusingBudget;
 
-            fn allowance(&self) -> &Self::Memory {
+            fn allowance(&self) -> &Allowance {
                 &self.0
             }
-            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>> {
+            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind>> {
                 Ok(Buffer::collect(
                     [1, 2, 3].map(|channels| FilterKind::Delta { channels }),
                     &self.0,
@@ -3152,11 +3138,7 @@ mod tests {
             fn screen_options(&self, options: ()) {
                 options
             }
-            fn filtered_bytes(
-                &self,
-                _: &[u8],
-                _: &[FilterSpec],
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            fn filtered_bytes(&self, _: &[u8], _: &[FilterSpec]) -> Result<Buffer<u8>> {
                 unreachable!("the whole member is measured directly")
             }
             fn encode_plain(
@@ -3164,7 +3146,7 @@ mod tests {
                 _: &[u8],
                 _: (),
                 _: Option<&mut dyn FnMut(usize) -> bool>,
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            ) -> Result<Buffer<u8>> {
                 Ok(Buffer::collect([0; 10], &self.0)?)
             }
             fn encode_filtered(
@@ -3173,23 +3155,23 @@ mod tests {
                 _: &[FilterSpec],
                 _: (),
                 _: Option<&mut dyn FnMut(usize) -> bool>,
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            ) -> Result<Buffer<u8>> {
                 Ok(Buffer::collect([0], &self.0)?)
             }
         }
 
-        let run = |budget: &RefusingBudget| -> Result<()> {
+        let run = |budget: &Allowance| -> Result<()> {
             let finalists = super::finalists(&DeltaSearch(budget.clone()), &[0; 512], ())?;
             assert_eq!(finalists.len(), 7);
             assert!(finalists[1].0[0].range.is_none());
             assert!(finalists[2].0[0].range.is_some());
             Ok(())
         };
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert_eq!(
                 run(&budget),
                 Err(crate::Error::Cancelled),
@@ -3201,21 +3183,20 @@ mod tests {
 
     #[test]
     fn x86_screen_releases_storage_on_each_admission_failure() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
         use std::cell::Cell;
 
         struct ScreenSearch {
-            budget: RefusingBudget,
+            budget: Allowance,
             encodes: Cell<usize>,
         }
         impl OwnedSearch for ScreenSearch {
             type Options = ();
-            type Memory = RefusingBudget;
 
-            fn allowance(&self) -> &Self::Memory {
+            fn allowance(&self) -> &Allowance {
                 &self.budget
             }
-            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>> {
+            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind>> {
                 Ok(Buffer::new(&self.budget))
             }
             fn detects_x86(&self) -> bool {
@@ -3230,11 +3211,7 @@ mod tests {
             fn screen_options(&self, options: ()) {
                 options
             }
-            fn filtered_bytes(
-                &self,
-                data: &[u8],
-                _: &[FilterSpec],
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            fn filtered_bytes(&self, data: &[u8], _: &[FilterSpec]) -> Result<Buffer<u8>> {
                 Ok(Buffer::collect(data.iter().copied(), &self.budget)?)
             }
             fn encode_plain(
@@ -3242,7 +3219,7 @@ mod tests {
                 _: &[u8],
                 _: (),
                 _: Option<&mut dyn FnMut(usize) -> bool>,
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            ) -> Result<Buffer<u8>> {
                 let pass = self.encodes.get();
                 self.encodes.set(pass + 1);
                 let size = [10, 5, 6][pass];
@@ -3254,12 +3231,12 @@ mod tests {
                 _: &[FilterSpec],
                 _: (),
                 _: Option<&mut dyn FnMut(usize) -> bool>,
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            ) -> Result<Buffer<u8>> {
                 unreachable!("the x86 screen encodes filtered bytes as plain data")
             }
         }
 
-        let run = |budget: &RefusingBudget| -> Result<()> {
+        let run = |budget: &Allowance| -> Result<()> {
             let search = ScreenSearch {
                 budget: budget.clone(),
                 encodes: Cell::new(0),
@@ -3271,11 +3248,11 @@ mod tests {
             assert!(!result.jumps_cost_more);
             Ok(())
         };
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert_eq!(
                 run(&budget),
                 Err(crate::Error::Cancelled),
@@ -3287,17 +3264,16 @@ mod tests {
 
     #[test]
     fn table_only_candidate_releases_storage_on_each_admission_failure() {
-        use crate::codec::workspace::RefusingBudget;
+        use crate::codec::workspace::Allowance;
 
-        struct TableSearch(RefusingBudget);
+        struct TableSearch(Allowance);
         impl OwnedSearch for TableSearch {
             type Options = ();
-            type Memory = RefusingBudget;
 
-            fn allowance(&self) -> &Self::Memory {
+            fn allowance(&self) -> &Allowance {
                 &self.0
             }
-            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, Self::Memory>> {
+            fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind>> {
                 Ok(Buffer::new(&self.0))
             }
             fn detects_x86(&self) -> bool {
@@ -3312,11 +3288,7 @@ mod tests {
             fn screen_options(&self, options: ()) {
                 options
             }
-            fn filtered_bytes(
-                &self,
-                _: &[u8],
-                _: &[FilterSpec],
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            fn filtered_bytes(&self, _: &[u8], _: &[FilterSpec]) -> Result<Buffer<u8>> {
                 Ok(Buffer::collect([0], &self.0)?)
             }
             fn encode_plain(
@@ -3324,7 +3296,7 @@ mod tests {
                 data: &[u8],
                 _: (),
                 _: Option<&mut dyn FnMut(usize) -> bool>,
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            ) -> Result<Buffer<u8>> {
                 let size = if data.len() == 1 { 1 } else { 10 };
                 Ok(Buffer::collect(std::iter::repeat_n(0, size), &self.0)?)
             }
@@ -3334,13 +3306,13 @@ mod tests {
                 _: &[FilterSpec],
                 _: (),
                 _: Option<&mut dyn FnMut(usize) -> bool>,
-            ) -> Result<Buffer<u8, Self::Memory>> {
+            ) -> Result<Buffer<u8>> {
                 unreachable!("the candidate search only screens the table")
             }
         }
 
         let data = reloc_table(2048);
-        let run = |budget: &RefusingBudget| -> Result<()> {
+        let run = |budget: &Allowance| -> Result<()> {
             let finalists = super::finalists(&TableSearch(budget.clone()), &data, ())?;
             assert_eq!(finalists.len(), 2);
             assert!(matches!(
@@ -3352,11 +3324,11 @@ mod tests {
             ));
             Ok(())
         };
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         run(&baseline).unwrap();
         assert_eq!(baseline.used(), 0);
         for index in 0..baseline.attempts() {
-            let budget = RefusingBudget::new(index);
+            let budget = Allowance::refusing(index);
             assert_eq!(
                 run(&budget),
                 Err(crate::Error::Cancelled),
@@ -4469,7 +4441,6 @@ mod tests {
         struct Calls(Allowance);
         impl OwnedSearch for Calls {
             type Options = ();
-            type Memory = Allowance;
 
             fn allowance(&self) -> &Allowance {
                 &self.0

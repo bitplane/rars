@@ -392,8 +392,8 @@ fn split_in_two(archive: &Archive, member: &FileHeader, last: &FileHeader) -> [A
     [first, second]
 }
 
-fn write_split<B: Budget>(
-    session: &mut DecoderSession<'_, B>,
+fn write_split(
+    session: &mut DecoderSession<'_>,
     volumes: &[Archive],
     writer: &mut dyn Write,
 ) -> Result<()> {
@@ -453,10 +453,10 @@ fn optional_crc_policy_keeps_scratch_dispatch_before_hash_initialization() {
 
 #[test]
 fn optional_crc_keeps_limited_growth_and_refusals_identical_to_legacy_streaming() {
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
     let data = b"limited CRC policy bytes\n".repeat(4096);
     let (archive, file) = fixture(&data, false, false);
-    let run = |budget: &RefusingBudget, optional| {
+    let run = |budget: &Allowance, optional| {
         let mut session = DecoderSession::with_allowance(None, 0, budget);
         let mut output = Buffer::new(budget);
         if optional {
@@ -481,14 +481,14 @@ fn optional_crc_keeps_limited_growth_and_refusals_identical_to_legacy_streaming(
         assert_eq!(&output[..], &data);
         Ok::<(), Error>(())
     };
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     run(&baseline, false).unwrap();
     let attempts = baseline.attempts();
     assert!(attempts > 0);
     assert_eq!(baseline.used(), 0);
     for fail_at in 0..=attempts {
-        let old = RefusingBudget::new(fail_at);
-        let new = RefusingBudget::new(fail_at);
+        let old = Allowance::refusing(fail_at);
+        let new = Allowance::refusing(fail_at);
         let expected = run(&old, false);
         let actual = run(&new, true);
         assert_eq!(

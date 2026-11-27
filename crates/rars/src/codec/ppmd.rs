@@ -12,9 +12,7 @@ mod pool;
 
 pub use pool::mapped_bytes as pool_mapped_bytes;
 
-#[cfg(any(test, feature = "write"))]
-use super::workspace::Allowance;
-use super::workspace::Budget;
+use super::workspace::{Allowance, Charge};
 use super::{Error, Result};
 use pool::Pool;
 
@@ -120,12 +118,12 @@ impl RangeDecoder {
 }
 
 #[derive(Debug)]
-pub(crate) struct Ppmd7<B: Budget> {
+pub(crate) struct Ppmd7 {
     // The pool, reserved at its declared size. Untouched pages cost nothing
     // (see `pool`), so the budget is charged only for what the model has
     // reached.
     mem: Pool,
-    charge: B::Charge,
+    charge: Charge,
     charged: u64,
     // The furthest each region has reached since the pool was allocated. Its
     // pages stay touched across restarts, so these never move back.
@@ -179,8 +177,8 @@ fn hi_bits_flag4(symbol: u8) -> u32 {
     ((u32::from(symbol) + 0xc0) >> (8 - 4)) & (1 << 4)
 }
 
-impl<B: Budget> Ppmd7<B> {
-    pub(crate) fn with_allowance(allowance: &B) -> Self {
+impl Ppmd7 {
+    pub(crate) fn with_allowance(allowance: &Allowance) -> Self {
         let mut indx2units = [0u8; NUM_INDEXES];
         let mut units2indx = [0u8; 128];
         let mut k = 0usize;
@@ -263,8 +261,8 @@ impl<B: Budget> Ppmd7<B> {
 
     pub(crate) fn try_clone(&self) -> Result<Self> {
         // Only the text, the units in use and the contexts carry data.
-        let mut charge = B::allowance(&self.charge).charge();
-        B::resize(&mut charge, self.charged)?;
+        let mut charge = Allowance::allowance(&self.charge).charge();
+        Allowance::resize(&mut charge, self.charged)?;
         let mut mem = Pool::zeroed(self.mem.len());
         for range in [
             0..self.text as usize,
@@ -311,7 +309,7 @@ impl<B: Budget> Ppmd7<B> {
             self.allocated = false;
             if self.size != size || self.mem.is_empty() {
                 self.mem = Pool::empty();
-                B::resize(&mut self.charge, 0)?;
+                Allowance::resize(&mut self.charge, 0)?;
                 self.charged = 0;
                 self.align = 4u32.wrapping_sub(size) & 3;
                 self.mem = Pool::zeroed((self.align + size) as usize);
@@ -449,7 +447,7 @@ impl<B: Budget> Ppmd7<B> {
             .next_multiple_of(CHARGE_STEP)
             .min(self.mem.len() as u64);
         if reached > self.charged {
-            B::resize(&mut self.charge, reached)?;
+            Allowance::resize(&mut self.charge, reached)?;
             self.charged = reached;
         }
         Ok(())
@@ -1290,7 +1288,7 @@ impl<B: Budget> Ppmd7<B> {
 // The writer's side: the same model, coding symbols instead of reading them.
 
 #[cfg(any(test, feature = "write"))]
-impl Ppmd7<Allowance> {
+impl Ppmd7 {
     fn for_encoding(max_order: usize, dictionary_mb: usize) -> Result<Self> {
         if !(2..=MAX_ORDER).contains(&max_order) {
             return Err(Error::InvalidData("RAR PPMd order is invalid"));
@@ -1415,7 +1413,7 @@ impl Ppmd7<Allowance> {
 }
 
 #[cfg(any(test, feature = "write"))]
-impl Clone for Ppmd7<Allowance> {
+impl Clone for Ppmd7 {
     fn clone(&self) -> Self {
         self.try_clone().expect("unlimited PPMd model copy")
     }
@@ -1478,7 +1476,7 @@ impl RangeEncoder {
 #[derive(Debug, Clone)]
 #[cfg(any(test, feature = "write"))]
 pub struct PpmdModel {
-    state: Box<Ppmd7<Allowance>>,
+    state: Box<Ppmd7>,
 }
 
 /// Codes one RAR 2.9 PPMd block: literals and the escape commands the

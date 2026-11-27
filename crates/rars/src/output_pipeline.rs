@@ -1,8 +1,7 @@
+use crate::codec::workspace::{Allowance, Charge};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-
-use crate::codec::workspace::Budget;
 
 const INLINE_LIMIT: u64 = 256 << 10;
 const CHUNK: usize = 1 << 20;
@@ -15,10 +14,10 @@ pub(crate) enum PipeError<E> {
 }
 
 /// The pooled buffers' charge when a member of `size` bytes should be pipelined, or None to run inline.
-pub(crate) fn admit<B: Budget>(size: u64, allowance: &B) -> Option<B::Charge> {
+pub(crate) fn admit(size: u64, allowance: &Allowance) -> Option<Charge> {
     admit_with(size, |bytes| {
         let mut charge = allowance.charge();
-        B::resize(&mut charge, bytes).ok()?;
+        Allowance::resize(&mut charge, bytes).ok()?;
         Some(charge)
     })
 }

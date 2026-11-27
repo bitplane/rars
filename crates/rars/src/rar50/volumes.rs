@@ -8,13 +8,13 @@ use crate::volume_extract::{
 };
 use std::ops::Range;
 
-pub(super) fn extract<F, R, B: Budget>(
+pub(super) fn extract<F, R>(
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
     open: &mut F,
     redirect: &mut R,
     redirections: Redirections,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -190,12 +190,12 @@ fn volume_end(archive: &Archive) -> VolumeEnd {
 ///
 /// When it fails with a member error handler set, the rest of its volumes
 /// are still read, so the walk can go on to the members after it.
-fn extract_split<F, B: Budget>(
+fn extract_split<F>(
     volume: &Archive,
     first: &FileHeader,
     feed: &mut VolumeFeed<'_, '_, Archive>,
     options: crate::ArchiveReadOptions<'_>,
-    session: &mut DecoderSession<'_, B>,
+    session: &mut DecoderSession<'_>,
     budget: &mut OutputBudget,
     open: &mut F,
 ) -> std::result::Result<Archive, SplitFailure<Archive>>
@@ -231,12 +231,12 @@ where
     }
 }
 
-fn extract_split_walk<F, B: Budget>(
+fn extract_split_walk<F>(
     volume: &Archive,
     first: &FileHeader,
-    walk: &mut SplitWalk<'_, '_, '_, B>,
+    walk: &mut SplitWalk<'_, '_, '_>,
     salvage: bool,
-    session: &mut DecoderSession<'_, B>,
+    session: &mut DecoderSession<'_>,
     budget: &mut OutputBudget,
     open: &mut F,
 ) -> Result<Box<dyn Write>>
@@ -333,10 +333,10 @@ fn decoded_size_matches(last: &FileHeader, decoded: Option<usize>) -> Result<()>
     }
 }
 
-fn split_decryptor<B: Budget>(
+fn split_decryptor(
     volume: &Archive,
     first: &FileHeader,
-    session: &DecoderSession<'_, B>,
+    session: &DecoderSession<'_>,
 ) -> Result<Option<SplitDecryptor>> {
     if !first.encrypted {
         return Ok(None);
@@ -348,12 +348,12 @@ fn split_decryptor<B: Budget>(
     }))
 }
 
-pub(super) fn packed_reader<'a, B: Budget>(
+pub(super) fn packed_reader<'a>(
     chain: LazyChain<'a>,
     decryptor: Option<&SplitDecryptor>,
-    allowance: &B,
+    allowance: &Allowance,
     salvage: bool,
-) -> Result<PackedReader<'a, B>> {
+) -> Result<PackedReader<'a>> {
     let Some(decryptor) = decryptor else {
         return Ok(PackedReader::Plain(chain));
     };
@@ -402,13 +402,13 @@ impl SplitChecksums {
     }
 }
 
-pub(super) fn write_stored<B: Budget>(
+pub(super) fn write_stored(
     first: &FileHeader,
-    walk: &mut SplitWalk<'_, '_, '_, B>,
+    walk: &mut SplitWalk<'_, '_, '_>,
     first_reader: RangeReader<'static>,
     decryptor: Option<&SplitDecryptor>,
     writer: &mut dyn Write,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()> {
     let mut sums = SplitChecksums::new(first);
     let salvage = walk.options.salvage;
@@ -437,11 +437,11 @@ pub(super) fn write_stored<B: Budget>(
     sums.verify(last, decryptor)
 }
 
-impl<B: Budget> DecoderSession<'_, B> {
+impl DecoderSession<'_> {
     pub(super) fn write_lazy_split_to(
         &mut self,
         first: &FileHeader,
-        walk: &mut SplitWalk<'_, '_, '_, B>,
+        walk: &mut SplitWalk<'_, '_, '_>,
         first_reader: RangeReader<'static>,
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
@@ -491,7 +491,7 @@ impl<B: Budget> DecoderSession<'_, B> {
     pub(super) fn stream_lazy_split_to(
         &mut self,
         first: &FileHeader,
-        walk: &mut SplitWalk<'_, '_, '_, B>,
+        walk: &mut SplitWalk<'_, '_, '_>,
         first_reader: RangeReader<'static>,
         decryptor: Option<&SplitDecryptor>,
         writer: &mut dyn Write,
@@ -514,7 +514,7 @@ impl<B: Budget> DecoderSession<'_, B> {
                 &self.allowance,
                 salvage,
             )?;
-            control.finish(unchecked.stream_packed_with_crc_policy::<true, _>(
+            control.finish(unchecked.stream_packed_with_crc_policy::<true>(
                 &mut packed,
                 None,
                 &mut decoder,
@@ -556,10 +556,10 @@ impl<B: Budget> DecoderSession<'_, B> {
     pub(super) fn decode_lazy_split(
         &mut self,
         first: &FileHeader,
-        walk: &mut SplitWalk<'_, '_, '_, B>,
+        walk: &mut SplitWalk<'_, '_, '_>,
         first_reader: RangeReader<'static>,
         decryptor: Option<&SplitDecryptor>,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         let info = first.decoded_compression_info()?;
         let dictionary_size = usize::try_from(info.dictionary_size).map_err(|_| {
             Error::InvalidHeader("RAR 5 dictionary size overflows host address size")
@@ -646,7 +646,7 @@ impl FragmentCheck {
 }
 
 /// Fetches a split member's later volumes as its reader reaches each fragment's end.
-pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
+pub(super) struct SplitWalk<'f, 'p, 'o> {
     feed: &'f mut VolumeFeed<'p, 'o, Archive>,
     options: crate::ArchiveReadOptions<'o>,
     first: FileHeader,
@@ -654,18 +654,18 @@ pub(super) struct SplitWalk<'f, 'p, 'o, B: Budget> {
     size: Option<u64>,
     split_after: bool,
     last: Option<Archive>,
-    fragments: Buffer<Fragment, B>,
+    fragments: Buffer<Fragment>,
     prefetched: std::collections::VecDeque<RangeReader<'static>>,
     /// A refused or missing volume, reported as itself rather than as a decode failure.
     failure: Option<Error>,
 }
 
-impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
+impl<'f, 'p, 'o> SplitWalk<'f, 'p, 'o> {
     pub(super) fn new(
         feed: &'f mut VolumeFeed<'p, 'o, Archive>,
         volume: &Archive,
         first: &FileHeader,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Self> {
         let options = feed.options();
         let mut fragments = Buffer::new(allowance);
@@ -800,7 +800,7 @@ impl<'f, 'p, 'o, B: Budget> SplitWalk<'f, 'p, 'o, B> {
     }
 }
 
-impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
+impl FragmentWalk for SplitWalk<'_, '_, '_> {
     fn next_fragment(&mut self) -> Result<Option<RangeReader<'static>>> {
         // Fragments fetched before a failure are still read, when salvaging.
         if let Some(reader) = self.prefetched.pop_front() {
@@ -826,7 +826,7 @@ impl<B: Budget> FragmentWalk for SplitWalk<'_, '_, '_, B> {
     }
 }
 
-impl<B: Budget> SplitWalk<'_, '_, '_, B> {
+impl SplitWalk<'_, '_, '_> {
     fn advance(&mut self) -> Result<Option<RangeReader<'static>>> {
         if !self.split_after {
             return Ok(None);
@@ -864,11 +864,11 @@ impl<B: Budget> SplitWalk<'_, '_, '_, B> {
 }
 
 #[cfg(all(test, feature = "write"))]
-pub(super) fn with_walk<B: Budget, T>(
+pub(super) fn with_walk<T>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
-    allowance: &B,
-    run: impl FnOnce(&Archive, &FileHeader, &mut SplitWalk<'_, '_, '_, B>) -> Result<T>,
+    allowance: &Allowance,
+    run: impl FnOnce(&Archive, &FileHeader, &mut SplitWalk<'_, '_, '_>) -> Result<T>,
 ) -> Result<T> {
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);

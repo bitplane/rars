@@ -1,4 +1,5 @@
 use super::{Error, Result};
+use crate::codec::workspace::Allowance;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg(any(test, feature = "write"))]
@@ -203,13 +204,13 @@ pub(crate) fn delta_decode_with_control(
     .map(super::workspace::Buffer::into_vec)
 }
 
-pub(crate) fn delta_decode_with_allowance<B: super::workspace::Budget>(
+pub(crate) fn delta_decode_with_allowance(
     data: &[u8],
     channels: usize,
     messages: DeltaErrorMessages,
     control: &crate::read_control::ReadControl,
-    allowance: &B,
-) -> Result<super::workspace::Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<super::workspace::Buffer<u8>> {
     control.check_codec()?;
     let mut poller = control.poller();
     if channels == 0 {
@@ -331,12 +332,12 @@ pub fn delta_encode(data: &[u8], channels: usize) -> Result<Vec<u8>> {
 }
 
 #[cfg(any(test, feature = "write"))]
-pub(crate) fn delta_encode_with_allowance<B: super::workspace::Budget>(
+pub(crate) fn delta_encode_with_allowance(
     data: &[u8],
     channels: usize,
     messages: DeltaErrorMessages,
-    allowance: &B,
-) -> Result<super::workspace::Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<super::workspace::Buffer<u8>> {
     if channels == 0 || channels > 32 {
         return Err(Error::InvalidData(messages.invalid_channels));
     }

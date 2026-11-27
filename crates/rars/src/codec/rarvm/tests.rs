@@ -26,9 +26,9 @@ fn reader_vm_invocation() -> Invocation<'static> {
 
 #[test]
 fn reader_vm_workspace_refusals_release_program_operands_memory_and_results() {
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
     let blob = reader_vm_blob();
-    let run = |budget: &RefusingBudget| -> Result<()> {
+    let run = |budget: &Allowance| -> Result<()> {
         let program = OwnedProgram::parse(&blob, budget)?;
         let mut vm = Vm::with_allowance(&program, reader_vm_invocation(), budget)?;
         let result = vm.run(&program, &crate::read_control::ReadControl::default())?;
@@ -36,13 +36,13 @@ fn reader_vm_workspace_refusals_release_program_operands_memory_and_results() {
         assert_eq!(result.globals.len(), SYSTEM_GLOBAL_SIZE + 8);
         Ok(())
     };
-    let baseline = RefusingBudget::new(usize::MAX);
+    let baseline = Allowance::refusing(usize::MAX);
     run(&baseline).unwrap();
     let attempts = baseline.attempts();
     assert!(attempts >= 7);
     assert_eq!(baseline.used(), 0);
     for index in 0..attempts {
-        let budget = RefusingBudget::new(index);
+        let budget = Allowance::refusing(index);
         assert!(
             matches!(run(&budget), Err(Error::Cancelled)),
             "allocation {index}"

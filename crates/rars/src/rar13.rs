@@ -23,7 +23,7 @@ pub use write::{
 };
 
 use crate::codec::rar13::Reader15State;
-use crate::codec::workspace::{Allowance, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Buffer};
 use crate::crypto::rar13::{Rar13Cipher, Rar13DecryptReader};
 use crate::detect::{find_archive_start, ArchiveSignature, RAR13_SIGNATURE, SFX_SCAN_LIMIT};
 use crate::error::{Error, Result};
@@ -295,13 +295,13 @@ impl FileHeader {
 
 /// Stored members need no dictionary. Delay model allocation until the first
 /// compressed member, retaining the same allowance throughout a solid chain.
-struct Decoder15<B: Budget = Allowance> {
+struct Decoder15 {
     read_control: crate::read_control::ReadControl,
-    allowance: B,
-    state: Option<Reader15State<B>>,
+    allowance: Allowance,
+    state: Option<Reader15State>,
 }
-impl<B: Budget> Decoder15<B> {
-    fn with_allowance(allowance: &B) -> Self {
+impl Decoder15 {
+    fn with_allowance(allowance: &Allowance) -> Self {
         Self {
             read_control: Default::default(),
             allowance: allowance.clone(),
@@ -329,7 +329,7 @@ impl<B: Budget> Decoder15<B> {
         state.decode_member_from_reader(input, output_size, solid, out)
     }
 }
-impl Decoder15<Allowance> {
+impl Decoder15 {
     fn new() -> Self {
         Self::with_allowance(&Allowance::default())
     }
@@ -658,13 +658,13 @@ impl Archive {
         self.extract_with_allowance(options, open, selector, on_error, &Allowance::default())
     }
 
-    fn extract_with_allowance<F, B: Budget>(
+    fn extract_with_allowance<F>(
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut F,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<crate::ExtractionOutcome>
     where
         F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
@@ -818,10 +818,10 @@ impl Archive {
         self.archive_comment_with_allowance(options, &Allowance::default())
     }
 
-    fn archive_comment_with_allowance<B: Budget>(
+    fn archive_comment_with_allowance(
         &self,
         options: crate::ArchiveReadOptions<'_>,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<Option<Vec<u8>>> {
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
@@ -1025,12 +1025,12 @@ impl Entry {
         }
     }
 
-    fn write_stored_to<B: Budget>(
+    fn write_stored_to(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
         out: &mut impl Write,
-        allowance: &B,
+        allowance: &Allowance,
     ) -> Result<()> {
         if self.is_empty_without_key(password) {
             return Ok(());
@@ -1067,11 +1067,11 @@ impl Entry {
         }
     }
 
-    fn write_compressed_to<B: Budget>(
+    fn write_compressed_to(
         &self,
         archive: &Archive,
         password: Option<&[u8]>,
-        unpack15: &mut Decoder15<B>,
+        unpack15: &mut Decoder15,
         solid: bool,
         out: &mut impl Write,
     ) -> Result<()> {
@@ -1193,11 +1193,11 @@ where
     extract_volumes_with_allowance(volumes, options, open, &Allowance::default())
 }
 
-fn extract_volumes_with_allowance<F, B: Budget>(
+fn extract_volumes_with_allowance<F>(
     volumes: &[Archive],
     options: crate::ArchiveReadOptions<'_>,
     open: F,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()>
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,

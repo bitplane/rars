@@ -45,7 +45,7 @@ pub(crate) use filter_thread::FILTER_THREAD_BYTES;
 
 use super::cached_bits::CachedBits as BitReader;
 use super::filters::{self, DeltaErrorMessages};
-use super::workspace::{Allowance, Budget, Buffer};
+use super::workspace::{Allowance, Buffer};
 use super::{Error, Result};
 use std::io::Read;
 use std::ops::Range;
@@ -88,9 +88,9 @@ pub struct CompressedBlockHeader {
     pub payload_bits: usize,
 }
 
-struct OwnedCompressedBlock<B: Budget = Allowance> {
+struct OwnedCompressedBlock {
     header: CompressedBlockHeader,
-    payload: Buffer<u8, B>,
+    payload: Buffer<u8>,
 }
 
 #[derive(Debug)]
@@ -122,11 +122,11 @@ pub struct TableLengths {
     pub length: Vec<u8>,
 }
 
-struct OwnedLengths<B: Budget = Allowance> {
-    main: Buffer<u8, B>,
-    distance: Buffer<u8, B>,
-    align: Buffer<u8, B>,
-    length: Buffer<u8, B>,
+struct OwnedLengths {
+    main: Buffer<u8>,
+    distance: Buffer<u8>,
+    align: Buffer<u8>,
+    length: Buffer<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -261,15 +261,15 @@ pub fn read_level_lengths(input: &[u8]) -> Result<([u8; LEVEL_TABLE_SIZE], usize
 }
 
 #[derive(Debug)]
-struct ReaderTables<B: Budget> {
-    main: HuffmanState<B>,
-    distance: HuffmanState<B>,
-    align: HuffmanState<B>,
-    length: HuffmanState<B>,
+struct ReaderTables {
+    main: HuffmanState,
+    distance: HuffmanState,
+    align: HuffmanState,
+    length: HuffmanState,
     align_mode: bool,
 }
-impl<B: Budget> ReaderTables<B> {
-    fn from_lengths(lengths: &OwnedLengths<B>, allowance: &B) -> Result<Self> {
+impl ReaderTables {
+    fn from_lengths(lengths: &OwnedLengths, allowance: &Allowance) -> Result<Self> {
         Ok(Self {
             main: HuffmanState::from_lengths(&lengths.main, allowance)?,
             distance: HuffmanState::from_lengths(&lengths.distance, allowance)?,
@@ -309,11 +309,11 @@ pub fn read_table_lengths(input: &[u8], algorithm_version: u8) -> Result<(TableL
     )
 }
 
-fn read_table_lengths_with_allowance<B: Budget>(
+fn read_table_lengths_with_allowance(
     input: &[u8],
     algorithm_version: u8,
-    allowance: &B,
-) -> Result<(OwnedLengths<B>, usize)> {
+    allowance: &Allowance,
+) -> Result<(OwnedLengths, usize)> {
     let table_size = table_length_count(algorithm_version)?;
     let (level_lengths, level_bits) = read_level_lengths(input)?;
     let level_decoder = HuffmanState::from_lengths(&level_lengths, allowance)?;
@@ -435,7 +435,7 @@ impl TryFrom<crate::FilterKind> for Rar50Filter {
 #[derive(Debug)]
 pub struct Unpack50Decoder {
     pub(crate) read_control: crate::read_control::ReadControl,
-    state: ReaderState<Allowance>,
+    state: ReaderState,
 }
 impl Clone for Unpack50Decoder {
     fn clone(&self) -> Self {
@@ -618,14 +618,14 @@ pub(crate) enum HistoryRetention {
 }
 
 #[derive(Debug)]
-pub(crate) struct ReaderState<B: Budget> {
+pub(crate) struct ReaderState {
     pub(crate) read_control: crate::read_control::ReadControl,
-    tables: Option<Arc<ReaderTables<B>>>,
+    tables: Option<Arc<ReaderTables>>,
     reps: [usize; 4],
     last_length: usize,
-    history: Buffer<u8, B>,
+    history: Buffer<u8>,
     // A streamed member's history, kept as is so the next stream reuses it.
-    streamed_history: Option<StreamedHistory<B>>,
+    streamed_history: Option<StreamedHistory>,
     // Only this tail is reachable. Older bytes may remain as physical slack.
     history_window: usize,
     // Set when the last member's final block ended before its declared size,
@@ -637,13 +637,13 @@ pub(crate) struct ReaderState<B: Budget> {
     ran_past: bool,
     // Under salvage: what a buffered member that failed decoded before the
     // failure, up to the first filter it couldn't apply.
-    salvaged: Option<Buffer<u8, B>>,
+    salvaged: Option<Buffer<u8>>,
     // The next buffered member's blocks, decoded ahead on the pool.
     #[cfg(all(
         feature = "parallel",
         not(all(target_arch = "wasm32", target_os = "unknown"))
     ))]
-    claimed: Option<Claimed<B>>,
+    claimed: Option<Claimed>,
     // Whether the last claimed member replayed to its final block.
     #[cfg(all(
         feature = "parallel",
@@ -652,15 +652,15 @@ pub(crate) struct ReaderState<B: Budget> {
     replayed_whole: bool,
 }
 
-impl<B: Budget> ReaderState<B> {
-    pub(crate) fn allowance(&self) -> B {
+impl ReaderState {
+    pub(crate) fn allowance(&self) -> Allowance {
         self.history.allowance()
     }
     /// Whether this decoder's workspace has a ceiling.
     pub(crate) fn is_limited(&self) -> bool {
         self.history.is_limited()
     }
-    pub(crate) fn new(allowance: &B) -> Self {
+    pub(crate) fn new(allowance: &Allowance) -> Self {
         Self {
             read_control: crate::read_control::ReadControl::default(),
             tables: None,
@@ -712,7 +712,7 @@ impl<B: Budget> ReaderState<B> {
     }
 
     /// What a buffered member that failed under salvage decoded first.
-    pub(crate) fn take_salvaged(&mut self) -> Option<Buffer<u8, B>> {
+    pub(crate) fn take_salvaged(&mut self) -> Option<Buffer<u8>> {
         self.salvaged.take()
     }
 
@@ -763,7 +763,7 @@ impl<B: Budget> ReaderState<B> {
     }
 
     #[cfg(test)]
-    fn with_history(history: Buffer<u8, B>) -> Self {
+    fn with_history(history: Buffer<u8>) -> Self {
         let mut state = Self::new(&history.allowance());
         state.history_window = history.len();
         state.history = history;
@@ -783,8 +783,8 @@ impl<B: Budget> ReaderState<B> {
                     let mut history =
                         Buffer::with_capacity(streamed.window(), &streamed.allowance())?;
                     history.resize(streamed.zeros, 0)?;
-                    history.extend_from_slice(front).map_err(Into::into)?;
-                    history.extend_from_slice(back).map_err(Into::into)?;
+                    history.extend_from_slice(front)?;
+                    history.extend_from_slice(back)?;
                     history
                 }
                 // Slack is not reachable history and need not be copied.
@@ -836,7 +836,7 @@ impl<B: Budget> ReaderState<B> {
         output_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.read_control.check_codec()?;
         self.decode_member_with_dictionary(
             input,
@@ -856,7 +856,7 @@ impl<B: Budget> ReaderState<B> {
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.decode_member_with_dictionary_and_history(
             input,
             algorithm_version,
@@ -878,9 +878,9 @@ impl<B: Budget> ReaderState<B> {
         solid: bool,
         mode: DecodeMode,
         history: HistoryRetention,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.read_control.check_codec()?;
-        let mut input = crate::rar50::packed_bytes::<B>(input);
+        let mut input = crate::rar50::packed_bytes(input);
         self.decode_member_from_reader_with_dictionary_and_history(
             &mut input,
             algorithm_version,
@@ -899,7 +899,7 @@ impl<B: Budget> ReaderState<B> {
         output_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.read_control.check_codec()?;
         let control = self.read_control.clone();
         let input = &mut control.reader(input);
@@ -921,7 +921,7 @@ impl<B: Budget> ReaderState<B> {
         dictionary_size: usize,
         solid: bool,
         mode: DecodeMode,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.decode_member_from_reader_with_dictionary_and_history(
             input,
             algorithm_version,
@@ -943,7 +943,7 @@ impl<B: Budget> ReaderState<B> {
         solid: bool,
         mode: DecodeMode,
         history: HistoryRetention,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         self.ended_early = None;
         self.ran_past = false;
         self.salvaged = None;
@@ -1027,9 +1027,7 @@ impl<B: Budget> ReaderState<B> {
                                 &mut literals[..room],
                             );
                             if count != 0 {
-                                output
-                                    .extend_from_slice(&literals[..count])
-                                    .map_err(Into::into)?;
+                                output.extend_from_slice(&literals[..count])?;
                             }
                         }
                         256 if mode.uses_lz() => {
@@ -1208,7 +1206,7 @@ impl<B: Budget> ReaderState<B> {
         algorithm_version: u8,
         declared: usize,
         dictionary_size: usize,
-        resume: Resume<B>,
+        resume: Resume,
     ) {
         let retained = self.history_window.min(dictionary_size);
         self.history.discard_prefix(self.history.len() - retained);
@@ -1377,7 +1375,7 @@ impl<B: Budget> ReaderState<B> {
 
     fn finish_stream<E>(
         &mut self,
-        mut output: StreamingOutput<B>,
+        mut output: StreamingOutput,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
     ) -> std::result::Result<(), StreamDecodeError<E>> {
         // Decoding stops at the declared size or at the stream's last block.
@@ -1403,11 +1401,11 @@ impl<B: Budget> ReaderState<B> {
         &mut self,
         input: &mut impl Read,
         algorithm_version: u8,
-        output: &mut StreamingOutput<B>,
+        output: &mut StreamingOutput,
         sink: &mut impl FnMut(DecodedChunk<'_>) -> std::result::Result<(), E>,
         filters: &mut Option<&mut dyn FnMut(PendingFilter) -> std::result::Result<(), E>>,
-        mut resume: Option<Resume<B>>,
-    ) -> std::result::Result<Option<Resume<B>>, StreamDecodeError<E>> {
+        mut resume: Option<Resume>,
+    ) -> std::result::Result<Option<Resume>, StreamDecodeError<E>> {
         let output_size = output.output_limit;
         let mut literals = [0; LITERAL_BURST];
 
@@ -1542,8 +1540,8 @@ impl<B: Budget> ReaderState<B> {
         &mut self,
         input: &mut impl Read,
         algorithm_version: u8,
-        output: &mut StreamingOutput<B>,
-        resume: Resume<B>,
+        output: &mut StreamingOutput,
+        resume: Resume,
     ) {
         let declared = output.output_limit;
         debug_assert_eq!(output.written, declared);
@@ -1584,9 +1582,7 @@ impl<B: Budget> ReaderState<B> {
             && capacity <= limit
             && self.history.len() + incoming.len() <= capacity
         {
-            self.history
-                .extend_from_slice(incoming)
-                .map_err(Into::into)?;
+            self.history.extend_from_slice(incoming)?;
         } else if capacity <= limit
             && capacity >= required
             && (limited || capacity == limit || incoming.len() == dictionary_size)
@@ -1594,9 +1590,7 @@ impl<B: Budget> ReaderState<B> {
             // Compact a full slack buffer in place. A full incoming dictionary
             // replaces every old byte, including any discontinuous prefix.
             self.history.discard_prefix(self.history.len() - keep);
-            self.history
-                .extend_from_slice(incoming)
-                .map_err(Into::into)?;
+            self.history.extend_from_slice(incoming)?;
         } else if !limited
             && reader_history_capacity(limited, capacity, required, dictionary_size)
                 >= (self.history.len() + incoming.len()).max(capacity + 1)
@@ -1606,18 +1600,14 @@ impl<B: Budget> ReaderState<B> {
             let capacity = reader_history_capacity(limited, capacity, required, dictionary_size);
             self.history.grow_in_place(capacity)?;
             self.history.discard_prefix(self.history.len() - keep);
-            self.history
-                .extend_from_slice(incoming)
-                .map_err(Into::into)?;
+            self.history.extend_from_slice(incoming)?;
         } else {
             // Admit the replacement before touching the old window. Growing
             // toward the slack limit avoids moving a full dictionary per file.
             let capacity = reader_history_capacity(limited, capacity, required, dictionary_size);
             let mut history = Buffer::with_capacity(capacity, &self.history.allowance())?;
-            history
-                .extend_from_slice(&self.history[self.history.len() - keep..])
-                .map_err(Into::into)?;
-            history.extend_from_slice(incoming).map_err(Into::into)?;
+            history.extend_from_slice(&self.history[self.history.len() - keep..])?;
+            history.extend_from_slice(incoming)?;
             self.history = history;
         }
         // Physical slack must never become reachable when a later member
@@ -1659,7 +1649,7 @@ impl<B: Budget> ReaderState<B> {
 
     fn copy_match(
         &self,
-        output: &mut Buffer<u8, B>,
+        output: &mut Buffer<u8>,
         distance: usize,
         length: usize,
         output_limit: usize,
@@ -1682,7 +1672,7 @@ impl<B: Budget> ReaderState<B> {
 
     fn copy_visible(
         &self,
-        output: &mut Buffer<u8, B>,
+        output: &mut Buffer<u8>,
         distance: usize,
         length: usize,
         zero_fill: bool,
@@ -1713,7 +1703,7 @@ impl<B: Budget> ReaderState<B> {
                         let bytes: [u8; SHORT_MATCH] = output[start..start + SHORT_MATCH]
                             .try_into()
                             .expect("fixed-width slice");
-                        output.extend_from_slice(&bytes).map_err(Into::into)?;
+                        output.extend_from_slice(&bytes)?;
                         output.truncate(len + remaining);
                         return Ok(());
                     }
@@ -1734,9 +1724,7 @@ impl<B: Budget> ReaderState<B> {
                 let history_distance = distance - output.len();
                 let index = self.history.len() - history_distance;
                 let take = remaining.min(history_distance);
-                output
-                    .extend_from_slice(&self.history[index..index + take])
-                    .map_err(Into::into)?;
+                output.extend_from_slice(&self.history[index..index + take])?;
                 remaining -= take;
             }
         }
@@ -1782,15 +1770,15 @@ fn reader_history_capacity(
 /// A streamed member's window: the newest `len` bytes of a ring end before `end`,
 /// after `zeros` older zero bytes that a run of zeros left out of the ring.
 #[derive(Debug)]
-pub(crate) struct StreamedHistory<B: Budget = Allowance> {
-    bytes: Buffer<u8, B>,
+pub(crate) struct StreamedHistory {
+    bytes: Buffer<u8>,
     end: usize,
     len: usize,
     // Only an all-zero window gains these, so they all precede the stored bytes.
     zeros: usize,
 }
 
-impl<B: Budget> StreamedHistory<B> {
+impl StreamedHistory {
     // Initialized ring space; fixed-width copies may land anywhere in it.
     fn capacity(&self) -> usize {
         self.bytes.len()
@@ -1820,7 +1808,7 @@ impl<B: Budget> StreamedHistory<B> {
         self.len + self.zeros
     }
 
-    fn allowance(&self) -> B {
+    fn allowance(&self) -> Allowance {
         self.bytes.allowance()
     }
 
@@ -1846,7 +1834,7 @@ impl<B: Budget> StreamedHistory<B> {
     }
 
     /// Flattens in place, oldest byte first. Only unstored zeros allocate.
-    fn into_buffer(mut self) -> Result<Buffer<u8, B>> {
+    fn into_buffer(mut self) -> Result<Buffer<u8>> {
         let start = self.back(self.len);
         self.bytes.rotate_left(start);
         self.bytes.truncate(self.len);
@@ -1881,8 +1869,8 @@ impl<B: Budget> StreamedHistory<B> {
         debug_assert!(capacity > self.len);
         let mut bytes = Buffer::with_capacity(capacity, &self.allowance())?;
         let (older, newer) = self.as_slices();
-        bytes.extend_from_slice(older).map_err(Into::into)?;
-        bytes.extend_from_slice(newer).map_err(Into::into)?;
+        bytes.extend_from_slice(older)?;
+        bytes.extend_from_slice(newer)?;
         bytes.resize(capacity, 0)?;
         self.bytes = bytes;
         self.end = self.len;
@@ -1890,9 +1878,9 @@ impl<B: Budget> StreamedHistory<B> {
     }
 }
 
-impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
+impl From<Buffer<u8>> for StreamedHistory {
     // Spare capacity becomes ring space only as the ring grows into it.
-    fn from(history: Buffer<u8, B>) -> Self {
+    fn from(history: Buffer<u8>) -> Self {
         Self {
             end: history.len(),
             len: history.len(),
@@ -1904,8 +1892,8 @@ impl<B: Budget> From<Buffer<u8, B>> for StreamedHistory<B> {
 
 /// Where a stream that went on past its declared size stopped: in `block`,
 /// `bit_pos` bits into its payload.
-struct Resume<B: Budget> {
-    block: OwnedCompressedBlock<B>,
+struct Resume {
+    block: OwnedCompressedBlock,
     bit_pos: usize,
 }
 
@@ -1931,12 +1919,12 @@ const SHORT_MATCH: usize = 32;
 // Ring space beyond the reachable history: unflushed output plus over-copy.
 const STREAM_SLACK: usize = STREAM_FLUSH_THRESHOLD + SHORT_MATCH;
 
-struct StreamingOutput<B: Budget = Allowance> {
+struct StreamingOutput {
     // History, then the `pending` bytes not yet flushed, which never wrap.
-    ring: StreamedHistory<B>,
+    ring: StreamedHistory,
     pending: usize,
     max_capacity: usize,
-    stage: FilterStage<B>,
+    stage: FilterStage,
     written: usize,
     output_limit: usize,
     dictionary_size: usize,
@@ -1944,9 +1932,9 @@ struct StreamingOutput<B: Budget = Allowance> {
     all_zero: bool,
 }
 
-impl<B: Budget> StreamingOutput<B> {
+impl StreamingOutput {
     fn new(
-        history: impl Into<StreamedHistory<B>>,
+        history: impl Into<StreamedHistory>,
         output_limit: usize,
         dictionary_size: usize,
         history_limit: usize,
@@ -2334,7 +2322,7 @@ impl<B: Budget> StreamingOutput<B> {
         self.stage.finish()
     }
 
-    fn into_history(self) -> StreamedHistory<B> {
+    fn into_history(self) -> StreamedHistory {
         self.ring
     }
 }
@@ -2348,13 +2336,13 @@ impl<B: Budget> StreamingOutput<B> {
 /// Filters must arrive in order and not overlap, each at most
 /// `MAX_STREAMED_FILTER_LENGTH` long, at most `MAX_STREAMED_FILTERS` held at
 /// once; anything else ends streaming with `StreamDecodeError::FilteredMember`.
-struct FilterStage<B: Budget = Allowance> {
+struct FilterStage {
     /// Accepted filters in output order; those from `applied` on are pending.
-    filters: Buffer<PendingFilter, B>,
+    filters: Buffer<PendingFilter>,
     /// How many filters at the front of `filters` have been applied.
     applied: usize,
     /// Bytes from the next filter's start up to `position`, never past its end.
-    held: Buffer<u8, B>,
+    held: Buffer<u8>,
     /// Output position of the next byte to arrive.
     position: usize,
     /// End of the last filter accepted.
@@ -2366,8 +2354,8 @@ struct FilterStage<B: Budget = Allowance> {
     pass_through: bool,
 }
 
-impl<B: Budget> FilterStage<B> {
-    fn new(allowance: &B) -> Self {
+impl FilterStage {
+    fn new(allowance: &Allowance) -> Self {
         Self {
             filters: Buffer::new(allowance),
             applied: 0,
@@ -2441,7 +2429,7 @@ impl<B: Budget> FilterStage<B> {
                 DecodedChunk::Bytes(bytes) => self
                     .held
                     .extend_from_slice(bytes)
-                    .map_err(|error| StreamDecodeError::Decode(error.into()))?,
+                    .map_err(|error| StreamDecodeError::Decode(error))?,
                 DecodedChunk::Repeated { byte, len } => {
                     self.held.resize(self.held.len() + len, byte)?;
                 }
@@ -2538,10 +2526,10 @@ fn read_compressed_block(input: &mut impl Read) -> Result<OwnedCompressedBlock> 
 }
 
 #[cfg(all(test, feature = "write"))]
-fn read_compressed_block_with_allowance<B: Budget>(
+fn read_compressed_block_with_allowance(
     input: &mut impl Read,
-    allowance: &B,
-) -> Result<OwnedCompressedBlock<B>> {
+    allowance: &Allowance,
+) -> Result<OwnedCompressedBlock> {
     read_compressed_block_salvaging(input, allowance, false)
 }
 
@@ -2554,11 +2542,11 @@ const CUT_BLOCK_MARGIN_BITS: usize = 128;
 /// read as the last, holding the bits there are, short of
 /// [`CUT_BLOCK_MARGIN_BITS`]: a symbol that runs on past them can't be
 /// decoded.
-fn read_compressed_block_salvaging<B: Budget>(
+fn read_compressed_block_salvaging(
     input: &mut impl Read,
-    allowance: &B,
+    allowance: &Allowance,
     salvage: bool,
-) -> Result<OwnedCompressedBlock<B>> {
+) -> Result<OwnedCompressedBlock> {
     let mut fixed = [0u8; 2];
     input
         .read_exact(&mut fixed)
@@ -2660,8 +2648,8 @@ pub(crate) enum FilterType {
 const PAST_DECLARED: Error = Error::InvalidData("RAR 5 stream continues past the declared size");
 
 /// Past the declared size a block may hold only whole filter records and the zero bits writers pad with.
-fn refuse_stream_past_declared<B: Budget>(
-    tables: &ReaderTables<B>,
+fn refuse_stream_past_declared(
+    tables: &ReaderTables,
     mut bits: BitReader<'_>,
     payload_bits: usize,
 ) -> Result<()> {
@@ -2748,12 +2736,12 @@ fn apply_filters_with_control(
 /// The part of a failed member's raw output that is final: up to the first
 /// filter the output doesn't cover, with the filters before it applied. A
 /// filter that fails leaves its block as decoded.
-fn salvaged_prefix<B: Budget>(
-    mut output: Buffer<u8, B>,
+fn salvaged_prefix(
+    mut output: Buffer<u8>,
     filters: &[PendingFilter],
     control: &crate::read_control::ReadControl,
-    allowance: &B,
-) -> Buffer<u8, B> {
+    allowance: &Allowance,
+) -> Buffer<u8> {
     let ends_by = |filter: &PendingFilter, len: usize| {
         filter
             .start
@@ -2780,11 +2768,11 @@ fn salvaged_prefix<B: Budget>(
     output
 }
 
-fn apply_filters_with_allowance<B: Budget>(
+fn apply_filters_with_allowance(
     output: &mut [u8],
     filters: &[PendingFilter],
     control: &crate::read_control::ReadControl,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()> {
     control.check_codec()?;
     for filter in filters {
@@ -2809,11 +2797,11 @@ pub(crate) fn apply_filter_data(
 ) -> Result<()> {
     apply_filter_data_with_allowance(data, filter, control, &Allowance::default())
 }
-pub(crate) fn apply_filter_data_with_allowance<B: Budget>(
+pub(crate) fn apply_filter_data_with_allowance(
     data: &mut [u8],
     filter: &PendingFilter,
     control: &crate::read_control::ReadControl,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()> {
     match filter.filter_type {
         FilterType::Delta => {
@@ -3011,7 +2999,7 @@ fn distance_from_slot_parts(slot: usize, bit_count: usize, extra_bits: u64) -> u
 
 #[derive(Debug)]
 pub struct HuffmanTable {
-    state: HuffmanState<Allowance>,
+    state: HuffmanState,
 }
 impl Clone for HuffmanTable {
     fn clone(&self) -> Self {
@@ -3035,8 +3023,8 @@ impl HuffmanTable {
     }
 }
 #[derive(Debug)]
-struct HuffmanState<B: Budget> {
-    state: super::canonical::Huffman<B>,
+struct HuffmanState {
+    state: super::canonical::Huffman,
     literals: ByteLiterals,
 }
 
@@ -3093,11 +3081,11 @@ impl ByteLiterals {
     }
 }
 
-impl<B: Budget> HuffmanState<B> {
+impl HuffmanState {
     pub fn is_empty(&self) -> bool {
         self.state.is_empty()
     }
-    fn from_lengths(lengths: &[u8], allowance: &B) -> Result<Self> {
+    fn from_lengths(lengths: &[u8], allowance: &Allowance) -> Result<Self> {
         let mut count = [0u16; 16];
         for &length in lengths {
             if length > 15 {
@@ -3150,26 +3138,21 @@ impl<B: Budget> HuffmanState<B> {
 impl BitReader<'_> {
     /// A call-free loop over a copy, so the reader stays in registers per literal.
     #[inline(always)]
-    fn literal_burst<B: Budget>(
-        &mut self,
-        table: &HuffmanState<B>,
-        end: usize,
-        out: &mut [u8],
-    ) -> usize {
+    fn literal_burst(&mut self, table: &HuffmanState, end: usize, out: &mut [u8]) -> usize {
         match table.literals {
-            ByteLiterals::Scalar => self.literal_run::<B, 0>(table, end, out),
-            ByteLiterals::All => self.literal_run::<B, 1>(table, end, out),
-            ByteLiterals::Gap { .. } => self.literal_run::<B, 2>(table, end, out),
-            ByteLiterals::Range { .. } => self.literal_run::<B, 3>(table, end, out),
+            ByteLiterals::Scalar => self.literal_run::<0>(table, end, out),
+            ByteLiterals::All => self.literal_run::<1>(table, end, out),
+            ByteLiterals::Gap { .. } => self.literal_run::<2>(table, end, out),
+            ByteLiterals::Range { .. } => self.literal_run::<3>(table, end, out),
         }
     }
 
     /// `SHAPE` is the [`ByteLiterals`] variant, so each loop carries only
     /// its own batch step.
     #[inline(always)]
-    fn literal_run<B: Budget, const SHAPE: u8>(
+    fn literal_run<const SHAPE: u8>(
         &mut self,
-        table: &HuffmanState<B>,
+        table: &HuffmanState,
         end: usize,
         out: &mut [u8],
     ) -> usize {

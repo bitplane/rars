@@ -196,8 +196,8 @@ fn independent_history_encrypted_digest_and_password_errors_match_stateful_decod
     }
 }
 
-fn entry_result<B: Budget>(
-    value: Result<ParallelExtractedEntry<B>>,
+fn entry_result(
+    value: Result<ParallelExtractedEntry>,
 ) -> std::result::Result<(String, Vec<u8>), String> {
     value
         .map(|entry| match entry {
@@ -209,12 +209,12 @@ fn entry_result<B: Budget>(
 }
 #[test]
 fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_errors() {
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
     for filter in [None, Some(FilterKind::Delta { channels: 2 })] {
         let (archive, _) = archive(ArchiveVersion::Rar50, filter);
         let file = archive.files().next().unwrap();
         let options = crate::ArchiveReadOptions::new().with_rar50_buffered_decode_limit(u64::MAX);
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         drop(
             reference_decode_parallel_entry(&archive, file, None, u64::MAX, options, &baseline)
                 .unwrap(),
@@ -222,8 +222,8 @@ fn independent_history_worker_limited_keeps_original_attempts_callbacks_and_erro
         assert_eq!(baseline.used(), 0);
         for fail_at in 0..=baseline.attempts() {
             for cancelled in [false, true] {
-                let old = RefusingBudget::new(fail_at);
-                let actual = RefusingBudget::new(fail_at);
+                let old = Allowance::refusing(fail_at);
+                let actual = Allowance::refusing(fail_at);
                 let old_token = crate::ReadCancellation::new();
                 let actual_token = crate::ReadCancellation::new();
                 // Use identical upfront cancellation, plus the decoder-level
@@ -334,14 +334,14 @@ fn independent_history_late_publication_cancellation_keeps_the_verified_prefix()
 }
 
 // Original d2 private-worker pipeline, independent of the history selection.
-fn reference_decode_parallel_entry<B: Budget>(
+fn reference_decode_parallel_entry(
     archive: &Archive,
     file: &FileHeader,
     password: Option<&[u8]>,
     buffered_decode_limit: u64,
     options: crate::ArchiveReadOptions<'_>,
-    allowance: &B,
-) -> Result<ParallelExtractedEntry<B>> {
+    allowance: &Allowance,
+) -> Result<ParallelExtractedEntry> {
     options.check_cancelled()?;
     let mut budget = crate::output_limit::OutputBudget::new(options);
     file.check_dictionary_limit(options.rar50_dictionary_size_limit)?;

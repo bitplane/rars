@@ -1,6 +1,7 @@
 //! Byte statistics that stand in for a sample encode when judging a filter.
 
-use crate::codec::workspace::{Budget, Buffer};
+use crate::codec::workspace::Allowance;
+use crate::codec::workspace::Buffer;
 use crate::codec::Result;
 
 /// Entries in each table [`x86_repeat_gain`] remembers operands in.
@@ -28,10 +29,10 @@ pub(crate) struct OperandRepeats {
 ///
 /// Only operands within the filter's 16 MiB reach either way are converted, as
 /// the filter converts only those.
-pub(crate) fn x86_repeat_gain<B: Budget>(
+pub(crate) fn x86_repeat_gain(
     data: &[u8],
     offset: usize,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<OperandRepeats> {
     let mut gain = OperandRepeats::default();
     if data.len() <= 4 {
@@ -79,7 +80,7 @@ const LZ_TABLE_BITS: u32 = 14;
 /// own order-0 entropy, and each match at a fixed cost plus the width of its
 /// distance, or less for the distance before. It builds no tables and writes
 /// nothing, so it costs a fraction of the lightest encode.
-pub(crate) fn lz_cost<B: Budget>(data: &[u8], allowance: &B) -> Result<u64> {
+pub(crate) fn lz_cost(data: &[u8], allowance: &Allowance) -> Result<u64> {
     let bits = data
         .len()
         .next_power_of_two()

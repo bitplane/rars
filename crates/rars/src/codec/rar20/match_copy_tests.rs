@@ -1,9 +1,9 @@
 use super::*;
-use crate::codec::workspace::RefusingBudget;
+use crate::codec::workspace::Allowance;
 
 // Original byte loop: an independent oracle for output and failure state.
-fn scalar_copy<B: Budget>(
-    state: &mut Reader20State<B>,
+fn scalar_copy(
+    state: &mut Reader20State,
     length: usize,
     offset: usize,
     target: usize,
@@ -23,9 +23,9 @@ fn scalar_copy<B: Budget>(
     }
     Ok(())
 }
-fn start<B: Budget>(
+fn start(
     old: bool,
-    state: &mut Reader20State<B>,
+    state: &mut Reader20State,
     length: usize,
     offset: usize,
     target: usize,
@@ -37,7 +37,7 @@ fn start<B: Budget>(
         state.copy_match(length, offset, target)
     }
 }
-fn drain<B: Budget>(old: bool, state: &mut Reader20State<B>, target: usize) -> Result<()> {
+fn drain(old: bool, state: &mut Reader20State, target: usize) -> Result<()> {
     if old {
         if let Some((length, offset, zero)) = state.pending_match.take() {
             scalar_copy(state, length, offset, target, zero)?;
@@ -47,7 +47,7 @@ fn drain<B: Budget>(old: bool, state: &mut Reader20State<B>, target: usize) -> R
         state.drain_pending_match(target)
     }
 }
-fn assert_same<B: Budget>(actual: &Reader20State<B>, expected: &Reader20State<B>) {
+fn assert_same(actual: &Reader20State, expected: &Reader20State) {
     assert_eq!(actual.output, expected.output);
     assert_eq!(actual.pending_match, expected.pending_match);
     assert_eq!(actual.base_offset, expected.base_offset);
@@ -55,7 +55,7 @@ fn assert_same<B: Budget>(actual: &Reader20State<B>, expected: &Reader20State<B>
 
 #[test]
 fn match_lengths_distances_and_checkpoints_agree_with_scalar_copy() {
-    fn check<B: Budget>(budget: &B) {
+    fn check(budget: &Allowance) {
         let seed: Vec<_> = (0..256).map(|i| (i % 23) as u8).collect();
         for base in [0, MAX_HISTORY] {
             for length in [0, 1, 2, 8, 9, 63, 64, 65, 128, 255, 258, 259, 260] {
@@ -66,11 +66,7 @@ fn match_lengths_distances_and_checkpoints_agree_with_scalar_copy() {
                     for chunk in [0, 1, 63, 64, 65, 260] {
                         let mut expected = Reader20State::with_allowance(budget);
                         expected.base_offset = base;
-                        expected
-                            .output
-                            .extend_from_slice(&seed)
-                            .map_err(Into::<Error>::into)
-                            .unwrap();
+                        expected.output.extend_from_slice(&seed).unwrap();
                         let mut actual = expected.try_clone().unwrap();
                         let end = actual.current_pos() + length;
                         let target = if chunk == 0 {
@@ -107,23 +103,15 @@ fn match_lengths_distances_and_checkpoints_agree_with_scalar_copy() {
 
 #[test]
 fn pending_long_matches_survive_history_trimming() {
-    fn check<B: Budget>(budget: &B) {
+    fn check(budget: &Allowance) {
         let seed: Vec<_> = (0..MAX_HISTORY + 127).map(|i| (i % 23) as u8).collect();
         for offset in [1, 3, 64, MAX_HISTORY] {
             let mut expected = Reader20State::with_allowance(budget);
-            expected
-                .output
-                .extend_from_slice(&seed)
-                .map_err(Into::<Error>::into)
-                .unwrap();
+            expected.output.extend_from_slice(&seed).unwrap();
             // Start with identical physical histories: unlimited checkpoints
             // may omit obsolete bytes before the forced trim exercised here.
             let mut actual = Reader20State::with_allowance(budget);
-            actual
-                .output
-                .extend_from_slice(&seed)
-                .map_err(Into::<Error>::into)
-                .unwrap();
+            actual.output.extend_from_slice(&seed).unwrap();
             let begin = actual.current_pos();
             start(true, &mut expected, 260, offset, begin + 67).unwrap();
             start(false, &mut actual, 260, offset, begin + 67).unwrap();
@@ -150,10 +138,10 @@ struct Outcome {
     result: Result<()>,
     output: Vec<u8>,
 }
-fn limited_run<B: Budget>(old: bool, budget: &B, offset: usize) -> Outcome {
+fn limited_run(old: bool, budget: &Allowance, offset: usize) -> Outcome {
     let mut state = Reader20State::with_allowance(budget);
     let result = (|| {
-        state.output.extend_from_slice(b"ABC").map_err(Into::into)?;
+        state.output.extend_from_slice(b"ABC")?;
         start(old, &mut state, 260, offset, 73)?;
         drain(old, &mut state, 263)
     })();
@@ -186,10 +174,10 @@ fn refusals_during_a_long_match_leave_a_prefix_and_release_everything() {
             );
             assert_eq!(budget.used(), 0);
         }
-        let baseline = RefusingBudget::new(usize::MAX);
+        let baseline = Allowance::refusing(usize::MAX);
         assert!(limited_run(false, &baseline, offset).result.is_ok());
         for failure in 0..=baseline.attempts() {
-            let budget = RefusingBudget::new(failure);
+            let budget = Allowance::refusing(failure);
             check(
                 limited_run(false, &budget, offset),
                 &format!("failure={failure}"),
@@ -202,7 +190,7 @@ fn refusals_during_a_long_match_leave_a_prefix_and_release_everything() {
 #[cfg(feature = "write")]
 #[test]
 fn encoded_long_matches_preserve_member_splits_and_streaming_solid_history() {
-    fn check<B: Budget>(budget: &B, data: &[u8], packed: &[u8], next: &[u8], packed_next: &[u8]) {
+    fn check(budget: &Allowance, data: &[u8], packed: &[u8], next: &[u8], packed_next: &[u8]) {
         // A declared size inside the match truncates the output; the window
         // keeps the rest of that match.
         let mut decoder = Reader20State::with_allowance(budget);

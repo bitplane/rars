@@ -1,5 +1,6 @@
 //! Common link extraction without changing the byte-oriented extraction APIs.
-use crate::codec::workspace::{Budget, Buffer};
+use crate::codec::workspace::Allowance;
+use crate::codec::workspace::Buffer;
 use crate::{Archive, ArchiveReadOptions, Error, ExtractedEntryMeta, Result};
 use std::io::Write;
 
@@ -262,9 +263,9 @@ fn link_error(error: Error, name: &[u8]) -> Error {
 
 // Decode through the same budget/session exactly once. Target storage remains
 // charged to the decoder's allowance until after the verified link callback.
-pub(crate) fn legacy_output<B: Budget>(
+pub(crate) fn legacy_output(
     meta: &crate::rar15_40::ExtractedEntryMeta,
-    allowance: &B,
+    allowance: &Allowance,
     control: &crate::read_control::ReadControl,
     links: &mut Option<&mut LegacyLink<'_>>,
     open: impl FnOnce() -> Result<Box<dyn Write>>,
@@ -276,9 +277,9 @@ pub(crate) fn legacy_output<B: Budget>(
     Ok(())
 }
 
-pub(crate) fn decode_legacy_output<B: Budget>(
+pub(crate) fn decode_legacy_output(
     meta: &crate::rar15_40::ExtractedEntryMeta,
-    allowance: &B,
+    allowance: &Allowance,
     control: &crate::read_control::ReadControl,
     links: &mut Option<&mut LegacyLink<'_>>,
     open: impl FnOnce() -> Result<Box<dyn Write>>,
@@ -299,7 +300,7 @@ pub(crate) fn decode_legacy_output<B: Budget>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::workspace::RefusingBudget;
+    use crate::codec::workspace::Allowance;
     use std::cell::Cell;
 
     fn meta() -> crate::rar15_40::ExtractedEntryMeta {
@@ -377,7 +378,7 @@ mod tests {
     #[test]
     fn target_storage_refusals_and_late_cancellation_do_not_emit_links() {
         for cancel_after_decode in [false, true] {
-            let allowance = RefusingBudget::new(if cancel_after_decode { usize::MAX } else { 0 });
+            let allowance = Allowance::refusing(if cancel_after_decode { usize::MAX } else { 0 });
             let token = crate::ReadCancellation::new();
             let control = crate::read_control::ReadControl::new(Some(&token));
             let calls = Cell::new(0);
@@ -407,7 +408,7 @@ mod tests {
 
     #[test]
     fn target_charge_is_live_during_callback_and_released_on_callback_error() {
-        let allowance = RefusingBudget::new(usize::MAX);
+        let allowance = Allowance::refusing(usize::MAX);
         let control = crate::read_control::ReadControl::default();
         let mut callback = |_: &crate::rar15_40::ExtractedEntryMeta, target: &[u8]| {
             assert_eq!(target, b"target");

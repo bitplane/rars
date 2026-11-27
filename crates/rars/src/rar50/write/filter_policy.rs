@@ -7,7 +7,7 @@ use crate::codec::rar50::{
 };
 #[cfg(test)]
 use crate::codec::workspace::Allowance;
-use crate::codec::workspace::{Budget, Buffer};
+use crate::codec::workspace::Buffer;
 use crate::filter_search::{encode_pass, EncodeProgress, OwnedSearch};
 
 fn borrow_progress<'a>(
@@ -55,14 +55,14 @@ pub(super) fn encode_member_with_filter_policy_candidates_and_progress(
     )
     .map(Buffer::into_vec)
 }
-pub(super) fn candidates_with_allowance<B: Budget>(
+pub(super) fn candidates_with_allowance(
     data: &[u8],
     algorithm_version: u8,
     policy: &FilterPolicy,
     candidates: &[EncodeOptions],
     mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     let mut remaining = candidates.iter().copied();
     let first = remaining.next().ok_or(Error::WriterFailure(
         "RAR 5 compression level has no encoder options",
@@ -622,7 +622,7 @@ const SCREENED_KINDS: [FilterKind; 5] = [
 /// lose.
 const RAR50_TABLE_SCAN_WINDOW: usize = 256;
 
-struct Rar50OwnedSearch<B: Budget> {
+struct Rar50OwnedSearch {
     algorithm_version: u8,
     /// Where the data searched starts in its member. The x86 filters convert
     /// by file position, so a run has to be measured at its own.
@@ -636,15 +636,14 @@ struct Rar50OwnedSearch<B: Budget> {
     /// Whether the samples are priced rather than encoded (see
     /// [`estimated_search`]).
     estimates: bool,
-    allowance: B,
+    allowance: Allowance,
 }
-impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
+impl OwnedSearch for Rar50OwnedSearch {
     type Options = EncodeOptions;
-    type Memory = B;
-    fn allowance(&self) -> &B {
+    fn allowance(&self) -> &Allowance {
         &self.allowance
     }
-    fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind, B>> {
+    fn screened_kinds(&self, _: &[u8]) -> Result<Buffer<FilterKind>> {
         Ok(Buffer::collect(SCREENED_KINDS, &self.allowance)?)
     }
     fn detects_x86(&self) -> bool {
@@ -677,7 +676,7 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
     fn estimates(&self) -> bool {
         self.estimates
     }
-    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8, B>> {
+    fn filtered_bytes(&self, data: &[u8], filters: &[FilterSpec]) -> Result<Buffer<u8>> {
         if self.file_offset != 0 {
             return Ok(crate::codec::rar50::filtered_run_bytes(
                 data,
@@ -697,7 +696,7 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         data: &[u8],
         offset: usize,
         filters: &[FilterSpec],
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         Ok(crate::codec::rar50::filtered_run_bytes(
             data,
             filters,
@@ -710,7 +709,7 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         data: &[u8],
         options: EncodeOptions,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         Ok(crate::codec::rar50::encode_owned_member(
             data,
             self.algorithm_version,
@@ -726,7 +725,7 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
         filters: &[FilterSpec],
         options: EncodeOptions,
         progress: Option<&mut dyn FnMut(usize) -> bool>,
-    ) -> Result<Buffer<u8, B>> {
+    ) -> Result<Buffer<u8>> {
         if self.file_offset != 0 {
             return Ok(crate::codec::rar50::encode_filtered_run(
                 data,
@@ -758,13 +757,13 @@ impl<B: Budget> OwnedSearch for Rar50OwnedSearch<B> {
 /// a piece at a time, on the grid the block path cuts it into runs and pieces,
 /// with the same search each of those gets, so both paths pick the same filters
 /// for a member.
-fn choose_owned_filter<B: Budget>(
+fn choose_owned_filter(
     data: &[u8],
     algorithm_version: u8,
     options: EncodeOptions,
     mut progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-    allowance: &B,
-) -> Result<crate::filter_search::FilterChoice<B>> {
+    allowance: &Allowance,
+) -> Result<crate::filter_search::FilterChoice> {
     let piece = filter_search_bytes();
     if data.len() <= piece {
         return crate::filter_search::choose_owned(
@@ -835,14 +834,14 @@ fn estimated_search(options: EncodeOptions) -> bool {
 /// The decoder converts x86 and ARM addresses from a 32-bit file offset, and
 /// the encoder refuses one past that, so a run reaching beyond
 /// [`FILTER_REACH`] stays unfiltered.
-pub(super) fn run_filters_with_allowance<B: Budget>(
+pub(super) fn run_filters_with_allowance(
     data: &[u8],
     file_offset: usize,
     algorithm_version: u8,
     options: EncodeOptions,
     cancelled: &dyn Fn() -> bool,
-    allowance: &B,
-) -> Result<Buffer<FilterSpec, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<FilterSpec>> {
     let mut progress = |_| !cancelled();
     piece_filters(
         data,
@@ -855,14 +854,14 @@ pub(super) fn run_filters_with_allowance<B: Budget>(
 }
 
 /// The search [`run_filters_with_allowance`] makes, reporting to `progress`.
-fn piece_filters<B: Budget>(
+fn piece_filters(
     data: &[u8],
     file_offset: usize,
     algorithm_version: u8,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<FilterSpec, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<FilterSpec>> {
     let past_offsets = file_offset
         .checked_add(data.len())
         .is_none_or(|end| end > FILTER_REACH);
@@ -903,14 +902,14 @@ fn run_search_options(options: EncodeOptions) -> EncodeOptions {
     search
 }
 
-fn specs_with_allowance<B: Budget>(
+fn specs_with_allowance(
     data: &[u8],
     algorithm_version: u8,
     filters: &[FilterSpec],
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     encode_pass(progress, |progress| {
         Ok(crate::codec::rar50::encode_owned_member(
             data,
@@ -949,14 +948,14 @@ pub(super) fn explicit_member_filter(spec: &FilterSpec, len: usize) -> Option<Fi
     (range.start < range.end).then(|| FilterSpec::range(spec.kind, range))
 }
 
-fn policy_with_allowance<B: Budget>(
+fn policy_with_allowance(
     data: &[u8],
     algorithm_version: u8,
     policy: &FilterPolicy,
     options: EncodeOptions,
     progress: Option<&mut dyn FnMut(EncodeProgress) -> bool>,
-    allowance: &B,
-) -> Result<Buffer<u8, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<u8>> {
     match policy {
         FilterPolicy::Auto if auto_size_filter_search_applies(data) => {
             choose_owned_filter(data, algorithm_version, options, progress, allowance)

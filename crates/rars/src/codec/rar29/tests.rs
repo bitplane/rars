@@ -35,16 +35,16 @@ fn unpack29_decode_with_vm(input: &[u8], output_size: usize) -> Result<Vec<u8>> 
 }
 
 fn refuse_each_rar29_allocation(
-    mut run: impl FnMut(&crate::codec::workspace::RefusingBudget) -> Result<()>,
+    mut run: impl FnMut(&crate::codec::workspace::Allowance) -> Result<()>,
 ) {
-    use crate::codec::workspace::RefusingBudget;
-    let baseline = RefusingBudget::new(usize::MAX);
+    use crate::codec::workspace::Allowance;
+    let baseline = Allowance::refusing(usize::MAX);
     run(&baseline).unwrap();
     let attempts = baseline.attempts();
     assert!(attempts > 0);
     assert_eq!(baseline.used(), 0);
     for index in 0..attempts {
-        let budget = RefusingBudget::new(index);
+        let budget = Allowance::refusing(index);
         assert!(
             matches!(run(&budget), Err(Error::Cancelled)),
             "allocation {index}"
@@ -167,7 +167,7 @@ fn reader_rar29_returned_output_keeps_reservation_after_decoder_drop() {
     assert_eq!(ledger.used(), 0);
 }
 
-type Unpack29 = super::Reader29State<super::Allowance>;
+type Unpack29 = super::Reader29State;
 #[test]
 fn ppmd_progress_preserves_bytes_and_interrupts_both_engines() {
     let input = b"PPMd cooperative cancellation payload\n".repeat(400);

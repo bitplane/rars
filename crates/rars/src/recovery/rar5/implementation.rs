@@ -3,7 +3,7 @@ use super::checksum::{crc64_update, CRC64_XZ_INIT};
 use super::{crc64_rar_state, crc64_xz};
 use super::{Error, Result};
 
-use crate::codec::workspace::{Allowance, Budget, Buffer};
+use crate::codec::workspace::{Allowance, Buffer};
 const FIELD_SIZE: usize = 65_535;
 const FIELD_MASK: u32 = 0xffff;
 const PRIMITIVE_POLYNOMIAL: u32 = 0x1100b;
@@ -319,9 +319,8 @@ pub(crate) fn choose_recovery_capacity_mode(
     memory_limit: u64,
     allowance: &crate::codec::workspace::Limited,
 ) -> Result<(RecoveryMemoryMode, u64)> {
-    use crate::codec::workspace::Limited;
     let rows = plan.recovery_shards;
-    let descriptor = std::mem::size_of::<Buffer<u8, Limited>>() as u64;
+    let descriptor = std::mem::size_of::<Buffer<u8>>() as u64;
     let fixed = rows
         .saturating_mul(descriptor)
         .saturating_add(rows.saturating_mul(plan.data_shards).saturating_mul(2))
@@ -472,7 +471,7 @@ pub(crate) const MAX_STREAMED_RECOVERY_PREFIX: u64 = MAX_WINRAR602_DATA_SHARDS
         & !1);
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
+pub(crate) fn streamed_recovery_with_allowance(
     body: &mut dyn ReadSeek,
     body_len: u64,
     plan: InlineRecoveryPlan,
@@ -481,7 +480,7 @@ pub(crate) fn streamed_recovery_with_allowance<B: Budget>(
     sink: &mut dyn std::io::Write,
     progress: Option<ProgressReporter<'_>>,
     pass: usize,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<StreamedRecoveryOutput> {
     check_recovery_cancelled(progress)?;
     // Fail on unrepresentable geometry before doing any work.
@@ -665,11 +664,11 @@ fn check_recovery_cancelled(progress: Option<ProgressReporter<'_>>) -> Result<()
     Ok(())
 }
 
-fn rows_with_allowance<B: Budget>(
+fn rows_with_allowance(
     rows: usize,
     width: usize,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     let mut out = Buffer::with_capacity(rows, allowance)?;
     for _ in 0..rows {
         out.push_admitted(Buffer::filled(width, 0u8, allowance)?);
@@ -677,12 +676,12 @@ fn rows_with_allowance<B: Budget>(
     Ok(out)
 }
 
-fn encoder_matrix_with_allowance<B: Budget>(
+fn encoder_matrix_with_allowance(
     data_shards: usize,
     recovery_shards: usize,
     gf: &GfView<'_>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u16, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u16>>> {
     if data_shards == 0
         || recovery_shards == 0
         || data_shards
@@ -703,15 +702,15 @@ fn encoder_matrix_with_allowance<B: Budget>(
 }
 
 /// Parity rows, wherever they happen to live.
-enum ParityRows<'a, B: Budget> {
-    Resident(Buffer<Buffer<u8, B>, B>),
+enum ParityRows<'a> {
+    Resident(Buffer<Buffer<u8>>),
     Spooled {
         scratch: &'a mut dyn ReadWriteSeek,
         group_count: u64,
     },
 }
 
-impl<B: Budget> ParityRows<'_, B> {
+impl ParityRows<'_> {
     /// Feeds row `index` to `visit` in buffer-sized pieces.
     fn for_each_chunk(
         &mut self,
@@ -814,13 +813,13 @@ fn parity_work_split(
 }
 
 /// A refused task list leaves the work on this thread rather than failing the write.
-fn accumulate_shard<B: Budget>(
-    parity: &mut [Buffer<u8, B>],
+fn accumulate_shard(
+    parity: &mut [Buffer<u8>],
     offset: usize,
     source: &[u8],
-    matrix: &[Buffer<u16, B>],
+    matrix: &[Buffer<u16>],
     shard_index: usize,
-    allowance: &B,
+    allowance: &Allowance,
 ) {
     let threads = if crate::parallel::may_nest() {
         crate::parallel::threads()
@@ -884,16 +883,16 @@ fn accumulate_shard<B: Budget>(
 
 /// Single forward pass over the body, holding every parity row in memory.
 #[allow(clippy::too_many_arguments)]
-fn encode_parity_resident<B: Budget>(
+fn encode_parity_resident(
     body: &mut dyn ReadSeek,
     body_len: u64,
     plan: &InlineRecoveryPlan,
-    matrix: &[Buffer<u16, B>],
+    matrix: &[Buffer<u16>],
     shard_states: &mut [u64],
     encode_units: u64,
     report: &dyn Fn(u64) -> Result<()>,
-    allowance: &B,
-) -> Result<Buffer<Buffer<u8, B>, B>> {
+    allowance: &Allowance,
+) -> Result<Buffer<Buffer<u8>>> {
     // The streaming entry point admitted these as native-size values.
     let group_count = plan.group_count as usize;
     let recovery_shards = plan.recovery_shards as usize;
@@ -942,17 +941,17 @@ fn encode_parity_resident<B: Budget>(
 /// Column-stripe pass: bounded memory, one seek per data shard per stripe,
 /// and the body still read exactly once in total.
 #[allow(clippy::too_many_arguments)]
-fn encode_parity_striped<B: Budget>(
+fn encode_parity_striped(
     body: &mut dyn ReadSeek,
     body_len: u64,
     plan: &InlineRecoveryPlan,
-    matrix: &[Buffer<u16, B>],
+    matrix: &[Buffer<u16>],
     shard_states: &mut [u64],
     stripe_len: usize,
     scratch: &mut dyn ReadWriteSeek,
     encode_units: u64,
     report: &dyn Fn(u64) -> Result<()>,
-    allowance: &B,
+    allowance: &Allowance,
 ) -> Result<()> {
     let recovery_shards = plan.recovery_shards as usize;
     if plan.group_count == 0 {

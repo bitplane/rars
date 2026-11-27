@@ -3,18 +3,18 @@
 use crate::{Error, Result};
 use std::convert::Infallible;
 use std::marker::PhantomData;
-pub(crate) struct Reader<R, B = ()> {
+pub(crate) struct Reader<R> {
     unavailable: Infallible,
-    _parameters: PhantomData<(R, B)>,
+    _parameters: PhantomData<R>,
 }
-impl<R, B> Reader<R, B> {
+impl<R> Reader<R> {
     pub(crate) fn with_allowance(
         _inner: R,
         _version: u8,
         _password: &[u8],
         _salt: Option<[u8; 8]>,
         _key_cache: &crate::key_cache::KeyCache,
-        _allowance: &B,
+        _allowance: &crate::codec::workspace::Allowance,
     ) -> Result<Self> {
         Err(Error::FeatureDisabled {
             feature: "encryption",
@@ -23,15 +23,14 @@ impl<R, B> Reader<R, B> {
     pub(crate) fn dropping_cut_block(self, _drop: bool) -> Self {
         match self.unavailable {}
     }
-}
-impl<R> Reader<R> {
+
     pub(crate) fn with_keys(_inner: R, _key: [u8; 32], _iv: [u8; 16]) -> Result<Self> {
         Err(Error::FeatureDisabled {
             feature: "encryption",
         })
     }
 }
-impl<R, B> std::io::Read for Reader<R, B> {
+impl<R> std::io::Read for Reader<R> {
     fn read(&mut self, _out: &mut [u8]) -> std::io::Result<usize> {
         match self.unavailable {}
     }
