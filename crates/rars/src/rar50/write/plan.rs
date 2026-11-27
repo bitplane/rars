@@ -2,7 +2,6 @@
 
 use super::FilterPolicy;
 use crate::codec::rar50::EncodeOptions;
-use crate::streaming::preparation::Records;
 use crate::{Result, WriterResources};
 
 /// How much of a run one filter search covers when a member is too large to
@@ -108,7 +107,7 @@ pub(super) enum ExecutionPlan {
         admission: u64,
         run_filters: bool,
     },
-    IndependentMembers(Records<MemberPlan>),
+    IndependentMembers(Vec<MemberPlan>),
 }
 
 impl ExecutionPlan {
@@ -166,8 +165,8 @@ impl ExecutionPlan {
                 run_filters,
             });
         }
-        Ok(Self::IndependentMembers(Records::collect(
-            sizes.map(|size| {
+        Ok(Self::IndependentMembers(
+            (sizes.map(|size| {
                 let required = whole_member_workspace(size, settings);
                 let routing = whole_member_routing_workspace(size, settings);
                 // A run's search is a piece of the member's, so it fits too.
@@ -203,9 +202,9 @@ impl ExecutionPlan {
                     });
                 };
                 Ok(MemberPlan::in_runs(settings, size, fallback, limit))
-            }),
-            resources,
-        )?))
+            }))
+            .collect::<Result<Vec<_>>>()?,
+        ))
     }
 
     /// Coded whole, an explicit-filter member could not go out as it is packed.
@@ -410,7 +409,7 @@ pub(super) struct CompressPlan {
     /// filters search the whole member when it fits the memory budget, and
     /// each run of it when it does not.
     pub(super) filter_policy: FilterPolicy,
-    pub(super) candidates: Records<EncodeOptions>,
+    pub(super) candidates: Vec<EncodeOptions>,
     /// Hash members with BLAKE2sp as well as CRC32, for an archive that
     /// stores the hash.
     pub(super) blake2sp: bool,
@@ -522,7 +521,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options].into(),
+            candidates: vec![encode_options],
             blake2sp: true,
         }
     }
@@ -588,7 +587,7 @@ mod tests {
         // over the last run, so it stays whole.
         let mut optimal = settings.clone();
         optimal.encode_options = optimal.encode_options.with_optimal_parse(true);
-        optimal.candidates = vec![optimal.encode_options].into();
+        optimal.candidates = vec![optimal.encode_options];
         let optimal = ExecutionPlan::new(&optimal, [search + 1].into_iter(), u64::MAX);
         assert_eq!(optimal.members()[0].execution, Execution::WholeMember);
     }
@@ -624,10 +623,7 @@ mod tests {
     fn candidate_trials_cannot_silently_fall_back() {
         let mut settings = settings();
         settings.filter_policy = FilterPolicy::None;
-        settings
-            .candidates
-            .push_growing(settings.encode_options)
-            .unwrap();
+        settings.candidates.push(settings.encode_options);
         let execution = ExecutionPlan::new(&settings, [16].into_iter(), 1);
         assert_eq!(execution.members()[0].execution, Execution::WholeMember);
         assert!(execution.members()[0].workspace > 1);
@@ -638,7 +634,7 @@ mod tests {
         let mut settings = settings();
         settings.filter_policy = FilterPolicy::None;
         settings.encode_options = settings.encode_options.with_optimal_parse(true);
-        settings.candidates = vec![settings.encode_options].into();
+        settings.candidates = vec![settings.encode_options];
         let member = 160 * 1024;
         let charge = |input: u64| {
             super::super::streaming_lz_workspace(settings.dictionary_size, input as usize, true)
@@ -729,7 +725,7 @@ mod tests {
         let settings = CompressPlan {
             encode_options: options,
             dictionary_size: dictionary,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
             ..settings()
         };
@@ -776,7 +772,6 @@ mod tests {
             FilterPolicy::Auto,
             size,
             resources.planning_memory_limit(),
-            resources,
         )
         .unwrap();
         let admission = match ExecutionPlan::with_resources(
@@ -879,16 +874,5 @@ mod tests {
         }
         let custom = ExecutionPlan::new(&settings, [size].into_iter(), required);
         assert_eq!(custom.members()[0].execution, Execution::WholeMember);
-    }
-
-    #[test]
-    fn independent_member_planning_respects_the_execution_ledger() {
-        let ledger = crate::codec::workspace::Allowance::limited(0);
-        let resources = WriterResources::default().with_execution_allowance(ledger.clone());
-        let error = ExecutionPlan::with_resources(&settings(), [1].into_iter(), &resources)
-            .err()
-            .unwrap();
-        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
-        assert_eq!(ledger.used(), 0);
     }
 }

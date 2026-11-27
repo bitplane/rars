@@ -45,7 +45,7 @@ use crate::recovery::rar5::{
     choose_recovery_memory_mode, plan_inline_recovery, streamed_recovery_with_allowance,
     ReadWriteSeek,
 };
-use crate::streaming::preparation::{Bytes, Owned, Records};
+use crate::streaming::preparation::Bytes;
 use crate::streaming::Spool;
 use crate::write_progress::{check_cancelled, CancellableIo, ProgressReporter, WorkTracker};
 use crate::write_stream::{patch_header, CallerOutput, CancellableOutput};
@@ -103,7 +103,7 @@ enum Payload<'a> {
     Packed(Spool),
     /// Encrypted on the way out, so the ciphertext is never stored anywhere.
     Encrypted {
-        plain: Owned<PlainPayload<'a>>,
+        plain: Box<PlainPayload<'a>>,
         keys: Rar50Keys,
         iv: [u8; 16],
     },
@@ -292,9 +292,9 @@ pub(super) fn write_archive<'a>(
         None
     };
 
-    let mut sources = Records::new(entries.len(), resources)?;
+    let mut sources = Vec::with_capacity(entries.len());
     for entry in entries {
-        sources.push(entry.source.clone())?;
+        sources.push(entry.source.clone());
     }
     let total_input = total_input_size(entries)?;
     let total_entries = entries.len();
@@ -440,15 +440,15 @@ pub(super) fn write_archive<'a>(
         Ok(())
     };
 
-    let mut leading = Records::<PreparedBlock>::new(2, resources)?;
-    leading.push(producer_block(header_keys.as_ref(), resources)?)?;
+    let mut leading = Vec::<PreparedBlock>::with_capacity(2);
+    leading.push(producer_block(header_keys.as_ref(), resources)?);
     if let Some(comment) = &plan.archive_comment {
         leading.push(prepare_comment(
             comment,
             &mut write_keys,
             header_keys.as_ref(),
             resources,
-        )?)?;
+        )?);
     }
     // Drawn here whether the main header goes out before the members or after,
     // so a seekable and a stream output draw in the same order.
@@ -491,9 +491,9 @@ pub(super) fn write_archive<'a>(
     let (mut held, mut leading) = if in_order {
         (None, Some(leading))
     } else {
-        let mut held = Records::<PreparedBlock>::new(block_count, resources)?;
+        let mut held = Vec::<PreparedBlock>::with_capacity(block_count);
         for block in leading {
-            held.push(block)?;
+            held.push(block);
         }
         (Some(held), None)
     };
@@ -518,7 +518,7 @@ pub(super) fn write_archive<'a>(
             check_cancelled(plan.progress)?;
             let entry = &entries[index];
             // A member and its services are all prepared before any goes out.
-            let mut blocks = Records::<PreparedBlock>::new(1 + entry.services.len(), resources)?;
+            let mut blocks = Vec::<PreparedBlock>::with_capacity(1 + entry.services.len());
             let mut opening = None;
             match handed {
                 Handed::Packed(bytes) => {
@@ -539,7 +539,7 @@ pub(super) fn write_archive<'a>(
                         resources,
                     )
                     .map_err(|error| member_error(error, &entry.name, "preparing"))?;
-                    blocks.push(block)?;
+                    blocks.push(block);
                 }
                 Handed::Closed(closed) => {
                     let member = in_place.take().expect("a member closes after it opens");
@@ -556,7 +556,7 @@ pub(super) fn write_archive<'a>(
                             resources,
                         )
                         .map_err(|error| member_error(error, &entry.name, "preparing"))?;
-                        blocks.push(block)?;
+                        blocks.push(block);
                     }
                     let header_at = member.header_at;
                     let patched = member
@@ -574,7 +574,7 @@ pub(super) fn write_archive<'a>(
                             .map_err(|error| {
                                 member_error(error, &entry.name, "preparing service")
                             })?;
-                    blocks.push(block)?;
+                    blocks.push(block);
                 }
             }
             if held.is_none() {
@@ -608,7 +608,7 @@ pub(super) fn write_archive<'a>(
             for mut block in blocks {
                 block.entry_index = Some(index);
                 match held.as_mut() {
-                    Some(held) => held.push(block)?,
+                    Some(held) => held.push(block),
                     None => emit(
                         block,
                         &mut sink,
@@ -977,7 +977,7 @@ fn vint_width(value: u64) -> usize {
 /// Spooled, as headers for many members would not fit in memory.
 struct WrittenHeaders {
     headers: Spool,
-    at: Records<(u64, usize)>,
+    at: Vec<(u64, usize)>,
     longest: usize,
 }
 
@@ -985,7 +985,7 @@ impl WrittenHeaders {
     fn new(blocks: usize, resources: &WriterResources) -> Result<Self> {
         Ok(Self {
             headers: Spool::create_parked(resources)?,
-            at: Records::new(blocks, resources)?,
+            at: Vec::with_capacity(blocks),
             longest: 0,
         })
     }
@@ -993,7 +993,7 @@ impl WrittenHeaders {
     fn record(&mut self, at: u64, header: &[u8]) -> Result<()> {
         self.headers.write_all(header)?;
         self.headers.park();
-        self.at.push((at, header.len()))?;
+        self.at.push((at, header.len()));
         self.longest = self.longest.max(header.len());
         Ok(())
     }
@@ -1361,7 +1361,7 @@ fn encrypted_service_block<'a>(
     Ok(PreparedBlock {
         header,
         payload: Payload::Encrypted {
-            plain: Owned::new(PlainPayload::Borrowed(data), resources)?,
+            plain: Box::new(PlainPayload::Borrowed(data)),
             keys,
             iv,
         },
@@ -1436,7 +1436,7 @@ fn prepare_member<'a>(
             };
             (
                 Payload::Encrypted {
-                    plain: Owned::new(plain.into(), resources)?,
+                    plain: Box::new(plain.into()),
                     keys,
                     iv,
                 },
@@ -1920,7 +1920,7 @@ fn write_payload(
             let _permit = resources.acquire_cancellable(chunk_size as u64, 0, &|| {
                 progress.is_some_and(ProgressReporter::is_cancelled)
             })?;
-            match plain.into_inner() {
+            match *plain {
                 PlainPayload::Stored(source) => {
                     let mut reader = source.open(copy_work.filter(|_| source.hashed_on_copy))?;
                     encrypt_reader_to(
@@ -2451,7 +2451,7 @@ enum FragmentSource {
     },
     Stored {
         prepared: PreparedSource,
-        emitted: Owned<ChecksumSink>,
+        emitted: Box<ChecksumSink>,
         /// Open from the first fragment to the last, so the member is read
         /// once, front to back, whatever volumes it is cut across.
         reader: Option<Box<dyn crate::EntryReader>>,
@@ -2897,7 +2897,7 @@ pub(super) fn write_volumes_above<'a>(
     // Every member's salt and IV are drawn before any volume header's, so a
     // set draws its entropy in one order however its members and volumes
     // interleave.
-    let mut member_ivs = Records::new(entries.len(), resources)?;
+    let mut member_ivs = Vec::with_capacity(entries.len());
     for entry in entries {
         member_ivs.push(match entry.password.as_deref() {
             Some(password) => {
@@ -2905,12 +2905,12 @@ pub(super) fn write_volumes_above<'a>(
                 Some(fresh_iv()?)
             }
             None => None,
-        })?;
+        });
     }
 
-    let mut sources = Records::new(entries.len(), resources)?;
+    let mut sources = Vec::with_capacity(entries.len());
     for entry in entries {
-        sources.push(entry.source.clone())?;
+        sources.push(entry.source.clone());
     }
     let total_input = total_input_size(entries)?;
     let total_entries = entries.len();
@@ -3109,7 +3109,7 @@ fn prepare_volume_member<'a>(
     let (crc32, hash) = (member.crc32, member.hash);
     let plain = if member.store {
         FragmentSource::Stored {
-            emitted: Owned::new(ChecksumSink::new(member.hash.is_some()), resources)?,
+            emitted: Box::new(ChecksumSink::new(member.hash.is_some())),
             prepared: PreparedSource::new(&entry.source, &member, member.checksums_pending),
             reader: None,
         }
@@ -4139,7 +4139,7 @@ struct Cutter<'a> {
     split_before: bool,
     open: Option<OpenFragment>,
     /// Earlier volumes the member's fragments went into.
-    pending: Records<Pending>,
+    pending: Vec<Pending>,
     /// The member's fragment in the volume being filled, once cut.
     current: Option<CutFragment>,
     /// The rest of the payload, from `start` on, once it cannot go straight
@@ -4229,7 +4229,7 @@ impl<'a> VolumeInPlace<'a> {
                 start: 0,
                 split_before: false,
                 open: None,
-                pending: Records::new(if may_store { MOST_OPEN_VOLUMES } else { 0 }, resources)?,
+                pending: Vec::with_capacity(if may_store { MOST_OPEN_VOLUMES } else { 0 }),
                 current: None,
                 rest: None,
             },
@@ -4477,7 +4477,8 @@ impl Cutter<'_> {
         };
         if self.pending.len() < MOST_OPEN_VOLUMES {
             let volume = writer.take_volume();
-            return self.pending.push(Pending { volume, fragment });
+            self.pending.push(Pending { volume, fragment });
+            return Ok(());
         }
         // The volume stays the one being filled, and is left once the
         // member's length is known.
@@ -4488,7 +4489,7 @@ impl Cutter<'_> {
 
     /// Cuts the rest of a member that turned out not to be stored.
     fn finish(mut self, writer: &mut VolumeWriter) -> Result<()> {
-        let pending = std::mem::replace(&mut self.pending, Records::new(0, writer.resources)?);
+        let pending = std::mem::replace(&mut self.pending, Vec::with_capacity(0));
         for pending in pending {
             writer.seal(pending.volume, true)?;
         }
@@ -5714,7 +5715,7 @@ mod emission_ledger_tests {
                     .encrypt_in_place(&mut expected)
                     .unwrap();
                 let payload = Payload::Encrypted {
-                    plain: Owned::new(PlainPayload::Borrowed(&data), &resources).unwrap(),
+                    plain: Box::new(PlainPayload::Borrowed(&data)),
                     keys,
                     iv: [2; 16],
                 };
@@ -5836,7 +5837,7 @@ mod emission_ledger_tests {
                 solid: false,
                 method: 0,
                 filter_policy: super::super::FilterPolicy::None,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             },
             recovery_percent: cfg!(feature = "recovery").then_some(10),
@@ -6013,7 +6014,7 @@ mod emission_ledger_tests {
                         assert_eq!(*actual_limit, limit);
                         assert!(*required > limit);
                         refusals += 1;
-                        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                        drop(Vec::<u8>::with_capacity(limit as usize));
                         limit = *required;
                         assert!(limit < 64 * 1024, "tiny archive used too much preparation");
                     }
@@ -6052,7 +6053,7 @@ mod emission_ledger_tests {
                         assert_eq!(*actual_limit, limit);
                         assert!(*required > limit);
                         refusals += 1;
-                        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                        drop(Vec::<u8>::with_capacity(limit as usize));
                         limit = *required;
                         assert!(
                             limit < 1024 * 1024,
@@ -6096,7 +6097,7 @@ mod emission_ledger_tests {
                     Error::WriterPreparationLimitExceeded { required, .. } => {
                         assert!(*required > limit);
                         refusals += 1;
-                        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                        drop(Vec::<u8>::with_capacity(limit as usize));
                         limit = *required;
                         assert!(
                             limit < 64 * 1024,
@@ -6129,7 +6130,7 @@ mod emission_ledger_tests {
             Error::WriterPreparationLimitExceeded { limit: 128, .. }
         ));
         assert!(output.is_empty());
-        drop(Records::<u8>::new(128, &resources).unwrap());
+        drop(Vec::<u8>::with_capacity(128));
     }
 
     #[test]
@@ -6161,7 +6162,7 @@ mod emission_ledger_tests {
                     CallerOutput::stream(&mut output),
                 );
                 assert_eq!(resources.workspace_in_use(), 0);
-                drop(Records::<u8>::new(limit as usize, &resources).unwrap());
+                drop(Vec::<u8>::with_capacity(limit as usize));
                 match result {
                     Ok(()) => {
                         assert!(!output.is_empty());
@@ -6210,7 +6211,7 @@ mod emission_ledger_tests {
             error,
             Error::WriterPreparationLimitExceeded { limit: 512, .. }
         ));
-        drop(Records::<u8>::new(512, &resources).unwrap());
+        drop(Vec::<u8>::with_capacity(512));
     }
 
     #[test]

@@ -321,7 +321,6 @@ pub(super) fn write_volumes_above(
                 extras.filter_policy,
                 dictionary_reach(entries, options.features.solid),
                 resources.planning_memory_limit(),
-                resources,
             )?,
             recovery_percent: extras.recovery_percent,
             header_encrypted: options.features.header_encryption,
@@ -553,7 +552,6 @@ fn write_archive_reporting(
                 extras.filter_policy,
                 dictionary_reach(entries, options.features.solid),
                 resources.planning_memory_limit(),
-                resources,
             )?,
             recovery_percent,
             header_encrypted: options.features.header_encryption,
@@ -599,7 +597,6 @@ fn compression_plan(
     filter_policy: FilterPolicy,
     content: u64,
     memory_limit: u64,
-    resources: &WriterResources,
 ) -> Result<compress::CompressPlan> {
     let method = compression_method_for_level(options.compression_level)?;
     let filter_policy = filter_policy_for_level(filter_policy, options.compression_level);
@@ -621,10 +618,7 @@ fn compression_plan(
         solid: options.features.solid,
         method,
         filter_policy,
-        candidates: crate::streaming::preparation::Records::collect(
-            candidates.into_iter().map(Ok),
-            resources,
-        )?,
+        candidates: candidates.to_vec(),
         blake2sp: options.features.blake2sp,
     })
 }
@@ -1202,30 +1196,6 @@ mod tests {
                 .kind(),
             crate::ErrorKind::SourceChanged
         );
-    }
-
-    #[test]
-    fn volume_compression_plan_refusal_does_not_open_sources_or_start_a_volume() {
-        let entries = [super::ArchiveEntry::new(
-            b"file".to_vec(),
-            crate::EntrySource::from_opener(1, || panic!("plan refusal opened source")),
-        )];
-        let resources = crate::WriterResources::default().with_max_preparation_bytes(0);
-        let mut volumes = super::CollectedVolumes::new();
-        let error = super::write_streaming_volumes_to(
-            &entries,
-            super::WriterOptions::new(
-                crate::ArchiveVersion::Rar50,
-                crate::FeatureSet::store_only(),
-            ),
-            super::ArchiveExtras::default(),
-            64,
-            &mut volumes,
-            &resources,
-        )
-        .unwrap_err();
-        assert_eq!(error.kind(), crate::ErrorKind::ResourceLimit);
-        assert!(volumes.take().is_empty());
     }
 
     #[test]
@@ -2534,7 +2504,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![encode_options].into(),
+            candidates: vec![encode_options],
             blake2sp: true,
         };
         // A job stops at the first block ending past run_size, and a block

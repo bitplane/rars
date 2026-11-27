@@ -35,7 +35,6 @@ use crate::codec::rar50::{
 use crate::codec::workspace::{Allowance, Buffer};
 use crate::crc32::Crc32;
 use crate::rar50::blake2sp;
-use crate::streaming::preparation::Records;
 use crate::streaming::Spool;
 use crate::{EntrySource, Error, Result, WriterResources};
 use std::io::{Read, Write};
@@ -92,13 +91,13 @@ impl CompressionProgress for BatchProgress<'_> {
 /// stay owned until all callbacks join, even if one callback fails. The caller
 /// retains its workspace reservation through consumption of returned results.
 fn run_jobs<T: Send, O: Send>(
-    jobs: Records<T>,
+    jobs: Vec<T>,
     resources: &WriterResources,
     progress: &dyn CompressionProgress,
     map: impl Fn(T, &dyn CompressionProgress) -> Result<O> + Sync + Send,
-) -> Result<Records<O>> {
-    let output = Records::new(jobs.len(), resources)?;
-    let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
+) -> Result<Vec<O>> {
+    let output = Vec::with_capacity(jobs.len());
+    let slots = (jobs.into_iter().map(|job| Ok((Some(job), None)))).collect::<Result<Vec<_>>>()?;
     complete_jobs(slots, output, resources, progress, |_, job, progress| {
         map(job, progress)
     })
@@ -107,12 +106,12 @@ fn run_jobs<T: Send, O: Send>(
 type JobSlot<T, O> = (Option<T>, Option<Result<O>>);
 
 fn complete_jobs<T: Send, O: Send>(
-    slots: Records<JobSlot<T, O>>,
-    output: Records<O>,
+    slots: Vec<JobSlot<T, O>>,
+    output: Vec<O>,
     resources: &WriterResources,
     progress: &dyn CompressionProgress,
     map: impl Fn(usize, T, &dyn CompressionProgress) -> Result<O> + Sync + Send,
-) -> Result<Records<O>> {
+) -> Result<Vec<O>> {
     complete_jobs_dispatched(slots, output, resources, progress, map, |slots, run| {
         crate::parallel::for_each_mut(slots, |index, slot| run(index, slot, None));
     })
@@ -124,13 +123,13 @@ type RunSlot<'a, T, O> = dyn Fn(usize, &mut JobSlot<T, O>, Option<Error>) + Sync
 /// [`complete_jobs`], with `dispatch` deciding when each slot runs. It must
 /// run every slot once and return only when all have run.
 fn complete_jobs_dispatched<T: Send, O: Send>(
-    mut slots: Records<JobSlot<T, O>>,
-    mut output: Records<O>,
+    mut slots: Vec<JobSlot<T, O>>,
+    mut output: Vec<O>,
     resources: &WriterResources,
     progress: &dyn CompressionProgress,
     map: impl Fn(usize, T, &dyn CompressionProgress) -> Result<O> + Sync + Send,
     dispatch: impl FnOnce(&mut [JobSlot<T, O>], &RunSlot<'_, T, O>),
-) -> Result<Records<O>> {
+) -> Result<Vec<O>> {
     let batch = BatchProgress {
         progress,
         resources,
@@ -170,7 +169,7 @@ fn complete_jobs_dispatched<T: Send, O: Send>(
         return Err(Error::Cancelled);
     }
     for (_, result) in slots {
-        output.push(result.expect("all jobs completed")?)?;
+        output.push(result.expect("all jobs completed")?);
     }
     Ok(output)
 }
@@ -204,22 +203,22 @@ struct BlockJob {
     data: Buffer<u8>,
     history: Buffer<u8>,
     /// Member index, end within `data`, and final-block flag.
-    blocks: Records<(usize, usize, bool)>,
+    blocks: Vec<(usize, usize, bool)>,
     /// Where `data` starts in its member. Only filtered runs read it.
     offset: usize,
     /// Where one run ends and the next starts in `data`, when the job codes
     /// several runs of its member back to back: see [`runs_per_job`]. Each
     /// run keeps its own filter search, filters and blocks, so only the tree
     /// it would have seeded is saved.
-    seams: Records<usize>,
+    seams: Vec<usize>,
     /// Filters ranged over `data`, each inside one run. A run with any is
     /// coded as one filtered stream, cut where its filter records fit rather
     /// than at `blocks`.
-    filters: Records<crate::FilterSpec>,
+    filters: Vec<crate::FilterSpec>,
     /// In a solid run, where each member's bytes lie in `data` and how far
     /// into the member they start. A solid run can hold several members, and
     /// a filter converts by position in its own.
-    segments: Records<(std::ops::Range<usize>, usize)>,
+    segments: Vec<(std::ops::Range<usize>, usize)>,
     /// In a solid run that was filtered, each block's filter records. `data`
     /// already holds the filtered bytes, and the blocks stay as they were.
     records: Option<Buffer<Buffer<EncodeFilter>>>,
@@ -889,8 +888,8 @@ pub(super) fn compress_members_with_context(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Records<CompressedMember>> {
-    let mut members = Records::new(sources.len(), resources)?;
+) -> Result<Vec<CompressedMember>> {
+    let mut members = Vec::with_capacity(sources.len());
     compress_members_in_order(
         sources,
         plan,
@@ -900,7 +899,10 @@ pub(super) fn compress_members_with_context(
         false,
         &|_, _| false,
         &mut |_, handed| match handed {
-            Handed::Member(member) => members.push(member),
+            Handed::Member(member) => {
+                members.push(member);
+                Ok(())
+            }
             _ => unreachable!("no member goes out straight"),
         },
     )?;
@@ -938,29 +940,29 @@ pub(super) fn compress_members_in_order(
 
     // The rest are planned and coded as if the stored members were not there:
     // nothing about one independent member depends on another.
-    let split = |store: bool| -> Result<(Records<usize>, Records<EntrySource>)> {
+    let split = |store: bool| -> Result<(Vec<usize>, Vec<EntrySource>)> {
         let count = stored_early.iter().filter(|&&early| early == store).count();
-        let mut indexes = Records::new(count, resources)?;
-        let mut picked = Records::new(count, resources)?;
+        let mut indexes = Vec::with_capacity(count);
+        let mut picked = Vec::with_capacity(count);
         for index in (0..sources.len()).filter(|&index| stored_early[index] == store) {
-            indexes.push(index)?;
-            picked.push(sources[index].clone())?;
+            indexes.push(index);
+            picked.push(sources[index].clone());
         }
         Ok((indexes, picked))
     };
     let (stored, stored_sources) = split(true)?;
     let (coded, coded_sources) = split(false)?;
 
-    let mut stored_integrity = Records::new(stored.len(), resources)?;
+    let mut stored_integrity = Vec::with_capacity(stored.len());
     for (member, source) in stored_sources.iter().enumerate() {
         let size = source
             .len()
             .map_err(|error| error_context(stored[member], error))?;
         // A placeholder hash sizes the header until the copy's is patched in.
         let hash = (stored_hashed_later && plan.blake2sp).then_some([0; 32]);
-        stored_integrity.push((size, 0, hash))?;
+        stored_integrity.push((size, 0, hash));
     }
-    let mut checksums = Records::new(stored.len(), resources)?;
+    let mut checksums = Vec::with_capacity(stored.len());
     if stored_hashed_later {
         // Progress reports them where hashing them would have.
         for (member, &integrity) in stored_integrity.iter().enumerate() {
@@ -969,7 +971,7 @@ pub(super) fn compress_members_in_order(
                 return Err(Error::Cancelled);
             }
             advance.finished(stored[member], integrity.0);
-            checksums.push(integrity)?;
+            checksums.push(integrity);
         }
     } else {
         hash_stored_members(
@@ -979,7 +981,10 @@ pub(super) fn compress_members_in_order(
             resources,
             &Remapped::new(&stored, advance),
             &|member, error| error_context(stored[member], error),
-            &mut |_, size, crc, hash| checksums.push((size, crc, hash)),
+            &mut |_, size, crc, hash| {
+                checksums.push((size, crc, hash));
+                Ok(())
+            },
         )?;
     }
 
@@ -1087,11 +1092,11 @@ fn probe_members(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Option<Records<bool>>> {
+) -> Result<Option<Vec<bool>>> {
     if plan.method == 0 || plan.solid || matches!(plan.filter_policy, FilterPolicy::Explicit(_)) {
         return Ok(None);
     }
-    let mut candidates = Records::new(sources.len(), resources)?;
+    let mut candidates = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
         // A rewrite's sources are staged one window at a time, in order, and
         // held until written, so opening one ahead to sample it can need
@@ -1101,13 +1106,16 @@ fn probe_members(
         }
         let size = source.len().map_err(|error| error_context(index, error))?;
         if crate::incompressible::sample_ranges(size).is_some() {
-            candidates.push((index, size))?;
+            candidates.push((index, size));
         }
     }
     if candidates.is_empty() {
         return Ok(None);
     }
-    let mut stored = Records::collect(sources.iter().map(|_| Ok(false)), resources)?;
+    let mut stored = sources
+        .iter()
+        .map(|_| Ok(false))
+        .collect::<Result<Vec<_>>>()?;
     let mut any = false;
     let sample = crate::incompressible::SAMPLE_LEN;
     let charge = super::streaming_lz_workspace(sample as u64, sample, false) + sample as u64;
@@ -1176,13 +1184,13 @@ fn compress_members_as_planned(
     straight: &Straight<'_>,
     consume: &mut Consume<'_>,
 ) -> Result<()> {
-    let mut integrity = Records::new(sources.len(), resources)?;
+    let mut integrity = Vec::with_capacity(sources.len());
     for (index, source) in sources.iter().enumerate() {
         let input_size = source.len().map_err(|error| error_context(index, error))?;
         // Compression fills these checksums while consuming the source. A
         // member hashed on its copy keeps the placeholder, which sizes its
         // header until the real hash is patched in.
-        integrity.push((input_size, 0, plan.blake2sp.then_some([0; 32])))?;
+        integrity.push((input_size, 0, plan.blake2sp.then_some([0; 32])));
     }
 
     let mut execution =
@@ -1370,13 +1378,11 @@ fn hash_stored_members(
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     consume: &mut dyn FnMut(usize, u64, u32, Option<[u8; 32]>) -> Result<()>,
 ) -> Result<()> {
-    let jobs = Records::collect(
-        integrity
-            .iter()
-            .enumerate()
-            .map(|(index, &(size, ..))| Ok((index, size))),
-        resources,
-    )?;
+    let jobs = (integrity
+        .iter()
+        .enumerate()
+        .map(|(index, &(size, ..))| Ok((index, size))))
+    .collect::<Result<Vec<_>>>()?;
     crate::parallel::map_slice_windowed(
         &jobs,
         crate::parallel::default_window().min(source_preparation_window(sources)),
@@ -1890,7 +1896,7 @@ fn compress_members_whole(
         let permit = resources
             .acquire_cancellable(reserved, plan.dictionary_size, &|| advance.is_cancelled())
             .map_err(|error| error_context(start, error))?;
-        let jobs = Records::collect((start..end).map(Ok), resources)?;
+        let jobs = (start..end).map(Ok).collect::<Result<Vec<_>>>()?;
         let allowance = resources.allowance();
         let completed = run_jobs(jobs, resources, advance, |index, progress| {
             compress_whole_member(
@@ -1957,7 +1963,10 @@ fn compress_lookahead(
     consume: &mut Consume<'_>,
 ) -> Result<()> {
     let first = window.start;
-    let mut packed = Records::collect(window.clone().map(|_| Ok(None)), resources)?;
+    let mut packed = window
+        .clone()
+        .map(|_| Ok(None))
+        .collect::<Result<Vec<_>>>()?;
     for wanted in [Some(true), Some(false), None] {
         let count = members[window.clone()]
             .iter()
@@ -1966,18 +1975,18 @@ fn compress_lookahead(
         if count == 0 {
             continue;
         }
-        let mut indexes = Records::new(count, resources)?;
-        let mut picked_sources = Records::new(count, resources)?;
-        let mut picked_integrity = Records::new(count, resources)?;
-        let mut picked_members = Records::new(count, resources)?;
+        let mut indexes = Vec::with_capacity(count);
+        let mut picked_sources = Vec::with_capacity(count);
+        let mut picked_integrity = Vec::with_capacity(count);
+        let mut picked_members = Vec::with_capacity(count);
         for index in window
             .clone()
             .filter(|&index| runs_kind(&members[index]) == wanted)
         {
-            indexes.push(index)?;
-            picked_sources.push(sources[index].clone())?;
-            picked_integrity.push(integrity[index])?;
-            picked_members.push(members[index])?;
+            indexes.push(index);
+            picked_sources.push(sources[index].clone());
+            picked_integrity.push(integrity[index]);
+            picked_members.push(members[index]);
         }
         compress_members_whole(
             &picked_sources,
@@ -2246,27 +2255,25 @@ fn compress_independent_members(
             .saturating_add(group_capacity)
             .min(sources.len());
         let group = &sources[group_start..group_end];
-        let mut streams = Records::collect(
-            group.iter().enumerate().map(|(offset, source)| {
-                MemberStream::new(
-                    group_start + offset,
-                    source,
-                    integrity[group_start + offset].0,
-                    plan.blake2sp,
-                    resources,
-                    advance,
-                    allowance,
-                )
-                .map_err(|error| error_context(group_start + offset, error))
-            }),
-            resources,
-        )?;
+        let mut streams = (group.iter().enumerate().map(|(offset, source)| {
+            MemberStream::new(
+                group_start + offset,
+                source,
+                integrity[group_start + offset].0,
+                plan.blake2sp,
+                resources,
+                advance,
+                allowance,
+            )
+            .map_err(|error| error_context(group_start + offset, error))
+        }))
+        .collect::<Result<Vec<_>>>()?;
 
-        let mut histories = Records::collect(
-            (0..streams.len()).map(|_| Ok(Buffer::new(allowance))),
-            resources,
-        )?;
-        let mut offsets = Records::collect((0..streams.len()).map(|_| Ok(0usize)), resources)?;
+        let mut histories =
+            ((0..streams.len()).map(|_| Ok(Buffer::new(allowance)))).collect::<Result<Vec<_>>>()?;
+        let mut offsets = (0..streams.len())
+            .map(|_| Ok(0usize))
+            .collect::<Result<Vec<_>>>()?;
         let mut cursor = 0usize;
         let mut handed = 0usize;
         let goes_straight = |stream: &MemberStream| straight(stream.member, stream.input_size);
@@ -2285,7 +2292,7 @@ fn compress_independent_members(
                 }
             }
             let mut wave = BlockWave::default();
-            let mut jobs = Records::new(batch_capacity, resources)?;
+            let mut jobs = Vec::with_capacity(batch_capacity);
             let mut misses = 0usize;
             // Tails to be cut off into jobs of their own once filters are chosen.
             let mut tails = 0usize;
@@ -2329,11 +2336,11 @@ fn compress_independent_members(
                     } else {
                         Buffer::copied(&histories[member], allowance)?
                     },
-                    blocks: Records::new(0, resources)?,
+                    blocks: Vec::with_capacity(0),
                     offset: offsets[member],
-                    seams: Records::new(0, resources)?,
-                    filters: Records::new(0, resources)?,
-                    segments: Records::new(0, resources)?,
+                    seams: Vec::with_capacity(0),
+                    filters: Vec::with_capacity(0),
+                    segments: Vec::with_capacity(0),
                     records: None,
                     shared: None,
                     tail: None,
@@ -2355,7 +2362,7 @@ fn compress_independent_members(
                                 .map_err(|error| error_context(stream.member, error))?,
                         )?;
                         job.blocks
-                            .push_growing((member, job.data.len(), !stream.has_more()))?;
+                            .push((member, job.data.len(), !stream.has_more()));
                     }
                     if job.seams.len() + 1 >= runs_per_job
                         || !stream.has_more()
@@ -2364,7 +2371,7 @@ fn compress_independent_members(
                         break;
                     }
                     run_start = job.data.len();
-                    job.seams.push_growing(run_start)?;
+                    job.seams.push(run_start);
                 }
                 wave.record(&job, plan, filter_runs, history);
                 // A tail worth a thread of its own, where there is one, is coded
@@ -2401,7 +2408,7 @@ fn compress_independent_members(
                     // buffer, so release it instead of copying terminal bytes.
                     histories[member] = Buffer::new(allowance);
                 }
-                jobs.push(job)?;
+                jobs.push(job);
             }
 
             if filter_runs {
@@ -2414,7 +2421,7 @@ fn compress_independent_members(
                 }
             }
             if tails > 0 {
-                jobs = split_tails(jobs, filter_runs, plan, resources, allowance)?;
+                jobs = split_tails(jobs, filter_runs, plan, allowance)?;
             }
             if filter_runs {
                 for job in jobs.iter_mut() {
@@ -2471,7 +2478,7 @@ fn compress_solid_chain(
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()> {
     let source_window = source_preparation_window(sources);
-    let mut streams = Records::new(sources.len(), resources)?;
+    let mut streams = Vec::with_capacity(sources.len());
 
     let mut history = Buffer::new(allowance);
     let mut next = 0usize;
@@ -2501,12 +2508,12 @@ fn compress_solid_chain(
                     allowance,
                 )
                 .map_err(|error| error_context(member, error))?;
-                streams.push(stream)?;
+                streams.push(stream);
                 remaining = remaining.saturating_add(size);
             }
         }
         let mut wave = BlockWave::default();
-        let mut jobs = Records::new(batch_capacity, resources)?;
+        let mut jobs = Vec::with_capacity(batch_capacity);
         let mut opens = false;
         while jobs.len() < batch_capacity && !opens {
             while next < streams.len() && !streams[next].has_more() {
@@ -2539,11 +2546,11 @@ fn compress_solid_chain(
                 } else {
                     Buffer::copied(&history, allowance)?
                 },
-                blocks: Records::new(0, resources)?,
+                blocks: Vec::with_capacity(0),
                 offset: 0,
-                seams: Records::new(0, resources)?,
-                filters: Records::new(0, resources)?,
-                segments: Records::new(0, resources)?,
+                seams: Vec::with_capacity(0),
+                filters: Vec::with_capacity(0),
+                segments: Vec::with_capacity(0),
                 records: None,
                 shared: None,
                 tail: None,
@@ -2563,16 +2570,14 @@ fn compress_solid_chain(
                         .map_err(|error| error_context(stream.member, error))?,
                 )?;
                 job.blocks
-                    .push_growing((stream.member, job.data.len(), !stream.has_more()))?;
+                    .push((stream.member, job.data.len(), !stream.has_more()));
                 if filter_runs {
                     let block = job.data.len() - start;
                     match job.segments.last_mut() {
                         Some((segment, _)) if stream.placed != 0 && segment.end == start => {
                             segment.end += block;
                         }
-                        _ => job
-                            .segments
-                            .push_growing((start..start + block, stream.placed))?,
+                        _ => job.segments.push((start..start + block, stream.placed)),
                     }
                     stream.placed += block;
                 }
@@ -2585,7 +2590,7 @@ fn compress_solid_chain(
             wave.record(&job, plan, filter_runs, placed.min(dictionary));
             remaining = remaining.saturating_sub(job.data.len() as u64);
             placed = placed.saturating_add(job.data.len() as u64);
-            jobs.push(job)?;
+            jobs.push(job);
         }
 
         if filter_runs && !jobs.is_empty() {
@@ -2594,10 +2599,8 @@ fn compress_solid_chain(
             for job in jobs.iter_mut() {
                 job.history = Buffer::copied(&history, allowance)?;
                 if !job.filters.is_empty() {
-                    let boundaries = Records::collect(
-                        job.blocks.iter().map(|&(_, end, last)| Ok((end, last))),
-                        resources,
-                    )?;
+                    let boundaries = (job.blocks.iter().map(|&(_, end, last)| Ok((end, last))))
+                        .collect::<Result<Vec<_>>>()?;
                     job.records = Some(filter_streaming_blocks_in_place(
                         &mut job.data,
                         &boundaries,
@@ -2607,7 +2610,7 @@ fn compress_solid_chain(
                     )?);
                     // The filters are in the bytes now. Left here they would
                     // send the run down the one-member filtered path.
-                    job.filters = Records::new(0, resources)?;
+                    job.filters = Vec::with_capacity(0);
                 }
                 history.remember(&job.data, plan.encode_options.max_match_distance)?;
             }
@@ -2753,22 +2756,21 @@ static TAILS_CUT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsiz
 /// Cuts each job's tail ([`BlockJob::tail`]) off into a job of its own,
 /// after it, where [`split_tail`] can.
 fn split_tails(
-    jobs: Records<BlockJob>,
+    jobs: Vec<BlockJob>,
     filter_runs: bool,
     plan: &CompressPlan,
-    resources: &WriterResources,
     allowance: &Allowance,
-) -> Result<Records<BlockJob>> {
+) -> Result<Vec<BlockJob>> {
     let tails = jobs.iter().filter(|job| job.tail.is_some()).count();
-    let mut split = Records::new(jobs.len() + tails, resources)?;
+    let mut split = Vec::with_capacity(jobs.len() + tails);
     for mut job in jobs {
         let tail = match job.tail.take() {
-            Some(at) => split_tail(&mut job, at, filter_runs, plan, resources, allowance)?,
+            Some(at) => split_tail(&mut job, at, filter_runs, plan, allowance)?,
             None => None,
         };
-        split.push(job)?;
+        split.push(job);
         if let Some(tail) = tail {
-            split.push(tail)?;
+            split.push(tail);
         }
     }
     Ok(split)
@@ -2793,7 +2795,6 @@ fn split_tail(
     at: usize,
     filter_runs: bool,
     plan: &CompressPlan,
-    resources: &WriterResources,
     allowance: &Allowance,
 ) -> Result<Option<BlockJob>> {
     let len = job.data.len();
@@ -2814,30 +2815,30 @@ fn split_tail(
         }
     }
     let (member, _, _) = job.blocks[0];
-    let mut blocks = Records::new(0, resources)?;
-    let mut head = Records::new(0, resources)?;
+    let mut blocks = Vec::with_capacity(0);
+    let mut head = Vec::with_capacity(0);
     for &(member, end, last) in job.blocks.iter() {
         if end <= at {
-            head.push_growing((member, end, false))?;
+            head.push((member, end, false));
         } else {
-            blocks.push_growing((member, end - at, last))?;
+            blocks.push((member, end - at, last));
         }
     }
-    let mut filters = Records::new(0, resources)?;
-    let mut kept = Records::new(0, resources)?;
+    let mut filters = Vec::with_capacity(0);
+    let mut kept = Vec::with_capacity(0);
     for spec in job.filters.iter() {
         let range = spec.range.clone().unwrap_or(0..len);
         if range.start < at {
-            kept.push_growing(crate::FilterSpec::range(
+            kept.push(crate::FilterSpec::range(
                 spec.kind,
                 range.start..range.end.min(at),
-            ))?;
+            ));
         }
         if range.end > at {
-            filters.push_growing(crate::FilterSpec::range(
+            filters.push(crate::FilterSpec::range(
                 spec.kind,
                 range.start.max(at) - at..range.end - at,
-            ))?;
+            ));
         }
     }
     let data = Buffer::copied(&job.data[at..], allowance)?;
@@ -2859,9 +2860,9 @@ fn split_tail(
         history,
         blocks,
         offset: job.offset + at,
-        seams: Records::new(0, resources)?,
+        seams: Vec::with_capacity(0),
         filters,
-        segments: Records::new(0, resources)?,
+        segments: Vec::with_capacity(0),
         records: None,
         shared: None,
         tail: None,
@@ -2879,8 +2880,7 @@ fn explicit_run_filter(job: &mut BlockJob, spec: &crate::FilterSpec) -> Result<(
         }
     }
     for range in found {
-        job.filters
-            .push_growing(crate::FilterSpec::range(spec.kind, range))?;
+        job.filters.push(crate::FilterSpec::range(spec.kind, range));
     }
     Ok(())
 }
@@ -2907,35 +2907,27 @@ fn choose_run_filters(
     advance: &dyn CompressionProgress,
 ) -> Result<()> {
     let allowance = resources.allowance();
-    let mut pieces = Records::new(0, resources)?;
+    let mut pieces = Vec::with_capacity(0);
     for (index, job) in jobs.iter().enumerate() {
         for (range, offset) in filter_pieces(job) {
-            pieces.push_growing((index, range, offset))?;
+            pieces.push((index, range, offset));
         }
     }
-    let owners = Records::collect(pieces.iter().map(|&(index, _, _)| Ok(index)), resources)?;
+    let owners = (pieces.iter().map(|&(index, _, _)| Ok(index))).collect::<Result<Vec<_>>>()?;
     let found = run_jobs(
         pieces,
         resources,
         advance,
         |(index, range, offset), progress| {
-            search_filter_piece(
-                &jobs[index],
-                range,
-                offset,
-                plan,
-                progress,
-                resources,
-                &allowance,
-            )
+            search_filter_piece(&jobs[index], range, offset, plan, progress, &allowance)
         },
     )?;
     for job in jobs.iter_mut() {
-        job.filters = Records::new(0, resources)?;
+        job.filters = Vec::with_capacity(0);
     }
     for (index, found) in owners.into_iter().zip(found) {
         for spec in found {
-            jobs[index].filters.push_growing(spec)?;
+            jobs[index].filters.push(spec);
         }
     }
     Ok(())
@@ -2952,7 +2944,7 @@ fn filter_pieces(job: &BlockJob) -> impl Iterator<Item = (std::ops::Range<usize>
             })
             .collect()
     } else {
-        job.segments.iter().cloned().collect()
+        job.segments.to_vec()
     };
     let piece = filter_search_bytes();
     segments
@@ -2974,9 +2966,8 @@ fn search_filter_piece(
     offset: usize,
     plan: &CompressPlan,
     progress: &dyn CompressionProgress,
-    resources: &WriterResources,
     allowance: &Allowance,
-) -> Result<Records<crate::FilterSpec>> {
+) -> Result<Vec<crate::FilterSpec>> {
     let specs = super::filter_policy::run_filters_with_allowance(
         &job.data[range.clone()],
         offset,
@@ -2985,12 +2976,12 @@ fn search_filter_piece(
         &|| progress.is_cancelled(),
         allowance,
     )?;
-    let mut filters = Records::new(0, resources)?;
+    let mut filters = Vec::with_capacity(0);
     for spec in specs {
         let span = spec.range.map_or(range.clone(), |r| {
             range.start + r.start..range.start + r.end
         });
-        filters.push_growing(crate::FilterSpec::range(spec.kind, span))?;
+        filters.push(crate::FilterSpec::range(spec.kind, span));
     }
     Ok(filters)
 }
@@ -2999,7 +2990,7 @@ fn search_filter_piece(
 /// members in job order so output does not depend on scheduling.
 #[allow(clippy::too_many_arguments)]
 fn compress_wave(
-    jobs: Records<BlockJob>,
+    jobs: Vec<BlockJob>,
     seeding: Vec<TreeRuns>,
     plan: &CompressPlan,
     streams: &mut [MemberStream],
@@ -3008,9 +2999,9 @@ fn compress_wave(
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
     consume: &mut ConsumePacked<'_>,
 ) -> Result<()> {
-    let jobs = prepare_block_jobs(jobs, resources)?;
-    let output = Records::new(jobs.len(), resources)?;
-    let slots = Records::collect(jobs.into_iter().map(|job| Ok((Some(job), None))), resources)?;
+    let jobs = prepare_block_jobs(jobs);
+    let output = Vec::with_capacity(jobs.len());
+    let slots = (jobs.into_iter().map(|job| Ok((Some(job), None)))).collect::<Result<Vec<_>>>()?;
     let packed_runs = complete_jobs_dispatched(
         slots,
         output,
@@ -3163,26 +3154,21 @@ fn code_seeded_wave(
     });
 }
 
-type PackedBlocks = Records<(usize, Buffer<u8>, bool)>;
-type PreparedBlockJob = (BlockJob, Records<(usize, bool)>, PackedBlocks);
+type PackedBlocks = Vec<(usize, Buffer<u8>, bool)>;
+type PreparedBlockJob = (BlockJob, Vec<(usize, bool)>, PackedBlocks);
 
-fn prepare_block_jobs(
-    jobs: Records<BlockJob>,
-    resources: &WriterResources,
-) -> Result<Records<PreparedBlockJob>> {
-    // Allocate boundary and result descriptors before dispatch. Worker outputs
-    // carry their scoped codec charge; descriptor arrays keep the root charge.
-    Records::collect(
-        jobs.into_iter().map(|job| {
-            let boundaries = Records::collect(
-                job.blocks.iter().map(|&(_, end, last)| Ok((end, last))),
-                resources,
-            )?;
-            let output = Records::new(job.blocks.len(), resources)?;
-            Ok((job, boundaries, output))
-        }),
-        resources,
-    )
+fn prepare_block_jobs(jobs: Vec<BlockJob>) -> Vec<PreparedBlockJob> {
+    jobs.into_iter()
+        .map(|job| {
+            let boundaries = job
+                .blocks
+                .iter()
+                .map(|&(_, end, last)| (end, last))
+                .collect();
+            let output = Vec::with_capacity(job.blocks.len());
+            (job, boundaries, output)
+        })
+        .collect()
 }
 
 fn encode_block_job(
@@ -3213,7 +3199,7 @@ fn encode_block_job(
         if reported < job.data.len() && !progress.advance((job.data.len() - reported) as u64) {
             return Err(Error::Cancelled);
         }
-        output.push((member, packed, last))?;
+        output.push((member, packed, last));
         return Ok(output);
     }
     let mut block_done = |bytes: usize| progress.advance(bytes as u64);
@@ -3285,11 +3271,11 @@ fn encode_block_job(
         for block in packed {
             run.extend_from_slice(&block)?;
         }
-        output.push((member, run, last))?;
+        output.push((member, run, last));
         return Ok(output);
     }
     for ((member, _, last), packed) in job.blocks.into_iter().zip(packed) {
-        output.push((member, packed, last))?;
+        output.push((member, packed, last));
     }
     Ok(output)
 }
@@ -3374,17 +3360,17 @@ fn encode_shared_block_job(
         for block in packed {
             run.extend_from_slice(&block)?;
         }
-        output.push((member, run, last))?;
+        output.push((member, run, last));
         return Ok(output);
     }
     for ((member, _, last), packed) in blocks.into_iter().zip(packed) {
-        output.push((member, packed, last))?;
+        output.push((member, packed, last));
     }
     Ok(output)
 }
 
 fn append_packed_runs(
-    packed_runs: Records<PackedBlocks>,
+    packed_runs: Vec<PackedBlocks>,
     plan: &CompressPlan,
     streams: &mut [MemberStream],
     advance: &dyn CompressionProgress,
@@ -3468,8 +3454,8 @@ fn compress_members_hashing_stored_later(
     resources: &WriterResources,
     advance: &dyn CompressionProgress,
     error_context: &(dyn Fn(usize, Error) -> Error + Sync),
-) -> Result<Records<CompressedMember>> {
-    let mut members = Records::new(sources.len(), resources)?;
+) -> Result<Vec<CompressedMember>> {
+    let mut members = Vec::with_capacity(sources.len());
     compress_members_in_order(
         sources,
         plan,
@@ -3479,7 +3465,10 @@ fn compress_members_hashing_stored_later(
         true,
         &|_, _| false,
         &mut |_, handed| match handed {
-            Handed::Member(member) => members.push(member),
+            Handed::Member(member) => {
+                members.push(member);
+                Ok(())
+            }
             _ => unreachable!("no member goes out straight"),
         },
     )?;
@@ -3617,7 +3606,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let source = EntrySource::from_opener(1, || {
@@ -3675,7 +3664,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let execution = ExecutionPlan::with_resources(&plan, [32].into_iter(), &resources).unwrap();
@@ -3713,56 +3702,6 @@ mod tests {
     }
 
     #[test]
-    fn streaming_compression_releases_each_refused_preparation_allocation() {
-        use std::sync::atomic::Ordering;
-
-        let scratch = crate::scratch::case("streaming-preparation-refusals");
-        let sources = [EntrySource::from_bytes(vec![b'A'; 2048])];
-        let options = EncodeOptions::new(8);
-        for solid in [false, true] {
-            let plan = CompressPlan {
-                algorithm_version: 0,
-                encode_options: options,
-                dictionary_size: 65536,
-                block_size: 1024,
-                solid,
-                method: 1,
-                filter_policy: FilterPolicy::None,
-                candidates: vec![options].into(),
-                blake2sp: true,
-            };
-            let run = |resources: &WriterResources| -> Result<()> {
-                let packed =
-                    compress_members_reporting(&sources, plan.clone(), resources, &|_| true)?;
-                assert_eq!(packed.len(), 1);
-                Ok(())
-            };
-            let (resources, attempts) = WriterResources::default()
-                .with_temp_dir(&*scratch)
-                .refuse_preparation_growth_at(usize::MAX);
-            run(&resources).unwrap();
-            let count = attempts.load(Ordering::Relaxed);
-            assert!(count > 5);
-            assert!(count < 100);
-            assert_eq!(resources.preparation_in_use(), 0);
-
-            for index in 0..count {
-                let (resources, _) = WriterResources::default()
-                    .with_temp_dir(&*scratch)
-                    .refuse_preparation_growth_at(index);
-                let error = run(&resources).unwrap_err();
-                assert_eq!(
-                    error.root_cause(),
-                    &Error::WriterFailure("injected preparation admission failure"),
-                    "solid mode {solid}, admission {index}"
-                );
-                assert_eq!(resources.preparation_in_use(), 0, "admission {index}");
-                assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
-            }
-        }
-    }
-
-    #[test]
     fn admitted_whole_member_worker_propagates_source_failure() {
         let options = EncodeOptions::new(8);
         let plan = CompressPlan {
@@ -3773,7 +3712,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options, options].into(),
+            candidates: vec![options, options],
             blake2sp: true,
         };
         let source = EntrySource::from_opener(1024, || {
@@ -3787,36 +3726,6 @@ mod tests {
         assert_eq!(error.kind(), crate::ErrorKind::Io);
         assert_eq!(resources.workspace_in_use(), 0);
         assert_eq!(resources.execution.as_ref().unwrap().used(), 0);
-    }
-
-    #[test]
-    fn stored_member_descriptor_refusal_releases_preparation_charge() {
-        let options = EncodeOptions::new(8);
-        let plan = CompressPlan {
-            algorithm_version: 0,
-            encode_options: options,
-            dictionary_size: 128 * 1024,
-            block_size: 4096,
-            solid: false,
-            method: 0,
-            filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
-            blake2sp: true,
-        };
-        let source = EntrySource::from_bytes(b"payload".to_vec());
-        let limit = std::mem::size_of::<Integrity>() as u64;
-        let resources = WriterResources::default().with_max_preparation_bytes(limit);
-        let error = compress_members_reporting(&[source], plan, &resources, &|_| true)
-            .err()
-            .expect("the stored spool descriptors must exceed the integrity record");
-        assert!(matches!(
-            error,
-            Error::WriterPreparationLimitExceeded {
-                limit: actual_limit,
-                ..
-            } if actual_limit == limit
-        ));
-        drop(Records::<u8>::new(limit as usize, &resources).unwrap());
     }
 
     #[cfg(all(
@@ -3851,7 +3760,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         for size in [0, 16] {
@@ -3924,7 +3833,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let scratch = crate::scratch::case("whole-member-cancel-between-waves");
@@ -3980,7 +3889,11 @@ mod tests {
     #[test]
     fn cancellation_prevents_worker_dispatch_and_empty_source_open() {
         let resources = WriterResources::default();
-        let jobs = Records::collect([1u8].into_iter().map(Ok), &resources).unwrap();
+        let jobs = [1u8]
+            .into_iter()
+            .map(Ok)
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
         assert_eq!(
             run_jobs(jobs, &resources, &Cancelled, |_, _| -> Result<u8> {
                 panic!("cancelled job was dispatched")
@@ -4010,17 +3923,15 @@ mod tests {
     #[test]
     fn a_codec_failure_takes_precedence_over_sibling_cancellation() {
         let resources = WriterResources::default();
-        let jobs = Records::collect(
-            [
-                (None::<u8>, Some(Err::<u8, _>(Error::Cancelled))),
-                (None, Some(Err(Error::InvalidArgument("codec failure")))),
-            ]
-            .into_iter()
-            .map(Ok),
-            &resources,
-        )
+        let jobs = ([
+            (None::<u8>, Some(Err::<u8, _>(Error::Cancelled))),
+            (None, Some(Err(Error::InvalidArgument("codec failure")))),
+        ]
+        .into_iter()
+        .map(Ok))
+        .collect::<Result<Vec<_>>>()
         .unwrap();
-        let output = Records::new(2, &resources).unwrap();
+        let output = Vec::with_capacity(2);
         assert_eq!(
             complete_jobs(
                 jobs,
@@ -4036,20 +3947,18 @@ mod tests {
             Error::InvalidArgument("codec failure")
         );
 
-        let jobs = Records::collect(
-            [
-                (
-                    None::<u8>,
-                    Some(Err::<u8, _>(Error::InvalidArgument("first"))),
-                ),
-                (None, Some(Err(Error::InvalidArgument("second")))),
-            ]
-            .into_iter()
-            .map(Ok),
-            &resources,
-        )
+        let jobs = ([
+            (
+                None::<u8>,
+                Some(Err::<u8, _>(Error::InvalidArgument("first"))),
+            ),
+            (None, Some(Err(Error::InvalidArgument("second")))),
+        ]
+        .into_iter()
+        .map(Ok))
+        .collect::<Result<Vec<_>>>()
         .unwrap();
-        let output = Records::new(2, &resources).unwrap();
+        let output = Vec::with_capacity(2);
         assert_eq!(
             complete_jobs(
                 jobs,
@@ -4086,7 +3995,7 @@ mod tests {
             solid: false,
             method: 0,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let resources = WriterResources::default();
@@ -4244,7 +4153,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let sources = [
@@ -4365,7 +4274,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let mut expected_integrity = [(size as u64, 0, None); 2];
@@ -4447,7 +4356,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let required = super::super::plan::lazy_streaming_workspace(options, size as u64);
@@ -4458,7 +4367,7 @@ mod tests {
                 2
             };
             let resources = WriterResources::new(required * max_workers).with_temp_dir(&*scratch);
-            let collect = |members: Records<CompressedMember>| -> Vec<_> {
+            let collect = |members: Vec<CompressedMember>| -> Vec<_> {
                 members
                     .into_iter()
                     .map(|mut member| {
@@ -4503,11 +4412,6 @@ mod tests {
                     })
                     .unwrap();
                 assert!(peak.load(Ordering::Relaxed) > 0);
-                // Native spools retain their path storage alongside result descriptors.
-                assert!(
-                    ledger.used()
-                        > (sources.len() * std::mem::size_of::<CompressedMember>()) as u64
-                );
                 assert_eq!(collect(actual), expected);
                 assert_eq!(ledger.used(), 0);
                 assert_eq!(bounded.workspace_in_use(), 0);
@@ -4530,7 +4434,7 @@ mod tests {
                 solid,
                 method: 1,
                 filter_policy: FilterPolicy::None,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let ledger = Allowance::limited(256 * 1024 * 1024);
@@ -4608,7 +4512,7 @@ mod tests {
             solid: false,
             method: 0,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let opens = Arc::new(AtomicUsize::new(0));
@@ -4683,7 +4587,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let data: Arc<[u8]> = (0..1024u32)
@@ -4737,7 +4641,6 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(opens.load(Ordering::Relaxed), 4);
-            assert!(ledger.used() > (4 * std::mem::size_of::<CompressedMember>()) as u64);
             for mut member in result {
                 let mut bytes = Vec::new();
                 member.packed.copy_to(&mut bytes).unwrap();
@@ -4746,36 +4649,6 @@ mod tests {
             assert_eq!(ledger.used(), 0);
             assert_eq!(resources.workspace_in_use(), 0);
             assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
-        }
-    }
-
-    #[test]
-    fn coordinator_slots_are_admitted_before_callbacks_and_results_stay_charged() {
-        use std::sync::atomic::AtomicUsize;
-        let calls = AtomicUsize::new(0);
-        let limited = WriterResources::default().with_max_preparation_bytes(16);
-        let jobs = Records::collect([Ok(1u64), Ok(2)].into_iter(), &limited).unwrap();
-        assert!(matches!(
-            run_jobs(jobs, &limited, &|_| true, |job, _| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                Ok(job)
-            }),
-            Err(Error::WriterPreparationLimitExceeded { .. })
-        ));
-        assert_eq!(calls.load(Ordering::Relaxed), 0);
-        drop(Records::<u8>::new(16, &limited).unwrap());
-
-        let resources = WriterResources::default().with_max_preparation_bytes(65536);
-        for _ in 0..8 {
-            let jobs = Records::collect([Ok(1u64), Ok(2)].into_iter(), &resources).unwrap();
-            let output = run_jobs(jobs, &resources, &|_| true, |job, _| Ok(job * 2)).unwrap();
-            assert_eq!(&*output, &[2, 4]);
-            assert!(matches!(
-                Records::<u8>::new(65536, &resources),
-                Err(Error::WriterPreparationLimitExceeded { used: 16, .. })
-            ));
-            drop(output);
-            drop(Records::<u8>::new(65536, &resources).unwrap());
         }
     }
 
@@ -4803,7 +4676,7 @@ mod tests {
             .build()
             .unwrap();
         let permit = resources.acquire(100, 0).unwrap();
-        let jobs = Records::collect((0..3).map(Ok), &resources).unwrap();
+        let jobs = (0..3).map(Ok).collect::<Result<Vec<_>>>().unwrap();
         let result = pool.install(|| {
             run_jobs(jobs, &resources, &|_| true, |job, _| {
                 calls.fetch_add(1, Ordering::Relaxed);
@@ -4824,8 +4697,8 @@ mod tests {
         drop(permit);
         assert_eq!(resources.workspace_in_use(), 0);
         assert_eq!(std::fs::read_dir(&*scratch).unwrap().count(), 0);
-        drop(Records::<u8>::new(65536, &resources).unwrap());
-        let jobs = Records::collect((0..3).map(Ok), &resources).unwrap();
+        drop(Vec::<u8>::with_capacity(65536));
+        let jobs = (0..3).map(Ok).collect::<Result<Vec<_>>>().unwrap();
         assert_eq!(
             pool.install(|| run_jobs(jobs, &resources, &|_| true, |job, _| Ok(job)))
                 .unwrap()
@@ -4848,8 +4721,8 @@ mod tests {
             .num_threads(2)
             .build()
             .unwrap();
-        let jobs = Records::collect((0..2).map(Ok), &resources).unwrap();
-        let result: Result<Records<()>> = pool.install(|| {
+        let jobs = (0..2).map(Ok).collect::<Result<Vec<_>>>().unwrap();
+        let result: Result<Vec<()>> = pool.install(|| {
             run_jobs(jobs, &resources, &|_| true, |job, progress| {
                 barrier.wait();
                 if job == 1 {
@@ -4867,7 +4740,7 @@ mod tests {
             Err(Error::SourceChanged("original failure"))
         ));
         assert_eq!(joined.load(Ordering::Relaxed), 1);
-        drop(Records::<u8>::new(65536, &resources).unwrap());
+        drop(Vec::<u8>::with_capacity(65536));
     }
 
     #[cfg(all(
@@ -4888,7 +4761,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options, options.with_optimal_parse(true)].into(),
+            candidates: vec![options, options.with_optimal_parse(true)],
             blake2sp: true,
         };
         let data: Vec<u8> = (0..1024u32).flat_map(|n| n.to_le_bytes()).collect();
@@ -5014,7 +4887,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options].into(),
+            candidates: vec![encode_options],
             blake2sp: true,
         };
         let required = whole_member_workspace(32, &plan);
@@ -5063,7 +4936,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let execution =
@@ -5147,7 +5020,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options].into(),
+            candidates: vec![encode_options],
             blake2sp: true,
         };
         let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
@@ -5223,7 +5096,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options].into(),
+            candidates: vec![encode_options],
             blake2sp: true,
         };
         let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
@@ -5295,7 +5168,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![encode_options].into(),
+            candidates: vec![encode_options],
             blake2sp: true,
         };
         let resources = WriterResources::new(70 * 1024 * 1024).with_temp_dir(&*scratch);
@@ -5431,7 +5304,7 @@ mod tests {
                 solid,
                 method,
                 filter_policy,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let mut members =
@@ -5502,7 +5375,7 @@ mod tests {
             solid: true,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let scratch = crate::scratch::case("lazy-solid-inputs");
@@ -5531,7 +5404,7 @@ mod tests {
             solid: false,
             method: 3,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let required = whole_member_workspace(size as u64, &plan);
@@ -5572,7 +5445,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let run = |threads: usize, budget| {
@@ -5653,7 +5526,7 @@ mod tests {
                     solid,
                     method: 1,
                     filter_policy: policy.clone(),
-                    candidates: vec![options].into(),
+                    candidates: vec![options],
                     blake2sp: true,
                 };
                 let members = compress_members_reporting(
@@ -5717,7 +5590,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let run = run_size(&plan);
@@ -5785,7 +5658,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         }
     }
@@ -5848,7 +5721,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::Auto,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         assert_eq!(member_run_size(&plan), 4 * MIB as usize);
@@ -5873,7 +5746,7 @@ mod tests {
         let lazy = plan.encode_options.with_optimal_parse(false);
         let lazy = CompressPlan {
             encode_options: lazy,
-            candidates: vec![lazy].into(),
+            candidates: vec![lazy],
             ..plan
         };
         assert_eq!(member_run_size(&lazy), 16 * MIB as usize);
@@ -5906,7 +5779,7 @@ mod tests {
                 solid: false,
                 method: 1,
                 filter_policy: filter_policy.clone(),
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let code = |threads: usize| -> Vec<u8> {
@@ -5997,7 +5870,7 @@ mod tests {
             solid: false,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         };
         let code = |threads: usize| -> (Vec<u8>, usize) {
@@ -6065,7 +5938,7 @@ mod tests {
                 solid: false,
                 method: 1,
                 filter_policy: filter_policy.clone(),
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             };
             let code = |threads: usize| -> (Vec<u8>, usize) {
@@ -6196,7 +6069,7 @@ mod tests {
                 solid: false,
                 method: 1,
                 filter_policy: FilterPolicy::Auto,
-                candidates: vec![options].into(),
+                candidates: vec![options],
                 blake2sp: true,
             }
         };
@@ -6254,7 +6127,7 @@ mod stored_hashing_tests {
             solid: false,
             method: 0,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         }
     }
@@ -6423,7 +6296,7 @@ mod incompressible_probe_tests {
             solid,
             method: 1,
             filter_policy: FilterPolicy::None,
-            candidates: vec![options].into(),
+            candidates: vec![options],
             blake2sp: true,
         }
     }
