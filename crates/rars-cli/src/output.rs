@@ -216,7 +216,7 @@ impl CreatedModes {
 /// metadata through its own descriptor; `set` records whether it did, and
 /// publication sets anything it did not.
 pub(crate) struct StagedFile {
-    file: Result<fs::File, Option<(rars::output_tree::FileDir, std::ffi::OsString)>>,
+    file: rars::output_tree::DeferredFile,
     early: Option<EarlyMetadata>,
     set: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// The permission bits it is created with: its member's, when known.
@@ -233,7 +233,7 @@ impl StagedFile {
         created_modes: CreatedModes,
     ) -> std::io::Result<(Self, std::sync::Arc<std::sync::atomic::AtomicBool>)> {
         let (mut staged, set) = Self::deferred(dir, name, meta, created_modes);
-        staged.file()?;
+        staged.file.file()?;
         Ok((staged, set))
     }
 
@@ -246,41 +246,29 @@ impl StagedFile {
     ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let set = std::sync::Arc::default();
         let early = early_metadata(meta);
+        let create_mode = create_mode_for(early);
         let staged = Self {
-            file: Err(Some((dir, name))),
+            file: rars::output_tree::DeferredFile::new(dir, name, create_mode),
             early,
             set: std::sync::Arc::clone(&set),
-            create_mode: create_mode_for(early),
+            create_mode,
             created_modes,
         };
         (staged, set)
-    }
-
-    fn file(&mut self) -> std::io::Result<&mut fs::File> {
-        if let Err(pending) = &mut self.file {
-            let (dir, name) = pending
-                .take()
-                .ok_or_else(|| std::io::Error::other("the staged file could not be created"))?;
-            self.file = Ok(dir.create_file(&name, self.create_mode)?);
-        }
-        match &mut self.file {
-            Ok(file) => Ok(file),
-            Err(_) => unreachable!("created above"),
-        }
     }
 }
 
 impl std::io::Write for StagedFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file()?.write(buf)
+        self.file.write(buf)
     }
 
     fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.file()?.write_all(buf)
+        self.file.write_all(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file()?.flush()
+        self.file.flush()
     }
 }
 
@@ -290,7 +278,7 @@ impl Drop for StagedFile {
         let create_mode = self.create_mode;
         let created_modes = self.created_modes.clone();
         // An empty member nothing flushed is still a file.
-        let Ok(file) = self.file() else {
+        let Ok(file) = self.file.file() else {
             return;
         };
         let Some((modified, mode)) = early else {

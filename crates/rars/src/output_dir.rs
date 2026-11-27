@@ -8,7 +8,7 @@ use crate::output_links::{create_link_output, link_source_path};
 use crate::output_staging::{
     failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
-use crate::output_tree::{FileDir, HeldFile, OutputTree, TreeEntry};
+use crate::output_tree::{DeferredFile, FileDir, HeldFile, OutputTree, TreeEntry};
 use crate::publish_queue::{PublishQueue, PublishStep};
 use crate::ExtractedLink;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -100,8 +100,8 @@ struct PendingOutput {
     staged: Option<PathBuf>,
     /// Staged by descriptor: the directory it is in and its name there.
     staged_at: Option<(FileDir, std::ffi::OsString)>,
-    /// Whether the staged file took its time as it closed.
-    time_set: Option<Arc<AtomicBool>>,
+    /// What the staged file did as it closed.
+    closed: Option<Arc<CloseOutcome>>,
     /// Written in place by descriptor: the file, once the library is done writing it.
     held: Option<Arc<OnceLock<fs::File>>>,
     stored: PathBuf,
@@ -160,9 +160,16 @@ impl Write for SharedBuffer {
 
 /// Takes its member's time as it closes, so the publish needs no call by name.
 struct StagedFile {
-    file: fs::File,
+    file: DeferredFile,
     modified: Option<SystemTime>,
-    set: Arc<AtomicBool>,
+    closed: Arc<CloseOutcome>,
+}
+
+#[derive(Default)]
+struct CloseOutcome {
+    /// An empty member nothing wrote is created as it closes, which can fail unheard.
+    created: AtomicBool,
+    time_set: AtomicBool,
 }
 
 impl Write for StagedFile {
@@ -181,9 +188,13 @@ impl Write for StagedFile {
 
 impl Drop for StagedFile {
     fn drop(&mut self) {
+        let Ok(file) = self.file.file() else {
+            return;
+        };
+        self.closed.created.store(true, Ordering::Release);
         if let Some(modified) = self.modified {
-            if self.file.set_modified(modified).is_ok() {
-                self.set.store(true, Ordering::Release);
+            if file.set_modified(modified).is_ok() {
+                self.closed.time_set.store(true, Ordering::Release);
             }
         }
     }
@@ -536,7 +547,7 @@ impl<'a> DirOutputs<'a> {
         self.pending = Some(PendingOutput {
             staged: None,
             staged_at: None,
-            time_set: None,
+            closed: None,
             held,
             stored,
             destination,
@@ -574,7 +585,7 @@ impl<'a> DirOutputs<'a> {
         let (staged, staged_at, file) = match &storage.files {
             Some((dir, root)) => {
                 let name = std::ffi::OsString::from(index);
-                let file = dir.create_file(&name, 0o666)?;
+                let file = DeferredFile::new(dir.clone(), name.clone(), 0o666);
                 (root.join(&name), Some((dir.clone(), name)), file)
             }
             None => {
@@ -583,16 +594,16 @@ impl<'a> DirOutputs<'a> {
                     .write(true)
                     .create_new(true)
                     .open(&staged)?;
-                (staged, None, file)
+                (staged, None, DeferredFile::from_file(file))
             }
         };
         self.staged += 1;
         let modified = self.modified_time(meta);
-        let set = Arc::new(AtomicBool::new(false));
+        let closed = Arc::new(CloseOutcome::default());
         self.pending = Some(PendingOutput {
             staged: Some(staged),
             staged_at,
-            time_set: modified.is_some().then(|| Arc::clone(&set)),
+            closed: Some(Arc::clone(&closed)),
             held: None,
             stored,
             destination,
@@ -602,7 +613,7 @@ impl<'a> DirOutputs<'a> {
         Ok(Box::new(StagedFile {
             file,
             modified,
-            set,
+            closed,
         }))
     }
 
@@ -658,7 +669,7 @@ impl<'a> DirOutputs<'a> {
         self.pending = Some(PendingOutput {
             staged: None,
             staged_at: None,
-            time_set: None,
+            closed: None,
             held: None,
             stored: PathBuf::new(),
             destination: PathBuf::new(),
@@ -911,10 +922,11 @@ impl Publishing {
             self.record_published(pending.stored, pending.destination, &pending.meta, later);
             return Ok(());
         };
-        let time_set = pending
-            .time_set
-            .as_ref()
-            .is_some_and(|set| set.load(Ordering::Acquire));
+        let closed = pending.closed.as_ref().expect("a staged file closes");
+        if !closed.created.load(Ordering::Acquire) {
+            return Err(crate::output_tree::never_created().into());
+        }
+        let time_set = closed.time_set.load(Ordering::Acquire);
         if let Some((dir, name)) = &pending.staged_at {
             if let Some((published, later)) =
                 self.publish_by_descriptor(&pending, dir, name, time_set)?

@@ -308,3 +308,129 @@ fn a_file_on_a_directory_an_unsettled_members_path_makes_is_refused_as_already_t
         });
     }
 }
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn plant_next_staged(outputs: &DirOutputs<'_>) {
+    let storage = outputs.storage.as_ref().expect("a member staged already");
+    let (_, files) = storage.files.as_ref().expect("staged by descriptor");
+    fs::write(files.join(outputs.staged.to_string()), b"planted").unwrap();
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[test]
+fn a_staged_file_that_cant_be_created_fails_its_write_not_its_open() {
+    for settled in [false, true] {
+        for threads in THREADS {
+            capped(threads, || {
+                let root = crate::scratch::case("dir-outputs-staged-create-fails");
+                let mut outputs = DirOutputs::new(
+                    &root,
+                    crate::ArchiveFamily::Rar50Plus,
+                    None,
+                    mode(OverwritePolicy::Never),
+                    None,
+                );
+                let context = format!("settled={settled} threads={threads}");
+                if settled {
+                    write(&mut outputs, &file("first"), b"first");
+                    plant_next_staged(&outputs);
+                    let mut writer = outputs
+                        .open_settled(&file("second"))
+                        .expect("opening creates no file");
+                    // Written on another thread, as the decode workers do.
+                    let error = std::thread::spawn(move || writer.write_all(b"second"))
+                        .join()
+                        .unwrap()
+                        .unwrap_err();
+                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{context}");
+                    outputs.settle(true).unwrap();
+                    outputs.settle(false).unwrap();
+                    outputs.finish(Ok(())).unwrap();
+                } else {
+                    open_and_write(&mut outputs, &file("first"), b"first");
+                    plant_next_staged(&outputs);
+                    let mut writer = outputs
+                        .open(&file("second"))
+                        .expect("opening creates no file");
+                    let error = writer.write_all(b"second").unwrap_err();
+                    drop(writer);
+                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{context}");
+                    outputs.finish(Err(error.into())).unwrap_err();
+                }
+                assert_eq!(listing(&root), ["first"], "{context}");
+            });
+        }
+    }
+}
+
+#[test]
+fn an_empty_member_nothing_writes_is_published_with_its_time() {
+    let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+    let meta = |name: &str| {
+        crate::ExtractedEntryMeta::new(
+            name.as_bytes().to_vec(),
+            Some(crate::Timestamp::from_unix_seconds(1_600_000_000)),
+            0,
+            false,
+        )
+    };
+    for settled in [false, true] {
+        for threads in THREADS {
+            capped(threads, || {
+                let root = crate::scratch::case("dir-outputs-empty-member");
+                let mut timed = mode(OverwritePolicy::Never);
+                timed.restore_times = true;
+                let mut outputs =
+                    DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, timed, None);
+                for name in ["one", "two"] {
+                    if settled {
+                        drop(outputs.open_settled(&meta(name)).unwrap());
+                        outputs.settle(true).unwrap();
+                    } else {
+                        drop(outputs.open(&meta(name)).unwrap());
+                    }
+                }
+                outputs.finish(Ok(())).unwrap();
+                for name in ["one", "two"] {
+                    let context = format!("settled={settled} threads={threads} {name}");
+                    let published = fs::metadata(root.join(name)).expect(&context);
+                    assert_eq!(published.len(), 0, "{context}");
+                    assert_eq!(published.modified().unwrap(), modified, "{context}");
+                }
+            });
+        }
+    }
+}
+
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[test]
+fn an_empty_member_whose_staged_file_cant_be_created_fails_to_publish_saying_so() {
+    for threads in THREADS {
+        capped(threads, || {
+            let root = crate::scratch::case("dir-outputs-empty-create-fails");
+            let mut outputs = DirOutputs::new(
+                &root,
+                crate::ArchiveFamily::Rar50Plus,
+                None,
+                mode(OverwritePolicy::Never),
+                None,
+            );
+            write(&mut outputs, &file("first"), b"first");
+            plant_next_staged(&outputs);
+            drop(outputs.open_settled(&file("empty")).unwrap());
+            outputs.settle(true).unwrap();
+            let settled = outputs.settle(true);
+            let finished = outputs.finish(Ok(()));
+            let error = settled
+                .err()
+                .or(finished.err())
+                .expect("the empty member is refused")
+                .to_string();
+            assert!(
+                error.contains("the staged file could not be created"),
+                "threads={threads}: {error}"
+            );
+            assert_eq!(listing(&root), ["first"], "threads={threads}");
+        });
+    }
+}
