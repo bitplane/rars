@@ -171,14 +171,14 @@ pub(super) fn should_store_compressed_payload(
 /// How hard each level looks for a match, and where the default sits.
 ///
 /// Each rung packs smaller than the one below. Level 1 is the greedy parse over
-/// two chain candidates, the quick rung. Level 3 is the default because it is
+/// four chain candidates, the quick rung. Level 3 is the default because it is
 /// the knee. Level 5 searches no deeper than level 4: past 128 candidates the
 /// time grows faster than the output shrinks. Its 16 MiB window and longer
 /// parse ([`parse_effort_for_level`]) are what it buys.
 fn match_candidates_for_level(level: u8) -> Result<usize> {
     match level {
         0 => Ok(0),
-        1 => Ok(2),
+        1 => Ok(4),
         2 => Ok(8),
         3 => Ok(32),
         4 => Ok(128),
