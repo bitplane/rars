@@ -27,6 +27,7 @@ use rars::FeatureSet;
 use rars::{detect_archive_family, ArchiveFamily, ArchiveReadOptions, Error};
 use std::cell::RefCell;
 use std::io::Write;
+#[cfg(feature = "write")]
 use std::path::Path;
 #[cfg(feature = "write")]
 use std::process::Command;

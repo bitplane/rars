@@ -2,6 +2,7 @@
 
 #[path = "support/data.rs"]
 mod data;
+#[cfg(feature = "encryption")]
 use data::xorshift;
 
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind};

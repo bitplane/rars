@@ -4,6 +4,7 @@
 mod data;
 #[path = "support/sinks.rs"]
 mod sinks;
+#[cfg(feature = "encryption")]
 use data::xorshift;
 use sinks::Capture;
 
