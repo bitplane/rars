@@ -1647,12 +1647,14 @@ impl<'a> ExtractOutputState<'a> {
             policy,
             created_paths,
             renames,
+            None,
         );
         if self.in_place {
             // Made by path, which can remove a directory the walks hold.
             publisher.forget_walks();
         }
-        let (path, restore_metadata) = created?;
+        let (path, made) = created?;
+        let restore_metadata = made.is_file();
         let (created_paths, _) = publisher.link_paths(&self.unpublished);
         let hardlink_target = match link {
             rars::ExtractedLink::HardLink { .. } => {

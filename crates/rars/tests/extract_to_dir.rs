@@ -234,8 +234,7 @@ fn mixed_archive_extracts_as_extractall_does() {
     assert_eq!(extracted.skipped_links[0].name, b"escape.txt");
     assert_eq!(extracted.skipped_links[0].target, b"../outside.txt");
 
-    // Stored attributes are not applied: the read-only file stays writable.
-    assert!(!fs::metadata(out.join("windows/readonly.txt"))
+    assert!(fs::metadata(out.join("windows/readonly.txt"))
         .unwrap()
         .permissions()
         .readonly());
@@ -681,4 +680,224 @@ fn an_empty_volume_set_is_refused() {
     let error =
         rars::extract_volumes_to_dir(&[], &*root, &ExtractDirOptions::default()).unwrap_err();
     assert!(matches!(error, rars::Error::InvalidHeader(_)), "{error}");
+}
+
+#[cfg(unix)]
+fn mode_of(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn unix_modes_rar5() -> Vec<u8> {
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    for (name, mode) in [
+        ("600", 0o600),
+        ("755", 0o755),
+        ("750", 0o750),
+        ("777", 0o777),
+        ("400", 0o400),
+    ] {
+        builder
+            .add_bytes(
+                name.as_bytes().to_vec(),
+                name.as_bytes().to_vec(),
+                None,
+                Some(0o100000 | mode),
+            )
+            .unwrap();
+    }
+    builder
+        .add_directory(b"private".to_vec(), None, Some(0o700))
+        .unwrap();
+    builder
+        .add_bytes(
+            b"private/604".to_vec(),
+            b"604".to_vec(),
+            None,
+            Some(0o100604),
+        )
+        .unwrap();
+    builder.to_bytes().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn unix_modes_are_restored_exactly_at_any_thread_count() {
+    let root = scratch::case("extract-to-dir-unix-modes");
+    let archive = read(unix_modes_rar5());
+    for threads in [1, 2, 8] {
+        let out = root.join(threads.to_string());
+        let options = ExtractDirOptions::new()
+            .with_read_options(ArchiveReadOptions::new().with_threads(threads));
+
+        archive.extract_to_dir(&out, &options).unwrap();
+
+        for (name, mode) in [
+            ("600", 0o600),
+            ("755", 0o755),
+            ("750", 0o750),
+            ("777", 0o777),
+            ("400", 0o400),
+            ("private", 0o700),
+            ("private/604", 0o604),
+        ] {
+            assert_eq!(mode_of(&out.join(name)), mode, "threads={threads} {name}");
+        }
+    }
+}
+
+#[cfg(unix)]
+fn default_modes(root: &Path) -> (u32, u32) {
+    let file = root.join("default-file");
+    let dir = root.join("default-dir");
+    fs::write(&file, b"").unwrap();
+    fs::create_dir(&dir).unwrap();
+    (mode_of(&file), mode_of(&dir))
+}
+
+#[cfg(unix)]
+#[test]
+fn dos_read_only_files_become_0444_and_others_keep_the_defaults() {
+    let root = scratch::case("extract-to-dir-dos-modes");
+    let (file_default, dir_default) = default_modes(&root);
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder.add_directory(b"dir".to_vec(), None, None).unwrap();
+    builder.set_dos_attributes(b"dir", 0x10 | 0x01).unwrap();
+    for name in ["dir/readonly", "dir/plain"] {
+        builder
+            .add_bytes(name.as_bytes().to_vec(), b"x".to_vec(), None, None)
+            .unwrap();
+    }
+    builder
+        .set_dos_attributes(b"dir/readonly", 0x20 | 0x01)
+        .unwrap();
+    let out = root.join("out");
+
+    read(builder.to_bytes().unwrap())
+        .extract_to_dir(&out, &ExtractDirOptions::new())
+        .unwrap();
+
+    assert_eq!(mode_of(&out.join("dir/readonly")), 0o444);
+    assert_eq!(mode_of(&out.join("dir/plain")), file_default);
+    assert_eq!(mode_of(&out.join("dir")), dir_default);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_unix_value_without_file_type_bits_is_not_applied() {
+    use rars::rar15_40::{write_stored_archive, StoredEntry, WriterOptions};
+    let root = scratch::case("extract-to-dir-untyped-mode");
+    let (file_default, _) = default_modes(&root);
+    let archive = write_stored_archive(
+        &[StoredEntry {
+            name: b"untyped",
+            data: b"x",
+            file_time: 0,
+            file_attr: 0o600,
+            host_os: 3,
+            password: None,
+            file_comment: None,
+        }],
+        WriterOptions::new(ArchiveVersion::Rar40, rars::FeatureSet::store_only()),
+    )
+    .unwrap();
+    let out = root.join("out");
+
+    read(archive)
+        .extract_to_dir(&out, &ExtractDirOptions::new())
+        .unwrap();
+
+    assert_eq!(mode_of(&out.join("untyped")), file_default);
+}
+
+#[cfg(unix)]
+#[test]
+fn modes_are_left_alone_when_asked() {
+    let root = scratch::case("extract-to-dir-no-modes");
+    let (file_default, dir_default) = default_modes(&root);
+    let out = root.join("out");
+    let options = ExtractDirOptions::new().with_restore_modes(false);
+
+    read(unix_modes_rar5())
+        .extract_to_dir(&out, &options)
+        .unwrap();
+
+    for name in ["600", "755", "750", "777", "400", "private/604"] {
+        assert_eq!(mode_of(&out.join(name)), file_default, "{name}");
+    }
+    assert_eq!(mode_of(&out.join("private")), dir_default);
+}
+
+fn copies_of_a_file_at_rar5(mode: u32) -> Vec<u8> {
+    let payload = b"locked".to_vec();
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(
+            b"locked".to_vec(),
+            payload.clone(),
+            None,
+            Some(0o100000 | mode),
+        )
+        .unwrap();
+    for name in ["hard", "copy"] {
+        builder
+            .add_unix_symlink(
+                name.as_bytes().to_vec(),
+                b"locked".to_vec(),
+                false,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+    let Archive::Rar50Plus(mut rar5) = read(builder.to_bytes().unwrap()) else {
+        unreachable!()
+    };
+    for block in &mut rar5.blocks {
+        if let rars::rar50::Block::File(file) = block {
+            if let Some(redirection) = file.redirection.as_mut() {
+                // Hard link 4, file copy 5.
+                redirection.redirection_type = if file.name == b"hard" { 4 } else { 5 };
+                file.attributes = u64::from(0o100000 | mode);
+                file.unpacked_size = payload.len() as u64;
+            }
+        }
+    }
+    let mutated = Archive::Rar50Plus(rar5);
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    for member in mutated.members() {
+        if member.meta.name == b"locked" {
+            builder
+                .add_bytes(
+                    b"locked".to_vec(),
+                    payload.clone(),
+                    None,
+                    Some(0o100000 | mode),
+                )
+                .unwrap();
+        } else {
+            builder.add_archive_redirection(&member).unwrap();
+        }
+    }
+    builder.to_bytes().unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn files_later_members_copy_keep_their_modes_even_unreadable_ones() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = scratch::case("extract-to-dir-copied-source");
+    for mode in [0o400, 0o200] {
+        let out = root.join(format!("{mode:o}"));
+
+        read(copies_of_a_file_at_rar5(mode))
+            .extract_to_dir(&out, &ExtractDirOptions::new())
+            .unwrap();
+
+        for name in ["locked", "hard", "copy"] {
+            assert_eq!(mode_of(&out.join(name)), mode, "{mode:o} {name}");
+        }
+        fs::set_permissions(out.join("copy"), fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(fs::read(out.join("copy")).unwrap(), b"locked", "{mode:o}");
+    }
 }

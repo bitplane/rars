@@ -10,8 +10,8 @@ use std::sync::Mutex;
 
 /// Options for [`Archive::extract_to_dir`] and [`extract_volumes_to_dir`].
 ///
-/// The default refuses to overwrite, restores modification times and reads
-/// with [`ArchiveReadOptions::default`].
+/// The default refuses to overwrite, restores modification times and modes,
+/// and reads with [`ArchiveReadOptions::default`].
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ExtractDirOptions<'a> {
@@ -37,6 +37,12 @@ pub struct ExtractDirOptions<'a> {
     /// records, once extraction ends. On by default. Symbolic links keep
     /// their own times.
     pub restore_times: bool,
+    /// Gives each file and directory the permissions the archive records, on
+    /// Unix. On by default. A Unix mode is applied as stored; a DOS read-only
+    /// file becomes `0o444`; anything else keeps the default permissions less
+    /// the umask. Off, every file and directory keeps those defaults.
+    /// Symbolic links keep their own modes.
+    pub restore_modes: bool,
 }
 
 impl Default for ExtractDirOptions<'_> {
@@ -45,12 +51,13 @@ impl Default for ExtractDirOptions<'_> {
             read: ArchiveReadOptions::default(),
             overwrite: OverwritePolicy::Never,
             restore_times: true,
+            restore_modes: true,
         }
     }
 }
 
 impl<'a> ExtractDirOptions<'a> {
-    /// The defaults: refuse to overwrite, restore times, default read options.
+    /// The defaults: refuse to overwrite, restore times and modes, default read options.
     pub fn new() -> Self {
         Self::default()
     }
@@ -73,6 +80,13 @@ impl<'a> ExtractDirOptions<'a> {
     #[must_use]
     pub fn with_restore_times(mut self, restore_times: bool) -> Self {
         self.restore_times = restore_times;
+        self
+    }
+
+    /// Sets whether file and directory modes are restored. See [`Self::restore_modes`].
+    #[must_use]
+    pub fn with_restore_modes(mut self, restore_modes: bool) -> Self {
+        self.restore_modes = restore_modes;
         self
     }
 }
@@ -119,8 +133,8 @@ impl Archive {
     /// to private storage inside `dir` and moved to its destination once it
     /// verifies, so a member that fails leaves nothing at its destination; an
     /// existing hard link, FIFO or symbolic link there is never written
-    /// through. Files are created with the default permissions, less the
-    /// umask: stored attributes are not applied.
+    /// through. Modes are restored as [`ExtractDirOptions::restore_modes`]
+    /// says.
     ///
     /// Links are created: symbolic links and junctions only when their
     /// target stays inside `dir`, else they are left out and listed in
@@ -225,6 +239,7 @@ fn extract_into(
         overwrite: options.overwrite,
         in_place: false,
         restore_times: options.restore_times,
+        restore_modes: options.restore_modes,
         flatten: false,
         exists_hint: "; set ExtractDirOptions::overwrite to replace it or keep both",
     };

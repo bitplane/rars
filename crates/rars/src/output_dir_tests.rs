@@ -5,6 +5,7 @@ fn mode(overwrite: OverwritePolicy) -> DirMode {
         overwrite,
         in_place: false,
         restore_times: false,
+        restore_modes: false,
         flatten: false,
         exists_hint: "",
     }
@@ -431,6 +432,84 @@ fn an_empty_member_whose_staged_file_cant_be_created_fails_to_publish_saying_so(
                 "threads={threads}: {error}"
             );
             assert_eq!(listing(&root), ["first"], "threads={threads}");
+        });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn modes_go_on_through_descriptors_except_unreadable_files_and_directories() {
+    let unix = |name: &str, mode: u64, directory: bool| {
+        crate::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, mode, directory)
+            .with_attr_source(crate::AttrSource::Unix)
+    };
+    for threads in THREADS {
+        capped(threads, || {
+            for (settled, in_place) in [(false, false), (true, false), (false, true)] {
+                let root = crate::scratch::case("dir-outputs-modes-by-descriptor");
+                let mut moded = mode(OverwritePolicy::Never);
+                moded.restore_modes = true;
+                moded.in_place = in_place;
+                let mut outputs =
+                    DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, moded, None);
+                let members = [
+                    unix("d", 0o040700, true),
+                    unix("d/604", 0o100604, false),
+                    unix("777", 0o100777, false),
+                    unix("600", 0o100600, false),
+                    unix("200", 0o100200, false),
+                ];
+                for meta in &members {
+                    if settled {
+                        write(&mut outputs, meta, b"x");
+                        outputs.settle(true).unwrap();
+                    } else {
+                        open_and_write(&mut outputs, meta, b"x");
+                    }
+                }
+                // Settling is only for archives without links.
+                let links = [
+                    ("hard", 0o100600, ExtractedLink::HardLink { target: b"600" }),
+                    ("copy", 0o100600, ExtractedLink::FileCopy { target: b"600" }),
+                    (
+                        "copy200",
+                        0o100200,
+                        ExtractedLink::FileCopy { target: b"200" },
+                    ),
+                ];
+                if !settled {
+                    for (name, mode, link) in links {
+                        outputs.link(&unix(name, mode, false), link).unwrap();
+                    }
+                }
+                outputs.publish_pending().unwrap();
+                let mut by_path = vec![root.join("200")];
+                if !settled {
+                    by_path.push(root.join("copy200"));
+                }
+                by_path.push(root.join("d"));
+                assert_eq!(
+                    outputs.modes_by_path(),
+                    by_path,
+                    "threads={threads} settled={settled} in_place={in_place}"
+                );
+                outputs.finish(Ok(())).unwrap();
+                let linked = [("hard", 0o600), ("copy", 0o600), ("copy200", 0o200)];
+                for (name, mode) in [
+                    ("d", 0o700),
+                    ("d/604", 0o604),
+                    ("777", 0o777),
+                    ("600", 0o600),
+                    ("200", 0o200),
+                ]
+                .into_iter()
+                .chain(linked.into_iter().filter(|_| !settled))
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let found = fs::metadata(root.join(name)).unwrap().permissions().mode();
+                    assert_eq!(found & 0o7777, mode, "{name} in_place={in_place}");
+                }
+            }
         });
     }
 }

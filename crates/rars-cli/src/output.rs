@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 pub(crate) use rars::output_modes::{
-    applied_mode, create_mode, has_mode, set_file_mode, set_path_mode, waits_for_end, CreatedModes,
+    applied_mode, create_mode, has_mode, set_file_mode, waits_for_end, CreatedModes,
 };
 pub(crate) use rars::output_staging::{ExtractionStaging, OverwritePolicy};
 
@@ -83,18 +83,11 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
     }
     times.finish();
     times.restore()?;
-    let (mut directories, files): (Vec<_>, Vec<_>) = restored
-        .into_iter()
-        .partition(|output| output.meta.is_directory);
-    for output in files {
-        set_path_mode(&output.path, &output.meta)?;
+    let mut modes = rars::output_modes::PathModes::default();
+    for output in restored {
+        modes.record(output.path.clone(), &output.meta);
     }
-    // Finish descendants before a parent's mode can deny access to them.
-    directories.sort_by_cached_key(|output| std::cmp::Reverse(output.path.components().count()));
-    for output in directories {
-        set_path_mode(&output.path, &output.meta)?;
-    }
-    Ok(())
+    modes.restore()
 }
 
 /// The modified time and mode a regular file can take before it is
@@ -130,8 +123,6 @@ pub(crate) struct StagedFile {
     file: rars::output_tree::DeferredFile,
     early: Option<EarlyMetadata>,
     set: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// The permission bits it is created with: its member's, when known.
-    create_mode: u32,
     created_modes: CreatedModes,
 }
 
@@ -157,12 +148,10 @@ impl StagedFile {
     ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let set = std::sync::Arc::default();
         let early = early_metadata(meta);
-        let create_mode = create_mode(meta);
         let staged = Self {
-            file: rars::output_tree::DeferredFile::new(dir, name, create_mode),
+            file: rars::output_tree::DeferredFile::new(dir, name, create_mode(meta)),
             early,
             set: std::sync::Arc::clone(&set),
-            create_mode,
             created_modes,
         };
         (staged, set)
@@ -186,7 +175,6 @@ impl std::io::Write for StagedFile {
 impl Drop for StagedFile {
     fn drop(&mut self) {
         let early = self.early;
-        let create_mode = self.create_mode;
         let created_modes = self.created_modes.clone();
         // An empty member nothing flushed is still a file.
         let Ok(file) = self.file.file() else {
@@ -199,10 +187,9 @@ impl Drop for StagedFile {
             if let Some(modified) = modified {
                 file.set_modified(modified)?;
             }
-            // Created with its mode, it keeps it unless the umask cleared some.
-            let kept = |mode| mode == create_mode && created_modes.kept(file, mode);
-            if let Some(mode) = mode.filter(|&mode| !kept(mode)) {
-                set_file_mode(file, mode)?;
+            // Created with its early mode.
+            if let Some(mode) = mode {
+                created_modes.apply(file, mode)?;
             }
             std::io::Result::Ok(())
         })();
@@ -818,7 +805,9 @@ mod tests {
             overwrite,
             created,
             &mut Default::default(),
+            None,
         )
+        .map(|(path, made)| (path, made.is_file()))
     }
     fn output_path_for_rar50_entry(
         out: &std::path::Path,
