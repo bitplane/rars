@@ -43,6 +43,9 @@ pub struct ExtractDirOptions<'a> {
     /// the umask. Off, every file and directory keeps those defaults.
     /// Symbolic links keep their own modes.
     pub restore_modes: bool,
+    /// Leaves symbolic links and junctions out, as RAR's `-ol-` does; a hard
+    /// link or file copy to one fails as its own member.
+    pub skip_symlinks: bool,
 }
 
 impl Default for ExtractDirOptions<'_> {
@@ -52,6 +55,7 @@ impl Default for ExtractDirOptions<'_> {
             overwrite: OverwritePolicy::Never,
             restore_times: true,
             restore_modes: true,
+            skip_symlinks: false,
         }
     }
 }
@@ -87,6 +91,13 @@ impl<'a> ExtractDirOptions<'a> {
     #[must_use]
     pub fn with_restore_modes(mut self, restore_modes: bool) -> Self {
         self.restore_modes = restore_modes;
+        self
+    }
+
+    /// Sets whether symbolic links and junctions are left out. See [`Self::skip_symlinks`].
+    #[must_use]
+    pub fn with_skip_symlinks(mut self, skip_symlinks: bool) -> Self {
+        self.skip_symlinks = skip_symlinks;
         self
     }
 }
@@ -138,8 +149,9 @@ impl Archive {
     ///
     /// Links are created: symbolic links and junctions only when their
     /// target stays inside `dir`, else they are left out and listed in
-    /// [`ExtractedDir::skipped_links`]. A hard link or file copy whose target
-    /// was not extracted earlier fails the call. Where the platform can't
+    /// [`ExtractedDir::skipped_links`], or always left out with
+    /// [`ExtractDirOptions::skip_symlinks`]. A hard link or file copy whose
+    /// target was not extracted earlier fails the call. Where the platform can't
     /// create a symbolic link, the call fails.
     ///
     /// A member that fails ends the call with its error, leaving the members
@@ -240,6 +252,7 @@ fn extract_into(
         in_place: false,
         restore_times: options.restore_times,
         restore_modes: options.restore_modes,
+        skip_symlinks: options.skip_symlinks,
         flatten: false,
         exists_hint: "; set ExtractDirOptions::overwrite to replace it or keep both",
     };

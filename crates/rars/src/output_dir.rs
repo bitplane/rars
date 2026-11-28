@@ -28,6 +28,7 @@ pub struct DirMode {
     pub in_place: bool,
     pub restore_times: bool,
     pub restore_modes: bool,
+    pub skip_symlinks: bool,
     /// Writes every file straight into the directory under its base name.
     pub flatten: bool,
     /// Follows "`<path>` already exists" when `overwrite` is `Never` refuses a file.
@@ -44,6 +45,8 @@ pub struct DirOutputs<'a> {
     flatten: bool,
     restore_times: bool,
     restore_modes: bool,
+    /// So a hard link or copy naming a link left out fails as its own member.
+    skipped_symlinks: Option<HashSet<PathBuf>>,
     /// Whether files created with a mode keep it, learnt once per mode.
     created_modes: CreatedModes,
     exists_hint: &'static str,
@@ -255,6 +258,7 @@ impl<'a> DirOutputs<'a> {
             flatten: mode.flatten,
             restore_times: mode.restore_times,
             restore_modes: mode.restore_modes,
+            skipped_symlinks: mode.skip_symlinks.then(HashSet::new),
             created_modes: CreatedModes::default(),
             exists_hint: mode.exists_hint,
             flat_names: Default::default(),
@@ -721,6 +725,15 @@ impl<'a> DirOutputs<'a> {
         link: ExtractedLink<'_>,
     ) -> crate::Result<()> {
         self.publish_previous()?;
+        if let (Some(skipped), ExtractedLink::Symlink { .. } | ExtractedLink::Junction { .. }) =
+            (&mut self.skipped_symlinks, link)
+        {
+            let family = self.queue.state().family;
+            let (stored, _) = output_names(meta, family, self.encoding, self.flatten)
+                .map_err(|error| refused_output(error, &meta.name))?;
+            skipped.insert(stored);
+            return self.publish_failure();
+        }
         self.queue.wait();
         self.publish_failure()?;
         let (stored, destination, existing) = self.queue.state().destination(meta)?;
@@ -743,6 +756,18 @@ impl<'a> DirOutputs<'a> {
             });
             return Ok(());
         };
+        if matches!(
+            link,
+            ExtractedLink::HardLink { .. } | ExtractedLink::FileCopy { .. }
+        ) && self
+            .skipped_symlinks
+            .as_ref()
+            .is_some_and(|skipped| skipped.contains(&target))
+        {
+            return Err(crate::Error::InvalidArgument(
+                "hard link or file copy target is a symbolic link left out",
+            ));
+        }
         self.claim(&destination, meta)?;
         if !self.in_place
             && self.overwrite == OverwritePolicy::Never

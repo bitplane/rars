@@ -901,3 +901,169 @@ fn files_later_members_copy_keep_their_modes_even_unreadable_ones() {
         assert_eq!(fs::read(out.join("copy")).unwrap(), b"locked", "{mode:o}");
     }
 }
+
+const SYMLINK: u64 = 1;
+const HARD_LINK: u64 = 4;
+const FILE_COPY: u64 = 5;
+
+fn rar5_links(links: &[(&str, u64, &str)]) -> Vec<u8> {
+    // The RAR 5 writer, unlike Builder, takes a link whose target is a symlink.
+    use rars::rar50::{self, ArchiveEntry, ArchiveExtras, Block, WriterOptions};
+    use rars::EntrySource;
+    let payload = b"payload".to_vec();
+    // A redirection can't be built outside the crate, so one is read back.
+    let mut builder = Builder::new(ArchiveVersion::Rar50);
+    builder
+        .add_unix_symlink(b"x".to_vec(), b"x".to_vec(), false, None, None)
+        .unwrap();
+    let Archive::Rar50Plus(rar5) = read(builder.to_bytes().unwrap()) else {
+        unreachable!()
+    };
+    let symlink = rar5
+        .blocks
+        .iter()
+        .find_map(|block| match block {
+            Block::File(file) => file.redirection.clone(),
+            _ => None,
+        })
+        .unwrap();
+    let unix = |entry: ArchiveEntry, mode: u64| entry.with_host_os(1).with_attributes(mode);
+    let mut entries = vec![
+        unix(
+            ArchiveEntry::new("d", EntrySource::from_bytes(Vec::new())).with_directory(true),
+            0o040755,
+        ),
+        unix(
+            ArchiveEntry::new("f", EntrySource::from_bytes(payload.clone())),
+            0o100644,
+        ),
+    ];
+    for &(name, kind, target) in links {
+        let mut redirection = symlink.clone();
+        redirection.redirection_type = kind;
+        redirection.flags = u64::from(target == "d");
+        redirection.target_name = target.as_bytes().to_vec();
+        let entry = ArchiveEntry::new(name, EntrySource::from_bytes(Vec::new()))
+            .with_redirection(Some(redirection));
+        entries.push(if kind == SYMLINK {
+            unix(entry, 0o120777)
+        } else {
+            // A link has its target's size, and a symlink has none.
+            let size = if target == "f" {
+                payload.len() as u64
+            } else {
+                0
+            };
+            unix(entry.with_redirection_size(Some(size)), 0o100644)
+        });
+    }
+    let mut out = Vec::new();
+    rar50::write_streaming_archive_to(
+        &entries,
+        WriterOptions::default(),
+        ArchiveExtras::default(),
+        &rars::WriterResources::default(),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_symlinks_leaves_out_symlinks_and_keeps_hard_links() {
+    let root = scratch::case("extract-to-dir-skip-symlinks");
+    let bytes = rar5_links(&[
+        ("sl", SYMLINK, "f"),
+        ("dl", SYMLINK, "d"),
+        ("hl", HARD_LINK, "f"),
+    ]);
+    for skip in [false, true] {
+        let out = root.join(skip.to_string());
+
+        let extracted = read(bytes.clone())
+            .extract_to_dir(&out, &ExtractDirOptions::new().with_skip_symlinks(skip))
+            .unwrap();
+
+        let mut expected = vec!["d", "f", "hl"];
+        if !skip {
+            expected.extend(["sl", "dl"]);
+        }
+        assert_eq!(tree(&out), paths(&expected), "skip={skip}");
+        assert_eq!(fs::read(out.join("hl")).unwrap(), b"payload");
+        assert!(extracted.skipped_links.is_empty(), "skip={skip}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn skip_symlinks_leaves_out_legacy_symlinks() {
+    let root = scratch::case("extract-to-dir-skip-legacy-symlinks");
+    let mut builder = Builder::new(ArchiveVersion::Rar29);
+    builder
+        .add_bytes(b"f".to_vec(), b"payload".to_vec(), None, None)
+        .unwrap();
+    builder
+        .add_unix_symlink(b"sl".to_vec(), b"f".to_vec(), false, None, None)
+        .unwrap();
+    builder
+        .add_bytes(b"after".to_vec(), b"after".to_vec(), None, None)
+        .unwrap();
+    let bytes = builder.to_bytes().unwrap();
+    for skip in [false, true] {
+        let out = root.join(skip.to_string());
+
+        let extracted = read(bytes.clone())
+            .extract_to_dir(&out, &ExtractDirOptions::new().with_skip_symlinks(skip))
+            .unwrap();
+
+        let mut expected = vec!["f", "after"];
+        if !skip {
+            expected.push("sl");
+        }
+        assert_eq!(tree(&out), paths(&expected), "skip={skip}");
+        assert_eq!(fs::read(out.join("after")).unwrap(), b"after");
+        assert!(extracted.skipped_links.is_empty(), "skip={skip}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn links_to_a_skipped_symlink_fail_as_their_own_members() {
+    let root = scratch::case("extract-to-dir-links-to-skipped");
+    let bytes = rar5_links(&[
+        ("sl", SYMLINK, "f"),
+        ("hl", HARD_LINK, "sl"),
+        ("cp", FILE_COPY, "sl"),
+    ]);
+    let seen = Mutex::new(Vec::new());
+    let handler = recorded(&seen);
+    let options = ExtractDirOptions::new()
+        .with_skip_symlinks(true)
+        .with_read_options(ArchiveReadOptions::new().with_member_error_handler(&handler));
+    let out = root.join("handled");
+
+    read(bytes.clone()).extract_to_dir(&out, &options).unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [
+            (b"hl".to_vec(), ErrorKind::InvalidArgument),
+            (b"cp".to_vec(), ErrorKind::InvalidArgument),
+        ]
+    );
+    assert_eq!(tree(&out), paths(&["d", "f"]));
+    assert_eq!(fs::read(out.join("f")).unwrap(), b"payload");
+
+    let error = read(bytes)
+        .extract_to_dir(
+            root.join("unhandled"),
+            &ExtractDirOptions::new().with_skip_symlinks(true),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::InvalidArgument);
+    assert!(
+        error.to_string().contains("symbolic link left out"),
+        "{error}"
+    );
+}

@@ -6,6 +6,7 @@ fn mode(overwrite: OverwritePolicy) -> DirMode {
         in_place: false,
         restore_times: false,
         restore_modes: false,
+        skip_symlinks: false,
         flatten: false,
         exists_hint: "",
     }
