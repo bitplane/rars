@@ -164,7 +164,7 @@ _rars() {
             return 0
             ;;
         rars__subcmd__extract)
-            opts="-p -h -V --password --password-file --legacy-name-encoding --rar50-buffered-decode-limit --rar50-decode-workers --rar50-dictionary-size-limit --max-member-output-bytes --max-total-output-bytes --max-reader-workspace-bytes --max-header-count --max-header-bytes --rar50-scratch-dir --rar50-scratch-bytes --rar50-filter-memory-limit --allow-rar3-vm --overwrite --in-place --keep-broken --flatten --threads --progress --help --version"
+            opts="-p -h -V --password --password-file --legacy-name-encoding --rar50-buffered-decode-limit --rar50-decode-workers --rar50-dictionary-size-limit --max-member-output-bytes --max-total-output-bytes --max-reader-workspace-bytes --max-header-count --max-header-bytes --rar50-scratch-dir --rar50-scratch-bytes --rar50-filter-memory-limit --allow-rar3-vm --overwrite --in-place --keep-broken --flatten --ignore-attributes --skip-symlinks --threads --progress --help --version"
             if [[ ${cur} == -* || ${COMP_CWORD} -eq 2 ]] ; then
                 COMPREPLY=( $(compgen -W "${opts}" -- "${cur}") )
                 return 0

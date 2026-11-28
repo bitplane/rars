@@ -201,6 +201,12 @@ pub(crate) struct ExtractArgs {
     /// Write every file straight into the output directory under its base name, creating no directories
     #[arg(long)]
     pub flatten: bool,
+    /// Set no file or directory modes, like unrar -ai: files are created 0666 and directories 0777, less the umask; times are still restored
+    #[arg(long)]
+    pub ignore_attributes: bool,
+    /// Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made
+    #[arg(long)]
+    pub skip_symlinks: bool,
     /// Archive (and optional sibling parts) followed by an output directory
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
     pub paths: Vec<std::path::PathBuf>,

@@ -1564,7 +1564,7 @@ fn unsupported_selection_switches_are_refused() {
         assert!(!dir.join("out").exists(), "{switch}");
     }
     // Cosmetic ones are still accepted.
-    let output = unrars(&dir, &["x", "-idq", "-ai", "-c-", "tree.rar", "out/"]);
+    let output = unrars(&dir, &["x", "-idq", "-c-", "tree.rar", "out/"]);
     assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
 }
 
