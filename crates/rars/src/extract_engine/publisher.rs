@@ -1,8 +1,9 @@
-use crate::output::{self, ExtractedOutput, ExtractionStaging, OverwritePolicy};
-use rars::in_flight::InFlight;
-use rars::output_staging::{refused_output, FileIdentity, RenameCounters};
-use rars::output_tree::OutputTree;
-use rars::publish_queue::{PublishQueue, PublishStep};
+use super::staged::{self as output, ExtractedOutput};
+use crate::in_flight::InFlight;
+use crate::output_staging::{refused_output, FileIdentity, RenameCounters};
+use crate::output_staging::{ExtractionStaging, OverwritePolicy};
+use crate::output_tree::OutputTree;
+use crate::publish_queue::{PublishQueue, PublishStep};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,7 +12,7 @@ use std::sync::{Arc, MutexGuard};
 
 /// A file staged under a name of its own in a directory held open.
 pub(crate) struct Staged {
-    pub(crate) dir: rars::output_tree::FileDir,
+    pub(crate) dir: crate::output_tree::FileDir,
     pub(crate) name: std::ffi::OsString,
     /// Whether it took its early metadata as it closed: see [`output::StagedFile`].
     pub(crate) early_set: Arc<AtomicBool>,
@@ -29,7 +30,7 @@ pub(crate) enum Pending {
 
 /// A file written in place through the output tree.
 pub(crate) struct InPlace {
-    /// The file, once the library is done writing it: see [`rars::output_tree::HeldFile`].
+    /// The file, once the library is done writing it: see [`crate::output_tree::HeldFile`].
     pub(crate) file: Arc<std::sync::OnceLock<fs::File>>,
     /// The directory it is in.
     pub(crate) dir: FileIdentity,
@@ -54,7 +55,7 @@ pub(crate) struct Unpublished {
     pub(crate) time_on_publish: bool,
 }
 
-pub(crate) type PublishReport = dyn FnMut(&ExtractedOutput) + Send;
+pub type PublishReport = dyn FnMut(&ExtractedOutput) + Send;
 
 /// What publishing changes, and opening reads: see [`Publisher::state`].
 pub(crate) struct PublishState {
@@ -77,7 +78,7 @@ pub(crate) struct PublishState {
     /// kept up to date from then on: most archives have neither.
     created_paths: Option<HashMap<PathBuf, PathBuf>>,
     /// Whether files created in place in a directory with given permission
-    /// bits have them, as [`output::CreatedModes`] says for staged files.
+    /// bits have them, as [`crate::output_modes::CreatedModes`] says for staged files.
     in_place_modes: HashMap<(FileIdentity, u32), bool>,
     directory_times: Vec<(PathBuf, std::time::SystemTime)>,
     /// Told about each output once it is verified and in place.
@@ -110,7 +111,7 @@ impl PublishState {
     }
 
     /// The output tree, opened on first use: a queued publish adds to it.
-    pub(crate) fn tree(&mut self) -> rars::Result<Option<&mut OutputTree>> {
+    pub(crate) fn tree(&mut self) -> crate::Result<Option<&mut OutputTree>> {
         if self.out_tree.is_none() {
             self.out_tree = OutputTree::open(&self.out_dir)?;
         }
@@ -119,8 +120,8 @@ impl PublishState {
 
     /// Whether members are written in place through the output tree,
     /// creating the output directory and opening it if need be.
-    pub(crate) fn in_place_tree(&mut self) -> rars::Result<bool> {
-        if self.out_tree.is_none() && rars::output_tree::AVAILABLE {
+    pub(crate) fn in_place_tree(&mut self) -> crate::Result<bool> {
+        if self.out_tree.is_none() && crate::output_tree::AVAILABLE {
             fs::create_dir_all(&self.out_dir)?;
             self.out_tree = OutputTree::open(&self.out_dir)?;
         }
@@ -172,8 +173,8 @@ impl PublishState {
     pub(crate) fn record_directory_time(
         &mut self,
         destination: &Path,
-        meta: &rars::ExtractedEntryMeta,
-    ) -> rars::Result<()> {
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<()> {
         if let Some(time) = directory_time(destination, meta)? {
             self.directory_times.push(time);
         }
@@ -221,7 +222,7 @@ impl PublishState {
     }
 
     // Publish new inodes rather than truncating any existing hard-link target.
-    fn publish_one(&mut self, next: &mut Unpublished) -> rars::Result<()> {
+    fn publish_one(&mut self, next: &mut Unpublished) -> crate::Result<()> {
         if next.time_on_publish {
             self.record_directory_time(&next.output.path, &next.output.meta)?;
             next.time_on_publish = false;
@@ -284,9 +285,9 @@ impl PublishState {
                 let kept = created_mode == Some(mode)
                     && *modes
                         .entry((dir, mode))
-                        .or_insert_with(|| output::has_mode(file, mode));
+                        .or_insert_with(|| crate::output_modes::has_mode(file, mode));
                 if !kept {
-                    output::set_file_mode(file, mode)?;
+                    crate::output_modes::set_file_mode(file, mode)?;
                 }
             }
             std::io::Result::Ok(())
@@ -298,7 +299,7 @@ impl PublishState {
     /// directories. `false` leaves it to [`Self::publish_by_path`]: there are
     /// no open directories, it is a redirection, or the filesystem cannot
     /// rename it into place.
-    fn publish_by_descriptor(&mut self, next: &mut Unpublished) -> rars::Result<bool> {
+    fn publish_by_descriptor(&mut self, next: &mut Unpublished) -> crate::Result<bool> {
         let repeats_allowed = self.repeats_allowed;
         let (Some(out_tree), true) = (&mut self.out_tree, self.by_descriptor) else {
             return Ok(false);
@@ -310,7 +311,7 @@ impl PublishState {
         let destination = &output.path;
         let relative = destination
             .strip_prefix(&self.out_dir)
-            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            .map_err(|_| crate::Error::InvalidHeader("unsafe archive path"))?;
         let name = &output.meta.name;
         let refuse = |error| output::refused_path(error, name);
         let directory = output.meta.is_directory;
@@ -318,7 +319,7 @@ impl PublishState {
         // `Always` needs to know which files this run wrote.
         let tracked = !repeats_allowed && self.overwrite == OverwritePolicy::Always;
         let repeated = || {
-            Err(rars::Error::InvalidHeader(
+            Err(crate::Error::InvalidHeader(
                 "multiple archive entries map to the same output path",
             ))
         };
@@ -370,11 +371,11 @@ impl PublishState {
             .map_err(|error| match error {
                 // Opening it refused anything already there, so another
                 // member was published there since.
-                rars::Error::Io(error)
+                crate::Error::Io(error)
                     if error.kind == std::io::ErrorKind::AlreadyExists
                         && self.overwrite == OverwritePolicy::Never =>
                 {
-                    rars::Error::InvalidHeader(
+                    crate::Error::InvalidHeader(
                         "multiple archive entries map to the same output path",
                     )
                 }
@@ -394,7 +395,7 @@ impl PublishState {
         Ok(true)
     }
 
-    fn publish_by_path(&mut self, next: &mut Unpublished) -> rars::Result<()> {
+    fn publish_by_path(&mut self, next: &mut Unpublished) -> crate::Result<()> {
         // Whatever this changes, the open directories no longer describe.
         self.forget_walks();
         let staged = &next.staged;
@@ -403,7 +404,7 @@ impl PublishState {
         let relative = output
             .path
             .strip_prefix(&self.out_dir)
-            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
+            .map_err(|_| crate::Error::InvalidHeader("unsafe archive path"))?;
         let destination = output::checked_output_path(&self.out_dir, relative)
             .map_err(|error| refused_output(error, name))?;
         // The alias check resolves the destination already when it exists.
@@ -415,7 +416,7 @@ impl PublishState {
         };
         if let Some(identity) = existing {
             if self.identities.contains(&identity) && !self.repeats_allowed {
-                return Err(rars::Error::InvalidHeader(
+                return Err(crate::Error::InvalidHeader(
                     "multiple archive entries map to the same output path",
                 ));
             }
@@ -441,7 +442,7 @@ impl PublishState {
                     .and_then(|published| published.get(target))
                     .map_or(target, PathBuf::as_path)
             });
-            let published = output::publish_verified_output(
+            let published = crate::output_staging::publish_verified_output(
                 staged,
                 &destination,
                 self.overwrite,
@@ -455,7 +456,7 @@ impl PublishState {
     }
 
     // Symlinks may be dangling; their destination entries were reserved on open.
-    fn record_identity(&mut self, destination: &Path) -> rars::Result<()> {
+    fn record_identity(&mut self, destination: &Path) -> crate::Result<()> {
         if let Ok(identity) = FileIdentity::of(destination) {
             if !fs::symlink_metadata(destination)?.file_type().is_symlink() {
                 self.identities.insert(identity);
@@ -468,7 +469,7 @@ impl PublishState {
 impl PublishStep for PublishState {
     type Job = Unpublished;
 
-    fn publish(&mut self, mut next: Unpublished) -> rars::Result<()> {
+    fn publish(&mut self, mut next: Unpublished) -> crate::Result<()> {
         self.publish_one(&mut next)?;
         if let Some(report) = &mut self.on_published {
             report(&next.output);
@@ -590,7 +591,7 @@ impl Publisher {
     }
 
     /// The first failure of an output queued earlier, naming its member.
-    pub(crate) fn publish_failure(&mut self) -> rars::Result<()> {
+    pub(crate) fn publish_failure(&mut self) -> crate::Result<()> {
         match self.queue.take_failure() {
             Some(failure) => {
                 self.failure_given = true;
@@ -600,14 +601,14 @@ impl Publisher {
         }
     }
 
-    pub(crate) fn finish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
+    pub(crate) fn finish(mut self) -> crate::Result<Vec<ExtractedOutput>> {
         self.go_on();
         let (mut state, failures) = self.queue.finish();
         if let Some(failure) = failures.into_iter().next() {
             return Err(failure);
         }
         for (path, modified) in &state.directory_times {
-            rars::output_times::set_modified_time(path, *modified)?;
+            crate::output_times::set_modified_time(path, *modified)?;
         }
         Ok(std::mem::take(&mut state.outputs))
     }
@@ -617,8 +618,8 @@ impl Publisher {
 /// already at `destination`, before extraction changes it.
 fn directory_time(
     destination: &Path,
-    meta: &rars::ExtractedEntryMeta,
-) -> rars::Result<Option<(PathBuf, std::time::SystemTime)>> {
+    meta: &crate::ExtractedEntryMeta,
+) -> crate::Result<Option<(PathBuf, std::time::SystemTime)>> {
     if !meta.is_directory || meta.modified.is_some() {
         return Ok(None);
     }

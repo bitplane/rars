@@ -6,7 +6,8 @@
 
 use crate::output::{restore_output_metadata, ExtractedOutput, OverwritePolicy};
 use crate::password::Password;
-use crate::{display_bytes_lossy, lock, ExtractOutputState};
+use crate::{display_bytes_lossy, lock};
+use rars::extract_engine::ExtractEngine;
 use rars::output_links::Settled;
 use rars::{Archive, ArchiveReadOptions, ArchiveReader, ErrorKind};
 use std::collections::HashSet;
@@ -2000,14 +2001,17 @@ where
         Overwrite::Rename => OverwritePolicy::Rename,
     };
     let destination = invocation.destination_for(failures.path);
-    let mut state = ExtractOutputState::new(
+    let mut state = ExtractEngine::new(
         &destination,
         policy,
         invocation.keep_broken,
         invocation.command == (Command::Extract { flat: true }),
         archive.family(),
     );
-    state.skip_existing = policy == OverwritePolicy::Never;
+    crate::output::print_engine_warnings(&mut state);
+    if policy == OverwritePolicy::Never {
+        state.skip_existing();
+    }
     if invocation.ignore_attributes {
         state.ignore_modes();
     }
@@ -2039,7 +2043,7 @@ where
     };
     let state = Mutex::new(state);
     // Starts the line of a member whose output has just opened, if it has one.
-    let opened = |state: &ExtractOutputState<'_>, before: usize, member: &[u8], link: bool| {
+    let opened = |state: &ExtractEngine<'_>, before: usize, member: &[u8], link: bool| {
         if state.opened() == before {
             progress.pass(member);
             return;
@@ -2052,7 +2056,7 @@ where
         }
         // Staged, an output `-or` renames gets its name when it is published.
         let renamed = policy == OverwritePolicy::Rename
-            && !state.in_place
+            && !state.in_place()
             && std::fs::symlink_metadata(&output.path).is_ok();
         let how = match (renamed, link) {
             (true, _) => Opened::Renamed,
@@ -2128,8 +2132,8 @@ where
     let state = state
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let skipped_links = state.skipped_links;
-    let kept = state.kept_existing;
+    let skipped_links = state.skipped_links();
+    let kept = state.kept_existing();
     let outputs = state.publish()?;
     restore_output_metadata(&outputs)?;
     Ok(Extracted {
