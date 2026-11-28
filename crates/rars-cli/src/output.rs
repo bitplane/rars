@@ -137,17 +137,9 @@ pub(crate) struct StagedFile {
 }
 
 impl StagedFile {
-    /// A file created now as `name` in `dir`.
-    pub(crate) fn new(
-        dir: rars::output_tree::FileDir,
-        name: std::ffi::OsString,
-        meta: &ExtractedEntryMeta,
-        restore_mode: bool,
-        created_modes: CreatedModes,
-    ) -> std::io::Result<(Self, std::sync::Arc<std::sync::atomic::AtomicBool>)> {
-        let (mut staged, set) = Self::deferred(dir, name, meta, restore_mode, created_modes);
-        staged.file.file()?;
-        Ok((staged, set))
+    /// Created on the thread that opens it, when that thread also writes it: quicker than at first write.
+    pub(crate) fn create(&mut self) -> std::io::Result<()> {
+        self.file.file().map(drop)
     }
 
     /// A file to create as `name` in `dir` once it is first used.
@@ -394,6 +386,17 @@ mod tests {
         crate::scratch::case(&format!("rars-output-{name}"))
     }
 
+    fn write_verified(
+        state: &mut crate::ExtractOutputState<'_>,
+        meta: &ExtractedEntryMeta,
+        data: &[u8],
+    ) {
+        let mut writer = state.open_settled(meta).unwrap();
+        std::io::Write::write_all(&mut writer, data).unwrap();
+        drop(writer);
+        assert!(!state.settle(true).unwrap());
+    }
+
     /// Staged files are created with their member's permission bits. Each
     /// ends with exactly those bits, whether the umask kept them, so that
     /// nothing changes them after, or cleared some, so that they are set.
@@ -414,12 +417,11 @@ mod tests {
             let meta =
                 ExtractedEntryMeta::new(b"member".to_vec(), None, 0o100000 | mode as u64, false)
                     .with_attr_source(rars::AttrSource::Unix);
-            let (mut file, set) = if index % 2 == 0 {
-                super::StagedFile::deferred(dir.clone(), name, &meta, true, created_modes.clone())
-            } else {
-                super::StagedFile::new(dir.clone(), name, &meta, true, created_modes.clone())
-                    .unwrap()
-            };
+            let (mut file, set) =
+                super::StagedFile::deferred(dir.clone(), name, &meta, true, created_modes.clone());
+            if index % 2 == 1 {
+                file.create().unwrap();
+            }
             file.write_all(b"data").unwrap();
             drop(file);
             assert!(set.load(std::sync::atomic::Ordering::Acquire), "{mode:o}");
@@ -443,14 +445,11 @@ mod tests {
             false,
             ArchiveFamily::Rar50Plus,
         );
-        state
-            .open_entry(&rars::ExtractedEntryMeta::new(
-                b"ordinary".to_vec(),
-                None,
-                0,
-                false,
-            ))
-            .unwrap();
+        write_verified(
+            &mut state,
+            &rars::ExtractedEntryMeta::new(b"ordinary".to_vec(), None, 0, false),
+            b"",
+        );
         let storage = state.publisher.state().staging().unwrap().root.clone();
         let alias = storage
             .file_name()
@@ -460,7 +459,7 @@ mod tests {
         // On a case-sensitive host this distinct name is a legitimate output.
         let aliases_storage = root.join(&alias).exists();
         let name = format!("{alias}/payload").into_bytes();
-        let result = state.open_entry(&rars::ExtractedEntryMeta::new(name, None, 0, false));
+        let result = state.open_settled(&rars::ExtractedEntryMeta::new(name, None, 0, false));
         if aliases_storage {
             assert!(matches!(
                 &result,
@@ -471,8 +470,8 @@ mod tests {
             // The earlier member is published as the run ends at the refusal,
             // leaving nothing staged, only perhaps the empty directory files
             // stage in.
-            let error = result.err().unwrap();
-            state.publish_before_failure(&error).unwrap();
+            assert!(state.settle(false).unwrap(), "its open failed");
+            state.publish_verified_and_wait().unwrap();
             let staged: Vec<_> = fs::read_dir(&storage)
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
@@ -638,7 +637,6 @@ mod tests {
     #[test]
     fn verified_redirection_publication_replaces_only_empty_directories() {
         use super::*;
-        use std::io::Write;
         let mut kinds = vec![FSREDIR_FILE_COPY, FSREDIR_HARDLINK];
         if cfg!(unix) {
             kinds.push(FSREDIR_UNIX_SYMLINK);
@@ -661,11 +659,7 @@ mod tests {
                     );
                     let (mut meta, mut redirection) = redirection_fixture();
                     meta.name = b"source".to_vec();
-                    state
-                        .open_entry(&rars::rar50_meta(&meta))
-                        .unwrap()
-                        .write_all(b"payload")
-                        .unwrap();
+                    write_verified(&mut state, &rars::rar50_meta(&meta), b"payload");
                     meta.name = b"destination".to_vec();
                     redirection.target_name = b"source".to_vec();
                     redirection.redirection_type = kind;
@@ -908,11 +902,12 @@ mod tests {
             };
             meta.name = rars::filename::encode_rar50(native).into_owned();
             state
-                .open_entry(&rars::rar50_meta(&meta))
+                .open_settled(&rars::rar50_meta(&meta))
                 .unwrap()
                 .write_all(b"payload")
                 .unwrap();
             assert_eq!(state.last_opened().unwrap().name, meta.name);
+            state.settle(true).unwrap();
             redirection.target_name = meta.name.clone();
             redirection.redirection_type = kind;
             let link = if crate::scratch::supports_raw_byte_names(&dir) {
@@ -939,7 +934,6 @@ mod tests {
     #[test]
     fn rar50_redirections_keep_backslash_names_distinct_from_directories() {
         use super::*;
-        use std::io::Write;
 
         for host_os in [0, 1] {
             for kind in [FSREDIR_HARDLINK, FSREDIR_FILE_COPY, FSREDIR_UNIX_SYMLINK] {
@@ -962,11 +956,7 @@ mod tests {
                     (b"links/item", b"existing destination"),
                 ] {
                     meta.name = name.to_vec();
-                    state
-                        .open_entry(&rars::rar50_meta(&meta))
-                        .unwrap()
-                        .write_all(data)
-                        .unwrap();
+                    write_verified(&mut state, &rars::rar50_meta(&meta), data);
                 }
 
                 meta.name = br"links\item".to_vec();
@@ -1010,7 +1000,6 @@ mod tests {
     #[test]
     fn rar50_redirections_reject_colliding_output_names() {
         use super::*;
-        use std::io::Write;
 
         for host_os in [0, 1] {
             let dir = scratch("rar50-redirection-collision");
@@ -1024,11 +1013,7 @@ mod tests {
             let (mut meta, mut redirection) = redirection_fixture();
             meta.host_os = host_os;
             meta.name = br"same\name".to_vec();
-            state
-                .open_entry(&rars::rar50_meta(&meta))
-                .unwrap()
-                .write_all(b"keep me")
-                .unwrap();
+            write_verified(&mut state, &rars::rar50_meta(&meta), b"keep me");
             let name = if cfg!(unix) && host_os == 1 {
                 r"same\name"
             } else {
