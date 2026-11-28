@@ -204,9 +204,9 @@ pub(crate) struct ExtractArgs {
     /// Set no file or directory modes, like unrar -ai: files are created 0666 and directories 0777, less the umask; times are still restored
     #[arg(long)]
     pub ignore_attributes: bool,
-    /// Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made
-    #[arg(long)]
-    pub skip_symlinks: bool,
+    /// Which symbolic links and junctions to make, like unrar -ol, -ola and -ol-; hard links and file copies are always made
+    #[arg(long, value_enum, default_value_t = SymlinksCli::Inside)]
+    pub symlinks: SymlinksCli,
     /// Archive (and optional sibling parts) followed by an output directory
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
     pub paths: Vec<std::path::PathBuf>,
@@ -369,6 +369,26 @@ impl TargetFormat {
             ArchiveVersion::Rar50 => Some(Self::Rar50),
             ArchiveVersion::Rar70 => Some(Self::Rar70),
             _ => None,
+        }
+    }
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+pub(crate) enum SymlinksCli {
+    /// Only those whose target stays inside the output directory; the rest are skipped and reported
+    Inside,
+    /// Every one as stored, wherever it leads; nothing is ever written through one
+    All,
+    /// None
+    Skip,
+}
+
+impl From<SymlinksCli> for rars::SymlinkPolicy {
+    fn from(value: SymlinksCli) -> Self {
+        match value {
+            SymlinksCli::Inside => Self::Inside,
+            SymlinksCli::All => Self::All,
+            SymlinksCli::Skip => Self::Skip,
         }
     }
 }

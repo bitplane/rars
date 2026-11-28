@@ -106,7 +106,9 @@ mod read_control;
 pub mod read_session;
 pub use read_control::ReadCancellation;
 mod extract_dir;
-pub use extract_dir::{extract_volumes_to_dir, ExtractDirOptions, ExtractedDir, SkippedLink};
+pub use extract_dir::{
+    extract_volumes_to_dir, ExtractDirOptions, ExtractedDir, SkippedLink, SymlinkPolicy,
+};
 mod extraction_control;
 mod extraction_links;
 mod file_times;

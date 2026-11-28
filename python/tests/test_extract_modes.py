@@ -64,7 +64,7 @@ def test_a_hard_link_and_a_copy_of_an_unreadable_file_keep_their_modes(tmp_path,
     assert os.lstat(tmp_path / "linked.txt").st_nlink == nlink
 
 
-def test_skip_symlinks_leaves_symlinks_out_and_keeps_hard_links(tmp_path):
+def test_skipped_symlinks_are_left_out_and_hard_links_kept(tmp_path):
     builder = rars.RarBuilder(level=0)
     builder.add_bytes(b"target", "c/target.txt")
     builder.add_unix_symlink("a/inside.txt", "../c/target.txt")
@@ -74,7 +74,7 @@ def test_skip_symlinks_leaves_symlinks_out_and_keeps_hard_links(tmp_path):
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", rars.UnsafeLinkWarning)
-        written = rars.RarFile(data).extractall(tmp_path, skip_symlinks=True)
+        written = rars.RarFile(data).extractall(tmp_path, symlinks="skip")
 
     assert not os.path.lexists(tmp_path / "a/inside.txt")
     assert not os.path.lexists(tmp_path / "a/outside.txt")
@@ -83,15 +83,15 @@ def test_skip_symlinks_leaves_symlinks_out_and_keeps_hard_links(tmp_path):
 
 
 @pytest.mark.parametrize("format", ["rar50", "rar29"])
-def test_skip_symlinks_on_extract_and_with_flatten(tmp_path, format):
+def test_skipped_symlinks_on_extract_and_with_flatten(tmp_path, format):
     builder = rars.RarBuilder(version=format, level=0)
     builder.add_bytes(b"target", "target.txt")
     builder.add_unix_symlink("near.txt", "target.txt")
     archive = rars.RarFile(builder.to_bytes())
 
     with pytest.raises(KeyError, match="no extractable payload"):
-        archive.extract("near.txt", tmp_path / "one", skip_symlinks=True)
-    archive.extractall(tmp_path / "flat", flatten=True, skip_symlinks=True)
+        archive.extract("near.txt", tmp_path / "one", symlinks="skip")
+    archive.extractall(tmp_path / "flat", flatten=True, symlinks="skip")
 
     assert not os.path.lexists(tmp_path / "one/near.txt")
     assert not os.path.lexists(tmp_path / "flat/near.txt")
@@ -109,7 +109,7 @@ def test_a_hard_link_to_a_skipped_symlink_fails_as_its_own_member(tmp_path, volu
 
     failed = []
     written = rars.RarFile(data).extractall(
-        tmp_path, skip_symlinks=True, on_member_error=failed.append, volumes=volumes
+        tmp_path, symlinks="skip", on_member_error=failed.append, volumes=volumes
     )
 
     assert [error.member for error in failed] == ["hard"]
@@ -117,3 +117,74 @@ def test_a_hard_link_to_a_skipped_symlink_fails_as_its_own_member(tmp_path, volu
     assert not os.path.lexists(tmp_path / "hard")
     assert (tmp_path / "after.txt").read_bytes() == b"after"
     assert tmp_path / "after.txt" in written
+
+
+def links_archive(victim):
+    builder = rars.RarBuilder(level=0)
+    builder.add_bytes(b"file", "file.txt")
+    builder.add_unix_symlink("inside", "file.txt")
+    builder.add_unix_symlink("up", "../outside")
+    builder.add_unix_symlink("lone", str(victim))
+    builder.add_unix_symlink("abs", str(victim), target_is_directory=True)
+    builder.add_bytes(b"under", "up/file.txt")
+    builder.add_bytes(b"under", "abs/file.txt")
+    return rars.RarFile(builder.to_bytes())
+
+
+@pytest.mark.parametrize("in_place", [False, True])
+def test_inside_links_are_made_and_the_rest_warn(tmp_path, in_place):
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    out = tmp_path / "out"
+    with pytest.warns(rars.UnsafeLinkWarning) as caught:
+        links_archive(victim).extractall(out, in_place=in_place)
+    assert len(caught) == 3
+    assert os.readlink(out / "inside") == "file.txt"
+    assert not os.path.lexists(out / "lone")
+    for name in ["up", "abs"]:
+        assert (out / name).is_dir() and not (out / name).is_symlink()
+        assert (out / name / "file.txt").read_bytes() == b"under"
+    assert list(victim.iterdir()) == []
+
+
+@pytest.mark.parametrize("symlinks", ["all", rars.Symlinks.ALL])
+@pytest.mark.parametrize("in_place", [False, True])
+def test_every_link_is_made_and_none_written_through(tmp_path, symlinks, in_place):
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    out = tmp_path / "out"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", rars.UnsafeLinkWarning)
+        links_archive(victim).extractall(out, symlinks=symlinks, in_place=in_place)
+    assert os.readlink(out / "inside") == "file.txt"
+    assert os.readlink(out / "lone") == str(victim)
+    # A member stored under a link this call made replaces the link with a directory.
+    for name in ["up", "abs"]:
+        assert (out / name).is_dir() and not (out / name).is_symlink()
+        assert (out / name / "file.txt").read_bytes() == b"under"
+    assert list(victim.iterdir()) == []
+    assert not (tmp_path / "outside").exists()
+
+
+@pytest.mark.parametrize(
+    "arguments", [{"symlinks": "skip"}, {"symlinks": rars.Symlinks.SKIP}]
+)
+def test_no_link_is_made_when_skipped(tmp_path, arguments):
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    out = tmp_path / "out"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", rars.UnsafeLinkWarning)
+        links_archive(victim).extractall(out, **arguments)
+    assert sorted(path.name for path in out.iterdir()) == ["abs", "file.txt", "up"]
+    assert not any(path.is_symlink() for path in out.rglob("*"))
+
+
+def test_symlinks_takes_only_its_three_values(tmp_path):
+    archive = links_archive(tmp_path)
+    with pytest.raises(ValueError, match="symlinks must be"):
+        archive.extractall(tmp_path / "out", symlinks="none")
+    with pytest.raises(TypeError, match="symlinks must be"):
+        archive.extractall(tmp_path / "out", symlinks=True)
+    assert not (tmp_path / "out").exists()
+    assert [member.value for member in rars.Symlinks] == ["inside", "all", "skip"]

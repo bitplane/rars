@@ -29,6 +29,7 @@ __all__ = [
     "MissingPart",
     "HeaderDamage",
     "HeaderDamageKind",
+    "Symlinks",
     "check_password",
     "is_rarfile",
     "is_rarfile_sfx",
@@ -59,6 +60,7 @@ _Password: TypeAlias = str | bytes
 _Member: TypeAlias = RarInfo | str | bytes
 _NewName: TypeAlias = str | bytes
 _Overwrite: TypeAlias = bool | Literal["rename"]
+_Symlinks: TypeAlias = Symlinks | Literal["inside", "all", "skip"]
 _Progress: TypeAlias = Callable[[ProgressEvent], object]
 _MemberErrorHandler: TypeAlias = Callable[[Exception], object]
 
@@ -126,6 +128,16 @@ class HeaderDamageKind(str, Enum):
     """A malformed optional record was dropped and the rest of the header kept."""
     UNREADABLE = "unreadable"
     """The header doesn't parse; its member, or every member after it, is lost."""
+
+class Symlinks(str, Enum):
+    """Which symlinks and junctions `extract` and `extractall` make, as unrar's `-ol` switches do."""
+    def __new__(cls, value: str) -> Self: ...
+    INSIDE = "inside"
+    """Those whose target stays inside the output directory; the rest warn `UnsafeLinkWarning`."""
+    ALL = "all"
+    """Every one as stored; nothing is written through one, a later member replaces it with a directory."""
+    SKIP = "skip"
+    """None, without a warning."""
 
 
 class Error(Exception):
@@ -379,7 +391,7 @@ class RarFile:
         volumes: Iterable[_Source] | None = None,
         restore_times: bool = True,
         restore_modes: bool = True,
-        skip_symlinks: bool = False,
+        symlinks: _Symlinks = ...,
         in_place: bool = False,
         flatten: bool = False,
     ) -> Path: ...
@@ -396,7 +408,7 @@ class RarFile:
         volumes: Iterable[_Source] | None = None,
         restore_times: bool = True,
         restore_modes: bool = True,
-        skip_symlinks: bool = False,
+        symlinks: _Symlinks = ...,
         in_place: bool = False,
         flatten: bool = False,
         on_member_error: _MemberErrorHandler | None = None,
@@ -406,7 +418,7 @@ class RarFile:
         `keep_broken=True`, with `salvage=True`, keeps it under its own name, holding what
         was delivered for it, unless it failed on its password.
         `restore_modes` sets the recorded modes on Unix, and 0o444 on a DOS read-only file.
-        `skip_symlinks=True` leaves symlinks and junctions out, without a warning."""
+        `symlinks` chooses which symlinks and junctions are made; see `Symlinks`."""
     def testrar(
         self,
         *,

@@ -80,6 +80,8 @@ function extractor(directory, { overwrite, restoreTimes, restoreModes }) {
   const skipped = [];
   // Where each stored path went, for hard links and copies that name an earlier member.
   const created = new Map();
+  // Symlinks and junctions this call made, by output path.
+  const madeLinks = new Set();
   const fsSync = require("node:fs");
   const under = (relative) => path.join(root, ...relative.split("/"));
   // Places something new at `target` under the overwrite policy, by calling `make(path)`,
@@ -120,6 +122,25 @@ function extractor(directory, { overwrite, restoreTimes, restoreModes }) {
       : undefined;
     return place(target, (file) => fsSync.symlinkSync(to.split("/").join(path.sep), file, type));
   }
+  // As unrar does, a link this call made gives way to a directory when a later member is
+  // stored under it, so nothing is ever written through one.
+  function replaceMadeLinks(relative, isDirectory) {
+    if (madeLinks.size === 0) return;
+    const parts = relative.split("/");
+    for (let end = 1; end <= parts.length - (isDirectory ? 0 : 1); end++) {
+      const above = parts.slice(0, end).join("/");
+      if (!madeLinks.delete(above)) continue;
+      const file = under(above);
+      try {
+        if (!fsSync.lstatSync(file).isSymbolicLink()) continue;
+      } catch (error) {
+        if (error.code === "ENOENT") continue;
+        throw error;
+      }
+      // A directory link on Windows is removed as a directory.
+      try { fsSync.unlinkSync(file); } catch { fsSync.rmdirSync(file); }
+    }
+  }
   function setTime(file, mtime) {
     if (restoreTimes && mtime !== undefined) fsSync.utimesSync(file, mtime, mtime);
   }
@@ -153,10 +174,14 @@ function extractor(directory, { overwrite, restoreTimes, restoreModes }) {
         skipped.push({ name: entry.stored, target: entry.target });
         return;
       }
+      replaceMadeLinks(entry.path, entry.isDirectory === true);
       const mode = modes ? entry.mode : undefined;
       if (entry.link) {
         fsSync.mkdirSync(path.dirname(target), { recursive: true });
         const placed = link(entry, target);
+        if (entry.link.kind === "symlink" || entry.link.kind === "junction") {
+          madeLinks.add(path.relative(root, placed).split(path.sep).join("/"));
+        }
         // A hard link shares its source's mode; a copy has its own.
         if (entry.link.kind === "copy" && mode !== undefined) {
           if (entry.modeEarly) {

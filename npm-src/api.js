@@ -297,7 +297,8 @@ export function createApi(runtime) {
      * Extracts entries under `directory` (Node) in one pass and returns the files written.
      * `members` selects some; `overwrite` is false (refuse), true or "rename" (name(N).ext);
      * `flatten` drops stored directories; `restoreTimes` (default true) sets modification times;
-     * `restoreModes` (default true) sets Unix modes; `skipSymlinks` leaves symlinks out.
+     * `restoreModes` (default true) sets Unix modes; `symlinks` is "inside" (default), "all"
+     * or "skip", as unrar's -ol, -ola and -ol-.
      * `onMemberError` carries on past members that fail, writing none of their output, unless
      * `keepBroken`, which needs `salvage`, keeps what was delivered for each.
      */
@@ -307,6 +308,10 @@ export function createApi(runtime) {
       const overwrite = operation.overwrite ?? false;
       if (overwrite !== true && overwrite !== false && overwrite !== "rename") {
         throw new TypeError('overwrite must be true, false or "rename"');
+      }
+      const symlinks = operation.symlinks ?? "inside";
+      if (symlinks !== "inside" && symlinks !== "all" && symlinks !== "skip") {
+        throw new TypeError('symlinks must be "inside", "all" or "skip"');
       }
       const onMemberError = memberErrorCallback(operation);
       const keepBroken = operation.keepBroken ?? false;
@@ -341,7 +346,7 @@ export function createApi(runtime) {
         flatten: operation.flatten ?? false,
         restoreTimes: operation.restoreTimes ?? true,
         restoreModes: operation.restoreModes ?? true,
-        skipSymlinks: operation.skipSymlinks ?? false,
+        symlinks,
         keepBroken,
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,

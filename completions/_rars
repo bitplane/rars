@@ -106,6 +106,9 @@ _arguments "${_arguments_options[@]}" : \
 '--overwrite=[Behaviour when an extracted file already exists on disk]:OVERWRITE:((never\:""
 always\:""
 rename\:"Write beside an existing file as name(N).ext"))' \
+'--symlinks=[Which symbolic links and junctions to make, like unrar -ol, -ola and -ol-; hard links and file copies are always made]:SYMLINKS:((inside\:"Only those whose target stays inside the output directory; the rest are skipped and reported"
+all\:"Every one as stored, wherever it leads; nothing is ever written through one"
+skip\:"None"))' \
 '--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
 '--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
 '--allow-rar3-vm[Run RAR 3 VM filter programs other than the six standard ones. Off by default\: they are arbitrary bytecode from the archive and can use a lot of CPU time. Enable only for archives you trust]' \
@@ -113,7 +116,6 @@ rename\:"Write beside an existing file as name(N).ext"))' \
 '--keep-broken[Keep a damaged member'\''s file with what could be read of it, like unrar -kb; implies --in-place]' \
 '--flatten[Write every file straight into the output directory under its base name, creating no directories]' \
 '--ignore-attributes[Set no file or directory modes, like unrar -ai\: files are created 0666 and directories 0777, less the umask; times are still restored]' \
-'--skip-symlinks[Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -141,6 +143,9 @@ _arguments "${_arguments_options[@]}" : \
 '--overwrite=[Behaviour when an extracted file already exists on disk]:OVERWRITE:((never\:""
 always\:""
 rename\:"Write beside an existing file as name(N).ext"))' \
+'--symlinks=[Which symbolic links and junctions to make, like unrar -ol, -ola and -ol-; hard links and file copies are always made]:SYMLINKS:((inside\:"Only those whose target stays inside the output directory; the rest are skipped and reported"
+all\:"Every one as stored, wherever it leads; nothing is ever written through one"
+skip\:"None"))' \
 '--threads=[Worker threads for parallel compression and extraction (default\: all available cores)]:N:_default' \
 '--progress=[Progress reporting mode for long-running operations]:PROGRESS:(auto always never)' \
 '--allow-rar3-vm[Run RAR 3 VM filter programs other than the six standard ones. Off by default\: they are arbitrary bytecode from the archive and can use a lot of CPU time. Enable only for archives you trust]' \
@@ -148,7 +153,6 @@ rename\:"Write beside an existing file as name(N).ext"))' \
 '--keep-broken[Keep a damaged member'\''s file with what could be read of it, like unrar -kb; implies --in-place]' \
 '--flatten[Write every file straight into the output directory under its base name, creating no directories]' \
 '--ignore-attributes[Set no file or directory modes, like unrar -ai\: files are created 0666 and directories 0777, less the umask; times are still restored]' \
-'--skip-symlinks[Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \

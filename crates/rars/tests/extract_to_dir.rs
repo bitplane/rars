@@ -4,7 +4,7 @@
 
 use rars::{
     Archive, ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind,
-    ExtractDirOptions, ExtractionErrorAction, OverwritePolicy, Timestamp,
+    ExtractDirOptions, ExtractionErrorAction, OverwritePolicy, SymlinkPolicy, Timestamp,
 };
 use std::collections::BTreeSet;
 use std::fs;
@@ -272,7 +272,6 @@ fn hostile_member_names_are_refused() {
     for (index, name) in [
         b"../escape.txt".as_slice(),
         b"a/../../escape.txt",
-        b"..\\escape.txt",
         b"/etc/passwd",
         b"C:\\windows\\x",
         b"with\0nul.txt",
@@ -303,6 +302,33 @@ fn hostile_member_names_are_refused() {
         assert_eq!(tree(&out), BTreeSet::new(), "{label}");
         assert_eq!(tree(&case), paths(&["out"]), "{label}");
     }
+}
+
+#[test]
+fn a_rar5_backslash_is_part_of_the_name_not_a_way_out() {
+    let root = scratch::case("extract-to-dir-backslash");
+    let name = b"..\\escape.txt";
+    let placeholder = vec![b'p'; name.len()];
+    let mut builder = Builder::new(ArchiveVersion::Rar50).store(true);
+    builder
+        .add_bytes(placeholder.clone(), b"owned\n".to_vec(), None, None)
+        .unwrap();
+    let archive = read(rewrite_rar5_name(
+        &builder.to_bytes().unwrap(),
+        &placeholder,
+        name,
+    ));
+    let out = root.join("out");
+
+    let extracted = archive
+        .extract_to_dir(&out, &ExtractDirOptions::default())
+        .unwrap();
+
+    assert_eq!(extracted.paths.len(), 1);
+    let written = &extracted.paths[0];
+    assert_eq!(written.parent(), Some(out.as_path()));
+    assert_eq!(fs::read(written).unwrap(), b"owned\n");
+    assert_eq!(tree(&root).len(), 2);
 }
 
 #[cfg(unix)]
@@ -1010,8 +1036,16 @@ fn rar5_links(links: &[(&str, u64, &str)]) -> Vec<u8> {
 }
 
 #[cfg(unix)]
+fn policy(skip: bool) -> SymlinkPolicy {
+    if skip {
+        SymlinkPolicy::Skip
+    } else {
+        SymlinkPolicy::Inside
+    }
+}
+
 #[test]
-fn skip_symlinks_leaves_out_symlinks_and_keeps_hard_links() {
+fn skipped_symlinks_are_left_out_and_hard_links_kept() {
     let root = scratch::case("extract-to-dir-skip-symlinks");
     let bytes = rar5_links(&[
         ("sl", SYMLINK, "f"),
@@ -1022,7 +1056,7 @@ fn skip_symlinks_leaves_out_symlinks_and_keeps_hard_links() {
         let out = root.join(skip.to_string());
 
         let extracted = read(bytes.clone())
-            .extract_to_dir(&out, &ExtractDirOptions::new().with_skip_symlinks(skip))
+            .extract_to_dir(&out, &ExtractDirOptions::new().with_symlinks(policy(skip)))
             .unwrap();
 
         let mut expected = vec!["d", "f", "hl"];
@@ -1037,7 +1071,7 @@ fn skip_symlinks_leaves_out_symlinks_and_keeps_hard_links() {
 
 #[cfg(unix)]
 #[test]
-fn skip_symlinks_leaves_out_legacy_symlinks() {
+fn skipped_symlinks_leave_out_legacy_symlinks() {
     let root = scratch::case("extract-to-dir-skip-legacy-symlinks");
     let mut builder = Builder::new(ArchiveVersion::Rar29);
     builder
@@ -1054,7 +1088,7 @@ fn skip_symlinks_leaves_out_legacy_symlinks() {
         let out = root.join(skip.to_string());
 
         let extracted = read(bytes.clone())
-            .extract_to_dir(&out, &ExtractDirOptions::new().with_skip_symlinks(skip))
+            .extract_to_dir(&out, &ExtractDirOptions::new().with_symlinks(policy(skip)))
             .unwrap();
 
         let mut expected = vec!["f", "after"];
@@ -1079,7 +1113,7 @@ fn links_to_a_skipped_symlink_fail_as_their_own_members() {
     let seen = Mutex::new(Vec::new());
     let handler = recorded(&seen);
     let options = ExtractDirOptions::new()
-        .with_skip_symlinks(true)
+        .with_symlinks(SymlinkPolicy::Skip)
         .with_read_options(ArchiveReadOptions::new().with_member_error_handler(&handler));
     let out = root.join("handled");
 
@@ -1098,7 +1132,7 @@ fn links_to_a_skipped_symlink_fail_as_their_own_members() {
     let error = read(bytes)
         .extract_to_dir(
             root.join("unhandled"),
-            &ExtractDirOptions::new().with_skip_symlinks(true),
+            &ExtractDirOptions::new().with_symlinks(SymlinkPolicy::Skip),
         )
         .unwrap_err();
     assert_eq!(error.kind(), ErrorKind::InvalidArgument);

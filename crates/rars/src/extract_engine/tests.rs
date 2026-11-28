@@ -1,11 +1,7 @@
-use super::staged::{open_output_writer, StagedFile, UnsafePaths};
+use super::staged::{checked_output_path, open_output_writer, StagedFile};
 use super::*;
 use crate::{ArchiveFamily, Error, ExtractedEntryMeta};
 use std::collections::HashMap;
-
-fn checked_output_path(out_dir: &Path, rel: &Path) -> crate::Result<PathBuf> {
-    UnsafePaths::AsBadHeader.checked_output_path(out_dir, rel)
-}
 
 const FSREDIR_UNIX_SYMLINK: u64 = 0x01;
 const FSREDIR_HARDLINK: u64 = 0x04;
@@ -497,7 +493,6 @@ fn open_test_writer(
         meta.is_directory,
         overwrite,
         &mut Default::default(),
-        UnsafePaths::AsBadHeader,
     )
     .map(|(path, writer)| (path, writer as Box<dyn std::io::Write>))
 }
@@ -955,7 +950,7 @@ fn open_output_writer_rejects_existing_symlink_components() {
     std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
     assert!(matches!(
         checked_output_path(&root, Path::new("link").join("escape.txt").as_path()),
-        Err(Error::InvalidHeader("unsafe archive path crosses symlink"))
+        Err(Error::UnsafePath("unsafe archive path crosses symlink"))
     ));
     assert!(!outside.join("escape.txt").exists());
 }

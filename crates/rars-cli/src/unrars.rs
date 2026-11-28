@@ -28,6 +28,7 @@ const FATAL: i32 = 2;
 const CHECKSUM: i32 = 3;
 const MISSING_VOLUME: i32 = 6;
 const USAGE: i32 = 7;
+const CREATE: i32 = 9;
 const NO_FILES: i32 = 10;
 const BAD_PASSWORD: i32 = 11;
 const READ_ERROR: i32 = 12;
@@ -207,8 +208,8 @@ struct Invocation {
     inside: Option<Vec<u8>>,
     /// `-ad`: extract into a directory named after the archive.
     archive_directory: bool,
-    /// `-ol-`: leave symbolic links out.
-    skip_symlinks: bool,
+    /// `-ol`, `-ola`, `-ol-`.
+    symlinks: rars::SymlinkPolicy,
     /// `-ai`: set no file or directory modes.
     ignore_attributes: bool,
     /// `-ierr`: every message on stderr.
@@ -307,15 +308,12 @@ fn read_mask_list(list: &[u8]) -> Result<Vec<Vec<u8>>, ()> {
 }
 
 /// Switches unrars refuses rather than ignores: they filter by time, size,
-/// attributes or freshness, rename what is written, or allow absolute paths
-/// and links.
+/// attributes or freshness, rename what is written, or allow absolute paths.
 fn refused_switch(lower: &[u8]) -> bool {
-    matches!(
-        lower,
-        b"f" | b"u" | b"cl" | b"cu" | b"ad1" | b"ad2" | b"ola"
-    ) || [&b"ta"[..], b"tb", b"tn", b"to", b"sl", b"sm", b"ep", b"e+"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix) && lower != b"ep")
+    matches!(lower, b"f" | b"u" | b"cl" | b"cu" | b"ad1" | b"ad2")
+        || [&b"ta"[..], b"tb", b"tn", b"to", b"sl", b"sm", b"ep", b"e+"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix) && lower != b"ep")
         || (lower.starts_with(b"e") && lower.len() > 1 && lower[1].is_ascii_digit())
 }
 
@@ -367,7 +365,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         exclude: Vec::new(),
         inside: None,
         archive_directory: false,
-        skip_symlinks: false,
+        symlinks: rars::SymlinkPolicy::Inside,
         ignore_attributes: false,
         stderr_only: false,
         archive: PathBuf::from(words.next().ok_or(())?),
@@ -413,7 +411,9 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
                     *flat = true;
                 }
             }
-            b"ol-" => invocation.skip_symlinks = true,
+            b"ol" => invocation.symlinks = rars::SymlinkPolicy::Inside,
+            b"ola" => invocation.symlinks = rars::SymlinkPolicy::All,
+            b"ol-" => invocation.symlinks = rars::SymlinkPolicy::Skip,
             b"ai" => invocation.ignore_attributes = true,
             b"ierr" => invocation.stderr_only = true,
             _ if refused_switch(&lower) => return Err(Refused::Switch(raw.to_vec())),
@@ -495,6 +495,8 @@ Switches
   -ad     Extract into a directory named after the archive
   -ep     Extract without paths, as e does
   -op<p>  Extract into <p>
+  -ol     Make symbolic links that stay inside the output; skip the rest
+  -ola    Make every symbolic link as stored; nothing is written through one
   -ol-    Leave symbolic links out
   -ai     Ignore file attributes: set no file or directory modes
   -ierr   Send all messages to stderr
@@ -505,7 +507,7 @@ Switches
 
 Switches that filter by time, size, attributes or freshness (-ta, -tb, -tn,
 -to, -sl, -sm, -e, -f, -u), change names (-cl, -cu) or allow absolute paths
-and links (-ad1, -ad2, -ep1 to -ep4, -ola) are refused. Other unrar switches
+(-ad1, -ad2, -ep1 to -ep4) are refused. Other unrar switches
 are accepted and ignored.
 ",
         banner()
@@ -2015,9 +2017,7 @@ where
     if invocation.ignore_attributes {
         state.ignore_modes();
     }
-    if invocation.skip_symlinks {
-        state.skip_symlinks();
-    }
+    state.symlinks(invocation.symlinks);
     // As with unrar, a later member on the same path replaces an earlier one,
     // as `-ap` can make happen.
     state.allow_overwrite_repeats();
@@ -2319,6 +2319,8 @@ fn member_error_line(
         ErrorKind::PasswordRequired | ErrorKind::BadPassword => {
             (format!("Incorrect password for {member}"), BAD_PASSWORD)
         }
+        // Our refusal of a name or a path through a link; unrar writes what it can't create this way.
+        ErrorKind::UnsafePath => (format!("Cannot create {member}"), CREATE),
         // Such as a compression method from a later version, or one that
         // damage made up.
         ErrorKind::UnsupportedFeature | ErrorKind::UnsupportedFormat => (

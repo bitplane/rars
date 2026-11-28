@@ -1552,7 +1552,6 @@ fn unsupported_selection_switches_are_refused() {
         "-u",
         "-ep3",
         "-ad1",
-        "-ola",
         "-cl",
     ] {
         let output = unrars(&dir, &["x", switch, "tree.rar", "out/"]);

@@ -82,7 +82,6 @@ pub(crate) struct PublishState {
     directory_times: Vec<(PathBuf, std::time::SystemTime)>,
     /// Told about each output once it is verified and in place.
     on_published: Option<Box<PublishReport>>,
-    pub(crate) unsafe_paths: output::UnsafePaths,
 }
 
 impl PublishState {
@@ -103,7 +102,6 @@ impl PublishState {
             in_place_modes: HashMap::new(),
             directory_times: Vec::new(),
             on_published: None,
-            unsafe_paths: output::UnsafePaths::AsBadHeader,
         }
     }
 
@@ -314,8 +312,7 @@ impl PublishState {
             .strip_prefix(&self.out_dir)
             .map_err(|_| crate::Error::InvalidHeader("unsafe archive path"))?;
         let name = &output.meta.name;
-        let unsafe_paths = self.unsafe_paths;
-        let refuse = |error| unsafe_paths.refused(error, name);
+        let refuse = |error| output::refused_path(error, name);
         let directory = output.meta.is_directory;
         // Under `Never` an existing file already stops the rename, so only
         // `Always` needs to know which files this run wrote.
@@ -412,9 +409,7 @@ impl PublishState {
             .path
             .strip_prefix(&self.out_dir)
             .map_err(|_| crate::Error::InvalidHeader("unsafe archive path"))?;
-        let destination = self
-            .unsafe_paths
-            .checked_output_path(&self.out_dir, relative)
+        let destination = output::checked_output_path(&self.out_dir, relative)
             .map_err(|error| refused_output(error, name))?;
         // The alias check resolves the destination already when it exists.
         let existing = match &self.staging {
@@ -434,8 +429,7 @@ impl PublishState {
             fs::create_dir_all(&destination)?;
         } else {
             fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
-            self.unsafe_paths
-                .checked_output_path(&self.out_dir, relative)
+            output::checked_output_path(&self.out_dir, relative)
                 .map_err(|error| refused_output(error, name))?;
             if self.overwrite == OverwritePolicy::Always && next.redirection {
                 match fs::symlink_metadata(&destination) {

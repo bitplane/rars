@@ -170,6 +170,16 @@ does.
 Extract into
 .IR path .
 .TP
+.B \-ol
+Make symbolic links whose target stays inside the destination; skip the rest
+with a warning.
+This is the default.
+.TP
+.B \-ola
+Make every symbolic link as stored, wherever it leads.
+Nothing is ever written through one: a later member stored under a link
+unrars made replaces the link with a directory.
+.TP
 .B \-ol\-
 Leave symbolic links out.
 .TP
@@ -205,8 +215,8 @@ Filters by time, size, attributes or freshness.
 .BR \-cl ", " \-cu
 Case changes to the names written.
 .TP
-.BR \-ad1 ", " \-ad2 ", " \-ep1 " to " \-ep4 ", " \-ola
-Absolute paths and links.
+.BR \-ad1 ", " \-ad2 ", " \-ep1 " to " \-ep4
+Absolute paths.
 .PP
 Other
 .B unrar

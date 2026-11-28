@@ -267,7 +267,7 @@ export function startWorker(port, wasm, platform) {
             case "extract": {
               const output = platform.extractor(payload.directory, payload);
               archive.extractEach(payload.indices, payload.password, payload.readOptions,
-                payload.flatten, platform.posix, payload.skipSymlinks ?? false, output.deliver, output.readLink,
+                payload.flatten, platform.posix, payload.symlinks ?? "inside", output.deliver, output.readLink,
                 platform.nextVolume?.(payload.volumeFeed), report, memberError, payload.keepBroken ?? false);
               result = output.finish();
               break;

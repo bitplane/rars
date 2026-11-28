@@ -43,9 +43,24 @@ pub struct ExtractDirOptions<'a> {
     /// the umask. Off, every file and directory keeps those defaults.
     /// Symbolic links keep their own modes.
     pub restore_modes: bool,
-    /// Leaves symbolic links and junctions out, as RAR's `-ol-` does; a hard
-    /// link or file copy to one fails as its own member.
-    pub skip_symlinks: bool,
+    /// Which symbolic links and junctions are made. [`SymlinkPolicy::Inside`] by default.
+    pub symlinks: SymlinkPolicy,
+}
+
+/// Which symbolic links and junctions extraction makes, as RAR's `-ol` switches choose.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum SymlinkPolicy {
+    /// Those whose target stays inside the directory; the rest are left out and
+    /// listed in [`ExtractedDir::skipped_links`]. RAR's default and `-ol`.
+    #[default]
+    Inside,
+    /// Every one, as stored, wherever it leads, as `-ola` does. Extraction
+    /// still never writes through a link: a later member stored under one this
+    /// run made replaces it with a directory.
+    All,
+    /// None, as `-ol-` does; a hard link or file copy to one fails as its own member.
+    Skip,
 }
 
 impl Default for ExtractDirOptions<'_> {
@@ -55,7 +70,7 @@ impl Default for ExtractDirOptions<'_> {
             overwrite: OverwritePolicy::Never,
             restore_times: true,
             restore_modes: true,
-            skip_symlinks: false,
+            symlinks: SymlinkPolicy::Inside,
         }
     }
 }
@@ -94,10 +109,10 @@ impl<'a> ExtractDirOptions<'a> {
         self
     }
 
-    /// Sets whether symbolic links and junctions are left out. See [`Self::skip_symlinks`].
+    /// Sets which symbolic links and junctions are made. See [`Self::symlinks`].
     #[must_use]
-    pub fn with_skip_symlinks(mut self, skip_symlinks: bool) -> Self {
-        self.skip_symlinks = skip_symlinks;
+    pub fn with_symlinks(mut self, symlinks: SymlinkPolicy) -> Self {
+        self.symlinks = symlinks;
         self
     }
 }
@@ -138,19 +153,19 @@ impl Archive {
     /// ```
     ///
     /// Every destination stays inside `dir`. A member whose name is absolute
-    /// or climbs out with `..` is refused with [`Error::UnsafePath`] or
-    /// [`Error::InvalidHeader`], as is one whose path crosses a symbolic link
-    /// already there. Directories are created as needed. Each file is written
+    /// or climbs out with `..` is refused with [`Error::UnsafePath`], as is
+    /// one whose path crosses a symbolic link already there. Directories are
+    /// created as needed. Each file is written
     /// to private storage inside `dir` and moved to its destination once it
     /// verifies, so a member that fails leaves nothing at its destination; an
     /// existing hard link, FIFO or symbolic link there is never written
     /// through. Modes are restored as [`ExtractDirOptions::restore_modes`]
     /// says.
     ///
-    /// Links are created: symbolic links and junctions only when their
-    /// target stays inside `dir`, else they are left out and listed in
-    /// [`ExtractedDir::skipped_links`], or always left out with
-    /// [`ExtractDirOptions::skip_symlinks`]. A hard link or file copy whose
+    /// Links are created: symbolic links and junctions as
+    /// [`ExtractDirOptions::symlinks`] says, by default only when their target
+    /// stays inside `dir`, else they are left out and listed in
+    /// [`ExtractedDir::skipped_links`]. A hard link or file copy whose
     /// target was not extracted earlier fails as its own member. Where the
     /// platform can't create a symbolic link, the call fails.
     ///
@@ -229,7 +244,7 @@ fn extract_into(
         in_place: false,
         restore_times: options.restore_times,
         restore_modes: options.restore_modes,
-        skip_symlinks: options.skip_symlinks,
+        symlinks: options.symlinks,
         flatten: false,
         exists_hint: "; set ExtractDirOptions::overwrite to replace it or keep both",
     };

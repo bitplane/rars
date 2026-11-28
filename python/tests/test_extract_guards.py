@@ -113,7 +113,6 @@ def test_the_rewriter_produces_an_archive_that_still_reads():
     [
         (b"../escape.txt", "parent traversal"),
         (b"a/../../escape.txt", "traversal below a safe first component"),
-        (b"..\\escape.txt", "backslash traversal, since backslashes become slashes"),
         (b"/etc/passwd", "absolute path"),
         (b"C:\\windows\\x", "windows drive letter"),
         (b"with\x00nul.txt", "NUL byte"),
@@ -135,6 +134,19 @@ def test_extractall_refuses_a_hostile_member_name(tmp_path, name, label):
     # disk rather than trusting the exception.
     assert tree(out) == set(), f"{label} left {tree(out)} behind"
     assert tree(tmp_path) == {Path("out")}, f"{label} wrote outside the output directory"
+
+
+@pytest.mark.parametrize("flatten", [False, True])
+def test_a_rar5_backslash_is_part_of_the_name_as_unrar_has_it(tmp_path, flatten):
+    out = tmp_path / "out"
+    out.mkdir()
+    archive = rars.RarFile(hostile_archive(b"..\\escape.txt"))
+
+    written = archive.extractall(out, flatten=flatten)
+
+    assert len(written) == 1 and written[0].parent == out
+    assert written[0].read_bytes() == b"owned\n"
+    assert tree(tmp_path) == {Path("out"), written[0].relative_to(tmp_path)}
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
