@@ -8,7 +8,7 @@ use crate::output_tree::{OutputTree, TreeEntry};
 pub use dir::{extract_archive, DirExtraction, DirMode, Outputs};
 pub use publisher::PublishReport;
 use publisher::{InPlace, Pending, Publisher, Staged, Unpublished};
-use staged::{open_output_writer, UnsafePaths};
+use staged::open_output_writer;
 pub use staged::{restore_output_metadata, ExtractedOutput};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -84,6 +84,10 @@ pub struct ExtractEngine<'a> {
     restore_times: bool,
     /// So a hard link or copy naming a symlink left out fails as its own member.
     skipped_symlinks: Option<HashSet<PathBuf>>,
+    /// A symlink or junction whose target leaves the output directory is made as stored.
+    every_link: bool,
+    /// Symlinks and junctions this run made, by output path: see [`Self::replace_made_links`].
+    made_links: HashSet<PathBuf>,
     staged_directories: HashSet<FileIdentity>,
     skipped_links: usize,
     /// Members whose header gives no name: decoded and checked, never written.
@@ -102,7 +106,6 @@ pub struct ExtractEngine<'a> {
     /// A directory member with no time keeps the one already there.
     keep_directory_time: bool,
     refuse_decoded_repeats: bool,
-    unsafe_paths: UnsafePaths,
     look_in_made_directories: bool,
     /// Outputs before this index have verified: see [`Self::settle`].
     settled: usize,
@@ -151,6 +154,8 @@ impl<'a> ExtractEngine<'a> {
             restore_modes: true,
             restore_times: true,
             skipped_symlinks: None,
+            every_link: false,
+            made_links: HashSet::new(),
             staged_directories: HashSet::new(),
             skipped_links: 0,
             skipped_unnamed: 0,
@@ -162,7 +167,6 @@ impl<'a> ExtractEngine<'a> {
             exists_hint: None,
             keep_directory_time: true,
             refuse_decoded_repeats: false,
-            unsafe_paths: UnsafePaths::AsBadHeader,
             look_in_made_directories: false,
             settled: 0,
             written_elsewhere: false,
@@ -192,8 +196,9 @@ impl<'a> ExtractEngine<'a> {
         self.keep_directory_time = false;
     }
 
-    pub fn skip_symlinks(&mut self) {
-        self.skipped_symlinks = Some(HashSet::new());
+    pub fn symlinks(&mut self, policy: crate::SymlinkPolicy) {
+        self.skipped_symlinks = (policy == crate::SymlinkPolicy::Skip).then(HashSet::new);
+        self.every_link = policy == crate::SymlinkPolicy::All;
     }
 
     /// Leaves a file already at a member's destination alone instead of failing.
@@ -240,12 +245,6 @@ impl<'a> ExtractEngine<'a> {
     /// Two names one encoding decodes alike are the encoding's fault, not a repeat to overwrite.
     pub fn refuse_decoded_repeats(&mut self) {
         self.refuse_decoded_repeats = true;
-    }
-
-    /// For the library's documented refusals: a backslash climbs out in any family, as [`crate::Error::UnsafePath`].
-    pub fn strict_names(&mut self) {
-        self.unsafe_paths = UnsafePaths::AsUnsafe;
-        self.publisher.state().unsafe_paths = UnsafePaths::AsUnsafe;
     }
 
     /// So an entry planted in a directory this run made is refused for what it is, not as a repeat.
@@ -378,13 +377,7 @@ impl<'a> ExtractEngine<'a> {
     // Decode names once at the filesystem boundary, retaining the archive's
     // raw identity for errors and publication. RAR5 Unix hosts map to AttrSource::Unix.
     fn entry_path(&self, meta: &crate::ExtractedEntryMeta) -> crate::Result<(Vec<u8>, PathBuf)> {
-        let unsafe_path = |error| match self.unsafe_paths {
-            UnsafePaths::AsBadHeader => crate::Error::InvalidHeader("unsafe archive path"),
-            UnsafePaths::AsUnsafe => refused_output(error, &meta.name),
-        };
-        if self.unsafe_paths == UnsafePaths::AsUnsafe {
-            crate::filename::validate_relative(&meta.name).map_err(unsafe_path)?;
-        }
+        let unsafe_path = |error| refused_output(error, &meta.name);
         if self.family == crate::ArchiveFamily::Rar50Plus {
             let unix_host = meta.attr_source == crate::AttrSource::Unix;
             let path = rar50_relative_path(&meta.name, unix_host).map_err(unsafe_path)?;
@@ -418,10 +411,11 @@ impl<'a> ExtractEngine<'a> {
             return Ok(Box::new(std::io::sink()));
         }
         let relative = self.output_relative(&stored);
+        self.replace_made_links(&relative, meta.is_directory)?;
         self.wait_for_queued(&relative, meta.is_directory)?;
         let (destination, existing) = self
             .checked_destination(&relative)
-            .map_err(|error| self.unsafe_paths.refused(error, &meta.name))?;
+            .map_err(|error| staged::refused_path(error, &meta.name))?;
         if self.passed_over(meta, &destination, existing.as_ref()) {
             return Ok(Box::new(std::io::sink()));
         }
@@ -485,7 +479,6 @@ impl<'a> ExtractEngine<'a> {
                     meta.is_directory,
                     policy,
                     self.publisher.state().renames(),
-                    self.unsafe_paths,
                 )?;
                 self.record_staged_path(&path, meta.is_directory)?;
                 (Some(path.clone()), path, None, writer)
@@ -543,22 +536,35 @@ impl<'a> ExtractEngine<'a> {
             return Ok(());
         }
         let relative = self.output_relative(&stored);
-        let destination = self
-            .unsafe_paths
-            .checked_output_path(self.out_dir, &relative)
+        self.replace_made_links(&relative, false)?;
+        let destination = staged::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
         if self.passed_over(meta, &destination, None) {
             return Ok(());
         }
-        let Some(target) = crate::output_links::link_target(
+        let target = match crate::output_links::link_target(
             self.out_dir,
             &relative,
             meta,
             link,
             self.family,
             self.flatten,
-        )?
-        else {
+        )? {
+            Some(target) => Some(target),
+            None if self.every_link => match link {
+                crate::ExtractedLink::Symlink { target, .. }
+                | crate::ExtractedLink::Junction { target } => {
+                    crate::output_links::stored_symlink_target(
+                        target,
+                        self.family,
+                        meta.attr_source == crate::AttrSource::Unix,
+                    )
+                }
+                _ => None,
+            },
+            None => None,
+        };
+        let Some(target) = target else {
             self.warn(Warning::SkippedLink {
                 name: &name,
                 stored: &meta.name,
@@ -604,6 +610,9 @@ impl<'a> ExtractEngine<'a> {
             publisher.forget_walks();
         }
         let (path, made) = created?;
+        if made == crate::output_links::MadeLink::Symlink {
+            self.made_links.insert(relative.to_path_buf());
+        }
         let restore_metadata = made.is_file();
         let (created_paths, _) = publisher.link_paths(&self.unpublished);
         let hardlink_target = match link {
@@ -650,6 +659,37 @@ impl<'a> ExtractEngine<'a> {
     fn unnamed(&self, meta: &crate::ExtractedEntryMeta) -> bool {
         // Warned about once it settles, in archive order.
         meta.name.is_empty()
+    }
+
+    /// As the reference does, a link this run made gives way to a directory when
+    /// a later member is stored under it, so nothing is ever written through one.
+    /// One already there before the run is still refused as crossing a symlink.
+    fn replace_made_links(&mut self, relative: &Path, directory: bool) -> crate::Result<()> {
+        if self.made_links.is_empty() {
+            return Ok(());
+        }
+        let crossed: Vec<PathBuf> = relative
+            .ancestors()
+            .skip(usize::from(!directory))
+            .filter(|path| self.made_links.contains(*path))
+            .map(Path::to_path_buf)
+            .collect();
+        if crossed.is_empty() {
+            return Ok(());
+        }
+        // Staged, the link is published on the publish thread.
+        self.publisher.wait();
+        self.publisher.publish_failure()?;
+        for link in crossed.into_iter().rev() {
+            let path = self.out_dir.join(&link);
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+                // A directory symlink on Windows is removed as a directory.
+                fs::remove_file(&path).or_else(|_| fs::remove_dir(&path))?;
+            }
+            self.made_links.remove(&link);
+        }
+        self.publisher.state().forget_walks();
+        Ok(())
     }
 
     /// Waits for the outputs queued ahead of a member when one could change
@@ -888,8 +928,7 @@ impl<'a> ExtractEngine<'a> {
     ) -> crate::Result<(PathBuf, Pending, Box<dyn Write + Send>)> {
         let mut publisher = self.publisher.state();
         let tree = publisher.opened_tree().expect("opened by in_place_tree");
-        let unsafe_paths = self.unsafe_paths;
-        let refuse = |error| unsafe_paths.refused(error, &meta.name);
+        let refuse = |error| staged::refused_path(error, &meta.name);
         if meta.is_directory {
             let identity = tree.create_dirs(relative).map_err(refuse)?;
             return Ok((

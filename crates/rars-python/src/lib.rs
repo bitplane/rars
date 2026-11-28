@@ -109,6 +109,12 @@ class HeaderDamageKind(str, enum.Enum):
     UNREADABLE = 'unreadable'
 
 
+class Symlinks(str, enum.Enum):
+    INSIDE = 'inside'
+    ALL = 'all'
+    SKIP = 'skip'
+
+
 ENUMS = (
     ArchiveVersion,
     ArchiveFamily,
@@ -118,6 +124,7 @@ ENUMS = (
     TruncatedBlock,
     MissingPart,
     HeaderDamageKind,
+    Symlinks,
 )
 for cls in ENUMS:
     cls.__str__ = str.__str__
@@ -1549,7 +1556,7 @@ impl RarFile {
 
     /// `overwrite`, `in_place`, `flatten`, `volumes`, `restore_modes` and
     /// `skip_symlinks` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, skip_symlinks = false, in_place = false, flatten = false))]
+    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, symlinks = Symlinks(rars_rs::SymlinkPolicy::Inside), skip_symlinks = false, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -1564,6 +1571,7 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
         restore_modes: bool,
+        symlinks: Symlinks,
         skip_symlinks: bool,
         in_place: bool,
         flatten: bool,
@@ -1588,7 +1596,7 @@ impl RarFile {
             in_place,
             restore_times,
             restore_modes,
-            skip_symlinks,
+            symlinks: symlinks.with_skip(skip_symlinks)?,
             flatten,
         };
         let chosen = |index: usize| index == target;
@@ -1657,15 +1665,22 @@ impl RarFile {
     ///
     /// `restore_modes=True`, on Unix, gives files and directories the modes the
     /// archive records, and a DOS read-only file 0o444; others keep the umask
-    /// default. `skip_symlinks=True` leaves symlinks and junctions out without a
-    /// warning; a hard link or file copy to one fails as its own member.
+    /// default.
+    ///
+    /// `symlinks` chooses which symlinks and junctions are made, as unrar's `-ol`
+    /// switches do: `"inside"` (the default) makes those that stay inside `path`
+    /// and warns of the rest with `UnsafeLinkWarning`; `"all"` makes every one as
+    /// stored, wherever it leads, and still never writes through one: a later
+    /// member stored under a link this call made replaces it with a directory;
+    /// `"skip"` makes none, without a warning. A hard link or file copy to a link
+    /// left out fails as its own member. `skip_symlinks=True` is `symlinks="skip"`.
     ///
     /// `on_member_error` carries on past members that fail, as `testrar` does,
     /// and none of their output is kept. It can't be combined with `members`.
     /// `keep_broken=True`, on a `RarFile` opened with `salvage=True`, keeps
     /// it: each member `on_member_error` is given keeps its file under its own
     /// name, holding what was delivered for it, unless it failed on its password.
-    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, skip_symlinks = false, in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
+    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, symlinks = Symlinks(rars_rs::SymlinkPolicy::Inside), skip_symlinks = false, in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1680,6 +1695,7 @@ impl RarFile {
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
         restore_modes: bool,
+        symlinks: Symlinks,
         skip_symlinks: bool,
         in_place: bool,
         flatten: bool,
@@ -1711,7 +1727,7 @@ impl RarFile {
             in_place,
             restore_times,
             restore_modes,
-            skip_symlinks,
+            symlinks: symlinks.with_skip(skip_symlinks)?,
             flatten,
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
@@ -4147,6 +4163,7 @@ fn rars(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         "TruncatedBlock",
         "MissingPart",
         "HeaderDamageKind",
+        "Symlinks",
     ] {
         m.add(name, enums.getattr(name)?)?;
     }
@@ -4462,12 +4479,47 @@ struct OutputMode {
     in_place: bool,
     restore_times: bool,
     restore_modes: bool,
-    skip_symlinks: bool,
+    symlinks: rars_rs::SymlinkPolicy,
     flatten: bool,
 }
 
 /// `True`, `False` or `"rename"`, as `extract` and `extractall` accept it.
 struct Overwrite(OverwritePolicy);
+
+/// `"inside"`, `"all"` or `"skip"`, or a `Symlinks` member, as `extract` and `extractall` accept it.
+struct Symlinks(rars_rs::SymlinkPolicy);
+
+impl Symlinks {
+    fn with_skip(self, skip_symlinks: bool) -> PyResult<rars_rs::SymlinkPolicy> {
+        match (self.0, skip_symlinks) {
+            (policy, false) => Ok(policy),
+            (rars_rs::SymlinkPolicy::Inside | rars_rs::SymlinkPolicy::Skip, true) => {
+                Ok(rars_rs::SymlinkPolicy::Skip)
+            }
+            (_, true) => Err(PyValueError::new_err(
+                "skip_symlinks=True conflicts with symlinks; pass symlinks=\"skip\" alone",
+            )),
+        }
+    }
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for Symlinks {
+    type Error = PyErr;
+
+    fn extract(value: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        match value.extract::<&str>() {
+            Ok("inside") => Ok(Self(rars_rs::SymlinkPolicy::Inside)),
+            Ok("all") => Ok(Self(rars_rs::SymlinkPolicy::All)),
+            Ok("skip") => Ok(Self(rars_rs::SymlinkPolicy::Skip)),
+            Ok(other) => Err(PyValueError::new_err(format!(
+                "symlinks must be \"inside\", \"all\" or \"skip\", not {other:?}"
+            ))),
+            Err(_) => Err(pyo3::exceptions::PyTypeError::new_err(
+                "symlinks must be \"inside\", \"all\" or \"skip\"",
+            )),
+        }
+    }
+}
 
 /// Unix seconds as an int or a float, as `time.time()` and `os.stat_result.st_mtime` give them.
 struct UnixSeconds(rars_rs::Timestamp);
@@ -4581,7 +4633,7 @@ impl<'a> ExtractOutputs<'a> {
             in_place: mode.in_place,
             restore_times: mode.restore_times,
             restore_modes: mode.restore_modes,
-            skip_symlinks: mode.skip_symlinks,
+            symlinks: mode.symlinks,
             flatten: mode.flatten,
             exists_hint: "; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
         };
@@ -5458,6 +5510,7 @@ mod tests {
                     None,
                     true,
                     true,
+                    Symlinks(rars_rs::SymlinkPolicy::Inside),
                     false,
                     false,
                     false,
@@ -5475,6 +5528,7 @@ mod tests {
                     None,
                     true,
                     true,
+                    Symlinks(rars_rs::SymlinkPolicy::Inside),
                     false,
                     false,
                     false,
@@ -5599,6 +5653,7 @@ mod tests {
                     None,
                     true,
                     true,
+                    Symlinks(rars_rs::SymlinkPolicy::Inside),
                     false,
                     false,
                     false,
@@ -5645,6 +5700,7 @@ mod tests {
                     None,
                     true,
                     true,
+                    Symlinks(rars_rs::SymlinkPolicy::Inside),
                     false,
                     false,
                     false,
@@ -5983,7 +6039,7 @@ mod tests {
                     in_place: false,
                     restore_times: true,
                     restore_modes: true,
-                    skip_symlinks: false,
+                    symlinks: rars_rs::SymlinkPolicy::Inside,
                     flatten: false,
                 },
                 None,
@@ -6003,7 +6059,7 @@ mod tests {
                     in_place: false,
                     restore_times: true,
                     restore_modes: true,
-                    skip_symlinks: false,
+                    symlinks: rars_rs::SymlinkPolicy::Inside,
                     flatten: false,
                 },
                 None,
@@ -6023,7 +6079,7 @@ mod tests {
                     in_place: false,
                     restore_times: true,
                     restore_modes: true,
-                    skip_symlinks: false,
+                    symlinks: rars_rs::SymlinkPolicy::Inside,
                     flatten: false,
                 },
                 None,

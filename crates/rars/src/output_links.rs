@@ -17,6 +17,19 @@ pub fn rar50_native_name(name: &[u8], unix_host: bool) -> Vec<u8> {
         .collect()
 }
 
+/// A symlink's target as stored, for a link made wherever it leads.
+pub fn stored_symlink_target(
+    target: &[u8],
+    family: ArchiveFamily,
+    unix_host: bool,
+) -> Option<PathBuf> {
+    let target = native_target(target, family, unix_host);
+    if target.is_empty() || target.contains(&0) {
+        return None;
+    }
+    native_str(&target).ok().map(PathBuf::from)
+}
+
 fn native_target(target: &[u8], family: ArchiveFamily, unix_host: bool) -> Cow<'_, [u8]> {
     // Legacy targets are native Unix bytes, not member names.
     if family == ArchiveFamily::Rar50Plus {
@@ -768,12 +781,7 @@ pub fn create_link_output(
         }
         ExtractedLink::Symlink { .. } | ExtractedLink::Junction { .. } => None,
     };
-    let checked = |root: &Path| {
-        crate::filename::checked_output_path(root, relative).map_err(|error| match error {
-            Error::UnsafePath(message) => Error::InvalidHeader(message),
-            other => other,
-        })
-    };
+    let checked = |root: &Path| crate::filename::checked_output_path(root, relative);
     let mut out_path = checked(out_dir)?;
     fs::create_dir_all(
         out_path

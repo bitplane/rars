@@ -9,7 +9,7 @@ fn mode(overwrite: OverwritePolicy) -> DirMode {
         in_place: false,
         restore_times: false,
         restore_modes: false,
-        skip_symlinks: false,
+        symlinks: crate::SymlinkPolicy::Inside,
         flatten: false,
         exists_hint: "",
     }
@@ -583,5 +583,101 @@ fn a_failed_run_still_restores_what_it_published() {
                 "threads={threads}"
             );
         });
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn each_symlink_policy_makes_the_links_it_names() {
+    let link = |target: &'static [u8]| ExtractedLink::Symlink {
+        target,
+        directory: false,
+    };
+    for policy in [
+        crate::SymlinkPolicy::Inside,
+        crate::SymlinkPolicy::All,
+        crate::SymlinkPolicy::Skip,
+    ] {
+        for threads in THREADS {
+            capped(threads, || {
+                let case = format!("{policy:?} threads={threads}");
+                let root = crate::scratch::case("dir-extraction-symlink-policy");
+                let out = root.join("out");
+                let mut linked = mode(OverwritePolicy::Never);
+                linked.symlinks = policy;
+                let mut outputs = outputs(&out, linked);
+                open_and_write(&mut outputs, &file("file.txt"), b"file");
+                outputs.link(&file("inside"), link(b"file.txt")).unwrap();
+                outputs.link(&file("up"), link(b"../outside")).unwrap();
+                outputs.link(&file("abs"), link(b"/absolute")).unwrap();
+                let extracted = outputs.finish(Ok(())).unwrap();
+                let made = |name: &str| fs::read_link(out.join(name)).ok();
+                let skipped: Vec<_> = extracted
+                    .skipped_links
+                    .iter()
+                    .map(|link| link.name.clone())
+                    .collect();
+                match policy {
+                    crate::SymlinkPolicy::Inside => {
+                        assert_eq!(made("inside"), Some("file.txt".into()), "{case}");
+                        assert_eq!(made("up"), None, "{case}");
+                        assert_eq!(made("abs"), None, "{case}");
+                        assert_eq!(skipped, [b"up".to_vec(), b"abs".to_vec()], "{case}");
+                    }
+                    crate::SymlinkPolicy::All => {
+                        assert_eq!(made("inside"), Some("file.txt".into()), "{case}");
+                        assert_eq!(made("up"), Some("../outside".into()), "{case}");
+                        assert_eq!(made("abs"), Some("/absolute".into()), "{case}");
+                        assert!(skipped.is_empty(), "{case}");
+                    }
+                    _ => {
+                        assert_eq!(listing(&out), ["file.txt"], "{case}");
+                        assert!(skipped.is_empty(), "{case}");
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_member_under_a_link_the_run_made_replaces_it_with_a_directory() {
+    for (policy, target) in [
+        (crate::SymlinkPolicy::Inside, b"real".as_slice()),
+        (crate::SymlinkPolicy::All, b"../victim"),
+    ] {
+        for in_place in [false, true] {
+            for threads in THREADS {
+                capped(threads, || {
+                    let case = format!("{policy:?} in_place={in_place} threads={threads}");
+                    let root = crate::scratch::case("dir-extraction-under-made-link");
+                    let out = root.join("out");
+                    fs::create_dir_all(root.join("victim")).unwrap();
+                    let mut linked = mode(OverwritePolicy::Never);
+                    linked.symlinks = policy;
+                    linked.in_place = in_place;
+                    let mut outputs = outputs(&out, linked);
+                    outputs.written_elsewhere(!in_place);
+                    drop(outputs.open(&dir("real")).unwrap());
+                    outputs.settle(Settled::Verified).unwrap();
+                    let link = ExtractedLink::Symlink {
+                        target,
+                        directory: true,
+                    };
+                    outputs.link(&file("link"), link).unwrap();
+                    open_and_write(&mut outputs, &file("link/file.txt"), b"under");
+                    outputs.finish(Ok(())).unwrap();
+                    let at = out.join("link");
+                    assert!(
+                        fs::symlink_metadata(&at).unwrap().is_dir(),
+                        "{case}: the link gave way to a directory"
+                    );
+                    assert_eq!(fs::read(at.join("file.txt")).unwrap(), b"under", "{case}");
+                    assert_eq!(listing(&out.join("real")), [] as [&str; 0], "{case}");
+                    assert_eq!(listing(&root.join("victim")), [] as [&str; 0], "{case}");
+                });
+            }
+        }
     }
 }

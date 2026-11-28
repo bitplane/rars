@@ -4,7 +4,7 @@
 .SH NAME
 rars\-extract \- Extract archive contents
 .SH SYNOPSIS
-\fBrars extract\fR [\fB\-p\fR|\fB\-\-password\fR] [\fB\-\-threads\fR] [\fB\-\-password\-file\fR] [\fB\-\-progress\fR] [\fB\-\-legacy\-name\-encoding\fR] [\fB\-\-rar50\-buffered\-decode\-limit\fR] [\fB\-\-rar50\-decode\-workers\fR] [\fB\-\-rar50\-dictionary\-size\-limit\fR] [\fB\-\-max\-member\-output\-bytes\fR] [\fB\-\-max\-total\-output\-bytes\fR] [\fB\-\-max\-reader\-workspace\-bytes\fR] [\fB\-\-max\-header\-count\fR] [\fB\-\-max\-header\-bytes\fR] [\fB\-\-rar50\-scratch\-dir\fR] [\fB\-\-rar50\-scratch\-bytes\fR] [\fB\-\-rar50\-filter\-memory\-limit\fR] [\fB\-\-allow\-rar3\-vm\fR] [\fB\-\-overwrite\fR] [\fB\-\-in\-place\fR] [\fB\-\-keep\-broken\fR] [\fB\-\-flatten\fR] [\fB\-\-ignore\-attributes\fR] [\fB\-\-skip\-symlinks\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIPATH\fR> 
+\fBrars extract\fR [\fB\-p\fR|\fB\-\-password\fR] [\fB\-\-threads\fR] [\fB\-\-password\-file\fR] [\fB\-\-progress\fR] [\fB\-\-legacy\-name\-encoding\fR] [\fB\-\-rar50\-buffered\-decode\-limit\fR] [\fB\-\-rar50\-decode\-workers\fR] [\fB\-\-rar50\-dictionary\-size\-limit\fR] [\fB\-\-max\-member\-output\-bytes\fR] [\fB\-\-max\-total\-output\-bytes\fR] [\fB\-\-max\-reader\-workspace\-bytes\fR] [\fB\-\-max\-header\-count\fR] [\fB\-\-max\-header\-bytes\fR] [\fB\-\-rar50\-scratch\-dir\fR] [\fB\-\-rar50\-scratch\-bytes\fR] [\fB\-\-rar50\-filter\-memory\-limit\fR] [\fB\-\-allow\-rar3\-vm\fR] [\fB\-\-overwrite\fR] [\fB\-\-in\-place\fR] [\fB\-\-keep\-broken\fR] [\fB\-\-flatten\fR] [\fB\-\-ignore\-attributes\fR] [\fB\-\-symlinks\fR] [\fB\-\-skip\-symlinks\fR] [\fB\-h\fR|\fB\-\-help\fR] [\fB\-V\fR|\fB\-\-version\fR] <\fIPATH\fR> 
 .SH DESCRIPTION
 Extract archive contents
 .SH OPTIONS
@@ -99,8 +99,23 @@ Write every file straight into the output directory under its base name, creatin
 \fB\-\-ignore\-attributes\fR
 Set no file or directory modes, like unrar \-ai: files are created 0666 and directories 0777, less the umask; times are still restored
 .TP
+\fB\-\-symlinks\fR \fI<SYMLINKS>\fR [default: inside]
+Which symbolic links and junctions to make, like unrar \-ol, \-ola and \-ol\-; hard links and file copies are always made
+.br
+
+.br
+\fIPossible values:\fR
+.RS 14
+.IP \(bu 2
+inside: Only those whose target stays inside the output directory; the rest are skipped and reported
+.IP \(bu 2
+all: Every one as stored, wherever it leads; nothing is ever written through one
+.IP \(bu 2
+skip: None
+.RE
+.TP
 \fB\-\-skip\-symlinks\fR
-Leave symbolic links and junctions out, like unrar \-ol\-; hard links and file copies are still made
+Leave symbolic links and junctions out, like unrar \-ol\-: the same as \-\-symlinks=skip
 .TP
 \fB\-h\fR, \fB\-\-help\fR
 Print help (see a summary with \*(Aq\-h\*(Aq)

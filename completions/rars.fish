@@ -97,6 +97,9 @@ complete -c rars -n "__fish_rars_using_subcommand extract" -l rar50-filter-memor
 complete -c rars -n "__fish_rars_using_subcommand extract" -l overwrite -d 'Behaviour when an extracted file already exists on disk' -r -f -a "never\t''
 always\t''
 rename\t'Write beside an existing file as name(N).ext'"
+complete -c rars -n "__fish_rars_using_subcommand extract" -l symlinks -d 'Which symbolic links and junctions to make, like unrar -ol, -ola and -ol-; hard links and file copies are always made' -r -f -a "inside\t'Only those whose target stays inside the output directory; the rest are skipped and reported'
+all\t'Every one as stored, wherever it leads; nothing is ever written through one'
+skip\t'None'"
 complete -c rars -n "__fish_rars_using_subcommand extract" -l threads -d 'Worker threads for parallel compression and extraction (default: all available cores)' -r
 complete -c rars -n "__fish_rars_using_subcommand extract" -l progress -d 'Progress reporting mode for long-running operations' -r -f -a "auto\t''
 always\t''
@@ -106,7 +109,7 @@ complete -c rars -n "__fish_rars_using_subcommand extract" -l in-place -d 'Write
 complete -c rars -n "__fish_rars_using_subcommand extract" -l keep-broken -d 'Keep a damaged member\'s file with what could be read of it, like unrar -kb; implies --in-place'
 complete -c rars -n "__fish_rars_using_subcommand extract" -l flatten -d 'Write every file straight into the output directory under its base name, creating no directories'
 complete -c rars -n "__fish_rars_using_subcommand extract" -l ignore-attributes -d 'Set no file or directory modes, like unrar -ai: files are created 0666 and directories 0777, less the umask; times are still restored'
-complete -c rars -n "__fish_rars_using_subcommand extract" -l skip-symlinks -d 'Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made'
+complete -c rars -n "__fish_rars_using_subcommand extract" -l skip-symlinks -d 'Leave symbolic links and junctions out, like unrar -ol-: the same as --symlinks=skip'
 complete -c rars -n "__fish_rars_using_subcommand extract" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c rars -n "__fish_rars_using_subcommand extract" -s V -l version -d 'Print version'
 complete -c rars -n "__fish_rars_using_subcommand x" -s p -l password -d 'Archive password (visible in process list — prefer --password-file or the TTY prompt)' -r
@@ -126,6 +129,9 @@ complete -c rars -n "__fish_rars_using_subcommand x" -l rar50-filter-memory-limi
 complete -c rars -n "__fish_rars_using_subcommand x" -l overwrite -d 'Behaviour when an extracted file already exists on disk' -r -f -a "never\t''
 always\t''
 rename\t'Write beside an existing file as name(N).ext'"
+complete -c rars -n "__fish_rars_using_subcommand x" -l symlinks -d 'Which symbolic links and junctions to make, like unrar -ol, -ola and -ol-; hard links and file copies are always made' -r -f -a "inside\t'Only those whose target stays inside the output directory; the rest are skipped and reported'
+all\t'Every one as stored, wherever it leads; nothing is ever written through one'
+skip\t'None'"
 complete -c rars -n "__fish_rars_using_subcommand x" -l threads -d 'Worker threads for parallel compression and extraction (default: all available cores)' -r
 complete -c rars -n "__fish_rars_using_subcommand x" -l progress -d 'Progress reporting mode for long-running operations' -r -f -a "auto\t''
 always\t''
@@ -135,7 +141,7 @@ complete -c rars -n "__fish_rars_using_subcommand x" -l in-place -d 'Write each 
 complete -c rars -n "__fish_rars_using_subcommand x" -l keep-broken -d 'Keep a damaged member\'s file with what could be read of it, like unrar -kb; implies --in-place'
 complete -c rars -n "__fish_rars_using_subcommand x" -l flatten -d 'Write every file straight into the output directory under its base name, creating no directories'
 complete -c rars -n "__fish_rars_using_subcommand x" -l ignore-attributes -d 'Set no file or directory modes, like unrar -ai: files are created 0666 and directories 0777, less the umask; times are still restored'
-complete -c rars -n "__fish_rars_using_subcommand x" -l skip-symlinks -d 'Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made'
+complete -c rars -n "__fish_rars_using_subcommand x" -l skip-symlinks -d 'Leave symbolic links and junctions out, like unrar -ol-: the same as --symlinks=skip'
 complete -c rars -n "__fish_rars_using_subcommand x" -s h -l help -d 'Print help (see more with \'--help\')'
 complete -c rars -n "__fish_rars_using_subcommand x" -s V -l version -d 'Print version'
 complete -c rars -n "__fish_rars_using_subcommand repair" -s p -l password -d 'Archive password (visible in process list — prefer --password-file or the TTY prompt)' -r

@@ -16,7 +16,7 @@ pub struct DirMode {
     pub in_place: bool,
     pub restore_times: bool,
     pub restore_modes: bool,
-    pub skip_symlinks: bool,
+    pub symlinks: crate::SymlinkPolicy,
     /// Writes every file straight into the directory under its base name.
     pub flatten: bool,
     /// Follows "`<path>` already exists" when `overwrite` is `Never` refuses a file.
@@ -46,7 +46,6 @@ impl<'a> DirExtraction<'a> {
         engine.exists_hint(mode.exists_hint);
         engine.leave_directory_time();
         engine.refuse_decoded_repeats();
-        engine.strict_names();
         engine.look_in_made_directories();
         if mode.overwrite == OverwritePolicy::Always {
             engine.allow_overwrite_repeats();
@@ -57,9 +56,7 @@ impl<'a> DirExtraction<'a> {
         if !mode.restore_modes {
             engine.ignore_modes();
         }
-        if mode.skip_symlinks {
-            engine.skip_symlinks();
-        }
+        engine.symlinks(mode.symlinks);
         let skipped_links = Arc::new(Mutex::new(Vec::new()));
         let skipped = Arc::clone(&skipped_links);
         engine.warn_to(Box::new(move |warning| {

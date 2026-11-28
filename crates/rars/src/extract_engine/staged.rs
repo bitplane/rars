@@ -23,9 +23,8 @@ pub(crate) fn open_output_writer(
     directory: bool,
     overwrite: OverwritePolicy,
     renames: &mut crate::output_staging::RenameCounters,
-    unsafe_paths: UnsafePaths,
 ) -> crate::Result<(PathBuf, Box<dyn std::io::Write + Send>)> {
-    let mut out_path = unsafe_paths.checked_output_path(out_dir, relative)?;
+    let mut out_path = checked_output_path(out_dir, relative)?;
     if directory {
         fs::create_dir_all(&out_path)?;
         return Ok((out_path, Box::new(std::io::sink())));
@@ -35,7 +34,7 @@ pub(crate) fn open_output_writer(
             .parent()
             .expect("validated output path has a parent"),
     )?;
-    out_path = unsafe_paths.checked_output_path(out_dir, relative)?;
+    out_path = checked_output_path(out_dir, relative)?;
     let (out_path, file) = crate::output_staging::open_in_place(&out_path, overwrite, renames)?;
     Ok((out_path, Box::new(file)))
 }
@@ -190,32 +189,14 @@ impl Drop for StagedFile {
     }
 }
 
-/// How a member path that would leave the output directory is reported.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum UnsafePaths {
-    /// As a bad header, as every refusal the CLI reports is.
-    AsBadHeader,
-    /// As [`Error::UnsafePath`], as the library documents, after its stricter name check.
-    AsUnsafe,
+pub(crate) fn checked_output_path(out_dir: &Path, rel: &Path) -> crate::Result<PathBuf> {
+    crate::filename::checked_output_path(out_dir, rel)
 }
 
-impl UnsafePaths {
-    fn report(self, error: Error) -> Error {
-        match (self, error) {
-            (Self::AsBadHeader, Error::UnsafePath(message)) => Error::InvalidHeader(message),
-            (_, error) => error,
-        }
-    }
-
-    pub(crate) fn checked_output_path(self, out_dir: &Path, rel: &Path) -> crate::Result<PathBuf> {
-        crate::filename::checked_output_path(out_dir, rel).map_err(|error| self.report(error))
-    }
-
-    /// Names the member, which the walks' own errors don't.
-    pub(crate) fn refused(self, error: Error, name: &[u8]) -> Error {
-        match error {
-            Error::UnsafePath(_) => crate::output_staging::refused_output(self.report(error), name),
-            other => other,
-        }
+/// Names the member an unsafe path belongs to; the walks' own errors don't.
+pub(crate) fn refused_path(error: Error, name: &[u8]) -> Error {
+    match error {
+        Error::UnsafePath(_) => crate::output_staging::refused_output(error, name),
+        other => other,
     }
 }

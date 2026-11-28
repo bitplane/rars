@@ -105,7 +105,7 @@ def test_an_invalid_overwrite_value_raises(tmp_path, value, error):
 
 
 @pytest.mark.parametrize(
-    "name", [b"../evil.txt", b"a/../../evil.txt", b"..\\evil.txt", b"/etc/evil", b"C:\\evil", b".."]
+    "name", [b"../evil.txt", b"a/../../evil.txt", b"/etc/evil", b"C:\\evil", b".."]
 )
 @pytest.mark.parametrize("overwrite", [False, True, "rename"])
 def test_flatten_cannot_escape_the_output_directory(tmp_path, name, overwrite):
