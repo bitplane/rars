@@ -378,6 +378,8 @@ class RarFile:
         cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
         restore_times: bool = True,
+        restore_modes: bool = True,
+        skip_symlinks: bool = False,
         in_place: bool = False,
         flatten: bool = False,
     ) -> Path: ...
@@ -393,6 +395,8 @@ class RarFile:
         cancellation: CancellationToken | None = None,
         volumes: Iterable[_Source] | None = None,
         restore_times: bool = True,
+        restore_modes: bool = True,
+        skip_symlinks: bool = False,
         in_place: bool = False,
         flatten: bool = False,
         on_member_error: _MemberErrorHandler | None = None,
@@ -400,7 +404,9 @@ class RarFile:
     ) -> list[Path]:
         """`on_member_error` works as in `testrar`, and no output of a failed member is kept.
         `keep_broken=True`, with `salvage=True`, keeps it under its own name, holding what
-        was delivered for it, unless it failed on its password."""
+        was delivered for it, unless it failed on its password.
+        `restore_modes` sets the recorded modes on Unix, and 0o444 on a DOS read-only file.
+        `skip_symlinks=True` leaves symlinks and junctions out, without a warning."""
     def testrar(
         self,
         *,
