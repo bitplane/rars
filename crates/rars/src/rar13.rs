@@ -219,6 +219,21 @@ fn admit_header(
     budget.admit(size, offset)
 }
 
+/// A header whose size field is at `size_at` in its fixed `prefix`, read whole
+/// or as far as the file goes, so that its parser tells a header too short to
+/// hold its fields from one the end of the file cuts through.
+fn read_header(
+    file: &mut (impl Read + std::io::Seek),
+    offset: usize,
+    prefix: &[u8],
+    size_at: usize,
+    remaining: u64,
+) -> Result<Vec<u8>> {
+    let size = usize::from(read_u16(prefix, size_at)?).max(prefix.len());
+    // HEAD_SIZE is a u16, so the read fits in usize.
+    read_exact_at(file, offset, (size as u64).min(remaining) as usize)
+}
+
 /// The member whose header or data the end of the file cuts through, from
 /// the bytes left at its header, `rest`, which starts at file offset `offset`.
 fn cut_member(rest: &[u8], offset: usize) -> Truncation {
@@ -422,78 +437,13 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar13 {
             return Err(Error::UnsupportedSignature);
         }
-
-        let archive = &input[sig.offset..];
-        let mut budget = crate::parse_budget::ParseBudget::new(options);
-        admit_header(archive, archive.len() as u64, true, &mut budget, 0)?;
-        let main = MainHeader::parse(archive)?;
-        let mut pos = main.head_size as usize;
-        let mut entries = Vec::new();
-        let mut truncation = None;
-
-        while pos < archive.len() {
-            if archive.len() - pos < FILE_HEAD_BASE_SIZE {
-                break;
-            }
-
-            let parsed = admit_header(
-                &archive[pos..],
-                (archive.len() - pos) as u64,
-                false,
-                &mut budget,
-                pos,
-            )
-            .and_then(|()| FileHeader::parse(&archive[pos..]));
-            let (header, name, extra, consumed) = match parsed {
-                Err(Error::TooShort) if options.salvages() => {
-                    truncation = Some(cut_member(&archive[pos..], sig.offset + pos));
-                    break;
-                }
-                parsed => parsed?,
-            };
-            let data_start = pos + consumed;
-            let data_end =
-                data_start
-                    .checked_add(header.pack_size as usize)
-                    .ok_or(Error::InvalidHeader(
-                        "RAR 1.3 file data size overflows usize",
-                    ))?;
-            if data_end > archive.len() {
-                if options.salvages() {
-                    truncation = Some(cut_member(&archive[pos..], sig.offset + pos));
-                    let entry = Entry {
-                        header,
-                        name,
-                        extra,
-                        packed_range: sig.offset + data_start..sig.offset + archive.len(),
-                        cut_short: true,
-                    };
-                    if salvages_cut_member(&options, &entry) {
-                        entries.push(entry);
-                    }
-                    break;
-                }
-                return Err(Error::TooShort);
-            }
-
-            entries.push(Entry {
-                header,
-                name,
-                extra,
-                packed_range: sig.offset + data_start..sig.offset + data_end,
-                cut_short: false,
-            });
-            pos = data_end;
-        }
-
-        options.check_cancelled()?;
-        Ok(Self {
-            sfx_offset: sig.offset,
-            main,
-            entries,
-            source: ArchiveSource::Memory(input),
-            truncation,
-        })
+        Self::parse_seekable(
+            std::io::Cursor::new(&input[..]),
+            input.len() as u64,
+            sig.offset,
+            ArchiveSource::Memory(Arc::clone(&input)),
+            options,
+        )
     }
 
     pub(crate) fn parse_seekable(
@@ -506,38 +456,34 @@ impl Archive {
         options.check_cancelled()?;
         let mut budget = crate::parse_budget::ParseBudget::new(options);
         let mut file = budget.control.reader(file);
+        let remaining = file_len
+            .checked_sub(sfx_offset as u64)
+            .ok_or(Error::TooShort)?;
+        if remaining < u64::from(MAIN_HEAD_SIZE) {
+            return Err(Error::TooShort);
+        }
         let main_prefix = read_exact_at(&mut file, sfx_offset, MAIN_HEAD_SIZE as usize)?;
-        let head_size = read_u16(&main_prefix, 4)? as usize;
-        admit_header(
-            &main_prefix,
-            file_len
-                .checked_sub(sfx_offset as u64)
-                .ok_or(Error::TooShort)?,
-            true,
-            &mut budget,
-            0,
-        )?;
-        let main_bytes = read_exact_at(&mut file, sfx_offset, head_size)?;
+        admit_header(&main_prefix, remaining, true, &mut budget, 0)?;
+        let main_bytes = read_header(&mut file, sfx_offset, &main_prefix, 4, remaining)?;
         let main = MainHeader::parse(&main_bytes)?;
         let mut pos = main.head_size as usize;
         let mut entries = Vec::new();
         let mut truncation = None;
 
         while (sfx_offset + pos) as u64 + FILE_HEAD_BASE_SIZE as u64 <= file_len {
-            let header_prefix = read_exact_at(&mut file, sfx_offset + pos, FILE_HEAD_BASE_SIZE)?;
-            let head_size = read_u16(&header_prefix, 10)? as usize;
-            let remaining = file_len
-                .checked_sub((sfx_offset + pos) as u64)
-                .ok_or(Error::TooShort)?;
-            if options.salvages() && head_size as u64 > remaining {
-                // HEAD_SIZE is a u16, so what is left of the header is too.
-                let rest = read_exact_at(&mut file, sfx_offset + pos, remaining as usize)?;
-                truncation = Some(cut_member(&rest, sfx_offset + pos));
-                break;
-            }
-            admit_header(&header_prefix, remaining, false, &mut budget, pos)?;
-            let header_bytes = read_exact_at(&mut file, sfx_offset + pos, head_size)?;
-            let (header, name, extra, consumed) = FileHeader::parse(&header_bytes)?;
+            let remaining = file_len - (sfx_offset + pos) as u64;
+            let prefix = read_exact_at(&mut file, sfx_offset + pos, FILE_HEAD_BASE_SIZE)?;
+            let parsed = admit_header(&prefix, remaining, false, &mut budget, pos)
+                .and_then(|()| read_header(&mut file, sfx_offset + pos, &prefix, 10, remaining))
+                .and_then(|bytes| FileHeader::parse(&bytes));
+            let (header, name, extra, consumed) = match parsed {
+                Err(Error::TooShort) if options.salvages() => {
+                    let rest = read_header(&mut file, sfx_offset + pos, &prefix, 10, remaining)?;
+                    truncation = Some(cut_member(&rest, sfx_offset + pos));
+                    break;
+                }
+                parsed => parsed?,
+            };
             let data_start = pos + consumed;
             let data_end =
                 data_start
@@ -547,7 +493,8 @@ impl Archive {
                     ))?;
             if (sfx_offset + data_end) as u64 > file_len {
                 if options.salvages() {
-                    truncation = Some(cut_member(&header_bytes, sfx_offset + pos));
+                    let cut = TruncatedBlock::Member(name.clone());
+                    truncation = Some(Truncation::new(sfx_offset + pos, cut, true));
                     let file_end = usize::try_from(file_len)
                         .map_err(|_| Error::InvalidHeader("RAR 1.3 file size overflows usize"))?;
                     let entry = Entry {
