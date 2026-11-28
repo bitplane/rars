@@ -128,26 +128,14 @@ fn configure_threads(threads: Option<usize>) -> CliResult<()> {
 
 /// A line telling the user which option would let a refused operation run.
 fn retry_hint(error: &rars::Error) -> String {
-    if error.root_cause() == &rars::Error::Rar3VmProgramRefused {
-        return "\nhint: retry with --allow-rar3-vm if you trust this archive".to_string();
-    }
-    let Some((_, required)) = find_rar50_buffered_decode_limit_error(error) else {
-        return String::new();
-    };
-    format!(
-        "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
-    )
-}
-
-fn find_rar50_buffered_decode_limit_error(error: &rars::Error) -> Option<(u64, u64)> {
-    match error {
-        rars::Error::Rar50BufferedDecodeLimitExceeded { limit, required } => {
-            Some((*limit, *required))
+    match error.root_cause() {
+        rars::Error::Rar3VmProgramRefused => {
+            "\nhint: retry with --allow-rar3-vm if you trust this archive".to_string()
         }
-        rars::Error::AtEntry { source, .. } | rars::Error::AtArchiveOffset { source, .. } => {
-            find_rar50_buffered_decode_limit_error(source)
-        }
-        _ => None,
+        rars::Error::Rar50BufferedDecodeLimitExceeded { required, .. } => format!(
+            "\nhint: retry with --rar50-buffered-decode-limit {required} if you trust this archive and have enough memory"
+        ),
+        _ => String::new(),
     }
 }
 
@@ -4265,11 +4253,13 @@ mod tests {
             offset: 123,
             source: Box::new(error),
         };
-        assert_eq!(
-            super::find_rar50_buffered_decode_limit_error(&offset_context),
-            Some((512 * 1024 * 1024, 900 * 1024 * 1024))
-        );
         assert!(retry_hint(&offset_context).contains("943718400"));
+        // A member split across volumes fails inside the volume it ends in.
+        let in_volume = Error::InVolume {
+            index: 2,
+            source: Box::new(offset_context),
+        };
+        assert!(retry_hint(&in_volume).contains("943718400"));
     }
 
     #[test]
