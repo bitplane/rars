@@ -999,11 +999,16 @@ impl RarFile {
 
     /// Decodes the entries at `indices` (every entry when undefined) in one pass and hands
     /// each to `deliver(entry, bytes)` once the core has verified it. `entry` is
-    /// `{ path, stored, isDirectory, mtime }` for a file or directory, where `path` is the
-    /// safe relative output path, `/`-separated, and `stored` the same before flattening.
+    /// `{ path, stored, isDirectory, mtime, mode, modeEarly }` for a file or directory, where
+    /// `path` is the safe relative output path, `/`-separated, and `stored` the same before
+    /// flattening. `mode` is the permission bits to give it, if any, and `modeEarly` whether
+    /// a file can take them before it is published; otherwise they wait for the end, so
+    /// later members can still read it.
     /// A link comes as `{ path, stored, link: { kind, target, directory } }` with no bytes,
     /// `kind` one of `symlink`, `junction`, `hardlink` or `copy`, or with `skipped: true`
     /// and its raw target when following it could leave the output directory.
+    /// `skipSymlinks` leaves symlinks and junctions out undelivered; a hard link or copy
+    /// to one fails.
     /// `readLink(path)` answers for that check: the target of the symbolic link already at
     /// `path` under the output directory, or undefined.
     ///
@@ -1019,6 +1024,7 @@ impl RarFile {
         settings: JsValue,
         flatten: bool,
         posix: bool,
+        skip_symlinks: bool,
         deliver: js_sys::Function,
         read_link: js_sys::Function,
         next_volume: Option<js_sys::Function>,
@@ -1064,6 +1070,7 @@ impl RarFile {
         let encoding = options.legacy_name_encoding;
         let tree = JsTree(read_link);
         let raised: RefCell<Option<JsValue>> = RefCell::new(None);
+        let skipped_symlinks: RefCell<HashSet<String>> = RefCell::default();
         // The entry, its bytes, and its stored name, which a failure report names.
         type Pending = (JsValue, Rc<RefCell<Vec<u8>>>, Vec<u8>);
         let pending: RefCell<Option<Pending>> = RefCell::new(None);
@@ -1094,17 +1101,22 @@ impl RarFile {
             hand_over(&entry, &bytes)
         };
         let describe =
-            |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<(js_sys::Object, String)> {
+            |meta: &rars_rs::ExtractedEntryMeta| -> rars_rs::Result<(js_sys::Object, String, String)> {
                 let (stored, path) = output_paths(meta, family, encoding, flatten, posix)?;
                 let entry = js_sys::Object::new();
                 set_error_field(&entry, "path", &path.as_str().into());
-                set_error_field(&entry, "stored", &stored.into());
+                set_error_field(&entry, "stored", &stored.as_str().into());
                 set_error_field(&entry, "isDirectory", &meta.is_directory.into());
                 if let Some(time) = meta.modified {
                     let seconds = time.unix_seconds() as f64 + f64::from(time.nanoseconds()) / 1e9;
                     set_error_field(&entry, "mtime", &seconds.into());
                 }
-                Ok((entry, path))
+                if let Some(mode) = rars_rs::output_modes::restored_mode(meta) {
+                    set_error_field(&entry, "mode", &mode.into());
+                    let early = !rars_rs::output_modes::waits_for_end(mode);
+                    set_error_field(&entry, "modeEarly", &early.into());
+                }
+                Ok((entry, stored, path))
             };
         let result = progress::watching(progress, || {
             let count = progress::ReadCount::with_total("extracting", total);
@@ -1114,7 +1126,7 @@ impl RarFile {
                     if !chosen(&meta.name) {
                         return Ok(Box::new(std::io::sink()));
                     }
-                    let (entry, _) = describe(meta)?;
+                    let (entry, _, _) = describe(meta)?;
                     let buffer = Rc::new(RefCell::new(Vec::new()));
                     *pending.borrow_mut() =
                         Some((entry.into(), Rc::clone(&buffer), meta.name.clone()));
@@ -1125,7 +1137,16 @@ impl RarFile {
                 if !chosen(&meta.name) {
                     return Ok(());
                 }
-                let (entry, path) = describe(meta)?;
+                let (entry, stored, path) = describe(meta)?;
+                if skip_symlinks
+                    && matches!(
+                        link,
+                        ExtractedLink::Symlink { .. } | ExtractedLink::Junction { .. }
+                    )
+                {
+                    skipped_symlinks.borrow_mut().insert(stored);
+                    return Ok(());
+                }
                 let target = rars_rs::output_links::link_target_in(
                     &tree,
                     std::path::Path::new(""),
@@ -1143,6 +1164,17 @@ impl RarFile {
                     ExtractedLink::FileCopy { .. } => Some(("copy", false)),
                     _ => None,
                 };
+                let links_to_skipped = matches!(
+                    link,
+                    ExtractedLink::HardLink { .. } | ExtractedLink::FileCopy { .. }
+                ) && target
+                    .as_ref()
+                    .is_some_and(|target| skipped_symlinks.borrow().contains(&slash_path(target)));
+                if links_to_skipped {
+                    return Err(rars_rs::Error::InvalidArgument(
+                        "hard link or file copy target is a symbolic link left out",
+                    ));
+                }
                 match target.zip(kind) {
                     Some((target, (kind, directory))) => {
                         let detail = js_sys::Object::new();

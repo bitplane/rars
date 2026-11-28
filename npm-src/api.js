@@ -296,7 +296,8 @@ export function createApi(runtime) {
     /**
      * Extracts entries under `directory` (Node) in one pass and returns the files written.
      * `members` selects some; `overwrite` is false (refuse), true or "rename" (name(N).ext);
-     * `flatten` drops stored directories; `restoreTimes` (default true) sets modification times.
+     * `flatten` drops stored directories; `restoreTimes` (default true) sets modification times;
+     * `restoreModes` (default true) sets Unix modes; `skipSymlinks` leaves symlinks out.
      * `onMemberError` carries on past members that fail, writing none of their output, unless
      * `keepBroken`, which needs `salvage`, keeps what was delivered for each.
      */
@@ -339,6 +340,8 @@ export function createApi(runtime) {
         overwrite,
         flatten: operation.flatten ?? false,
         restoreTimes: operation.restoreTimes ?? true,
+        restoreModes: operation.restoreModes ?? true,
+        skipSymlinks: operation.skipSymlinks ?? false,
         keepBroken,
         readOptions: this._readOptions(operation),
         password: operation.password ?? this._password,
