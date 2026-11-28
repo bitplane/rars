@@ -13,7 +13,6 @@ mod input;
 mod output;
 mod password;
 mod progress;
-mod publisher;
 mod repair;
 mod unrars;
 use rars::timestamp as time;
@@ -24,10 +23,9 @@ use cli::{AddArgs, Command, ExtractArgs, InfoArgs, PasswordArgs, TestArgs};
 use error::{CliError, CliResult};
 use input::{collect_inputs, rar15_file_attr, StoredTime};
 use output::{
-    create_link_output, damaged_member_warning, incomplete_member_warning, kept_broken_warning,
-    open_output_writer, print_ok_entry, print_ok_name, rar50_output_relative_path,
-    restore_output_metadata, warn_archive_structure, warn_rar50_redirections, ExtractedOutput,
-    ExtractionStaging, OverwritePolicy,
+    damaged_member_warning, incomplete_member_warning, kept_broken_warning, print_ok_entry,
+    print_ok_name, restore_output_metadata, warn_archive_structure, warn_rar50_redirections,
+    OverwritePolicy,
 };
 use password::{
     classify_rars_error, ensure_password_for_archives_extract, ensure_password_for_extract,
@@ -35,11 +33,10 @@ use password::{
     read_archive_path_prompting_with_options, resolve_password, Password,
 };
 use progress::CliProgress;
-use publisher::{InPlace, Pending, PublishReport, Publisher, Staged, Unpublished};
+use rars::extract_engine::ExtractEngine;
 use rars::filename::LegacyNameEncoding;
 use rars::output_links::{Settled, SettledSource};
-use rars::output_staging::{failed_entry_name, refused_output, FileIdentity};
-use rars::output_tree::{OutputTree, TreeEntry};
+use rars::output_staging::failed_entry_name;
 use rars::rar13::{self, WriterOptions as Rar13WriterOptions};
 use rars::rar15_40::WriterOptions as Rar15WriterOptions;
 use rars::{
@@ -47,7 +44,6 @@ use rars::{
     ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
 };
 use repair::cmd_repair;
-use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -842,13 +838,13 @@ impl KeptBroken {
     /// Opens a member's output, noting it if there is one to keep.
     fn open(
         &self,
-        state: &mut ExtractOutputState<'_>,
+        engine: &mut ExtractEngine<'_>,
         meta: &rars::ExtractedEntryMeta,
     ) -> rars::Result<Box<dyn Write + Send>> {
         *lock(&self.open) = None;
-        let outputs = state.opened();
-        let writer = state.open_settled(meta)?;
-        if state.opened() > outputs {
+        let outputs = engine.opened();
+        let writer = engine.open_settled(meta)?;
+        if engine.opened() > outputs {
             *lock(&self.open) = Some(meta.name.clone());
         }
         Ok(writer)
@@ -1098,14 +1094,14 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
         .first()
         .map(DetectedArchive::family)
         .ok_or("no archive parts provided")?;
-    let mut state = ExtractOutputState::new(&out_dir, overwrite, in_place, args.flatten, family);
+    let mut engine = ExtractEngine::new(&out_dir, overwrite, in_place, args.flatten, family);
+    output::print_engine_warnings(&mut engine);
     if args.ignore_attributes {
-        state.ignore_modes();
+        engine.ignore_modes();
     }
     if args.skip_symlinks {
-        state.skip_symlinks();
+        engine.skip_symlinks();
     }
-    let state = Mutex::new(state);
     let kept = KeptBroken::default();
     let mut options = args
         .read_options
@@ -1125,13 +1121,13 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
         let handler =
             |member: &rars::ArchiveMember, error: &rars::Error| damaged.handle(member, error);
         let options = options.with_member_error_handler(&handler);
-        let result = extract_archives(archives, options, &state, &damaged)
-            .and_then(|()| lock(&state).queued_failure());
+        let result = extract_archives(archives, options, &mut engine, &damaged)
+            .and_then(|()| engine.queued_failure());
         passed_over += damaged.passed_over();
         result
             .inspect_err(|_| {
                 // Keep verified predecessors; retain the extraction error if publication fails.
-                if let Err(failure) = lock(&state).publish_verified_and_wait() {
+                if let Err(failure) = engine.publish_verified_and_wait() {
                     eprintln!("warning: {failure}");
                 }
             })
@@ -1153,14 +1149,11 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
                 })
             })?;
     }
-    let state = state
-        .into_inner()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let skipped_links = state.skipped_links;
-    let skipped_unnamed = state.skipped_unnamed;
+    let skipped_links = engine.skipped_links();
+    let skipped_unnamed = engine.skipped_unnamed();
     // Publishing the last members writes them where they belong, and can
     // fail as writing any member can.
-    let outputs = state.publish().map_err(|err| {
+    let outputs = engine.publish().map_err(|err| {
         classify_rars_error(err, |err| {
             format!(
                 "failed to write extracted entry to '{}': {err}{}",
@@ -1213,916 +1206,72 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
     truncated_result(&truncated)
 }
 
-type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + Send + 'a;
-
-/// Where files stage in a staging storage walked by descriptor.
-const STAGED_FILES: &str = "files";
-/// Where links stage in a staging storage walked by descriptor.
-const STAGED_LINKS: &str = "links";
-
-struct ExtractOutputState<'a> {
-    out_dir: &'a Path,
-    overwrite: OverwritePolicy,
-    in_place: bool,
-    flatten: bool,
-    flat_names: rars::output_staging::FlatNames,
-    family: rars::ArchiveFamily,
-    legacy_name_encoding: Option<rars::filename::LegacyNameEncoding>,
-    unpublished: VecDeque<Unpublished>,
-    publisher: Publisher,
-    planned_paths: HashSet<PathBuf>,
-    /// Where the staging storage is, once made: publishing never moves it.
-    staging_at: Option<PathBuf>,
-    /// The staging storage, walked the same way; present only with `out_tree`.
-    /// Files stage there under names of their own in [`STAGED_FILES`], and
-    /// links under their own paths in [`STAGED_LINKS`].
-    staging_tree: Option<OutputTree>,
-    /// [`STAGED_FILES`], once a file has staged there, and its path.
-    staging_files: Option<(rars::output_tree::FileDir, PathBuf)>,
-    /// Names taken in [`STAGED_FILES`].
-    staged_count: u64,
-    /// Which permission bits files created in [`STAGED_FILES`] keep.
-    created_modes: output::CreatedModes,
-    restore_modes: bool,
-    /// So a hard link or copy naming a symlink left out fails as its own member.
-    skipped_symlinks: Option<HashSet<PathBuf>>,
-    staged_directories: HashSet<FileIdentity>,
-    skipped_links: usize,
-    /// Members whose header gives no name: decoded and checked, never written.
-    skipped_unnamed: usize,
-    /// Leaves a file already at its destination alone instead of failing (`unrars -o-`).
-    skip_existing: bool,
-    /// Lets members that land on one path overwrite each other with
-    /// [`OverwritePolicy::Always`], as flattening does (`unrars -o+`).
-    overwrite_repeats: bool,
-    /// Members `skip_existing` left alone.
-    kept_existing: usize,
-    /// Members outside this set are decoded but not written.
-    selected: Option<Box<Selection<'a>>>,
-    /// Outputs before this index have verified: see [`Self::settle`].
-    settled: usize,
-    /// Staged files are created as they are written, since the library may write them on other threads.
-    written_elsewhere: bool,
-    /// What each member opened and not yet settled left.
-    unsettled: VecDeque<Opened>,
+/// One run of `x` over the engine, as [`DamagedMembers`] sees its callbacks.
+struct RunOutputs<'r, 'e, 'p> {
+    engine: &'r mut ExtractEngine<'e>,
+    damaged: &'r DamagedMembers<'p>,
 }
 
-/// What opening a member left, until it settles.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Opened {
-    /// A staged output.
-    Output,
-    /// Nothing to publish; `unnamed` if left out for having no name.
-    Nothing { unnamed: bool },
-    /// The open failed.
-    Refused,
-}
-
-impl<'a> ExtractOutputState<'a> {
-    fn new(
-        out_dir: &'a Path,
-        overwrite: OverwritePolicy,
-        in_place: bool,
-        flatten: bool,
-        family: rars::ArchiveFamily,
-    ) -> Self {
-        let mut state = Self {
-            out_dir,
-            overwrite,
-            in_place,
-            flatten,
-            flat_names: Default::default(),
-            family,
-            legacy_name_encoding: None,
-            unpublished: VecDeque::new(),
-            publisher: Publisher::new(out_dir, overwrite, in_place),
-            planned_paths: HashSet::new(),
-            staging_at: None,
-            staging_tree: None,
-            staging_files: None,
-            staged_count: 0,
-            created_modes: Default::default(),
-            restore_modes: true,
-            skipped_symlinks: None,
-            staged_directories: HashSet::new(),
-            skipped_links: 0,
-            skipped_unnamed: 0,
-            skip_existing: false,
-            overwrite_repeats: false,
-            kept_existing: 0,
-            selected: None,
-            settled: 0,
-            written_elsewhere: false,
-            unsettled: VecDeque::new(),
+impl rars::output_dir::Outputs for RunOutputs<'_, '_, '_> {
+    fn open(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write + Send>> {
+        let opened = match self.damaged.keep_broken {
+            Some(kept) => kept.open(self.engine, meta),
+            None => self.engine.open_settled(meta),
         };
-        state
-            .publisher
-            .state()
-            .set_repeats_allowed(state.repeats_allowed());
-        // In place, opening writes the destination; flattened, it claims names publishing keeps.
-        state.publisher.publish_on_thread(!in_place && !flatten);
-        state
+        self.damaged.callback(opened)
     }
 
-    /// For callers whose own output follows each publish as it happens.
-    fn publish_on_calling_thread(&mut self) {
-        self.publisher.publish_on_thread(false);
-    }
-
-    fn ignore_modes(&mut self) {
-        self.restore_modes = false;
-    }
-
-    fn skip_symlinks(&mut self) {
-        self.skipped_symlinks = Some(HashSet::new());
-    }
-
-    fn allow_overwrite_repeats(&mut self) {
-        self.overwrite_repeats = true;
-        self.publisher
-            .state()
-            .set_repeats_allowed(self.repeats_allowed());
-    }
-
-    fn report_to(&mut self, report: Box<PublishReport>) {
-        self.publisher.report_to(report);
-    }
-
-    fn opened(&self) -> usize {
-        self.publisher.len() + self.unpublished.len()
-    }
-
-    fn last_opened(&self) -> Option<&ExtractedOutput> {
-        self.unpublished
-            .back()
-            .map(|unpublished| &unpublished.output)
-    }
-
-    fn open_settled(
-        &mut self,
-        meta: &rars::ExtractedEntryMeta,
-    ) -> rars::Result<Box<dyn Write + Send>> {
-        let outputs = self.opened();
-        let opened = self.open_entry(meta);
-        self.unsettled.push_back(match &opened {
-            Ok(_) if self.opened() > outputs => Opened::Output,
-            Ok(_) => Opened::Nothing {
-                unnamed: meta.name.is_empty(),
-            },
-            Err(_) => Opened::Refused,
-        });
-        opened
-    }
-
-    /// A member's open failed before it reached [`Self::open_settled`]; it still settles.
-    fn refuse(&mut self, error: rars::Error) -> rars::Error {
-        self.unsettled.push_back(Opened::Refused);
-        error
-    }
-
-    /// Opens nothing for a member the caller leaves out; it still settles.
-    fn pass_over(&mut self) -> Box<dyn Write + Send> {
-        self.unsettled.push_back(Opened::Nothing { unnamed: false });
-        Box::new(std::io::sink())
-    }
-
-    /// The library is done with the oldest member opened and not settled.
-    /// A verified member's output now counts as verified and is published,
-    /// so a failure to publish it is its own; a failed one's is dropped.
-    /// Returns whether its open had failed.
-    fn settle(&mut self, verified: bool) -> rars::Result<bool> {
-        let opened = self
-            .unsettled
-            .pop_front()
-            .expect("the library settles only members it opened");
-        match opened {
-            Opened::Refused => return Ok(true),
-            Opened::Output if !verified => {
-                self.discard_output(self.settled);
-                return Ok(false);
-            }
-            Opened::Nothing { .. } if !verified => return Ok(false),
-            Opened::Nothing { unnamed: true } => {
-                eprintln!("warning: skipping a member with no name");
-                self.skipped_unnamed += 1;
-            }
-            Opened::Output | Opened::Nothing { .. } => {}
+    fn settle(&mut self, outcome: Settled) -> rars::Result<()> {
+        // `--keep-broken` is what turns salvage on, so a member kept broken is kept.
+        let verified = outcome != Settled::Failed;
+        // A failed open ends the run once the members before it settle.
+        if self.damaged.callback(self.engine.settle(verified))? {
+            self.damaged.callback_failed.store(true, Ordering::Relaxed);
         }
-        self.publish_verified()?;
-        if opened == Opened::Output {
-            self.settled += 1;
-            self.publish_verified()?;
-        }
-        Ok(false)
+        Ok(())
     }
 
-    /// Drops an output that is not to be published, and what it staged.
-    fn discard_output(&mut self, index: usize) {
-        let staged = self.unpublished[index].staged.clone();
-        self.publisher.wait();
-        self.publisher
-            .link_state()
-            .forget_created(&self.unpublished, &staged);
-        self.unpublished.remove(index);
-        if !self.in_place {
-            let _ = fs::remove_file(&staged);
-        }
-    }
-
-    // Decode names once at the filesystem boundary, retaining the archive's
-    // raw identity for errors and publication. RAR5 Unix hosts map to AttrSource::Unix.
-    fn entry_path(&self, meta: &rars::ExtractedEntryMeta) -> rars::Result<(Vec<u8>, PathBuf)> {
-        if self.family == rars::ArchiveFamily::Rar50Plus {
-            let path = rar50_output_relative_path(
-                &meta.name,
-                u64::from(meta.attr_source == rars::AttrSource::Unix),
-            )
-            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-            Ok((meta.name.clone(), path))
-        } else {
-            let name = rars::filename::decoded_name(
-                &meta.name,
-                meta.name_is_unicode,
-                self.legacy_name_encoding,
-            )?
-            .into_owned();
-            let path = output::output_relative_path(&name)
-                .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-            Ok((name, path))
-        }
-    }
-
-    fn open_entry(
-        &mut self,
-        meta: &rars::ExtractedEntryMeta,
-    ) -> rars::Result<Box<dyn Write + Send>> {
-        // Publishes links reported since the last settle, unless a member before this one is unsettled.
-        if self.settled == self.unpublished.len() {
-            self.publish_verified()?;
-        }
-        self.publisher.publish_failure()?;
-        if self.unnamed(meta) {
-            return Ok(Box::new(std::io::sink()));
-        }
-        let (name, stored) = self.entry_path(meta)?;
-        if self.flatten && meta.is_directory {
-            return Ok(Box::new(std::io::sink()));
-        }
-        let relative = self.output_relative(&stored);
-        self.wait_for_queued(&relative, meta.is_directory)?;
-        let (destination, existing) = self
-            .checked_destination(&relative)
-            .map_err(|error| output::refused_path(error, &meta.name))?;
-        if self.passed_over(meta, &destination, existing.as_ref()) {
-            return Ok(Box::new(std::io::sink()));
-        }
-        self.claim_flat_name(&relative, &meta.name)?;
-        self.reserve_output_path(destination.clone())?;
-        // Staged, the members before this one may not be published yet: the
-        // time is taken as it is published.
-        if self.in_place {
-            self.publisher
-                .state()
-                .record_directory_time(&destination, meta)?;
-        }
-        self.prepare_staged_path(&destination, meta.is_directory, existing.as_ref())?;
-        let by_descriptor = self.in_place && self.publisher.state().in_place_tree()?;
-        let (path, staged, pending, writer) = match &mut self.staging_tree {
-            Some(tree) => {
-                // Each member stages under a name of its own, so only
-                // publishing it can meet another member's output.
-                let index = self.staged_count;
-                self.staged_count += 1;
-                let name = std::ffi::OsString::from(index.to_string());
-                if self.staging_files.is_none() {
-                    let dir = tree.file_dir(Path::new(STAGED_FILES))?;
-                    let root = self.staging_root();
-                    self.staging_files = Some((dir, root.join(STAGED_FILES)));
-                }
-                let (dir, root) = self.staging_files.as_ref().expect("made above");
-                let path = root.join(&name);
-                let (writer, staged): (Box<dyn Write + Send>, _) = if meta.is_directory {
-                    // Publishing creates it.
-                    (Box::new(std::io::sink()), None)
-                } else {
-                    let dir = dir.clone();
-                    let (mut file, early_set) = output::StagedFile::deferred(
-                        dir.clone(),
-                        name.clone(),
-                        meta,
-                        self.restore_modes,
-                        self.created_modes.clone(),
-                    );
-                    if !self.written_elsewhere {
-                        file.create()?;
-                    }
-                    let staged = Staged {
-                        dir,
-                        name,
-                        early_set,
-                    };
-                    (Box::new(file), Some(staged))
-                };
-                (None, path, staged.map(Pending::Staged), writer)
-            }
-            None if by_descriptor => {
-                let (path, pending, writer) =
-                    self.open_in_place(&relative, destination.clone(), meta, existing.as_ref())?;
-                (Some(path.clone()), path, Some(pending), writer)
-            }
-            None => {
-                let policy = self.staged_policy();
-                let root = self.staging_root();
-                let (path, writer) = open_output_writer(
-                    &root,
-                    &relative,
-                    meta.is_directory,
-                    policy,
-                    self.publisher.state().renames(),
-                )?;
-                self.record_staged_path(&path, meta.is_directory)?;
-                (Some(path.clone()), path, None, writer)
-            }
-        };
-        // In place, `Rename` chose the name when it opened.
-        let path = match path {
-            Some(path) if self.in_place => path,
-            _ => destination,
-        };
-        self.publisher.note_created(&stored, &staged);
-        self.unpublished.push_back(Unpublished {
-            output: ExtractedOutput {
-                name,
-                stored,
-                path,
-                meta: meta.clone(),
-                restore_metadata: true,
-                restore_mode: self.restore_modes,
-            },
-            staged,
-            pending,
-            redirection: false,
-            hardlink_target: None,
-            time_on_publish: !self.in_place,
-        });
-        Ok(writer)
-    }
-
-    fn create_link(
+    fn link(
         &mut self,
         meta: &rars::ExtractedEntryMeta,
         link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
-        if !self.unsettled.is_empty() {
-            return Err(rars::Error::InvalidArgument(
-                "a link was reported before the members ahead of it settled",
-            ));
+        if let Some(kept) = self.damaged.keep_broken {
+            kept.close();
         }
-        self.publish_verified()?;
-        // The link finds its target where it was published.
-        self.publisher.wait();
-        self.publisher.publish_failure()?;
-        if self.unnamed(meta) {
-            return Ok(());
-        }
-        let (name, stored) = self.entry_path(meta)?;
-        if let (
-            Some(skipped),
-            rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. },
-        ) = (&mut self.skipped_symlinks, link)
-        {
-            skipped.insert(stored);
-            return Ok(());
-        }
-        let relative = self.output_relative(&stored);
-        let destination = output::checked_output_path(self.out_dir, &relative)
-            .map_err(|error| refused_output(error, &meta.name))?;
-        if self.passed_over(meta, &destination, None) {
-            return Ok(());
-        }
-        let Some(target) = rars::output_links::link_target(
-            self.out_dir,
-            &relative,
-            meta,
-            link,
-            self.family,
-            self.flatten,
-        )?
-        else {
-            eprintln!("{}", output::skipped_link_warning(&name, link.target()));
-            self.skipped_links += 1;
-            return Ok(());
-        };
-        if matches!(
-            link,
-            rars::ExtractedLink::HardLink { .. } | rars::ExtractedLink::FileCopy { .. }
-        ) && self
-            .skipped_symlinks
-            .as_ref()
-            .is_some_and(|skipped| skipped.contains(&target))
-        {
-            return Err(rars::Error::InvalidArgument(
-                "hard link or file copy target is a symbolic link left out",
-            ));
-        }
-        self.claim_flat_name(&relative, &meta.name)?;
-        self.reserve_output_path(destination.clone())?;
-        self.prepare_staged_path(&destination, false, None)?;
-        let mut staging = self.staging_root();
-        if self.staging_tree.is_some() {
-            staging.push(STAGED_LINKS);
-        }
-        let policy = self.staged_policy();
-        let mut publisher = self.publisher.link_state();
-        let (created_paths, renames) = publisher.link_paths(&self.unpublished);
-        let created = create_link_output(
-            &staging,
-            &relative,
-            &target,
-            link,
-            policy,
-            created_paths,
-            renames,
-            None,
-        );
-        if self.in_place {
-            // Made by path, which can remove a directory the walks hold.
-            publisher.forget_walks();
-        }
-        let (path, made) = created?;
-        let restore_metadata = made.is_file();
-        let (created_paths, _) = publisher.link_paths(&self.unpublished);
-        let hardlink_target = match link {
-            rars::ExtractedLink::HardLink { .. } => {
-                Some(output::link_source_path(&target, created_paths)?.to_path_buf())
-            }
-            _ => None,
-        };
-        created_paths.insert(stored.clone(), path.clone());
-        if hardlink_target.is_some() {
-            publisher.track_hard_links();
-        }
-        drop(publisher);
-        self.record_staged_path(&path, false)?;
-        self.unpublished.push_back(Unpublished {
-            output: ExtractedOutput {
-                name,
-                stored,
-                path: if self.in_place {
-                    path.clone()
-                } else {
-                    destination
-                },
-                meta: meta.clone(),
-                restore_metadata,
-                restore_mode: self.restore_modes,
-            },
-            staged: path,
-            pending: None,
-            redirection: true,
-            hardlink_target,
-            time_on_publish: false,
-        });
-        // The library reports a link once every member before it has settled.
-        self.settled = self.unpublished.len();
-        Ok(())
+        self.damaged.callback(self.engine.create_link(meta, link))
     }
 
-    /// Whether a member has no name to write it under, as when its header's
-    /// name field starts with a NUL. Like UnRAR, extraction leaves it out;
-    /// its data is still decoded, so a solid stream stays in step.
-    fn unnamed(&self, meta: &rars::ExtractedEntryMeta) -> bool {
-        // Warned about once it settles, in archive order.
-        meta.name.is_empty()
-    }
-
-    /// Waits for the outputs queued ahead of a member when one could change
-    /// what opening it finds, so it finds what it would at one thread.
-    fn wait_for_queued(&mut self, relative: &Path, directory: bool) -> rars::Result<()> {
-        if !self.publisher.queued_changes(relative, directory) {
-            return Ok(());
-        }
-        self.queued_failure()
-    }
-
-    fn output_relative<'p>(&self, stored: &'p Path) -> std::borrow::Cow<'p, Path> {
-        if self.flatten {
-            rars::output_staging::flat_relative(stored).into()
-        } else {
-            stored.into()
-        }
-    }
-
-    /// Where outputs stage: the extraction storage, or in place the output directory.
-    fn staging_root(&self) -> PathBuf {
-        match &self.staging_at {
-            Some(root) if !self.in_place => root.clone(),
-            _ => self.out_dir.to_path_buf(),
-        }
-    }
-
-    fn claim_flat_name(&mut self, relative: &Path, member: &[u8]) -> rars::Result<()> {
-        if !self.flatten {
-            return Ok(());
-        }
-        self.flat_names
-            .claim(relative, member, self.overwrite)
-            .map_err(|error| refused_output(error, member))
-    }
-
-    /// Whether a later member may land where an earlier one did: beside it,
-    /// or over it when flattening or [`Self::overwrite_repeats`] allows.
-    fn repeats_allowed(&self) -> bool {
-        self.overwrite == OverwritePolicy::Rename
-            || ((self.flatten || self.overwrite_repeats)
-                && self.overwrite == OverwritePolicy::Always)
-    }
-
-    /// Where a member goes, refusing a symlink on the way. With the output
-    /// directory open by descriptor, also what is there now; except in a
-    /// directory this run made, where nothing was before it began. There a
-    /// path this run used already is caught as it is reserved, or as it is
-    /// published, which refuses anything else put there meanwhile.
-    fn checked_destination(
-        &mut self,
-        relative: &Path,
-    ) -> rars::Result<(PathBuf, Option<TreeEntry>)> {
-        let mut publisher = self.publisher.state();
-        let Some(tree) = publisher.tree()? else {
-            return Ok((
-                rars::filename::checked_output_path(self.out_dir, relative)?,
-                None,
-            ));
-        };
-        // Skipping existing files needs to see this run's own directories.
-        let entry = if self.skip_existing {
-            tree.lstat(relative)?
-        } else {
-            tree.lstat_unless_created(relative)?
-        };
-        match entry {
-            TreeEntry::Symlink => Err(rars::Error::UnsafePath(
-                "unsafe archive path crosses symlink",
-            )),
-            entry => Ok((self.out_dir.join(relative), Some(entry))),
-        }
-    }
-
-    /// Whether a member is left unwritten: not selected, or kept out by an existing file,
-    /// including one an earlier member is writing.
-    fn passed_over(
-        &mut self,
-        meta: &rars::ExtractedEntryMeta,
-        destination: &Path,
-        existing: Option<&TreeEntry>,
-    ) -> bool {
-        if self
-            .selected
-            .as_ref()
-            .is_some_and(|selected| !selected(meta))
-        {
-            return true;
-        }
-        let kept = self.skip_existing
-            && !meta.is_directory
-            && (self.planned_paths.contains(destination)
-                || match existing {
-                    Some(entry) => *entry != TreeEntry::Missing,
-                    None => fs::symlink_metadata(destination).is_ok(),
-                });
-        self.kept_existing += usize::from(kept);
-        kept
-    }
-
-    fn reserve_output_path(&mut self, path: PathBuf) -> rars::Result<()> {
-        if !self.planned_paths.insert(path)
-            && !((self.flatten || self.overwrite_repeats)
-                && self.overwrite != OverwritePolicy::Never)
-        {
-            return Err(rars::Error::InvalidHeader(
-                "multiple archive entries map to the same output path",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Checks a member may stage for `destination`, and readies the
-    /// [`Self::staging_root`] it stages under. `existing` is what the output
-    /// tree found at `destination`; without a tree, the checks go by path.
-    fn prepare_staged_path(
-        &mut self,
-        destination: &Path,
-        directory: bool,
-        existing: Option<&TreeEntry>,
-    ) -> rars::Result<()> {
-        if !directory
-            && self.overwrite == OverwritePolicy::Never
-            && match existing {
-                Some(entry) => *entry != TreeEntry::Missing,
-                None => fs::symlink_metadata(destination).is_ok(),
-            }
-        {
-            // As publishing it would find, if it opened before the
-            // directory there was made.
-            if let Some(TreeEntry::Directory(identity)) = existing {
-                if self.publisher.state().made_here(identity) {
-                    return Err(rars::Error::InvalidHeader(
-                        "multiple archive entries map to the same output path",
-                    ));
-                }
-            }
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::AlreadyExists, "File exists").into(),
-            );
-        }
-        if self.in_place {
-            // A collision would otherwise overwrite an earlier member before any check.
-            let ours = |identity: &FileIdentity| {
-                // A directory a walk made for an earlier member's path is
-                // the run's own, but a directory member may land on it.
-                if directory {
-                    self.publisher.state().published(identity)
-                } else {
-                    self.publisher.state().made_here(identity)
-                }
-            };
-            let ours = match existing {
-                Some(TreeEntry::Directory(identity) | TreeEntry::Other(identity)) => ours(identity),
-                Some(_) => false,
-                None => FileIdentity::of(destination).is_ok_and(|identity| ours(&identity)),
-            };
-            if ours && !self.repeats_allowed() {
-                return Err(rars::Error::InvalidHeader(
-                    "multiple archive entries map to the same output path",
-                ));
-            }
-            return Ok(());
-        }
-        if self.staging_at.is_none() {
-            let staging = ExtractionStaging::new(self.out_dir)?;
-            self.staging_at = Some(staging.root.clone());
-            if let Some(out_tree) = self.publisher.state().tree()? {
-                self.staging_tree = OutputTree::open(&staging.root)?;
-                if let Some(staging_tree) = &self.staging_tree {
-                    out_tree.forbid(staging_tree.identity());
-                }
-            }
-            let by_descriptor = self.staging_tree.is_some();
-            self.publisher.state().start_staging(staging, by_descriptor);
-        }
-        // The output tree refused the storage on its walk to the destination.
-        if existing.is_none() {
-            let publisher = self.publisher.state();
-            let staging = publisher.staging().expect("staging exists");
-            staging.reject_alias(destination)?;
-        }
-        let root = self.staging_at.as_deref().expect("staging exists");
-        let relative = destination
-            .strip_prefix(self.out_dir)
-            .map_err(|_| rars::Error::InvalidHeader("unsafe archive path"))?;
-        if destination.starts_with(root) {
-            return Err(rars::Error::InvalidHeader(
-                "archive path conflicts with extraction storage",
-            ));
-        }
-        // With a staging tree nothing stages at its own path: publishing
-        // finds any collision.
-        if self.staging_tree.is_none() {
-            let staged = root.join(relative);
-            let collides = match fs::symlink_metadata(&staged) {
-                Ok(metadata) => {
-                    !metadata.is_dir()
-                        || !directory
-                        || self
-                            .staged_directories
-                            .contains(&FileIdentity::of(&staged)?)
-                }
-                Err(_) => false,
-            };
-            if collides {
-                return Err(rars::Error::InvalidHeader(
-                    "multiple archive entries map to the same output path",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Opens a member at its destination, relative to the output directory
-    /// opened by descriptor, by the overwrite policy. Never follows a
-    /// symlink, and never writes through a hard link or anything but a
-    /// regular file. `existing` is what [`Self::checked_destination`] found
-    /// there. Returns where it was opened.
-    fn open_in_place(
-        &mut self,
-        relative: &Path,
-        destination: PathBuf,
-        meta: &rars::ExtractedEntryMeta,
-        existing: Option<&TreeEntry>,
-    ) -> rars::Result<(PathBuf, Pending, Box<dyn Write + Send>)> {
-        let mut publisher = self.publisher.state();
-        let tree = publisher.opened_tree().expect("opened by in_place_tree");
-        let refuse = |error| output::refused_path(error, &meta.name);
-        if meta.is_directory {
-            let identity = tree.create_dirs(relative).map_err(refuse)?;
-            return Ok((
-                destination,
-                Pending::InPlaceDirectory(identity),
-                Box::new(std::io::sink()),
-            ));
-        }
-        let (dir, dir_identity) = tree.parent_dir(relative).map_err(refuse)?;
-        // Nothing was in a directory this run made before it began: a name
-        // taken there was taken by this run, or by something racing it.
-        let fresh = tree.created(&dir_identity);
-        // Later checks take the state again.
-        drop(publisher);
-        let name = relative.file_name().expect("output path has a name");
-        let mode = output::file_create_mode(meta, self.restore_modes);
-        let repeated =
-            || rars::Error::InvalidHeader("multiple archive entries map to the same output path");
-        // Only `Always` opens what is there, so only it needs to know which
-        // files this run wrote.
-        let tracked = self.overwrite == OverwritePolicy::Always && !self.repeats_allowed();
-        let (path, file, created_mode, identity) = match self.overwrite {
-            OverwritePolicy::Never => match dir.create_file(name, mode) {
-                Ok(file) => (destination, file, Some(mode), None),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // In a directory this run made, another member's
-                    // output, as publishing a staged file would say.
-                    // Elsewhere, what the checks before opening would have
-                    // said, had it been there then.
-                    if fresh {
-                        return Err(repeated());
-                    }
-                    return Err(match dir.entry(name)? {
-                        TreeEntry::Symlink => refuse(rars::Error::UnsafePath(
-                            "unsafe archive path crosses symlink",
-                        )),
-                        TreeEntry::Directory(identity)
-                            if self.publisher.state().made_here(&identity) =>
-                        {
-                            repeated()
-                        }
-                        _ => error.into(),
-                    });
-                }
-                Err(error) => return Err(error.into()),
-            },
-            OverwritePolicy::Rename => {
-                let (path, file) =
-                    dir.create_numbered(&destination, mode, self.publisher.state().renames())?;
-                (path, file, Some(mode), None)
-            }
-            OverwritePolicy::Always => {
-                let created = match existing {
-                    Some(TreeEntry::Missing) => match dir.create_file(name, mode) {
-                        Ok(file) => Some(file),
-                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                            if fresh && tracked {
-                                return Err(repeated());
-                            }
-                            None
-                        }
-                        Err(error) => return Err(error.into()),
-                    },
-                    _ => None,
-                };
-                match created {
-                    Some(file) => {
-                        let identity = tracked
-                            .then(|| rars::output_tree::file_identity(&file))
-                            .transpose()?;
-                        (destination, file, Some(mode), identity)
-                    }
-                    None => {
-                        let opened = dir.open_in_place(name, mode)?;
-                        if tracked && self.publisher.state().made_here(&opened.identity) {
-                            return Err(repeated());
-                        }
-                        if opened.len > 0 {
-                            opened.file.set_len(0)?;
-                        }
-                        (destination, opened.file, None, Some(opened.identity))
-                    }
-                }
-            }
-        };
-        let (writer, done) = rars::output_tree::HeldFile::new(file);
-        let pending = Pending::InPlace(InPlace {
-            file: done,
-            dir: dir_identity,
-            created_mode,
-            identity,
-        });
-        Ok((path, pending, Box::new(writer)))
-    }
-
-    /// Staged outputs are always new files; in-place ones follow the caller's policy.
-    fn staged_policy(&self) -> OverwritePolicy {
-        if self.in_place {
-            self.overwrite
-        } else {
-            OverwritePolicy::Never
-        }
-    }
-
-    fn record_staged_path(&mut self, path: &Path, directory: bool) -> rars::Result<()> {
-        if directory {
-            self.staged_directories.insert(FileIdentity::of(path)?);
-        }
-        Ok(())
-    }
-
-    /// Move every settled staged output to its destination. Publishing as
-    /// they settle keeps verified members when a later one fails and holds
-    /// few members in staging.
-    fn publish_verified(&mut self) -> rars::Result<()> {
-        for output in self.unpublished.drain(..self.settled) {
-            self.publisher.queue(output);
-        }
-        self.settled = 0;
-        self.publisher.publish_failure()
-    }
-
-    /// As [`Self::publish_verified`], once everything queued is in place:
-    /// a run that ends early still publishes what verified, and says why it could not.
-    fn publish_verified_and_wait(&mut self) -> rars::Result<()> {
-        let queued = self.publish_verified();
-        self.publisher.wait_to_failure();
-        queued?;
-        self.publisher.publish_failure()
-    }
-
-    /// A run that ended well still fails on a member published since its last
-    /// open, as it would have at that open had it published there.
-    fn queued_failure(&mut self) -> rars::Result<()> {
-        self.publisher.wait_to_failure();
-        self.publisher.publish_failure()
-    }
-
-    /// Publish the final member once the whole extraction call has succeeded.
-    fn publish(mut self) -> rars::Result<Vec<ExtractedOutput>> {
-        self.publish_verified()?;
-        self.publisher.finish()
+    fn can_open_ahead(&self) -> bool {
+        self.engine.can_open_ahead()
     }
 }
 
 fn extract_archives(
     archives: &[DetectedArchive],
     options: ArchiveReadOptions<'_>,
-    state: &Mutex<ExtractOutputState<'_>>,
+    engine: &mut ExtractEngine<'_>,
     damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
-    let one_at_a_time = {
-        let mut state = lock(state);
-        state.legacy_name_encoding = options.legacy_name_encoding;
-        // In place, a member opened after a failure would already be at its
-        // destination. Flattened, a member can stage where an earlier one is
-        // still staged. Both keep opening each member once the last verified.
-        state.in_place || state.flatten
-    };
-    let source = match archives {
-        [archive] => SettledSource::Archive(archive),
-        volumes => SettledSource::Volumes(volumes),
-    };
+    use rars::output_dir::Outputs;
+    engine.legacy_name_encoding(options.legacy_name_encoding);
     // Only RAR 5's write lane hands outputs to workers.
-    lock(state).written_elsewhere = !one_at_a_time
-        && matches!(
-            source,
-            SettledSource::Archive(DetectedArchive::Rar50Plus(_))
-        );
-    let open = |meta: &rars::ExtractedEntryMeta| {
-        let mut state = lock(state);
-        let opened = match damaged.keep_broken {
-            Some(kept) => kept.open(&mut state, meta),
-            None => state.open_settled(meta),
-        };
-        damaged.callback(opened)
+    engine.written_elsewhere(
+        engine.can_open_ahead() && matches!(archives, [DetectedArchive::Rar50Plus(_)]),
+    );
+    let outputs = Mutex::new(RunOutputs { engine, damaged });
+    let volumes = match archives {
+        [archive] => return rars::output_dir::extract_archive(archive, options, None, &outputs),
+        volumes => volumes,
     };
-    let link = |meta: &rars::ExtractedEntryMeta, link: rars::ExtractedLink<'_>| {
-        if let Some(kept) = damaged.keep_broken {
-            kept.close();
-        }
-        damaged.callback(lock(state).create_link(meta, link))
-    };
-    let settled = |_: &rars::ExtractedEntryMeta, outcome: Settled| {
-        // `--keep-broken` is what turns salvage on, so a member kept broken is kept.
-        let verified = outcome != Settled::Failed;
-        // A failed open ends the run once the members before it settle.
-        if damaged.callback(lock(state).settle(verified))? {
-            damaged.callback_failed.store(true, Ordering::Relaxed);
-        }
-        Ok(())
-    };
-    match source {
-        SettledSource::Archive(archive) if one_at_a_time => {
-            rars::output_links::settle_in_order(options, open, link, settled, |read, open, link| {
-                archive.extract_with_links(read, open, link)
-            })
-        }
-        source => rars::output_links::extract_settled(source, options, None, open, link, settled),
-    }
+    rars::output_links::extract_settled(
+        SettledSource::Volumes(volumes),
+        options,
+        None,
+        |meta| lock(&outputs).open(meta),
+        |meta, link| lock(&outputs).link(meta, link),
+        |_, outcome| lock(&outputs).settle(outcome),
+    )
 }
 
 fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {
@@ -3485,21 +2634,21 @@ mod tests {
         let root = crate::scratch::case("collection-extract-redirections");
         let archive =
             rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
-        let state = std::sync::Mutex::new(super::ExtractOutputState::new(
+        let mut engine = super::ExtractEngine::new(
             &root,
             super::OverwritePolicy::Never,
             false,
             false,
             rars::ArchiveFamily::Rar50Plus,
-        ));
+        );
         super::extract_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
             super::ArchiveReadOptions::new(),
-            &state,
+            &mut engine,
             &super::DamagedMembers::new(&root),
         )
         .unwrap();
-        state.into_inner().unwrap().publish().unwrap();
+        engine.publish().unwrap();
         assert_eq!(
             std::fs::read_link(root.join("symlink.txt")).unwrap(),
             std::path::PathBuf::from("file.txt")
@@ -3514,17 +2663,17 @@ mod tests {
         std::fs::write(root.join("symlink.txt"), b"existing destination").unwrap();
         let archive =
             rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
-        let state = std::sync::Mutex::new(super::ExtractOutputState::new(
+        let mut engine = super::ExtractEngine::new(
             &root,
             super::OverwritePolicy::Never,
             false,
             false,
             rars::ArchiveFamily::Rar50Plus,
-        ));
+        );
         assert!(super::extract_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
             super::ArchiveReadOptions::new(),
-            &state,
+            &mut engine,
             &super::DamagedMembers::new(&root),
         )
         .is_err());
@@ -3538,23 +2687,23 @@ mod tests {
             fixtures.join("rar15_40/encrypted/rar4_unicode_name_encrypted.rar"),
         )
         .unwrap();
-        let state = std::sync::Mutex::new(super::ExtractOutputState::new(
+        let mut engine = super::ExtractEngine::new(
             &root,
             super::OverwritePolicy::Never,
             false,
             false,
             rars::ArchiveFamily::Rar15To40,
-        ));
+        );
         let mut options = super::ArchiveReadOptions::with_optional_password(Some(b"test"));
         options.legacy_name_encoding = Some(rars::filename::LegacyNameEncoding::Cp850);
         super::extract_archives(
             &[super::DetectedArchive::Rar15To40(archive)],
             options,
-            &state,
+            &mut engine,
             &super::DamagedMembers::new(&root),
         )
         .unwrap();
-        state.into_inner().unwrap().publish().unwrap();
+        engine.publish().unwrap();
         assert_eq!(
             std::fs::read(root.join("新建文本文档.txt")).unwrap(),
             b"aaaaaaaaaa"
@@ -3811,20 +2960,6 @@ mod tests {
         assert!(!super::looks_like_archive_path(&root).unwrap());
         assert!(!super::looks_like_archive_path(&root.join("missing")).unwrap());
         assert!(super::reject_ambiguous_extract_target(&[]).is_ok());
-        let mut state = super::ExtractOutputState::new(
-            &root,
-            super::OverwritePolicy::Always,
-            false,
-            false,
-            rars::ArchiveFamily::Rar50Plus,
-        );
-        state.reserve_output_path(file.clone()).unwrap();
-        assert!(matches!(
-            state.reserve_output_path(file),
-            Err(rars::Error::InvalidHeader(
-                "multiple archive entries map to the same output path"
-            ))
-        ));
         #[cfg(unix)]
         {
             let loop_path = root.join("loop");
@@ -4090,7 +3225,7 @@ mod tests {
     }
 
     use super::{display_text, parse_size, retry_hint};
-    use crate::output::{checked_output_path, output_relative_path, redirection_warning};
+    use crate::output::redirection_warning;
     use crate::password::{error_needs_password, should_prompt_password};
     use crate::volumes::{infer_part_index, rar50_volume_part_path, volume_part_path};
     use rars::Error;
@@ -4194,362 +3329,6 @@ mod tests {
     fn password_prompt_is_gated_on_terminal_stdin() {
         assert!(!should_prompt_password(false));
         assert!(should_prompt_password(true));
-    }
-
-    #[test]
-    fn output_relative_path_accepts_plain_nested_names() {
-        assert_eq!(
-            output_relative_path(b"dir\\subdir/file.txt").unwrap(),
-            Path::new("dir").join("subdir").join("file.txt")
-        );
-    }
-
-    #[test]
-    fn output_relative_path_rejects_traversal_and_absolute_names() {
-        for name in [
-            b"../evil.txt".as_slice(),
-            b"safe/../../evil.txt",
-            b"/tmp/evil.txt",
-            b"//server/share/evil.txt",
-            b"\\server\\share\\evil.txt",
-            b"C:/evil.txt",
-            b"C:evil.txt",
-            b"",
-            b".",
-            b"./.",
-            b"bad\0name.txt",
-        ] {
-            assert!(output_relative_path(name).is_err(), "{name:?}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn output_relative_path_preserves_non_utf8_archive_names() {
-        use std::os::unix::ffi::OsStrExt;
-        let path = output_relative_path(b"legacy-\xff-name.txt").unwrap();
-        assert_eq!(path.as_os_str().as_bytes(), b"legacy-\xff-name.txt");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn open_output_writer_rejects_existing_symlink_components() {
-        let scratch = crate::scratch::case("rars-symlink-output");
-        let root = scratch.join("root");
-        let outside = scratch.join("outside");
-        std::fs::create_dir_all(&outside).unwrap();
-        std::fs::create_dir_all(&root).unwrap();
-        std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
-        assert!(matches!(
-            checked_output_path(&root, Path::new("link").join("escape.txt").as_path()),
-            Err(Error::InvalidHeader("unsafe archive path crosses symlink"))
-        ));
-        assert!(!outside.join("escape.txt").exists());
-    }
-
-    fn write_settled(
-        state: &mut super::ExtractOutputState<'_>,
-        meta: &rars::ExtractedEntryMeta,
-        data: &[u8],
-    ) -> rars::Result<()> {
-        let written = state.open_settled(meta).and_then(|mut writer| {
-            writer.write_all(data)?;
-            Ok(())
-        });
-        state.settle(written.is_ok())?;
-        written
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_directory_swapped_for_a_symlink_mid_extraction_is_never_written_through() {
-        use std::io::Write;
-        let policies = [
-            super::OverwritePolicy::Never,
-            super::OverwritePolicy::Always,
-            super::OverwritePolicy::Rename,
-        ];
-        for planted in ["a", "a/b"] {
-            for overwrite in policies {
-                let scratch = crate::scratch::case("rars-planted-symlink");
-                let root = scratch.join("out");
-                let outside = scratch.join("outside");
-                std::fs::create_dir_all(&outside).unwrap();
-                let mut state = super::ExtractOutputState::new(
-                    &root,
-                    overwrite,
-                    false,
-                    false,
-                    rars::ArchiveFamily::Rar50Plus,
-                );
-                let meta = |name: &str| {
-                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
-                };
-                write_settled(&mut state, &meta("a/b/one"), b"a/b/one").unwrap();
-                let mut writer = state.open_settled(&meta("a/b/two")).unwrap();
-                writer.write_all(b"a/b/two").unwrap();
-                drop(writer);
-                // `one` is in place and `two` is staged when the directory is swapped.
-                state.publisher.wait();
-                let moved = root.join("moved");
-                std::fs::rename(root.join(planted), &moved).unwrap();
-                std::os::unix::fs::symlink(&outside, root.join(planted)).unwrap();
-                let finished = state
-                    .settle(true)
-                    .and_then(|_| write_settled(&mut state, &meta("a/b/three"), b"a/b/three"))
-                    .and_then(|()| state.publish().map(drop));
-
-                let escaped: Vec<_> = std::fs::read_dir(&outside)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().file_name())
-                    .collect();
-                assert!(escaped.is_empty(), "{planted} {overwrite:?}: {escaped:?}");
-                if finished.is_ok() {
-                    // Written into the directory the extraction opened, wherever it went.
-                    let moved = if planted == "a" {
-                        moved.join("b")
-                    } else {
-                        moved
-                    };
-                    for name in ["one", "two", "three"] {
-                        assert_eq!(
-                            std::fs::read(moved.join(name)).unwrap(),
-                            format!("a/b/{name}").into_bytes()
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// In place, each member is opened at its destination through the
-    /// directories the run opened. A directory swapped for a symlink
-    /// partway through is never written through: later members, in it or in
-    /// a new directory below it, land in the directory the run opened,
-    /// wherever it went.
-    #[cfg(unix)]
-    #[test]
-    fn a_directory_swapped_for_a_symlink_mid_extraction_in_place_is_never_written_through() {
-        let policies = [
-            super::OverwritePolicy::Never,
-            super::OverwritePolicy::Always,
-            super::OverwritePolicy::Rename,
-        ];
-        for planted in ["a", "a/b"] {
-            for overwrite in policies {
-                let scratch = crate::scratch::case("rars-planted-symlink-in-place");
-                let root = scratch.join("out");
-                let outside = scratch.join("outside");
-                std::fs::create_dir_all(&outside).unwrap();
-                let mut state = super::ExtractOutputState::new(
-                    &root,
-                    overwrite,
-                    true,
-                    false,
-                    rars::ArchiveFamily::Rar50Plus,
-                );
-                let meta = |name: &str| {
-                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
-                };
-                let write = |state: &mut super::ExtractOutputState, name: &str| {
-                    write_settled(state, &meta(name), name.as_bytes())
-                };
-                write(&mut state, "a/b/one").unwrap();
-                write(&mut state, "a/b/two").unwrap();
-                // Both are at their destinations when the directory is swapped.
-                assert_eq!(std::fs::read(root.join("a/b/one")).unwrap(), b"a/b/one");
-                let moved = root.join("moved");
-                std::fs::rename(root.join(planted), &moved).unwrap();
-                std::os::unix::fs::symlink(&outside, root.join(planted)).unwrap();
-                let finished = write(&mut state, "a/b/three")
-                    .and_then(|()| write(&mut state, "a/b/c/four"))
-                    .and_then(|()| state.publish().map(drop));
-
-                let context = format!("{planted} {overwrite:?}: {finished:?}");
-                let escaped: Vec<_> = std::fs::read_dir(&outside)
-                    .unwrap()
-                    .map(|entry| entry.unwrap().file_name())
-                    .collect();
-                assert!(escaped.is_empty(), "{context}: {escaped:?}");
-                assert!(finished.is_ok(), "{context}");
-                let moved = if planted == "a" {
-                    moved.join("b")
-                } else {
-                    moved
-                };
-                for name in ["one", "two", "three", "c/four"] {
-                    assert_eq!(
-                        std::fs::read(moved.join(name)).unwrap(),
-                        format!("a/b/{name}").into_bytes(),
-                        "{context}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// In place, a member in a directory this run made is opened without
-    /// looking at its destination first. Something planted there after the
-    /// directory was made is never written through or over: `Never` and
-    /// `Always` refuse it as another member's output, `Rename` goes beside it.
-    #[cfg(unix)]
-    #[test]
-    fn an_entry_planted_where_a_member_goes_in_place_is_never_written_through() {
-        let policies = [
-            super::OverwritePolicy::Never,
-            super::OverwritePolicy::Always,
-            super::OverwritePolicy::Rename,
-        ];
-        for plant in ["symlink", "hard link", "file"] {
-            for overwrite in policies {
-                let scratch = crate::scratch::case("rars-planted-in-place");
-                let root = scratch.join("out");
-                let outside = scratch.join("outside");
-                std::fs::create_dir_all(&outside).unwrap();
-                std::fs::write(outside.join("target"), b"outside").unwrap();
-                let mut state = super::ExtractOutputState::new(
-                    &root,
-                    overwrite,
-                    true,
-                    false,
-                    rars::ArchiveFamily::Rar50Plus,
-                );
-                let meta = |name: &str| {
-                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
-                };
-                let write = |state: &mut super::ExtractOutputState, name: &str| {
-                    write_settled(state, &meta(name), name.as_bytes())
-                };
-                write(&mut state, "d/one").unwrap();
-                let planted = root.join("d/two");
-                match plant {
-                    "symlink" => {
-                        std::os::unix::fs::symlink(outside.join("target"), &planted).unwrap()
-                    }
-                    "hard link" => std::fs::hard_link(outside.join("target"), &planted).unwrap(),
-                    _ => std::fs::write(&planted, b"planted").unwrap(),
-                }
-                let finished = write(&mut state, "d/two").and_then(|()| state.publish().map(drop));
-
-                let context = format!("{plant} {overwrite:?}: {finished:?}");
-                assert_eq!(
-                    std::fs::read(outside.join("target")).unwrap(),
-                    b"outside",
-                    "{context}"
-                );
-                assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "{context}");
-                let found = std::fs::symlink_metadata(&planted).unwrap();
-                assert_eq!(found.file_type().is_symlink(), plant == "symlink");
-                if plant == "file" {
-                    assert_eq!(std::fs::read(&planted).unwrap(), b"planted", "{context}");
-                }
-                if overwrite == super::OverwritePolicy::Rename {
-                    assert!(finished.is_ok(), "{context}");
-                    assert_eq!(std::fs::read(root.join("d/two(1)")).unwrap(), b"d/two");
-                } else {
-                    assert!(
-                        matches!(
-                            &finished,
-                            Err(Error::InvalidHeader(
-                                "multiple archive entries map to the same output path"
-                            ))
-                        ),
-                        "{context}"
-                    );
-                    assert_eq!(std::fs::read_dir(root.join("d")).unwrap().count(), 2);
-                }
-                assert_eq!(std::fs::read(root.join("d/one")).unwrap(), b"d/one");
-            }
-        }
-    }
-
-    /// A member in a directory this run made is opened without looking at
-    /// its destination. Something planted there after the directory was made
-    /// is still never written through, and only `Always` replaces it.
-    #[cfg(unix)]
-    #[test]
-    fn an_entry_planted_in_a_directory_made_by_the_run_is_never_written_through() {
-        let policies = [
-            super::OverwritePolicy::Never,
-            super::OverwritePolicy::Always,
-            super::OverwritePolicy::Rename,
-        ];
-        for plant in ["symlink", "file"] {
-            for overwrite in policies {
-                let scratch = crate::scratch::case("rars-planted-in-made-directory");
-                let root = scratch.join("out");
-                let outside = scratch.join("outside");
-                std::fs::create_dir_all(&outside).unwrap();
-                std::fs::write(outside.join("target"), b"outside").unwrap();
-                let mut state = super::ExtractOutputState::new(
-                    &root,
-                    overwrite,
-                    false,
-                    false,
-                    rars::ArchiveFamily::Rar50Plus,
-                );
-                let meta = |name: &str| {
-                    rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
-                };
-                let write = |state: &mut super::ExtractOutputState, name: &str| {
-                    write_settled(state, &meta(name), name.as_bytes())
-                };
-                // Opening `other` publishes `one`, which makes `d`.
-                write(&mut state, "d/one").unwrap();
-                write(&mut state, "d/other").unwrap();
-                state.publisher.wait();
-                assert_eq!(std::fs::read(root.join("d/one")).unwrap(), b"d/one");
-                let planted = root.join("d/two");
-                if plant == "symlink" {
-                    std::os::unix::fs::symlink(outside.join("target"), &planted).unwrap();
-                } else {
-                    std::fs::write(&planted, b"planted").unwrap();
-                }
-                let finished = write(&mut state, "d/two").and_then(|()| state.publish().map(drop));
-
-                let context = format!("{plant} {overwrite:?}: {finished:?}");
-                assert_eq!(
-                    std::fs::read(outside.join("target")).unwrap(),
-                    b"outside",
-                    "{context}"
-                );
-                assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1, "{context}");
-                let found = std::fs::symlink_metadata(&planted).unwrap();
-                match overwrite {
-                    super::OverwritePolicy::Never => {
-                        assert!(
-                            matches!(
-                                &finished,
-                                Err(Error::InvalidHeader(
-                                    "multiple archive entries map to the same output path"
-                                ))
-                            ),
-                            "{context}"
-                        );
-                        assert_eq!(found.file_type().is_symlink(), plant == "symlink");
-                        assert_eq!(std::fs::read_dir(root.join("d")).unwrap().count(), 3);
-                    }
-                    super::OverwritePolicy::Always => {
-                        assert!(finished.is_ok(), "{context}");
-                        assert!(found.file_type().is_file(), "{context}");
-                        assert_eq!(std::fs::read(&planted).unwrap(), b"d/two");
-                    }
-                    super::OverwritePolicy::Rename => {
-                        assert!(finished.is_ok(), "{context}");
-                        assert_eq!(found.file_type().is_symlink(), plant == "symlink");
-                        let renamed: Vec<_> = std::fs::read_dir(root.join("d"))
-                            .unwrap()
-                            .map(|entry| entry.unwrap().file_name())
-                            .filter(|name| name.to_string_lossy().starts_with("two"))
-                            .collect();
-                        assert_eq!(renamed.len(), 2, "{context}: {renamed:?}");
-                        let ours = renamed.iter().find(|name| *name != "two").unwrap();
-                        assert_eq!(std::fs::read(root.join("d").join(ours)).unwrap(), b"d/two");
-                    }
-                }
-                assert_eq!(std::fs::read(root.join("d/other")).unwrap(), b"d/other");
-            }
-        }
     }
 
     #[test]

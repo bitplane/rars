@@ -55,6 +55,8 @@ pub mod filter;
 mod header_damage;
 mod resync;
 pub use header_damage::{HeaderDamage, HeaderDamageKind};
+#[doc(hidden)]
+pub mod extract_engine;
 #[cfg(feature = "write")]
 mod filter_search;
 #[cfg(feature = "write")]
