@@ -89,6 +89,349 @@ where
     )
 }
 
+/// How a member [`extract_settled`] opened ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Settled {
+    /// Written, verified, and its writer dropped.
+    Verified,
+    /// Its open or the member failed; what it delivered isn't its own.
+    Failed,
+    /// Failed under [`crate::ArchiveReadOptions::salvage`], and the member
+    /// error handler carried on past it: keep what it delivered.
+    KeptBroken,
+}
+
+/// What [`extract_settled`] extracts.
+#[derive(Debug, Clone, Copy)]
+pub enum SettledSource<'a> {
+    Archive(&'a crate::Archive),
+    /// In order, starting with the first.
+    Volumes(&'a [crate::Archive]),
+}
+
+/// Chooses members by index in archive order; a member split across volumes counts once.
+pub type Select<'a> = dyn Fn(usize, &crate::ArchiveMember) -> bool + 'a;
+
+/// [`extract_rar50_settled_with_links`] for every family and volume sets, so outputs need only the settle protocol; under salvage a member settles once the handler has answered.
+pub fn extract_settled<F, L, S>(
+    source: SettledSource<'_>,
+    options: crate::ArchiveReadOptions<'_>,
+    select: Option<&Select<'_>>,
+    mut open: F,
+    mut link: L,
+    settled: S,
+) -> Result<()>
+where
+    F: FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write + Send>>,
+    L: FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
+    S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()> + Send,
+{
+    if let (SettledSource::Archive(crate::Archive::Rar50Plus(archive)), None, false) =
+        (source, select, options.salvage)
+    {
+        return extract_rar50_settling_all(archive, options, open, link, settled);
+    }
+    let state = std::sync::Mutex::new(Settling {
+        settled,
+        opened: None,
+        legacy_link: None,
+    });
+    let caller = options.member_errors;
+    let salvage = options.salvage;
+    let handler = |member: &crate::ArchiveMember, error: &Error| {
+        let caller = caller.expect("installed only over the caller's handler");
+        let opened = lock(&state).opened_failed(&member.meta.name)?;
+        if opened && !salvage {
+            lock(&state).settle(Settled::Failed)?;
+        }
+        let action = (caller.0)(member, error)?;
+        if opened && salvage {
+            let kept = action == crate::ExtractionErrorAction::Continue
+                && !matches!(
+                    error.kind(),
+                    crate::ErrorKind::PasswordRequired | crate::ErrorKind::BadPassword
+                );
+            lock(&state).settle(if kept {
+                Settled::KeptBroken
+            } else {
+                Settled::Failed
+            })?;
+        }
+        Ok(action)
+    };
+    let read = match caller {
+        Some(_) => options.with_member_error_handler(&handler),
+        None => options,
+    };
+    let mut open = |meta: &crate::ExtractedEntryMeta| {
+        let mut state = lock(&state);
+        state.settle(Settled::Verified)?;
+        state.opened = Some(meta.clone());
+        drop(state);
+        open(meta).map(|writer| writer as Box<dyn std::io::Write>)
+    };
+    let mut link = |meta: &crate::ExtractedEntryMeta, made: ExtractedLink<'_>| {
+        lock(&state).settle(Settled::Verified)?;
+        link(meta, made)
+    };
+    let result = match (source, select) {
+        (SettledSource::Archive(archive), Some(select)) => {
+            extract_selected(archive, read, select, &state, &mut open, &mut link)
+        }
+        (SettledSource::Archive(archive), None) => {
+            archive.extract_with_links(read, &mut open, &mut link)
+        }
+        (SettledSource::Volumes(volumes), select) => {
+            let chosen = std::cell::RefCell::new(select.map(|select| Chosen::new(volumes, select)));
+            let chosen = |name: &[u8]| {
+                chosen
+                    .borrow_mut()
+                    .as_mut()
+                    .is_none_or(|chosen| chosen.advance_to(name))
+            };
+            crate::extract_volumes_with_links(
+                volumes,
+                read,
+                |meta| {
+                    if chosen(&meta.name) {
+                        open(meta)
+                    } else {
+                        Ok(Box::new(std::io::sink()))
+                    }
+                },
+                |meta, made| {
+                    if chosen(&meta.name) {
+                        link(meta, made)
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        }
+    };
+    let mut state = state.into_inner().expect("settling lock poisoned");
+    match &result {
+        Ok(()) => state.settle(Settled::Verified)?,
+        Err(error) => {
+            // A later member's error means the one still open verified.
+            let outcome = match (
+                crate::output_staging::failed_entry_name(error),
+                &state.opened,
+            ) {
+                (Some(failed), Some(opened)) if failed != opened.name.as_slice() => {
+                    Settled::Verified
+                }
+                _ => Settled::Failed,
+            };
+            // The extraction's own error wins.
+            let _ = state.settle(outcome);
+        }
+    }
+    result
+}
+
+/// Settles what the write lane left open when the call fails, so every member opened settles.
+fn extract_rar50_settling_all<F, L, S>(
+    archive: &crate::rar50::Archive,
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    link: L,
+    settled: S,
+) -> Result<()>
+where
+    F: FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write + Send>>,
+    L: FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
+    S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()>,
+{
+    let opened = std::cell::RefCell::new(std::collections::VecDeque::new());
+    let settled = std::cell::RefCell::new(settled);
+    let result = extract_rar50_settled_with_links(
+        archive,
+        options,
+        |meta| {
+            opened.borrow_mut().push_back(meta.clone());
+            open(meta)
+        },
+        link,
+        |meta, verified| {
+            opened.borrow_mut().pop_front();
+            let outcome = if verified {
+                Settled::Verified
+            } else {
+                Settled::Failed
+            };
+            (settled.borrow_mut())(meta, outcome)
+        },
+    );
+    if result.is_err() {
+        for meta in opened.take() {
+            // The extraction's own error wins.
+            let _ = (settled.borrow_mut())(&meta, Settled::Failed);
+        }
+    }
+    result
+}
+
+struct Settling<S> {
+    settled: S,
+    /// The member opened last, until it settles.
+    opened: Option<crate::ExtractedEntryMeta>,
+    /// A selected legacy symbolic link's target, made into a link once it verifies.
+    legacy_link: Option<(
+        crate::ExtractedEntryMeta,
+        std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    )>,
+}
+
+impl<S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()>> Settling<S> {
+    fn settle(&mut self, outcome: Settled) -> Result<()> {
+        match self.opened.take() {
+            Some(meta) => (self.settled)(&meta, outcome),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the member named failed after opening; a different one still open has verified.
+    fn opened_failed(&mut self, name: &[u8]) -> Result<bool> {
+        if self
+            .legacy_link
+            .as_ref()
+            .is_some_and(|(meta, _)| meta.name == name)
+        {
+            self.legacy_link = None;
+        }
+        match &self.opened {
+            Some(opened) if opened.name == name => Ok(true),
+            Some(_) => self.settle(Settled::Verified).map(|()| false),
+            None => Ok(false),
+        }
+    }
+}
+
+/// Matched by name: a member that fails before it opens reports nothing to count by.
+struct Chosen {
+    members: Vec<(Vec<u8>, bool)>,
+    next: usize,
+}
+
+impl Chosen {
+    fn new(volumes: &[crate::Archive], select: &Select<'_>) -> Self {
+        let members = volumes
+            .iter()
+            .flat_map(crate::Archive::members)
+            .filter(|member| !member.meta.is_split_before)
+            .enumerate()
+            .map(|(index, member)| (member.meta.name.clone(), select(index, &member)))
+            .collect();
+        Self { members, next: 0 }
+    }
+
+    fn advance_to(&mut self, name: &[u8]) -> bool {
+        let Some(found) = self.members[self.next..]
+            .iter()
+            .position(|(member, _)| member == name)
+        else {
+            return false;
+        };
+        self.next += found + 1;
+        self.members[self.next - 1].1
+    }
+}
+
+/// [`crate::Archive::extract_with_control`] skips what's left out and asks once the previous member verified.
+fn extract_selected<S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()>>(
+    archive: &crate::Archive,
+    read: crate::ArchiveReadOptions<'_>,
+    select: &Select<'_>,
+    state: &std::sync::Mutex<Settling<S>>,
+    open: &mut dyn FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write>>,
+    link: &mut dyn FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
+) -> Result<()> {
+    let chosen: Vec<bool> = archive
+        .members()
+        .enumerate()
+        .map(|(index, member)| select(index, &member))
+        .collect();
+    let Some(last) = chosen.iter().rposition(|&chosen| chosen) else {
+        return Ok(());
+    };
+    let solid = archive.is_solid();
+    let link_verified =
+        |link: &mut dyn FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>| {
+            let Some((meta, target)) = lock(state).legacy_link.take() else {
+                return Ok(());
+            };
+            let target = std::mem::take(&mut *lock(&target));
+            check_legacy_symlink_target(&meta.name, target.len() as u64, Some(&target))?;
+            link(
+                &meta,
+                ExtractedLink::Symlink {
+                    target: &target,
+                    directory: false,
+                },
+            )
+        };
+    let mut index = 0;
+    let result = archive.extract_with_control(read, |member| {
+        link_verified(&mut *link)?;
+        lock(state).settle(Settled::Verified)?;
+        let current = index;
+        index += 1;
+        if current > last {
+            return Ok(crate::ExtractionDecision::Stop);
+        }
+        let meta = &member.meta;
+        if meta.is_redirection {
+            if let (
+                true,
+                crate::ArchiveMemberDetail::Rar50Plus {
+                    redirection: Some(redirection),
+                    ..
+                },
+            ) = (chosen[current], &member.detail)
+            {
+                link(&member_meta(member), ExtractedLink::rar50(redirection)?)?;
+            }
+            return Ok(crate::ExtractionDecision::Skip);
+        }
+        if !chosen[current] {
+            return Ok(if solid && !meta.is_directory {
+                crate::ExtractionDecision::Extract(Box::new(std::io::sink()))
+            } else {
+                crate::ExtractionDecision::Skip
+            });
+        }
+        if is_legacy_symlink_member(meta) {
+            check_legacy_symlink_target(&meta.name, meta.unpacked_size, None)?;
+            let target = std::sync::Arc::default();
+            lock(state).legacy_link = Some((member_meta(member), std::sync::Arc::clone(&target)));
+            return Ok(crate::ExtractionDecision::Extract(Box::new(
+                crate::output_dir::SharedBuffer(target),
+            )));
+        }
+        open(&member_meta(member)).map(crate::ExtractionDecision::Extract)
+    });
+    result?;
+    link_verified(link)
+}
+
+fn member_meta(member: &crate::ArchiveMember) -> crate::ExtractedEntryMeta {
+    let meta = &member.meta;
+    let mut extracted = crate::ExtractedEntryMeta::new(
+        meta.name.clone(),
+        meta.modification_time(),
+        meta.file_attr,
+        meta.is_directory,
+    )
+    .with_attr_source(meta.attr_source());
+    extracted.name_is_unicode = member.name_is_unicode();
+    extracted
+}
+
+fn lock<T>(state: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    state.lock().expect("settling lock poisoned")
+}
+
 pub fn check_legacy_symlink_target(name: &[u8], size: u64, target: Option<&[u8]>) -> Result<()> {
     if size > crate::extraction_links::LEGACY_TARGET_LIMIT {
         return Err(
