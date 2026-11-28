@@ -10,6 +10,7 @@ pub use crate::file_times::{RecordTime, TimeRecord};
 use crate::io_util::align16 as checked_align16;
 use crate::io_util::read_exact_at;
 use crate::key_cache::KeyCache;
+use crate::resync::{salvage_skips, salvage_stops, Resync, SIZES_PAST_END};
 pub(crate) use crate::source::ArchiveSource;
 use crate::truncation::{TruncatedBlock, Truncation};
 use crate::version::ArchiveFamily;
@@ -2760,7 +2761,7 @@ where
                 parsed.block.header_type,
                 HEAD_FILE | HEAD_SERVICE | HEAD_END
             );
-            if let Some(reason) = salvage.read_header(pos, parsed.damaged, known) {
+            if let Some(reason) = salvage.resync.read_header(pos, parsed.damaged, known) {
                 if let Some((next, _)) = resume!(pos, reason) {
                     pos = next;
                     continue;
@@ -2768,7 +2769,7 @@ where
             }
             let next = parsed.next_offset;
             if next > archive_len {
-                if salvage.suspect.is_some() {
+                if salvage.resync.suspect.is_some() {
                     // A damaged header whose sizes run past the end: if a
                     // header follows, its member's data ends there.
                     if let Some((next, start)) = resume!(pos, SIZES_PAST_END) {
@@ -2958,18 +2959,6 @@ where
     Ok((main, blocks, truncation, budget.control.take_damage()))
 }
 
-/// Why a salvaging walk resynced: a header whose sizes run past the file.
-const SIZES_PAST_END: &str = "the header's sizes run past the end of the file";
-/// Why a salvaging walk resynced: a header of no type a walk reads, which
-/// fails its checksum, is taken for no header at all.
-const UNKNOWN_DAMAGED: &str = "it fails its checksum and its type is unknown";
-/// Why a salvaging walk resynced: the header fails its checksum, as do the
-/// ones just before it.
-const DAMAGED_RUN: &str = "it fails its checksum, as do the headers before it";
-/// How many headers in a row a salvaging walk reads as stored when their
-/// checksums fail.
-const MAX_DAMAGED_RUN: usize = 3;
-
 /// Where a block's header starts and its data ends, in the file.
 fn block_span(block: &Block) -> Range<usize> {
     let block = match block {
@@ -2982,13 +2971,7 @@ fn block_span(block: &Block) -> Range<usize> {
 
 /// What a salvaging walk keeps to resync past a header that doesn't parse.
 struct Salvage {
-    resync: crate::resync::ResyncBudget,
-    /// The first of the blocks just read whose header failed its checksum,
-    /// by offset from the archive's start. Its sizes may be wrong, and so may
-    /// everything the walk read after it.
-    suspect: Option<usize>,
-    /// How many headers in a row failed their checksums.
-    run: usize,
+    resync: Resync,
     /// Whether any member may have been lost.
     lost: bool,
     /// Whether the main header was lost, so members before the first block
@@ -3001,49 +2984,14 @@ struct Salvage {
 impl Salvage {
     fn new(archive_len: usize) -> Self {
         Self {
-            resync: crate::resync::ResyncBudget::new(archive_len),
-            suspect: None,
-            run: 0,
+            resync: Resync::new(archive_len),
             lost: false,
             start_lost: false,
             passed: Vec::new(),
         }
     }
 
-    /// Notes a block header just read at `pos`, and whether its checksum
-    /// failed. Returns the reason to resync instead of reading it as stored:
-    /// it is of no type the walk reads, or too many damaged headers came in
-    /// a row. The walk got to those by the sizes of a damaged one, and
-    /// following them on would let a crafted file send it through the same
-    /// bytes again after every resync.
-    fn read_header(&mut self, pos: usize, damaged: bool, known: bool) -> Option<&'static str> {
-        if !damaged {
-            self.suspect = None;
-            self.run = 0;
-            return None;
-        }
-        if self.suspect.is_none() {
-            self.suspect = Some(pos);
-        }
-        self.run += 1;
-        if !known {
-            Some(UNKNOWN_DAMAGED)
-        } else if self.run > MAX_DAMAGED_RUN {
-            Some(DAMAGED_RUN)
-        } else {
-            None
-        }
-    }
-
-    /// Where the walk carries on after the header at `pos` failed with
-    /// `reason`: the next header after it that checks out, or after the first
-    /// damaged header of the run that led here, if one did. Blocks read since
-    /// that one are dropped, with what they reported, as the walk only got to
-    /// them by its sizes. Returns the header found and where the damage
-    /// began; `None` when no header is found, and then nothing is changed.
-    ///
-    /// `pos` and the result are relative to `archive_offset`, where the
-    /// archive starts in the file, and `archive_len` is its length from there.
+    /// [`Resync::resume`] over this archive's `blocks`.
     #[allow(clippy::too_many_arguments)]
     fn resume(
         &mut self,
@@ -3055,36 +3003,19 @@ impl Salvage {
         budget: &crate::parse_budget::ParseBudget,
         read: &mut dyn FnMut(usize, usize) -> Result<Vec<u8>>,
     ) -> Result<Option<(usize, usize)>> {
-        let start = self.suspect.unwrap_or(pos);
-        let Some(next) = crate::resync::scan(
-            start + 1,
+        let found = self.resync.resume(
+            pos,
+            reason,
             archive_len,
-            &mut self.resync,
+            archive_offset,
             &budget.control,
             read,
-            &|prefix, left| resync_probe(prefix, left),
+            &resync_probe,
             &mut |at, header| resync_confirm(at, header, archive_len, archive_offset, budget),
-        )?
-        else {
-            return Ok(None);
-        };
-        if self.suspect.is_some() {
-            blocks.retain(|block| block_span(block).start <= archive_offset + start);
-            budget
-                .control
-                .retract_damage(archive_offset + start + 1..archive_offset + pos + 1);
-        }
-        budget.control.report_damage(
-            archive_offset + start,
-            crate::HeaderDamageKind::Resynced {
-                reason,
-                next: (archive_offset + next) as u64,
-            },
-        );
-        self.suspect = None;
-        self.run = 0;
-        self.lost = true;
-        Ok(Some((next, start)))
+            &mut |start| blocks.retain(|block| block_span(block).start <= archive_offset + start),
+        )?;
+        self.lost |= found.is_some();
+        Ok(found)
     }
 
     /// Marks each solid member whose stream lost an earlier member: one
@@ -3327,21 +3258,6 @@ fn quick_open_members(
         found.push(file);
     }
     Ok(found)
-}
-
-/// Whether a salvaging parse passes over a header whose block was read
-/// whole but whose own fields fail with `error`. Here even a field that runs
-/// past the header is damage, not a cut.
-fn salvage_skips(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
-    options.salvage && error.kind() == crate::ErrorKind::InvalidArchive
-}
-
-/// Whether a salvaging parse goes past `error` in a header, rather than
-/// failing: damage, not cancellation, a limit or a missing password.
-fn salvage_stops(options: &crate::ArchiveReadOptions<'_>, error: &Error) -> bool {
-    options.salvage
-        && error.kind() == crate::ErrorKind::InvalidArchive
-        && !matches!(error.root_cause(), Error::TooShort)
 }
 
 /// How many bytes [`cut_header_block`] reads to name a block cut short.
