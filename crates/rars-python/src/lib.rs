@@ -1550,8 +1550,9 @@ impl RarFile {
             .collect()
     }
 
-    /// `overwrite`, `in_place`, `flatten` and `volumes` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false))]
+    /// `overwrite`, `in_place`, `flatten`, `volumes`, `restore_modes` and
+    /// `skip_symlinks` work as in `extractall`.
+    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, skip_symlinks = false, in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -1565,6 +1566,8 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
+        restore_modes: bool,
+        skip_symlinks: bool,
         in_place: bool,
         flatten: bool,
     ) -> PyResult<PathBuf> {
@@ -1587,6 +1590,8 @@ impl RarFile {
             overwrite,
             in_place,
             restore_times,
+            restore_modes,
+            skip_symlinks,
             flatten,
         };
         let chosen = |index: usize| index == target;
@@ -1653,12 +1658,17 @@ impl RarFile {
     /// every file straight into `path` under its base name and creates no
     /// directories; symlinks are kept only when they point at a bare name.
     ///
+    /// `restore_modes=True`, on Unix, gives files and directories the modes the
+    /// archive records, and a DOS read-only file 0o444; others keep the umask
+    /// default. `skip_symlinks=True` leaves symlinks and junctions out without a
+    /// warning; a hard link or file copy to one fails as its own member.
+    ///
     /// `on_member_error` carries on past members that fail, as `testrar` does,
     /// and none of their output is kept. It can't be combined with `members`.
     /// `keep_broken=True`, on a `RarFile` opened with `salvage=True`, keeps
     /// it: each member `on_member_error` is given keeps its file under its own
     /// name, holding what was delivered for it, unless it failed on its password.
-    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
+    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, skip_symlinks = false, in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1672,6 +1682,8 @@ impl RarFile {
         cancellation: Option<&CancellationToken>,
         volumes: Option<&Bound<'_, PyAny>>,
         restore_times: bool,
+        restore_modes: bool,
+        skip_symlinks: bool,
         in_place: bool,
         flatten: bool,
         on_member_error: Option<&Bound<'_, PyAny>>,
@@ -1701,6 +1713,8 @@ impl RarFile {
             overwrite: overwrite.0,
             in_place,
             restore_times,
+            restore_modes,
+            skip_symlinks,
             flatten,
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
@@ -4441,6 +4455,8 @@ struct OutputMode {
     overwrite: OverwritePolicy,
     in_place: bool,
     restore_times: bool,
+    restore_modes: bool,
+    skip_symlinks: bool,
     flatten: bool,
 }
 
@@ -4558,8 +4574,8 @@ impl<'a> ExtractOutputs<'a> {
             overwrite: mode.overwrite,
             in_place: mode.in_place,
             restore_times: mode.restore_times,
-            restore_modes: false,
-            skip_symlinks: false,
+            restore_modes: mode.restore_modes,
+            skip_symlinks: mode.skip_symlinks,
             flatten: mode.flatten,
             exists_hint: "; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
         };
@@ -5541,6 +5557,8 @@ mod tests {
                     None,
                     None,
                     true,
+                    true,
+                    false,
                     false,
                     false,
                 )
@@ -5556,6 +5574,8 @@ mod tests {
                     None,
                     None,
                     true,
+                    true,
+                    false,
                     false,
                     false,
                     None,
@@ -5678,6 +5698,8 @@ mod tests {
                     None,
                     None,
                     true,
+                    true,
+                    false,
                     false,
                     false,
                     None,
@@ -5722,6 +5744,8 @@ mod tests {
                     None,
                     None,
                     true,
+                    true,
+                    false,
                     false,
                     false,
                 )
@@ -6058,6 +6082,8 @@ mod tests {
                     overwrite: OverwritePolicy::Never,
                     in_place: false,
                     restore_times: true,
+                    restore_modes: true,
+                    skip_symlinks: false,
                     flatten: false,
                 },
                 None,
@@ -6076,6 +6102,8 @@ mod tests {
                     overwrite: OverwritePolicy::Never,
                     in_place: false,
                     restore_times: true,
+                    restore_modes: true,
+                    skip_symlinks: false,
                     flatten: false,
                 },
                 None,
@@ -6094,6 +6122,8 @@ mod tests {
                     overwrite: OverwritePolicy::Never,
                     in_place: false,
                     restore_times: true,
+                    restore_modes: true,
+                    skip_symlinks: false,
                     flatten: false,
                 },
                 None,

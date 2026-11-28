@@ -20,9 +20,11 @@ def archive(links, format="rar50", target=True):
     return builder.to_bytes()
 
 
-def redirect(data, kind):
+def redirect(data, kind, only=None):
     data = bytearray(data)
     for crc_at, body_at, body_end in _headers(data):
+        if only is not None and only.encode() not in data[body_at:body_end]:
+            continue
         _, cursor = _read_vint(data, body_at)
         header, cursor = _read_vint(data, cursor)
         flags, cursor = _read_vint(data, cursor)
