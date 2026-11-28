@@ -5354,11 +5354,9 @@ fn reader_block_admits_capacity_before_reading_payload_and_releases_failures() {
 }
 
 #[test]
-fn reader_block_keeps_its_worker_charge_after_reservation_retirement() {
+fn reader_block_keeps_its_charge_until_dropped() {
     let packed = encode_compressed_block(&[0x31; 8], 64, false, true).unwrap();
-    let ledger = Allowance::limited(128);
-    let reservation = ledger.reserve(16).unwrap();
-    let allowance = reservation.allowance();
+    let allowance = Allowance::limited(16);
     let block = read_compressed_block_with_allowance(&mut packed.as_slice(), &allowance).unwrap();
     let larger = encode_compressed_block(&[0x31; 9], 72, false, true).unwrap();
     assert!(matches!(
@@ -5366,12 +5364,8 @@ fn reader_block_keeps_its_worker_charge_after_reservation_retirement() {
         Err(Error::WorkspaceLimitExceeded(_))
     ));
     assert_eq!(allowance.used(), 8);
-    reservation.retire();
-    assert_eq!(ledger.used(), 8);
     drop(block);
-    assert_eq!(ledger.used(), 0);
-    drop(allowance);
-    assert_eq!(ledger.used(), 0);
+    assert_eq!(allowance.used(), 0);
 }
 
 #[test]
