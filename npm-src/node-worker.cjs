@@ -69,10 +69,14 @@ async function writeAtomic(target, bytes, overwrite) {
 // Writes verified entries under `directory`, as Python's extractall does: an existing file
 // is refused unless overwrite is true, or kept with the new one beside it as name(N).ext
 // under "rename". Directory times are set last, after their contents are written.
-function extractor(directory, { overwrite, restoreTimes }) {
+// A file takes its mode through its own descriptor before it is published; a mode denying
+// its owner read waits for the end, as do directories', set deepest first.
+function extractor(directory, { overwrite, restoreTimes, restoreModes }) {
   const root = path.resolve(directory);
   const written = [];
   const directories = [];
+  const modes = restoreModes && process.platform !== "win32";
+  const lateModes = [];
   const skipped = [];
   // Where each stored path went, for hard links and copies that name an earlier member.
   const created = new Map();
@@ -149,24 +153,41 @@ function extractor(directory, { overwrite, restoreTimes }) {
         skipped.push({ name: entry.stored, target: entry.target });
         return;
       }
+      const mode = modes ? entry.mode : undefined;
       if (entry.link) {
         fsSync.mkdirSync(path.dirname(target), { recursive: true });
         const placed = link(entry, target);
+        // A hard link shares its source's mode; a copy has its own.
+        if (entry.link.kind === "copy" && mode !== undefined) {
+          if (entry.modeEarly) {
+            const descriptor = fsSync.openSync(placed, "r+");
+            try { fsSync.fchmodSync(descriptor, mode); } finally { fsSync.closeSync(descriptor); }
+          } else {
+            lateModes.push([placed, mode]);
+          }
+        }
         created.set(entry.stored, placed);
         written.push(placed);
         return;
       }
       if (entry.isDirectory) {
         fsSync.mkdirSync(target, { recursive: true });
-        directories.push([target, entry.mtime]);
+        directories.push([target, entry.mtime, mode]);
         return;
       }
       fsSync.mkdirSync(path.dirname(target), { recursive: true });
       const temporary = `${target}.rars-${process.pid}-${Date.now()}.tmp`;
       try {
-        fsSync.writeFileSync(temporary, bytes, { flag: "wx" });
+        const descriptor = fsSync.openSync(temporary, "wx");
+        try {
+          fsSync.writeFileSync(descriptor, bytes);
+          if (mode !== undefined && entry.modeEarly) fsSync.fchmodSync(descriptor, mode);
+        } finally {
+          fsSync.closeSync(descriptor);
+        }
         setTime(temporary, entry.mtime);
         const placed = publish(temporary, target);
+        if (mode !== undefined && !entry.modeEarly) lateModes.push([placed, mode]);
         created.set(entry.stored, placed);
         written.push(placed);
       } catch (error) {
@@ -187,7 +208,11 @@ function extractor(directory, { overwrite, restoreTimes }) {
       }
     },
     finish() {
-      for (const [target, mtime] of directories.reverse()) setTime(target, mtime);
+      const depth = (directory) => directory.split(path.sep).length;
+      directories.sort(([left], [right]) => depth(right) - depth(left));
+      for (const [target, mtime] of directories) setTime(target, mtime);
+      for (const [file, mode] of lateModes) fsSync.chmodSync(file, mode);
+      for (const [target, , mode] of directories) if (mode !== undefined) fsSync.chmodSync(target, mode);
       return { written, skipped };
     },
   };

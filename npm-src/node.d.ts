@@ -57,8 +57,11 @@ export class RarArchive {
    * Extracts entries under `directory` in one pass and returns the files written. Each is
    * written only once verified. `overwrite` is false (refuse an existing file), true, or
    * "rename" (write beside it as name(N).ext); `flatten` drops stored directories;
-   * `restoreTimes` (default true) sets modification times. Links are written too; one that
-   * could lead outside `directory` is skipped with an `UnsafeLinkWarning` process warning.
+   * `restoreTimes` (default true) sets modification times. `restoreModes` (default true)
+   * sets the Unix modes the archive records, and 0o444 on a DOS read-only file; off Windows
+   * only. Links are written too; one that could lead outside `directory` is skipped with an
+   * `UnsafeLinkWarning` process warning. `skipSymlinks` leaves symlinks and junctions out,
+   * without a warning; a hard link or copy to one fails.
    * `volumes` gives the set's later parts as they arrive, as for `test()`.
    *
    * `onMemberError` carries on past members that fail and writes none of their output; it
@@ -73,6 +76,8 @@ export class RarArchive {
     overwrite?: boolean | "rename";
     flatten?: boolean;
     restoreTimes?: boolean;
+    restoreModes?: boolean;
+    skipSymlinks?: boolean;
   }): Promise<readonly string[]>;
   close(): void;
 }

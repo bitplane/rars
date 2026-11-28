@@ -5,6 +5,7 @@ import "./test-npm-errors.mjs";
 import "./test-npm-client.mjs";
 import "./test-npm-node.mjs";
 import "./test-npm-salvage.mjs";
+import "./test-npm-extract-modes.mjs";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { lstat, mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from "node:fs/promises";
