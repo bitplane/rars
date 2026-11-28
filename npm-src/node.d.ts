@@ -61,7 +61,7 @@ export class RarArchive {
    * sets the Unix modes the archive records, and 0o444 on a DOS read-only file; off Windows
    * only. Links are written too; one that could lead outside `directory` is skipped with an
    * `UnsafeLinkWarning` process warning. `skipSymlinks` leaves symlinks and junctions out,
-   * without a warning; a hard link or copy to one fails.
+   * without a warning; a hard link or copy to one fails as its own member.
    * `volumes` gives the set's later parts as they arrive, as for `test()`.
    *
    * `onMemberError` carries on past members that fail and writes none of their output; it

@@ -892,3 +892,42 @@ fn rar50_settled_extraction_matches_sequential_at_any_thread_count() {
         }
     }
 }
+
+#[test]
+fn a_failing_link_callback_is_a_member_error_on_every_walk() {
+    for version in [ArchiveVersion::Rar40, ArchiveVersion::Rar50] {
+        for solid in [false, true] {
+            let archive = fixture(version, false, solid);
+            for volumes in [false, true] {
+                let case = format!("{version:?} solid {solid} volumes {volumes}");
+                let failed = std::sync::Mutex::new(Vec::new());
+                let on_error = |member: &rars::ArchiveMember, _: &rars::Error| {
+                    failed.lock().unwrap().push(member.meta.name.clone());
+                    Ok(rars::ExtractionErrorAction::Continue)
+                };
+                let options = ArchiveReadOptions::new().with_member_error_handler(&on_error);
+                let mut opened = Vec::new();
+                let mut open = |meta: &rars::ExtractedEntryMeta| -> rars::Result<Box<dyn Write>> {
+                    opened.push(meta.name.clone());
+                    Ok(Box::new(io::sink()))
+                };
+                let link = |_: &rars::ExtractedEntryMeta, _: ExtractedLink<'_>| {
+                    Err(rars::Error::InvalidHeader("refused"))
+                };
+                let result = if volumes {
+                    rars::extract_volumes_with_links(
+                        std::slice::from_ref(&archive),
+                        options,
+                        &mut open,
+                        link,
+                    )
+                } else {
+                    archive.extract_with_links(options, &mut open, link)
+                };
+                result.unwrap_or_else(|error| panic!("{case}: {error}"));
+                assert_eq!(failed.into_inner().unwrap(), [b"link".to_vec()], "{case}");
+                assert_eq!(opened, [b"before".to_vec(), b"after".to_vec()], "{case}");
+            }
+        }
+    }
+}
