@@ -69,14 +69,6 @@ impl PathModes {
         }
     }
 
-    #[cfg(all(test, unix))]
-    pub(crate) fn paths(&self) -> impl Iterator<Item = &Path> {
-        self.files
-            .iter()
-            .chain(&self.directories)
-            .map(|(path, _)| path.as_path())
-    }
-
     pub fn restore(mut self) -> std::io::Result<()> {
         self.directories
             .sort_by_cached_key(|(path, _)| std::cmp::Reverse(path.components().count()));

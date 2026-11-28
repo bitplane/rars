@@ -3,8 +3,8 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
 use pyo3::{create_exception, PyErr};
+use rars_rs::extract_engine::{DirExtraction, DirMode, Outputs};
 use rars_rs::filename::LegacyNameEncoding;
-use rars_rs::output_dir::{DirMode, DirOutputs, Outputs};
 use rars_rs::output_links::Settled;
 use rars_rs::output_staging::{failed_entry_name, OverwritePolicy};
 use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
@@ -4519,9 +4519,9 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
     }
 }
 
-/// The library's directory outputs, with each file's bytes counted for progress.
+/// The library's directory extraction, with each file's bytes counted for progress.
 struct ExtractOutputs<'a> {
-    outputs: DirOutputs<'a>,
+    outputs: DirExtraction<'a>,
     progress: Option<Arc<ReadProgress>>,
     /// `keep_broken=True`; without it, a salvaged read still drops what a failed member delivered.
     keep_broken: bool,
@@ -4586,7 +4586,7 @@ impl<'a> ExtractOutputs<'a> {
             exists_hint: "; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
         };
         Self {
-            outputs: DirOutputs::new(out_dir, family, options.legacy_name_encoding, mode),
+            outputs: DirExtraction::new(out_dir, family, options.legacy_name_encoding, mode),
             progress,
             keep_broken,
         }
@@ -4631,6 +4631,10 @@ impl Outputs for ExtractOutputs<'_> {
     fn can_open_ahead(&self) -> bool {
         self.outputs.can_open_ahead()
     }
+
+    fn written_elsewhere(&mut self, elsewhere: bool) {
+        self.outputs.written_elsewhere(elsewhere);
+    }
 }
 
 fn extract_archive<S: Selection>(
@@ -4660,7 +4664,7 @@ fn extract_archive<S: Selection>(
         selected.is_some_and(|selected| selected.contains_member(index, &member.meta.name))
     };
     let select = selected.map(|_| &select as &rars_rs::output_links::Select<'_>);
-    let result = rars_rs::output_dir::extract_archive(archive, options, select, &outputs);
+    let result = rars_rs::extract_engine::extract_archive(archive, options, select, &outputs);
     outputs
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

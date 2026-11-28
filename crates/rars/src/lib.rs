@@ -74,8 +74,6 @@ mod member_read;
 mod member_reader;
 pub use member_read::{read_volume_members_at, read_volume_members_at_with_options};
 pub use member_reader::{MemberReader, MembersIter};
-#[doc(hidden)]
-pub mod output_dir;
 mod output_limit;
 #[doc(hidden)]
 pub mod output_links;

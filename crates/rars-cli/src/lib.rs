@@ -1212,7 +1212,7 @@ struct RunOutputs<'r, 'e, 'p> {
     damaged: &'r DamagedMembers<'p>,
 }
 
-impl rars::output_dir::Outputs for RunOutputs<'_, '_, '_> {
+impl rars::extract_engine::Outputs for RunOutputs<'_, '_, '_> {
     fn open(&mut self, meta: &rars::ExtractedEntryMeta) -> rars::Result<Box<dyn Write + Send>> {
         let opened = match self.damaged.keep_broken {
             Some(kept) => kept.open(self.engine, meta),
@@ -1245,6 +1245,10 @@ impl rars::output_dir::Outputs for RunOutputs<'_, '_, '_> {
     fn can_open_ahead(&self) -> bool {
         self.engine.can_open_ahead()
     }
+
+    fn written_elsewhere(&mut self, elsewhere: bool) {
+        self.engine.written_elsewhere(elsewhere);
+    }
 }
 
 fn extract_archives(
@@ -1253,17 +1257,16 @@ fn extract_archives(
     engine: &mut ExtractEngine<'_>,
     damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
-    use rars::output_dir::Outputs;
+    use rars::extract_engine::Outputs;
     engine.legacy_name_encoding(options.legacy_name_encoding);
-    // Only RAR 5's write lane hands outputs to workers.
-    engine.written_elsewhere(
-        engine.can_open_ahead() && matches!(archives, [DetectedArchive::Rar50Plus(_)]),
-    );
     let outputs = Mutex::new(RunOutputs { engine, damaged });
     let volumes = match archives {
-        [archive] => return rars::output_dir::extract_archive(archive, options, None, &outputs),
+        [archive] => {
+            return rars::extract_engine::extract_archive(archive, options, None, &outputs)
+        }
         volumes => volumes,
     };
+    lock(&outputs).written_elsewhere(false);
     rars::output_links::extract_settled(
         SettledSource::Volumes(volumes),
         options,

@@ -47,13 +47,6 @@ impl InFlight {
         }
     }
 
-    /// Whether an output goes to `relative` itself.
-    pub fn holds(&self, relative: &Path) -> bool {
-        self.paths
-            .get(relative)
-            .is_some_and(|counts| counts.files + counts.directories > 0)
-    }
-
     /// Whether these outputs can change what opening finds at `relative`.
     pub fn changes(&self, relative: &Path, directory: bool) -> bool {
         if self.paths.is_empty() {
@@ -85,8 +78,6 @@ mod tests {
         let mut queued = InFlight::default();
         queued.add(Path::new("a/b"), false);
         queued.add(Path::new("d"), true);
-        assert!(queued.holds(Path::new("a/b")));
-        assert!(!queued.holds(Path::new("a")));
         // A file there, a file above, or for a file anything below.
         assert!(queued.changes(Path::new("a/b"), true));
         assert!(queued.changes(Path::new("a/b/c"), false));

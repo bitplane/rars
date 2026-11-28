@@ -21,7 +21,7 @@ pub(crate) fn print_engine_warnings(engine: &mut rars::extract_engine::ExtractEn
         rars::extract_engine::Warning::Unnamed => {
             eprintln!("warning: skipping a member with no name");
         }
-        rars::extract_engine::Warning::SkippedLink { name, target } => {
+        rars::extract_engine::Warning::SkippedLink { name, target, .. } => {
             eprintln!("{}", skipped_link_warning(name, target));
         }
     }));

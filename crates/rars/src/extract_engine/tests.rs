@@ -1,7 +1,11 @@
-use super::staged::{checked_output_path, open_output_writer, StagedFile};
+use super::staged::{open_output_writer, StagedFile, UnsafePaths};
 use super::*;
 use crate::{ArchiveFamily, Error, ExtractedEntryMeta};
 use std::collections::HashMap;
+
+fn checked_output_path(out_dir: &Path, rel: &Path) -> crate::Result<PathBuf> {
+    UnsafePaths::AsBadHeader.checked_output_path(out_dir, rel)
+}
 
 const FSREDIR_UNIX_SYMLINK: u64 = 0x01;
 const FSREDIR_HARDLINK: u64 = 0x04;
@@ -87,14 +91,17 @@ fn staged_files_end_with_their_members_mode_whatever_the_umask_clears() {
         let name = std::ffi::OsString::from(index.to_string());
         let meta = ExtractedEntryMeta::new(b"member".to_vec(), None, 0o100000 | mode as u64, false)
             .with_attr_source(crate::AttrSource::Unix);
-        let (mut file, set) =
-            StagedFile::deferred(dir.clone(), name, &meta, true, created_modes.clone());
+        let (mut file, closed) =
+            StagedFile::deferred(dir.clone(), name, &meta, true, true, created_modes.clone());
         if index % 2 == 1 {
             file.create().unwrap();
         }
         file.write_all(b"data").unwrap();
         drop(file);
-        assert!(set.load(std::sync::atomic::Ordering::Acquire), "{mode:o}");
+        assert!(
+            closed.early_set.load(std::sync::atomic::Ordering::Acquire),
+            "{mode:o}"
+        );
         let path = root.join("files").join(index.to_string());
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
@@ -417,6 +424,7 @@ fn metadata_restoration_errors_and_opt_out_are_observable() {
                 .with_attr_source(crate::AttrSource::Unix),
                 restore_metadata: false,
                 restore_mode: true,
+                restore_time: true,
             };
             restore_output_metadata(std::slice::from_ref(&output)).unwrap();
             #[cfg(unix)]
@@ -489,6 +497,7 @@ fn open_test_writer(
         meta.is_directory,
         overwrite,
         &mut Default::default(),
+        UnsafePaths::AsBadHeader,
     )
     .map(|(path, writer)| (path, writer as Box<dyn std::io::Write>))
 }
@@ -816,6 +825,7 @@ fn restore_output_metadata_updates_file_and_directory_times() {
             ),
             restore_metadata: true,
             restore_mode: true,
+            restore_time: true,
         },
         ExtractedOutput {
             name: b"nested".to_vec(),
@@ -829,6 +839,7 @@ fn restore_output_metadata_updates_file_and_directory_times() {
             ),
             restore_metadata: true,
             restore_mode: true,
+            restore_time: true,
         },
     ];
 
@@ -875,6 +886,7 @@ fn restore_directory_metadata_handles_restrictive_modes_in_any_entry_order() {
                 .with_attr_source(crate::AttrSource::Unix),
                 restore_metadata: true,
                 restore_mode: true,
+                restore_time: true,
             }
         })
         .collect();
