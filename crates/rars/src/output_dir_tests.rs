@@ -28,7 +28,7 @@ fn dir(name: &str) -> crate::ExtractedEntryMeta {
 }
 
 fn write(outputs: &mut DirOutputs<'_>, meta: &crate::ExtractedEntryMeta, bytes: &[u8]) {
-    let mut writer = outputs.open_settled(meta).unwrap();
+    let mut writer = outputs.open(meta).unwrap();
     writer.write_all(bytes).unwrap();
 }
 
@@ -51,7 +51,6 @@ fn settling_publishes_verified_members_and_drops_failed_ones() {
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Never),
-                None,
             );
             write(&mut outputs, &file("kept"), b"kept");
             write(&mut outputs, &file("broken"), b"broken");
@@ -60,9 +59,9 @@ fn settling_publishes_verified_members_and_drops_failed_ones() {
                 !root.join("kept").exists(),
                 "nothing is published before it settles"
             );
-            outputs.settle(true).unwrap();
-            outputs.settle(false).unwrap();
-            outputs.settle(true).unwrap();
+            outputs.settle(Settled::Verified).unwrap();
+            outputs.settle(Settled::Failed).unwrap();
+            outputs.settle(Settled::Verified).unwrap();
             let extracted = outputs.finish(Ok(())).unwrap();
             assert_eq!(listing(&root), ["kept", "later"]);
             assert_eq!(fs::read(root.join("kept")).unwrap(), b"kept");
@@ -82,12 +81,17 @@ fn a_member_on_the_path_of_an_unsettled_one_is_refused_only_once_that_one_publis
                     crate::ArchiveFamily::Rar50Plus,
                     None,
                     mode(OverwritePolicy::Never),
-                    None,
                 );
                 write(&mut outputs, &file("same"), b"first");
                 write(&mut outputs, &file("same"), b"second");
-                outputs.settle(first_verified).unwrap();
-                let second = outputs.settle(true);
+                outputs
+                    .settle(if first_verified {
+                        Settled::Verified
+                    } else {
+                        Settled::Failed
+                    })
+                    .unwrap();
+                let second = outputs.settle(Settled::Verified);
                 let extracted = outputs.finish(Ok(())).unwrap();
                 if first_verified {
                     let error = second.unwrap_err().to_string();
@@ -114,12 +118,11 @@ fn a_directory_is_made_once_the_members_before_it_settle() {
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Always),
-                None,
             );
             write(&mut outputs, &file("taken"), b"file");
-            outputs.open_settled(&dir("taken")).unwrap();
-            outputs.settle(true).unwrap();
-            let settled = outputs.settle(true);
+            outputs.open(&dir("taken")).unwrap();
+            outputs.settle(Settled::Verified).unwrap();
+            let settled = outputs.settle(Settled::Verified);
             let finished = outputs.finish(Ok(()));
             // Published on a thread of its own, it fails at the settle or at the end.
             let error = settled
@@ -145,12 +148,11 @@ fn a_file_on_the_path_of_an_unsettled_directory_is_refused_as_already_there() {
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Never),
-                None,
             );
-            outputs.open_settled(&dir("taken")).unwrap();
+            outputs.open(&dir("taken")).unwrap();
             write(&mut outputs, &file("taken"), b"file");
-            outputs.settle(true).unwrap();
-            let error = outputs.settle(true).unwrap_err().to_string();
+            outputs.settle(Settled::Verified).unwrap();
+            let error = outputs.settle(Settled::Verified).unwrap_err().to_string();
             outputs.finish(Ok(())).unwrap();
             assert!(error.contains("taken already exists"), "{error}");
             assert!(root.join("taken").is_dir());
@@ -159,7 +161,8 @@ fn a_file_on_the_path_of_an_unsettled_directory_is_refused_as_already_there() {
 }
 
 fn open_and_write(outputs: &mut DirOutputs<'_>, meta: &crate::ExtractedEntryMeta, bytes: &[u8]) {
-    outputs.open(meta).unwrap().write_all(bytes).unwrap();
+    write(outputs, meta, bytes);
+    outputs.settle(Settled::Verified).unwrap();
 }
 
 #[test]
@@ -172,7 +175,6 @@ fn a_member_on_the_path_of_one_still_publishing_is_refused_as_already_there() {
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Never),
-                None,
             );
             open_and_write(&mut outputs, &file("same"), b"first");
             let error = match outputs.open(&file("same")) {
@@ -200,7 +202,6 @@ fn a_file_on_the_path_of_a_directory_still_publishing_is_refused_as_already_ther
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Never),
-                None,
             );
             open_and_write(&mut outputs, &file("a/b"), b"inner");
             let error = match outputs.open(&file("a")) {
@@ -228,12 +229,15 @@ fn members_on_one_path_publish_in_archive_order() {
                     crate::ArchiveFamily::Rar50Plus,
                     None,
                     mode(overwrite),
-                    None,
                 );
                 let mut refused = None;
                 for (index, name) in ["x", "y", "x", "x"].into_iter().enumerate() {
                     match outputs.open(&file(name)) {
-                        Ok(mut writer) => writer.write_all(index.to_string().as_bytes()).unwrap(),
+                        Ok(mut writer) => {
+                            writer.write_all(index.to_string().as_bytes()).unwrap();
+                            drop(writer);
+                            outputs.settle(Settled::Verified).unwrap();
+                        }
                         Err(error) => {
                             refused = Some(error.to_string());
                             break;
@@ -265,8 +269,7 @@ fn a_staged_file_keeps_its_time_once_published() {
             let root = crate::scratch::case("dir-outputs-queued-times");
             let mut timed = mode(OverwritePolicy::Never);
             timed.restore_times = true;
-            let mut outputs =
-                DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, timed, None);
+            let mut outputs = DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, timed);
             for name in ["d/one", "d/two", "three"] {
                 let meta = crate::ExtractedEntryMeta::new(
                     name.as_bytes().to_vec(),
@@ -295,12 +298,11 @@ fn a_file_on_a_directory_an_unsettled_members_path_makes_is_refused_as_already_t
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Never),
-                None,
             );
             write(&mut outputs, &file("a/b/c"), b"inner");
             write(&mut outputs, &file("a/b"), b"outer");
-            outputs.settle(true).unwrap();
-            let error = outputs.settle(true).unwrap_err().to_string();
+            outputs.settle(Settled::Verified).unwrap();
+            let error = outputs.settle(Settled::Verified).unwrap_err().to_string();
             outputs.finish(Ok(())).unwrap();
             assert!(
                 error.contains("a/b already exists"),
@@ -321,47 +323,35 @@ fn plant_next_staged(outputs: &DirOutputs<'_>) {
 #[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
 #[test]
 fn a_staged_file_that_cant_be_created_fails_its_write_not_its_open() {
-    for settled in [false, true] {
-        for threads in THREADS {
-            capped(threads, || {
-                let root = crate::scratch::case("dir-outputs-staged-create-fails");
-                let mut outputs = DirOutputs::new(
-                    &root,
-                    crate::ArchiveFamily::Rar50Plus,
-                    None,
-                    mode(OverwritePolicy::Never),
-                    None,
-                );
-                let context = format!("settled={settled} threads={threads}");
-                if settled {
-                    write(&mut outputs, &file("first"), b"first");
-                    plant_next_staged(&outputs);
-                    let mut writer = outputs
-                        .open_settled(&file("second"))
-                        .expect("opening creates no file");
-                    // Written on another thread, as the decode workers do.
-                    let error = std::thread::spawn(move || writer.write_all(b"second"))
-                        .join()
-                        .unwrap()
-                        .unwrap_err();
-                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{context}");
-                    outputs.settle(true).unwrap();
-                    outputs.settle(false).unwrap();
-                    outputs.finish(Ok(())).unwrap();
-                } else {
-                    open_and_write(&mut outputs, &file("first"), b"first");
-                    plant_next_staged(&outputs);
-                    let mut writer = outputs
-                        .open(&file("second"))
-                        .expect("opening creates no file");
-                    let error = writer.write_all(b"second").unwrap_err();
-                    drop(writer);
-                    assert_eq!(error.kind(), io::ErrorKind::AlreadyExists, "{context}");
-                    outputs.finish(Err(error.into())).unwrap_err();
-                }
-                assert_eq!(listing(&root), ["first"], "{context}");
-            });
-        }
+    for threads in THREADS {
+        capped(threads, || {
+            let root = crate::scratch::case("dir-outputs-staged-create-fails");
+            let mut outputs = DirOutputs::new(
+                &root,
+                crate::ArchiveFamily::Rar50Plus,
+                None,
+                mode(OverwritePolicy::Never),
+            );
+            write(&mut outputs, &file("first"), b"first");
+            plant_next_staged(&outputs);
+            let mut writer = outputs
+                .open(&file("second"))
+                .expect("opening creates no file");
+            // Written on another thread, as the decode workers do.
+            let error = std::thread::spawn(move || writer.write_all(b"second"))
+                .join()
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(
+                error.kind(),
+                io::ErrorKind::AlreadyExists,
+                "threads={threads}"
+            );
+            outputs.settle(Settled::Verified).unwrap();
+            outputs.settle(Settled::Failed).unwrap();
+            outputs.finish(Ok(())).unwrap();
+            assert_eq!(listing(&root), ["first"], "threads={threads}");
+        });
     }
 }
 
@@ -376,31 +366,24 @@ fn an_empty_member_nothing_writes_is_published_with_its_time() {
             false,
         )
     };
-    for settled in [false, true] {
-        for threads in THREADS {
-            capped(threads, || {
-                let root = crate::scratch::case("dir-outputs-empty-member");
-                let mut timed = mode(OverwritePolicy::Never);
-                timed.restore_times = true;
-                let mut outputs =
-                    DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, timed, None);
-                for name in ["one", "two"] {
-                    if settled {
-                        drop(outputs.open_settled(&meta(name)).unwrap());
-                        outputs.settle(true).unwrap();
-                    } else {
-                        drop(outputs.open(&meta(name)).unwrap());
-                    }
-                }
-                outputs.finish(Ok(())).unwrap();
-                for name in ["one", "two"] {
-                    let context = format!("settled={settled} threads={threads} {name}");
-                    let published = fs::metadata(root.join(name)).expect(&context);
-                    assert_eq!(published.len(), 0, "{context}");
-                    assert_eq!(published.modified().unwrap(), modified, "{context}");
-                }
-            });
-        }
+    for threads in THREADS {
+        capped(threads, || {
+            let root = crate::scratch::case("dir-outputs-empty-member");
+            let mut timed = mode(OverwritePolicy::Never);
+            timed.restore_times = true;
+            let mut outputs = DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, timed);
+            for name in ["one", "two"] {
+                drop(outputs.open(&meta(name)).unwrap());
+                outputs.settle(Settled::Verified).unwrap();
+            }
+            outputs.finish(Ok(())).unwrap();
+            for name in ["one", "two"] {
+                let context = format!("threads={threads} {name}");
+                let published = fs::metadata(root.join(name)).expect(&context);
+                assert_eq!(published.len(), 0, "{context}");
+                assert_eq!(published.modified().unwrap(), modified, "{context}");
+            }
+        });
     }
 }
 
@@ -415,13 +398,12 @@ fn an_empty_member_whose_staged_file_cant_be_created_fails_to_publish_saying_so(
                 crate::ArchiveFamily::Rar50Plus,
                 None,
                 mode(OverwritePolicy::Never),
-                None,
             );
             write(&mut outputs, &file("first"), b"first");
             plant_next_staged(&outputs);
-            drop(outputs.open_settled(&file("empty")).unwrap());
-            outputs.settle(true).unwrap();
-            let settled = outputs.settle(true);
+            drop(outputs.open(&file("empty")).unwrap());
+            outputs.settle(Settled::Verified).unwrap();
+            let settled = outputs.settle(Settled::Verified);
             let finished = outputs.finish(Ok(()));
             let error = settled
                 .err()
@@ -446,13 +428,13 @@ fn modes_go_on_through_descriptors_except_unreadable_files_and_directories() {
     };
     for threads in THREADS {
         capped(threads, || {
-            for (settled, in_place) in [(false, false), (true, false), (false, true)] {
+            for in_place in [false, true] {
                 let root = crate::scratch::case("dir-outputs-modes-by-descriptor");
                 let mut moded = mode(OverwritePolicy::Never);
                 moded.restore_modes = true;
                 moded.in_place = in_place;
                 let mut outputs =
-                    DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, moded, None);
+                    DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, moded);
                 let members = [
                     unix("d", 0o040700, true),
                     unix("d/604", 0o100604, false),
@@ -461,14 +443,8 @@ fn modes_go_on_through_descriptors_except_unreadable_files_and_directories() {
                     unix("200", 0o100200, false),
                 ];
                 for meta in &members {
-                    if settled {
-                        write(&mut outputs, meta, b"x");
-                        outputs.settle(true).unwrap();
-                    } else {
-                        open_and_write(&mut outputs, meta, b"x");
-                    }
+                    open_and_write(&mut outputs, meta, b"x");
                 }
-                // Settling is only for archives without links.
                 let links = [
                     ("hard", 0o100600, ExtractedLink::HardLink { target: b"600" }),
                     ("copy", 0o100600, ExtractedLink::FileCopy { target: b"600" }),
@@ -478,21 +454,13 @@ fn modes_go_on_through_descriptors_except_unreadable_files_and_directories() {
                         ExtractedLink::FileCopy { target: b"200" },
                     ),
                 ];
-                if !settled {
-                    for (name, mode, link) in links {
-                        outputs.link(&unix(name, mode, false), link).unwrap();
-                    }
+                for (name, mode, link) in links {
+                    outputs.link(&unix(name, mode, false), link).unwrap();
                 }
-                outputs.publish_pending().unwrap();
-                let mut by_path = vec![root.join("200")];
-                if !settled {
-                    by_path.push(root.join("copy200"));
-                }
-                by_path.push(root.join("d"));
                 assert_eq!(
                     outputs.modes_by_path(),
-                    by_path,
-                    "threads={threads} settled={settled} in_place={in_place}"
+                    [root.join("200"), root.join("copy200"), root.join("d")],
+                    "threads={threads} in_place={in_place}"
                 );
                 outputs.finish(Ok(())).unwrap();
                 let linked = [("hard", 0o600), ("copy", 0o600), ("copy200", 0o200)];
@@ -504,12 +472,51 @@ fn modes_go_on_through_descriptors_except_unreadable_files_and_directories() {
                     ("200", 0o200),
                 ]
                 .into_iter()
-                .chain(linked.into_iter().filter(|_| !settled))
+                .chain(linked)
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let found = fs::metadata(root.join(name)).unwrap().permissions().mode();
                     assert_eq!(found & 0o7777, mode, "{name} in_place={in_place}");
                 }
+            }
+        });
+    }
+}
+
+#[test]
+fn writing_in_place_or_flattened_settles_each_member_before_the_next_opens() {
+    for threads in THREADS {
+        capped(threads, || {
+            for (in_place, flatten) in [(true, false), (false, true)] {
+                let case = format!("threads={threads} in_place={in_place} flatten={flatten}");
+                let root = crate::scratch::case("dir-outputs-in-order");
+                let mut written = mode(OverwritePolicy::Never);
+                written.in_place = in_place;
+                written.flatten = flatten;
+                let mut outputs =
+                    DirOutputs::new(&root, crate::ArchiveFamily::Rar50Plus, None, written);
+                drop(outputs.open(&dir("d")).unwrap());
+                outputs.settle(Settled::Verified).unwrap();
+                write(&mut outputs, &file("d/kept"), b"kept");
+                outputs.settle(Settled::Verified).unwrap();
+                write(&mut outputs, &file("d/broken"), b"broken");
+                outputs.settle(Settled::Failed).unwrap();
+                write(&mut outputs, &file("d/salvaged"), b"salvaged");
+                outputs.settle(Settled::KeptBroken).unwrap();
+
+                let extracted = outputs.finish(Ok(())).unwrap();
+
+                let at = |name: &str| match flatten {
+                    true => root.join(name),
+                    false => root.join("d").join(name),
+                };
+                let mut expected = vec![at("kept"), at("salvaged")];
+                if !flatten {
+                    expected.insert(0, root.join("d"));
+                }
+                assert_eq!(extracted.paths, expected, "{case}");
+                assert_eq!(fs::read(at("kept")).unwrap(), b"kept", "{case}");
+                assert_eq!(fs::read(at("salvaged")).unwrap(), b"salvaged", "{case}");
             }
         });
     }

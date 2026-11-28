@@ -5,6 +5,7 @@ use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyT
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::LegacyNameEncoding;
 use rars_rs::output_dir::{DirMode, DirOutputs, Outputs};
+use rars_rs::output_links::Settled;
 use rars_rs::output_staging::{failed_entry_name, OverwritePolicy};
 use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
 use rars_rs::ExtractedLink;
@@ -944,25 +945,14 @@ impl ReadProgress {
         self.report(state, false);
     }
 
-    fn counted(self: &Arc<Self>, name: &[u8], writer: Box<dyn Write>) -> Box<dyn Write> {
-        self.entry(name);
-        Box::new(CountedWriter {
-            writer,
-            progress: Arc::clone(self),
-            pending: 0,
-            reports: true,
-        })
-    }
-
-    /// Counts a writer that may run on a worker thread, leaving the reports
-    /// to the calling thread, so the callback never runs anywhere else.
-    fn counted_quietly<W: Write>(self: &Arc<Self>, name: &[u8], writer: W) -> CountedWriter<W> {
+    /// Reports only on the thread that opened it, so the callback never runs on a worker.
+    fn counted<W: Write>(self: &Arc<Self>, name: &[u8], writer: W) -> CountedWriter<W> {
         self.entry(name);
         CountedWriter {
             writer,
             progress: Arc::clone(self),
             pending: 0,
-            reports: false,
+            reports_on: std::thread::current().id(),
         }
     }
 
@@ -1089,7 +1079,15 @@ struct CountedWriter<W: Write> {
     writer: W,
     progress: Arc<ReadProgress>,
     pending: u64,
-    reports: bool,
+    reports_on: std::thread::ThreadId,
+}
+
+impl<W: Write> CountedWriter<W> {
+    fn hand_over(&mut self) {
+        let reports = std::thread::current().id() == self.reports_on;
+        self.progress
+            .hand_over(std::mem::take(&mut self.pending), reports);
+    }
 }
 
 impl<W: Write> Write for CountedWriter<W> {
@@ -1097,8 +1095,7 @@ impl<W: Write> Write for CountedWriter<W> {
         let written = self.writer.write(bytes)?;
         self.pending += written as u64;
         if self.pending >= COUNTED_BATCH {
-            self.progress
-                .hand_over(std::mem::take(&mut self.pending), self.reports);
+            self.hand_over();
         }
         Ok(written)
     }
@@ -1111,7 +1108,7 @@ impl<W: Write> Write for CountedWriter<W> {
 impl<W: Write> Drop for CountedWriter<W> {
     fn drop(&mut self) {
         if self.pending > 0 {
-            self.progress.hand_over(self.pending, self.reports);
+            self.hand_over();
         }
     }
 }
@@ -1605,7 +1602,7 @@ impl RarFile {
                 &out_dir,
                 mode,
                 progress.as_ref(),
-                None,
+                false,
             )
         } else {
             if let Some(progress) = &progress {
@@ -1619,7 +1616,7 @@ impl RarFile {
                     options,
                     mode,
                     progress.clone(),
-                    None,
+                    false,
                 )
             })
             .map_err(map_error)
@@ -1752,7 +1749,9 @@ impl RarFile {
             Some(_) => options.with_member_error_handler(&handler),
             None => options,
         };
-        let failed = member_errors.as_ref().map(|errors| &errors.failed);
+        let keep_broken = member_errors
+            .as_ref()
+            .is_some_and(|errors| errors.keep_broken);
         let extracted = if in_set {
             self.extract_from_set(
                 py,
@@ -1763,7 +1762,7 @@ impl RarFile {
                 &out_dir,
                 mode,
                 progress.as_ref(),
-                failed,
+                keep_broken,
             )
         } else {
             if let Some(progress) = &progress {
@@ -1778,7 +1777,7 @@ impl RarFile {
                     options,
                     mode,
                     progress.clone(),
-                    failed,
+                    keep_broken,
                 )
             })
             .map_err(map_error)
@@ -1846,7 +1845,9 @@ impl RarFile {
             let sink = |meta: &rars_rs::ExtractedEntryMeta| {
                 let sink = Box::new(io::sink()) as Box<dyn Write>;
                 Ok(match &progress {
-                    Some(progress) if !meta.is_directory => progress.counted(&meta.name, sink),
+                    Some(progress) if !meta.is_directory => {
+                        Box::new(progress.counted(&meta.name, sink))
+                    }
                     _ => sink,
                 })
             };
@@ -2523,7 +2524,7 @@ impl RarFile {
         out_dir: &Path,
         mode: OutputMode,
         progress: Option<&Arc<ReadProgress>>,
-        failed: Option<&Mutex<Vec<Vec<u8>>>>,
+        keep_broken: bool,
     ) -> PyResult<Extracted> {
         let first = &self.archive;
         let chosen = |index: usize| selected.is_none_or(|selected| selected.contains(&index));
@@ -2531,47 +2532,52 @@ impl RarFile {
             self.begin_set(py, volumes, options, progress, &chosen);
         }
         self.extract_prepared_set(py, volumes, prepared, options, |volumes| {
-            let outputs = std::cell::RefCell::new(ExtractOutputs::new(
+            let outputs = Mutex::new(ExtractOutputs::new(
                 out_dir,
                 first.family(),
                 options,
                 mode,
                 progress.cloned(),
-                failed,
+                keep_broken,
             ));
             // A `volumes` iterator can look at the output directory: it finds every earlier member there.
-            let published = outputs.borrow().outputs.publish_waiter();
+            let published = lock(&outputs).outputs.publish_waiter();
             let mut tracked = tracked(progress.map(Arc::as_ref), volumes, &chosen);
             let mut volumes = std::iter::from_fn(|| {
                 published();
                 tracked.next()
             });
-            let open = |meta: &rars_rs::ExtractedEntryMeta| outputs.borrow_mut().open(meta);
-            let link = |meta: &rars_rs::ExtractedEntryMeta, link: ExtractedLink<'_>| {
-                outputs.borrow_mut().link(meta, link)
-            };
-            let result = match selected {
-                Some(selected) => extract_arriving_selected(
-                    first,
-                    &mut volumes,
-                    options,
-                    selected,
-                    self.selection_end(selected),
-                    |_, meta| open(meta),
-                    link,
-                ),
-                None => match self.salvaged_run() {
-                    Some(run) => rars_rs::extract_volumes_with_links(&run, options, open, link),
-                    None => rars_rs::output_links::extract_arriving_with_links(
+            let result = rars_rs::output_links::settle_in_order(
+                options,
+                |meta| lock(&outputs).open(meta),
+                |meta, link| lock(&outputs).link(meta, link),
+                |_, outcome| lock(&outputs).settle(outcome),
+                |read, open, link| match selected {
+                    Some(selected) => extract_arriving_selected(
                         first,
                         &mut volumes,
-                        options,
-                        open,
+                        read,
+                        selected,
+                        self.selection_end(selected),
+                        |_, meta| open(meta),
                         link,
                     ),
+                    None => match self.salvaged_run() {
+                        Some(run) => rars_rs::extract_volumes_with_links(&run, read, open, link),
+                        None => rars_rs::output_links::extract_arriving_with_links(
+                            first,
+                            &mut volumes,
+                            read,
+                            open,
+                            link,
+                        ),
+                    },
                 },
-            };
-            outputs.into_inner().finish(result)
+            );
+            outputs
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .finish(result)
         })
     }
 
@@ -2610,7 +2616,7 @@ impl RarFile {
                         .insert(index, Arc::clone(&buffer));
                     let buffer = Box::new(SharedBuffer(buffer));
                     Ok(match progress {
-                        Some(progress) => progress.counted(&meta.name, buffer),
+                        Some(progress) => Box::new(progress.counted(&meta.name, buffer)),
                         None => buffer,
                     })
                 },
@@ -4517,6 +4523,8 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
 struct ExtractOutputs<'a> {
     outputs: DirOutputs<'a>,
     progress: Option<Arc<ReadProgress>>,
+    /// `keep_broken=True`; without it, a salvaged read still drops what a failed member delivered.
+    keep_broken: bool,
 }
 
 /// What an extraction wrote, and the links it left out.
@@ -4566,7 +4574,7 @@ impl<'a> ExtractOutputs<'a> {
         options: rars_rs::ArchiveReadOptions<'_>,
         mode: OutputMode,
         progress: Option<Arc<ReadProgress>>,
-        failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
+        keep_broken: bool,
     ) -> Self {
         let mode = DirMode {
             overwrite: mode.overwrite,
@@ -4578,20 +4586,10 @@ impl<'a> ExtractOutputs<'a> {
             exists_hint: "; pass overwrite=True to replace it or overwrite=\"rename\" to keep both",
         };
         Self {
-            outputs: DirOutputs::new(out_dir, family, options.legacy_name_encoding, mode, failed),
+            outputs: DirOutputs::new(out_dir, family, options.legacy_name_encoding, mode),
             progress,
+            keep_broken,
         }
-    }
-
-    fn open_legacy_link(
-        &mut self,
-        meta: &rars_rs::ExtractedEntryMeta,
-    ) -> rars_rs::Result<Box<dyn Write>> {
-        self.outputs.open_legacy_link(meta)
-    }
-
-    fn publish_pending(&mut self) -> rars_rs::Result<()> {
-        self.outputs.publish_pending()
     }
 
     fn finish(self, result: rars_rs::Result<()>) -> rars_rs::Result<Extracted> {
@@ -4600,32 +4598,26 @@ impl<'a> ExtractOutputs<'a> {
 }
 
 impl Outputs for ExtractOutputs<'_> {
-    fn open(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
-        let writer = self.outputs.open(meta)?;
-        Ok(match &self.progress {
-            Some(progress) if !meta.is_directory => progress.counted(&meta.name, writer),
-            _ => writer,
-        })
-    }
-
-    fn open_settled(
+    fn open(
         &mut self,
         meta: &rars_rs::ExtractedEntryMeta,
     ) -> rars_rs::Result<Box<dyn Write + Send>> {
-        let writer = self.outputs.open_settled(meta)?;
+        let writer = self.outputs.open(meta)?;
         Ok(match &self.progress {
-            Some(progress) if !meta.is_directory => {
-                Box::new(progress.counted_quietly(&meta.name, writer))
-            }
+            Some(progress) if !meta.is_directory => Box::new(progress.counted(&meta.name, writer)),
             _ => writer,
         })
     }
 
-    fn settle(&mut self, verified: bool) -> rars_rs::Result<()> {
+    fn settle(&mut self, outcome: Settled) -> rars_rs::Result<()> {
         if let Some(progress) = &self.progress {
             progress.advance(0);
         }
-        self.outputs.settle(verified)
+        let outcome = match outcome {
+            Settled::KeptBroken if !self.keep_broken => Settled::Failed,
+            outcome => outcome,
+        };
+        self.outputs.settle(outcome)
     }
 
     fn link(
@@ -4636,8 +4628,8 @@ impl Outputs for ExtractOutputs<'_> {
         self.outputs.link(meta, link)
     }
 
-    fn can_settle(&self) -> bool {
-        self.outputs.can_settle()
+    fn can_open_ahead(&self) -> bool {
+        self.outputs.can_open_ahead()
     }
 }
 
@@ -4648,7 +4640,7 @@ fn extract_archive<S: Selection>(
     options: rars_rs::ArchiveReadOptions<'_>,
     mode: OutputMode,
     progress: Option<Arc<ReadProgress>>,
-    failed: Option<&Mutex<Vec<Vec<u8>>>>,
+    keep_broken: bool,
 ) -> rars_rs::Result<Extracted> {
     if options
         .cancellation
@@ -4656,85 +4648,23 @@ fn extract_archive<S: Selection>(
     {
         return Err(rars_rs::Error::Cancelled);
     }
-    let outputs = std::cell::RefCell::new(ExtractOutputs::new(
+    let outputs = Mutex::new(ExtractOutputs::new(
         out_dir,
         archive.family(),
         options,
         mode,
         progress,
-        failed,
+        keep_broken,
     ));
-    let result = extract_selected(archive, selected, options, &outputs);
-    outputs.into_inner().finish(result)
-}
-
-fn extract_selected<S: Selection>(
-    archive: &rars_rs::Archive,
-    selected: Option<&S>,
-    options: rars_rs::ArchiveReadOptions<'_>,
-    outputs: &std::cell::RefCell<ExtractOutputs<'_>>,
-) -> rars_rs::Result<()> {
-    let Some(selected) = selected else {
-        return rars_rs::output_dir::extract_archive(archive, options, outputs);
+    let select = |index: usize, member: &rars_rs::ArchiveMember| {
+        selected.is_some_and(|selected| selected.contains_member(index, &member.meta.name))
     };
-    let last = archive
-        .member_refs()
-        .enumerate()
-        .filter(|(index, member)| selected.contains_member(*index, member.name_bytes()))
-        .map(|(index, _)| index)
-        .last();
-    let Some(last) = last else {
-        return Ok(());
-    };
-    let solid = archive.is_solid();
-    let mut index = 0;
-    archive.extract_with_control(options, |member| {
-        // The previous payload has passed decoding and integrity checks.
-        outputs.borrow_mut().publish_pending()?;
-        let current = index;
-        index += 1;
-        if current > last {
-            return Ok(rars_rs::ExtractionDecision::Stop);
-        }
-        let meta = &member.meta;
-        let chosen = selected.contains_member(current, &meta.name);
-        if meta.is_redirection {
-            if chosen {
-                if let rars_rs::ArchiveMemberDetail::Rar50Plus {
-                    redirection: Some(redirection),
-                    ..
-                } = &member.detail
-                {
-                    let link = rars_rs::output_links::rar50_link(redirection)?;
-                    outputs.borrow_mut().link(&extracted_meta(member), link)?;
-                }
-            }
-            return Ok(rars_rs::ExtractionDecision::Skip);
-        }
-        if !chosen {
-            return Ok(if solid && !meta.is_directory {
-                rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
-            } else {
-                rars_rs::ExtractionDecision::Skip
-            });
-        }
-        if rars_rs::output_links::is_legacy_symlink_member(meta) {
-            rars_rs::output_links::check_legacy_symlink_target(
-                &meta.name,
-                meta.unpacked_size,
-                None,
-            )?;
-            return Ok(rars_rs::ExtractionDecision::Extract(
-                outputs
-                    .borrow_mut()
-                    .open_legacy_link(&extracted_meta(member))?,
-            ));
-        }
-        Ok(rars_rs::ExtractionDecision::Extract(
-            outputs.borrow_mut().open(&extracted_meta(member))?,
-        ))
-    })?;
-    Ok(())
+    let select = selected.map(|_| &select as &rars_rs::output_links::Select<'_>);
+    let result = rars_rs::output_dir::extract_archive(archive, options, select, &outputs);
+    outputs
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .finish(result)
 }
 
 /// Stops once the last selected member is verified, so a generator isn't asked for volumes nobody needs.
@@ -4878,9 +4808,9 @@ fn read_counted(
             if selected.contains(&index) {
                 let buffer = Arc::new(Mutex::new(Vec::new()));
                 buffers.insert(index, Arc::clone(&buffer));
-                return Ok(rars_rs::ExtractionDecision::Extract(
-                    progress.counted(&meta.name, Box::new(SharedBuffer(buffer))),
-                ));
+                return Ok(rars_rs::ExtractionDecision::Extract(Box::new(
+                    progress.counted(&meta.name, SharedBuffer(buffer)),
+                )));
             }
             Ok(if solid {
                 rars_rs::ExtractionDecision::Extract(Box::new(io::sink()))
@@ -4920,19 +4850,6 @@ fn test_counted(
         }
         Ok(())
     })
-}
-
-fn extracted_meta(member: &rars_rs::ArchiveMember) -> rars_rs::ExtractedEntryMeta {
-    let meta = &member.meta;
-    let mut extracted = rars_rs::ExtractedEntryMeta::new(
-        meta.name.clone(),
-        meta.modification_time(),
-        meta.file_attr,
-        meta.is_directory,
-    )
-    .with_attr_source(meta.attr_source());
-    extracted.name_is_unicode = member.name_is_unicode();
-    extracted
 }
 
 /// Runs `run` without the GIL over the volumes `next` gives; an exception `next` raises wins over `run`'s error.
@@ -6066,7 +5983,7 @@ mod tests {
                     flatten: false,
                 },
                 None,
-                None,
+                false,
             )
             .unwrap()
             .paths;
@@ -6086,7 +6003,7 @@ mod tests {
                     flatten: false,
                 },
                 None,
-                None,
+                false,
             )
             .map(|extracted| extracted.paths)
             .unwrap_err();
@@ -6106,7 +6023,7 @@ mod tests {
                     flatten: false,
                 },
                 None,
-                None,
+                false,
             )
             .unwrap()
             .paths;

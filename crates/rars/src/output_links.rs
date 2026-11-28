@@ -26,10 +26,6 @@ fn native_target(target: &[u8], family: ArchiveFamily, unix_host: bool) -> Cow<'
     }
 }
 
-pub fn rar50_link(redirection: &crate::rar50::FileRedirection) -> Result<ExtractedLink<'_>> {
-    ExtractedLink::rar50(redirection)
-}
-
 pub fn is_legacy_symlink_member(meta: &crate::ArchiveMemberMeta) -> bool {
     meta.family == ArchiveFamily::Rar15To40
         && meta.host_os.is_some_and(|host| {
@@ -117,8 +113,8 @@ pub fn extract_settled<F, L, S>(
     source: SettledSource<'_>,
     options: crate::ArchiveReadOptions<'_>,
     select: Option<&Select<'_>>,
-    mut open: F,
-    mut link: L,
+    open: F,
+    link: L,
     settled: S,
 ) -> Result<()>
 where
@@ -131,6 +127,93 @@ where
     {
         return extract_rar50_settling_all(archive, options, open, link, settled);
     }
+    settle_walk(
+        options,
+        open,
+        link,
+        settled,
+        |read, state, open, link| match (source, select) {
+            (SettledSource::Archive(archive), Some(select)) => {
+                extract_selected(archive, read, select, state, open, link)
+            }
+            (SettledSource::Archive(archive), None) => archive.extract_with_links(read, open, link),
+            (SettledSource::Volumes(volumes), select) => {
+                let chosen =
+                    std::cell::RefCell::new(select.map(|select| Chosen::new(volumes, select)));
+                let chosen = |name: &[u8]| {
+                    chosen
+                        .borrow_mut()
+                        .as_mut()
+                        .is_none_or(|chosen| chosen.advance_to(name))
+                };
+                crate::extract_volumes_with_links(
+                    volumes,
+                    read,
+                    |meta| {
+                        if chosen(&meta.name) {
+                            open(meta)
+                        } else {
+                            Ok(Box::new(std::io::sink()))
+                        }
+                    },
+                    |meta, made| {
+                        if chosen(&meta.name) {
+                            link(meta, made)
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            }
+        },
+    )
+}
+
+pub type OpenOutput<'a> =
+    dyn FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write>> + 'a;
+pub type MakeLink<'a> = dyn FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()> + 'a;
+
+/// [`extract_settled`]'s settling for a walk it doesn't drive, such as arriving volumes; members open one at a time, as writing in place needs.
+pub fn settle_in_order<F, L, S, R>(
+    options: crate::ArchiveReadOptions<'_>,
+    open: F,
+    link: L,
+    settled: S,
+    run: R,
+) -> Result<()>
+where
+    F: FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write + Send>>,
+    L: FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
+    S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()> + Send,
+    R: for<'r> FnOnce(
+        crate::ArchiveReadOptions<'r>,
+        &mut OpenOutput<'_>,
+        &mut MakeLink<'_>,
+    ) -> Result<()>,
+{
+    settle_walk(options, open, link, settled, |read, _, open, link| {
+        run(read, open, link)
+    })
+}
+
+fn settle_walk<F, L, S, R>(
+    options: crate::ArchiveReadOptions<'_>,
+    mut open: F,
+    mut link: L,
+    settled: S,
+    run: R,
+) -> Result<()>
+where
+    F: FnMut(&crate::ExtractedEntryMeta) -> Result<Box<dyn std::io::Write + Send>>,
+    L: FnMut(&crate::ExtractedEntryMeta, ExtractedLink<'_>) -> Result<()>,
+    S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()> + Send,
+    R: for<'r> FnOnce(
+        crate::ArchiveReadOptions<'r>,
+        &std::sync::Mutex<Settling<S>>,
+        &mut OpenOutput<'_>,
+        &mut MakeLink<'_>,
+    ) -> Result<()>,
+{
     let state = std::sync::Mutex::new(Settling {
         settled,
         opened: None,
@@ -174,41 +257,7 @@ where
         lock(&state).settle(Settled::Verified)?;
         link(meta, made)
     };
-    let result = match (source, select) {
-        (SettledSource::Archive(archive), Some(select)) => {
-            extract_selected(archive, read, select, &state, &mut open, &mut link)
-        }
-        (SettledSource::Archive(archive), None) => {
-            archive.extract_with_links(read, &mut open, &mut link)
-        }
-        (SettledSource::Volumes(volumes), select) => {
-            let chosen = std::cell::RefCell::new(select.map(|select| Chosen::new(volumes, select)));
-            let chosen = |name: &[u8]| {
-                chosen
-                    .borrow_mut()
-                    .as_mut()
-                    .is_none_or(|chosen| chosen.advance_to(name))
-            };
-            crate::extract_volumes_with_links(
-                volumes,
-                read,
-                |meta| {
-                    if chosen(&meta.name) {
-                        open(meta)
-                    } else {
-                        Ok(Box::new(std::io::sink()))
-                    }
-                },
-                |meta, made| {
-                    if chosen(&meta.name) {
-                        link(meta, made)
-                    } else {
-                        Ok(())
-                    }
-                },
-            )
-        }
-    };
+    let result = run(read, &state, &mut open, &mut link);
     let mut state = state.into_inner().expect("settling lock poisoned");
     match &result {
         Ok(()) => state.settle(Settled::Verified)?,
