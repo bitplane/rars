@@ -4,7 +4,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyByteArray, PyBytes, PyList, PyModule, PyString, PyTuple, PyType};
 use pyo3::{create_exception, PyErr};
 use rars_rs::filename::LegacyNameEncoding;
-use rars_rs::output_dir::{DirMode, DirOutputs};
+use rars_rs::output_dir::{DirMode, DirOutputs, Outputs};
 use rars_rs::output_staging::{failed_entry_name, OverwritePolicy};
 use rars_rs::password_check::{PasswordProbe, PasswordVerdict};
 use rars_rs::ExtractedLink;
@@ -4517,8 +4517,6 @@ impl<'a, 'py> FromPyObject<'a, 'py> for Overwrite {
 struct ExtractOutputs<'a> {
     outputs: DirOutputs<'a>,
     progress: Option<Arc<ReadProgress>>,
-    /// Writing in place or flattened, opening reads what the members before it published.
-    can_settle: bool,
 }
 
 /// What an extraction wrote, and the links it left out.
@@ -4582,10 +4580,26 @@ impl<'a> ExtractOutputs<'a> {
         Self {
             outputs: DirOutputs::new(out_dir, family, options.legacy_name_encoding, mode, failed),
             progress,
-            can_settle: !mode.in_place && !mode.flatten,
         }
     }
 
+    fn open_legacy_link(
+        &mut self,
+        meta: &rars_rs::ExtractedEntryMeta,
+    ) -> rars_rs::Result<Box<dyn Write>> {
+        self.outputs.open_legacy_link(meta)
+    }
+
+    fn publish_pending(&mut self) -> rars_rs::Result<()> {
+        self.outputs.publish_pending()
+    }
+
+    fn finish(self, result: rars_rs::Result<()>) -> rars_rs::Result<Extracted> {
+        self.outputs.finish(result)
+    }
+}
+
+impl Outputs for ExtractOutputs<'_> {
     fn open(&mut self, meta: &rars_rs::ExtractedEntryMeta) -> rars_rs::Result<Box<dyn Write>> {
         let writer = self.outputs.open(meta)?;
         Ok(match &self.progress {
@@ -4614,13 +4628,6 @@ impl<'a> ExtractOutputs<'a> {
         self.outputs.settle(verified)
     }
 
-    fn open_legacy_link(
-        &mut self,
-        meta: &rars_rs::ExtractedEntryMeta,
-    ) -> rars_rs::Result<Box<dyn Write>> {
-        self.outputs.open_legacy_link(meta)
-    }
-
     fn link(
         &mut self,
         meta: &rars_rs::ExtractedEntryMeta,
@@ -4629,12 +4636,8 @@ impl<'a> ExtractOutputs<'a> {
         self.outputs.link(meta, link)
     }
 
-    fn publish_pending(&mut self) -> rars_rs::Result<()> {
-        self.outputs.publish_pending()
-    }
-
-    fn finish(self, result: rars_rs::Result<()>) -> rars_rs::Result<Extracted> {
-        self.outputs.finish(result)
+    fn can_settle(&self) -> bool {
+        self.outputs.can_settle()
     }
 }
 
@@ -4672,31 +4675,7 @@ fn extract_selected<S: Selection>(
     outputs: &std::cell::RefCell<ExtractOutputs<'_>>,
 ) -> rars_rs::Result<()> {
     let Some(selected) = selected else {
-        // Salvage keeps a failed member's output, which it can only do before
-        // the next member opens.
-        let can_settle = outputs.borrow().can_settle && !options.salvage;
-        if let (rars_rs::Archive::Rar50Plus(rar50), true) = (archive, can_settle) {
-            return rars_rs::output_links::extract_rar50_settled_with_links(
-                rar50,
-                options,
-                |meta| outputs.borrow_mut().open_settled(meta),
-                |meta, link| outputs.borrow_mut().link(meta, link),
-                |_, verified| outputs.borrow_mut().settle(verified),
-            );
-        }
-        // RAR 5 decodes members in parallel only where there are no links to create.
-        if archive.family() == rars_rs::ArchiveFamily::Rar50Plus
-            && !archive.member_refs().any(|member| member.is_redirection())
-        {
-            return archive.extract_to_parallel_buffered_with_options(options, |meta| {
-                outputs.borrow_mut().open(meta)
-            });
-        }
-        return archive.extract_with_links(
-            options,
-            |meta| outputs.borrow_mut().open(meta),
-            |meta, link| outputs.borrow_mut().link(meta, link),
-        );
+        return rars_rs::output_dir::extract_archive(archive, options, outputs);
     };
     let last = archive
         .member_refs()

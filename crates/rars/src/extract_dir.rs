@@ -163,19 +163,7 @@ impl Archive {
         options: &ExtractDirOptions<'_>,
     ) -> Result<ExtractedDir> {
         extract_into(dir.as_ref(), self.family(), options, |read, outputs| {
-            // RAR 5 decodes members in parallel only where there are no links to create.
-            if self.family() == ArchiveFamily::Rar50Plus
-                && !self.member_refs().any(|member| member.is_redirection())
-            {
-                return self.extract_to_parallel_buffered_with_options(read, |meta| {
-                    outputs.borrow_mut().open(meta)
-                });
-            }
-            self.extract_with_links(
-                read,
-                |meta| outputs.borrow_mut().open(meta),
-                |meta, link| outputs.borrow_mut().link(meta, link),
-            )
+            crate::output_dir::extract_archive(self, read, outputs)
         })
     }
 }

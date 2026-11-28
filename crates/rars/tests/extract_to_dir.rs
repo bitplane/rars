@@ -612,6 +612,46 @@ fn a_member_the_handler_goes_past_leaves_no_file() {
 }
 
 #[test]
+fn a_member_that_fails_verification_leaves_nothing_at_any_thread_count() {
+    let root = scratch::case("extract-to-dir-unverified");
+    for threads in [1, 2, 8] {
+        let out = root.join(threads.to_string());
+        let options = ExtractDirOptions::new()
+            .with_read_options(ArchiveReadOptions::new().with_threads(threads));
+
+        let error = read(with_a_corrupt_member())
+            .extract_to_dir(&out, &options)
+            .unwrap_err();
+
+        assert_eq!(
+            error.kind(),
+            ErrorKind::ChecksumMismatch,
+            "threads={threads}"
+        );
+        assert_eq!(tree(&out), paths(&["first.txt"]), "threads={threads}");
+
+        let seen = Mutex::new(Vec::new());
+        let handler = recorded(&seen);
+        let out = root.join(format!("{threads}-handled"));
+        let options = ExtractDirOptions::new().with_read_options(
+            ArchiveReadOptions::new()
+                .with_threads(threads)
+                .with_member_error_handler(&handler),
+        );
+
+        read(with_a_corrupt_member())
+            .extract_to_dir(&out, &options)
+            .unwrap();
+
+        assert_eq!(
+            tree(&out),
+            paths(&["first.txt", "last.txt"]),
+            "threads={threads}"
+        );
+    }
+}
+
+#[test]
 fn salvage_keeps_what_a_failed_member_delivered() {
     let root = scratch::case("extract-to-dir-salvage");
     let seen = Mutex::new(Vec::new());

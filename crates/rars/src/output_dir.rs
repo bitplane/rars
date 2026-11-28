@@ -1321,6 +1321,77 @@ fn like_create_dir_all(error: crate::Error, directory: &Path) -> crate::Error {
     error
 }
 
+/// Where [`extract_archive`] writes: [`DirOutputs`], or a wrapper around it.
+pub trait Outputs {
+    fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>>;
+    fn open_settled(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write + Send>>;
+    fn settle(&mut self, verified: bool) -> crate::Result<()>;
+    fn link(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+        link: ExtractedLink<'_>,
+    ) -> crate::Result<()>;
+    /// Whether [`Self::open_settled`] can be used: not in place or flattened.
+    fn can_settle(&self) -> bool;
+}
+
+impl Outputs for DirOutputs<'_> {
+    fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>> {
+        DirOutputs::open(self, meta)
+    }
+
+    fn open_settled(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+    ) -> crate::Result<Box<dyn Write + Send>> {
+        DirOutputs::open_settled(self, meta)
+    }
+
+    fn settle(&mut self, verified: bool) -> crate::Result<()> {
+        DirOutputs::settle(self, verified)
+    }
+
+    fn link(
+        &mut self,
+        meta: &crate::ExtractedEntryMeta,
+        link: ExtractedLink<'_>,
+    ) -> crate::Result<()> {
+        DirOutputs::link(self, meta, link)
+    }
+
+    fn can_settle(&self) -> bool {
+        !self.in_place && !self.flatten
+    }
+}
+
+/// The one choice of decode path for directory extraction, so the library and Python agree.
+pub fn extract_archive(
+    archive: &crate::Archive,
+    read: crate::ArchiveReadOptions<'_>,
+    outputs: &std::cell::RefCell<impl Outputs>,
+) -> crate::Result<()> {
+    // Salvage keeps a failed member's output, which it can only do before
+    // the next member opens.
+    let settle = outputs.borrow().can_settle() && !read.salvage;
+    if let (crate::Archive::Rar50Plus(rar50), true) = (archive, settle) {
+        return crate::output_links::extract_rar50_settled_with_links(
+            rar50,
+            read,
+            |meta| outputs.borrow_mut().open_settled(meta),
+            |meta, link| outputs.borrow_mut().link(meta, link),
+            |_, verified| outputs.borrow_mut().settle(verified),
+        );
+    }
+    archive.extract_with_links(
+        read,
+        |meta| outputs.borrow_mut().open(meta),
+        |meta, link| outputs.borrow_mut().link(meta, link),
+    )
+}
+
 #[cfg(test)]
 #[path = "output_dir_tests.rs"]
 mod tests;
