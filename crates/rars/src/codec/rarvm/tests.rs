@@ -52,16 +52,14 @@ fn reader_vm_workspace_refusals_release_program_operands_memory_and_results() {
 }
 
 #[test]
-fn reader_vm_workspace_results_remain_charged_after_worker_retirement() {
+fn reader_vm_workspace_results_remain_charged_after_the_vm_is_dropped() {
     let ledger = Allowance::limited(1024 * 1024);
-    let reservation = ledger.reserve(1024 * 1024).unwrap();
-    let budget = reservation.allowance();
+    let budget = ledger.clone();
     let program = OwnedProgram::parse(&reader_vm_blob(), &budget).unwrap();
     let mut vm = Vm::with_allowance(&program, reader_vm_invocation(), &budget).unwrap();
     let result = vm
         .run(&program, &crate::read_control::ReadControl::default())
         .unwrap();
-    reservation.retire();
     assert!(ledger.used() >= MEMORY_SIZE as u64);
     drop(vm);
     drop(program);

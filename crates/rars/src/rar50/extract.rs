@@ -1593,7 +1593,7 @@ impl Archive {
         )
     }
 
-    /// Runs `members` as [`member_batches::Workers::batches`] does for an
+    /// Runs `members` as [`Limited::batches`](crate::codec::workspace::Limited::batches) does for an
     /// unlimited workspace, except that each member's output is opened on this
     /// thread as the member is admitted, in archive order, and written and
     /// closed on its worker; publishing it only settles it. A redirection
@@ -1614,13 +1614,9 @@ impl Archive {
     ) -> Result<usize> {
         options.check_cancelled()?;
         let window = crate::parallel::default_window().max(1);
-        let running_limit = member_batches::running_workspace();
-        // The buffered output and the workspace of the members running.
         // Nothing is held once a member is written.
-        let held = std::cell::Cell::new((0u128, 0u128));
-        let fits = |held: u128, more: u64, limit: u64| {
-            held == 0 || held + u128::from(more) <= u128::from(limit)
-        };
+        let room =
+            member_batches::Room::new(buffered_decode_limit, member_batches::running_workspace());
         // Once a member fails before it is decoded, as when its output cannot
         // be opened, nothing after it is opened until it has settled.
         let failed = std::cell::Cell::new(false);
@@ -1628,25 +1624,16 @@ impl Archive {
             members,
             window,
             |(file, cost), idle| {
-                let workspace = hint(file);
-                let (bytes, running) = held.get();
-                let admitted = idle
-                    || (!failed.get()
-                        && file.redirection.is_none()
-                        && fits(bytes, cost, buffered_decode_limit)
-                        && fits(running, workspace, running_limit));
+                let admitted = (idle || (!failed.get() && file.redirection.is_none()))
+                    && room.admit(cost, hint(file), idle);
                 if !admitted {
                     return None;
                 }
-                held.set((bytes + u128::from(cost), running + u128::from(workspace)));
                 let ticket = Ticket::admit(file, options, settling, redirect.as_deref_mut());
                 failed.set(ticket.failed());
                 Some(ticket)
             },
-            |(file, cost)| {
-                let (bytes, running) = held.get();
-                held.set((bytes - u128::from(cost), running - u128::from(hint(file))));
-            },
+            |(file, cost)| room.finished(cost, hint(file), false),
             |_| {},
             |(file, _), ticket| {
                 let written = match ticket {

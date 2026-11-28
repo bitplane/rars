@@ -110,6 +110,7 @@ mod threaded {
 
     /// Process preallocated slots without allocating a separate result vector.
     /// Returns only after every admitted callback has finished.
+    #[cfg(any(test, feature = "write", feature = "encryption", feature = "recovery"))]
     pub(crate) fn for_each_mut<T, F>(items: &mut [T], apply: F)
     where
         T: Send,
@@ -478,6 +479,7 @@ mod threaded {
 mod sequential {
     /// Process preallocated slots without allocating a separate result vector.
     /// Returns only after every admitted callback has finished.
+    #[cfg(any(test, feature = "write", feature = "encryption", feature = "recovery"))]
     pub(crate) fn for_each_mut<T, F>(items: &mut [T], apply: F)
     where
         T: Send,
