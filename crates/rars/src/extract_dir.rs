@@ -1,7 +1,7 @@
 //! Extracting an archive or a volume set into a directory.
 
+use crate::extract_engine::{DirExtraction, DirMode, Outputs};
 use crate::extraction_control::ExtractionErrorAction;
-use crate::output_dir::{DirMode, DirOutputs};
 use crate::output_links::{extract_settled, SettledSource};
 use crate::output_staging::OverwritePolicy;
 use crate::{Archive, ArchiveFamily, ArchiveMember, ArchiveReadOptions, Error, ErrorKind, Result};
@@ -163,7 +163,7 @@ impl Archive {
         options: &ExtractDirOptions<'_>,
     ) -> Result<ExtractedDir> {
         extract_into(dir.as_ref(), self.family(), options, |read, outputs| {
-            crate::output_dir::extract_archive(self, read, None, outputs)
+            crate::extract_engine::extract_archive(self, read, None, outputs)
         })
     }
 }
@@ -207,7 +207,7 @@ fn extract_into(
     dir: &Path,
     family: ArchiveFamily,
     options: &ExtractDirOptions<'_>,
-    extract: impl FnOnce(ArchiveReadOptions<'_>, &Mutex<DirOutputs<'_>>) -> Result<()>,
+    extract: impl FnOnce(ArchiveReadOptions<'_>, &Mutex<DirExtraction<'_>>) -> Result<()>,
 ) -> Result<ExtractedDir> {
     options.read.check_cancelled()?;
     let caller = options.read.member_errors;
@@ -233,7 +233,7 @@ fn extract_into(
         flatten: false,
         exists_hint: "; set ExtractDirOptions::overwrite to replace it or keep both",
     };
-    let outputs = Mutex::new(DirOutputs::new(
+    let outputs = Mutex::new(DirExtraction::new(
         dir,
         family,
         read.legacy_name_encoding,

@@ -454,14 +454,31 @@ fn extract_selected<S: FnMut(&crate::ExtractedEntryMeta, Settled) -> Result<()>>
             check_legacy_symlink_target(&meta.name, meta.unpacked_size, None)?;
             let target = std::sync::Arc::default();
             lock(state).legacy_link = Some((member_meta(member), std::sync::Arc::clone(&target)));
-            return Ok(crate::ExtractionDecision::Extract(Box::new(
-                crate::output_dir::SharedBuffer(target),
-            )));
+            return Ok(crate::ExtractionDecision::Extract(Box::new(LinkTarget(
+                target,
+            ))));
         }
         open(&member_meta(member)).map(crate::ExtractionDecision::Extract)
     });
     result?;
     link_verified(link)
+}
+
+/// Collects a legacy symlink member's data, which is its target.
+struct LinkTarget(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LinkTarget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("link target lock poisoned")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 fn member_meta(member: &crate::ArchiveMember) -> crate::ExtractedEntryMeta {

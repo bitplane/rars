@@ -7,15 +7,14 @@ use crate::publish_queue::{PublishQueue, PublishStep};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, MutexGuard};
 
 /// A file staged under a name of its own in a directory held open.
 pub(crate) struct Staged {
     pub(crate) dir: crate::output_tree::FileDir,
     pub(crate) name: std::ffi::OsString,
-    /// Whether it took its early metadata as it closed: see [`output::StagedFile`].
-    pub(crate) early_set: Arc<AtomicBool>,
+    pub(crate) closed: Arc<output::Closed>,
 }
 
 /// What a member opened by descriptor leaves to do once it verifies.
@@ -83,6 +82,7 @@ pub(crate) struct PublishState {
     directory_times: Vec<(PathBuf, std::time::SystemTime)>,
     /// Told about each output once it is verified and in place.
     on_published: Option<Box<PublishReport>>,
+    pub(crate) unsafe_paths: output::UnsafePaths,
 }
 
 impl PublishState {
@@ -103,6 +103,7 @@ impl PublishState {
             in_place_modes: HashMap::new(),
             directory_times: Vec::new(),
             on_published: None,
+            unsafe_paths: output::UnsafePaths::AsBadHeader,
         }
     }
 
@@ -313,7 +314,8 @@ impl PublishState {
             .strip_prefix(&self.out_dir)
             .map_err(|_| crate::Error::InvalidHeader("unsafe archive path"))?;
         let name = &output.meta.name;
-        let refuse = |error| output::refused_path(error, name);
+        let unsafe_paths = self.unsafe_paths;
+        let refuse = |error| unsafe_paths.refused(error, name);
         let directory = output.meta.is_directory;
         // Under `Never` an existing file already stops the rename, so only
         // `Always` needs to know which files this run wrote.
@@ -354,8 +356,13 @@ impl PublishState {
         let Some(Pending::Staged(staged)) = &next.pending else {
             return Ok(false);
         };
+        if !staged.closed.created.load(Ordering::Acquire) {
+            return Err(crate::output_tree::never_created().into());
+        }
         let early = output::early_file_metadata(output);
-        if let (Some((modified, mode)), false) = (early, staged.early_set.load(Ordering::Acquire)) {
+        if let (Some((modified, mode)), false) =
+            (early, staged.closed.early_set.load(Ordering::Acquire))
+        {
             staged.dir.set_metadata(&staged.name, modified, mode)?;
         }
         let published = staged
@@ -405,7 +412,9 @@ impl PublishState {
             .path
             .strip_prefix(&self.out_dir)
             .map_err(|_| crate::Error::InvalidHeader("unsafe archive path"))?;
-        let destination = output::checked_output_path(&self.out_dir, relative)
+        let destination = self
+            .unsafe_paths
+            .checked_output_path(&self.out_dir, relative)
             .map_err(|error| refused_output(error, name))?;
         // The alias check resolves the destination already when it exists.
         let existing = match &self.staging {
@@ -425,7 +434,8 @@ impl PublishState {
             fs::create_dir_all(&destination)?;
         } else {
             fs::create_dir_all(destination.parent().expect("validated path has parent"))?;
-            output::checked_output_path(&self.out_dir, relative)
+            self.unsafe_paths
+                .checked_output_path(&self.out_dir, relative)
                 .map_err(|error| refused_output(error, name))?;
             if self.overwrite == OverwritePolicy::Always && next.redirection {
                 match fs::symlink_metadata(&destination) {
@@ -545,6 +555,10 @@ impl Publisher {
         }
     }
 
+    pub(crate) fn waiter(&self) -> impl Fn() + Send + Sync + 'static {
+        self.queue.waiter()
+    }
+
     /// Waits for every output queued so far; only a member the run went on to calls it.
     pub(crate) fn wait(&mut self) {
         self.go_on();
@@ -611,6 +625,15 @@ impl Publisher {
             crate::output_times::set_modified_time(path, *modified)?;
         }
         Ok(std::mem::take(&mut state.outputs))
+    }
+
+    /// What was published before a failure; what is held behind it stays unpublished.
+    pub(crate) fn abandon(self) -> Vec<ExtractedOutput> {
+        let (mut state, _) = self.queue.finish();
+        for (path, modified) in &state.directory_times {
+            let _ = crate::output_times::set_modified_time(path, *modified);
+        }
+        std::mem::take(&mut state.outputs)
     }
 }
 

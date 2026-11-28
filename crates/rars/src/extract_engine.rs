@@ -1,12 +1,14 @@
+mod dir;
 mod publisher;
 mod staged;
 
 use crate::output_links::{create_link_output, link_source_path};
 use crate::output_staging::{refused_output, ExtractionStaging, FileIdentity, OverwritePolicy};
 use crate::output_tree::{OutputTree, TreeEntry};
+pub use dir::{extract_archive, DirExtraction, DirMode, Outputs};
 pub use publisher::PublishReport;
 use publisher::{InPlace, Pending, Publisher, Staged, Unpublished};
-use staged::open_output_writer;
+use staged::{open_output_writer, UnsafePaths};
 pub use staged::{restore_output_metadata, ExtractedOutput};
 use std::collections::{HashSet, VecDeque};
 use std::fs;
@@ -21,7 +23,12 @@ pub enum Warning<'w> {
     /// A member with no name settled; it was decoded, never written.
     Unnamed,
     /// A link whose target leaves the output directory was left out.
-    SkippedLink { name: &'w [u8], target: &'w [u8] },
+    /// `name` is decoded as the member's output is named; `stored` is as the header has it.
+    SkippedLink {
+        name: &'w [u8],
+        stored: &'w [u8],
+        target: &'w [u8],
+    },
 }
 
 pub type Warn<'a> = dyn FnMut(Warning<'_>) + Send + 'a;
@@ -74,6 +81,7 @@ pub struct ExtractEngine<'a> {
     /// Which permission bits files created in [`STAGED_FILES`] keep.
     created_modes: crate::output_modes::CreatedModes,
     restore_modes: bool,
+    restore_times: bool,
     /// So a hard link or copy naming a symlink left out fails as its own member.
     skipped_symlinks: Option<HashSet<PathBuf>>,
     staged_directories: HashSet<FileIdentity>,
@@ -93,6 +101,9 @@ pub struct ExtractEngine<'a> {
     exists_hint: Option<&'static str>,
     /// A directory member with no time keeps the one already there.
     keep_directory_time: bool,
+    refuse_decoded_repeats: bool,
+    unsafe_paths: UnsafePaths,
+    look_in_made_directories: bool,
     /// Outputs before this index have verified: see [`Self::settle`].
     settled: usize,
     /// Staged files are created as they are written, since the library may write them on other threads.
@@ -138,6 +149,7 @@ impl<'a> ExtractEngine<'a> {
             staged_count: 0,
             created_modes: Default::default(),
             restore_modes: true,
+            restore_times: true,
             skipped_symlinks: None,
             staged_directories: HashSet::new(),
             skipped_links: 0,
@@ -149,6 +161,9 @@ impl<'a> ExtractEngine<'a> {
             warn: None,
             exists_hint: None,
             keep_directory_time: true,
+            refuse_decoded_repeats: false,
+            unsafe_paths: UnsafePaths::AsBadHeader,
+            look_in_made_directories: false,
             settled: 0,
             written_elsewhere: false,
             unsettled: VecDeque::new(),
@@ -169,6 +184,12 @@ impl<'a> ExtractEngine<'a> {
 
     pub fn ignore_modes(&mut self) {
         self.restore_modes = false;
+    }
+
+    /// Leaves every time as extraction leaves it, a directory's included.
+    pub fn ignore_times(&mut self) {
+        self.restore_times = false;
+        self.keep_directory_time = false;
     }
 
     pub fn skip_symlinks(&mut self) {
@@ -214,6 +235,27 @@ impl<'a> ExtractEngine<'a> {
 
     pub fn legacy_name_encoding(&mut self, encoding: Option<crate::filename::LegacyNameEncoding>) {
         self.legacy_name_encoding = encoding;
+    }
+
+    /// Two names one encoding decodes alike are the encoding's fault, not a repeat to overwrite.
+    pub fn refuse_decoded_repeats(&mut self) {
+        self.refuse_decoded_repeats = true;
+    }
+
+    /// For the library's documented refusals: a backslash climbs out in any family, as [`crate::Error::UnsafePath`].
+    pub fn strict_names(&mut self) {
+        self.unsafe_paths = UnsafePaths::AsUnsafe;
+        self.publisher.state().unsafe_paths = UnsafePaths::AsUnsafe;
+    }
+
+    /// So an entry planted in a directory this run made is refused for what it is, not as a repeat.
+    pub fn look_in_made_directories(&mut self) {
+        self.look_in_made_directories = true;
+    }
+
+    /// For code the run calls out to, which can look at the output directory: waits for what is queued.
+    pub fn publish_waiter(&self) -> impl Fn() + Send + Sync + 'static {
+        self.publisher.waiter()
     }
 
     /// Writers are dropped on other threads (RAR 5's write lane): create staged files there.
@@ -336,7 +378,13 @@ impl<'a> ExtractEngine<'a> {
     // Decode names once at the filesystem boundary, retaining the archive's
     // raw identity for errors and publication. RAR5 Unix hosts map to AttrSource::Unix.
     fn entry_path(&self, meta: &crate::ExtractedEntryMeta) -> crate::Result<(Vec<u8>, PathBuf)> {
-        let unsafe_path = |_| crate::Error::InvalidHeader("unsafe archive path");
+        let unsafe_path = |error| match self.unsafe_paths {
+            UnsafePaths::AsBadHeader => crate::Error::InvalidHeader("unsafe archive path"),
+            UnsafePaths::AsUnsafe => refused_output(error, &meta.name),
+        };
+        if self.unsafe_paths == UnsafePaths::AsUnsafe {
+            crate::filename::validate_relative(&meta.name).map_err(unsafe_path)?;
+        }
         if self.family == crate::ArchiveFamily::Rar50Plus {
             let unix_host = meta.attr_source == crate::AttrSource::Unix;
             let path = rar50_relative_path(&meta.name, unix_host).map_err(unsafe_path)?;
@@ -373,7 +421,7 @@ impl<'a> ExtractEngine<'a> {
         self.wait_for_queued(&relative, meta.is_directory)?;
         let (destination, existing) = self
             .checked_destination(&relative)
-            .map_err(|error| staged::refused_path(error, &meta.name))?;
+            .map_err(|error| self.unsafe_paths.refused(error, &meta.name))?;
         if self.passed_over(meta, &destination, existing.as_ref()) {
             return Ok(Box::new(std::io::sink()));
         }
@@ -407,21 +455,18 @@ impl<'a> ExtractEngine<'a> {
                     (Box::new(std::io::sink()), None)
                 } else {
                     let dir = dir.clone();
-                    let (mut file, early_set) = staged::StagedFile::deferred(
+                    let (mut file, closed) = staged::StagedFile::deferred(
                         dir.clone(),
                         name.clone(),
                         meta,
+                        self.restore_times,
                         self.restore_modes,
                         self.created_modes.clone(),
                     );
                     if !self.written_elsewhere {
                         file.create()?;
                     }
-                    let staged = Staged {
-                        dir,
-                        name,
-                        early_set,
-                    };
+                    let staged = Staged { dir, name, closed };
                     (Box::new(file), Some(staged))
                 };
                 (None, path, staged.map(Pending::Staged), writer)
@@ -440,6 +485,7 @@ impl<'a> ExtractEngine<'a> {
                     meta.is_directory,
                     policy,
                     self.publisher.state().renames(),
+                    self.unsafe_paths,
                 )?;
                 self.record_staged_path(&path, meta.is_directory)?;
                 (Some(path.clone()), path, None, writer)
@@ -459,6 +505,7 @@ impl<'a> ExtractEngine<'a> {
                 meta: meta.clone(),
                 restore_metadata: true,
                 restore_mode: self.restore_modes,
+                restore_time: self.restore_times,
             },
             staged,
             pending,
@@ -496,7 +543,9 @@ impl<'a> ExtractEngine<'a> {
             return Ok(());
         }
         let relative = self.output_relative(&stored);
-        let destination = staged::checked_output_path(self.out_dir, &relative)
+        let destination = self
+            .unsafe_paths
+            .checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
         if self.passed_over(meta, &destination, None) {
             return Ok(());
@@ -512,6 +561,7 @@ impl<'a> ExtractEngine<'a> {
         else {
             self.warn(Warning::SkippedLink {
                 name: &name,
+                stored: &meta.name,
                 target: link.target(),
             });
             self.skipped_links += 1;
@@ -579,7 +629,9 @@ impl<'a> ExtractEngine<'a> {
                 },
                 meta: meta.clone(),
                 restore_metadata,
-                restore_mode: self.restore_modes,
+                // Set by path, it would be the target's.
+                restore_mode: self.restore_modes && made != crate::output_links::MadeLink::HardLink,
+                restore_time: self.restore_times,
             },
             staged: path,
             pending: None,
@@ -659,7 +711,7 @@ impl<'a> ExtractEngine<'a> {
             ));
         };
         // Skipping existing files needs to see this run's own directories.
-        let entry = if self.skip_existing {
+        let entry = if self.skip_existing || self.look_in_made_directories {
             tree.lstat(relative)?
         } else {
             tree.lstat_unless_created(relative)?
@@ -699,10 +751,19 @@ impl<'a> ExtractEngine<'a> {
     }
 
     fn reserve_output_path(&mut self, path: PathBuf) -> crate::Result<()> {
-        if !self.planned_paths.insert(path)
-            && !((self.flatten || self.overwrite_repeats)
-                && self.overwrite != OverwritePolicy::Never)
+        if self.planned_paths.insert(path) {
+            return Ok(());
+        }
+        if self.refuse_decoded_repeats
+            && self.legacy_name_encoding.is_some()
+            && !self.flatten
+            && self.overwrite != OverwritePolicy::Rename
         {
+            return Err(crate::Error::InvalidArgument(
+                "multiple entries map to the same decoded output path",
+            ));
+        }
+        if !((self.flatten || self.overwrite_repeats) && self.overwrite != OverwritePolicy::Never) {
             return Err(crate::Error::InvalidHeader(
                 "multiple archive entries map to the same output path",
             ));
@@ -827,7 +888,8 @@ impl<'a> ExtractEngine<'a> {
     ) -> crate::Result<(PathBuf, Pending, Box<dyn Write + Send>)> {
         let mut publisher = self.publisher.state();
         let tree = publisher.opened_tree().expect("opened by in_place_tree");
-        let refuse = |error| staged::refused_path(error, &meta.name);
+        let unsafe_paths = self.unsafe_paths;
+        let refuse = |error| unsafe_paths.refused(error, &meta.name);
         if meta.is_directory {
             let identity = tree.create_dirs(relative).map_err(refuse)?;
             return Ok((
@@ -839,7 +901,7 @@ impl<'a> ExtractEngine<'a> {
         let (dir, dir_identity) = tree.parent_dir(relative).map_err(refuse)?;
         // Nothing was in a directory this run made before it began: a name
         // taken there was taken by this run, or by something racing it.
-        let fresh = tree.created(&dir_identity);
+        let fresh = tree.created(&dir_identity) && !self.look_in_made_directories;
         // Later checks take the state again.
         drop(publisher);
         let name = relative.file_name().expect("output path has a name");
@@ -976,6 +1038,12 @@ impl<'a> ExtractEngine<'a> {
     pub fn queued_failure(&mut self) -> crate::Result<()> {
         self.publisher.wait_to_failure();
         self.publisher.publish_failure()
+    }
+
+    /// After a failed run, what verified is published and what was published is returned.
+    pub fn abandon(mut self) -> Vec<ExtractedOutput> {
+        let _ = self.publish_verified_and_wait();
+        self.publisher.abandon()
     }
 
     /// Publish the final member once the whole extraction call has succeeded.

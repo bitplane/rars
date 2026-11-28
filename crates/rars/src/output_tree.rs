@@ -89,10 +89,6 @@ impl DeferredFile {
         }
     }
 
-    pub fn from_file(file: std::fs::File) -> Self {
-        Self { file: Ok(file) }
-    }
-
     /// The file, created now if it isn't yet.
     pub fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
         if let Err(pending) = &mut self.file {
