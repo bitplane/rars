@@ -37,16 +37,16 @@ use password::{
 use progress::CliProgress;
 use publisher::{InPlace, Pending, PublishReport, Publisher, Staged, Unpublished};
 use rars::filename::LegacyNameEncoding;
+use rars::output_links::{Settled, SettledSource};
 use rars::output_staging::{failed_entry_name, refused_output, FileIdentity};
 use rars::output_tree::{OutputTree, TreeEntry};
 use rars::rar13::{self, WriterOptions as Rar13WriterOptions};
 use rars::rar15_40::WriterOptions as Rar15WriterOptions;
 use rars::{
-    extract_volumes_with_links, test_volumes_with_options_and_callback, Archive as DetectedArchive,
-    ArchiveReadOptions, ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
+    test_volumes_with_options_and_callback, Archive as DetectedArchive, ArchiveReadOptions,
+    ArchiveReader, ArchiveVersion, FeatureSet, MemberCoding,
 };
 use repair::cmd_repair;
-use std::cell::RefCell;
 use std::collections::{HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
@@ -716,8 +716,6 @@ struct DamagedMembers<'p> {
     locked: AtomicUsize,
     /// Members `test` found with no name, which `x` cannot write.
     unnamed: AtomicUsize,
-    /// Names of members gone past whose output `x` has yet to drop.
-    failed: Mutex<Vec<Vec<u8>>>,
     /// The member `test` last started, not yet known to pass.
     testing: Mutex<Option<rars::ExtractedEntryMeta>>,
     /// One of our own callbacks failed, and its error ends the run.
@@ -734,7 +732,6 @@ impl<'p> DamagedMembers<'p> {
             count: AtomicUsize::new(0),
             locked: AtomicUsize::new(0),
             unnamed: AtomicUsize::new(0),
-            failed: Mutex::new(Vec::new()),
             testing: Mutex::new(None),
             callback_failed: AtomicBool::new(false),
         }
@@ -791,7 +788,6 @@ impl<'p> DamagedMembers<'p> {
             &self.count
         };
         count.fetch_add(1, Ordering::Relaxed);
-        lock(&self.failed).push(member.meta.name.clone());
         Ok(rars::ExtractionErrorAction::Continue)
     }
 
@@ -814,10 +810,6 @@ impl<'p> DamagedMembers<'p> {
                 print_ok_entry(&entry);
             }
         }
-    }
-
-    fn take_failed(&self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut *lock(&self.failed))
     }
 
     /// Notes that one of our callbacks failed, so its error is not gone past.
@@ -855,7 +847,7 @@ impl KeptBroken {
     ) -> rars::Result<Box<dyn Write + Send>> {
         *lock(&self.open) = None;
         let outputs = state.opened();
-        let writer = state.open_entry(meta)?;
+        let writer = state.open_settled(meta)?;
         if state.opened() > outputs {
             *lock(&self.open) = Some(meta.name.clone());
         }
@@ -1113,7 +1105,7 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
     if args.skip_symlinks {
         state.skip_symlinks();
     }
-    let state = RefCell::new(state);
+    let state = Mutex::new(state);
     let kept = KeptBroken::default();
     let mut options = args
         .read_options
@@ -1133,18 +1125,13 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
         let handler =
             |member: &rars::ArchiveMember, error: &rars::Error| damaged.handle(member, error);
         let options = options.with_member_error_handler(&handler);
-        let result = if archives.len() == 1 {
-            extract_single_archive(&archives[0], options, &state, &damaged)
-        } else {
-            extract_volume_archives(archives, options, &state, &damaged)
-        }
-        .and_then(|()| state.borrow_mut().queued_failure());
-        state.borrow_mut().discard_failed(&damaged.take_failed());
+        let result = extract_archives(archives, options, &state, &damaged)
+            .and_then(|()| lock(&state).queued_failure());
         passed_over += damaged.passed_over();
         result
-            .inspect_err(|err| {
+            .inspect_err(|_| {
                 // Keep verified predecessors; retain the extraction error if publication fails.
-                if let Err(failure) = state.borrow_mut().publish_before_failure(err) {
+                if let Err(failure) = lock(&state).publish_verified_and_wait() {
                     eprintln!("warning: {failure}");
                 }
             })
@@ -1166,7 +1153,9 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
                 })
             })?;
     }
-    let state = state.into_inner();
+    let state = state
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let skipped_links = state.skipped_links;
     let skipped_unnamed = state.skipped_unnamed;
     // Publishing the last members writes them where they belong, and can
@@ -1224,7 +1213,7 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
     truncated_result(&truncated)
 }
 
-type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + 'a;
+type Selection<'a> = dyn Fn(&rars::ExtractedEntryMeta) -> bool + Send + 'a;
 
 /// Where files stage in a staging storage walked by descriptor.
 const STAGED_FILES: &str = "files";
@@ -1270,12 +1259,11 @@ struct ExtractOutputState<'a> {
     kept_existing: usize,
     /// Members outside this set are decoded but not written.
     selected: Option<Box<Selection<'a>>>,
-    /// The library says when each member it opened has verified, rather than
-    /// opening the next one only once it has: see [`Self::settle`].
-    settling: bool,
-    /// While `settling`, outputs before this index have verified.
+    /// Outputs before this index have verified: see [`Self::settle`].
     settled: usize,
-    /// While `settling`, what each member opened and not yet settled left.
+    /// Staged files are created as they are written, since the library may write them on other threads.
+    written_elsewhere: bool,
+    /// What each member opened and not yet settled left.
     unsettled: VecDeque<Opened>,
 }
 
@@ -1323,8 +1311,8 @@ impl<'a> ExtractOutputState<'a> {
             overwrite_repeats: false,
             kept_existing: 0,
             selected: None,
-            settling: false,
             settled: 0,
+            written_elsewhere: false,
             unsettled: VecDeque::new(),
         };
         state
@@ -1370,17 +1358,6 @@ impl<'a> ExtractOutputState<'a> {
             .map(|unpublished| &unpublished.output)
     }
 
-    /// Whether the next run's members settle explicitly. Outputs left from an
-    /// earlier run have verified.
-    fn settle_explicitly(&mut self, settling: bool) {
-        self.settling = settling;
-        // Settling, a collision with a member still queued is caught as it is published.
-        self.publisher.track_paths(!settling);
-        self.settled = self.unpublished.len();
-        self.unsettled.clear();
-    }
-
-    /// Opens a member's output, when its members settle explicitly.
     fn open_settled(
         &mut self,
         meta: &rars::ExtractedEntryMeta,
@@ -1395,6 +1372,18 @@ impl<'a> ExtractOutputState<'a> {
             Err(_) => Opened::Refused,
         });
         opened
+    }
+
+    /// A member's open failed before it reached [`Self::open_settled`]; it still settles.
+    fn refuse(&mut self, error: rars::Error) -> rars::Error {
+        self.unsettled.push_back(Opened::Refused);
+        error
+    }
+
+    /// Opens nothing for a member the caller leaves out; it still settles.
+    fn pass_over(&mut self) -> Box<dyn Write + Send> {
+        self.unsettled.push_back(Opened::Nothing { unnamed: false });
+        Box::new(std::io::sink())
     }
 
     /// The library is done with the oldest member opened and not settled.
@@ -1425,15 +1414,6 @@ impl<'a> ExtractOutputState<'a> {
             self.publish_verified()?;
         }
         Ok(false)
-    }
-
-    /// Outputs from `published` up to this one are verified.
-    fn verified_end(&self) -> usize {
-        if self.settling {
-            self.settled
-        } else {
-            self.unpublished.len()
-        }
     }
 
     /// Drops an output that is not to be published, and what it staged.
@@ -1476,8 +1456,8 @@ impl<'a> ExtractOutputState<'a> {
         &mut self,
         meta: &rars::ExtractedEntryMeta,
     ) -> rars::Result<Box<dyn Write + Send>> {
-        // Settling, members opened before this one can still be unverified.
-        if self.verified_end() == self.unpublished.len() {
+        // Publishes links reported since the last settle, unless a member before this one is unsettled.
+        if self.settled == self.unpublished.len() {
             self.publish_verified()?;
         }
         self.publisher.publish_failure()?;
@@ -1526,25 +1506,16 @@ impl<'a> ExtractOutputState<'a> {
                     (Box::new(std::io::sink()), None)
                 } else {
                     let dir = dir.clone();
-                    let (file, early_set) = if self.settling {
-                        // Created where it is written: the library may
-                        // write it on another thread.
-                        output::StagedFile::deferred(
-                            dir.clone(),
-                            name.clone(),
-                            meta,
-                            self.restore_modes,
-                            self.created_modes.clone(),
-                        )
-                    } else {
-                        output::StagedFile::new(
-                            dir.clone(),
-                            name.clone(),
-                            meta,
-                            self.restore_modes,
-                            self.created_modes.clone(),
-                        )?
-                    };
+                    let (mut file, early_set) = output::StagedFile::deferred(
+                        dir.clone(),
+                        name.clone(),
+                        meta,
+                        self.restore_modes,
+                        self.created_modes.clone(),
+                    );
+                    if !self.written_elsewhere {
+                        file.create()?;
+                    }
                     let staged = Staged {
                         dir,
                         name,
@@ -1602,7 +1573,7 @@ impl<'a> ExtractOutputState<'a> {
         meta: &rars::ExtractedEntryMeta,
         link: rars::ExtractedLink<'_>,
     ) -> rars::Result<()> {
-        if self.settling && !self.unsettled.is_empty() {
+        if !self.unsettled.is_empty() {
             return Err(rars::Error::InvalidArgument(
                 "a link was reported before the members ahead of it settled",
             ));
@@ -1713,26 +1684,16 @@ impl<'a> ExtractOutputState<'a> {
             time_on_publish: false,
         });
         // The library reports a link once every member before it has settled.
-        if self.settling && self.unsettled.is_empty() {
-            self.settled = self.unpublished.len();
-        }
+        self.settled = self.unpublished.len();
         Ok(())
     }
 
     /// Whether a member has no name to write it under, as when its header's
     /// name field starts with a NUL. Like UnRAR, extraction leaves it out;
     /// its data is still decoded, so a solid stream stays in step.
-    fn unnamed(&mut self, meta: &rars::ExtractedEntryMeta) -> bool {
-        if !meta.name.is_empty() {
-            return false;
-        }
-        if self.settling {
-            // Warned about once it settles, in archive order.
-            return true;
-        }
-        eprintln!("warning: skipping a member with no name");
-        self.skipped_unnamed += 1;
-        true
+    fn unnamed(&self, meta: &rars::ExtractedEntryMeta) -> bool {
+        // Warned about once it settles, in archive order.
+        meta.name.is_empty()
     }
 
     /// Waits for the outputs queued ahead of a member when one could change
@@ -2073,59 +2034,15 @@ impl<'a> ExtractOutputState<'a> {
         Ok(())
     }
 
-    /// Move every verified staged output to its destination. Unless members
-    /// settle explicitly, the library extracts them one at a time and verifies
-    /// each before asking for the next output, so everything staged before a
-    /// new callback has passed its checksum. Publishing here keeps verified
-    /// members when a later one fails and holds few members in staging.
+    /// Move every settled staged output to its destination. Publishing as
+    /// they settle keeps verified members when a later one fails and holds
+    /// few members in staging.
     fn publish_verified(&mut self) -> rars::Result<()> {
-        let verified = self.verified_end();
-        for output in self.unpublished.drain(..verified) {
+        for output in self.unpublished.drain(..self.settled) {
             self.publisher.queue(output);
         }
-        if self.settling {
-            self.settled = 0;
-        }
+        self.settled = 0;
         self.publisher.publish_failure()
-    }
-
-    /// Drops the output of members the library failed on and went past. It
-    /// reports a failure before it opens the next output, so only the last
-    /// output staged can be such a member's. In place, what it wrote stays.
-    fn discard_failed(&mut self, failed: &[Vec<u8>]) {
-        if self.settling {
-            // Dropped as they settled.
-            return;
-        }
-        for name in failed {
-            if self.last_opened().map(|output| &output.meta.name) != Some(name) {
-                continue;
-            }
-            self.discard_output(self.unpublished.len() - 1);
-        }
-    }
-
-    /// Keep what verified before `error`. The library reports a failure before
-    /// asking for another output, so the last staged member is verified only
-    /// when the error names a different entry. Without a name it is discarded.
-    fn publish_before_failure(&mut self, error: &rars::Error) -> rars::Result<()> {
-        if self.settling {
-            while self.unpublished.len() > self.settled {
-                self.discard_output(self.unpublished.len() - 1);
-            }
-            return self.publish_verified_and_wait();
-        }
-        let last_verified = matches!(
-            (
-                failed_entry_name(error),
-                self.last_opened().map(|output| &output.meta.name)
-            ),
-            (Some(failed), Some(last)) if failed != last.as_slice()
-        );
-        if !last_verified {
-            self.unpublished.pop_back();
-        }
-        self.publish_verified_and_wait()
     }
 
     /// As [`Self::publish_verified`], once everything queued is in place:
@@ -2151,88 +2068,61 @@ impl<'a> ExtractOutputState<'a> {
     }
 }
 
-fn extract_single_archive(
-    archive: &DetectedArchive,
-    options: ArchiveReadOptions<'_>,
-    state: &RefCell<ExtractOutputState<'_>>,
-    damaged: &DamagedMembers<'_>,
-) -> rars::Result<()> {
-    state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
-    // In place, a member opened after a failure would already be at its
-    // destination. Flattened, a member can stage where an earlier one is
-    // still staged. Both keep opening each member once the last verified.
-    let one_at_a_time = state.borrow().in_place || state.borrow().flatten;
-    if let (DetectedArchive::Rar50Plus(archive), false) = (archive, one_at_a_time) {
-        // Members are written on workers, so each is verified only once the
-        // library settles it.
-        state.borrow_mut().settle_explicitly(true);
-        return rars::output_links::extract_rar50_settled_with_links(
-            archive,
-            options,
-            |meta| state.borrow_mut().open_settled(meta),
-            |meta, link| damaged.callback(state.borrow_mut().create_link(meta, link)),
-            |_, verified| {
-                // A failed open ends the run once the members before it settle.
-                if damaged.callback(state.borrow_mut().settle(verified))? {
-                    damaged.callback_failed.store(true, Ordering::Relaxed);
-                }
-                Ok(())
-            },
-        );
-    }
-    state.borrow_mut().settle_explicitly(false);
-    archive.extract_with_links(
-        options,
-        |meta| open_after_damage(state, damaged, meta),
-        |meta, link| link_after_damage(state, damaged, meta, link),
-    )
-}
-
-fn extract_volume_archives(
+fn extract_archives(
     archives: &[DetectedArchive],
     options: ArchiveReadOptions<'_>,
-    state: &RefCell<ExtractOutputState<'_>>,
+    state: &Mutex<ExtractOutputState<'_>>,
     damaged: &DamagedMembers<'_>,
 ) -> rars::Result<()> {
-    state.borrow_mut().legacy_name_encoding = options.legacy_name_encoding;
-    state.borrow_mut().settle_explicitly(false);
-    extract_volumes_with_links(
-        archives,
-        options,
-        |meta| open_after_damage(state, damaged, meta),
-        |meta, link| link_after_damage(state, damaged, meta, link),
-    )
-}
-
-/// Opens a member's output once any failed member before it is dropped.
-fn open_after_damage(
-    state: &RefCell<ExtractOutputState<'_>>,
-    damaged: &DamagedMembers<'_>,
-    meta: &rars::ExtractedEntryMeta,
-) -> rars::Result<Box<dyn Write>> {
-    let mut state = state.borrow_mut();
-    state.discard_failed(&damaged.take_failed());
-    let opened = match damaged.keep_broken {
-        Some(kept) => kept.open(&mut state, meta),
-        None => state.open_entry(meta),
+    let one_at_a_time = {
+        let mut state = lock(state);
+        state.legacy_name_encoding = options.legacy_name_encoding;
+        // In place, a member opened after a failure would already be at its
+        // destination. Flattened, a member can stage where an earlier one is
+        // still staged. Both keep opening each member once the last verified.
+        state.in_place || state.flatten
     };
-    damaged
-        .callback(opened)
-        .map(|writer| writer as Box<dyn Write>)
-}
-
-fn link_after_damage(
-    state: &RefCell<ExtractOutputState<'_>>,
-    damaged: &DamagedMembers<'_>,
-    meta: &rars::ExtractedEntryMeta,
-    link: rars::ExtractedLink<'_>,
-) -> rars::Result<()> {
-    let mut state = state.borrow_mut();
-    state.discard_failed(&damaged.take_failed());
-    if let Some(kept) = damaged.keep_broken {
-        kept.close();
+    let source = match archives {
+        [archive] => SettledSource::Archive(archive),
+        volumes => SettledSource::Volumes(volumes),
+    };
+    // Only RAR 5's write lane hands outputs to workers.
+    lock(state).written_elsewhere = !one_at_a_time
+        && matches!(
+            source,
+            SettledSource::Archive(DetectedArchive::Rar50Plus(_))
+        );
+    let open = |meta: &rars::ExtractedEntryMeta| {
+        let mut state = lock(state);
+        let opened = match damaged.keep_broken {
+            Some(kept) => kept.open(&mut state, meta),
+            None => state.open_settled(meta),
+        };
+        damaged.callback(opened)
+    };
+    let link = |meta: &rars::ExtractedEntryMeta, link: rars::ExtractedLink<'_>| {
+        if let Some(kept) = damaged.keep_broken {
+            kept.close();
+        }
+        damaged.callback(lock(state).create_link(meta, link))
+    };
+    let settled = |_: &rars::ExtractedEntryMeta, outcome: Settled| {
+        // `--keep-broken` is what turns salvage on, so a member kept broken is kept.
+        let verified = outcome != Settled::Failed;
+        // A failed open ends the run once the members before it settle.
+        if damaged.callback(lock(state).settle(verified))? {
+            damaged.callback_failed.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    };
+    match source {
+        SettledSource::Archive(archive) if one_at_a_time => {
+            rars::output_links::settle_in_order(options, open, link, settled, |read, open, link| {
+                archive.extract_with_links(read, open, link)
+            })
+        }
+        source => rars::output_links::extract_settled(source, options, None, open, link, settled),
     }
-    damaged.callback(state.create_link(meta, link))
 }
 
 fn validate_extract_destination(out_dir: &Path) -> CliResult<()> {
@@ -3595,21 +3485,21 @@ mod tests {
         let root = crate::scratch::case("collection-extract-redirections");
         let archive =
             rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
-        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+        let state = std::sync::Mutex::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
             false,
             false,
             rars::ArchiveFamily::Rar50Plus,
         ));
-        super::extract_volume_archives(
+        super::extract_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
             super::ArchiveReadOptions::new(),
             &state,
             &super::DamagedMembers::new(&root),
         )
         .unwrap();
-        state.into_inner().publish().unwrap();
+        state.into_inner().unwrap().publish().unwrap();
         assert_eq!(
             std::fs::read_link(root.join("symlink.txt")).unwrap(),
             std::path::PathBuf::from("file.txt")
@@ -3624,14 +3514,14 @@ mod tests {
         std::fs::write(root.join("symlink.txt"), b"existing destination").unwrap();
         let archive =
             rars::rar50::Archive::parse_path(fixtures.join("rar50/wild/symlink.rar")).unwrap();
-        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+        let state = std::sync::Mutex::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
             false,
             false,
             rars::ArchiveFamily::Rar50Plus,
         ));
-        assert!(super::extract_volume_archives(
+        assert!(super::extract_archives(
             &[super::DetectedArchive::Rar50Plus(archive)],
             super::ArchiveReadOptions::new(),
             &state,
@@ -3648,7 +3538,7 @@ mod tests {
             fixtures.join("rar15_40/encrypted/rar4_unicode_name_encrypted.rar"),
         )
         .unwrap();
-        let state = std::cell::RefCell::new(super::ExtractOutputState::new(
+        let state = std::sync::Mutex::new(super::ExtractOutputState::new(
             &root,
             super::OverwritePolicy::Never,
             false,
@@ -3657,14 +3547,14 @@ mod tests {
         ));
         let mut options = super::ArchiveReadOptions::with_optional_password(Some(b"test"));
         options.legacy_name_encoding = Some(rars::filename::LegacyNameEncoding::Cp850);
-        super::extract_volume_archives(
+        super::extract_archives(
             &[super::DetectedArchive::Rar15To40(archive)],
             options,
             &state,
             &super::DamagedMembers::new(&root),
         )
         .unwrap();
-        state.into_inner().publish().unwrap();
+        state.into_inner().unwrap().publish().unwrap();
         assert_eq!(
             std::fs::read(root.join("新建文本文档.txt")).unwrap(),
             b"aaaaaaaaaa"
@@ -4357,6 +4247,19 @@ mod tests {
         assert!(!outside.join("escape.txt").exists());
     }
 
+    fn write_settled(
+        state: &mut super::ExtractOutputState<'_>,
+        meta: &rars::ExtractedEntryMeta,
+        data: &[u8],
+    ) -> rars::Result<()> {
+        let written = state.open_settled(meta).and_then(|mut writer| {
+            writer.write_all(data)?;
+            Ok(())
+        });
+        state.settle(written.is_ok())?;
+        written
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_directory_swapped_for_a_symlink_mid_extraction_is_never_written_through() {
@@ -4382,18 +4285,18 @@ mod tests {
                 let meta = |name: &str| {
                     rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
                 };
-                for name in ["a/b/one", "a/b/two"] {
-                    let mut writer = state.open_entry(&meta(name)).unwrap();
-                    writer.write_all(name.as_bytes()).unwrap();
-                }
+                write_settled(&mut state, &meta("a/b/one"), b"a/b/one").unwrap();
+                let mut writer = state.open_settled(&meta("a/b/two")).unwrap();
+                writer.write_all(b"a/b/two").unwrap();
+                drop(writer);
                 // `one` is in place and `two` is staged when the directory is swapped.
                 state.publisher.wait();
                 let moved = root.join("moved");
                 std::fs::rename(root.join(planted), &moved).unwrap();
                 std::os::unix::fs::symlink(&outside, root.join(planted)).unwrap();
                 let finished = state
-                    .open_entry(&meta("a/b/three"))
-                    .and_then(|mut writer| Ok(writer.write_all(b"a/b/three")?))
+                    .settle(true)
+                    .and_then(|_| write_settled(&mut state, &meta("a/b/three"), b"a/b/three"))
                     .and_then(|()| state.publish().map(drop));
 
                 let escaped: Vec<_> = std::fs::read_dir(&outside)
@@ -4427,7 +4330,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_directory_swapped_for_a_symlink_mid_extraction_in_place_is_never_written_through() {
-        use std::io::Write;
         let policies = [
             super::OverwritePolicy::Never,
             super::OverwritePolicy::Always,
@@ -4450,9 +4352,7 @@ mod tests {
                     rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
                 };
                 let write = |state: &mut super::ExtractOutputState, name: &str| {
-                    let mut writer = state.open_entry(&meta(name))?;
-                    writer.write_all(name.as_bytes())?;
-                    rars::Result::Ok(())
+                    write_settled(state, &meta(name), name.as_bytes())
                 };
                 write(&mut state, "a/b/one").unwrap();
                 write(&mut state, "a/b/two").unwrap();
@@ -4495,7 +4395,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_entry_planted_where_a_member_goes_in_place_is_never_written_through() {
-        use std::io::Write;
         let policies = [
             super::OverwritePolicy::Never,
             super::OverwritePolicy::Always,
@@ -4519,9 +4418,7 @@ mod tests {
                     rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
                 };
                 let write = |state: &mut super::ExtractOutputState, name: &str| {
-                    let mut writer = state.open_entry(&meta(name))?;
-                    writer.write_all(name.as_bytes())?;
-                    rars::Result::Ok(())
+                    write_settled(state, &meta(name), name.as_bytes())
                 };
                 write(&mut state, "d/one").unwrap();
                 let planted = root.join("d/two");
@@ -4572,7 +4469,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_entry_planted_in_a_directory_made_by_the_run_is_never_written_through() {
-        use std::io::Write;
         let policies = [
             super::OverwritePolicy::Never,
             super::OverwritePolicy::Always,
@@ -4596,9 +4492,7 @@ mod tests {
                     rars::ExtractedEntryMeta::new(name.as_bytes().to_vec(), None, 0, false)
                 };
                 let write = |state: &mut super::ExtractOutputState, name: &str| {
-                    let mut writer = state.open_entry(&meta(name))?;
-                    writer.write_all(name.as_bytes())?;
-                    rars::Result::Ok(())
+                    write_settled(state, &meta(name), name.as_bytes())
                 };
                 // Opening `other` publishes `one`, which makes `d`.
                 write(&mut state, "d/one").unwrap();

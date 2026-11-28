@@ -492,8 +492,6 @@ pub(crate) struct Publisher {
     in_flight_paths: InFlight,
     /// Outputs queued before `in_flight`.
     retired: usize,
-    /// Whether opening asks where queued outputs go: see [`Self::queued_changes`].
-    track_paths: bool,
     /// A link or a discard has needed [`PublishState::link_paths`], so opening notes what it creates.
     notes_created: bool,
     /// A failure was handed on, and the run has not ended: its handler let it go on.
@@ -509,7 +507,6 @@ impl Publisher {
             in_flight: VecDeque::new(),
             in_flight_paths: InFlight::default(),
             retired: 0,
-            track_paths: true,
             notes_created: false,
             failure_given: false,
         }
@@ -569,7 +566,7 @@ impl Publisher {
         self.go_on();
         let output = &verified.output;
         let path = match output.path.strip_prefix(&self.out_dir) {
-            Ok(relative) if self.track_paths => {
+            Ok(relative) => {
                 self.in_flight_paths.add(relative, output.meta.is_directory);
                 Some((relative.to_path_buf(), output.meta.is_directory))
             }
@@ -578,11 +575,6 @@ impl Publisher {
         self.in_flight.push_back(path);
         self.queued += 1;
         self.queue.submit(verified);
-    }
-
-    /// Whether to note where outputs queued from now on go, for [`Self::queued_changes`].
-    pub(crate) fn track_paths(&mut self, track: bool) {
-        self.track_paths = track;
     }
 
     /// Whether an output still queued can change what opening finds at `relative`.

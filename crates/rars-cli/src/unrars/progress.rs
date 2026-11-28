@@ -509,7 +509,7 @@ fn spans(archive: &Archive, base: u64, size: u64) -> Vec<Span> {
 
 /// A member's output, counting what is written to it for its line.
 pub(super) struct Counted {
-    pub(super) writer: Box<dyn Write>,
+    pub(super) writer: Box<dyn Write + Send>,
     pub(super) progress: Arc<Progress>,
 }
 
