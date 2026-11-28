@@ -199,7 +199,7 @@ fn skipping_symlinks_keeps_hard_links() {
     succeeded(&rars_extract(&rar, &root.join("all"), &[]));
     assert_eq!(is_symlink(&root.join("all/sl")), Some(true));
 
-    succeeded(&rars_extract(&rar, &root.join("cli"), &["--skip-symlinks"]));
+    succeeded(&rars_extract(&rar, &root.join("cli"), &["--symlinks=skip"]));
     succeeded(&unrars(
         &root,
         &["x", "-idq", "-ol-", "modes.rar", "unrars/"],
@@ -217,7 +217,7 @@ fn a_hard_link_to_a_symlink_left_out_fails() {
     let root = scratch::case("cli-skip-symlinks-hard-link");
     let rar = root.join("links.rar");
     write_rar5(&rar, "sl");
-    let cli = rars_extract(&rar, &root.join("cli"), &["--skip-symlinks"]);
+    let cli = rars_extract(&rar, &root.join("cli"), &["--symlinks=skip"]);
     let unrars = unrars(&root, &["x", "-idq", "-ol-", "links.rar", "unrars/"]);
     for (output, out) in [(cli, "cli"), (unrars, "unrars")] {
         let out = root.join(out);

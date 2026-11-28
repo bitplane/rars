@@ -1555,8 +1555,8 @@ impl RarFile {
     }
 
     /// `overwrite`, `in_place`, `flatten`, `volumes`, `restore_modes` and
-    /// `skip_symlinks` work as in `extractall`.
-    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, symlinks = Symlinks(rars_rs::SymlinkPolicy::Inside), skip_symlinks = false, in_place = false, flatten = false))]
+    /// `symlinks` work as in `extractall`.
+    #[pyo3(signature = (member, path = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, symlinks = Symlinks(rars_rs::SymlinkPolicy::Inside), in_place = false, flatten = false))]
     #[allow(clippy::too_many_arguments)]
     fn extract(
         &self,
@@ -1572,7 +1572,6 @@ impl RarFile {
         restore_times: bool,
         restore_modes: bool,
         symlinks: Symlinks,
-        skip_symlinks: bool,
         in_place: bool,
         flatten: bool,
     ) -> PyResult<PathBuf> {
@@ -1596,7 +1595,7 @@ impl RarFile {
             in_place,
             restore_times,
             restore_modes,
-            symlinks: symlinks.with_skip(skip_symlinks)?,
+            symlinks: symlinks.0,
             flatten,
         };
         let chosen = |index: usize| index == target;
@@ -1673,14 +1672,14 @@ impl RarFile {
     /// stored, wherever it leads, and still never writes through one: a later
     /// member stored under a link this call made replaces it with a directory;
     /// `"skip"` makes none, without a warning. A hard link or file copy to a link
-    /// left out fails as its own member. `skip_symlinks=True` is `symlinks="skip"`.
+    /// left out fails as its own member.
     ///
     /// `on_member_error` carries on past members that fail, as `testrar` does,
     /// and none of their output is kept. It can't be combined with `members`.
     /// `keep_broken=True`, on a `RarFile` opened with `salvage=True`, keeps
     /// it: each member `on_member_error` is given keeps its file under its own
     /// name, holding what was delivered for it, unless it failed on its password.
-    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, symlinks = Symlinks(rars_rs::SymlinkPolicy::Inside), skip_symlinks = false, in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
+    #[pyo3(signature = (path = None, members = None, *, password = None, overwrite = Overwrite(OverwritePolicy::Never), options = None, progress = None, cancellation = None, volumes = None, restore_times = true, restore_modes = true, symlinks = Symlinks(rars_rs::SymlinkPolicy::Inside), in_place = false, flatten = false, on_member_error = None, keep_broken = false))]
     #[allow(clippy::too_many_arguments)]
     fn extractall(
         &self,
@@ -1696,7 +1695,6 @@ impl RarFile {
         restore_times: bool,
         restore_modes: bool,
         symlinks: Symlinks,
-        skip_symlinks: bool,
         in_place: bool,
         flatten: bool,
         on_member_error: Option<&Bound<'_, PyAny>>,
@@ -1727,7 +1725,7 @@ impl RarFile {
             in_place,
             restore_times,
             restore_modes,
-            symlinks: symlinks.with_skip(skip_symlinks)?,
+            symlinks: symlinks.0,
             flatten,
         };
         let out_dir = path.unwrap_or_else(|| PathBuf::from("."));
@@ -4489,20 +4487,6 @@ struct Overwrite(OverwritePolicy);
 /// `"inside"`, `"all"` or `"skip"`, or a `Symlinks` member, as `extract` and `extractall` accept it.
 struct Symlinks(rars_rs::SymlinkPolicy);
 
-impl Symlinks {
-    fn with_skip(self, skip_symlinks: bool) -> PyResult<rars_rs::SymlinkPolicy> {
-        match (self.0, skip_symlinks) {
-            (policy, false) => Ok(policy),
-            (rars_rs::SymlinkPolicy::Inside | rars_rs::SymlinkPolicy::Skip, true) => {
-                Ok(rars_rs::SymlinkPolicy::Skip)
-            }
-            (_, true) => Err(PyValueError::new_err(
-                "skip_symlinks=True conflicts with symlinks; pass symlinks=\"skip\" alone",
-            )),
-        }
-    }
-}
-
 impl<'a, 'py> FromPyObject<'a, 'py> for Symlinks {
     type Error = PyErr;
 
@@ -5513,7 +5497,6 @@ mod tests {
                     Symlinks(rars_rs::SymlinkPolicy::Inside),
                     false,
                     false,
-                    false,
                 )
                 .unwrap();
                 file.extractall(
@@ -5529,7 +5512,6 @@ mod tests {
                     true,
                     true,
                     Symlinks(rars_rs::SymlinkPolicy::Inside),
-                    false,
                     false,
                     false,
                     None,
@@ -5656,7 +5638,6 @@ mod tests {
                     Symlinks(rars_rs::SymlinkPolicy::Inside),
                     false,
                     false,
-                    false,
                     None,
                     false,
                 )
@@ -5701,7 +5682,6 @@ mod tests {
                     true,
                     true,
                     Symlinks(rars_rs::SymlinkPolicy::Inside),
-                    false,
                     false,
                     false,
                 )

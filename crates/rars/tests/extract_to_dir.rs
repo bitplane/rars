@@ -1045,7 +1045,7 @@ fn policy(skip: bool) -> SymlinkPolicy {
 }
 
 #[test]
-fn skip_symlinks_leaves_out_symlinks_and_keeps_hard_links() {
+fn skipped_symlinks_are_left_out_and_hard_links_kept() {
     let root = scratch::case("extract-to-dir-skip-symlinks");
     let bytes = rar5_links(&[
         ("sl", SYMLINK, "f"),
@@ -1071,7 +1071,7 @@ fn skip_symlinks_leaves_out_symlinks_and_keeps_hard_links() {
 
 #[cfg(unix)]
 #[test]
-fn skip_symlinks_leaves_out_legacy_symlinks() {
+fn skipped_symlinks_leave_out_legacy_symlinks() {
     let root = scratch::case("extract-to-dir-skip-legacy-symlinks");
     let mut builder = Builder::new(ArchiveVersion::Rar29);
     builder

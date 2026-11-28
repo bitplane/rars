@@ -392,7 +392,6 @@ class RarFile:
         restore_times: bool = True,
         restore_modes: bool = True,
         symlinks: _Symlinks = ...,
-        skip_symlinks: bool = False,
         in_place: bool = False,
         flatten: bool = False,
     ) -> Path: ...
@@ -410,7 +409,6 @@ class RarFile:
         restore_times: bool = True,
         restore_modes: bool = True,
         symlinks: _Symlinks = ...,
-        skip_symlinks: bool = False,
         in_place: bool = False,
         flatten: bool = False,
         on_member_error: _MemberErrorHandler | None = None,
@@ -420,8 +418,7 @@ class RarFile:
         `keep_broken=True`, with `salvage=True`, keeps it under its own name, holding what
         was delivered for it, unless it failed on its password.
         `restore_modes` sets the recorded modes on Unix, and 0o444 on a DOS read-only file.
-        `symlinks` chooses which symlinks and junctions are made; see `Symlinks`.
-        `skip_symlinks=True` is `symlinks="skip"`."""
+        `symlinks` chooses which symlinks and junctions are made; see `Symlinks`."""
     def testrar(
         self,
         *,

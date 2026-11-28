@@ -222,7 +222,7 @@ export class RarEntry {
   /** The raw target of this link, read from the headers and never followed. */
   readLink(options?: ReadOptions): Promise<Uint8Array>;
   /** Node only: extracts this entry under `directory`, as `archive.extractAll()` does, and returns the path written. */
-  extract(directory: string | URL, options?: ReadOptions & { overwrite?: boolean | "rename"; flatten?: boolean; restoreTimes?: boolean; restoreModes?: boolean; skipSymlinks?: boolean }): Promise<string>;
+  extract(directory: string | URL, options?: ReadOptions & { overwrite?: boolean | "rename"; flatten?: boolean; restoreTimes?: boolean; restoreModes?: boolean; symlinks?: "inside" | "all" | "skip" }): Promise<string>;
 }
 
 export class RarArchive {

@@ -1099,11 +1099,7 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
     if args.ignore_attributes {
         engine.ignore_modes();
     }
-    engine.symlinks(if args.skip_symlinks {
-        rars::SymlinkPolicy::Skip
-    } else {
-        args.symlinks.into()
-    });
+    engine.symlinks(args.symlinks.into());
     let kept = KeptBroken::default();
     let mut options = args
         .read_options

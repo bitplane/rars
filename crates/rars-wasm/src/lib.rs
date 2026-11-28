@@ -1007,8 +1007,10 @@ impl RarFile {
     /// A link comes as `{ path, stored, link: { kind, target, directory } }` with no bytes,
     /// `kind` one of `symlink`, `junction`, `hardlink` or `copy`, or with `skipped: true`
     /// and its raw target when following it could leave the output directory.
-    /// `skipSymlinks` leaves symlinks and junctions out undelivered; a hard link or copy
-    /// to one fails as its own member.
+    /// `symlinks` is `inside`, `all` or `skip`, as unrar's `-ol`, `-ola` and `-ol-`:
+    /// `all` delivers a symlink or junction leading outside with its stored target
+    /// instead of skipping it; `skip` leaves them out undelivered, and a hard link or
+    /// copy to one fails as its own member.
     /// `readLink(path)` answers for that check: the target of the symbolic link already at
     /// `path` under the output directory, or undefined.
     ///
@@ -1024,7 +1026,7 @@ impl RarFile {
         settings: JsValue,
         flatten: bool,
         posix: bool,
-        skip_symlinks: bool,
+        symlinks: String,
         deliver: js_sys::Function,
         read_link: js_sys::Function,
         next_volume: Option<js_sys::Function>,
@@ -1032,8 +1034,19 @@ impl RarFile {
         member_error: Option<js_sys::Function>,
         keep_broken: bool,
     ) -> Result<(), JsValue> {
-        use rars_rs::ExtractedLink;
+        use rars_rs::{ExtractedLink, SymlinkPolicy};
         use std::cell::RefCell;
+        let symlinks = match symlinks.as_str() {
+            "inside" => SymlinkPolicy::Inside,
+            "all" => SymlinkPolicy::All,
+            "skip" => SymlinkPolicy::Skip,
+            _ => {
+                return Err(js_sys::TypeError::new(
+                    "symlinks must be \"inside\", \"all\" or \"skip\"",
+                )
+                .into())
+            }
+        };
         use std::collections::HashSet;
         use std::rc::Rc;
         let password = password_bytes(password)?.or_else(|| self.password.clone());
@@ -1138,7 +1151,7 @@ impl RarFile {
                     return Ok(());
                 }
                 let (entry, stored, path) = describe(meta)?;
-                if skip_symlinks
+                if symlinks == SymlinkPolicy::Skip
                     && matches!(
                         link,
                         ExtractedLink::Symlink { .. } | ExtractedLink::Junction { .. }
@@ -1156,6 +1169,19 @@ impl RarFile {
                     family,
                     flatten,
                 )?;
+                let target = match (target, link) {
+                    (
+                        None,
+                        ExtractedLink::Symlink { target, .. } | ExtractedLink::Junction { target },
+                    ) if symlinks == SymlinkPolicy::All => {
+                        rars_rs::output_links::stored_symlink_target(
+                            target,
+                            family,
+                            meta.attr_source == rars_rs::AttrSource::Unix,
+                        )
+                    }
+                    (target, _) => target,
+                };
                 // A kind this build doesn't know is skipped like an unsafe one.
                 let kind = match link {
                     ExtractedLink::Symlink { directory, .. } => Some(("symlink", directory)),
@@ -1597,11 +1623,20 @@ impl rars_rs::output_links::OutputTree for JsTree {
 }
 
 /// A relative path as `/`-separated text, the form the worker joins onto its directory.
+/// An absolute path, as an `all` link's target may be, keeps its one leading `/`.
 fn slash_path(path: &std::path::Path) -> String {
-    path.components()
-        .map(|part| part.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+    let mut slashed = String::new();
+    for part in path.components() {
+        if part == std::path::Component::RootDir {
+            slashed.push('/');
+            continue;
+        }
+        if !slashed.is_empty() && !slashed.ends_with('/') {
+            slashed.push('/');
+        }
+        slashed.push_str(&part.as_os_str().to_string_lossy());
+    }
+    slashed
 }
 
 /// The member's stored and output paths, `/`-separated, by the rules Python's extraction

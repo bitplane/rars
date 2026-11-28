@@ -129,7 +129,7 @@ try {
     }
   });
 
-  await check("skipSymlinks leaves symlinks out, without a warning, and keeps hard links", async () => {
+  await check("symlinks: \"skip\" leaves symlinks out, without a warning, and keeps hard links", async () => {
     const warnings = [];
     const listen = (warning) => { if (warning.name === "UnsafeLinkWarning") warnings.push(warning); };
     process.on("warning", listen);
@@ -141,11 +141,11 @@ try {
           .addSymlink("data/far", "../../outside")
           .bytes());
         const out = fresh();
-        const written = await archive.extractAll(out, { skipSymlinks: true });
+        const written = await archive.extractAll(out, { symlinks: "skip" });
         assert.deepEqual(written, [path.join(out, "data", "file.txt")], version);
         assert.equal(await exists(path.join(out, "data", "near")), false, version);
         assert.equal(await exists(path.join(out, "data", "far")), false, version);
-        await assert.rejects(archive.get("data/near").extract(fresh(), { skipSymlinks: true }),
+        await assert.rejects(archive.get("data/near").extract(fresh(), { symlinks: "skip" }),
           (error) => error.code === "ENTRY_NOT_FOUND", version);
       }
       await new Promise((resolve) => setImmediate(resolve));
@@ -154,7 +154,7 @@ try {
       process.off("warning", listen);
     }
     const fixture = await RarArchive.open(path.join(here, "..", "crates/rars/tests/fixtures/rar50/wild/hardlink.rar"));
-    const files = await fixture.extractAll(fresh(), { skipSymlinks: true });
+    const files = await fixture.extractAll(fresh(), { symlinks: "skip" });
     const [first, second] = await Promise.all(files.map((file) => stat(file)));
     assert.equal(first.ino, second.ino);
   });
@@ -169,12 +169,81 @@ try {
     const out = fresh();
     const failed = [];
     const written = await (await RarArchive.open(bytes))
-      .extractAll(out, { skipSymlinks: true, onMemberError: (error) => failed.push(error) });
+      .extractAll(out, { symlinks: "skip", onMemberError: (error) => failed.push(error) });
     assert.equal(failed.length, 1);
     assert.match(failed[0].message, /'hard'.*symbolic link left out/);
     assert.equal(await exists(path.join(out, "hard")), false);
     assert.ok(written.includes(path.join(out, "after.txt")));
     assert.equal(await readFile(path.join(out, "after.txt"), "utf8"), "after");
+  });
+
+  async function linksArchive(victim) {
+    return RarArchive.open(await new RarWriter({ level: 0 })
+      .add("file.txt", "file")
+      .addSymlink("inside", "file.txt")
+      .addSymlink("up", "../outside")
+      .addSymlink("lone", victim)
+      .addSymlink("abs", victim, { targetIsDirectory: true })
+      .add("up/file.txt", "under")
+      .add("abs/file.txt", "under")
+      .bytes());
+  }
+
+  async function watchingWarnings(body) {
+    const warnings = [];
+    const listen = (warning) => { if (warning.name === "UnsafeLinkWarning") warnings.push(warning); };
+    process.on("warning", listen);
+    try {
+      await body();
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("warning", listen);
+    }
+    return warnings;
+  }
+
+  const { mkdir, readdir, readlink } = await import("node:fs/promises");
+  const isDirectory = async (file) => (await lstat(file)).isDirectory();
+
+  await check("inside links are made, the rest warn, and a member under a made link replaces it", async () => {
+    const victim = fresh();
+    await mkdir(victim);
+    const out = fresh();
+    const warnings = await watchingWarnings(async () => {
+      await (await linksArchive(victim)).extractAll(out);
+    });
+    assert.equal(warnings.length, 3);
+    assert.equal(await readlink(path.join(out, "inside")), "file.txt");
+    assert.equal(await exists(path.join(out, "lone")), false);
+    for (const name of ["up", "abs"]) {
+      assert.ok(await isDirectory(path.join(out, name)), name);
+      assert.equal(await readFile(path.join(out, name, "file.txt"), "utf8"), "under");
+    }
+    assert.deepEqual(await readdir(victim), []);
+  });
+
+  await check("symlinks: \"all\" makes every link as stored and writes through none", async () => {
+    const victim = fresh();
+    await mkdir(victim);
+    const out = fresh();
+    const warnings = await watchingWarnings(async () => {
+      await (await linksArchive(victim)).extractAll(out, { symlinks: "all" });
+    });
+    assert.deepEqual(warnings, []);
+    assert.equal(await readlink(path.join(out, "inside")), "file.txt");
+    assert.equal(await readlink(path.join(out, "lone")), victim);
+    for (const name of ["up", "abs"]) {
+      assert.ok(await isDirectory(path.join(out, name)), name);
+      assert.equal(await readFile(path.join(out, name, "file.txt"), "utf8"), "under");
+    }
+    assert.deepEqual(await readdir(victim), []);
+    assert.equal(await exists(path.join(out, "..", "outside")), false);
+  });
+
+  await check("symlinks takes only its three values", async () => {
+    const archive = await linksArchive(fresh());
+    await assert.rejects(archive.extractAll(fresh(), { symlinks: "none" }), TypeError);
+    await assert.rejects(archive.extractAll(fresh(), { symlinks: true }), TypeError);
   });
 } finally {
   await rm(temporary, { recursive: true, force: true });

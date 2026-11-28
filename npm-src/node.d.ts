@@ -59,9 +59,12 @@ export class RarArchive {
    * "rename" (write beside it as name(N).ext); `flatten` drops stored directories;
    * `restoreTimes` (default true) sets modification times. `restoreModes` (default true)
    * sets the Unix modes the archive records, and 0o444 on a DOS read-only file; off Windows
-   * only. Links are written too; one that could lead outside `directory` is skipped with an
-   * `UnsafeLinkWarning` process warning. `skipSymlinks` leaves symlinks and junctions out,
-   * without a warning; a hard link or copy to one fails as its own member.
+   * only. Links are written too, as `symlinks` says, after unrar's -ol, -ola and -ol-:
+   * "inside" (the default) skips one that could lead outside `directory` with an
+   * `UnsafeLinkWarning` process warning; "all" makes every one as stored; "skip" leaves
+   * symlinks and junctions out, without a warning, and a hard link or copy to one fails as
+   * its own member. Nothing is written through a link: a later member stored under one this
+   * call made replaces it with a directory.
    * `volumes` gives the set's later parts as they arrive, as for `test()`.
    *
    * `onMemberError` carries on past members that fail and writes none of their output; it
@@ -77,7 +80,7 @@ export class RarArchive {
     flatten?: boolean;
     restoreTimes?: boolean;
     restoreModes?: boolean;
-    skipSymlinks?: boolean;
+    symlinks?: "inside" | "all" | "skip";
   }): Promise<readonly string[]>;
   close(): void;
 }

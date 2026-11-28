@@ -207,9 +207,6 @@ pub(crate) struct ExtractArgs {
     /// Which symbolic links and junctions to make, like unrar -ol, -ola and -ol-; hard links and file copies are always made
     #[arg(long, value_enum, default_value_t = SymlinksCli::Inside)]
     pub symlinks: SymlinksCli,
-    /// Leave symbolic links and junctions out, like unrar -ol-: the same as --symlinks=skip
-    #[arg(long, conflicts_with = "symlinks")]
-    pub skip_symlinks: bool,
     /// Archive (and optional sibling parts) followed by an output directory
     #[arg(value_name = "PATH", required = true, num_args = 2..)]
     pub paths: Vec<std::path::PathBuf>,

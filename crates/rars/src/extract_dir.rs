@@ -45,10 +45,6 @@ pub struct ExtractDirOptions<'a> {
     pub restore_modes: bool,
     /// Which symbolic links and junctions are made. [`SymlinkPolicy::Inside`] by default.
     pub symlinks: SymlinkPolicy,
-    /// Leaves symbolic links and junctions out, as [`SymlinkPolicy::Skip`]
-    /// does, whatever [`Self::symlinks`] says.
-    #[deprecated(note = "use `symlinks: SymlinkPolicy::Skip`")]
-    pub skip_symlinks: bool,
 }
 
 /// Which symbolic links and junctions extraction makes, as RAR's `-ol` switches choose.
@@ -68,7 +64,6 @@ pub enum SymlinkPolicy {
 }
 
 impl Default for ExtractDirOptions<'_> {
-    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             read: ArchiveReadOptions::default(),
@@ -76,7 +71,6 @@ impl Default for ExtractDirOptions<'_> {
             restore_times: true,
             restore_modes: true,
             symlinks: SymlinkPolicy::Inside,
-            skip_symlinks: false,
         }
     }
 }
@@ -120,25 +114,6 @@ impl<'a> ExtractDirOptions<'a> {
     pub fn with_symlinks(mut self, symlinks: SymlinkPolicy) -> Self {
         self.symlinks = symlinks;
         self
-    }
-
-    /// Sets whether symbolic links and junctions are left out.
-    #[deprecated(note = "use `with_symlinks(SymlinkPolicy::Skip)`")]
-    #[must_use]
-    #[allow(deprecated)]
-    pub fn with_skip_symlinks(mut self, skip_symlinks: bool) -> Self {
-        self.skip_symlinks = skip_symlinks;
-        self
-    }
-
-    /// [`Self::symlinks`], unless the deprecated [`Self::skip_symlinks`] is set.
-    #[allow(deprecated)]
-    fn symlink_policy(&self) -> SymlinkPolicy {
-        if self.skip_symlinks {
-            SymlinkPolicy::Skip
-        } else {
-            self.symlinks
-        }
     }
 }
 
@@ -269,7 +244,7 @@ fn extract_into(
         in_place: false,
         restore_times: options.restore_times,
         restore_modes: options.restore_modes,
-        symlinks: options.symlink_policy(),
+        symlinks: options.symlinks,
         flatten: false,
         exists_hint: "; set ExtractDirOptions::overwrite to replace it or keep both",
     };
