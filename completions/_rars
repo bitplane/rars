@@ -112,6 +112,8 @@ rename\:"Write beside an existing file as name(N).ext"))' \
 '--in-place[Write each file at its destination instead of staging it; a failed member leaves a partial file]' \
 '--keep-broken[Keep a damaged member'\''s file with what could be read of it, like unrar -kb; implies --in-place]' \
 '--flatten[Write every file straight into the output directory under its base name, creating no directories]' \
+'--ignore-attributes[Set no file or directory modes, like unrar -ai\: files are created 0666 and directories 0777, less the umask; times are still restored]' \
+'--skip-symlinks[Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \
@@ -145,6 +147,8 @@ rename\:"Write beside an existing file as name(N).ext"))' \
 '--in-place[Write each file at its destination instead of staging it; a failed member leaves a partial file]' \
 '--keep-broken[Keep a damaged member'\''s file with what could be read of it, like unrar -kb; implies --in-place]' \
 '--flatten[Write every file straight into the output directory under its base name, creating no directories]' \
+'--ignore-attributes[Set no file or directory modes, like unrar -ai\: files are created 0666 and directories 0777, less the umask; times are still restored]' \
+'--skip-symlinks[Leave symbolic links and junctions out, like unrar -ol-; hard links and file copies are still made]' \
 '-h[Print help (see more with '\''--help'\'')]' \
 '--help[Print help (see more with '\''--help'\'')]' \
 '-V[Print version]' \

@@ -15,6 +15,8 @@ pub(crate) struct ExtractedOutput {
     pub(crate) path: PathBuf,
     pub(crate) meta: ExtractedEntryMeta,
     pub(crate) restore_metadata: bool,
+    /// Off with `--ignore-attributes`: times are still restored.
+    pub(crate) restore_mode: bool,
 }
 
 #[cfg(test)]
@@ -84,7 +86,7 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
     times.finish();
     times.restore()?;
     let mut modes = rars::output_modes::PathModes::default();
-    for output in restored {
+    for output in restored.into_iter().filter(|output| output.restore_mode) {
         modes.record(output.path.clone(), &output.meta);
     }
     modes.restore()
@@ -96,15 +98,15 @@ pub(crate) fn restore_output_metadata(outputs: &[ExtractedOutput]) -> std::io::R
 pub(crate) fn early_file_metadata(output: &ExtractedOutput) -> Option<EarlyMetadata> {
     output
         .restore_metadata
-        .then(|| early_metadata(&output.meta))
+        .then(|| early_metadata(&output.meta, output.restore_mode))
         .flatten()
 }
 
 /// A file's modified time and mode, set before it is published.
 pub(crate) type EarlyMetadata = (Option<std::time::SystemTime>, Option<u32>);
 
-fn early_metadata(meta: &ExtractedEntryMeta) -> Option<EarlyMetadata> {
-    let mode = applied_mode(meta);
+fn early_metadata(meta: &ExtractedEntryMeta, restore_mode: bool) -> Option<EarlyMetadata> {
+    let mode = restore_mode.then(|| applied_mode(meta)).flatten();
     if mode.is_some_and(waits_for_end) {
         return None;
     }
@@ -112,6 +114,14 @@ fn early_metadata(meta: &ExtractedEntryMeta) -> Option<EarlyMetadata> {
         .modified
         .and_then(|time| std::time::SystemTime::try_from(time).ok());
     Some((modified, mode))
+}
+
+pub(crate) fn file_create_mode(meta: &ExtractedEntryMeta, restore_mode: bool) -> u32 {
+    if restore_mode {
+        create_mode(meta)
+    } else {
+        0o666
+    }
 }
 
 /// A staged file, created and finished on whichever thread writes it. It is
@@ -132,9 +142,10 @@ impl StagedFile {
         dir: rars::output_tree::FileDir,
         name: std::ffi::OsString,
         meta: &ExtractedEntryMeta,
+        restore_mode: bool,
         created_modes: CreatedModes,
     ) -> std::io::Result<(Self, std::sync::Arc<std::sync::atomic::AtomicBool>)> {
-        let (mut staged, set) = Self::deferred(dir, name, meta, created_modes);
+        let (mut staged, set) = Self::deferred(dir, name, meta, restore_mode, created_modes);
         staged.file.file()?;
         Ok((staged, set))
     }
@@ -144,12 +155,17 @@ impl StagedFile {
         dir: rars::output_tree::FileDir,
         name: std::ffi::OsString,
         meta: &ExtractedEntryMeta,
+        restore_mode: bool,
         created_modes: CreatedModes,
     ) -> (Self, std::sync::Arc<std::sync::atomic::AtomicBool>) {
         let set = std::sync::Arc::default();
-        let early = early_metadata(meta);
+        let early = early_metadata(meta, restore_mode);
         let staged = Self {
-            file: rars::output_tree::DeferredFile::new(dir, name, create_mode(meta)),
+            file: rars::output_tree::DeferredFile::new(
+                dir,
+                name,
+                file_create_mode(meta, restore_mode),
+            ),
             early,
             set: std::sync::Arc::clone(&set),
             created_modes,
@@ -399,9 +415,10 @@ mod tests {
                 ExtractedEntryMeta::new(b"member".to_vec(), None, 0o100000 | mode as u64, false)
                     .with_attr_source(rars::AttrSource::Unix);
             let (mut file, set) = if index % 2 == 0 {
-                super::StagedFile::deferred(dir.clone(), name, &meta, created_modes.clone())
+                super::StagedFile::deferred(dir.clone(), name, &meta, true, created_modes.clone())
             } else {
-                super::StagedFile::new(dir.clone(), name, &meta, created_modes.clone()).unwrap()
+                super::StagedFile::new(dir.clone(), name, &meta, true, created_modes.clone())
+                    .unwrap()
             };
             file.write_all(b"data").unwrap();
             drop(file);
@@ -757,6 +774,7 @@ mod tests {
                     )
                     .with_attr_source(rars::AttrSource::Unix),
                     restore_metadata: false,
+                    restore_mode: true,
                 };
                 restore_output_metadata(std::slice::from_ref(&output)).unwrap();
                 #[cfg(unix)]
@@ -1188,6 +1206,7 @@ mod tests {
                     false,
                 ),
                 restore_metadata: true,
+                restore_mode: true,
             },
             ExtractedOutput {
                 name: b"nested".to_vec(),
@@ -1200,6 +1219,7 @@ mod tests {
                     true,
                 ),
                 restore_metadata: true,
+                restore_mode: true,
             },
         ];
 
@@ -1245,6 +1265,7 @@ mod tests {
                     )
                     .with_attr_source(rars::AttrSource::Unix),
                     restore_metadata: true,
+                    restore_mode: true,
                 }
             })
             .collect();

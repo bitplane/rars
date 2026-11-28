@@ -208,6 +208,8 @@ struct Invocation {
     archive_directory: bool,
     /// `-ol-`: leave symbolic links out.
     skip_symlinks: bool,
+    /// `-ai`: set no file or directory modes.
+    ignore_attributes: bool,
     /// `-ierr`: every message on stderr.
     stderr_only: bool,
     /// May hold `*` and `?`, matched against the files in its directory.
@@ -365,6 +367,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
         inside: None,
         archive_directory: false,
         skip_symlinks: false,
+        ignore_attributes: false,
         stderr_only: false,
         archive: PathBuf::from(words.next().ok_or(())?),
         masks: Vec::new(),
@@ -410,6 +413,7 @@ fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Option<Invocation>,
                 }
             }
             b"ol-" => invocation.skip_symlinks = true,
+            b"ai" => invocation.ignore_attributes = true,
             b"ierr" => invocation.stderr_only = true,
             _ if refused_switch(&lower) => return Err(Refused::Switch(raw.to_vec())),
             // Masks and paths keep their case.
@@ -491,6 +495,7 @@ Switches
   -ep     Extract without paths, as e does
   -op<p>  Extract into <p>
   -ol-    Leave symbolic links out
+  -ai     Ignore file attributes: set no file or directory modes
   -ierr   Send all messages to stderr
   -inul   No messages
   -idq    Errors only; -idc no banner; -idd no closing \"All OK\";
@@ -2013,6 +2018,12 @@ where
         archive.family(),
     );
     state.skip_existing = policy == OverwritePolicy::Never;
+    if invocation.ignore_attributes {
+        state.ignore_modes();
+    }
+    if invocation.skip_symlinks {
+        state.skip_symlinks();
+    }
     // As with unrar, a later member on the same path replaces an earlier one,
     // as `-ap` can make happen.
     state.allow_overwrite_repeats();
@@ -2099,11 +2110,7 @@ where
             kept.close();
             let mut state = state.borrow_mut();
             state.discard_failed(&failures.take_failed());
-            let symlink = matches!(
-                link,
-                rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. }
-            );
-            if (symlink && invocation.skip_symlinks) || !failures.wanted.choose(&meta.name) {
+            if !failures.wanted.choose(&meta.name) {
                 progress.pass(&meta.name);
                 return Ok(());
             }

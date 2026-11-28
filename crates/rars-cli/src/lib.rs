@@ -1106,13 +1106,14 @@ fn cmd_extract(mut args: ExtractArgs) -> CliResult<()> {
         .first()
         .map(DetectedArchive::family)
         .ok_or("no archive parts provided")?;
-    let state = RefCell::new(ExtractOutputState::new(
-        &out_dir,
-        overwrite,
-        in_place,
-        args.flatten,
-        family,
-    ));
+    let mut state = ExtractOutputState::new(&out_dir, overwrite, in_place, args.flatten, family);
+    if args.ignore_attributes {
+        state.ignore_modes();
+    }
+    if args.skip_symlinks {
+        state.skip_symlinks();
+    }
+    let state = RefCell::new(state);
     let kept = KeptBroken::default();
     let mut options = args
         .read_options
@@ -1253,6 +1254,9 @@ struct ExtractOutputState<'a> {
     staged_count: u64,
     /// Which permission bits files created in [`STAGED_FILES`] keep.
     created_modes: output::CreatedModes,
+    restore_modes: bool,
+    /// So a hard link or copy naming a symlink left out fails as its own member.
+    skipped_symlinks: Option<HashSet<PathBuf>>,
     staged_directories: HashSet<FileIdentity>,
     skipped_links: usize,
     /// Members whose header gives no name: decoded and checked, never written.
@@ -1310,6 +1314,8 @@ impl<'a> ExtractOutputState<'a> {
             staging_files: None,
             staged_count: 0,
             created_modes: Default::default(),
+            restore_modes: true,
+            skipped_symlinks: None,
             staged_directories: HashSet::new(),
             skipped_links: 0,
             skipped_unnamed: 0,
@@ -1333,6 +1339,14 @@ impl<'a> ExtractOutputState<'a> {
     /// For callers whose own output follows each publish as it happens.
     fn publish_on_calling_thread(&mut self) {
         self.publisher.publish_on_thread(false);
+    }
+
+    fn ignore_modes(&mut self) {
+        self.restore_modes = false;
+    }
+
+    fn skip_symlinks(&mut self) {
+        self.skipped_symlinks = Some(HashSet::new());
     }
 
     fn allow_overwrite_repeats(&mut self) {
@@ -1519,6 +1533,7 @@ impl<'a> ExtractOutputState<'a> {
                             dir.clone(),
                             name.clone(),
                             meta,
+                            self.restore_modes,
                             self.created_modes.clone(),
                         )
                     } else {
@@ -1526,6 +1541,7 @@ impl<'a> ExtractOutputState<'a> {
                             dir.clone(),
                             name.clone(),
                             meta,
+                            self.restore_modes,
                             self.created_modes.clone(),
                         )?
                     };
@@ -1570,6 +1586,7 @@ impl<'a> ExtractOutputState<'a> {
                 path,
                 meta: meta.clone(),
                 restore_metadata: true,
+                restore_mode: self.restore_modes,
             },
             staged,
             pending,
@@ -1598,6 +1615,14 @@ impl<'a> ExtractOutputState<'a> {
             return Ok(());
         }
         let (name, stored) = self.entry_path(meta)?;
+        if let (
+            Some(skipped),
+            rars::ExtractedLink::Symlink { .. } | rars::ExtractedLink::Junction { .. },
+        ) = (&mut self.skipped_symlinks, link)
+        {
+            skipped.insert(stored);
+            return Ok(());
+        }
         let relative = self.output_relative(&stored);
         let destination = output::checked_output_path(self.out_dir, &relative)
             .map_err(|error| refused_output(error, &meta.name))?;
@@ -1617,6 +1642,18 @@ impl<'a> ExtractOutputState<'a> {
             self.skipped_links += 1;
             return Ok(());
         };
+        if matches!(
+            link,
+            rars::ExtractedLink::HardLink { .. } | rars::ExtractedLink::FileCopy { .. }
+        ) && self
+            .skipped_symlinks
+            .as_ref()
+            .is_some_and(|skipped| skipped.contains(&target))
+        {
+            return Err(rars::Error::InvalidArgument(
+                "hard link or file copy target is a symbolic link left out",
+            ));
+        }
         self.claim_flat_name(&relative, &meta.name)?;
         self.reserve_output_path(destination.clone())?;
         self.prepare_staged_path(&destination, false, None)?;
@@ -1667,6 +1704,7 @@ impl<'a> ExtractOutputState<'a> {
                 },
                 meta: meta.clone(),
                 restore_metadata,
+                restore_mode: self.restore_modes,
             },
             staged: path,
             pending: None,
@@ -1939,7 +1977,7 @@ impl<'a> ExtractOutputState<'a> {
         // Later checks take the state again.
         drop(publisher);
         let name = relative.file_name().expect("output path has a name");
-        let mode = output::create_mode(meta);
+        let mode = output::file_create_mode(meta, self.restore_modes);
         let repeated =
             || rars::Error::InvalidHeader("multiple archive entries map to the same output path");
         // Only `Always` opens what is there, so only it needs to know which
