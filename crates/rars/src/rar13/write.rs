@@ -3160,6 +3160,45 @@ mod tests {
     }
 
     #[test]
+    fn a_file_header_the_file_cuts_through_is_too_short_or_a_cut() {
+        let input = [StoredEntry {
+            name: b"hello.txt",
+            data: b"hello",
+            file_time: 0,
+            file_attr: 0x20,
+            password: None,
+            file_comment: None,
+        }];
+        let bytes = write_stored_archive(&input, WriterOptions::default()).unwrap();
+        let main = usize::from(crate::io_util::read_u16(&bytes, 4).unwrap());
+        let cut = &bytes[..main + FILE_HEAD_BASE_SIZE + 4];
+        let path = |options| {
+            Archive::parse_seekable(
+                std::io::Cursor::new(cut),
+                cut.len() as u64,
+                0,
+                super::ArchiveSource::Memory(std::sync::Arc::from(cut)),
+                options,
+            )
+        };
+        for options in [
+            crate::ArchiveReadOptions::new(),
+            crate::ArchiveReadOptions::new().with_max_header_bytes(1 << 20),
+        ] {
+            assert!(matches!(path(options), Err(Error::TooShort)));
+        }
+        let archive = path(crate::ArchiveReadOptions::new().with_salvage(true)).unwrap();
+        assert_eq!(archive.entries.len(), 0);
+        let truncation = archive.truncation().unwrap();
+        assert_eq!(truncation.offset, main as u64);
+        // The cut falls inside the name, so the member has none.
+        assert_eq!(
+            truncation.block,
+            crate::truncation::TruncatedBlock::Member(Vec::new())
+        );
+    }
+
+    #[test]
     fn returns_none_for_absent_archive_comment() {
         let bytes = write_stored_archive(&[], WriterOptions::default()).unwrap();
         let archive = Archive::parse(&bytes).unwrap();
