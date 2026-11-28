@@ -965,295 +965,14 @@ impl Archive {
         if sig.family != ArchiveFamily::Rar15To40 {
             return Err(Error::UnsupportedSignature);
         }
-
-        let password = options.password;
-        let mut budget = crate::parse_budget::ParseBudget::new(options);
-        let archive = &input[sig.offset..];
-        // find_archive_start matched these exact marker bytes, including the
-        // fixed MARK_HEAD type and seven-byte header length.
-        let marker_size = RAR15_SIGNATURE.len();
-        admit_plain_header(archive, marker_size, &mut budget)?;
-        let main_block = parse_block_header_salvaging(
-            archive,
-            marker_size,
-            &budget.control,
-            sig.offset + marker_size,
-        )?;
-        if main_block.head_type != MAIN_HEAD {
-            return Err(Error::InvalidHeader("RAR 1.5 main header is missing"));
-        }
-        let main = parse_main_header(archive, &main_block)?;
-        let mut pos = main_block.offset + main_block.head_size as usize;
-        let mut blocks = Vec::new();
-        if let Some(comment) = nested_main_comment(
-            &archive[main_block.offset..pos],
-            &main_block,
-            sig.offset + main_block.offset,
-        )? {
-            blocks.push(Block::Comment(comment));
-        }
-        let blocks_before_first_header = blocks.len();
-        let mut truncation = None;
-        let mut skipped = Vec::new();
-        let archive_len = archive.len();
-        let mut salvage = Salvage::new(archive_len, main.is_solid());
-        let mut read = |at: usize, len: usize| Ok(archive[at..at + len].to_vec());
-        // Under salvage, the next header that checks out after damage at
-        // `pos`, if there is one, and where the damage began.
-        macro_rules! resume {
-            ($pos:expr, $reason:expr) => {
-                if options.salvage {
-                    salvage.resume(
-                        $pos,
-                        $reason,
-                        archive_len,
-                        sig.offset,
-                        &mut blocks,
-                        &budget,
-                        &mut read,
-                    )?
-                } else {
-                    None
-                }
-            };
-        }
-
-        while pos < archive.len() {
-            if main.has_encrypted_headers() && archive.len() - pos < 7 {
-                truncation = Some(Truncation::new(
-                    sig.offset + pos,
-                    TruncatedBlock::Unknown,
-                    true,
-                ));
-                break;
-            }
-            let (block, header, total) = if main.has_encrypted_headers() {
-                crate::crypto::require_encryption()?;
-                let password = password.ok_or(Error::NeedPassword)?;
-                let encrypted = decrypt_encrypted_header_at(
-                    archive,
-                    pos,
-                    password,
-                    blocks.len() == blocks_before_first_header,
-                    &key_cache,
-                    &mut budget,
-                )?;
-                (encrypted.block, encrypted.header, encrypted.total_size)
-            } else {
-                let block = admit_plain_header(archive, pos, &mut budget).and_then(|()| {
-                    parse_block_header_flagged(archive, pos, &budget.control, sig.offset + pos)
-                });
-                let (block, damaged) = match block {
-                    Err(Error::TooShort) => {
-                        let cut =
-                            cut_block_header(&archive[pos..], sig.offset + pos, options.salvages());
-                        if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
-                            pos = next;
-                            continue;
-                        }
-                        match cut {
-                            // A whole header whose sizes run past the file.
-                            Err(error) if options.salvage => {
-                                unreadable(&budget.control, sig.offset + pos, &error);
-                            }
-                            cut => truncation = Some(cut?),
-                        }
-                        break;
-                    }
-                    Err(error) if salvage_stops(&options, &error) => {
-                        let reason = crate::header_damage::record_reason(&error);
-                        if let Some((next, _)) = resume!(pos, reason) {
-                            pos = next;
-                            continue;
-                        }
-                        unreadable(&budget.control, sig.offset + pos, &error);
-                        break;
-                    }
-                    block => block?,
-                };
-                let known = known_block_type(block.head_type);
-                if let Some(reason) = salvage.read_header(pos, damaged, known) {
-                    if let Some((next, _)) = resume!(pos, reason) {
-                        pos = next;
-                        continue;
-                    }
-                }
-                let total = block_total_size(&block)?;
-                let header = archive[pos..pos + block.head_size as usize].to_vec();
-                (block, header, total)
-            };
-            match block.head_type {
-                FILE_HEAD | NEWSUB_HEAD => {
-                    let mut file = match parse_file_like_header(&header, relative_block(&block), 0)
-                    {
-                        Err(error) if salvage_skips(&options, &error) => {
-                            unreadable(&budget.control, sig.offset + pos, &error);
-                            salvage.lost |= block.head_type == FILE_HEAD;
-                            match checked_block_next(&block, total, archive.len()) {
-                                Ok(next) => {
-                                    pos = next;
-                                    continue;
-                                }
-                                Err(_) => {
-                                    if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
-                                        pos = next;
-                                        continue;
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                        file => file?,
-                    };
-                    let total = file_block_total_size(&block, total, file.pack_size)?;
-                    let next = checked_block_next(&block, total, archive.len());
-                    if block.head_type == NEWSUB_HEAD {
-                        let next = match service_block_next(&block, next)? {
-                            Some(next) => next,
-                            None => {
-                                if salvage.suspect.is_some() {
-                                    if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
-                                        pos = next;
-                                        continue;
-                                    }
-                                }
-                                let cut = TruncatedBlock::service(&file.name);
-                                truncation =
-                                    Some(Truncation::new(sig.offset + block.offset, cut, true));
-                                break;
-                            }
-                        };
-                        file.block.offset = block.offset;
-                        file.packed_range = packed_range(sig.offset, next, file.pack_size);
-                        let kind = classify_new_sub(&file.name);
-                        blocks.push(Block::NewSub(NewSubHeader { file, kind }));
-                        pos = next;
-                        continue;
-                    }
-                    file.block.offset = block.offset;
-                    salvage.mark(&mut file);
-                    let next = match next {
-                        Err(Error::TooShort) if options.salvages() => {
-                            let data_start = block.offset + total - file.pack_size as usize;
-                            if salvage.suspect.is_some() {
-                                // A damaged header whose sizes run past the end:
-                                // if a header follows, its member's data ends
-                                // there.
-                                let was_lost = salvage.lost;
-                                if let Some((next, start)) = resume!(pos, SIZES_PAST_END) {
-                                    if start == pos && next > data_start {
-                                        salvage.lost = was_lost;
-                                        file.packed_range =
-                                            sig.offset + data_start..sig.offset + next;
-                                        blocks.push(Block::File(file));
-                                    }
-                                    pos = next;
-                                    continue;
-                                }
-                            }
-                            let cut = TruncatedBlock::Member(file.name.clone());
-                            if salvages_cut_member(&options, &file) {
-                                file.cut_short = true;
-                                file.packed_range =
-                                    sig.offset + data_start..sig.offset + archive.len();
-                                blocks.push(Block::File(file));
-                            }
-                            truncation =
-                                Some(Truncation::new(sig.offset + block.offset, cut, true));
-                            break;
-                        }
-                        next => next?,
-                    };
-                    file.packed_range = packed_range(sig.offset, next, file.pack_size);
-                    blocks.push(Block::File(file));
-                    pos = next;
-                }
-                COMM_HEAD => {
-                    let next = checked_block_next(&block, total, archive.len());
-                    let Some(next) = service_block_next(&block, next)? else {
-                        if salvage.suspect.is_some() {
-                            if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
-                                pos = next;
-                                continue;
-                            }
-                        }
-                        let cut = TruncatedBlock::Comment;
-                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
-                        break;
-                    };
-                    let mut comment = match parse_comment_header(&header, relative_block(&block)) {
-                        Err(error) if salvage_skips(&options, &error) => {
-                            unreadable(&budget.control, sig.offset + pos, &error);
-                            pos = next;
-                            continue;
-                        }
-                        comment => comment?,
-                    };
-                    comment.block.offset = block.offset;
-                    comment.packed_range =
-                        sig.offset + block.offset + 13..sig.offset + block.offset + total;
-                    blocks.push(Block::Comment(comment));
-                    pos = next;
-                }
-                head_type => {
-                    let next = checked_block_next(&block, total, archive.len());
-                    let Some(next) = service_block_next(&block, next)? else {
-                        if salvage.suspect.is_some() {
-                            if let Some((next, _)) = resume!(pos, SIZES_PAST_END) {
-                                pos = next;
-                                continue;
-                            }
-                        }
-                        let cut = match head_type {
-                            PROTECT_HEAD => TruncatedBlock::RecoveryRecord,
-                            ENDARC_HEAD => TruncatedBlock::End,
-                            _ => TruncatedBlock::Unknown,
-                        };
-                        truncation = Some(Truncation::new(sig.offset + block.offset, cut, true));
-                        break;
-                    };
-                    match head_type {
-                        PROTECT_HEAD => {
-                            let offset = sig.offset + block.offset;
-                            let protect = protect_block(
-                                &header,
-                                block,
-                                sig.offset,
-                                total,
-                                offset,
-                                &mut skipped,
-                            );
-                            blocks.push(protect?);
-                        }
-                        ENDARC_HEAD => {
-                            blocks.push(Block::End(parse_end_header(&header, block)));
-                            break;
-                        }
-                        _ => {
-                            skipped
-                                .extend(short_legacy_auth_block(&block, sig.offset + block.offset));
-                            blocks.push(Block::Unknown(block));
-                        }
-                    }
-                    pos = next;
-                }
-            }
-        }
-
-        options.check_cancelled()?;
-        // The walk records no cut at a block boundary, so it passes no
-        // trailing block on the way to one.
-        let truncation = truncation.map(|cut| cut.after_walk(main.is_volume(), false));
-        Ok(Self {
-            sfx_offset: sig.offset,
-            main,
-            blocks,
-            source: ArchiveSource::Memory(input),
+        Self::parse_seekable_cached(
+            std::io::Cursor::new(&input[..]),
+            input.len() as u64,
+            sig.offset,
+            ArchiveSource::Memory(Arc::clone(&input)),
+            options,
             key_cache,
-            truncation,
-            skipped,
-            damage: budget.control.take_damage(),
-        })
+        )
     }
 
     pub(crate) fn parse_seekable(
@@ -2951,80 +2670,19 @@ pub(crate) fn header_password_matches(
     options: crate::ArchiveReadOptions<'_>,
 ) -> Result<bool> {
     let mut budget = crate::parse_budget::ParseBudget::new(options);
-    match decrypt_encrypted_header_at(input, offset, password, true, key_cache, &mut budget) {
+    match read_encrypted_header_at(
+        &mut std::io::Cursor::new(input),
+        input.len() as u64,
+        0,
+        offset,
+        password,
+        true,
+        key_cache,
+        &mut budget,
+    ) {
         Ok(_) => Ok(true),
         Err(Error::WrongPasswordOrCorruptData) => Ok(false),
         Err(error) => Err(error),
-    }
-}
-
-fn decrypt_encrypted_header_at(
-    archive: &[u8],
-    offset: usize,
-    password: &[u8],
-    first: bool,
-    key_cache: &KeyCache,
-    budget: &mut crate::parse_budget::ParseBudget,
-) -> Result<EncryptedHeader> {
-    #[cfg(not(feature = "encryption"))]
-    {
-        let _ = (archive, offset, password, first, key_cache, budget);
-        Err(Error::FeatureDisabled {
-            feature: "encryption",
-        })
-    }
-    #[cfg(feature = "encryption")]
-    {
-        let salt = read_header_salt(archive, offset)?;
-        let first_ciphertext = archive
-            .get(offset + 8..offset + 24)
-            .ok_or(Error::TooShort)?;
-        budget.check_count(offset)?;
-        let mut cipher = key_cache.rar30(password, Some(salt))?;
-        let mut first_block = [0u8; 16];
-        first_block.copy_from_slice(first_ciphertext);
-        cipher.decrypt_block(&mut first_block);
-        let head_size = u16::from_le_bytes([first_block[5], first_block[6]]) as usize;
-        if head_size < 7 {
-            return Err(first_header_error(
-                first,
-                Error::InvalidHeader("RAR 1.5 block header is too short"),
-            ));
-        }
-        // A u16 wire length rounds to at most 65536, including on 32-bit hosts.
-        let encrypted_header_size = head_size.next_multiple_of(16);
-        // offset is within a physical slice (at most isize::MAX); this u16 wire
-        // length adds at most 65544, which fits usize on both supported widths.
-        let encrypted_end = offset + 8 + encrypted_header_size;
-        if encrypted_end > archive.len() {
-            return Err(first_header_error(first, Error::TooShort));
-        }
-        budget.admit(head_size, offset)?;
-        // The first 24 bytes and the rounded header end were admitted above.
-        let encrypted_rest = &archive[offset + 24..encrypted_end];
-        let mut header = Vec::with_capacity(encrypted_header_size);
-        header.extend_from_slice(&first_block);
-        header.extend_from_slice(encrypted_rest);
-        // The rounded header minus its first block is a whole number of AES blocks.
-        cipher
-            .decrypt_in_place(&mut header[16..])
-            .expect("rounded header rest is whole blocks");
-        header.truncate(head_size);
-
-        let mut block =
-            parse_decrypted_header(&header, first).map_err(|e| first_header_error(first, e))?;
-        block.offset = offset;
-        // Parsed add_size is a widened wire u32 and fits both supported widths.
-        let payload_size = block.add_size.unwrap_or(0) as usize;
-        let total_size = 8usize
-            .checked_add(encrypted_header_size)
-            .and_then(|size| size.checked_add(payload_size))
-            .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-        Ok(EncryptedHeader {
-            block,
-            header,
-            total_size,
-        })
     }
 }
 
@@ -3383,30 +3041,6 @@ fn decode_unicode_field(raw: &[u8]) -> Option<Vec<u8>> {
     String::from_utf16(&units).ok().map(String::into_bytes)
 }
 
-fn admit_plain_header(
-    input: &[u8],
-    offset: usize,
-    budget: &mut crate::parse_budget::ParseBudget,
-) -> Result<()> {
-    budget.control.check()?;
-    if !budget.is_limited() {
-        return Ok(());
-    }
-    // Both parser call sites bound offset by the physical archive extent.
-    let prefix = &input[offset..];
-    if prefix.len() < 7 {
-        return Err(Error::TooShort);
-    }
-    let size = u16::from_le_bytes([prefix[5], prefix[6]]) as usize;
-    if size < 7 {
-        return Err(Error::InvalidHeader("RAR 1.5 block header is too short"));
-    }
-    if size > prefix.len() {
-        return Err(Error::TooShort);
-    }
-    budget.admit(size, offset)
-}
-
 fn read_block_header_at(
     file: &mut (impl Read + std::io::Seek),
     file_len: u64,
@@ -3496,18 +3130,8 @@ fn parse_block_header(input: &[u8], offset: usize) -> Result<BlockHeader> {
     }
 }
 
-/// [`parse_block_header`], except that under salvage a header whose CRC
-/// fails is read as stored, and the damage recorded at `report_offset`.
-fn parse_block_header_salvaging(
-    input: &[u8],
-    offset: usize,
-    control: &crate::read_control::ReadControl,
-    report_offset: usize,
-) -> Result<BlockHeader> {
-    parse_block_header_flagged(input, offset, control, report_offset).map(|(block, _)| block)
-}
-
-/// [`parse_block_header_salvaging`], and whether the header's CRC failed.
+/// A block header, and whether its CRC failed; under salvage a header whose
+/// CRC fails is read as stored, and the damage recorded at `report_offset`.
 fn parse_block_header_flagged(
     input: &[u8],
     offset: usize,
@@ -3721,17 +3345,6 @@ fn file_block_total_size(
 /// to decode as far as it goes: one that isn't split across volumes.
 fn salvages_cut_member(options: &crate::ArchiveReadOptions<'_>, file: &FileHeader) -> bool {
     options.salvage && !file.is_split_before() && !file.is_split_after()
-}
-
-fn checked_block_next(block: &BlockHeader, total: usize, archive_len: usize) -> Result<usize> {
-    let next = block
-        .offset
-        .checked_add(total)
-        .ok_or(Error::InvalidHeader("RAR 1.5 block size overflows usize"))?;
-    if next > archive_len {
-        return Err(Error::TooShort);
-    }
-    Ok(next)
 }
 
 /// Where the walk goes after a block that carries no member data, or `None`
@@ -4134,37 +3747,27 @@ mod tests {
                 test_write_main_header(&mut bytes, 0);
                 bytes.extend_from_slice(&header);
                 bytes.resize(bytes.len() + available, 0);
-                for result in [
-                    Archive::parse(&bytes),
-                    Archive::parse_seekable(
-                        std::io::Cursor::new(&bytes),
-                        bytes.len() as u64,
-                        0,
-                        ArchiveSource::Memory(Arc::from(bytes.clone())),
-                        crate::ArchiveReadOptions::new(),
-                    ),
-                ] {
-                    if available < 4 && head_type == FILE_HEAD {
-                        assert!(
-                            matches!(result, Err(Error::TooShort)),
-                            "type {head_type:x}, extent {available}: {result:?}"
-                        );
-                    } else if available < 4 {
-                        // A cut service or end block ends the walk without
-                        // being kept, and is reported as where the file ends.
-                        let archive = result.unwrap();
-                        assert!(
-                            archive.blocks.is_empty(),
-                            "type {head_type:x}, extent {available}"
-                        );
-                        let truncation = archive.truncation().unwrap();
-                        assert_eq!(truncation.offset, 20, "type {head_type:x}");
-                        assert!(truncation.started);
-                    } else {
-                        let archive = result.unwrap();
-                        assert_eq!(archive.blocks.len(), 1);
-                        assert_eq!(archive.truncation(), None);
-                    }
+                let result = Archive::parse(&bytes);
+                if available < 4 && head_type == FILE_HEAD {
+                    assert!(
+                        matches!(result, Err(Error::TooShort)),
+                        "type {head_type:x}, extent {available}: {result:?}"
+                    );
+                } else if available < 4 {
+                    // A cut service or end block ends the walk without
+                    // being kept, and is reported as where the file ends.
+                    let archive = result.unwrap();
+                    assert!(
+                        archive.blocks.is_empty(),
+                        "type {head_type:x}, extent {available}"
+                    );
+                    let truncation = archive.truncation().unwrap();
+                    assert_eq!(truncation.offset, 20, "type {head_type:x}");
+                    assert!(truncation.started);
+                } else {
+                    let archive = result.unwrap();
+                    assert_eq!(archive.blocks.len(), 1);
+                    assert_eq!(archive.truncation(), None);
                 }
             }
         }
@@ -4201,28 +3804,18 @@ mod tests {
                 }
                 bytes.extend_from_slice(&header);
                 let options = crate::ArchiveReadOptions::with_password(b"pw");
-                for result in [
-                    Archive::parse_with_options(&bytes, options),
-                    Archive::parse_seekable(
-                        std::io::Cursor::new(&bytes),
-                        bytes.len() as u64,
-                        0,
-                        ArchiveSource::Memory(Arc::from(bytes.clone())),
-                        options,
-                    ),
-                ] {
-                    // On 64-bit, plain relative FILE size fits exactly, but the
-                    // containing archive offset (or encrypted physical prefix) does not.
-                    let expected = if usize::BITS == 32 && !encrypted {
-                        "RAR 1.5 packed file size overflows usize"
-                    } else {
-                        "RAR 1.5 block size overflows usize"
-                    };
-                    assert!(
-                        matches!(result, Err(Error::InvalidHeader(message)) if message == expected),
-                        "{result:?}"
-                    );
-                }
+                let result = Archive::parse_with_options(&bytes, options);
+                // On 64-bit, plain relative FILE size fits exactly, but the
+                // containing archive offset (or encrypted physical prefix) does not.
+                let expected = if usize::BITS == 32 && !encrypted {
+                    "RAR 1.5 packed file size overflows usize"
+                } else {
+                    "RAR 1.5 block size overflows usize"
+                };
+                assert!(
+                    matches!(result, Err(Error::InvalidHeader(message)) if message == expected),
+                    "{result:?}"
+                );
             }
         }
     }
@@ -4311,29 +3904,19 @@ mod tests {
                 }
                 bytes.extend_from_slice(&header);
                 let options = crate::ArchiveReadOptions::with_password(b"pw");
-                for result in [
-                    Archive::parse_with_options(&bytes, options),
-                    Archive::parse_seekable(
-                        std::io::Cursor::new(&bytes),
-                        bytes.len() as u64,
-                        0,
-                        ArchiveSource::Memory(Arc::from(bytes.clone())),
-                        options,
-                    ),
-                ] {
-                    if corrupt && encrypted {
-                        assert!(
-                            matches!(result, Err(Error::WrongPasswordOrCorruptData)),
-                            "{result:?}"
-                        );
-                    } else if corrupt {
-                        assert!(
-                            matches!(result, Err(Error::CrcMismatch { .. })),
-                            "{result:?}"
-                        );
-                    } else {
-                        assert!(matches!(result.unwrap().blocks.last(), Some(Block::End(_))));
-                    }
+                let result = Archive::parse_with_options(&bytes, options);
+                if corrupt && encrypted {
+                    assert!(
+                        matches!(result, Err(Error::WrongPasswordOrCorruptData)),
+                        "{result:?}"
+                    );
+                } else if corrupt {
+                    assert!(
+                        matches!(result, Err(Error::CrcMismatch { .. })),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(matches!(result.unwrap().blocks.last(), Some(Block::End(_))));
                 }
             }
         }
@@ -4401,7 +3984,7 @@ mod tests {
     }
 
     #[test]
-    fn nested_comment_crc_failure_survives_both_parser_adapters() {
+    fn nested_comment_crc_failure_is_refused() {
         let mut bytes = RAR15_SIGNATURE.to_vec();
         test_write_main_header(&mut bytes, MHD_COMMENT);
         let nested = bytes.len();
@@ -4416,23 +3999,13 @@ mod tests {
                 input[nested] ^= 1;
             }
             let memory = Archive::parse(&input);
-            let seekable = Archive::parse_seekable(
-                std::io::Cursor::new(&input),
-                input.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(input.clone())),
-                crate::ArchiveReadOptions::new(),
-            );
             if corrupt {
                 assert!(matches!(memory, Err(Error::CrcMismatch { .. })));
-                assert!(matches!(seekable, Err(Error::CrcMismatch { .. })));
             } else {
-                for archive in [memory.unwrap(), seekable.unwrap()] {
-                    assert_eq!(
-                        archive.archive_comment().unwrap().as_deref(),
-                        Some(&b"note"[..])
-                    );
-                }
+                assert_eq!(
+                    memory.unwrap().archive_comment().unwrap().as_deref(),
+                    Some(&b"note"[..])
+                );
             }
         }
     }
@@ -4568,25 +4141,15 @@ mod tests {
         header[5..7].copy_from_slice(&26u16.to_le_bytes());
         bytes.extend_from_slice(&header);
         test_write_header_crc(&mut bytes, start);
-        for result in [
-            Archive::parse(&bytes),
-            Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(bytes.clone())),
-                crate::ArchiveReadOptions::new(),
-            ),
-        ] {
-            let archive = result.unwrap();
-            let skipped = archive.skipped_blocks();
-            assert_eq!(skipped.len(), 1);
-            assert_eq!(
-                (skipped[0].offset, skipped[0].reason),
-                (start as u64, "RAR 2.x recovery header is missing data size")
-            );
-            assert!(matches!(archive.blocks[..], [Block::Unknown(_)]));
-        }
+        let result = Archive::parse(&bytes);
+        let archive = result.unwrap();
+        let skipped = archive.skipped_blocks();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(
+            (skipped[0].offset, skipped[0].reason),
+            (start as u64, "RAR 2.x recovery header is missing data size")
+        );
+        assert!(matches!(archive.blocks[..], [Block::Unknown(_)]));
     }
 
     #[test]
@@ -4606,30 +4169,20 @@ mod tests {
         header[40] = b'x';
         bytes.extend_from_slice(&header);
         test_write_header_crc(&mut bytes, start);
-        for result in [
-            Archive::parse(&bytes),
-            Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(bytes.clone())),
-                crate::ArchiveReadOptions::new(),
+        let result = Archive::parse(&bytes);
+        let expected = if usize::BITS == 32 {
+            // The low u32 payload plus its header already exceeds usize.
+            "RAR 1.5 block size overflows usize"
+        } else {
+            "RAR 1.5 packed file size overflows usize"
+        };
+        assert!(
+            matches!(
+                result,
+                Err(Error::InvalidHeader(message)) if message == expected
             ),
-        ] {
-            let expected = if usize::BITS == 32 {
-                // The low u32 payload plus its header already exceeds usize.
-                "RAR 1.5 block size overflows usize"
-            } else {
-                "RAR 1.5 packed file size overflows usize"
-            };
-            assert!(
-                matches!(
-                    result,
-                    Err(Error::InvalidHeader(message)) if message == expected
-                ),
-                "expected {expected}, got {result:?}"
-            );
-        }
+            "expected {expected}, got {result:?}"
+        );
     }
 
     #[test]
@@ -4657,26 +4210,15 @@ mod tests {
                 encrypted.then_some(&b"secret"[..]),
             );
             let memory = Archive::parse_with_options(&bytes, options).unwrap();
-            let seekable = Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                19,
-                ArchiveSource::Memory(Arc::from(bytes.clone())),
-                options,
-            )
-            .unwrap();
             assert_eq!(memory.sfx_offset, 19);
-            assert_eq!(memory.blocks, seekable.blocks);
-            for archive in [&memory, &seekable] {
-                let mut output = Vec::new();
-                archive
-                    .files()
-                    .next()
-                    .unwrap()
-                    .write_stored_to(archive, options.password, &mut output)
-                    .unwrap();
-                assert_eq!(output, b"sfx payload bytes");
-            }
+            let mut output = Vec::new();
+            memory
+                .files()
+                .next()
+                .unwrap()
+                .write_stored_to(&memory, options.password, &mut output)
+                .unwrap();
+            assert_eq!(output, b"sfx payload bytes");
         }
     }
 
@@ -4888,7 +4430,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_large_size_fields_have_matching_parser_refusals() {
+    fn incomplete_large_size_fields_are_refused() {
         for head_type in [FILE_HEAD, NEWSUB_HEAD] {
             for size in 32u16..=40 {
                 let mut bytes = RAR15_SIGNATURE.to_vec();
@@ -4903,21 +4445,10 @@ mod tests {
                 bytes.extend_from_slice(&header);
                 test_write_header_crc(&mut bytes, start);
                 let memory = Archive::parse(&bytes);
-                let seekable = Archive::parse_seekable(
-                    std::io::Cursor::new(&bytes),
-                    bytes.len() as u64,
-                    0,
-                    ArchiveSource::Memory(Arc::from(bytes.clone())),
-                    crate::ArchiveReadOptions::new(),
-                );
                 if size < 40 {
-                    assert!(matches!(memory, Err(Error::TooShort)), "memory size {size}");
-                    assert!(
-                        matches!(seekable, Err(Error::TooShort)),
-                        "seekable size {size}"
-                    );
+                    assert!(matches!(memory, Err(Error::TooShort)), "size {size}");
                 } else {
-                    assert_eq!(memory.unwrap().blocks, seekable.unwrap().blocks);
+                    memory.unwrap();
                 }
             }
         }
@@ -5091,7 +4622,7 @@ mod tests {
     }
 
     #[test]
-    fn seekable_comment_unknown_and_truncated_payload_match_memory_parser() {
+    fn short_comment_blocks_are_refused_and_unknown_blocks_kept() {
         for (kind, size, add_size) in [
             (COMM_HEAD, 13u16, 0u32),
             (0x7f, 11, 0),
@@ -5109,20 +4640,11 @@ mod tests {
             bytes.resize(start + usize::from(size), 0);
             test_write_header_crc(&mut bytes, start);
             let memory = Archive::parse(&bytes);
-            let seekable = Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(std::sync::Arc::from(bytes.clone())),
-                crate::ArchiveReadOptions::new(),
+            assert_eq!(
+                memory.is_err(),
+                size < 13 && kind == COMM_HEAD,
+                "type {kind:x}, size {size}, data {add_size}"
             );
-            if size < 13 && kind == COMM_HEAD {
-                assert_eq!(memory.unwrap_err().kind(), seekable.unwrap_err().kind());
-            } else {
-                let memory = memory.unwrap();
-                let seekable = seekable.unwrap();
-                assert_eq!(memory.blocks, seekable.blocks);
-            }
         }
     }
 
@@ -5151,7 +4673,7 @@ mod tests {
 
     /// Issue #489: short old authenticity, signature and recovery blocks, and
     /// a recovery block whose data size doesn't match its header, are passed
-    /// over by their declared size and reported, in both walks.
+    /// over by their declared size and reported.
     #[test]
     fn malformed_optional_legacy_blocks_are_skipped_and_reported() {
         const SHORT_AUTH: &str = "RAR legacy authenticity block is too short";
@@ -5194,31 +4716,21 @@ mod tests {
             bytes.resize(bytes.len() + add_size as usize, 0);
             expected.push((start as u64, PROTECT_HEAD, reason));
         }
-        let memory = Archive::parse(&bytes).unwrap();
-        let seekable = Archive::parse_seekable(
-            std::io::Cursor::new(&bytes),
-            bytes.len() as u64,
-            0,
-            ArchiveSource::Memory(Arc::from(bytes.clone())),
-            crate::ArchiveReadOptions::new(),
-        )
-        .unwrap();
-        for archive in [&memory, &seekable] {
-            let skipped: Vec<_> = archive
-                .skipped_blocks()
-                .iter()
-                .map(|skip| (skip.offset, skip.head_type, skip.reason))
-                .collect();
-            assert_eq!(skipped, expected);
-            assert_eq!(archive.blocks.len(), 6);
-            assert!(archive
-                .blocks
-                .iter()
-                .all(|block| matches!(block, Block::Unknown(_))));
-            assert_eq!(archive.truncation(), None);
-        }
+        let archive = Archive::parse(&bytes).unwrap();
+        let skipped: Vec<_> = archive
+            .skipped_blocks()
+            .iter()
+            .map(|skip| (skip.offset, skip.head_type, skip.reason))
+            .collect();
+        assert_eq!(skipped, expected);
+        assert_eq!(archive.blocks.len(), 6);
+        assert!(archive
+            .blocks
+            .iter()
+            .all(|block| matches!(block, Block::Unknown(_))));
+        assert_eq!(archive.truncation(), None);
         assert_eq!(
-            memory.skipped_blocks()[0].to_string(),
+            archive.skipped_blocks()[0].to_string(),
             format!(
                 "skipped malformed block 0x76 at offset {}: {SHORT_AUTH}",
                 expected[0].0
@@ -6161,15 +5673,7 @@ mod tests {
         bytes.extend_from_slice(&plain);
         let options = crate::ArchiveReadOptions::new();
         for first in [true, false] {
-            let memory = decrypt_encrypted_header_at(
-                &bytes,
-                0,
-                b"pw",
-                first,
-                &cache,
-                &mut crate::parse_budget::ParseBudget::new(options),
-            );
-            let seekable = read_encrypted_header_at(
+            let result = read_encrypted_header_at(
                 &mut std::io::Cursor::new(&bytes),
                 bytes.len() as u64,
                 0,
@@ -6179,20 +5683,32 @@ mod tests {
                 &cache,
                 &mut crate::parse_budget::ParseBudget::new(options),
             );
-            for result in [memory, seekable] {
-                if first {
-                    assert!(matches!(result, Err(Error::WrongPasswordOrCorruptData)));
-                } else {
-                    assert_eq!(result.unwrap().block.head_type, head_type);
-                }
+            if first {
+                assert!(matches!(result, Err(Error::WrongPasswordOrCorruptData)));
+            } else {
+                assert_eq!(result.unwrap().block.head_type, head_type);
             }
         }
     }
 
     #[test]
     #[cfg(feature = "encryption")]
-    fn encrypted_header_readers_reject_short_prefixes_and_declared_headers() {
+    fn encrypted_header_reader_rejects_short_prefixes_and_declared_headers() {
         let cache = KeyCache::default();
+        let read = |bytes: &[u8]| {
+            read_encrypted_header_at(
+                &mut std::io::Cursor::new(bytes),
+                bytes.len() as u64,
+                0,
+                0,
+                b"pw",
+                false,
+                &cache,
+                &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new()),
+            )
+            .err()
+            .unwrap()
+        };
         for size in [0u16, 6, 17, 65] {
             let mut plain = [0; 16];
             plain[5..7].copy_from_slice(&size.to_le_bytes());
@@ -6203,69 +5719,17 @@ mod tests {
                 .unwrap();
             let mut bytes = vec![0; 8];
             bytes.extend_from_slice(&plain);
-            let options = crate::ArchiveReadOptions::new();
-            let memory = decrypt_encrypted_header_at(
-                &bytes,
-                0,
-                b"pw",
-                false,
-                &cache,
-                &mut crate::parse_budget::ParseBudget::new(options),
-            )
-            .err()
-            .unwrap();
-            let seekable = read_encrypted_header_at(
-                &mut std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                0,
-                b"pw",
-                false,
-                &cache,
-                &mut crate::parse_budget::ParseBudget::new(options),
-            )
-            .err()
-            .unwrap();
             if size < 7 {
                 assert!(matches!(
-                    memory,
-                    Error::InvalidHeader("RAR 1.5 block header is too short")
-                ));
-                assert!(matches!(
-                    seekable,
+                    read(&bytes),
                     Error::InvalidHeader("RAR 1.5 block header is too short")
                 ));
             } else {
-                assert!(matches!(memory, Error::TooShort));
-                assert!(matches!(seekable, Error::TooShort));
+                assert!(matches!(read(&bytes), Error::TooShort));
             }
         }
         for available in [0, 7, 8, 23] {
-            let bytes = vec![0; available];
-            assert!(matches!(
-                decrypt_encrypted_header_at(
-                    &bytes,
-                    0,
-                    b"pw",
-                    false,
-                    &cache,
-                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
-                ),
-                Err(Error::TooShort)
-            ));
-            assert!(matches!(
-                read_encrypted_header_at(
-                    &mut std::io::Cursor::new(&bytes),
-                    available as u64,
-                    0,
-                    0,
-                    b"pw",
-                    false,
-                    &cache,
-                    &mut crate::parse_budget::ParseBudget::new(crate::ArchiveReadOptions::new())
-                ),
-                Err(Error::TooShort)
-            ));
+            assert!(matches!(read(&vec![0; available]), Error::TooShort));
         }
     }
 
@@ -6321,20 +5785,10 @@ mod tests {
             Archive::parse_with_options(&bytes, options),
             Err(Error::TooShort)
         ));
-        assert!(matches!(
-            Archive::parse_seekable(
-                std::io::Cursor::new(&bytes),
-                bytes.len() as u64,
-                0,
-                ArchiveSource::Memory(Arc::from(bytes.clone())),
-                options
-            ),
-            Err(Error::TooShort)
-        ));
     }
 
     #[test]
-    fn memory_and_seekable_parsers_reject_invalid_file_header_lengths() {
+    fn parser_rejects_invalid_file_header_lengths() {
         let original = stored_archive_bytes(b"lengths.txt", b"payload");
         let file_offset = Archive::parse(&original)
             .unwrap()
@@ -6352,29 +5806,18 @@ mod tests {
                 crate::ArchiveReadOptions::default(),
                 crate::ArchiveReadOptions::default().with_max_header_bytes(u64::MAX),
             ] {
-                let memory = Archive::parse_with_options(&bytes, options).unwrap_err();
-                let seekable = Archive::parse_seekable(
-                    std::io::Cursor::new(&bytes),
-                    bytes.len() as u64,
-                    0,
-                    ArchiveSource::Memory(Arc::from(bytes.clone().into_boxed_slice())),
-                    options,
-                )
-                .unwrap_err();
-
+                let error = Archive::parse_with_options(&bytes, options).unwrap_err();
                 if truncated {
-                    assert!(matches!(memory, Error::TooShort));
-                    assert!(matches!(seekable, Error::TooShort));
+                    assert!(matches!(error, Error::TooShort));
                 } else {
-                    assert!(matches!(memory, Error::InvalidHeader(_)));
-                    assert!(matches!(seekable, Error::InvalidHeader(_)));
+                    assert!(matches!(error, Error::InvalidHeader(_)));
                 }
             }
         }
     }
 
     #[test]
-    fn parsers_reject_a_validly_checksummed_non_main_header() {
+    fn parser_rejects_a_validly_checksummed_non_main_header() {
         let mut bytes = stored_archive_bytes(b"entry.txt", b"payload");
         let main_offset = RAR15_SIGNATURE.len();
         let main_size =
@@ -6382,21 +5825,8 @@ mod tests {
         bytes[main_offset + 2] = FILE_HEAD;
         test_write_header_crc(&mut bytes[main_offset..main_offset + main_size], 0);
 
-        let memory = Archive::parse(&bytes).unwrap_err();
-        let seekable = Archive::parse_seekable(
-            std::io::Cursor::new(&bytes),
-            bytes.len() as u64,
-            0,
-            ArchiveSource::Memory(Arc::from(bytes.clone().into_boxed_slice())),
-            crate::ArchiveReadOptions::default(),
-        )
-        .unwrap_err();
         assert!(matches!(
-            memory,
-            Error::InvalidHeader("RAR 1.5 main header is missing")
-        ));
-        assert!(matches!(
-            seekable,
+            Archive::parse(&bytes).unwrap_err(),
             Error::InvalidHeader("RAR 1.5 main header is missing")
         ));
     }
