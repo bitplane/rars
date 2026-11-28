@@ -86,7 +86,7 @@ impl Limited {
     pub(crate) fn is_limited(&self) -> bool {
         self.ledger.is_some()
     }
-    #[cfg(any(test, feature = "write"))]
+    #[cfg(feature = "write")]
     pub(crate) fn limit(&self) -> u64 {
         self.ledger.as_ref().map_or(u64::MAX, |ledger| ledger.limit)
     }
