@@ -590,16 +590,13 @@ impl Archive {
         selector: Option<&mut crate::extraction_control::Selector<'_>>,
         on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
     ) -> Result<crate::ExtractionOutcome> {
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.extract_with_allowance(
-                options,
-                open,
-                selector,
-                on_error,
-                &crate::codec::workspace::Allowance::limited(limit),
-            );
-        }
-        self.extract_with_allowance(options, open, selector, on_error, &Allowance::default())
+        self.extract_with_allowance(
+            options,
+            open,
+            selector,
+            on_error,
+            &options.reader_allowance(),
+        )
     }
 
     fn extract_with_allowance(
@@ -753,17 +750,7 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.archive_comment_with_allowance(options, &Allowance::limited(limit));
-        }
-        self.archive_comment_with_allowance(options, &Allowance::default())
-    }
-
-    fn archive_comment_with_allowance(
-        &self,
-        options: crate::ArchiveReadOptions<'_>,
-        allowance: &Allowance,
-    ) -> Result<Option<Vec<u8>>> {
+        let allowance = &options.reader_allowance();
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if !self.main.has_archive_comment() {
@@ -1128,26 +1115,10 @@ pub fn extract_volumes_to_with_options<F>(
 where
     F: FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 {
-    if let Some(limit) = options.max_reader_workspace_bytes {
-        return extract_volumes_with_allowance(
-            volumes,
-            options,
-            &mut open,
-            &Allowance::limited(limit),
-        );
-    }
-    extract_volumes_with_allowance(volumes, options, &mut open, &Allowance::default())
-}
-
-fn extract_volumes_with_allowance(
-    volumes: &[Archive],
-    options: crate::ArchiveReadOptions<'_>,
-    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    allowance: &Allowance,
-) -> Result<()> {
+    let allowance = &options.reader_allowance();
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);
-    volumes::extract(&mut feed, options, open, allowance)
+    volumes::extract(&mut feed, options, &mut open, allowance)
 }
 
 pub(crate) fn extract_from_feed(
@@ -1155,10 +1126,7 @@ pub(crate) fn extract_from_feed(
     options: crate::ArchiveReadOptions<'_>,
     open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
 ) -> Result<()> {
-    if let Some(limit) = options.max_reader_workspace_bytes {
-        return volumes::extract(feed, options, open, &Allowance::limited(limit));
-    }
-    volumes::extract(feed, options, open, &Allowance::default())
+    volumes::extract(feed, options, open, &options.reader_allowance())
 }
 
 struct Rar13ChecksumWriter<'a, W: Write + ?Sized> {

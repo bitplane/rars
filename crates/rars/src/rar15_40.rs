@@ -406,13 +406,9 @@ impl FileHeader {
         // Block admission bounded head_size; comment admission requires >=13.
         let packed = &self.file_comment[COMMENT_HEADER_SIZE..head_size];
         let mut budget = crate::output_limit::OutputBudget::new(options);
-        match options.max_reader_workspace_bytes {
-            Some(limit) => {
-                header.decode_with_allowance(packed, &mut budget, &Allowance::limited(limit))
-            }
-            None => header.decode_with_budget(packed, &mut budget),
-        }
-        .map(Some)
+        header
+            .decode_with_allowance(packed, &mut budget, &options.reader_allowance())
+            .map(Some)
     }
 
     pub fn is_stored(&self) -> bool {
@@ -766,15 +762,6 @@ impl CommentHeader {
             && usize::from(self.unp_size) <= usize::from(u16::MAX) - COMMENT_HEADER_SIZE
             && (self.method == 0x30
                 || ((0x31..=0x35).contains(&self.method) && matches!(self.unp_ver, 15 | 20 | 26)))
-    }
-
-    /// Unpacks comment data and checks it against the header's 16-bit CRC.
-    fn decode_with_budget(
-        &self,
-        packed: &[u8],
-        budget: &mut crate::output_limit::OutputBudget,
-    ) -> Result<Vec<u8>> {
-        self.decode_with_allowance(packed, budget, &Allowance::default())
     }
 
     fn decode_with_allowance(
@@ -1732,39 +1719,11 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
         open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        selector: Option<&mut crate::extraction_control::Selector<'_>>,
-        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
-        links: Option<&mut LegacyLink<'_>>,
-    ) -> Result<crate::ExtractionOutcome> {
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.extract_with_allowance(
-                options,
-                open,
-                selector,
-                on_error,
-                links,
-                &crate::codec::workspace::Allowance::limited(limit),
-            );
-        }
-        self.extract_with_allowance(
-            options,
-            open,
-            selector,
-            on_error,
-            links,
-            &crate::codec::workspace::Allowance::default(),
-        )
-    }
-
-    fn extract_with_allowance(
-        &self,
-        options: crate::ArchiveReadOptions<'_>,
-        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         mut links: Option<&mut LegacyLink<'_>>,
-        allowance: &Allowance,
     ) -> Result<crate::ExtractionOutcome> {
+        let allowance = &options.reader_allowance();
         debug_assert!(links.is_none() || selector.is_none());
         options.check_cancelled()?;
         let password = options.password;
@@ -1955,16 +1914,13 @@ impl Archive {
                 .map(|_| ());
         }
 
-        match options.max_reader_workspace_bytes {
-            Some(limit) => self.parallel_with(
-                options,
-                open,
-                links,
-                verification,
-                &Allowance::limited(limit),
-            ),
-            None => self.parallel_with(options, open, links, verification, &Allowance::default()),
-        }?;
+        self.parallel_with(
+            options,
+            open,
+            links,
+            verification,
+            &options.reader_allowance(),
+        )?;
         options.check_cancelled()
     }
 
@@ -2058,17 +2014,7 @@ impl Archive {
         &self,
         options: crate::ArchiveReadOptions<'_>,
     ) -> Result<Option<Vec<u8>>> {
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.archive_comment_with_allowance(options, &Allowance::limited(limit));
-        }
-        self.archive_comment_with_allowance(options, &Allowance::default())
-    }
-
-    fn archive_comment_with_allowance(
-        &self,
-        options: crate::ArchiveReadOptions<'_>,
-        allowance: &Allowance,
-    ) -> Result<Option<Vec<u8>>> {
+        let allowance = &options.reader_allowance();
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if let Some(comment) = self.blocks.iter().find_map(|block| match block {
@@ -4216,7 +4162,9 @@ mod tests {
             let mut budget =
                 crate::output_limit::OutputBudget::new(crate::ArchiveReadOptions::new());
             assert_eq!(
-                comment.decode_with_budget(&packed, &mut budget).unwrap(),
+                comment
+                    .decode_with_allowance(&packed, &mut budget, &Allowance::default())
+                    .unwrap(),
                 text
             );
             let mut limited = crate::output_limit::OutputBudget::new(
@@ -4224,7 +4172,7 @@ mod tests {
             );
             assert!(matches!(
                 comment
-                    .decode_with_budget(&packed, &mut limited)
+                    .decode_with_allowance(&packed, &mut limited, &Allowance::default())
                     .unwrap_err()
                     .root_cause(),
                 Error::MemberOutputLimitExceeded { .. }
@@ -4236,7 +4184,7 @@ mod tests {
                     crate::ArchiveReadOptions::new().with_cancellation(&token),
                 );
                 budget.control.cancel_after_checks(checks);
-                match comment.decode_with_budget(&packed, &mut budget) {
+                match comment.decode_with_allowance(&packed, &mut budget, &Allowance::default()) {
                     Ok(output) => {
                         assert_eq!(output, text);
                         assert!(checks > 2);
