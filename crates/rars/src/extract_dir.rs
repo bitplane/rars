@@ -151,8 +151,8 @@ impl Archive {
     /// target stays inside `dir`, else they are left out and listed in
     /// [`ExtractedDir::skipped_links`], or always left out with
     /// [`ExtractDirOptions::skip_symlinks`]. A hard link or file copy whose
-    /// target was not extracted earlier fails the call. Where the platform can't
-    /// create a symbolic link, the call fails.
+    /// target was not extracted earlier fails as its own member. Where the
+    /// platform can't create a symbolic link, the call fails.
     ///
     /// A member that fails ends the call with its error, leaving the members
     /// before it in place, unless `options.read` has a member error handler;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::extraction_control::{finish_member, finish_split_member, Resume};
+use crate::extraction_control::{finish_independent, finish_member, finish_split_member, Resume};
 use crate::output_limit::OutputBudget;
 use crate::rar50::{Block, FHFL_UNP_SIZE_UNKNOWN};
 use crate::source::{ArchiveSource, RangeReader};
@@ -102,7 +102,9 @@ pub(super) fn extract(
             {
                 if redirections == Redirections::Emit {
                     options.check_cancelled()?;
-                    redirect(&file.metadata(), redirection)?;
+                    let result = redirect(&file.metadata(), redirection);
+                    // A link decodes nothing, so the session carries on as it was.
+                    finish_independent(options, || crate::rar50_member(file), result)?;
                     options.check_cancelled()?;
                 }
                 continue;

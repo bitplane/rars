@@ -96,3 +96,24 @@ def test_skip_symlinks_on_extract_and_with_flatten(tmp_path, format):
     assert not os.path.lexists(tmp_path / "one/near.txt")
     assert not os.path.lexists(tmp_path / "flat/near.txt")
     assert (tmp_path / "flat/target.txt").read_bytes() == b"target"
+
+
+@pytest.mark.parametrize("volumes", [None, []])
+def test_a_hard_link_to_a_skipped_symlink_fails_as_its_own_member(tmp_path, volumes):
+    builder = rars.RarBuilder(level=0)
+    builder.add_bytes(b"target", "target.txt")
+    builder.add_unix_symlink("sym", "target.txt")
+    builder.add_unix_symlink("hard", "sym")
+    builder.add_bytes(b"after", "after.txt")
+    data = redirect(builder.to_bytes(), HARD_LINK, only="hard")
+
+    failed = []
+    written = rars.RarFile(data).extractall(
+        tmp_path, skip_symlinks=True, on_member_error=failed.append, volumes=volumes
+    )
+
+    assert [error.member for error in failed] == ["hard"]
+    assert "symbolic link left out" in str(failed[0])
+    assert not os.path.lexists(tmp_path / "hard")
+    assert (tmp_path / "after.txt").read_bytes() == b"after"
+    assert tmp_path / "after.txt" in written

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { lstat, mkdtemp, rm, stat } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm, stat } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -159,16 +159,22 @@ try {
     assert.equal(first.ino, second.ino);
   });
 
-  await check("a hard link to a symlink left out fails naming it", async () => {
+  await check("a hard link to a symlink left out fails as its own member", async () => {
     const bytes = redirect(await new RarWriter({ level: 0 })
       .add("target.txt", "target")
       .addSymlink("sym", "target.txt")
       .addSymlink("hard", "sym")
+      .add("after.txt", "after")
       .bytes(), "hard", HARD_LINK);
     const out = fresh();
-    await assert.rejects((await RarArchive.open(bytes)).extractAll(out, { skipSymlinks: true }),
-      /'hard'.*symbolic link left out/);
+    const failed = [];
+    const written = await (await RarArchive.open(bytes))
+      .extractAll(out, { skipSymlinks: true, onMemberError: (error) => failed.push(error) });
+    assert.equal(failed.length, 1);
+    assert.match(failed[0].message, /'hard'.*symbolic link left out/);
     assert.equal(await exists(path.join(out, "hard")), false);
+    assert.ok(written.includes(path.join(out, "after.txt")));
+    assert.equal(await readFile(path.join(out, "after.txt"), "utf8"), "after");
   });
 } finally {
   await rm(temporary, { recursive: true, force: true });

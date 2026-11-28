@@ -1008,7 +1008,7 @@ impl RarFile {
     /// `kind` one of `symlink`, `junction`, `hardlink` or `copy`, or with `skipped: true`
     /// and its raw target when following it could leave the output directory.
     /// `skipSymlinks` leaves symlinks and junctions out undelivered; a hard link or copy
-    /// to one fails.
+    /// to one fails as its own member.
     /// `readLink(path)` answers for that check: the target of the symbolic link already at
     /// `path` under the output directory, or undefined.
     ///
