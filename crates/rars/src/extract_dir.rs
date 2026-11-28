@@ -2,9 +2,9 @@
 
 use crate::extraction_control::ExtractionErrorAction;
 use crate::output_dir::{DirMode, DirOutputs};
+use crate::output_links::{extract_settled, SettledSource};
 use crate::output_staging::OverwritePolicy;
 use crate::{Archive, ArchiveFamily, ArchiveMember, ArchiveReadOptions, Error, ErrorKind, Result};
-use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -163,7 +163,7 @@ impl Archive {
         options: &ExtractDirOptions<'_>,
     ) -> Result<ExtractedDir> {
         extract_into(dir.as_ref(), self.family(), options, |read, outputs| {
-            crate::output_dir::extract_archive(self, read, outputs)
+            crate::output_dir::extract_archive(self, read, None, outputs)
         })
     }
 }
@@ -191,11 +191,14 @@ pub fn extract_volumes_to_dir(
         .first()
         .ok_or(Error::InvalidHeader("volume set is empty"))?;
     extract_into(dir.as_ref(), first.family(), options, |read, outputs| {
-        crate::extract_volumes_with_links(
-            volumes,
+        let lock = || outputs.lock().expect("outputs lock poisoned");
+        extract_settled(
+            SettledSource::Volumes(volumes),
             read,
-            |meta| outputs.borrow_mut().open(meta),
-            |meta, link| outputs.borrow_mut().link(meta, link),
+            None,
+            |meta| lock().open(meta),
+            |meta, link| lock().link(meta, link),
+            |_, outcome| lock().settle(outcome),
         )
     })
 }
@@ -204,12 +207,10 @@ fn extract_into(
     dir: &Path,
     family: ArchiveFamily,
     options: &ExtractDirOptions<'_>,
-    extract: impl FnOnce(ArchiveReadOptions<'_>, &RefCell<DirOutputs<'_>>) -> Result<()>,
+    extract: impl FnOnce(ArchiveReadOptions<'_>, &Mutex<DirOutputs<'_>>) -> Result<()>,
 ) -> Result<ExtractedDir> {
     options.read.check_cancelled()?;
     let caller = options.read.member_errors;
-    let keep_broken = options.read.salvage;
-    let failed = Mutex::new(Vec::new());
     let handler = |member: &ArchiveMember, error: &Error| {
         let Some(caller) = caller else {
             return Ok(ExtractionErrorAction::Abort);
@@ -217,19 +218,7 @@ fn extract_into(
         if matches!(error.kind(), ErrorKind::BadPassword | ErrorKind::Io) {
             return Ok(ExtractionErrorAction::Abort);
         }
-        let action = (caller.0)(member, error)?;
-        let kept = keep_broken
-            && !matches!(
-                error.kind(),
-                ErrorKind::PasswordRequired | ErrorKind::BadPassword
-            );
-        if action == ExtractionErrorAction::Continue && !kept {
-            failed
-                .lock()
-                .expect("failed members lock poisoned")
-                .push(member.meta.name.clone());
-        }
-        Ok(action)
+        (caller.0)(member, error)
     };
     let read = match caller {
         Some(_) => options.read.with_member_error_handler(&handler),
@@ -244,13 +233,15 @@ fn extract_into(
         flatten: false,
         exists_hint: "; set ExtractDirOptions::overwrite to replace it or keep both",
     };
-    let outputs = RefCell::new(DirOutputs::new(
+    let outputs = Mutex::new(DirOutputs::new(
         dir,
         family,
         read.legacy_name_encoding,
         mode,
-        caller.is_some().then_some(&failed),
     ));
     let result = extract(read, &outputs);
-    outputs.into_inner().finish(result)
+    outputs
+        .into_inner()
+        .expect("outputs lock poisoned")
+        .finish(result)
 }

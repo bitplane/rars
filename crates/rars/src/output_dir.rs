@@ -4,10 +4,10 @@
 
 use crate::extract_dir::{ExtractedDir, SkippedLink};
 use crate::in_flight::InFlight;
-use crate::output_links::{create_link_output, link_source_path, MadeLink};
+use crate::output_links::{create_link_output, link_source_path, MadeLink, Select, Settled};
 use crate::output_modes::{early_mode, set_file_mode, CreatedModes, PathModes};
 use crate::output_staging::{
-    failed_entry_name, publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
+    publish_verified_output, refused_output, ExtractionStaging, OverwritePolicy,
 };
 use crate::output_tree::{DeferredFile, FileDir, HeldFile, OutputTree, TreeEntry};
 use crate::publish_queue::{PublishQueue, PublishStep};
@@ -55,14 +55,11 @@ pub struct DirOutputs<'a> {
     rename_claims: HashSet<PathBuf>,
     staged: usize,
     storage: Option<Storage>,
-    pending: Option<PendingOutput>,
-    /// Members opened by [`Self::open_settled`] and not yet settled, oldest first.
+    /// Members opened and not yet settled, oldest first.
     unsettled: VecDeque<Unsettled>,
     /// Where unsettled members go.
     unsettled_paths: InFlight,
     skipped_links: Vec<SkippedLink>,
-    /// Members a member error handler went past, whose pending output is dropped.
-    failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
     queue: PublishQueue<Publishing>,
     /// A failure to publish was handed on: the run going on publishes what is held behind it.
     failure_given: bool,
@@ -117,12 +114,11 @@ struct PendingOutput {
     stored: PathBuf,
     destination: PathBuf,
     meta: crate::ExtractedEntryMeta,
-    /// A legacy symlink's target, buffered until verified.
-    link_target: Option<Arc<Mutex<Vec<u8>>>>,
 }
 
 enum Unsettled {
-    Refused,
+    /// Refused, or a directory flattening leaves out.
+    NoOutput,
     /// Made once it settles, so a file before it in the archive is published first.
     Directory {
         meta: crate::ExtractedEntryMeta,
@@ -221,14 +217,12 @@ impl Drop for StagedFile {
 
 impl<'a> DirOutputs<'a> {
     /// Outputs under `out_dir` for an archive of `family`, decoding legacy
-    /// names with `encoding`. A member named in `failed` when its output
-    /// would be published is dropped instead.
+    /// names with `encoding`.
     pub fn new(
         out_dir: &'a Path,
         family: crate::ArchiveFamily,
         encoding: Option<crate::filename::LegacyNameEncoding>,
         mode: DirMode,
-        failed: Option<&'a Mutex<Vec<Vec<u8>>>>,
     ) -> Self {
         let mut queue = PublishQueue::new(Publishing {
             out_dir: out_dir.to_path_buf(),
@@ -265,11 +259,9 @@ impl<'a> DirOutputs<'a> {
             rename_claims: HashSet::new(),
             staged: 0,
             storage: None,
-            pending: None,
             unsettled: VecDeque::new(),
             unsettled_paths: InFlight::default(),
             skipped_links: Vec::new(),
-            failed,
             queue,
             failure_given: false,
         }
@@ -381,39 +373,12 @@ impl<'a> DirOutputs<'a> {
         )
     }
 
-    /// Opens a file or directory member's output. The library has verified
-    /// the previous member by the time it asks for another output.
-    pub fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>> {
-        self.go_on();
-        self.publish_previous()?;
-        if self.flatten && meta.is_directory {
-            return Ok(Box::new(io::sink()));
-        }
-        let (stored, destination, existing) = self.destination(meta)?;
-        self.claim(&destination, meta)?;
-        if meta.is_directory {
-            self.submit(Job::Directory {
-                meta: meta.clone(),
-                destination,
-            });
-            self.publish_failure()?;
-            return Ok(Box::new(io::sink()));
-        }
-        if self.overwrite == OverwritePolicy::Never && exists(&destination, existing.as_ref()) {
-            return Err(self.already_exists(&destination).into());
-        }
-        if self.in_place {
-            return self.open_in_place(stored, destination, meta);
-        }
-        Ok(self.open_staged(stored, destination, meta)?)
-    }
-
-    /// For [`Self::settle`]: opening can't read what members still unsettled will publish, so writing in place or flattened can't use it.
-    pub fn open_settled(
+    /// In place or flattened, opening can't read what members still unsettled will publish, so they must have settled.
+    pub fn open(
         &mut self,
         meta: &crate::ExtractedEntryMeta,
     ) -> crate::Result<Box<dyn Write + Send>> {
-        debug_assert!(!self.in_place && !self.flatten);
+        debug_assert!(self.can_open_ahead() || self.unsettled.is_empty());
         self.go_on();
         let opened = self
             .publish_failure()
@@ -421,14 +386,14 @@ impl<'a> DirOutputs<'a> {
         let (writer, unsettled) = match opened {
             Ok(opened) => opened,
             Err(error) => {
-                self.unsettled.push_back(Unsettled::Refused);
+                self.unsettled.push_back(Unsettled::NoOutput);
                 return Err(error);
             }
         };
         let destination = match &unsettled {
             Unsettled::Output { pending, .. } => Some((&pending.destination, false)),
             Unsettled::Directory { destination, .. } => Some((destination, true)),
-            Unsettled::Refused => None,
+            Unsettled::NoOutput => None,
         };
         if let Some((destination, directory)) = destination {
             let relative = self.relative(destination);
@@ -438,10 +403,18 @@ impl<'a> DirOutputs<'a> {
         Ok(writer)
     }
 
+    /// Whether a member can open before the ones opened earlier settle: not in place or flattened.
+    pub fn can_open_ahead(&self) -> bool {
+        !self.in_place && !self.flatten
+    }
+
     fn open_unsettled(
         &mut self,
         meta: &crate::ExtractedEntryMeta,
     ) -> crate::Result<(Box<dyn Write + Send>, Unsettled)> {
+        if self.flatten && meta.is_directory {
+            return Ok((Box::new(io::sink()), Unsettled::NoOutput));
+        }
         let (stored, destination, existing) = self.destination(meta)?;
         self.claim(&destination, meta)?;
         if meta.is_directory {
@@ -454,24 +427,34 @@ impl<'a> DirOutputs<'a> {
         if self.overwrite == OverwritePolicy::Never && exists(&destination, existing.as_ref()) {
             return Err(self.already_exists(&destination).into());
         }
+        if self.in_place {
+            let (writer, pending) = self.open_in_place(stored, destination, meta)?;
+            return Ok((
+                writer,
+                Unsettled::Output {
+                    pending,
+                    recheck: false,
+                },
+            ));
+        }
         let recheck = self
             .unsettled_paths
             .changes(self.relative(&destination), false);
-        let writer = self.open_staged(stored, destination, meta)?;
-        let pending = self.pending.take().expect("staged above");
+        let (writer, pending) = self.open_staged(stored, destination, meta)?;
         Ok((writer, Unsettled::Output { pending, recheck }))
     }
 
-    /// Queues or drops the oldest member from [`Self::open_settled`]. An error
-    /// is that member's own, or an earlier member's that failed to publish.
-    pub fn settle(&mut self, verified: bool) -> crate::Result<()> {
+    /// Queues or drops the oldest member opened. An error is that member's
+    /// own, or an earlier member's that failed to publish.
+    pub fn settle(&mut self, outcome: Settled) -> crate::Result<()> {
+        let verified = outcome != Settled::Failed;
         self.go_on();
         let unsettled = self
             .unsettled
             .pop_front()
             .expect("only members opened are settled");
         match unsettled {
-            Unsettled::Refused => {}
+            Unsettled::NoOutput => {}
             Unsettled::Directory { meta, destination } => {
                 self.forget_unsettled(&destination, true);
                 if verified {
@@ -518,7 +501,7 @@ impl<'a> DirOutputs<'a> {
         stored: PathBuf,
         destination: PathBuf,
         meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write>> {
+    ) -> crate::Result<(Box<dyn Write + Send>, PendingOutput)> {
         let parent = destination
             .parent()
             .expect("checked output path has a file name")
@@ -527,7 +510,7 @@ impl<'a> DirOutputs<'a> {
         state.tree(true)?;
         let overwrite = self.overwrite;
         let state = &mut *state;
-        let (destination, writer, held): (_, Box<dyn Write>, _) = match &mut state.out_tree {
+        let (destination, writer, held): (_, Box<dyn Write + Send>, _) = match &mut state.out_tree {
             Some(tree) => {
                 let relative = destination
                     .strip_prefix(self.out_dir)
@@ -567,7 +550,7 @@ impl<'a> DirOutputs<'a> {
                 (destination, Box::new(file), None)
             }
         };
-        self.pending = Some(PendingOutput {
+        let pending = PendingOutput {
             staged: None,
             staged_at: None,
             closed: None,
@@ -575,9 +558,8 @@ impl<'a> DirOutputs<'a> {
             stored,
             destination,
             meta: meta.clone(),
-            link_target: None,
-        });
-        Ok(writer)
+        };
+        Ok((writer, pending))
     }
 
     /// Stages a member's file, to publish once it verifies.
@@ -586,7 +568,7 @@ impl<'a> DirOutputs<'a> {
         stored: PathBuf,
         destination: PathBuf,
         meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write + Send>> {
+    ) -> crate::Result<(Box<dyn Write + Send>, PendingOutput)> {
         if self.storage.is_none() {
             self.storage = Some(self.queue.state().storage()?);
         }
@@ -626,7 +608,7 @@ impl<'a> DirOutputs<'a> {
         self.staged += 1;
         let modified = self.modified_time(meta);
         let closed = Arc::new(CloseOutcome::default());
-        self.pending = Some(PendingOutput {
+        let pending = PendingOutput {
             staged: Some(staged),
             staged_at,
             closed: Some(Arc::clone(&closed)),
@@ -634,97 +616,24 @@ impl<'a> DirOutputs<'a> {
             stored,
             destination,
             meta: meta.clone(),
-            link_target: None,
-        });
-        Ok(Box::new(StagedFile {
+        };
+        let writer = StagedFile {
             file,
             modified,
             mode,
             created_modes: self.created_modes.clone(),
             closed,
-        }))
-    }
-
-    /// Publishes the member written last, once it has verified.
-    pub fn publish_pending(&mut self) -> crate::Result<()> {
-        self.go_on();
-        self.publish_previous()
-    }
-
-    /// Queues the member written last, which has verified, and reports any failure to publish.
-    fn publish_previous(&mut self) -> crate::Result<()> {
-        let Some(pending) = self.pending.take() else {
-            return self.publish_failure();
         };
-        // The library reports a failed member before it asks for the next output.
-        let failed = self.failed.is_some_and(|failed| {
-            let mut failed = failed.lock().expect("failed members lock poisoned");
-            let gone_past = failed.contains(&pending.meta.name);
-            failed.clear();
-            gone_past
-        });
-        if failed {
-            drop_staged(&pending);
-            return self.publish_failure();
-        }
-        if let Some(target) = pending.link_target {
-            let target = std::mem::take(&mut *target.lock().expect("link target lock poisoned"));
-            crate::output_links::check_legacy_symlink_target(
-                &pending.meta.name,
-                target.len() as u64,
-                Some(&target),
-            )?;
-            return self.link_after_queue(
-                &pending.meta,
-                ExtractedLink::Symlink {
-                    target: &target,
-                    directory: false,
-                },
-            );
-        }
-        self.submit(Job::Output(pending));
-        self.publish_failure()
+        Ok((Box::new(writer), pending))
     }
 
-    /// Buffers a legacy symlink's target; the link is made once the target is verified.
-    pub fn open_legacy_link(
-        &mut self,
-        meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write>> {
-        self.go_on();
-        self.publish_previous()?;
-        let target = Arc::new(Mutex::new(Vec::new()));
-        self.pending = Some(PendingOutput {
-            staged: None,
-            staged_at: None,
-            closed: None,
-            held: None,
-            stored: PathBuf::new(),
-            destination: PathBuf::new(),
-            meta: meta.clone(),
-            link_target: Some(Arc::clone(&target)),
-        });
-        Ok(Box::new(SharedBuffer(target)))
-    }
-
-    /// Creates a link member, or records it as skipped when it could lead
-    /// outside the directory.
+    /// Waits for every earlier output to publish, so a link finds what it names.
     pub fn link(
         &mut self,
         meta: &crate::ExtractedEntryMeta,
         link: ExtractedLink<'_>,
     ) -> crate::Result<()> {
         self.go_on();
-        self.link_after_queue(meta, link)
-    }
-
-    /// A link finds what it names, and is made, once every earlier output is published.
-    fn link_after_queue(
-        &mut self,
-        meta: &crate::ExtractedEntryMeta,
-        link: ExtractedLink<'_>,
-    ) -> crate::Result<()> {
-        self.publish_previous()?;
         if let (Some(skipped), ExtractedLink::Symlink { .. } | ExtractedLink::Junction { .. }) =
             (&mut self.skipped_symlinks, link)
         {
@@ -799,18 +708,11 @@ impl<'a> DirOutputs<'a> {
             }
         }
         let published = match &result {
-            Ok(()) => self.publish_pending(),
-            Err(error) => {
-                let verified = matches!(
-                    (failed_entry_name(error), &self.pending),
-                    (Some(failed), Some(pending)) if failed != pending.meta.name.as_slice()
-                );
-                if verified {
-                    // The extraction's own error wins over a failure to publish.
-                    let _ = self.publish_previous();
-                }
-                Ok(())
+            Ok(()) => {
+                self.go_on();
+                self.publish_failure()
             }
+            Err(_) => Ok(()),
         };
         let Self {
             queue,
@@ -1323,35 +1225,24 @@ fn like_create_dir_all(error: crate::Error, directory: &Path) -> crate::Error {
 
 /// Where [`extract_archive`] writes: [`DirOutputs`], or a wrapper around it.
 pub trait Outputs {
-    fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>>;
-    fn open_settled(
-        &mut self,
-        meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write + Send>>;
-    fn settle(&mut self, verified: bool) -> crate::Result<()>;
+    fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write + Send>>;
+    fn settle(&mut self, outcome: Settled) -> crate::Result<()>;
     fn link(
         &mut self,
         meta: &crate::ExtractedEntryMeta,
         link: ExtractedLink<'_>,
     ) -> crate::Result<()>;
-    /// Whether [`Self::open_settled`] can be used: not in place or flattened.
-    fn can_settle(&self) -> bool;
+    /// See [`DirOutputs::can_open_ahead`].
+    fn can_open_ahead(&self) -> bool;
 }
 
 impl Outputs for DirOutputs<'_> {
-    fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write>> {
+    fn open(&mut self, meta: &crate::ExtractedEntryMeta) -> crate::Result<Box<dyn Write + Send>> {
         DirOutputs::open(self, meta)
     }
 
-    fn open_settled(
-        &mut self,
-        meta: &crate::ExtractedEntryMeta,
-    ) -> crate::Result<Box<dyn Write + Send>> {
-        DirOutputs::open_settled(self, meta)
-    }
-
-    fn settle(&mut self, verified: bool) -> crate::Result<()> {
-        DirOutputs::settle(self, verified)
+    fn settle(&mut self, outcome: Settled) -> crate::Result<()> {
+        DirOutputs::settle(self, outcome)
     }
 
     fn link(
@@ -1362,8 +1253,8 @@ impl Outputs for DirOutputs<'_> {
         DirOutputs::link(self, meta, link)
     }
 
-    fn can_settle(&self) -> bool {
-        !self.in_place && !self.flatten
+    fn can_open_ahead(&self) -> bool {
+        DirOutputs::can_open_ahead(self)
     }
 }
 
@@ -1371,25 +1262,24 @@ impl Outputs for DirOutputs<'_> {
 pub fn extract_archive(
     archive: &crate::Archive,
     read: crate::ArchiveReadOptions<'_>,
-    outputs: &std::cell::RefCell<impl Outputs>,
+    select: Option<&Select<'_>>,
+    outputs: &Mutex<impl Outputs + Send>,
 ) -> crate::Result<()> {
-    // Salvage keeps a failed member's output, which it can only do before
-    // the next member opens.
-    let settle = outputs.borrow().can_settle() && !read.salvage;
-    if let (crate::Archive::Rar50Plus(rar50), true) = (archive, settle) {
-        return crate::output_links::extract_rar50_settled_with_links(
-            rar50,
+    let lock = || outputs.lock().expect("outputs lock poisoned");
+    let open = |meta: &crate::ExtractedEntryMeta| lock().open(meta);
+    let link = |meta: &crate::ExtractedEntryMeta, made: ExtractedLink<'_>| lock().link(meta, made);
+    let settled = |_: &crate::ExtractedEntryMeta, outcome| lock().settle(outcome);
+    if select.is_none() && !lock().can_open_ahead() {
+        return crate::output_links::settle_in_order(
             read,
-            |meta| outputs.borrow_mut().open_settled(meta),
-            |meta, link| outputs.borrow_mut().link(meta, link),
-            |_, verified| outputs.borrow_mut().settle(verified),
+            open,
+            link,
+            settled,
+            |read, open, link| archive.extract_with_links(read, open, link),
         );
     }
-    archive.extract_with_links(
-        read,
-        |meta| outputs.borrow_mut().open(meta),
-        |meta, link| outputs.borrow_mut().link(meta, link),
-    )
+    let source = crate::output_links::SettledSource::Archive(archive);
+    crate::output_links::extract_settled(source, read, select, open, link, settled)
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@
 mod sinks;
 use sinks::SyncCapture;
 
-use rars::output_links::{extract_settled, Select, Settled, SettledSource};
+use rars::output_links::{extract_settled, settle_in_order, Select, Settled, SettledSource};
 use rars::{
     ArchiveReadOptions, ArchiveReader, ArchiveVersion, Builder, ErrorKind, ExtractionErrorAction,
     ReadCancellation,
@@ -28,6 +28,7 @@ struct Case<'a> {
     on_error: Option<ExtractionErrorAction>,
     select: Option<&'a Select<'a>>,
     cancel_at: Option<(&'a str, &'a ReadCancellation)>,
+    in_order: bool,
 }
 
 fn run_with(source: SettledSource<'_>, options: ArchiveReadOptions<'_>, case: Case<'_>) -> Run {
@@ -35,6 +36,7 @@ fn run_with(source: SettledSource<'_>, options: ArchiveReadOptions<'_>, case: Ca
         on_error,
         select,
         cancel_at,
+        in_order,
     } = case;
     let events = Arc::new(Mutex::new(Vec::new()));
     let handler = |member: &rars::ArchiveMember, _: &rars::Error| {
@@ -48,59 +50,71 @@ fn run_with(source: SettledSource<'_>, options: ArchiveReadOptions<'_>, case: Ca
     };
     let opened: Opened = Arc::default();
     let kept = Arc::new(Mutex::new(Vec::new()));
-    let result = extract_settled(
-        source,
-        options,
-        select,
-        |meta| {
-            let data = Arc::new(Mutex::new(Vec::new()));
-            opened
-                .lock()
-                .unwrap()
-                .push((meta.name.clone(), data.clone()));
-            events
-                .lock()
-                .unwrap()
-                .push(format!("open {}", name(&meta.name)));
-            if let Some((at, token)) = cancel_at {
-                if meta.name == at.as_bytes() {
-                    token.cancel();
-                }
+    let open = |meta: &rars::ExtractedEntryMeta| -> rars::Result<Box<dyn std::io::Write + Send>> {
+        let data = Arc::new(Mutex::new(Vec::new()));
+        opened
+            .lock()
+            .unwrap()
+            .push((meta.name.clone(), data.clone()));
+        events
+            .lock()
+            .unwrap()
+            .push(format!("open {}", name(&meta.name)));
+        if let Some((at, token)) = cancel_at {
+            if meta.name == at.as_bytes() {
+                token.cancel();
             }
-            Ok(Box::new(SyncCapture(data)))
-        },
-        |meta, link| {
-            let event = format!("link {} {}", name(&meta.name), name(link.target()));
+        }
+        Ok(Box::new(SyncCapture(data)))
+    };
+    let link = |meta: &rars::ExtractedEntryMeta, link: rars::ExtractedLink<'_>| {
+        let event = format!("link {} {}", name(&meta.name), name(link.target()));
+        events.lock().unwrap().push(event);
+        Ok(())
+    };
+    let settled = {
+        let events = events.clone();
+        let opened = opened.clone();
+        let kept = kept.clone();
+        move |meta: &rars::ExtractedEntryMeta, outcome| {
+            let mut opened = opened.lock().unwrap();
+            assert!(!opened.is_empty(), "only opened members settle");
+            let (opened_name, data) = opened.remove(0);
+            assert_eq!(
+                opened_name, meta.name,
+                "members settle in the order they open"
+            );
+            let event = format!("settle {} {outcome:?}", name(&meta.name));
             events.lock().unwrap().push(event);
-            Ok(())
-        },
-        {
-            let events = events.clone();
-            let opened = opened.clone();
-            let kept = kept.clone();
-            move |meta, outcome| {
-                let mut opened = opened.lock().unwrap();
-                assert!(!opened.is_empty(), "only opened members settle");
-                let (opened_name, data) = opened.remove(0);
+            if outcome != Settled::Failed {
                 assert_eq!(
-                    opened_name, meta.name,
-                    "members settle in the order they open"
+                    Arc::strong_count(&data),
+                    1,
+                    "a member's writer is dropped before it settles"
                 );
-                let event = format!("settle {} {outcome:?}", name(&meta.name));
-                events.lock().unwrap().push(event);
-                if outcome != Settled::Failed {
-                    assert_eq!(
-                        Arc::strong_count(&data),
-                        1,
-                        "a member's writer is dropped before it settles"
-                    );
-                    let output = data.lock().unwrap().clone();
-                    kept.lock().unwrap().push((name(&meta.name), output));
-                }
-                Ok(())
+                let output = data.lock().unwrap().clone();
+                kept.lock().unwrap().push((name(&meta.name), output));
             }
-        },
-    );
+            Ok(())
+        }
+    };
+    let result = if in_order {
+        assert!(select.is_none(), "the walk driven chooses nothing");
+        settle_in_order(
+            options,
+            open,
+            link,
+            settled,
+            |read, open, link| match source {
+                SettledSource::Archive(archive) => archive.extract_with_links(read, open, link),
+                SettledSource::Volumes(volumes) => {
+                    rars::extract_volumes_with_links(volumes, read, open, link)
+                }
+            },
+        )
+    } else {
+        extract_settled(source, options, select, open, link, settled)
+    };
     assert!(
         opened.lock().unwrap().is_empty(),
         "every member opened settles"
@@ -798,6 +812,104 @@ fn a_selected_legacy_link_is_made_before_a_later_member_aborts() {
                 "fail bad"
             ],
             "{version:?}"
+        );
+    }
+}
+
+// Writing in place or flattened needs every earlier member settled before the next opens.
+fn opened_one_at_a_time(events: &[String]) -> bool {
+    let mut open = 0usize;
+    for event in events {
+        if event.starts_with("open ") {
+            if open > 0 {
+                return false;
+            }
+            open += 1;
+        } else if event.starts_with("settle ") {
+            open -= 1;
+        }
+    }
+    true
+}
+
+#[test]
+fn settling_in_order_opens_each_member_once_the_one_before_has_settled() {
+    let volume_sets = VOLUME_FAMILIES.map(volume_set);
+    let archives = FAMILIES.map(with_a_broken_member);
+    let sources = archives
+        .iter()
+        .map(SettledSource::Archive)
+        .chain(volume_sets.iter().map(|set| SettledSource::Volumes(set)));
+    for source in sources {
+        for threads in threads() {
+            let options = ArchiveReadOptions::new().with_threads(threads);
+            let in_order = |on_error| Case {
+                on_error,
+                in_order: true,
+                ..Case::default()
+            };
+
+            let carried_on = run_with(
+                source,
+                options,
+                in_order(Some(ExtractionErrorAction::Continue)),
+            );
+            let case = format!("{source:?} threads={threads}: {:?}", carried_on.events);
+            assert_eq!(carried_on.result, Ok(()), "{case}");
+            assert!(opened_one_at_a_time(&carried_on.events), "{case}");
+            let kept: Vec<_> = carried_on
+                .kept
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert_eq!(kept, ["a", "c"], "{case}");
+
+            let unhandled = run_with(source, options, in_order(None));
+            let case = format!("{source:?} threads={threads}: {:?}", unhandled.events);
+            assert_eq!(unhandled.result, Err(ErrorKind::ChecksumMismatch), "{case}");
+            assert!(opened_one_at_a_time(&unhandled.events), "{case}");
+            assert_eq!(
+                settled_order(&unhandled.events),
+                ["settle a Verified"],
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_selected_legacy_link_is_made_when_the_next_member_fails_before_it_opens() {
+    for version in [ArchiveVersion::Rar20, ArchiveVersion::Rar29] {
+        let mut builder = Builder::new(version).store(true);
+        builder
+            .add_bytes(b"a".to_vec(), b"first".to_vec(), None, None)
+            .unwrap();
+        builder
+            .add_unix_symlink(b"link".to_vec(), b"a".to_vec(), false, None, None)
+            .unwrap();
+        builder
+            .add_bytes(b"secret".to_vec(), b"hidden".to_vec(), None, None)
+            .unwrap();
+        builder
+            .set_entry_encryption(b"secret", Some(b"password".to_vec()), None)
+            .unwrap();
+        let archive = ArchiveReader::read_owned(builder.to_bytes().unwrap()).unwrap();
+        let all = only(&[0, 1, 2]);
+
+        let run = run_with(
+            SettledSource::Archive(&archive),
+            ArchiveReadOptions::new(),
+            Case {
+                select: Some(&all),
+                ..Case::default()
+            },
+        );
+
+        assert_eq!(run.result, Err(ErrorKind::PasswordRequired), "{version:?}");
+        assert!(
+            run.events.iter().any(|event| event == "link link a"),
+            "{version:?}: {:?}",
+            run.events
         );
     }
 }
