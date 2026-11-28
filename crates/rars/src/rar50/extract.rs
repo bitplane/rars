@@ -507,24 +507,7 @@ impl FileHeader {
         options: crate::ArchiveReadOptions<'_>,
         checksum: CommentChecksum,
     ) -> Result<Vec<u8>> {
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.decoded_comment_with_allowance(
-                archive,
-                options,
-                checksum,
-                &Allowance::limited(limit),
-            );
-        }
-        self.decoded_comment_with_allowance(archive, options, checksum, &Allowance::default())
-    }
-
-    fn decoded_comment_with_allowance(
-        &self,
-        archive: &Archive,
-        options: crate::ArchiveReadOptions<'_>,
-        checksum: CommentChecksum,
-        allowance: &Allowance,
-    ) -> Result<Vec<u8>> {
+        let allowance = &options.reader_allowance();
         let verify = checksum == CommentChecksum::Verify;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         if budget.is_limited() && self.known_unpacked_size().is_none() {
@@ -1086,46 +1069,11 @@ impl Archive {
         open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
         redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
         redirections: Redirections,
-        selector: Option<&mut crate::extraction_control::Selector<'_>>,
-        on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
-        settling: Option<&Settling<'_>>,
-    ) -> Result<crate::ExtractionOutcome> {
-        if let Some(limit) = options.max_reader_workspace_bytes {
-            return self.extract_with_allowance(
-                options,
-                open,
-                redirect,
-                redirections,
-                selector,
-                on_error,
-                settling,
-                &crate::codec::workspace::Allowance::limited(limit),
-            );
-        }
-        self.extract_with_allowance(
-            options,
-            open,
-            redirect,
-            redirections,
-            selector,
-            on_error,
-            settling,
-            &Allowance::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn extract_with_allowance(
-        &self,
-        options: crate::ArchiveReadOptions<'_>,
-        open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-        redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
-        redirections: Redirections,
         mut selector: Option<&mut crate::extraction_control::Selector<'_>>,
         mut on_error: Option<&mut crate::extraction_control::ErrorHandler<'_>>,
         settling: Option<&Settling<'_>>,
-        allowance: &Allowance,
     ) -> Result<crate::ExtractionOutcome> {
+        let allowance = &options.reader_allowance();
         options.check_cancelled()?;
         let mut budget = crate::output_limit::OutputBudget::new(options);
         let buffered_decode_limit = rar50_buffered_decode_limit(options);
@@ -1434,24 +1382,14 @@ impl Archive {
                 .map(|_| ());
         }
 
-        match options.max_reader_workspace_bytes {
-            Some(limit) => self.parallel_with(
-                options,
-                open,
-                redirect,
-                verification,
-                settling,
-                &Allowance::limited(limit),
-            ),
-            None => self.parallel_with(
-                options,
-                open,
-                redirect,
-                verification,
-                settling,
-                &Allowance::default(),
-            ),
-        }?;
+        self.parallel_with(
+            options,
+            open,
+            redirect,
+            verification,
+            settling,
+            &options.reader_allowance(),
+        )?;
         options.check_cancelled()
     }
 
@@ -2264,23 +2202,13 @@ pub(crate) fn extract_from_feed(
     redirect: &mut dyn FnMut(&ExtractedEntryMeta, &FileRedirection) -> Result<()>,
     redirections: Redirections,
 ) -> Result<()> {
-    if let Some(limit) = options.max_reader_workspace_bytes {
-        return volumes::extract(
-            feed,
-            options,
-            open,
-            redirect,
-            redirections,
-            &Allowance::limited(limit),
-        );
-    }
     volumes::extract(
         feed,
         options,
         open,
         redirect,
         redirections,
-        &Allowance::default(),
+        &options.reader_allowance(),
     )
 }
 

@@ -418,6 +418,15 @@ impl<'a> ArchiveReadOptions<'a> {
         self
     }
 
+    /// The workspace one call may use: up to `max_reader_workspace_bytes`,
+    /// or unlimited.
+    pub(crate) fn reader_allowance(&self) -> crate::codec::workspace::Allowance {
+        self.max_reader_workspace_bytes.map_or_else(
+            crate::codec::workspace::Allowance::default,
+            crate::codec::workspace::Allowance::limited,
+        )
+    }
+
     /// Sets the logical member output ceiling.
     pub fn with_max_member_output_bytes(mut self, limit: u64) -> Self {
         self.max_member_output_bytes = Some(limit);

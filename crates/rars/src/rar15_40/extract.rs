@@ -428,25 +428,7 @@ pub(crate) fn extract_volumes_with_links(
     open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: Option<&mut LegacyLink<'_>>,
 ) -> Result<()> {
-    if let Some(limit) = options.max_reader_workspace_bytes {
-        return extract_volumes_with_allowance(
-            volumes,
-            options,
-            open,
-            links,
-            &Allowance::limited(limit),
-        );
-    }
-    extract_volumes_with_allowance(volumes, options, open, links, &Allowance::default())
-}
-
-fn extract_volumes_with_allowance(
-    volumes: &[Archive],
-    options: crate::ArchiveReadOptions<'_>,
-    open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
-    links: Option<&mut LegacyLink<'_>>,
-    allowance: &Allowance,
-) -> Result<()> {
+    let allowance = &options.reader_allowance();
     let mut volumes = volumes.iter().cloned().map(Ok);
     let mut feed = VolumeFeed::complete(&mut volumes, options);
     volumes::extract(&mut feed, options, open, links, allowance)
@@ -458,10 +440,7 @@ pub(crate) fn extract_from_feed(
     open: &mut dyn FnMut(&ExtractedEntryMeta) -> Result<Box<dyn Write>>,
     links: Option<&mut LegacyLink<'_>>,
 ) -> Result<()> {
-    if let Some(limit) = options.max_reader_workspace_bytes {
-        return volumes::extract(feed, options, open, links, &Allowance::limited(limit));
-    }
-    volumes::extract(feed, options, open, links, &Allowance::default())
+    volumes::extract(feed, options, open, links, &options.reader_allowance())
 }
 
 #[cfg(feature = "encryption")]
