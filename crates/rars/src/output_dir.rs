@@ -152,7 +152,7 @@ impl Job {
     }
 }
 
-struct SharedBuffer(Arc<Mutex<Vec<u8>>>);
+pub(crate) struct SharedBuffer(pub(crate) Arc<Mutex<Vec<u8>>>);
 
 impl Write for SharedBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
